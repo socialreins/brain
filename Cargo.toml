@@ -1,0 +1,10 @@
+[workspace]
+members = ["app", "app/migration", "crates/*"]
+resolver = "2"
+
+[workspace.lints.clippy]
+print_stdout = "deny"
+print_stderr = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"

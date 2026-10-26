@@ -1,0 +1,13 @@
+# Local Postgres for `cargo run` and `cargo test`: `docker compose up -d postgres`.
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: brain
+      POSTGRES_PASSWORD: brain
+      POSTGRES_DB: socialreins_brain
+    ports: ["${PG_PORT:-5432}:5432"]
+    volumes: [pg-data:/var/lib/postgresql/data]
+
+volumes:
+  pg-data:
