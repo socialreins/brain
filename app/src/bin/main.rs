@@ -19,12 +19,15 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let db = connect(&config).await?;
-    let app = controllers::router(AppState::new(db, config.git_commit.clone()), &config);
+    let app = controllers::router(AppState::new(db, &config), &config);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port)).await?;
     tracing::info!(port = config.port, "listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown())
+    .await?;
     Ok(())
 }
 

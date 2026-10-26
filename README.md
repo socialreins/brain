@@ -29,7 +29,7 @@ crates/core/     framework-free domain rules (email checks)
 
 `POST /v1/waitlist` answers `200 {"status":"ok"}` for a new email and for one already on the
 list, so it never reveals who signed up. A bad email gets `422 {"error":"invalid_email"}`. Each
-client IP gets 10 requests a minute, then `429`.
+client IP (IPv6 by /64) gets 10 requests a minute, then `429`.
 
 ## Local development
 
@@ -53,6 +53,7 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `DATABASE_URL` | yes | |
 | `PORT` | no | `8080` |
 | `CORS_ORIGINS` | no | `https://socialreins.com,https://www.socialreins.com,http://localhost:3000` |
+| `TRUST_PROXY` | no | `false`. Set `true` on Railway so the rate limit keys on the real client IP from `X-Forwarded-For`; leave it off anywhere a client could reach brain directly |
 | `RAILWAY_GIT_COMMIT_SHA` | no | `dev` (Railway sets it) |
 | `RUST_LOG` | no | `info` |
 

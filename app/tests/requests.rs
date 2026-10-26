@@ -9,9 +9,15 @@ use socialreins_brain::{
 
 /// A fresh app (fresh rate limiter) over the migrated test database.
 async fn server() -> (TestServer, sea_orm::DatabaseConnection) {
-    let config = Config::from_env().expect("DATABASE_URL must point at a test Postgres");
+    server_with(false).await
+}
+
+async fn server_with(trust_proxy: bool) -> (TestServer, sea_orm::DatabaseConnection) {
+    let mut config = Config::from_env().expect("DATABASE_URL must point at a test Postgres");
+    config.git_commit = "dev".into();
+    config.trust_proxy = trust_proxy;
     let db = connect(&config).await.expect("database reachable");
-    let app = controllers::router(AppState::new(db.clone(), "dev".into()), &config);
+    let app = controllers::router(AppState::new(db.clone(), &config), &config);
     (TestServer::new(app).unwrap(), db)
 }
 
@@ -89,7 +95,7 @@ async fn invalid_email_is_rejected() {
 #[tokio::test]
 #[serial]
 async fn signups_are_rate_limited_per_ip() {
-    let (s, _) = server().await;
+    let (s, _) = server_with(true).await;
     let post = |ip: &'static str| {
         s.post("/v1/waitlist")
             .add_header("x-forwarded-for", ip)
@@ -100,6 +106,25 @@ async fn signups_are_rate_limited_per_ip() {
     }
     assert_eq!(post("203.0.113.9").await.status_code(), 429);
     post("203.0.113.10").await.assert_status_ok();
+}
+
+#[tokio::test]
+#[serial]
+async fn spoofed_forwarded_for_is_ignored_without_trust_proxy() {
+    let (s, _) = server().await;
+    for i in 0..10 {
+        s.post("/v1/waitlist")
+            .add_header("x-forwarded-for", format!("198.51.100.{i}"))
+            .json(&json!({"email": unique_email()}))
+            .await
+            .assert_status_ok();
+    }
+    let res = s
+        .post("/v1/waitlist")
+        .add_header("x-forwarded-for", "198.51.100.200")
+        .json(&json!({"email": unique_email()}))
+        .await;
+    assert_eq!(res.status_code(), 429);
 }
 
 #[tokio::test]

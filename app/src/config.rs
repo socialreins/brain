@@ -12,6 +12,9 @@ pub struct Config {
     pub cors_origins: Vec<HeaderValue>,
     /// `RAILWAY_GIT_COMMIT_SHA`, or `dev` outside Railway.
     pub git_commit: String,
+    /// `TRUST_PROXY=true` only behind a proxy that sets `X-Forwarded-For` (Railway). Off by
+    /// default: a client could otherwise spoof the header to dodge the rate limit.
+    pub trust_proxy: bool,
 }
 
 impl Config {
@@ -28,6 +31,11 @@ impl Config {
             port,
             cors_origins: parse_origins(&origins)?,
             git_commit: var("RAILWAY_GIT_COMMIT_SHA").unwrap_or_else(|| "dev".into()),
+            trust_proxy: match var("TRUST_PROXY").as_deref() {
+                None | Some("false") => false,
+                Some("true") => true,
+                Some(_) => return Err("TRUST_PROXY: expected true or false".into()),
+            },
         })
     }
 }
