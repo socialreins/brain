@@ -1,0 +1,79 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push to the same branch cancels the run still going.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  DATABASE_URL: postgres://brain:brain@localhost:5432/socialreins_brain_test
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: No em dashes
+        run: "! git grep -nF \"$(printf '\\342\\200\\224')\" -- . ':!LICENSE'"
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: brain
+          POSTGRES_PASSWORD: brain
+          POSTGRES_DB: socialreins_brain_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U brain" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test --workspace
+
+  # The production image builds and boots: migrates and serves /health within 60s.
+  image:
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17
+        env: { POSTGRES_USER: brain, POSTGRES_PASSWORD: brain, POSTGRES_DB: socialreins_brain_prod }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U brain" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t brain .
+      - run: |
+          docker run -d --name api --network host \
+            -e DATABASE_URL=postgres://brain:brain@localhost:5432/socialreins_brain_prod brain
+          timeout 60 bash -c 'until curl -sf http://localhost:8080/health >/dev/null; do sleep 2; done'
+      - if: failure()
+        run: docker logs api

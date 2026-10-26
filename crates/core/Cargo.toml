@@ -1,0 +1,11 @@
+[package]
+name = "socialreins-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Domain crate: keep framework-free (no axum, no sea-orm).
+[dependencies]
+
+[lints]
+workspace = true
