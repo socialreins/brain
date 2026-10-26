@@ -83,8 +83,9 @@ impl RateLimiter {
 }
 
 /// The client address. With `TRUST_PROXY=true` (behind Railway's edge, the one trusted proxy)
-/// it is the rightmost `X-Forwarded-For` value, which that proxy appends; otherwise the
-/// header is ignored and the socket peer address is used, so a spoofed header changes nothing.
+/// it is the rightmost `X-Forwarded-For` value, which that proxy appends, falling back to the
+/// socket peer when the header is missing or unparsable. Without it the header is ignored, so
+/// a spoofed value changes nothing.
 pub struct ClientIp(pub Option<IpAddr>);
 
 fn forwarded_for(parts: &Parts) -> Option<IpAddr> {
@@ -101,11 +102,19 @@ fn forwarded_for(parts: &Parts) -> Option<IpAddr> {
 impl FromRequestParts<AppState> for ClientIp {
     type Rejection = Infallible;
     async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, Infallible> {
-        if app.trust_proxy {
-            return Ok(Self(forwarded_for(parts)));
-        }
-        let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>();
-        Ok(Self(peer.map(|c| c.0.ip())))
+        let forwarded = app.trust_proxy.then(|| forwarded_for(parts)).flatten();
+        let peer = || {
+            let info = parts.extensions.get::<ConnectInfo<SocketAddr>>();
+            info.map(|c| c.0.ip())
+        };
+        let source = if forwarded.is_some() {
+            "x-forwarded-for"
+        } else {
+            "socket"
+        };
+        let ip = forwarded.or_else(peer);
+        tracing::debug!(client_ip = ?ip, source, "client ip");
+        Ok(Self(ip))
     }
 }
 

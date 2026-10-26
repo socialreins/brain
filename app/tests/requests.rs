@@ -94,6 +94,63 @@ async fn invalid_email_is_rejected() {
 
 #[tokio::test]
 #[serial]
+async fn bad_bodies_get_json_errors() {
+    let (s, _) = server().await;
+    let json_body = |raw: &'static str| {
+        s.post("/v1/waitlist")
+            .content_type("application/json")
+            .bytes(raw.into())
+    };
+    let cases = [
+        (json_body("{not json").await, 400, "invalid_json"),
+        (json_body(r#"{"source":"x"}"#).await, 422, "invalid_body"),
+        (json_body(r#"{"email":42}"#).await, 422, "invalid_body"),
+        (
+            s.post("/v1/waitlist").text("a@example.com").await,
+            415,
+            "unsupported_media_type",
+        ),
+    ];
+    for (res, status, code) in cases {
+        assert_eq!(res.status_code(), status, "{code}");
+        res.assert_json(&json!({"error": code}));
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn bodies_over_4_kib_are_refused() {
+    let (s, _) = server().await;
+    let email = format!("{}@example.com", "a".repeat(4100));
+    let res = s.post("/v1/waitlist").json(&json!({"email": email})).await;
+    assert_eq!(res.status_code(), 413);
+    res.assert_json(&json!({"error": "payload_too_large"}));
+}
+
+#[tokio::test]
+#[serial]
+async fn trusted_proxy_without_forwarded_for_falls_back_to_the_peer() {
+    // No header and no socket peer under the in-memory transport: one bucket, still limited.
+    let (s, _) = server_with(true).await;
+    for _ in 0..10 {
+        let req = s
+            .post("/v1/waitlist")
+            .json(&json!({"email": unique_email()}));
+        req.await.assert_status_ok();
+    }
+    let res = s
+        .post("/v1/waitlist")
+        .add_header("x-forwarded-for", "garbage");
+    assert_eq!(
+        res.json(&json!({"email": unique_email()}))
+            .await
+            .status_code(),
+        429
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn signups_are_rate_limited_per_ip() {
     let (s, _) = server_with(true).await;
     let post = |ip: &'static str| {

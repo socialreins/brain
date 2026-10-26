@@ -3,6 +3,7 @@ pub mod health;
 pub mod waitlist;
 
 use axum::{
+    extract::DefaultBodyLimit,
     http::{header, Method},
     routing::get,
     Json, Router,
@@ -15,6 +16,9 @@ use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 
 use crate::{config::Config, state::AppState};
+
+/// Largest `/v1` request body; a waitlist signup is well under 1 KB.
+const MAX_BODY_BYTES: usize = 4096;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -40,7 +44,7 @@ pub fn router(state: AppState, config: &Config) -> Router {
         .allow_headers([header::CONTENT_TYPE]);
     Router::new()
         .merge(health::routes())
-        .nest("/v1", v1)
+        .nest("/v1", v1.layer(DefaultBodyLimit::max(MAX_BODY_BYTES)))
         .route("/openapi.json", get(move || async move { Json(doc) }))
         .layer(cors)
         .layer(TraceLayer::new_for_http())

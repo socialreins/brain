@@ -21,7 +21,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let db = connect(&config).await?;
     let app = controllers::router(AppState::new(db, &config), &config);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port)).await?;
-    tracing::info!(port = config.port, "listening");
+    let ip_source = if config.trust_proxy {
+        "x-forwarded-for, then socket"
+    } else {
+        "socket"
+    };
+    tracing::info!(
+        port = config.port,
+        client_ip_source = ip_source,
+        "listening"
+    );
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
