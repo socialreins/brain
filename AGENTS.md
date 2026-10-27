@@ -9,6 +9,7 @@ replaces (`~/Code/social-media-manager`) is a read-only reference: read it, neve
 ```sh
 docker compose up -d postgres
 export DATABASE_URL=postgres://brain:brain@localhost:5432/socialreins_brain
+export MAIL_LOG=true   # sign-in links go to the log
 cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p socialreins-brain
@@ -17,7 +18,7 @@ cargo run -p socialreins-brain
 ## Layout
 
 - `app/`: Axum shell. `controllers/` parse and respond, `models/` hold SeaORM entities,
-  `config.rs` reads every env var (defaults live there and only there).
+  `config.rs` reads every env var (defaults live there and only there), `mail.rs` sends mail.
 - `app/migration/`: one file per migration, raw SQL, registered in `lib.rs`. Applied on boot.
 - `crates/*`: framework-free domain code. Never depend on `axum` or `sea-orm` there.
 - `/v1` routes carry `utoipa::path` annotations; `/openapi.json` is generated from them.

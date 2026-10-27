@@ -1,5 +1,6 @@
 pub mod config;
 pub mod controllers;
+pub mod mail;
 pub mod models;
 pub mod rate_limit;
 pub mod state;

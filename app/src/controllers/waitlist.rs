@@ -33,14 +33,14 @@ pub struct Error {
     pub error: String,
 }
 
-type Reply = (StatusCode, Json<serde_json::Value>);
+pub(crate) type Reply = (StatusCode, Json<serde_json::Value>);
 
-fn error(status: StatusCode, code: &str) -> Reply {
+pub(crate) fn error(status: StatusCode, code: &str) -> Reply {
     (status, Json(serde_json::json!({"error": code})))
 }
 
 /// A body axum could not read as `NewSignup`, as a JSON error instead of axum's plain text.
-fn rejected(r: &JsonRejection) -> Reply {
+pub(crate) fn rejected(r: &JsonRejection) -> Reply {
     let code = match r {
         JsonRejection::JsonSyntaxError(_) => "invalid_json",
         JsonRejection::MissingJsonContentType(_) => "unsupported_media_type",

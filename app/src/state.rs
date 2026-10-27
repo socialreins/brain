@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use sea_orm::DatabaseConnection;
 
-use crate::{config::Config, rate_limit::RateLimiter};
+use crate::{config::Config, mail::Mailer, rate_limit::RateLimiter};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -12,6 +12,12 @@ pub struct AppState {
     pub trust_proxy: bool,
     /// Per-IP limit on `POST /v1/waitlist`.
     pub waitlist_limiter: Arc<RateLimiter>,
+    /// Per-IP limit shared by `POST /auth/link` and `POST /auth/magic`.
+    pub magic_link_limiter: Arc<RateLimiter>,
+    pub brain_url: String,
+    pub web_url: String,
+    pub registration_disabled: bool,
+    pub mailer: Mailer,
 }
 
 impl AppState {
@@ -21,6 +27,11 @@ impl AppState {
             git_commit: config.git_commit.clone(),
             trust_proxy: config.trust_proxy,
             waitlist_limiter: Arc::new(RateLimiter::per_minute(10)),
+            magic_link_limiter: Arc::new(RateLimiter::per_minute(5)),
+            brain_url: config.brain_url.clone(),
+            web_url: config.web_url.clone(),
+            registration_disabled: config.registration_disabled,
+            mailer: config.mailer.clone(),
         }
     }
 }

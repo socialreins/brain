@@ -7,6 +7,8 @@ default-run = "socialreins-brain"
 
 [dependencies]
 axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "pool", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
 migration = { path = "migration" }
 sea-orm = { version = "2.0", default-features = false, features = ["macros", "with-uuid", "with-chrono", "runtime-tokio-rustls", "sqlx-postgres"] }
 serde = { version = "1", features = ["derive"] }
