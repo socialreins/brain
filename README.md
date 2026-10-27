@@ -33,12 +33,20 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | POST | `/auth/magic` | Form field `token`: uses the link, sets the session cookie, redirects to `WEB_URL` |
 | GET | `/auth/me` | The signed-in user, or `401 {"error":"unauthorized"}` |
 | POST | `/auth/logout` | Deletes the session, `204` |
+| POST | `/auth/login` | `{"email","password"}`: sets the session cookie, returns the user |
+| PUT | `/auth/password` | `{"password","current_password"}`: sets or changes the signed-in user's password, `204` |
+| POST | `/auth/passkeys/register/start` | `{}` or `{"password"}`: `{"challenge_id","options"}` for `navigator.credentials.create` |
+| POST | `/auth/passkeys/register/finish` | `{"challenge_id","credential","name"}`: stores the passkey, `201` |
+| POST | `/auth/passkeys/login/start` | `{"challenge_id","options"}` for `navigator.credentials.get` (discoverable, no email) |
+| POST | `/auth/passkeys/login/finish` | `{"challenge_id","credential"}`: sets the session cookie, returns the user |
+| GET | `/auth/passkeys` | The signed-in user's passkeys |
+| DELETE | `/auth/passkeys/{id}` | Deletes one of the signed-in user's passkeys, `204`, else `404` |
 
 `POST /v1/waitlist` answers `200 {"status":"ok"}` for a new email and for one already on the
 list, so it never reveals who signed up. A bad email gets `422 {"error":"invalid_email"}`. Each
 client IP (IPv6 by /64) gets 10 requests a minute, then `429`.
 
-Sign-in is by magic link only. `POST /auth/link` answers the same `202`, at the same speed,
+Sign-in is by magic link, password or passkey. `POST /auth/link` answers the same `202`, at the same speed,
 whether or not the email has an account (or is refused by `REGISTRATION_DISABLED`): the lookup
 and the mail run after the reply. Opening the link shows a button that posts it back, so mail
 scanners that prefetch links cannot use it up, and `POST /auth/magic` only accepts a post
@@ -47,6 +55,18 @@ creates the account if needed, then a 30-day session in the HttpOnly,
 SameSite=Lax `sr_session` cookie (`Secure` unless `BRAIN_URL` is `http://`). A dead link
 redirects to `WEB_URL/login?error=invalid_link` (or `registration_disabled`). Only SHA-256
 hashes of link and session tokens are stored. `POST /auth/link` and `POST /auth/magic` share 5 requests a minute per IP.
+
+Passwords are optional and hashed with Argon2id (12 to 256 characters). `POST /auth/login`
+answers the same `401 {"error":"invalid_credentials"}` for an unknown email, an account without
+a password and a wrong password, and takes about as long for each. Changing a password needs the
+current one; setting the first one, or adding a passkey, needs a session started in the last 10
+minutes (sign in again otherwise; adding a passkey also accepts the password). Password and
+passkey sign-in share 10 attempts a minute per IP, and password attempts 5 a minute per email.
+
+Passkeys use WebAuthn through the web app's pages: each `start` keeps the ceremony state in
+Postgres for 5 minutes and the matching `finish` uses it once. The state-changing endpoints in
+this section only accept requests whose `Origin` (or `Referer`) is one of `CORS_ORIGINS`, else
+`403 {"error":"forbidden_origin"}`.
 
 ## Local development
 
@@ -75,6 +95,8 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `TRUST_PROXY` | no | `false`. Set `true` on Railway so the rate limit keys on the real client IP from `X-Forwarded-For`; leave it off anywhere a client could reach brain directly |
 | `BRAIN_URL` | no | `http://localhost:8080`. Public URL of this API: emailed links point here, sign-in posts must come from its origin, and an `http://` value drops the cookie's `Secure` flag |
 | `WEB_URL` | no | `http://localhost:3000`. Public URL of the web app: sign-in redirects there |
+| `PASSKEY_RP_ID` | no | The host of `PASSKEY_RP_ORIGIN`. WebAuthn relying party id: the domain web and brain share, e.g. `socialreins.com` |
+| `PASSKEY_RP_ORIGIN` | no | The origin of `WEB_URL`. Where the browser runs the passkey ceremonies |
 | `REGISTRATION_DISABLED` | no | `false`. `true` stops new accounts; existing users still sign in |
 | `RESEND_API_KEY` | no | Send mail through the Resend HTTPS API (works where outbound SMTP is blocked, like Railway) |
 | `SMTP_URL` | no | Send mail through any SMTP server, e.g. `smtps://user:pass@smtp.example.com`. Used when `RESEND_API_KEY` is unset |

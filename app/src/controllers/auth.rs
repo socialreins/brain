@@ -14,7 +14,7 @@ use sea_orm::{
     ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, DbErr, EntityTrait, PaginatorTrait,
     QueryFilter, Statement, TransactionTrait,
 };
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::json;
 use socialreins_core::{email, token};
 
@@ -37,7 +37,7 @@ struct LinkRequest {
     email: String,
 }
 
-fn internal(e: impl std::fmt::Display, what: &str) -> Response {
+pub(crate) fn internal(e: impl std::fmt::Display, what: &str) -> Response {
     tracing::error!(error = %e, what, "auth query failed");
     error(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
 }
@@ -136,7 +136,10 @@ async fn insert_capped_link(app: &AppState, email: &str) -> Result<Option<String
     Ok(Some(secret))
 }
 
-async fn find_user(app: &AppState, email: &str) -> Result<Option<users::Model>, sea_orm::DbErr> {
+pub(crate) async fn find_user(
+    app: &AppState,
+    email: &str,
+) -> Result<Option<users::Model>, sea_orm::DbErr> {
     users::Entity::find()
         .filter(users::Column::Email.eq(email))
         .one(&app.db)
@@ -221,6 +224,14 @@ async fn redeem(
         },
         Err(e) => return internal(e, "user lookup"),
     };
+    match start_session(&app, user.id).await {
+        Ok(cookie) => ([(header::SET_COOKIE, cookie)], Redirect::to(&app.web_url)).into_response(),
+        Err(e) => internal(e, "session insert"),
+    }
+}
+
+/// Stores a new 30-day session for `user_id` and returns its `Set-Cookie` value.
+pub(crate) async fn start_session(app: &AppState, user_id: uuid::Uuid) -> Result<String, DbErr> {
     let secret = token::new();
     let now = Utc::now().fixed_offset();
     let expired = sessions::Entity::delete_many()
@@ -232,25 +243,61 @@ async fn redeem(
     }
     let session = sessions::ActiveModel {
         token_hash: Set(token::hash(&secret)),
-        user_id: Set(user.id),
+        user_id: Set(user_id),
         expires_at: Set(now + Duration::days(SESSION_DAYS)),
         ..Default::default()
     };
-    if let Err(e) = sessions::Entity::insert(session)
+    sessions::Entity::insert(session)
         .exec_without_returning(&app.db)
-        .await
-    {
-        return internal(e, "session insert");
-    }
-    let cookie = cookie(&app, &secret, Duration::days(SESSION_DAYS).num_seconds());
-    ([(header::SET_COOKIE, cookie)], Redirect::to(&app.web_url)).into_response()
+        .await?;
+    Ok(cookie(
+        app,
+        &secret,
+        Duration::days(SESSION_DAYS).num_seconds(),
+    ))
 }
 
-/// `Origin`, or `Referer` when a browser sent no `Origin`, is BRAIN_URL's origin.
-fn from_brain(app: &AppState, headers: &HeaderMap) -> bool {
+/// `Origin`, or the origin of `Referer` when a browser sent no `Origin`.
+fn sent_origin(headers: &HeaderMap) -> Option<&str> {
     let value = |name| headers.get(name).and_then(|v| v.to_str().ok());
-    let sent = value(header::ORIGIN).or_else(|| value(header::REFERER).map(origin));
-    sent == Some(origin(&app.brain_url))
+    value(header::ORIGIN).or_else(|| value(header::REFERER).map(origin))
+}
+
+/// The request came from BRAIN_URL's origin.
+fn from_brain(app: &AppState, headers: &HeaderMap) -> bool {
+    sent_origin(headers) == Some(origin(&app.brain_url))
+}
+
+/// Guard for state-changing calls the web app makes: like the check on `POST /auth/magic`, but
+/// the origin must be one of `CORS_ORIGINS`. Otherwise `403 {"error":"forbidden_origin"}`, so
+/// another site cannot drive a signed-in browser (CSRF) or sign it in (login CSRF).
+pub struct FromWeb;
+
+impl FromRequestParts<AppState> for FromWeb {
+    type Rejection = Reply;
+
+    async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, Reply> {
+        let sent = sent_origin(&parts.headers);
+        if sent.is_some_and(|o| app.web_origins.iter().any(|w| w == o)) {
+            Ok(Self)
+        } else {
+            Err(error(StatusCode::FORBIDDEN, "forbidden_origin"))
+        }
+    }
+}
+
+/// A JSON body, refused with the same JSON errors as `/v1`.
+pub struct Body<T>(pub T);
+
+impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for Body<T> {
+    type Rejection = Reply;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Reply> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(body)) => Ok(Self(body)),
+            Err(r) => Err(rejected(&r)),
+        }
+    }
 }
 
 async fn create_user(app: &AppState, email: &str) -> Result<users::Model, sea_orm::DbErr> {
@@ -291,8 +338,19 @@ fn session_token(headers: &HeaderMap) -> Option<&str> {
         .map(|(_, value)| value)
 }
 
-/// The signed-in user, from an unexpired session; `401 {"error":"unauthorized"}` otherwise.
-pub struct CurrentUser(pub users::Model);
+/// The signed-in user and their session, from an unexpired session cookie;
+/// `401 {"error":"unauthorized"}` otherwise.
+pub struct CurrentUser(pub users::Model, pub sessions::Model);
+
+/// How long a session counts as a fresh sign-in, for changes a stolen old cookie must not make.
+const RECENT_AUTH_MINUTES: i64 = 10;
+
+impl CurrentUser {
+    /// The session started within the last `RECENT_AUTH_MINUTES`.
+    pub fn recent(&self) -> bool {
+        self.1.created_at > Utc::now() - Duration::minutes(RECENT_AUTH_MINUTES)
+    }
+}
 
 impl FromRequestParts<AppState> for CurrentUser {
     type Rejection = Reply;
@@ -315,18 +373,23 @@ impl FromRequestParts<AppState> for CurrentUser {
             .await
             .map_err(internal)?
             .ok_or_else(unauthorized)?;
-        Ok(Self(user))
+        Ok(Self(user, session))
     }
 }
 
-async fn me(CurrentUser(user): CurrentUser) -> Reply {
-    let body = json!({
+/// The public fields of `user`, as `GET /auth/me` returns them.
+pub(crate) fn user_json(user: &users::Model) -> Json<serde_json::Value> {
+    Json(json!({
         "id": user.id,
         "email": user.email,
         "name": user.name,
         "username": user.username,
-    });
-    (StatusCode::OK, Json(body))
+        "has_password": user.password_hash.is_some(),
+    }))
+}
+
+async fn me(CurrentUser(user, _): CurrentUser) -> Reply {
+    (StatusCode::OK, user_json(&user))
 }
 
 async fn logout(State(app): State<AppState>, headers: HeaderMap) -> Response {

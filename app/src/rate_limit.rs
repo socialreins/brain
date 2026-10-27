@@ -4,6 +4,7 @@
 use std::{
     collections::HashMap,
     convert::Infallible,
+    hash::Hash,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::Mutex,
     time::{Duration, Instant},
@@ -19,11 +20,12 @@ use crate::state::AppState;
 /// Most networks tracked at once; past it the oldest window is evicted, so memory stays bounded.
 const MAX_KEYS: usize = 10_000;
 
-pub struct RateLimiter {
+/// Keyed by client network by default; `RateLimiter<String>` keys on anything else, e.g. an email.
+pub struct RateLimiter<K = Option<IpAddr>> {
     cap: u32,
     window: Duration,
     max_keys: usize,
-    hits: Mutex<HashMap<Option<IpAddr>, (Instant, u32)>>,
+    hits: Mutex<HashMap<K, (Instant, u32)>>,
 }
 
 /// The bucket key: an IPv4 address as is, an IPv6 address by its /64 (one subscriber's
@@ -39,6 +41,13 @@ fn bucket(ip: IpAddr) -> IpAddr {
 }
 
 impl RateLimiter {
+    /// Counts one hit for `ip`; false once its network is over the cap for the current window.
+    pub fn allow(&self, ip: Option<IpAddr>) -> bool {
+        self.hit(ip.map(bucket))
+    }
+}
+
+impl<K: Hash + Eq + Clone> RateLimiter<K> {
     pub fn per_minute(cap: u32) -> Self {
         Self::new(cap, Duration::from_secs(60), MAX_KEYS)
     }
@@ -52,9 +61,8 @@ impl RateLimiter {
         }
     }
 
-    /// Counts one hit for `ip`; false once its network is over the cap for the current window.
-    pub fn allow(&self, ip: Option<IpAddr>) -> bool {
-        let key = ip.map(bucket);
+    /// Counts one hit for `key`; false once it is over the cap for the current window.
+    pub fn hit(&self, key: K) -> bool {
         let now = Instant::now();
         let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         if !hits.contains_key(&key) && hits.len() >= self.max_keys {
@@ -63,7 +71,7 @@ impl RateLimiter {
                 let oldest = hits
                     .iter()
                     .min_by_key(|(_, (start, _))| *start)
-                    .map(|(k, _)| *k);
+                    .map(|(k, _)| k.clone());
                 if let Some(k) = oldest {
                     hits.remove(&k);
                 }
@@ -130,7 +138,7 @@ mod tests {
 
     #[test]
     fn caps_per_ip() {
-        let l = RateLimiter::per_minute(2);
+        let l: RateLimiter = RateLimiter::per_minute(2);
         assert!(l.allow(ip("203.0.113.1")) && l.allow(ip("203.0.113.1")));
         assert!(!l.allow(ip("203.0.113.1")));
         assert!(l.allow(ip("203.0.113.2")));
@@ -138,7 +146,7 @@ mod tests {
 
     #[test]
     fn ipv6_in_one_slash_64_shares_a_bucket() {
-        let l = RateLimiter::per_minute(2);
+        let l: RateLimiter = RateLimiter::per_minute(2);
         assert!(l.allow(ip("2001:db8:1:2::1")));
         assert!(l.allow(ip("2001:db8:1:2:ffff:ffff:ffff:ffff")));
         assert!(!l.allow(ip("2001:db8:1:2::abcd")));
@@ -148,7 +156,7 @@ mod tests {
 
     #[test]
     fn map_never_grows_past_its_cap() {
-        let l = RateLimiter::new(1, Duration::from_secs(60), 3);
+        let l: RateLimiter = RateLimiter::new(1, Duration::from_secs(60), 3);
         for i in 0..50u8 {
             assert!(l.allow(ip(&format!("198.51.100.{i}"))));
         }
