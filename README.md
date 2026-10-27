@@ -1,4 +1,6 @@
-# brain
+<p align="center"><img src="https://raw.githubusercontent.com/socialreins/.github/main/brand/logo.svg" width="96" height="96" alt="SocialReins logo"></p>
+
+<h1 align="center">brain</h1>
 
 The Rust backend for [SocialReins](https://socialreins.com), a social media manager for
 scheduling and publishing posts across platforms. For the project overview, roadmap and the
