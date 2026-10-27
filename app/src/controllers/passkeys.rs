@@ -20,7 +20,7 @@ use webauthn_rs::prelude::{
 };
 
 use super::{
-    auth::{internal, start_session, user_json, Body, CurrentUser, FromWeb},
+    auth::{end_other_sessions, internal, start_session, user_json, Body, CurrentUser, FromWeb},
     waitlist::error,
 };
 use crate::{
@@ -98,7 +98,7 @@ async fn register_start(
     let user = &current.0;
     let confirmed = match (body.password, &user.password_hash) {
         (Some(given), Some(phc)) => {
-            if !app.login_email_limiter.hit(user.email.clone()) {
+            if !app.account_limiter.hit(user.id) {
                 return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
             }
             let phc = phc.clone();
@@ -318,10 +318,11 @@ async fn list(State(app): State<AppState>, CurrentUser(user, _): CurrentUser) ->
 }
 
 /// `DELETE /auth/passkeys/{id}`: `204`, or `404` when it is not one of the user's passkeys.
+/// Every other session of the user ends, in case one was opened with that passkey.
 async fn remove(
     _: FromWeb,
     State(app): State<AppState>,
-    CurrentUser(user, _): CurrentUser,
+    CurrentUser(user, session): CurrentUser,
     Path(id): Path<Uuid>,
 ) -> Response {
     let deleted = passkeys::Entity::delete_many()
@@ -330,9 +331,13 @@ async fn remove(
         .exec(&app.db)
         .await;
     match deleted {
-        Ok(r) if r.rows_affected == 1 => StatusCode::NO_CONTENT.into_response(),
-        Ok(_) => reply(StatusCode::NOT_FOUND, "not_found"),
-        Err(e) => internal(e, "passkey delete"),
+        Ok(r) if r.rows_affected == 1 => {}
+        Ok(_) => return reply(StatusCode::NOT_FOUND, "not_found"),
+        Err(e) => return internal(e, "passkey delete"),
+    }
+    match end_other_sessions(&app, user.id, &session.token_hash).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal(e, "session revoke"),
     }
 }
 

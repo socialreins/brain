@@ -61,7 +61,11 @@ answers the same `401 {"error":"invalid_credentials"}` for an unknown email, an 
 a password and a wrong password, and takes about as long for each. Changing a password needs the
 current one; setting the first one, or adding a passkey, needs a session started in the last 10
 minutes (sign in again otherwise; adding a passkey also accepts the password). Password and
-passkey sign-in share 10 attempts a minute per IP, and password attempts 5 a minute per email.
+passkey sign-in share 10 attempts a minute per IP. Per email only failed passwords count: 5 a
+minute closes the email until the window ends, and a success clears the count, so strangers
+cannot lock out an owner who knows the password. Password checks by a signed-in user get 5 a
+minute per account. Setting or changing a password, or deleting a passkey, ends every other
+session of the user.
 
 Passkeys use WebAuthn through the web app's pages: each `start` keeps the ceremony state in
 Postgres for 5 minutes and the matching `finish` uses it once. The state-changing endpoints in

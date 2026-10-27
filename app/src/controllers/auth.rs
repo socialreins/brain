@@ -257,6 +257,20 @@ pub(crate) async fn start_session(app: &AppState, user_id: uuid::Uuid) -> Result
     ))
 }
 
+/// Deletes every session of `user_id` except the one hashed `keep`, after a credential change.
+pub(crate) async fn end_other_sessions(
+    app: &AppState,
+    user_id: uuid::Uuid,
+    keep: &str,
+) -> Result<(), DbErr> {
+    sessions::Entity::delete_many()
+        .filter(sessions::Column::UserId.eq(user_id))
+        .filter(sessions::Column::TokenHash.ne(keep))
+        .exec(&app.db)
+        .await
+        .map(|_| ())
+}
+
 /// `Origin`, or the origin of `Referer` when a browser sent no `Origin`.
 fn sent_origin(headers: &HeaderMap) -> Option<&str> {
     let value = |name| headers.get(name).and_then(|v| v.to_str().ok());

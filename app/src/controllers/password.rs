@@ -14,7 +14,10 @@ use serde::Deserialize;
 use socialreins_core::{email, password};
 
 use super::{
-    auth::{find_user, internal, start_session, user_json, Body, CurrentUser, FromWeb},
+    auth::{
+        end_other_sessions, find_user, internal, start_session, user_json, Body, CurrentUser,
+        FromWeb,
+    },
     waitlist::error,
 };
 use crate::{rate_limit::ClientIp, state::AppState};
@@ -52,9 +55,10 @@ async fn login(
     Body(body): Body<Login>,
 ) -> Response {
     let email = email::normalize(&body.email).unwrap_or_default();
-    // Both limits count every attempt, so one IP cannot spray many emails nor many IPs one email.
+    // Every attempt counts per IP; per email only failures do, so guessing one account from
+    // many IPs is capped without letting strangers lock its owner out.
     let ip_ok = app.login_limiter.allow(ip);
-    if !(app.login_email_limiter.hit(email.clone()) && ip_ok) {
+    if !ip_ok || app.login_email_limiter.blocked(&email) {
         return rate_limited();
     }
     let user = match find_user(&app, &email).await {
@@ -63,8 +67,10 @@ async fn login(
     };
     let phc = user.as_ref().and_then(|u| u.password_hash.clone());
     let (Some(user), true) = (user, verify(body.password, phc).await) else {
+        app.login_email_limiter.hit(email);
         return error(StatusCode::UNAUTHORIZED, "invalid_credentials").into_response();
     };
+    app.login_email_limiter.clear(&email);
     match start_session(&app, user.id).await {
         Ok(cookie) => ([(header::SET_COOKIE, cookie)], user_json(&user)).into_response(),
         Err(e) => internal(e, "session insert"),
@@ -78,7 +84,8 @@ struct SetPassword {
 }
 
 /// `PUT /auth/password`: changing a password needs the current one; setting the first one needs
-/// a session from the last 10 minutes, so a stolen old cookie cannot add a password.
+/// a session from the last 10 minutes, so a stolen old cookie cannot add a password. Every other
+/// session of the user ends.
 async fn set_password(
     _: FromWeb,
     State(app): State<AppState>,
@@ -89,7 +96,7 @@ async fn set_password(
         return error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_password").into_response();
     }
     let user = &current.0;
-    if !app.login_email_limiter.hit(user.email.clone()) {
+    if !app.account_limiter.hit(user.id) {
         return rate_limited();
     }
     let allowed = match &user.password_hash {
@@ -111,12 +118,17 @@ async fn set_password(
     let Ok(phc) = tokio::task::spawn_blocking(move || password::hash(&new)).await else {
         return internal("hash task failed", "password hash");
     };
-    let mut row = current.0.into_active_model();
+    let (user, session) = (current.0, current.1);
+    let user_id = user.id;
+    let mut row = user.into_active_model();
     row.password_hash = Set(Some(phc));
     row.updated_at = Set(chrono::Utc::now().fixed_offset());
-    match row.update(&app.db).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => internal(e, "password update"),
+    if let Err(e) = row.update(&app.db).await {
+        return internal(e, "password update");
+    }
+    match end_other_sessions(&app, user_id, &session.token_hash).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal(e, "session revoke"),
     }
 }
 

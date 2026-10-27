@@ -16,10 +16,14 @@ pub struct AppState {
     pub waitlist_limiter: Arc<RateLimiter>,
     /// Per-IP limit shared by `POST /auth/link` and `POST /auth/magic`.
     pub magic_link_limiter: Arc<RateLimiter>,
-    /// Per-IP limit on password and passkey sign-in, and on `PUT /auth/password`.
+    /// Per-IP limit on every password and passkey sign-in attempt.
     pub login_limiter: Arc<RateLimiter>,
-    /// Per-email limit on the same.
+    /// Per-email cap on failed password sign-ins; only failures count, so outside traffic
+    /// cannot lock out an owner who knows the password, and a success clears it.
     pub login_email_limiter: Arc<RateLimiter<String>>,
+    /// Per-user limit on password checks a signed-in user makes (`PUT /auth/password`, the
+    /// confirm on passkey registration). Keyed by user id, so outside traffic cannot drain it.
+    pub account_limiter: Arc<RateLimiter<uuid::Uuid>>,
     pub brain_url: String,
     pub web_url: String,
     /// `CORS_ORIGINS`: the web app's origins, the only ones that may call its state-changing
@@ -40,6 +44,7 @@ impl AppState {
             magic_link_limiter: Arc::new(RateLimiter::per_minute(5)),
             login_limiter: Arc::new(RateLimiter::per_minute(10)),
             login_email_limiter: Arc::new(RateLimiter::per_minute(5)),
+            account_limiter: Arc::new(RateLimiter::per_minute(5)),
             brain_url: config.brain_url.clone(),
             web_url: config.web_url.clone(),
             web_origins: config.cors_origins.clone(),

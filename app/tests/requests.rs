@@ -678,6 +678,61 @@ mod auth {
 
     #[tokio::test]
     #[serial]
+    async fn only_failed_logins_count_per_email() {
+        let (s, db) = server_where(|c| c.trust_proxy = true).await;
+        let (email, cookie) = signed_in(&s, &db).await;
+        set_password(&s, &cookie, json!({"password": PASSWORD}))
+            .await
+            .assert_status(axum::http::StatusCode::NO_CONTENT);
+        let from = |ip: &str, pw: &str| {
+            s.post("/auth/login")
+                .add_header("origin", WEB)
+                .add_header("x-forwarded-for", ip.to_owned())
+                .json(&json!({"email": email, "password": pw}))
+        };
+        // Another IP's failures under the cap do not stop the owner, and a success clears them.
+        for _ in 0..4 {
+            assert_eq!(
+                from("198.51.100.1", "wrong guess here").await.status_code(),
+                401
+            );
+        }
+        from("198.51.100.2", PASSWORD).await.assert_status_ok();
+        for _ in 0..4 {
+            assert_eq!(
+                from("198.51.100.3", "wrong guess here").await.status_code(),
+                401
+            );
+        }
+        from("198.51.100.2", PASSWORD).await.assert_status_ok();
+        // Five failures in a row, from any IPs, close the email for the window.
+        for i in 0..5 {
+            let ip = format!("198.51.100.{}", 10 + i);
+            assert_eq!(from(&ip, "wrong guess here").await.status_code(), 401);
+        }
+        let res = from("198.51.100.20", PASSWORD).await;
+        assert_eq!(res.status_code(), 429);
+        res.assert_json(&json!({"error": "rate_limited"}));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn setting_a_password_ends_the_other_sessions() {
+        let (s, db) = server_where(|_| {}).await;
+        let (email, cookie) = signed_in(&s, &db).await;
+        let (_, other) = open(&s, &link(&db, &email, Duration::minutes(15)).await).await;
+        let other = session(&other.unwrap());
+        let me = |c: &str| s.get("/auth/me").add_header("cookie", c.to_owned());
+        me(&other).await.assert_status_ok();
+        set_password(&s, &cookie, json!({"password": PASSWORD}))
+            .await
+            .assert_status(axum::http::StatusCode::NO_CONTENT);
+        assert_eq!(me(&other).await.status_code(), 401);
+        me(&cookie).await.assert_status_ok();
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn credential_endpoints_only_answer_the_web_origin() {
         let (s, db) = server_where(|_| {}).await;
         let (_, cookie) = signed_in(&s, &db).await;
@@ -900,6 +955,10 @@ mod auth {
             res.assert_json(&json!({"error": "not_found"}));
             assert_eq!(remove(&cookie).await.status_code(), 204);
             assert_eq!(remove(&cookie).await.status_code(), 404);
+            // The passkey's session ended with it; the one that deleted it stays.
+            let me = |c: &str| s.get("/auth/me").add_header("cookie", c.to_owned());
+            assert_eq!(me(fresh).await.status_code(), 401);
+            me(&cookie).await.assert_status_ok();
         }
 
         #[tokio::test]
