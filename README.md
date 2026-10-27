@@ -59,14 +59,14 @@ hashes of link and session tokens are stored. `POST /auth/link` and `POST /auth/
 Passwords are optional and hashed with Argon2id (12 to 256 characters). `POST /auth/login`
 answers the same `401 {"error":"invalid_credentials"}` for an unknown email, an account without
 a password and a wrong password, and takes about as long for each. Changing a password needs the
-current one; setting the first one, or adding a passkey, needs a session started in the last 10
+current one; setting the first one, or adding or deleting a passkey, needs a session started in the last 10
 minutes (sign in again otherwise; adding a passkey also accepts the password). Password and
 passkey sign-in share 10 attempts a minute per IP. Per email only failed passwords count: 5 a
 minute closes the email until the window ends, and a success clears the count, so strangers
 cannot lock out an owner who knows the password. A signed-in user's current-password checks
 have their own budget of 5 failures a minute per account, which outsiders cannot drain; each
 failure also counts against the email's login budget. Setting or changing a password, or deleting a passkey, ends every other
-session of the user.
+session of the user; setting or changing a password also voids unused sign-in links.
 
 Passkeys use WebAuthn through the web app's pages: each `start` keeps the ceremony state in
 Postgres for 5 minutes and the matching `finish` uses it once. The state-changing endpoints in

@@ -790,18 +790,22 @@ mod auth {
 
     #[tokio::test]
     #[serial]
-    async fn setting_a_password_ends_the_other_sessions() {
+    async fn setting_a_password_ends_other_sessions_and_links() {
         let (s, db) = server_where(|_| {}).await;
         let (email, cookie) = signed_in(&s, &db).await;
         let (_, other) = open(&s, &link(&db, &email, Duration::minutes(15)).await).await;
         let other = session(&other.unwrap());
         let me = |c: &str| s.get("/auth/me").add_header("cookie", c.to_owned());
         me(&other).await.assert_status_ok();
+        let pending = link(&db, &email, Duration::minutes(15)).await;
         set_password(&s, &cookie, json!({"password": PASSWORD}))
             .await
             .assert_status(axum::http::StatusCode::NO_CONTENT);
         assert_eq!(me(&other).await.status_code(), 401);
         me(&cookie).await.assert_status_ok();
+        assert_eq!(links(&db, &email).await, 0, "outstanding links are revoked");
+        let (to, _) = open(&s, &pending).await;
+        assert!(to.ends_with("/login?error=invalid_link"));
     }
 
     #[tokio::test]
@@ -1017,6 +1021,15 @@ mod auth {
             let list = s.get("/auth/passkeys").add_header("cookie", &cookie).await;
             assert!(list.json::<Value>()[0]["last_used_at"].is_string());
 
+            // The conditional counter update reads this path; it must exist in what we store.
+            let made_id: uuid::Uuid = made["body"]["id"].as_str().unwrap().parse().unwrap();
+            let stored = socialreins_brain::models::passkeys::Entity::find_by_id(made_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(stored.credential["cred"]["counter"].is_number());
+
             let id = made["body"]["id"].as_str().unwrap();
             let remove = |c: &str| {
                 s.delete(&format!("/auth/passkeys/{id}"))
@@ -1026,6 +1039,12 @@ mod auth {
             let res = remove(&stranger).await;
             assert_eq!(res.status_code(), 404);
             res.assert_json(&json!({"error": "not_found"}));
+            // A stolen old cookie cannot remove it.
+            age(&db, &cookie, Duration::minutes(11)).await;
+            let res = remove(&cookie).await;
+            assert_eq!(res.status_code(), 403);
+            res.assert_json(&json!({"error": "reauth_required"}));
+            age(&db, &cookie, Duration::zero()).await;
             assert_eq!(remove(&cookie).await.status_code(), 204);
             assert_eq!(remove(&cookie).await.status_code(), 404);
             // The passkey's session ended with it; the one that deleted it stays.

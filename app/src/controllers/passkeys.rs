@@ -9,7 +9,10 @@ use axum::{
     Json, Router,
 };
 use chrono::{Duration, Utc};
-use sea_orm::{ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder, SqlErr};
+use sea_orm::{
+    ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, DbErr, EntityTrait, QueryFilter,
+    QueryOrder, SqlErr, Statement,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -261,20 +264,31 @@ async fn login_finish(
             return refused();
         }
     };
-    let mut update = passkeys::ActiveModel {
+    let touched = passkeys::ActiveModel {
         id: Set(row.id),
         last_used_at: Set(Some(Utc::now().fixed_offset())),
         ..Default::default()
     };
-    // Stores the new signature counter and backup state.
-    if passkey.update_credential(&result) == Some(true) {
-        match serde_json::to_value(&passkey) {
-            Ok(v) => update.credential = Set(v),
-            Err(e) => return internal(e, "passkey serialize"),
-        }
-    }
-    if let Err(e) = passkeys::Entity::update(update).exec(&app.db).await {
+    if let Err(e) = passkeys::Entity::update(touched).exec(&app.db).await {
         return internal(e, "passkey update");
+    }
+    // Stores the new signature counter and backup state, unless a parallel sign-in already
+    // stored a higher counter. Equal is allowed: authenticators without a counter send 0.
+    if passkey.update_credential(&result) == Some(true) {
+        let Ok(credential) = serde_json::to_value(&passkey) else {
+            return internal("serialize failed", "passkey serialize");
+        };
+        let sql = "UPDATE passkeys SET credential = $1 WHERE id = $2 \
+                   AND COALESCE((credential #>> '{cred,counter}')::bigint, 0) <= $3";
+        let values = [
+            credential.into(),
+            row.id.into(),
+            i64::from(result.counter()).into(),
+        ];
+        let stmt = Statement::from_sql_and_values(DbBackend::Postgres, sql, values);
+        if let Err(e) = app.db.execute_raw(stmt).await {
+            return internal(e, "passkey counter update");
+        }
     }
     let user = match users::Entity::find_by_id(user_id).one(&app.db).await {
         Ok(Some(user)) => user,
@@ -313,13 +327,19 @@ async fn list(State(app): State<AppState>, CurrentUser(user, _): CurrentUser) ->
 }
 
 /// `DELETE /auth/passkeys/{id}`: `204`, or `404` when it is not one of the user's passkeys.
-/// Every other session of the user ends, in case one was opened with that passkey.
+/// Needs a session from the last 10 minutes, like adding one, so a stolen old cookie cannot
+/// remove the owner's passkey (and with it their other sessions). Every other session of the
+/// user ends, in case one was opened with that passkey.
 async fn remove(
     _: FromWeb,
     State(app): State<AppState>,
-    CurrentUser(user, session): CurrentUser,
+    current: CurrentUser,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if !current.recent() {
+        return reply(StatusCode::FORBIDDEN, "reauth_required");
+    }
+    let CurrentUser(user, session) = current;
     let deleted = passkeys::Entity::delete_many()
         .filter(passkeys::Column::Id.eq(id))
         .filter(passkeys::Column::UserId.eq(user.id))
