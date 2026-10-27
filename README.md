@@ -76,7 +76,7 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `BRAIN_URL` | no | `http://localhost:8080`. Public URL of this API: emailed links point here, sign-in posts must come from its origin, and an `http://` value drops the cookie's `Secure` flag |
 | `WEB_URL` | no | `http://localhost:3000`. Public URL of the web app: sign-in redirects there |
 | `REGISTRATION_DISABLED` | no | `false`. `true` stops new accounts; existing users still sign in |
-| `RESEND_API_KEY` | no | Send mail through Resend (its SMTP relay) |
+| `RESEND_API_KEY` | no | Send mail through the Resend HTTPS API (works where outbound SMTP is blocked, like Railway) |
 | `SMTP_URL` | no | Send mail through any SMTP server, e.g. `smtps://user:pass@smtp.example.com`. Used when `RESEND_API_KEY` is unset |
 | `MAIL_LOG` | if no mail | `false`. With no Resend key and no SMTP, brain refuses to start unless this is `true`; then sign-in links are written to the log at info level. Meant for a single-user self-host |
 | `MAIL_FROM` | with mail | Sender, e.g. `SocialReins <login@example.com>` |
