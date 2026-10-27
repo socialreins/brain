@@ -484,10 +484,21 @@ mod auth {
         assert!(cookie.contains("; Secure"));
         let me = || s.get("/auth/me").add_header("cookie", session(&cookie));
         me().await.assert_status_ok();
-        let out = s
-            .post("/auth/logout")
-            .add_header("cookie", session(&cookie))
-            .await;
+        let logout = || {
+            s.post("/auth/logout")
+                .add_header("cookie", session(&cookie))
+        };
+        for foreign in [None, Some("https://evil.example")] {
+            let res = match foreign {
+                Some(o) => logout().add_header("origin", o).await,
+                None => logout().await,
+            };
+            assert_eq!(res.status_code(), 403);
+            res.assert_json(&json!({"error": "forbidden_origin"}));
+        }
+        me().await.assert_status_ok();
+        // CORS_ORIGINS keeps its env default here, not the edited WEB_URL.
+        let out = logout().add_header("origin", "http://localhost:3000").await;
         assert_eq!(out.status_code(), 204);
         assert!(out
             .header("set-cookie")

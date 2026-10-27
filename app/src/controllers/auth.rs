@@ -406,7 +406,8 @@ async fn me(CurrentUser(user, _): CurrentUser) -> Reply {
     (StatusCode::OK, user_json(&user))
 }
 
-async fn logout(State(app): State<AppState>, headers: HeaderMap) -> Response {
+/// `POST /auth/logout`: only the web app's origins, so another site cannot sign a user out.
+async fn logout(_: FromWeb, State(app): State<AppState>, headers: HeaderMap) -> Response {
     if let Some(secret) = session_token(&headers) {
         let deleted = sessions::Entity::delete_by_id(token::hash(secret))
             .exec(&app.db)

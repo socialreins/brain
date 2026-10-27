@@ -32,7 +32,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/auth/magic/{token}` | The emailed link: a page with a sign-in button, does not use the link |
 | POST | `/auth/magic` | Form field `token`: uses the link, sets the session cookie, redirects to `WEB_URL` |
 | GET | `/auth/me` | The signed-in user, or `401 {"error":"unauthorized"}` |
-| POST | `/auth/logout` | Deletes the session, `204` |
+| POST | `/auth/logout` | Deletes the session, `204`. Origin must be in `CORS_ORIGINS` |
 | POST | `/auth/login` | `{"email","password"}`: sets the session cookie, returns the user |
 | PUT | `/auth/password` | `{"password","current_password"}`: sets or changes the signed-in user's password, `204` |
 | POST | `/auth/passkeys/register/start` | `{}` or `{"password"}`: `{"challenge_id","options"}` for `navigator.credentials.create` |
