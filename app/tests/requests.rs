@@ -193,10 +193,10 @@ async fn cors_allows_the_site_only() {
             .add_header("origin", origin)
             .add_header("access-control-request-method", "POST")
     };
-    let ok = preflight("https://socialreins.com").await;
+    let ok = preflight("http://localhost:3000").await;
     assert_eq!(
         ok.header("access-control-allow-origin"),
-        "https://socialreins.com"
+        "http://localhost:3000"
     );
     let other = preflight("https://evil.example").await;
     assert!(other.maybe_header("access-control-allow-origin").is_none());
@@ -260,7 +260,16 @@ mod auth {
     /// Redeems `secret` the way the button on the link page does, returning the redirect target
     /// and the session cookie it set, if any.
     async fn open(s: &TestServer, secret: &str) -> (String, Option<String>) {
-        let res = s.post("/auth/magic").form(&[("token", secret)]).await;
+        open_from(s, secret, "http://localhost:8080").await
+    }
+
+    /// `open`, posting from the page at `origin` (brain's own, unless BRAIN_URL was changed).
+    async fn open_from(s: &TestServer, secret: &str, origin: &str) -> (String, Option<String>) {
+        let res = s
+            .post("/auth/magic")
+            .add_header("origin", origin)
+            .form(&[("token", secret)])
+            .await;
         assert_eq!(res.status_code(), 303);
         let cookie = res
             .maybe_header("set-cookie")
@@ -315,7 +324,7 @@ mod auth {
         assert_eq!(to, "http://localhost:3000");
         let cookie = cookie.expect("session cookie");
         assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Lax"));
-        assert!(!cookie.contains("Secure"), "http WEB_URL drops Secure");
+        assert!(!cookie.contains("Secure"), "http BRAIN_URL drops Secure");
         let me = s
             .get("/auth/me")
             .add_header("cookie", session(&cookie))
@@ -348,6 +357,55 @@ mod auth {
         assert!(cookie.is_some());
         let junk = s.get("/auth/magic/%3Cscript%3E").await;
         assert_eq!(junk.status_code(), 303);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn redeem_from_another_origin_is_refused() {
+        let (s, db) = server_where(|_| {}).await;
+        let email = unique_email();
+        let secret = link(&db, &email, Duration::minutes(15)).await;
+        let post = || s.post("/auth/magic").form(&[("token", secret.as_str())]);
+        let foreign = post().add_header("origin", "https://evil.example").await;
+        assert_eq!(foreign.status_code(), 403);
+        foreign.assert_json(&json!({"error": "forbidden_origin"}));
+        assert_eq!(post().await.status_code(), 403, "no Origin or Referer");
+        let referer = post()
+            .add_header("referer", "https://evil.example/auth/magic/x")
+            .await;
+        assert_eq!(referer.status_code(), 403);
+        assert_eq!(
+            links(&db, &email).await,
+            1,
+            "a refused post leaves the link"
+        );
+        let ok = post()
+            .add_header(
+                "referer",
+                format!("http://localhost:8080/auth/magic/{secret}"),
+            )
+            .await;
+        assert_eq!(ok.status_code(), 303);
+        assert!(ok.maybe_header("set-cookie").is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn one_email_holds_at_most_three_live_links() {
+        let (s, db) = server_where(|_| {}).await;
+        let (capped, other) = (unique_email(), unique_email());
+        for _ in 0..3 {
+            link(&db, &capped, Duration::minutes(15)).await;
+        }
+        link(&db, &capped, Duration::minutes(-1)).await;
+        let ask = |email: &str| s.post("/auth/link").json(&json!({"email": email}));
+        assert_eq!(ask(&capped).await.status_code(), 202);
+        assert_eq!(ask(&other).await.status_code(), 202);
+        assert_eq!(links_eventually(&db, &other, 1).await, 1);
+        // The capped request came first, so its background task has finished by now; the
+        // expired link was swept by one of the two tasks.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(links(&db, &capped).await, 3);
     }
 
     #[tokio::test]
@@ -399,8 +457,13 @@ mod auth {
     #[tokio::test]
     #[serial]
     async fn logout_invalidates_the_session() {
-        let (s, db) = server_where(|c| c.web_url = "https://app.example".into()).await;
-        let (to, cookie) = open(&s, &link(&db, &unique_email(), Duration::minutes(15)).await).await;
+        let (s, db) = server_where(|c| {
+            c.web_url = "https://app.example".into();
+            c.brain_url = "https://api.example".into();
+        })
+        .await;
+        let secret = link(&db, &unique_email(), Duration::minutes(15)).await;
+        let (to, cookie) = open_from(&s, &secret, "https://api.example").await;
         assert_eq!(to, "https://app.example");
         let cookie = cookie.unwrap();
         assert!(cookie.contains("; Secure"));

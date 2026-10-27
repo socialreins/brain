@@ -37,6 +37,18 @@ fn api() -> OpenApiRouter<AppState> {
     OpenApiRouter::with_openapi(doc).merge(waitlist::api())
 }
 
+/// The request span. Logs the path only (no query), with the token in `/auth/magic/{token}`
+/// replaced, so a sign-in link never reaches the log.
+fn span(req: &axum::http::Request<axum::body::Body>) -> tracing::Span {
+    let path = req.uri().path();
+    let path = if path.starts_with("/auth/magic/") {
+        "/auth/magic/{token}"
+    } else {
+        path
+    };
+    tracing::debug_span!("request", method = %req.method(), path)
+}
+
 pub fn router(state: AppState, config: &Config) -> Router {
     let (v1, doc) = api().split_for_parts();
     let cors = CorsLayer::new()
@@ -51,6 +63,6 @@ pub fn router(state: AppState, config: &Config) -> Router {
         .nest("/v1", v1.layer(DefaultBodyLimit::max(MAX_BODY_BYTES)))
         .route("/openapi.json", get(move || async move { Json(doc) }))
         .layer(cors)
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(span))
         .with_state(state)
 }

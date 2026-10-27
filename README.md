@@ -41,9 +41,10 @@ client IP (IPv6 by /64) gets 10 requests a minute, then `429`.
 Sign-in is by magic link only. `POST /auth/link` answers the same `202`, at the same speed,
 whether or not the email has an account (or is refused by `REGISTRATION_DISABLED`): the lookup
 and the mail run after the reply. Opening the link shows a button that posts it back, so mail
-scanners that prefetch links cannot use it up. The link works once, for 15 minutes; using it
+scanners that prefetch links cannot use it up, and `POST /auth/magic` only accepts a post
+whose `Origin` (or `Referer`) is `BRAIN_URL`. One email holds at most 3 unexpired links. The link works once, for 15 minutes; using it
 creates the account if needed, then a 30-day session in the HttpOnly,
-SameSite=Lax `sr_session` cookie (`Secure` unless `WEB_URL` is `http://`). A dead link
+SameSite=Lax `sr_session` cookie (`Secure` unless `BRAIN_URL` is `http://`). A dead link
 redirects to `WEB_URL/login?error=invalid_link` (or `registration_disabled`). Only SHA-256
 hashes of link and session tokens are stored. `POST /auth/link` and `POST /auth/magic` share 5 requests a minute per IP.
 
@@ -55,6 +56,7 @@ You need Rust (stable) and Docker.
 docker compose up -d postgres
 export DATABASE_URL=postgres://brain:brain@localhost:5432/socialreins_brain
 export MAIL_LOG=true                  # sign-in links go to the log
+# or: cp .env.example .env and load it with your shell or direnv
 cargo run -p socialreins-brain        # http://localhost:8080
 cargo test --workspace                # uses the same DATABASE_URL
 cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
@@ -69,10 +71,10 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 |---|---|---|
 | `DATABASE_URL` | yes | |
 | `PORT` | no | `8080` |
-| `CORS_ORIGINS` | no | `https://socialreins.com,https://www.socialreins.com,http://localhost:3000` |
+| `CORS_ORIGINS` | no | The origin of `WEB_URL`. Comma-separated; hosted sets `https://socialreins.com,https://www.socialreins.com` |
 | `TRUST_PROXY` | no | `false`. Set `true` on Railway so the rate limit keys on the real client IP from `X-Forwarded-For`; leave it off anywhere a client could reach brain directly |
-| `BRAIN_URL` | no | `http://localhost:8080`. Public URL of this API, used in emailed links |
-| `WEB_URL` | no | `http://localhost:3000`. Public URL of the web app: sign-in redirects there, and an `http://` value drops the cookie's `Secure` flag |
+| `BRAIN_URL` | no | `http://localhost:8080`. Public URL of this API: emailed links point here, sign-in posts must come from its origin, and an `http://` value drops the cookie's `Secure` flag |
+| `WEB_URL` | no | `http://localhost:3000`. Public URL of the web app: sign-in redirects there |
 | `REGISTRATION_DISABLED` | no | `false`. `true` stops new accounts; existing users still sign in |
 | `RESEND_API_KEY` | no | Send mail through Resend (its SMTP relay) |
 | `SMTP_URL` | no | Send mail through any SMTP server, e.g. `smtps://user:pass@smtp.example.com`. Used when `RESEND_API_KEY` is unset |

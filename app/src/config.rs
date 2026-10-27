@@ -3,9 +3,6 @@ use axum::http::HeaderValue;
 
 use crate::mail::Mailer;
 
-const DEFAULT_CORS_ORIGINS: &str =
-    "https://socialreins.com,https://www.socialreins.com,http://localhost:3000";
-
 /// No `Debug`: `database_url` carries a password.
 #[derive(Clone)]
 pub struct Config {
@@ -37,7 +34,6 @@ impl Config {
             Some(p) => p.parse().map_err(|_| "PORT: not a port number")?,
             None => 8080,
         };
-        let origins = var("CORS_ORIGINS").unwrap_or_else(|| DEFAULT_CORS_ORIGINS.into());
         let flag = |name: &str| match var(name).as_deref() {
             None | Some("false") => Ok(false),
             Some("true") => Ok(true),
@@ -56,6 +52,9 @@ impl Config {
                 )
             }
         };
+        let web_url = base_url("WEB_URL", var("WEB_URL"), "http://localhost:3000")?;
+        // Default: the web app only.
+        let origins = var("CORS_ORIGINS").unwrap_or_else(|| origin(&web_url).into());
         Ok(Self {
             database_url,
             port,
@@ -63,7 +62,7 @@ impl Config {
             git_commit: var("RAILWAY_GIT_COMMIT_SHA").unwrap_or_else(|| "dev".into()),
             trust_proxy: flag("TRUST_PROXY")?,
             brain_url: base_url("BRAIN_URL", var("BRAIN_URL"), "http://localhost:8080")?,
-            web_url: base_url("WEB_URL", var("WEB_URL"), "http://localhost:3000")?,
+            web_url,
             registration_disabled: flag("REGISTRATION_DISABLED")?,
             mailer,
         })
@@ -77,6 +76,14 @@ fn base_url(name: &str, value: Option<String>, default: &str) -> Result<String, 
         return Err(format!("{name}: expected an http:// or https:// URL"));
     }
     Ok(url.into())
+}
+
+/// `scheme://host[:port]` of an absolute URL, e.g. the origin a browser sends for it.
+pub fn origin(url: &str) -> &str {
+    let host_start = url.find("://").map_or(0, |i| i + 3);
+    url[host_start..]
+        .find(['/', '?', '#'])
+        .map_or(url, |end| &url[..host_start + end])
 }
 
 /// Comma-separated origins, e.g. `https://a.com, http://localhost:3000`.
@@ -94,6 +101,22 @@ mod tests {
     fn origins_split_and_trim() {
         let o = super::parse_origins(" https://a.com ,http://localhost:3000,").unwrap();
         assert_eq!(o, ["https://a.com", "http://localhost:3000"]);
+    }
+
+    #[test]
+    fn origin_drops_the_path() {
+        assert_eq!(
+            super::origin("https://a.com:8443/x/y?z"),
+            "https://a.com:8443"
+        );
+        assert_eq!(
+            super::origin("http://localhost:3000"),
+            "http://localhost:3000"
+        );
+        assert_eq!(
+            super::origin("https://a.com.evil.test/"),
+            "https://a.com.evil.test"
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@ pub struct AppState {
     pub trust_proxy: bool,
     /// Per-IP limit on `POST /v1/waitlist`.
     pub waitlist_limiter: Arc<RateLimiter>,
-    /// Per-IP limit shared by `POST /auth/link` and `GET /auth/magic/{token}`.
+    /// Per-IP limit shared by `POST /auth/link` and `POST /auth/magic`.
     pub magic_link_limiter: Arc<RateLimiter>,
     pub brain_url: String,
     pub web_url: String,

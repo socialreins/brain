@@ -10,13 +10,14 @@ use axum::{
     Json, Router,
 };
 use chrono::{Duration, Utc};
-use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
 use serde::Deserialize;
 use serde_json::json;
 use socialreins_core::{email, token};
 
 use super::waitlist::{error, rejected, Reply};
 use crate::{
+    config::origin,
     models::{magic_links, sessions, users},
     rate_limit::ClientIp,
     state::AppState,
@@ -25,6 +26,8 @@ use crate::{
 pub const SESSION_COOKIE: &str = "sr_session";
 const LINK_MINUTES: i64 = 15;
 const SESSION_DAYS: i64 = 30;
+/// Unexpired links one email can hold; past it, `POST /auth/link` sends nothing.
+const MAX_LIVE_LINKS: u64 = 3;
 
 #[derive(Deserialize)]
 struct LinkRequest {
@@ -64,6 +67,16 @@ async fn request_link(
 
 /// Errors carry the failure only, never the email or the token.
 async fn send_link(app: &AppState, email: String) -> Result<(), String> {
+    let live = magic_links::Entity::find()
+        .filter(magic_links::Column::Email.eq(&email))
+        .filter(magic_links::Column::ExpiresAt.gt(Utc::now().fixed_offset()))
+        .count(&app.db)
+        .await
+        .map_err(|e| format!("magic link count: {e}"))?;
+    // Caps mail to one inbox no matter how many IPs ask.
+    if live >= MAX_LIVE_LINKS {
+        return Ok(());
+    }
     if app.registration_disabled
         && find_user(app, &email)
             .await
@@ -130,7 +143,8 @@ async fn confirm_page(State(app): State<AppState>, Path(secret): Path<String>) -
     (
         [
             (header::CACHE_CONTROL, "no-store"),
-            (header::REFERRER_POLICY, "no-referrer"),
+            // Not no-referrer: that makes the browser send `Origin: null` on the form post.
+            (header::REFERRER_POLICY, "same-origin"),
         ],
         Html(page),
     )
@@ -143,13 +157,19 @@ struct Redeem {
 }
 
 /// `POST /auth/magic` with form field `token`: uses the link once and starts the session.
+/// Only the button on brain's own page may post here, so another site cannot sign a browser
+/// in to an account of its choosing (login CSRF).
 async fn redeem(
     State(app): State<AppState>,
     ClientIp(ip): ClientIp,
+    headers: HeaderMap,
     Form(Redeem { token: secret }): Form<Redeem>,
 ) -> Response {
     if !app.magic_link_limiter.allow(ip) {
         return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited").into_response();
+    }
+    if !from_brain(&app, &headers) {
+        return error(StatusCode::FORBIDDEN, "forbidden_origin").into_response();
     }
     let hash = token::hash(&secret);
     let link = match magic_links::Entity::find_by_id(hash.clone())
@@ -203,6 +223,13 @@ async fn redeem(
     ([(header::SET_COOKIE, cookie)], Redirect::to(&app.web_url)).into_response()
 }
 
+/// `Origin`, or `Referer` when a browser sent no `Origin`, is BRAIN_URL's origin.
+fn from_brain(app: &AppState, headers: &HeaderMap) -> bool {
+    let value = |name| headers.get(name).and_then(|v| v.to_str().ok());
+    let sent = value(header::ORIGIN).or_else(|| value(header::REFERER).map(origin));
+    sent == Some(origin(&app.brain_url))
+}
+
 async fn create_user(app: &AppState, email: &str) -> Result<users::Model, sea_orm::DbErr> {
     let name = email.split('@').next().unwrap_or_default().to_owned();
     let row = users::ActiveModel {
@@ -218,11 +245,11 @@ async fn create_user(app: &AppState, email: &str) -> Result<users::Model, sea_or
         .await?;
     find_user(app, email)
         .await?
-        .ok_or_else(|| sea_orm::DbErr::RecordNotFound(email.into()))
+        .ok_or_else(|| sea_orm::DbErr::RecordNotFound("user vanished after insert".into()))
 }
 
 fn cookie(app: &AppState, value: &str, max_age: i64) -> String {
-    let secure = if app.web_url.starts_with("http://") {
+    let secure = if app.brain_url.starts_with("http://") {
         ""
     } else {
         "; Secure"
