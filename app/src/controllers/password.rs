@@ -69,6 +69,9 @@ pub(crate) async fn confirm_password(
     user: &users::Model,
     candidate: String,
 ) -> Option<bool> {
+    // shortcut: a caller holding a stolen session gets the per-user budget plus the login
+    // budget, at most 2x the cap per window; accepted so outsiders cannot lock the owner out of
+    // settings. Revisit if sessions become long-lived API credentials.
     if !app.account_limiter.hit(user.id) {
         return None;
     }
