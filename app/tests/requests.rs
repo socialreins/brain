@@ -214,7 +214,7 @@ mod auth {
     use super::*;
     use chrono::{Duration, Utc};
     use sea_orm::{ActiveValue::Set, DatabaseConnection};
-    use socialreins_brain::models::{magic_links, users};
+    use socialreins_brain::models::{magic_links, sessions, users};
     use socialreins_core::token;
 
     async fn server_where(edit: impl FnOnce(&mut Config)) -> (TestServer, DatabaseConnection) {
@@ -484,10 +484,21 @@ mod auth {
         assert!(cookie.contains("; Secure"));
         let me = || s.get("/auth/me").add_header("cookie", session(&cookie));
         me().await.assert_status_ok();
-        let out = s
-            .post("/auth/logout")
-            .add_header("cookie", session(&cookie))
-            .await;
+        let logout = || {
+            s.post("/auth/logout")
+                .add_header("cookie", session(&cookie))
+        };
+        for foreign in [None, Some("https://evil.example")] {
+            let res = match foreign {
+                Some(o) => logout().add_header("origin", o).await,
+                None => logout().await,
+            };
+            assert_eq!(res.status_code(), 403);
+            res.assert_json(&json!({"error": "forbidden_origin"}));
+        }
+        me().await.assert_status_ok();
+        // CORS_ORIGINS keeps its env default here, not the edited WEB_URL.
+        let out = logout().add_header("origin", "http://localhost:3000").await;
         assert_eq!(out.status_code(), 204);
         assert!(out
             .header("set-cookie")
@@ -529,5 +540,562 @@ mod auth {
         assert_eq!(res.status_code(), 429);
         let redeem = s.post("/auth/magic").form(&[("token", "x")]).await;
         assert_eq!(redeem.status_code(), 429);
+    }
+
+    const WEB: &str = "http://localhost:3000";
+    const PASSWORD: &str = "correct horse battery";
+
+    /// Signs a new user in by link, returning their email and the `sr_session=...` cookie.
+    async fn signed_in(s: &TestServer, db: &DatabaseConnection) -> (String, String) {
+        let email = unique_email();
+        let (_, cookie) = open(s, &link(db, &email, Duration::minutes(15)).await).await;
+        (email, session(&cookie.unwrap()))
+    }
+
+    /// Backdates the session behind `cookie`, so it no longer counts as a recent sign-in.
+    async fn age(db: &DatabaseConnection, cookie: &str, by: Duration) {
+        let hash = token::hash(cookie.trim_start_matches("sr_session="));
+        let row = sessions::ActiveModel {
+            token_hash: Set(hash),
+            created_at: Set((Utc::now() - by).fixed_offset()),
+            ..Default::default()
+        };
+        sessions::Entity::update(row).exec(db).await.unwrap();
+    }
+
+    async fn set_password(s: &TestServer, cookie: &str, body: Value) -> axum_test::TestResponse {
+        s.put("/auth/password")
+            .add_header("origin", WEB)
+            .add_header("cookie", cookie)
+            .json(&body)
+            .await
+    }
+
+    async fn login(s: &TestServer, email: &str, password: &str) -> axum_test::TestResponse {
+        s.post("/auth/login")
+            .add_header("origin", WEB)
+            .json(&json!({"email": email, "password": password}))
+            .await
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn password_login_answers_one_way_for_every_failure() {
+        let (s, db) = server_where(|_| {}).await;
+        let (email, cookie) = signed_in(&s, &db).await;
+        let (linkless, _) = signed_in(&s, &db).await;
+        let short = set_password(&s, &cookie, json!({"password": "short"})).await;
+        assert_eq!(short.status_code(), 422);
+        short.assert_json(&json!({"error": "invalid_password"}));
+        let set = set_password(&s, &cookie, json!({"password": PASSWORD})).await;
+        assert_eq!(set.status_code(), 204);
+        let me = s.get("/auth/me").add_header("cookie", &cookie).await;
+        assert_eq!(me.json::<Value>()["has_password"], true);
+        let stored = user(&db, &email).await.unwrap().password_hash.unwrap();
+        assert!(stored.starts_with("$argon2id$"));
+
+        for (who, pw) in [
+            (email.as_str(), "wrong password here"),
+            (&unique_email(), PASSWORD),
+            (&linkless, PASSWORD),
+        ] {
+            let res = login(&s, who, pw).await;
+            assert_eq!(res.status_code(), 401, "{who}");
+            res.assert_json(&json!({"error": "invalid_credentials"}));
+            assert!(res.maybe_header("set-cookie").is_none());
+        }
+        let ok = login(&s, &email.to_uppercase(), PASSWORD).await;
+        ok.assert_status_ok();
+        assert_eq!(ok.json::<Value>()["email"], email);
+        let fresh = session(ok.header("set-cookie").to_str().unwrap());
+        let me = s.get("/auth/me").add_header("cookie", fresh).await;
+        me.assert_status_ok();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn changing_a_password_needs_the_current_one() {
+        let (s, db) = server_where(|_| {}).await;
+        let (email, cookie) = signed_in(&s, &db).await;
+        set_password(&s, &cookie, json!({"password": PASSWORD}))
+            .await
+            .assert_status(axum::http::StatusCode::NO_CONTENT);
+        // An old session does not matter once a password exists: the current one is the check.
+        age(&db, &cookie, Duration::hours(1)).await;
+        let new = "a different long password";
+        for current in [None, Some("not the password")] {
+            let res = set_password(
+                &s,
+                &cookie,
+                json!({"password": new, "current_password": current}),
+            )
+            .await;
+            assert_eq!(res.status_code(), 403);
+            res.assert_json(&json!({"error": "invalid_current_password"}));
+        }
+        let res = set_password(
+            &s,
+            &cookie,
+            json!({"password": new, "current_password": PASSWORD}),
+        )
+        .await;
+        assert_eq!(res.status_code(), 204);
+        login(&s, &email, new).await.assert_status_ok();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn first_password_and_passkey_need_a_recent_sign_in() {
+        let (s, db) = server_where(|_| {}).await;
+        let (email, cookie) = signed_in(&s, &db).await;
+        age(&db, &cookie, Duration::minutes(11)).await;
+        let res = set_password(&s, &cookie, json!({"password": PASSWORD})).await;
+        assert_eq!(res.status_code(), 403);
+        res.assert_json(&json!({"error": "reauth_required"}));
+        let start = s
+            .post("/auth/passkeys/register/start")
+            .add_header("origin", WEB)
+            .add_header("cookie", &cookie)
+            .json(&json!({}))
+            .await;
+        assert_eq!(start.status_code(), 403);
+        start.assert_json(&json!({"error": "reauth_required"}));
+        assert!(user(&db, &email).await.unwrap().password_hash.is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn login_is_rate_limited_per_email_and_per_ip() {
+        let (s, _) = server_where(|_| {}).await;
+        let email = unique_email();
+        for _ in 0..5 {
+            assert_eq!(login(&s, &email, PASSWORD).await.status_code(), 401);
+        }
+        let res = login(&s, &email, PASSWORD).await;
+        assert_eq!(res.status_code(), 429);
+        res.assert_json(&json!({"error": "rate_limited"}));
+        // Six attempts so far from this client; the per-IP cap of 10 stops new emails too.
+        for _ in 0..4 {
+            assert_eq!(
+                login(&s, &unique_email(), PASSWORD).await.status_code(),
+                401
+            );
+        }
+        assert_eq!(
+            login(&s, &unique_email(), PASSWORD).await.status_code(),
+            429
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn only_failed_logins_count_per_email() {
+        let (s, db) = server_where(|c| c.trust_proxy = true).await;
+        let (email, cookie) = signed_in(&s, &db).await;
+        set_password(&s, &cookie, json!({"password": PASSWORD}))
+            .await
+            .assert_status(axum::http::StatusCode::NO_CONTENT);
+        let from = |ip: &str, pw: &str| {
+            s.post("/auth/login")
+                .add_header("origin", WEB)
+                .add_header("x-forwarded-for", ip.to_owned())
+                .json(&json!({"email": email, "password": pw}))
+        };
+        // Another IP's failures under the cap do not stop the owner, and a success clears them.
+        for _ in 0..4 {
+            assert_eq!(
+                from("198.51.100.1", "wrong guess here").await.status_code(),
+                401
+            );
+        }
+        from("198.51.100.2", PASSWORD).await.assert_status_ok();
+        for _ in 0..4 {
+            assert_eq!(
+                from("198.51.100.3", "wrong guess here").await.status_code(),
+                401
+            );
+        }
+        from("198.51.100.2", PASSWORD).await.assert_status_ok();
+        // Five failures in a row, from any IPs, close the email for the window.
+        for i in 0..5 {
+            let ip = format!("198.51.100.{}", 10 + i);
+            assert_eq!(from(&ip, "wrong guess here").await.status_code(), 401);
+        }
+        let res = from("198.51.100.20", PASSWORD).await;
+        assert_eq!(res.status_code(), 429);
+        res.assert_json(&json!({"error": "rate_limited"}));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn concurrent_wrong_guesses_cannot_pass_the_cap() {
+        let (s, db) = server_where(|c| c.trust_proxy = true).await;
+        let (email, cookie) = signed_in(&s, &db).await;
+        set_password(&s, &cookie, json!({"password": PASSWORD}))
+            .await
+            .assert_status(axum::http::StatusCode::NO_CONTENT);
+        let guess = |i: u8| {
+            s.post("/auth/login")
+                .add_header("origin", WEB)
+                .add_header("x-forwarded-for", format!("198.51.100.{i}"))
+                .json(&json!({"email": email, "password": "wrong guess here"}))
+        };
+        // Argon2 runs on blocking threads, so these verify in parallel.
+        let res = tokio::join!(
+            guess(1),
+            guess(2),
+            guess(3),
+            guess(4),
+            guess(5),
+            guess(6),
+            guess(7),
+            guess(8)
+        );
+        let codes = [res.0, res.1, res.2, res.3, res.4, res.5, res.6, res.7]
+            .map(|r| r.status_code().as_u16());
+        assert_eq!(codes.iter().filter(|&&c| c == 401).count(), 5, "{codes:?}");
+        assert_eq!(codes.iter().filter(|&&c| c == 429).count(), 3, "{codes:?}");
+        // Outsiders filling the email's login budget do not block the signed-in owner.
+        let res = set_password(
+            &s,
+            &cookie,
+            json!({"password": "another long password", "current_password": PASSWORD}),
+        )
+        .await;
+        assert_eq!(res.status_code(), 204);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_session_cannot_guess_the_current_password_faster_than_its_cap() {
+        let (s, db) = server_where(|_| {}).await;
+        let (email, cookie) = signed_in(&s, &db).await;
+        set_password(&s, &cookie, json!({"password": PASSWORD}))
+            .await
+            .assert_status(axum::http::StatusCode::NO_CONTENT);
+        let change = |current: &str| {
+            set_password(
+                &s,
+                &cookie,
+                json!({"password": "another long password", "current_password": current}),
+            )
+        };
+        for _ in 0..5 {
+            assert_eq!(change("wrong guess here").await.status_code(), 403);
+        }
+        assert_eq!(change(PASSWORD).await.status_code(), 429);
+        // The failures were charged to the email's login budget as well.
+        assert_eq!(login(&s, &email, PASSWORD).await.status_code(), 429);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn setting_a_password_ends_other_sessions_and_links() {
+        let (s, db) = server_where(|_| {}).await;
+        let (email, cookie) = signed_in(&s, &db).await;
+        let (_, other) = open(&s, &link(&db, &email, Duration::minutes(15)).await).await;
+        let other = session(&other.unwrap());
+        let me = |c: &str| s.get("/auth/me").add_header("cookie", c.to_owned());
+        me(&other).await.assert_status_ok();
+        let pending = link(&db, &email, Duration::minutes(15)).await;
+        set_password(&s, &cookie, json!({"password": PASSWORD}))
+            .await
+            .assert_status(axum::http::StatusCode::NO_CONTENT);
+        assert_eq!(me(&other).await.status_code(), 401);
+        me(&cookie).await.assert_status_ok();
+        assert_eq!(links(&db, &email).await, 0, "outstanding links are revoked");
+        let (to, _) = open(&s, &pending).await;
+        assert!(to.ends_with("/login?error=invalid_link"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn credential_endpoints_only_answer_the_web_origin() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, cookie) = signed_in(&s, &db).await;
+        let body = json!({"email": unique_email(), "password": PASSWORD});
+        for origin in [
+            None,
+            Some("https://evil.example"),
+            Some("http://localhost:8080"),
+        ] {
+            let calls = [
+                s.post("/auth/login").json(&body),
+                s.put("/auth/password")
+                    .add_header("cookie", &cookie)
+                    .json(&json!({"password": PASSWORD})),
+                s.post("/auth/passkeys/login/start"),
+                s.post("/auth/passkeys/register/start")
+                    .add_header("cookie", &cookie)
+                    .json(&json!({})),
+                s.delete(&format!("/auth/passkeys/{}", uuid::Uuid::now_v7()))
+                    .add_header("cookie", &cookie),
+            ];
+            for call in calls {
+                let res = match origin {
+                    Some(o) => call.add_header("origin", o).await,
+                    None => call.await,
+                };
+                assert_eq!(res.status_code(), 403, "{origin:?}");
+                res.assert_json(&json!({"error": "forbidden_origin"}));
+            }
+        }
+        let preflight = s
+            .method(axum::http::Method::OPTIONS, "/auth/password")
+            .add_header("origin", WEB)
+            .add_header("access-control-request-method", "PUT")
+            .await;
+        assert!(preflight
+            .header("access-control-allow-methods")
+            .to_str()
+            .unwrap()
+            .contains("PUT"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn registration_disabled_does_not_change_password_login() {
+        let (open_server, db) = server_where(|_| {}).await;
+        let (email, cookie) = signed_in(&open_server, &db).await;
+        set_password(&open_server, &cookie, json!({"password": PASSWORD}))
+            .await
+            .assert_status(axum::http::StatusCode::NO_CONTENT);
+        let (s, _) = server_where(|c| c.registration_disabled = true).await;
+        login(&s, &email, PASSWORD).await.assert_status_ok();
+        let stranger = unique_email();
+        assert_eq!(login(&s, &stranger, PASSWORD).await.status_code(), 401);
+        assert!(user(&db, &stranger).await.is_none());
+    }
+
+    mod passkeys {
+        use super::*;
+        use webauthn_authenticator_rs::{
+            prelude::Url, softpasskey::SoftPasskey, WebauthnAuthenticator,
+        };
+
+        async fn post(s: &TestServer, path: &str, cookie: Option<&str>, body: Value) -> Value {
+            let mut req = s.post(path).add_header("origin", WEB).json(&body);
+            if let Some(c) = cookie {
+                req = req.add_header("cookie", c);
+            }
+            let res = req.await;
+            let status = res.status_code().as_u16();
+            json!({"status": status, "body": res.json::<Value>(), "cookie":
+                res.maybe_header("set-cookie").map(|c| session(c.to_str().unwrap()))})
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn start_endpoints_return_webauthn_options() {
+            let (s, db) = server_where(|_| {}).await;
+            let (email, cookie) = signed_in(&s, &db).await;
+            let reg = post(
+                &s,
+                "/auth/passkeys/register/start",
+                Some(&cookie),
+                json!({}),
+            )
+            .await;
+            assert_eq!(reg["status"], 200, "{reg}");
+            let pk = &reg["body"]["options"]["publicKey"];
+            assert!(reg["body"]["challenge_id"].is_string());
+            assert!(pk["challenge"].as_str().unwrap().len() >= 32);
+            assert_eq!(pk["rp"]["id"], "localhost");
+            assert_eq!(pk["user"]["name"], email);
+            assert_eq!(pk["authenticatorSelection"]["residentKey"], "required");
+            assert_eq!(pk["authenticatorSelection"]["userVerification"], "required");
+
+            let login = post(&s, "/auth/passkeys/login/start", None, Value::Null).await;
+            assert_eq!(login["status"], 200, "{login}");
+            let pk = &login["body"]["options"]["publicKey"];
+            assert_eq!(pk["rpId"], "localhost");
+            assert!(pk["challenge"].is_string());
+            assert!(login["body"]["options"].get("mediation").is_none());
+
+            let signed_out = s
+                .post("/auth/passkeys/register/start")
+                .add_header("origin", WEB)
+                .json(&json!({}))
+                .await;
+            assert_eq!(signed_out.status_code(), 401);
+        }
+
+        /// The full ceremony against a software authenticator. It cannot store discoverable
+        /// credentials, so the test plays the browser's part: it relaxes `residentKey` on the way
+        /// in, and on sign-in passes the credential id and returns the user handle.
+        #[tokio::test]
+        #[serial]
+        async fn register_sign_in_and_replays() {
+            let (s, db) = server_where(|_| {}).await;
+            let (_, cookie) = signed_in(&s, &db).await;
+            let (_, stranger) = signed_in(&s, &db).await;
+            let origin = Url::parse(WEB).unwrap();
+            let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+
+            let start = post(
+                &s,
+                "/auth/passkeys/register/start",
+                Some(&cookie),
+                json!({}),
+            )
+            .await;
+            let challenge_id = start["body"]["challenge_id"].clone();
+            let mut options = start["body"]["options"].clone();
+            options["publicKey"]["authenticatorSelection"]["residentKey"] = json!("discouraged");
+            options["publicKey"]["authenticatorSelection"]["requireResidentKey"] = json!(false);
+            let credential = authenticator
+                .do_registration(origin.clone(), serde_json::from_value(options).unwrap())
+                .unwrap();
+            let finish = json!({"challenge_id": challenge_id, "credential": credential,
+                "name": "Laptop"});
+            // Someone else's session cannot finish this user's ceremony, and that uses it up.
+            let theirs = post(
+                &s,
+                "/auth/passkeys/register/finish",
+                Some(&stranger),
+                finish.clone(),
+            )
+            .await;
+            assert_eq!(theirs["status"], 400);
+            assert_eq!(theirs["body"], json!({"error": "invalid_challenge"}));
+
+            let start = post(
+                &s,
+                "/auth/passkeys/register/start",
+                Some(&cookie),
+                json!({}),
+            )
+            .await;
+            let mut options = start["body"]["options"].clone();
+            options["publicKey"]["authenticatorSelection"]["residentKey"] = json!("discouraged");
+            options["publicKey"]["authenticatorSelection"]["requireResidentKey"] = json!(false);
+            let credential = authenticator
+                .do_registration(origin.clone(), serde_json::from_value(options).unwrap())
+                .unwrap();
+            let finish = json!({"challenge_id": start["body"]["challenge_id"],
+                "credential": credential, "name": "Laptop"});
+            let made = post(
+                &s,
+                "/auth/passkeys/register/finish",
+                Some(&cookie),
+                finish.clone(),
+            )
+            .await;
+            assert_eq!(made["status"], 201, "{made}");
+            assert_eq!(made["body"]["name"], "Laptop");
+            let replay = post(&s, "/auth/passkeys/register/finish", Some(&cookie), finish).await;
+            assert_eq!(replay["status"], 400);
+            assert_eq!(replay["body"], json!({"error": "invalid_challenge"}));
+            let list = s.get("/auth/passkeys").add_header("cookie", &cookie).await;
+            assert_eq!(list.json::<Value>().as_array().unwrap().len(), 1);
+
+            let user_id = s
+                .get("/auth/me")
+                .add_header("cookie", &cookie)
+                .await
+                .json::<Value>()["id"]
+                .as_str()
+                .unwrap()
+                .parse::<uuid::Uuid>()
+                .unwrap();
+            let start = post(&s, "/auth/passkeys/login/start", None, Value::Null).await;
+            let mut options = start["body"]["options"].clone();
+            options["publicKey"]["allowCredentials"] =
+                json!([{"type": "public-key", "id": credential.raw_id}]);
+            let mut assertion = authenticator
+                .do_authentication(origin, serde_json::from_value(options).unwrap())
+                .unwrap();
+            assertion.response.user_handle = Some(user_id.as_bytes().to_vec().into());
+            let finish = json!({"challenge_id": start["body"]["challenge_id"],
+                "credential": assertion});
+            let ok = post(&s, "/auth/passkeys/login/finish", None, finish.clone()).await;
+            assert_eq!(ok["status"], 200, "{ok}");
+            let fresh = ok["cookie"].as_str().unwrap();
+            s.get("/auth/me")
+                .add_header("cookie", fresh)
+                .await
+                .assert_status_ok();
+            let replay = post(&s, "/auth/passkeys/login/finish", None, finish).await;
+            assert_eq!(replay["status"], 400);
+            assert_eq!(replay["body"], json!({"error": "invalid_challenge"}));
+            let list = s.get("/auth/passkeys").add_header("cookie", &cookie).await;
+            assert!(list.json::<Value>()[0]["last_used_at"].is_string());
+
+            // The conditional counter update reads this path; it must exist in what we store.
+            let made_id: uuid::Uuid = made["body"]["id"].as_str().unwrap().parse().unwrap();
+            let stored = socialreins_brain::models::passkeys::Entity::find_by_id(made_id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(stored.credential["cred"]["counter"].is_number());
+
+            let id = made["body"]["id"].as_str().unwrap();
+            let remove = |c: &str| {
+                s.delete(&format!("/auth/passkeys/{id}"))
+                    .add_header("origin", WEB)
+                    .add_header("cookie", c)
+            };
+            let res = remove(&stranger).await;
+            assert_eq!(res.status_code(), 404);
+            res.assert_json(&json!({"error": "not_found"}));
+            // A stolen old cookie cannot remove it.
+            age(&db, &cookie, Duration::minutes(11)).await;
+            let res = remove(&cookie).await;
+            assert_eq!(res.status_code(), 403);
+            res.assert_json(&json!({"error": "reauth_required"}));
+            age(&db, &cookie, Duration::zero()).await;
+            assert_eq!(remove(&cookie).await.status_code(), 204);
+            assert_eq!(remove(&cookie).await.status_code(), 404);
+            // The passkey's session ended with it; the one that deleted it stays.
+            let me = |c: &str| s.get("/auth/me").add_header("cookie", c.to_owned());
+            assert_eq!(me(fresh).await.status_code(), 401);
+            me(&cookie).await.assert_status_ok();
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn finish_rejects_unknown_challenges_and_bad_credentials() {
+            let (s, db) = server_where(|_| {}).await;
+            let (_, cookie) = signed_in(&s, &db).await;
+            let start = post(&s, "/auth/passkeys/login/start", None, Value::Null).await;
+            // A well-formed assertion from a key brain never registered.
+            let mut options = start["body"]["options"].clone();
+            let mut stray = WebauthnAuthenticator::new(SoftPasskey::new(true));
+            let reg_start = post(
+                &s,
+                "/auth/passkeys/register/start",
+                Some(&cookie),
+                json!({}),
+            )
+            .await;
+            let mut reg_options = reg_start["body"]["options"].clone();
+            reg_options["publicKey"]["authenticatorSelection"]["requireResidentKey"] = json!(false);
+            let stray_cred = stray
+                .do_registration(
+                    Url::parse(WEB).unwrap(),
+                    serde_json::from_value(reg_options).unwrap(),
+                )
+                .unwrap();
+            options["publicKey"]["allowCredentials"] =
+                json!([{"type": "public-key", "id": stray_cred.raw_id}]);
+            let mut assertion = stray
+                .do_authentication(
+                    Url::parse(WEB).unwrap(),
+                    serde_json::from_value(options).unwrap(),
+                )
+                .unwrap();
+            assertion.response.user_handle = Some(uuid::Uuid::now_v7().as_bytes().to_vec().into());
+            let unknown = json!({"challenge_id": uuid::Uuid::now_v7(), "credential": assertion});
+            let res = post(&s, "/auth/passkeys/login/finish", None, unknown).await;
+            assert_eq!(res["status"], 400);
+            assert_eq!(res["body"], json!({"error": "invalid_challenge"}));
+            let finish = json!({"challenge_id": start["body"]["challenge_id"],
+                "credential": assertion});
+            let res = post(&s, "/auth/passkeys/login/finish", None, finish).await;
+            assert_eq!(res["status"], 401);
+            assert_eq!(res["body"], json!({"error": "invalid_passkey"}));
+            assert!(res["cookie"].is_null());
+        }
     }
 }

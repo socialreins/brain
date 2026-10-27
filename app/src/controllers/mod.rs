@@ -1,6 +1,8 @@
 //! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, and the documented `/v1` API.
 pub mod auth;
 pub mod health;
+pub mod passkeys;
+pub mod password;
 pub mod waitlist;
 
 use axum::{
@@ -20,6 +22,8 @@ use crate::{config::Config, state::AppState};
 
 /// Largest `/v1` and `/auth` request body; a waitlist signup is well under 1 KB.
 const MAX_BODY_BYTES: usize = 4096;
+/// Passkey bodies carry an attestation or assertion, which can run past 4 KiB.
+const MAX_PASSKEY_BODY_BYTES: usize = 16 * 1024;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -53,13 +57,18 @@ pub fn router(state: AppState, config: &Config) -> Router {
     let (v1, doc) = api().split_for_parts();
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(config.cors_origins.clone()))
-        .allow_methods([Method::GET, Method::POST])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers([header::CONTENT_TYPE])
         // The web app sends the session cookie on cross-origin calls to `/auth/*`.
         .allow_credentials(true);
     Router::new()
         .merge(health::routes())
-        .merge(auth::routes().layer(DefaultBodyLimit::max(MAX_BODY_BYTES)))
+        .merge(
+            auth::routes()
+                .merge(password::routes())
+                .layer(DefaultBodyLimit::max(MAX_BODY_BYTES)),
+        )
+        .merge(passkeys::routes().layer(DefaultBodyLimit::max(MAX_PASSKEY_BODY_BYTES)))
         .nest("/v1", v1.layer(DefaultBodyLimit::max(MAX_BODY_BYTES)))
         .route("/openapi.json", get(move || async move { Json(doc) }))
         .layer(cors)

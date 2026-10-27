@@ -2,6 +2,7 @@ pub use sea_orm_migration::prelude::*;
 
 mod m20261026_000001_waitlist_signups;
 mod m20261027_000001_users_sessions_magic_links;
+mod m20261028_000001_passwords_passkeys;
 
 pub struct Migrator;
 
@@ -11,6 +12,7 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m20261026_000001_waitlist_signups::Migration),
             Box::new(m20261027_000001_users_sessions_magic_links::Migration),
+            Box::new(m20261028_000001_passwords_passkeys::Migration),
             // inject-above (do not remove this comment)
         ]
     }

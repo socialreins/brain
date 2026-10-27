@@ -15,7 +15,7 @@ RUN find app crates -name '*.rs' -exec touch {} + \
     && cargo build --release -p socialreins-brain --bin socialreins-brain
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --no-create-home brain
 COPY --from=builder /src/target/release/socialreins-brain /usr/local/bin/socialreins-brain

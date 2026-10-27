@@ -1,5 +1,8 @@
 //! `Config`: every setting is an environment variable, and its default lives here.
+use std::sync::Arc;
+
 use axum::http::HeaderValue;
+use webauthn_rs::{prelude::Url, Webauthn, WebauthnBuilder};
 
 use crate::mail::Mailer;
 
@@ -24,6 +27,10 @@ pub struct Config {
     /// `RESEND_API_KEY`, else `SMTP_URL` (either needs `MAIL_FROM`), else the log, which needs
     /// `MAIL_LOG=true` so sign-in links never reach the log by accident.
     pub mailer: Mailer,
+    /// WebAuthn relying party: `PASSKEY_RP_ID` (default: the host of `WEB_URL`) is the domain
+    /// web and brain share, `PASSKEY_RP_ORIGIN` (default: the origin of `WEB_URL`) is where the
+    /// browser runs the ceremony.
+    pub webauthn: Arc<Webauthn>,
 }
 
 impl Config {
@@ -55,6 +62,8 @@ impl Config {
         let web_url = base_url("WEB_URL", var("WEB_URL"), "http://localhost:3000")?;
         // Default: the web app only.
         let origins = var("CORS_ORIGINS").unwrap_or_else(|| origin(&web_url).into());
+        let rp_origin = var("PASSKEY_RP_ORIGIN").unwrap_or_else(|| origin(&web_url).into());
+        let webauthn = webauthn(var("PASSKEY_RP_ID"), &rp_origin)?;
         Ok(Self {
             database_url,
             port,
@@ -65,6 +74,7 @@ impl Config {
             web_url,
             registration_disabled: flag("REGISTRATION_DISABLED")?,
             mailer,
+            webauthn,
         })
     }
 }
@@ -76,6 +86,17 @@ fn base_url(name: &str, value: Option<String>, default: &str) -> Result<String, 
         return Err(format!("{name}: expected an http:// or https:// URL"));
     }
     Ok(url.into())
+}
+
+fn webauthn(rp_id: Option<String>, rp_origin: &str) -> Result<Arc<Webauthn>, String> {
+    let url = Url::parse(rp_origin).map_err(|_| "PASSKEY_RP_ORIGIN: not a URL")?;
+    let rp_id = rp_id.unwrap_or_else(|| url.host_str().unwrap_or_default().into());
+    WebauthnBuilder::new(&rp_id, &url)
+        .and_then(|b| b.rp_name("SocialReins").build())
+        .map(Arc::new)
+        .map_err(|_| {
+            "PASSKEY_RP_ID: must be the host of PASSKEY_RP_ORIGIN or a parent domain".into()
+        })
 }
 
 /// `scheme://host[:port]` of an absolute URL, e.g. the origin a browser sends for it.
@@ -117,6 +138,15 @@ mod tests {
             super::origin("https://a.com.evil.test/"),
             "https://a.com.evil.test"
         );
+    }
+
+    #[test]
+    fn passkey_rp_id_must_cover_the_origin() {
+        assert!(super::webauthn(None, "http://localhost:3000").is_ok());
+        let id = |v: &str| super::webauthn(Some(v.into()), "https://app.example.com");
+        assert!(id("example.com").is_ok());
+        assert!(id("other.com").is_err());
+        assert!(id("ample.com").is_err());
     }
 
     #[test]
