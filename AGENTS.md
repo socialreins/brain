@@ -1,7 +1,7 @@
 # AGENTS.md: brain
 
-The Rust backend for SocialReins. Project overview and decisions live in
-[socialreins/socialreins](https://github.com/socialreins/socialreins). The Laravel app it
+The Rust backend for SocialReins. Project overview and install docs live in
+[socialreins/web](https://github.com/socialreins/web). The Laravel app it
 replaces (`~/Code/social-media-manager`) is a read-only reference: read it, never change it.
 
 ## Run

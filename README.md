@@ -2,7 +2,7 @@
 
 The Rust backend for [SocialReins](https://socialreins.com), a social media manager for
 scheduling and publishing posts across platforms. For the project overview, roadmap and the
-other repos, see [socialreins/socialreins](https://github.com/socialreins/socialreins).
+other repos, see the main repo [socialreins/web](https://github.com/socialreins/web).
 
 Right now brain serves the waitlist behind the socialreins.com landing page. Publishing,
 accounts and the MCP server come later.
