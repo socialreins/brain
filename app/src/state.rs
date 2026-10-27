@@ -18,8 +18,9 @@ pub struct AppState {
     pub magic_link_limiter: Arc<RateLimiter>,
     /// Per-IP limit on every password and passkey sign-in attempt.
     pub login_limiter: Arc<RateLimiter>,
-    /// Per-email cap on failed password sign-ins; only failures count, so outside traffic
-    /// cannot lock out an owner who knows the password, and a success clears it.
+    /// Per-email budget of failed password checks, shared by `/auth/login` and signed-in
+    /// confirms; a success clears it, so outside traffic cannot lock out an owner who knows the
+    /// password for longer than a window.
     pub login_email_limiter: Arc<RateLimiter<String>>,
     /// Per-user limit on password checks a signed-in user makes (`PUT /auth/password`, the
     /// confirm on passkey registration). Keyed by user id, so outside traffic cannot drain it.

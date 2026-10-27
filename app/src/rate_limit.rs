@@ -85,14 +85,6 @@ impl<K: Hash + Eq + Clone> RateLimiter<K> {
         entry.1 <= self.cap
     }
 
-    /// True when `key` is already at the cap for the current window. Counts nothing, so a
-    /// limiter fed only by `hit` on failure caps failures without slowing successes.
-    pub fn blocked(&self, key: &K) -> bool {
-        let hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
-        hits.get(key)
-            .is_some_and(|(start, n)| start.elapsed() < self.window && *n >= self.cap)
-    }
-
     /// Forgets `key`, e.g. after a successful sign-in.
     pub fn clear(&self, key: &K) {
         self.hits
@@ -171,15 +163,12 @@ mod tests {
     }
 
     #[test]
-    fn blocked_peeks_and_clear_resets() {
-        let l: RateLimiter<String> = RateLimiter::per_minute(2);
+    fn clear_resets_a_key() {
+        let l: RateLimiter<String> = RateLimiter::per_minute(1);
         let k = "a@example.com".to_string();
-        assert!(!l.blocked(&k));
-        l.hit(k.clone());
-        l.hit(k.clone());
-        assert!(l.blocked(&k) && l.blocked(&k), "peeking does not count");
+        assert!(l.hit(k.clone()) && !l.hit(k.clone()));
         l.clear(&k);
-        assert!(!l.blocked(&k));
+        assert!(l.hit(k));
     }
 
     #[test]

@@ -717,6 +717,45 @@ mod auth {
 
     #[tokio::test]
     #[serial]
+    async fn concurrent_wrong_guesses_cannot_pass_the_cap() {
+        let (s, db) = server_where(|c| c.trust_proxy = true).await;
+        let (email, cookie) = signed_in(&s, &db).await;
+        set_password(&s, &cookie, json!({"password": PASSWORD}))
+            .await
+            .assert_status(axum::http::StatusCode::NO_CONTENT);
+        let guess = |i: u8| {
+            s.post("/auth/login")
+                .add_header("origin", WEB)
+                .add_header("x-forwarded-for", format!("198.51.100.{i}"))
+                .json(&json!({"email": email, "password": "wrong guess here"}))
+        };
+        // Argon2 runs on blocking threads, so these verify in parallel.
+        let res = tokio::join!(
+            guess(1),
+            guess(2),
+            guess(3),
+            guess(4),
+            guess(5),
+            guess(6),
+            guess(7),
+            guess(8)
+        );
+        let codes = [res.0, res.1, res.2, res.3, res.4, res.5, res.6, res.7]
+            .map(|r| r.status_code().as_u16());
+        assert_eq!(codes.iter().filter(|&&c| c == 401).count(), 5, "{codes:?}");
+        assert_eq!(codes.iter().filter(|&&c| c == 429).count(), 3, "{codes:?}");
+        // A signed-in confirm draws from the same budget, so it cannot be used to keep guessing.
+        let res = set_password(
+            &s,
+            &cookie,
+            json!({"password": "another long password", "current_password": PASSWORD}),
+        )
+        .await;
+        assert_eq!(res.status_code(), 429);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn setting_a_password_ends_the_other_sessions() {
         let (s, db) = server_where(|_| {}).await;
         let (email, cookie) = signed_in(&s, &db).await;

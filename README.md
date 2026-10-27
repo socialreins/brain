@@ -63,8 +63,8 @@ current one; setting the first one, or adding a passkey, needs a session started
 minutes (sign in again otherwise; adding a passkey also accepts the password). Password and
 passkey sign-in share 10 attempts a minute per IP. Per email only failed passwords count: 5 a
 minute closes the email until the window ends, and a success clears the count, so strangers
-cannot lock out an owner who knows the password. Password checks by a signed-in user get 5 a
-minute per account. Setting or changing a password, or deleting a passkey, ends every other
+cannot lock out an owner who knows the password. The current-password checks of a signed-in
+user draw from the same per-email budget, plus 5 a minute per account. Setting or changing a password, or deleting a passkey, ends every other
 session of the user.
 
 Passkeys use WebAuthn through the web app's pages: each `start` keeps the ceremony state in

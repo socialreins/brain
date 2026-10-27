@@ -12,7 +12,6 @@ use chrono::{Duration, Utc};
 use sea_orm::{ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder, SqlErr};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
-use socialreins_core::password;
 use uuid::Uuid;
 use webauthn_rs::prelude::{
     DiscoverableAuthentication, DiscoverableKey, Passkey, PasskeyRegistration, PublicKeyCredential,
@@ -21,6 +20,7 @@ use webauthn_rs::prelude::{
 
 use super::{
     auth::{end_other_sessions, internal, start_session, user_json, Body, CurrentUser, FromWeb},
+    password::check_password,
     waitlist::error,
 };
 use crate::{
@@ -101,10 +101,10 @@ async fn register_start(
             if !app.account_limiter.hit(user.id) {
                 return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
             }
-            let phc = phc.clone();
-            tokio::task::spawn_blocking(move || password::verify(&given, &phc))
-                .await
-                .unwrap_or(false)
+            match check_password(&app, &user.email, given, Some(phc.clone())).await {
+                Some(ok) => ok,
+                None => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+            }
         }
         _ => false,
     };

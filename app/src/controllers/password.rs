@@ -42,6 +42,25 @@ struct Login {
     password: String,
 }
 
+/// Every password guess for `email`, from `/auth/login` or a signed-in confirm, draws from one
+/// failure budget: a slot is reserved under the limiter's lock before Argon2 runs, so parallel
+/// guesses cannot all slip past the cap, and a success clears the count. `None`: over budget.
+pub(crate) async fn check_password(
+    app: &AppState,
+    email: &str,
+    candidate: String,
+    phc: Option<String>,
+) -> Option<bool> {
+    if !app.login_email_limiter.hit(email.to_owned()) {
+        return None;
+    }
+    let ok = verify(candidate, phc).await;
+    if ok {
+        app.login_email_limiter.clear(&email.to_owned());
+    }
+    Some(ok)
+}
+
 fn rate_limited() -> Response {
     error(StatusCode::TOO_MANY_REQUESTS, "rate_limited").into_response()
 }
@@ -55,10 +74,8 @@ async fn login(
     Body(body): Body<Login>,
 ) -> Response {
     let email = email::normalize(&body.email).unwrap_or_default();
-    // Every attempt counts per IP; per email only failures do, so guessing one account from
-    // many IPs is capped without letting strangers lock its owner out.
-    let ip_ok = app.login_limiter.allow(ip);
-    if !ip_ok || app.login_email_limiter.blocked(&email) {
+    // Every attempt counts per IP; per email only failures stay counted (see `check_password`).
+    if !app.login_limiter.allow(ip) {
         return rate_limited();
     }
     let user = match find_user(&app, &email).await {
@@ -66,11 +83,13 @@ async fn login(
         Err(e) => return internal(e, "user lookup"),
     };
     let phc = user.as_ref().and_then(|u| u.password_hash.clone());
-    let (Some(user), true) = (user, verify(body.password, phc).await) else {
-        app.login_email_limiter.hit(email);
+    let ok = match check_password(&app, &email, body.password, phc).await {
+        Some(ok) => ok,
+        None => return rate_limited(),
+    };
+    let (Some(user), true) = (user, ok) else {
         return error(StatusCode::UNAUTHORIZED, "invalid_credentials").into_response();
     };
-    app.login_email_limiter.clear(&email);
     match start_session(&app, user.id).await {
         Ok(cookie) => ([(header::SET_COOKIE, cookie)], user_json(&user)).into_response(),
         Err(e) => internal(e, "session insert"),
@@ -102,7 +121,10 @@ async fn set_password(
     let allowed = match &user.password_hash {
         Some(phc) => {
             let given = body.current_password.unwrap_or_default();
-            verify(given, Some(phc.clone())).await
+            match check_password(&app, &user.email, given, Some(phc.clone())).await {
+                Some(ok) => ok,
+                None => return rate_limited(),
+            }
         }
         None => current.recent(),
     };
