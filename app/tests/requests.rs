@@ -410,6 +410,21 @@ mod auth {
 
     #[tokio::test]
     #[serial]
+    async fn concurrent_link_requests_respect_the_cap() {
+        let (s, db) = server_where(|_| {}).await;
+        let email = unique_email();
+        // Each reply returns before its background insert, so the five inserts race.
+        for _ in 0..5 {
+            let res = s.post("/auth/link").json(&json!({"email": email})).await;
+            assert_eq!(res.status_code(), 202);
+        }
+        assert_eq!(links_eventually(&db, &email, 3).await, 3);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(links(&db, &email).await, 3);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn expired_link_is_refused() {
         let (s, db) = server_where(|_| {}).await;
         let email = unique_email();

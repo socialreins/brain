@@ -10,7 +10,10 @@ use axum::{
     Json, Router,
 };
 use chrono::{Duration, Utc};
-use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+use sea_orm::{
+    ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, DbErr, EntityTrait, PaginatorTrait,
+    QueryFilter, Statement, TransactionTrait,
+};
 use serde::Deserialize;
 use serde_json::json;
 use socialreins_core::{email, token};
@@ -67,16 +70,6 @@ async fn request_link(
 
 /// Errors carry the failure only, never the email or the token.
 async fn send_link(app: &AppState, email: String) -> Result<(), String> {
-    let live = magic_links::Entity::find()
-        .filter(magic_links::Column::Email.eq(&email))
-        .filter(magic_links::Column::ExpiresAt.gt(Utc::now().fixed_offset()))
-        .count(&app.db)
-        .await
-        .map_err(|e| format!("magic link count: {e}"))?;
-    // Caps mail to one inbox no matter how many IPs ask.
-    if live >= MAX_LIVE_LINKS {
-        return Ok(());
-    }
     if app.registration_disabled
         && find_user(app, &email)
             .await
@@ -91,17 +84,12 @@ async fn send_link(app: &AppState, email: String) -> Result<(), String> {
         .exec(&app.db)
         .await
         .map_err(|e| format!("magic link cleanup: {e}"))?;
-    let secret = token::new();
-    let link = magic_links::ActiveModel {
-        token_hash: Set(token::hash(&secret)),
-        email: Set(email.clone()),
-        expires_at: Set(now + Duration::minutes(LINK_MINUTES)),
-        ..Default::default()
-    };
-    magic_links::Entity::insert(link)
-        .exec_without_returning(&app.db)
+    let Some(secret) = insert_capped_link(app, &email)
         .await
-        .map_err(|e| format!("magic link insert: {e}"))?;
+        .map_err(|e| format!("magic link insert: {e}"))?
+    else {
+        return Ok(());
+    };
     let url = format!("{}/auth/magic/{secret}", app.brain_url);
     let text = format!(
         "Open this link to sign in to SocialReins:\n\n{url}\n\nIt works once and expires in \
@@ -111,6 +99,41 @@ async fn send_link(app: &AppState, email: String) -> Result<(), String> {
         .send(&email, "Your sign-in link", text)
         .await
         .map_err(|e| format!("mail: {e}"))
+}
+
+/// Stores a new link unless `email` already holds `MAX_LIVE_LINKS` unexpired ones, which caps
+/// mail to one inbox no matter how many IPs ask. The count and insert run under a per-email
+/// advisory lock, so concurrent requests cannot both pass the check. Returns the new token.
+async fn insert_capped_link(app: &AppState, email: &str) -> Result<Option<String>, DbErr> {
+    let txn = app.db.begin().await?;
+    let lock = "SELECT pg_advisory_xact_lock(hashtext($1))";
+    txn.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        lock,
+        [email.into()],
+    ))
+    .await?;
+    let now = Utc::now().fixed_offset();
+    let live = magic_links::Entity::find()
+        .filter(magic_links::Column::Email.eq(email))
+        .filter(magic_links::Column::ExpiresAt.gt(now))
+        .count(&txn)
+        .await?;
+    if live >= MAX_LIVE_LINKS {
+        return Ok(None);
+    }
+    let secret = token::new();
+    let link = magic_links::ActiveModel {
+        token_hash: Set(token::hash(&secret)),
+        email: Set(email.to_owned()),
+        expires_at: Set(now + Duration::minutes(LINK_MINUTES)),
+        ..Default::default()
+    };
+    magic_links::Entity::insert(link)
+        .exec_without_returning(&txn)
+        .await?;
+    txn.commit().await?;
+    Ok(Some(secret))
 }
 
 async fn find_user(app: &AppState, email: &str) -> Result<Option<users::Model>, sea_orm::DbErr> {
