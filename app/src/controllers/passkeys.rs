@@ -20,7 +20,7 @@ use webauthn_rs::prelude::{
 
 use super::{
     auth::{end_other_sessions, internal, start_session, user_json, Body, CurrentUser, FromWeb},
-    password::check_password,
+    password::confirm_password,
     waitlist::error,
 };
 use crate::{
@@ -97,15 +97,10 @@ async fn register_start(
 ) -> Response {
     let user = &current.0;
     let confirmed = match (body.password, &user.password_hash) {
-        (Some(given), Some(phc)) => {
-            if !app.account_limiter.hit(user.id) {
-                return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
-            }
-            match check_password(&app, &user.email, given, Some(phc.clone())).await {
-                Some(ok) => ok,
-                None => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
-            }
-        }
+        (Some(given), Some(_)) => match confirm_password(&app, user, given).await {
+            Some(ok) => ok,
+            None => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+        },
         _ => false,
     };
     if !(confirmed || current.recent()) {

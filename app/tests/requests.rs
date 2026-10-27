@@ -744,14 +744,37 @@ mod auth {
             .map(|r| r.status_code().as_u16());
         assert_eq!(codes.iter().filter(|&&c| c == 401).count(), 5, "{codes:?}");
         assert_eq!(codes.iter().filter(|&&c| c == 429).count(), 3, "{codes:?}");
-        // A signed-in confirm draws from the same budget, so it cannot be used to keep guessing.
+        // Outsiders filling the email's login budget do not block the signed-in owner.
         let res = set_password(
             &s,
             &cookie,
             json!({"password": "another long password", "current_password": PASSWORD}),
         )
         .await;
-        assert_eq!(res.status_code(), 429);
+        assert_eq!(res.status_code(), 204);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_session_cannot_guess_the_current_password_faster_than_its_cap() {
+        let (s, db) = server_where(|_| {}).await;
+        let (email, cookie) = signed_in(&s, &db).await;
+        set_password(&s, &cookie, json!({"password": PASSWORD}))
+            .await
+            .assert_status(axum::http::StatusCode::NO_CONTENT);
+        let change = |current: &str| {
+            set_password(
+                &s,
+                &cookie,
+                json!({"password": "another long password", "current_password": current}),
+            )
+        };
+        for _ in 0..5 {
+            assert_eq!(change("wrong guess here").await.status_code(), 403);
+        }
+        assert_eq!(change(PASSWORD).await.status_code(), 429);
+        // The failures were charged to the email's login budget as well.
+        assert_eq!(login(&s, &email, PASSWORD).await.status_code(), 429);
     }
 
     #[tokio::test]

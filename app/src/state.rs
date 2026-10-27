@@ -18,11 +18,10 @@ pub struct AppState {
     pub magic_link_limiter: Arc<RateLimiter>,
     /// Per-IP limit on every password and passkey sign-in attempt.
     pub login_limiter: Arc<RateLimiter>,
-    /// Per-email budget of failed password checks, shared by `/auth/login` and signed-in
-    /// confirms; a success clears it, so outside traffic cannot lock out an owner who knows the
-    /// password for longer than a window.
+    /// Per-email budget of failed `/auth/login` passwords (signed-in failures are charged too); a
+    /// success clears it. Never refuses a signed-in request.
     pub login_email_limiter: Arc<RateLimiter<String>>,
-    /// Per-user limit on password checks a signed-in user makes (`PUT /auth/password`, the
+    /// Per-user budget of failed password checks by a signed-in user (`PUT /auth/password`, the
     /// confirm on passkey registration). Keyed by user id, so outside traffic cannot drain it.
     pub account_limiter: Arc<RateLimiter<uuid::Uuid>>,
     pub brain_url: String,

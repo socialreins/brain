@@ -20,7 +20,7 @@ use super::{
     },
     waitlist::error,
 };
-use crate::{rate_limit::ClientIp, state::AppState};
+use crate::{models::users, rate_limit::ClientIp, state::AppState};
 
 /// Verified when the account is missing or has no password, so those answers take as long as
 /// a wrong password.
@@ -42,10 +42,10 @@ struct Login {
     password: String,
 }
 
-/// Every password guess for `email`, from `/auth/login` or a signed-in confirm, draws from one
-/// failure budget: a slot is reserved under the limiter's lock before Argon2 runs, so parallel
-/// guesses cannot all slip past the cap, and a success clears the count. `None`: over budget.
-pub(crate) async fn check_password(
+/// A `/auth/login` guess for `email`: a slot of the per-email failure budget is reserved under
+/// the limiter's lock before Argon2 runs, so parallel guesses cannot all slip past the cap, and
+/// a success clears the count. `None`: over budget.
+async fn check_password(
     app: &AppState,
     email: &str,
     candidate: String,
@@ -57,6 +57,26 @@ pub(crate) async fn check_password(
     let ok = verify(candidate, phc).await;
     if ok {
         app.login_email_limiter.clear(&email.to_owned());
+    }
+    Some(ok)
+}
+
+/// A signed-in user's password check, gated only by their per-account budget (reserved the same
+/// way), so outsiders failing logins on the email cannot block it. A failure is also charged to
+/// the email's login budget, so a stolen session gains no extra guesses. `None`: over budget.
+pub(crate) async fn confirm_password(
+    app: &AppState,
+    user: &users::Model,
+    candidate: String,
+) -> Option<bool> {
+    if !app.account_limiter.hit(user.id) {
+        return None;
+    }
+    let ok = verify(candidate, user.password_hash.clone()).await;
+    if ok {
+        app.account_limiter.clear(&user.id);
+    } else {
+        app.login_email_limiter.hit(user.email.clone());
     }
     Some(ok)
 }
@@ -115,13 +135,10 @@ async fn set_password(
         return error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_password").into_response();
     }
     let user = &current.0;
-    if !app.account_limiter.hit(user.id) {
-        return rate_limited();
-    }
     let allowed = match &user.password_hash {
-        Some(phc) => {
+        Some(_) => {
             let given = body.current_password.unwrap_or_default();
-            match check_password(&app, &user.email, given, Some(phc.clone())).await {
+            match confirm_password(&app, user, given).await {
                 Some(ok) => ok,
                 None => return rate_limited(),
             }
