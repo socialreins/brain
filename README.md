@@ -29,7 +29,8 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/openapi.json` | OpenAPI document for `/v1` |
 | POST | `/v1/waitlist` | `{"email":"...","source":"..."}` joins the waitlist |
 | POST | `/auth/link` | `{"email":"..."}` emails a sign-in link, `202 {"status":"sent"}` |
-| GET | `/auth/magic/{token}` | Redeems a link, sets the session cookie, redirects to `WEB_URL` |
+| GET | `/auth/magic/{token}` | The emailed link: a page with a sign-in button, does not use the link |
+| POST | `/auth/magic` | Form field `token`: uses the link, sets the session cookie, redirects to `WEB_URL` |
 | GET | `/auth/me` | The signed-in user, or `401 {"error":"unauthorized"}` |
 | POST | `/auth/logout` | Deletes the session, `204` |
 
@@ -37,12 +38,14 @@ crates/core/     framework-free domain rules (email checks, tokens)
 list, so it never reveals who signed up. A bad email gets `422 {"error":"invalid_email"}`. Each
 client IP (IPv6 by /64) gets 10 requests a minute, then `429`.
 
-Sign-in is by magic link only. `POST /auth/link` answers the same `202` whether or not the
-email has an account (or is refused by `REGISTRATION_DISABLED`). The link works once, for 15
-minutes; opening it creates the account if needed, then a 30-day session in the HttpOnly,
+Sign-in is by magic link only. `POST /auth/link` answers the same `202`, at the same speed,
+whether or not the email has an account (or is refused by `REGISTRATION_DISABLED`): the lookup
+and the mail run after the reply. Opening the link shows a button that posts it back, so mail
+scanners that prefetch links cannot use it up. The link works once, for 15 minutes; using it
+creates the account if needed, then a 30-day session in the HttpOnly,
 SameSite=Lax `sr_session` cookie (`Secure` unless `WEB_URL` is `http://`). A dead link
 redirects to `WEB_URL/login?error=invalid_link` (or `registration_disabled`). Only SHA-256
-hashes of link and session tokens are stored. Both link routes share 5 requests a minute per IP.
+hashes of link and session tokens are stored. `POST /auth/link` and `POST /auth/magic` share 5 requests a minute per IP.
 
 ## Local development
 
@@ -51,6 +54,7 @@ You need Rust (stable) and Docker.
 ```sh
 docker compose up -d postgres
 export DATABASE_URL=postgres://brain:brain@localhost:5432/socialreins_brain
+export MAIL_LOG=true                  # sign-in links go to the log
 cargo run -p socialreins-brain        # http://localhost:8080
 cargo test --workspace                # uses the same DATABASE_URL
 cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
@@ -71,7 +75,8 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `WEB_URL` | no | `http://localhost:3000`. Public URL of the web app: sign-in redirects there, and an `http://` value drops the cookie's `Secure` flag |
 | `REGISTRATION_DISABLED` | no | `false`. `true` stops new accounts; existing users still sign in |
 | `RESEND_API_KEY` | no | Send mail through Resend (its SMTP relay) |
-| `SMTP_URL` | no | Send mail through any SMTP server, e.g. `smtps://user:pass@smtp.example.com`. Used when `RESEND_API_KEY` is unset. With neither, sign-in links are written to the log at info level |
+| `SMTP_URL` | no | Send mail through any SMTP server, e.g. `smtps://user:pass@smtp.example.com`. Used when `RESEND_API_KEY` is unset |
+| `MAIL_LOG` | if no mail | `false`. With no Resend key and no SMTP, brain refuses to start unless this is `true`; then sign-in links are written to the log at info level. Meant for a single-user self-host |
 | `MAIL_FROM` | with mail | Sender, e.g. `SocialReins <login@example.com>` |
 | `RAILWAY_GIT_COMMIT_SHA` | no | `dev` (Railway sets it) |
 | `RUST_LOG` | no | `info` |

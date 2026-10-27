@@ -257,14 +257,26 @@ mod auth {
             .unwrap()
     }
 
-    /// Redeems `secret`, returning the redirect target and the session cookie it set, if any.
+    /// Redeems `secret` the way the button on the link page does, returning the redirect target
+    /// and the session cookie it set, if any.
     async fn open(s: &TestServer, secret: &str) -> (String, Option<String>) {
-        let res = s.get(&format!("/auth/magic/{secret}")).await;
+        let res = s.post("/auth/magic").form(&[("token", secret)]).await;
         assert_eq!(res.status_code(), 303);
         let cookie = res
             .maybe_header("set-cookie")
             .map(|c| c.to_str().unwrap().to_owned());
         (res.header("location").to_str().unwrap().to_owned(), cookie)
+    }
+
+    /// Waits for the background task of `POST /auth/link` to store `want` links for `email`.
+    async fn links_eventually(db: &DatabaseConnection, email: &str, want: u64) -> u64 {
+        for _ in 0..50 {
+            if links(db, email).await >= want {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        links(db, email).await
     }
 
     fn session(set_cookie: &str) -> String {
@@ -284,7 +296,7 @@ mod auth {
         assert_eq!(first.status_code(), 202);
         assert_eq!(first.json::<Value>(), json!({"status": "sent"}));
         assert_eq!(first.json::<Value>(), again.json::<Value>());
-        assert_eq!(links(&db, &email).await, 2);
+        assert_eq!(links_eventually(&db, &email, 2).await, 2);
         assert!(
             user(&db, &email).await.is_none(),
             "account waits for the link"
@@ -319,6 +331,27 @@ mod auth {
 
     #[tokio::test]
     #[serial]
+    async fn opening_the_link_only_shows_a_button() {
+        let (s, db) = server_where(|_| {}).await;
+        let email = unique_email();
+        let secret = link(&db, &email, Duration::minutes(15)).await;
+        for _ in 0..2 {
+            let page = s.get(&format!("/auth/magic/{secret}")).await;
+            page.assert_status_ok();
+            assert!(page.maybe_header("set-cookie").is_none());
+            let html = page.text();
+            assert!(html.contains(r#"action="/auth/magic""#) && html.contains(&secret));
+        }
+        assert_eq!(links(&db, &email).await, 1, "GET leaves the link usable");
+        assert!(user(&db, &email).await.is_none());
+        let (_, cookie) = open(&s, &secret).await;
+        assert!(cookie.is_some());
+        let junk = s.get("/auth/magic/%3Cscript%3E").await;
+        assert_eq!(junk.status_code(), 303);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn expired_link_is_refused() {
         let (s, db) = server_where(|_| {}).await;
         let email = unique_email();
@@ -346,7 +379,6 @@ mod auth {
         let res = s.post("/auth/link").json(&json!({"email": stranger})).await;
         assert_eq!(res.status_code(), 202);
         assert_eq!(res.json::<Value>(), json!({"status": "sent"}));
-        assert_eq!(links(&db, &stranger).await, 0, "no link for a new email");
         // A link made before sign-up closed no longer creates the account.
         let early = link(&db, &stranger, Duration::minutes(15)).await;
         let (to, cookie) = open(&s, &early).await;
@@ -357,7 +389,9 @@ mod auth {
             .json(&json!({"email": known}))
             .await
             .assert_status(axum::http::StatusCode::ACCEPTED);
-        assert_eq!(links(&db, &known).await, 1);
+        assert_eq!(links_eventually(&db, &known, 1).await, 1);
+        // The stranger asked first, so its background task has finished by now.
+        assert_eq!(links(&db, &stranger).await, 0, "no link for a new email");
         let (_, cookie) = open(&s, &link(&db, &known, Duration::minutes(15)).await).await;
         assert!(cookie.is_some());
     }
@@ -415,6 +449,7 @@ mod auth {
             .json(&json!({"email": unique_email()}))
             .await;
         assert_eq!(res.status_code(), 429);
-        assert_eq!(s.get("/auth/magic/whatever").await.status_code(), 429);
+        let redeem = s.post("/auth/magic").form(&[("token", "x")]).await;
+        assert_eq!(redeem.status_code(), 429);
     }
 }

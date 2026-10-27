@@ -1,4 +1,4 @@
-//! Outgoing mail: Resend or any SMTP server, or the log when neither is configured (self-host).
+//! Outgoing mail: Resend, any SMTP server, or the log (`MAIL_LOG=true`, single-user self-host).
 use lettre::{
     message::Mailbox, transport::smtp::authentication::Credentials, AsyncSmtpTransport,
     AsyncTransport, Message, Tokio1Executor,
@@ -6,7 +6,7 @@ use lettre::{
 
 #[derive(Clone)]
 pub enum Mailer {
-    /// No mail configured: each message is written to the log at info level.
+    /// `MAIL_LOG=true`: each message, sign-in link included, is written to the log at info level.
     Log,
     Smtp {
         transport: AsyncSmtpTransport<Tokio1Executor>,
@@ -38,25 +38,42 @@ impl Mailer {
         })
     }
 
+    /// Errors name the failure kind and SMTP code only, never the recipient or the body.
     pub async fn send(&self, to: &str, subject: &str, body: String) -> Result<(), String> {
         let (transport, from) = match self {
             Self::Log => {
-                tracing::info!(to, subject, body, "mail not configured, logging it instead");
+                tracing::info!(
+                    to,
+                    subject,
+                    body,
+                    "MAIL_LOG: logging mail instead of sending"
+                );
                 return Ok(());
             }
             Self::Smtp { transport, from } => (transport, from),
         };
+        let to = to.parse().map_err(|_| "recipient is not a mailbox")?;
         let message = Message::builder()
             .from(from.clone())
-            .to(to.parse().map_err(|e| format!("recipient: {e}"))?)
+            .to(to)
             .subject(subject)
             .body(body)
-            .map_err(|e| e.to_string())?;
-        transport
-            .send(message)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|_| "message did not build")?;
+        transport.send(message).await.map(|_| ()).map_err(|e| {
+            let kind = if e.is_permanent() {
+                "permanent"
+            } else if e.is_transient() {
+                "transient"
+            } else if e.is_timeout() {
+                "timeout"
+            } else if e.is_tls() {
+                "tls"
+            } else {
+                "connection"
+            };
+            let code = e.status().map(|c| c.to_string()).unwrap_or_default();
+            format!("smtp {kind} {code}").trim_end().to_owned()
+        })
     }
 }
 

@@ -1,11 +1,11 @@
 //! Sign-in by magic link and server-side sessions.
 //!
-//! `POST /auth/link` emails a link, `GET /auth/magic/{token}` redeems it once and sets the
-//! session cookie, `GET /auth/me` returns the signed-in user, `POST /auth/logout` ends it.
+//! `POST /auth/link` emails a link, `GET /auth/magic/{token}` shows a sign-in button that posts
+//! it to `POST /auth/magic`, which uses it once and sets the session cookie, `GET /auth/me` returns the signed-in user, `POST /auth/logout` ends it.
 use axum::{
-    extract::{FromRequest, FromRequestParts, Path, Request, State},
+    extract::{Form, FromRequest, FromRequestParts, Path, Request, State},
     http::{header, request::Parts, HeaderMap, StatusCode},
-    response::{IntoResponse, Redirect, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -36,9 +36,9 @@ fn internal(e: impl std::fmt::Display, what: &str) -> Response {
     error(StatusCode::INTERNAL_SERVER_ERROR, "internal").into_response()
 }
 
-/// Same 202 for a new email, a known one, and one refused by `REGISTRATION_DISABLED`, so the
-/// reply never says whether an account exists. The mail goes out in the background for the same
-/// reason: its timing would tell.
+/// Same 202, at the same speed, for a new email, a known one, and one refused by
+/// `REGISTRATION_DISABLED`: the lookup, insert and mail all run after the reply, so neither the
+/// body nor the timing says whether an account exists.
 async fn request_link(
     State(app): State<AppState>,
     ClientIp(ip): ClientIp,
@@ -54,22 +54,30 @@ async fn request_link(
     let Some(email) = email::normalize(&body.email) else {
         return error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_email").into_response();
     };
-    let sent = (StatusCode::ACCEPTED, Json(json!({"status": "sent"}))).into_response();
-    if app.registration_disabled {
-        match find_user(&app, &email).await {
-            Ok(Some(_)) => {}
-            Ok(None) => return sent,
-            Err(e) => return internal(e, "user lookup"),
+    tokio::spawn(async move {
+        if let Err(e) = send_link(&app, email).await {
+            tracing::error!(error = %e, "magic link not sent");
         }
+    });
+    (StatusCode::ACCEPTED, Json(json!({"status": "sent"}))).into_response()
+}
+
+/// Errors carry the failure only, never the email or the token.
+async fn send_link(app: &AppState, email: String) -> Result<(), String> {
+    if app.registration_disabled
+        && find_user(app, &email)
+            .await
+            .map_err(|e| format!("user lookup: {e}"))?
+            .is_none()
+    {
+        return Ok(());
     }
     let now = Utc::now().fixed_offset();
-    let expired = magic_links::Entity::delete_many()
+    magic_links::Entity::delete_many()
         .filter(magic_links::Column::ExpiresAt.lt(now))
         .exec(&app.db)
-        .await;
-    if let Err(e) = expired {
-        return internal(e, "magic link cleanup");
-    }
+        .await
+        .map_err(|e| format!("magic link cleanup: {e}"))?;
     let secret = token::new();
     let link = magic_links::ActiveModel {
         token_hash: Set(token::hash(&secret)),
@@ -77,23 +85,19 @@ async fn request_link(
         expires_at: Set(now + Duration::minutes(LINK_MINUTES)),
         ..Default::default()
     };
-    if let Err(e) = magic_links::Entity::insert(link)
+    magic_links::Entity::insert(link)
         .exec_without_returning(&app.db)
         .await
-    {
-        return internal(e, "magic link insert");
-    }
+        .map_err(|e| format!("magic link insert: {e}"))?;
     let url = format!("{}/auth/magic/{secret}", app.brain_url);
     let text = format!(
         "Open this link to sign in to SocialReins:\n\n{url}\n\nIt works once and expires in \
          {LINK_MINUTES} minutes. If you did not ask for it, ignore this email.\n"
     );
-    tokio::spawn(async move {
-        if let Err(e) = app.mailer.send(&email, "Your sign-in link", text).await {
-            tracing::error!(error = %e, "magic link mail failed");
-        }
-    });
-    sent
+    app.mailer
+        .send(&email, "Your sign-in link", text)
+        .await
+        .map_err(|e| format!("mail: {e}"))
 }
 
 async fn find_user(app: &AppState, email: &str) -> Result<Option<users::Model>, sea_orm::DbErr> {
@@ -108,10 +112,41 @@ fn refused(app: &AppState, code: &str) -> Response {
     Redirect::to(&format!("{}/login?error={code}", app.web_url)).into_response()
 }
 
+/// `GET /auth/magic/{token}`: a page whose button posts the token back. Opening the link does
+/// not use it up, so mail scanners that prefetch links cannot burn it, and a link alone cannot
+/// sign a browser in without a click.
+async fn confirm_page(State(app): State<AppState>, Path(secret): Path<String>) -> Response {
+    // Only our own 64-hex tokens reach the HTML, so nothing needs escaping.
+    if secret.len() != 64 || !secret.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return refused(&app, "invalid_link");
+    }
+    let page = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width\"><title>Sign in</title></head>\
+         <body><form method=\"post\" action=\"/auth/magic\">\
+         <input type=\"hidden\" name=\"token\" value=\"{secret}\">\
+         <button type=\"submit\">Sign in to SocialReins</button></form></body></html>"
+    );
+    (
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        Html(page),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct Redeem {
+    token: String,
+}
+
+/// `POST /auth/magic` with form field `token`: uses the link once and starts the session.
 async fn redeem(
     State(app): State<AppState>,
     ClientIp(ip): ClientIp,
-    Path(secret): Path<String>,
+    Form(Redeem { token: secret }): Form<Redeem>,
 ) -> Response {
     if !app.magic_link_limiter.allow(ip) {
         return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited").into_response();
@@ -260,7 +295,8 @@ async fn logout(State(app): State<AppState>, headers: HeaderMap) -> Response {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/auth/link", post(request_link))
-        .route("/auth/magic/{token}", get(redeem))
+        .route("/auth/magic", post(redeem))
+        .route("/auth/magic/{token}", get(confirm_page))
         .route("/auth/me", get(me))
         .route("/auth/logout", post(logout))
 }

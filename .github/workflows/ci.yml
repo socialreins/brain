@@ -16,6 +16,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   DATABASE_URL: postgres://brain:brain@localhost:5432/socialreins_brain_test
+  MAIL_LOG: "true"
 
 jobs:
   lint:
@@ -73,7 +74,8 @@ jobs:
       - run: docker build -t brain .
       - run: |
           docker run -d --name api --network host \
-            -e DATABASE_URL=postgres://brain:brain@localhost:5432/socialreins_brain_prod brain
+            -e DATABASE_URL=postgres://brain:brain@localhost:5432/socialreins_brain_prod \
+            -e MAIL_LOG=true brain
           timeout 60 bash -c 'until curl -sf http://localhost:8080/health >/dev/null; do sleep 2; done'
       - if: failure()
         run: docker logs api

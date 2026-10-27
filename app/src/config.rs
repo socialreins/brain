@@ -24,7 +24,8 @@ pub struct Config {
     pub web_url: String,
     /// `REGISTRATION_DISABLED=true`: magic links stop creating accounts; existing users still sign in.
     pub registration_disabled: bool,
-    /// `RESEND_API_KEY`, else `SMTP_URL`, else the log. Either needs `MAIL_FROM`.
+    /// `RESEND_API_KEY`, else `SMTP_URL` (either needs `MAIL_FROM`), else the log, which needs
+    /// `MAIL_LOG=true` so sign-in links never reach the log by accident.
     pub mailer: Mailer,
 }
 
@@ -46,7 +47,14 @@ impl Config {
         let mailer = match (var("RESEND_API_KEY"), var("SMTP_URL")) {
             (Some(key), _) => Mailer::resend(&key, &from()?)?,
             (None, Some(url)) => Mailer::smtp(&url, &from()?)?,
-            (None, None) => Mailer::Log,
+            (None, None) if flag("MAIL_LOG")? => Mailer::Log,
+            (None, None) => {
+                return Err(
+                    "no mail configured: set RESEND_API_KEY or SMTP_URL, or MAIL_LOG=true \
+                            to write sign-in links to the log (single-user self-host)"
+                        .into(),
+                )
+            }
         };
         Ok(Self {
             database_url,
