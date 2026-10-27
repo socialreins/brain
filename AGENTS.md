@@ -17,7 +17,7 @@ cargo run -p socialreins-brain
 ## Layout
 
 - `app/`: Axum shell. `controllers/` parse and respond, `models/` hold SeaORM entities,
-  `config.rs` reads every env var (defaults live there and only there).
+  `config.rs` reads every env var (defaults live there and only there), `mail.rs` sends mail.
 - `app/migration/`: one file per migration, raw SQL, registered in `lib.rs`. Applied on boot.
 - `crates/*`: framework-free domain code. Never depend on `axum` or `sea-orm` there.
 - `/v1` routes carry `utoipa::path` annotations; `/openapi.json` is generated from them.

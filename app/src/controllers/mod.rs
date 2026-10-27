@@ -1,4 +1,5 @@
-//! Routes: `/health`, `/version`, `/openapi.json`, and the documented `/v1` API.
+//! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, and the documented `/v1` API.
+pub mod auth;
 pub mod health;
 pub mod waitlist;
 
@@ -17,7 +18,7 @@ use utoipa_axum::router::OpenApiRouter;
 
 use crate::{config::Config, state::AppState};
 
-/// Largest `/v1` request body; a waitlist signup is well under 1 KB.
+/// Largest `/v1` and `/auth` request body; a waitlist signup is well under 1 KB.
 const MAX_BODY_BYTES: usize = 4096;
 
 #[derive(OpenApi)]
@@ -41,9 +42,12 @@ pub fn router(state: AppState, config: &Config) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(config.cors_origins.clone()))
         .allow_methods([Method::GET, Method::POST])
-        .allow_headers([header::CONTENT_TYPE]);
+        .allow_headers([header::CONTENT_TYPE])
+        // The web app sends the session cookie on cross-origin calls to `/auth/*`.
+        .allow_credentials(true);
     Router::new()
         .merge(health::routes())
+        .merge(auth::routes().layer(DefaultBodyLimit::max(MAX_BODY_BYTES)))
         .nest("/v1", v1.layer(DefaultBodyLimit::max(MAX_BODY_BYTES)))
         .route("/openapi.json", get(move || async move { Json(doc) }))
         .layer(cors)
