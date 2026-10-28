@@ -1113,6 +1113,8 @@ mod teams {
 
     async fn server_where(edit: impl FnOnce(&mut Config)) -> (TestServer, DatabaseConnection) {
         let mut config = Config::from_env().expect("DATABASE_URL must point at a test Postgres");
+        // Lets `sign_in` spread over client IPs, so making many users stays under the link limit.
+        config.trust_proxy = true;
         edit(&mut config);
         let db = connect(&config).await.expect("database reachable");
         let app = controllers::router(AppState::new(db.clone(), &config), &config);
@@ -1122,6 +1124,7 @@ mod teams {
     /// Signs `email` in by link (creating the account), returning the `sr_session=...` cookie.
     async fn sign_in(s: &TestServer, db: &DatabaseConnection, email: &str) -> Option<String> {
         let secret = token::new();
+        let b = token::new().into_bytes();
         let row = socialreins_brain::models::magic_links::ActiveModel {
             token_hash: Set(token::hash(&secret)),
             email: Set(email.into()),
@@ -1135,6 +1138,7 @@ mod teams {
         let res = s
             .post("/auth/magic")
             .add_header("origin", "http://localhost:8080")
+            .add_header("x-forwarded-for", format!("10.{}.{}.{}", b[0], b[1], b[2]))
             .form(&[("token", secret.as_str())])
             .await;
         res.maybe_header("set-cookie")
@@ -1209,7 +1213,14 @@ mod teams {
         role: &str,
     ) -> (String, uuid::Uuid) {
         let (email, cookie, id) = user(s, db).await;
-        let secret = invitation(db, team_id, &email, role, None, Duration::days(7)).await;
+        let owner = team_user::Entity::find()
+            .filter(team_user::Column::TeamId.eq(team_id.parse::<uuid::Uuid>().unwrap()))
+            .filter(team_user::Column::Role.eq("owner"))
+            .one(db)
+            .await
+            .unwrap()
+            .map(|m| m.user_id);
+        let secret = invitation(db, team_id, &email, role, owner, Duration::days(7)).await;
         let res = req(
             s,
             Method::POST,
@@ -1373,9 +1384,25 @@ mod teams {
         assert_eq!(row.token_hash.len(), 64);
         let valid = (row.expires_at - row.created_at).num_minutes();
         assert!((7 * 24 * 60 - 1..=7 * 24 * 60).contains(&valid), "{valid}");
+        // Re-inviting replaces the pending invitation instead of adding one.
         let again = invite(json!({"email": invitee, "role": "member"})).await;
-        assert_eq!(again.status_code(), 409);
-        again.assert_json(&json!({"error": "already_invited"}));
+        assert_eq!(again.status_code(), 201);
+        let again = again.json::<Value>();
+        assert_ne!(again["id"], made["id"]);
+        let pending = team_invitations::Entity::find()
+            .filter(team_invitations::Column::Email.eq(&invitee))
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].role, "member");
+        // A third send to the same address the same day is the last.
+        let third = invite(json!({"email": invitee, "role": "member"})).await;
+        assert_eq!(third.status_code(), 201);
+        let made = third.json::<Value>();
+        let fourth = invite(json!({"email": invitee, "role": "member"})).await;
+        assert_eq!(fourth.status_code(), 429);
+        fourth.assert_json(&json!({"error": "rate_limited"}));
         let listed = s
             .get("/v1/team/invitations")
             .add_header("cookie", &owner)
@@ -1640,7 +1667,7 @@ mod teams {
     #[serial]
     async fn closed_registration_still_admits_invited_emails() {
         let (open, db) = server_where(|_| {}).await;
-        let (_, owner, _) = user(&open, &db).await;
+        let (_, owner, owner_id) = user(&open, &db).await;
         let team_id = current(&open, &owner).await["id"]
             .as_str()
             .unwrap()
@@ -1648,7 +1675,15 @@ mod teams {
         let (s, _) = server_where(|c| c.registration_disabled = true).await;
         assert!(sign_in(&s, &db, &unique_email()).await.is_none());
         let invited = unique_email();
-        let secret = invitation(&db, &team_id, &invited, "member", None, Duration::days(7)).await;
+        let secret = invitation(
+            &db,
+            &team_id,
+            &invited,
+            "member",
+            Some(owner_id),
+            Duration::days(7),
+        )
+        .await;
         let cookie = sign_in(&s, &db, &invited)
             .await
             .expect("invited email signs up");
@@ -1661,6 +1696,135 @@ mod teams {
         .await;
         res.assert_status_ok();
         assert_eq!(res.json::<Value>()["role"], "member");
+    }
+
+    async fn pending(db: &DatabaseConnection, inviter: uuid::Uuid) -> u64 {
+        team_invitations::Entity::find()
+            .filter(team_invitations::Column::InvitedBy.eq(inviter))
+            .count(db)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn invitations_die_with_the_inviters_rights() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, owner, _) = user(&s, &db).await;
+        let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+        let invite = |cookie: &str| {
+            req(&s, Method::POST, "/v1/team/invitations", cookie)
+                .json(&json!({"email": unique_email(), "role": "member"}))
+        };
+        // Demoted below admin, or removed: their pending invitations go in the same change.
+        let (admin, admin_id) = joined(&s, &db, &team_id, "admin").await;
+        assert_eq!(invite(&admin).await.status_code(), 201);
+        let demote = req(
+            &s,
+            Method::PATCH,
+            &format!("/v1/team/members/{admin_id}"),
+            &owner,
+        )
+        .json(&json!({"role": "member"}));
+        demote.await.assert_status_ok();
+        assert_eq!(pending(&db, admin_id).await, 0);
+        let (other, other_id) = joined(&s, &db, &team_id, "admin").await;
+        assert_eq!(invite(&other).await.status_code(), 201);
+        let removal = req(
+            &s,
+            Method::DELETE,
+            &format!("/v1/team/members/{other_id}"),
+            &owner,
+        );
+        assert_eq!(removal.await.status_code(), 204);
+        assert_eq!(pending(&db, other_id).await, 0);
+        // A promotion keeps them.
+        let (third, third_id) = joined(&s, &db, &team_id, "admin").await;
+        assert_eq!(invite(&third).await.status_code(), 201);
+        req(
+            &s,
+            Method::PATCH,
+            &format!("/v1/team/members/{third_id}"),
+            &owner,
+        )
+        .json(&json!({"role": "owner"}))
+        .await
+        .assert_status_ok();
+        assert_eq!(pending(&db, third_id).await, 1);
+
+        // An inviter who lost the right some other way: the link is dead and the row goes.
+        let (_, stale_id) = joined(&s, &db, &team_id, "admin").await;
+        let (email, cookie, _) = user(&s, &db).await;
+        let secret = invitation(
+            &db,
+            &team_id,
+            &email,
+            "admin",
+            Some(stale_id),
+            Duration::days(7),
+        )
+        .await;
+        let row = team_user::ActiveModel {
+            team_id: Set(team_id.parse().unwrap()),
+            user_id: Set(stale_id),
+            role: Set("member".into()),
+            ..Default::default()
+        };
+        team_user::Entity::update(row).exec(&db).await.unwrap();
+        let path = format!("/v1/invitations/{secret}");
+        assert_eq!(
+            req(&s, Method::POST, &path, &cookie).await.status_code(),
+            404
+        );
+        assert_eq!(pending(&db, stale_id).await, 0);
+        assert_eq!(s.get(&path).await.status_code(), 404);
+        // No inviter left at all is the same.
+        let orphan = invitation(&db, &team_id, &email, "member", None, Duration::days(7)).await;
+        let path = format!("/v1/invitations/{orphan}");
+        assert_eq!(s.get(&path).await.status_code(), 404);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_team_sends_at_most_50_invitations_a_day() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, owner, _) = user(&s, &db).await;
+        let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+        let mut admins = vec![owner];
+        for _ in 0..4 {
+            admins.push(joined(&s, &db, &team_id, "admin").await.0);
+        }
+        // Five senders at 10 a minute each fill the team's 50.
+        for cookie in &admins {
+            for _ in 0..10 {
+                let res = req(&s, Method::POST, "/v1/team/invitations", cookie)
+                    .json(&json!({"email": unique_email(), "role": "member"}))
+                    .await;
+                assert_eq!(res.status_code(), 201);
+            }
+        }
+        let extra = joined(&s, &db, &team_id, "admin").await.0;
+        let res = req(&s, Method::POST, "/v1/team/invitations", &extra)
+            .json(&json!({"email": unique_email(), "role": "member"}))
+            .await;
+        assert_eq!(res.status_code(), 429);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn team_names_are_bounded() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, cookie, _) = user(&s, &db).await;
+        for bad in ["a".repeat(61), "Acme\nhttps://evil".into()] {
+            let res = req(&s, Method::POST, "/v1/teams", &cookie)
+                .json(&json!({"name": bad}))
+                .await;
+            assert_eq!(res.status_code(), 422);
+            let res = req(&s, Method::PATCH, "/v1/team", &cookie)
+                .json(&json!({"name": bad}))
+                .await;
+            assert_eq!(res.status_code(), 422);
+        }
     }
 
     #[tokio::test]

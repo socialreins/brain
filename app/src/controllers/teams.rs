@@ -16,7 +16,11 @@ use sea_orm::{
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, SqlErr, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
-use socialreins_core::{email, team::Role, token};
+use socialreins_core::{
+    email,
+    team::{self, Role},
+    token,
+};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
@@ -76,7 +80,7 @@ pub struct InvitationPreview {
 
 #[derive(Deserialize, ToSchema)]
 pub struct TeamName {
-    /// 1 to 100 characters after trimming.
+    /// 1 to 60 characters after trimming, no control characters.
     pub name: String,
 }
 
@@ -220,7 +224,11 @@ pub(crate) async fn ensure_team(db: &DatabaseConnection, user_id: Uuid) -> Resul
         .count(&txn)
         .await?;
     if teams == 0 {
-        create_team(&txn, user_id, &format!("{}'s team", user.name)).await?;
+        let name: String = format!("{}'s team", user.name)
+            .chars()
+            .take(team::MAX_NAME_CHARS)
+            .collect();
+        create_team(&txn, user_id, &name).await?;
     }
     txn.commit().await
 }
@@ -312,7 +320,7 @@ async fn create(
     CurrentUser(user, _): CurrentUser,
     Body(body): Body<TeamName>,
 ) -> Response {
-    let Some(name) = socialreins_core::team::name(&body.name) else {
+    let Some(name) = team::name(&body.name) else {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name");
     };
     let made = async {
@@ -396,7 +404,7 @@ async fn rename(
     if !t.role.manages() {
         return forbidden();
     }
-    let Some(name) = socialreins_core::team::name(&body.name) else {
+    let Some(name) = team::name(&body.name) else {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name");
     };
     let row = teams::ActiveModel {
@@ -523,6 +531,14 @@ async fn change_member(
             return Ok(Change::LastOwner);
         }
     }
+    // An invitation carries its inviter's rights: once they can no longer invite, theirs go.
+    if to.is_none_or(|r| !r.manages()) {
+        team_invitations::Entity::delete_many()
+            .filter(team_invitations::Column::TeamId.eq(team_id))
+            .filter(team_invitations::Column::InvitedBy.eq(target))
+            .exec(&txn)
+            .await?;
+    }
     let done = match to {
         Some(role) => {
             let row = team_user::ActiveModel {
@@ -594,7 +610,9 @@ async fn remove(
 }
 
 /// Invites an email to the current team as `admin` or `member` and emails a link to
-/// `{WEB_URL}/invitations/{token}`, valid 7 days. Owners and admins; rate limited per user.
+/// `{WEB_URL}/invitations/{token}`, valid 7 days, replacing a pending invitation of the same
+/// email. Owners and admins. At most 10 a minute per user, 50 a day per team and 3 a day per
+/// email in one team.
 #[utoipa::path(post, path = "/team/invitations", tag = "teams", request_body = NewInvitation,
     responses((status = 201, body = Invitation), (status = 401, body = Error),
         (status = 403, body = Error), (status = 409, body = Error), (status = 422, body = Error),
@@ -630,6 +648,15 @@ async fn invite(
         Ok(_) => return reply(StatusCode::CONFLICT, "already_member"),
         Err(e) => return internal(e, "member lookup"),
     }
+    // Caps mail per team and per recipient, so a team cannot be used to flood an inbox. Both
+    // are counted in memory, so revoking and re-inviting does not reset them.
+    if !app.team_invitation_limiter.hit(t.team.id)
+        || !app
+            .recipient_invitation_limiter
+            .hit((t.team.id, email.clone()))
+    {
+        return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    }
     let now = Utc::now().fixed_offset();
     let swept = team_invitations::Entity::delete_many()
         .filter(team_invitations::Column::ExpiresAt.lt(now))
@@ -649,10 +676,20 @@ async fn invite(
         expires_at: Set(now + Duration::days(INVITATION_DAYS)),
         ..Default::default()
     };
-    let row = match team_invitations::Entity::insert(row)
-        .exec_with_returning(&app.db)
-        .await
-    {
+    // Re-inviting a pending address replaces its invitation, so the old link stops working.
+    let replaced = async {
+        let txn = app.db.begin().await?;
+        team_invitations::Entity::delete_many()
+            .filter(team_invitations::Column::TeamId.eq(t.team.id))
+            .filter(team_invitations::Column::Email.eq(&email))
+            .exec(&txn)
+            .await?;
+        let row = team_invitations::Entity::insert(row)
+            .exec_with_returning(&txn)
+            .await?;
+        txn.commit().await.map(|_| row)
+    };
+    let row = match replaced.await {
         Ok(row) => row,
         Err(e) if matches!(e.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) => {
             return reply(StatusCode::CONFLICT, "already_invited")
@@ -660,18 +697,20 @@ async fn invite(
         Err(e) => return internal(e, "invitation insert"),
     };
     let url = format!("{}/invitations/{secret}", app.web_url);
+    // Names are user input: quoted and made inert so they cannot pass as links, and kept out
+    // of the subject.
     let text = format!(
         "{} invited you to join the team \"{}\" on SocialReins as {}.\n\nOpen this link to \
          accept:\n\n{url}\n\nIt expires in {INVITATION_DAYS} days. If you did not expect it, \
          ignore this email.\n",
-        inviter.name,
-        t.team.name,
+        team::inert(&inviter.name),
+        team::inert(&t.team.name),
         role.as_str()
     );
-    let subject = format!("Join {} on SocialReins", t.team.name);
-    if let Err(e) = app.mailer.send(&email, &subject, text).await {
+    let subject = "You're invited to a team on SocialReins";
+    if let Err(e) = app.mailer.send(&email, subject, text).await {
         tracing::error!(error = %e, "invitation not sent");
-        // An unsent invitation would block a retry with `already_invited`.
+        // The link was never delivered, so it should not stay usable.
         let undo = team_invitations::Entity::delete_by_id(row.id)
             .exec(&app.db)
             .await;
@@ -729,15 +768,31 @@ async fn revoke(
     }
 }
 
+/// The unexpired invitation behind `secret`, while its inviter is still an owner or admin of
+/// the team. One whose inviter lost that right (or their account) is deleted and not returned.
 async fn live_invitation(
     db: &DatabaseConnection,
     secret: &str,
 ) -> Result<Option<team_invitations::Model>, DbErr> {
-    team_invitations::Entity::find()
+    let Some(inv) = team_invitations::Entity::find()
         .filter(team_invitations::Column::TokenHash.eq(token::hash(secret)))
         .filter(team_invitations::Column::ExpiresAt.gt(Utc::now().fixed_offset()))
         .one(db)
-        .await
+        .await?
+    else {
+        return Ok(None);
+    };
+    let inviter = match inv.invited_by {
+        Some(id) => membership(db, inv.team_id, id).await?,
+        None => None,
+    };
+    if inviter.is_some_and(|m| role_of(&m).manages()) {
+        return Ok(Some(inv));
+    }
+    team_invitations::Entity::delete_by_id(inv.id)
+        .exec(db)
+        .await?;
+    Ok(None)
 }
 
 /// Public: what the invitation link offers. `404` when the token is unknown, used or expired.
