@@ -20,6 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && useradd --system --uid 10001 --no-create-home brain
 COPY --from=builder /src/target/release/socialreins-brain /usr/local/bin/socialreins-brain
 USER brain
-ENV PORT=8080
+# The commit /version reports in published images (Railway sets RAILWAY_GIT_COMMIT_SHA instead).
+ARG GIT_COMMIT
+ENV PORT=8080 GIT_COMMIT=$GIT_COMMIT
 EXPOSE 8080
 CMD ["socialreins-brain"]

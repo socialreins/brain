@@ -852,6 +852,121 @@ mod auth {
             .contains("PUT"));
     }
 
+    /// A server over a throwaway database with no users yet (the shared test database already
+    /// has some). Returns the database name for `drop_db`.
+    async fn empty_db_server(
+        edit: impl FnOnce(&mut Config),
+    ) -> (TestServer, DatabaseConnection, String) {
+        use sea_orm::ConnectionTrait;
+        let base = Config::from_env().unwrap().database_url;
+        let name = format!("brain_first_{}", uuid::Uuid::now_v7().simple());
+        let admin = sea_orm::Database::connect(&base).await.unwrap();
+        admin
+            .execute_unprepared(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap();
+        let url = format!("{}/{name}", &base[..base.rfind('/').unwrap()]);
+        let (s, db) = server_where(|c| {
+            c.database_url = url;
+            c.registration_disabled = true;
+            edit(c);
+        })
+        .await;
+        (s, db, name)
+    }
+
+    async fn drop_db(db: DatabaseConnection, name: &str) {
+        use sea_orm::ConnectionTrait;
+        db.close().await.unwrap();
+        let admin = sea_orm::Database::connect(Config::from_env().unwrap().database_url)
+            .await
+            .unwrap();
+        admin
+            .execute_unprepared(&format!("DROP DATABASE {name}"))
+            .await
+            .unwrap();
+    }
+
+    async fn users_count(db: &DatabaseConnection) -> u64 {
+        users::Entity::find().count(db).await.unwrap()
+    }
+
+    /// Without OWNER_EMAIL, a closed install lets its first account in, then no stranger.
+    #[tokio::test]
+    #[serial]
+    async fn closed_registration_admits_only_the_first_account() {
+        let (s, db, name) = empty_db_server(|_| {}).await;
+        let first = unique_email();
+        let (_, cookie) = open(&s, &link(&db, &first, Duration::minutes(15)).await).await;
+        assert!(cookie.is_some(), "the first account signs up");
+        let second = unique_email();
+        let (to, cookie) = open(&s, &link(&db, &second, Duration::minutes(15)).await).await;
+        assert!(to.ends_with("/login?error=registration_disabled"));
+        assert!(cookie.is_none() && user(&db, &second).await.is_none());
+        drop_db(db, &name).await;
+    }
+
+    /// Strangers racing for the first account take turns on an advisory lock: while another
+    /// sign-up holds it, a redemption waits, then sees that account and is refused.
+    #[tokio::test]
+    #[serial]
+    async fn first_sign_up_waits_for_the_lock() {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+        let (s, db, name) = empty_db_server(|_| {}).await;
+        let secret = link(&db, &unique_email(), Duration::minutes(15)).await;
+        let holder = db.begin().await.unwrap();
+        holder
+            .execute_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT pg_advisory_xact_lock(x'0053524649525354'::bigint)",
+            ))
+            .await
+            .unwrap();
+        let mut redeem = std::pin::pin!(open(&s, &secret));
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(300), &mut redeem).await;
+        assert!(waited.is_err(), "the redemption waits for the lock");
+        users::Entity::insert(users::ActiveModel {
+            id: Set(uuid::Uuid::now_v7()),
+            email: Set(unique_email()),
+            name: Set("first".into()),
+            ..Default::default()
+        })
+        .exec_without_returning(&holder)
+        .await
+        .unwrap();
+        holder.commit().await.unwrap();
+        let (to, cookie) = redeem.await;
+        assert!(to.ends_with("/login?error=registration_disabled"));
+        assert!(cookie.is_none());
+        assert_eq!(users_count(&db).await, 1);
+        drop_db(db, &name).await;
+    }
+
+    /// With OWNER_EMAIL, only the owner (and invited emails) sign up, even on an empty install.
+    #[tokio::test]
+    #[serial]
+    async fn owner_email_is_the_only_stranger_admitted() {
+        let owner = unique_email();
+        let (s, db, name) = empty_db_server(|c| c.owner_email = Some(owner.clone())).await;
+        let stranger = unique_email();
+        let (to, cookie) = open(&s, &link(&db, &stranger, Duration::minutes(15)).await).await;
+        assert!(to.ends_with("/login?error=registration_disabled"));
+        assert!(cookie.is_none() && users_count(&db).await == 0);
+        s.post("/auth/link")
+            .json(&json!({"email": stranger}))
+            .await
+            .assert_status(axum::http::StatusCode::ACCEPTED);
+        s.post("/auth/link")
+            .json(&json!({"email": owner.to_uppercase()}))
+            .await
+            .assert_status(axum::http::StatusCode::ACCEPTED);
+        assert_eq!(links_eventually(&db, &owner, 1).await, 1);
+        assert_eq!(links(&db, &stranger).await, 0, "no link for the stranger");
+        let (_, cookie) = open(&s, &link(&db, &owner, Duration::minutes(15)).await).await;
+        assert!(cookie.is_some(), "the owner signs up");
+        drop_db(db, &name).await;
+    }
+
     #[tokio::test]
     #[serial]
     async fn registration_disabled_does_not_change_password_login() {

@@ -12,7 +12,7 @@ pub struct Config {
     pub database_url: String,
     pub port: u16,
     pub cors_origins: Vec<HeaderValue>,
-    /// `RAILWAY_GIT_COMMIT_SHA`, or `dev` outside Railway.
+    /// `RAILWAY_GIT_COMMIT_SHA`, else `GIT_COMMIT` (baked into published images), else `dev`.
     pub git_commit: String,
     /// `TRUST_PROXY=true` only behind a proxy that sets `X-Forwarded-For` (Railway). Off by
     /// default: a client could otherwise spoof the header to dodge the rate limit.
@@ -22,8 +22,11 @@ pub struct Config {
     /// `WEB_URL`: the web app's public base URL, where sign-in lands. An `http://` URL turns
     /// off the cookie's `Secure` flag for local dev. No trailing slash.
     pub web_url: String,
-    /// `REGISTRATION_DISABLED=true`: magic links stop creating accounts; existing users still sign in.
+    /// `REGISTRATION_DISABLED=true`: magic links create only `OWNER_EMAIL`'s account (or, with
+    /// no `OWNER_EMAIL`, the first account) and invited ones; existing users still sign in.
     pub registration_disabled: bool,
+    /// `OWNER_EMAIL`, normalized: the one stranger a closed install still lets sign up.
+    pub owner_email: Option<String>,
     /// `RESEND_API_KEY`, else `SMTP_URL` (either needs `MAIL_FROM`), else the log, which needs
     /// `MAIL_LOG=true` so sign-in links never reach the log by accident.
     pub mailer: Mailer,
@@ -51,6 +54,7 @@ impl Config {
             (Some(key), _) => Mailer::resend(&key, &from()?)?,
             (None, Some(url)) => Mailer::smtp(&url, &from()?)?,
             (None, None) if flag("MAIL_LOG")? => Mailer::Log,
+            // Fail closed: a lost RESEND_API_KEY must not quietly put sign-in links in the log.
             (None, None) => {
                 return Err(
                     "no mail configured: set RESEND_API_KEY or SMTP_URL, or MAIL_LOG=true \
@@ -68,15 +72,24 @@ impl Config {
             database_url,
             port,
             cors_origins: parse_origins(&origins)?,
-            git_commit: var("RAILWAY_GIT_COMMIT_SHA").unwrap_or_else(|| "dev".into()),
+            git_commit: var("RAILWAY_GIT_COMMIT_SHA")
+                .or_else(|| var("GIT_COMMIT"))
+                .unwrap_or_else(|| "dev".into()),
             trust_proxy: flag("TRUST_PROXY")?,
             brain_url: base_url("BRAIN_URL", var("BRAIN_URL"), "http://localhost:8080")?,
             web_url,
             registration_disabled: flag("REGISTRATION_DISABLED")?,
+            owner_email: owner_email(var("OWNER_EMAIL"))?,
             mailer,
             webauthn,
         })
     }
+}
+
+/// `OWNER_EMAIL`, trimmed and lowercased like every sign-in email, so it matches in any case.
+fn owner_email(raw: Option<String>) -> Result<Option<String>, &'static str> {
+    raw.map(|e| socialreins_core::email::normalize(&e).ok_or("OWNER_EMAIL: not an email address"))
+        .transpose()
 }
 
 fn base_url(name: &str, value: Option<String>, default: &str) -> Result<String, String> {
@@ -147,6 +160,17 @@ mod tests {
         assert!(id("example.com").is_ok());
         assert!(id("other.com").is_err());
         assert!(id("ample.com").is_err());
+    }
+
+    #[test]
+    fn owner_email_is_normalized_and_checked() {
+        let owner = |v: &str| super::owner_email(Some(v.into()));
+        assert_eq!(
+            owner(" Me@Example.COM ").unwrap().as_deref(),
+            Some("me@example.com")
+        );
+        assert!(owner("not-an-email").is_err());
+        assert_eq!(super::owner_email(None).unwrap(), None);
     }
 
     #[test]
