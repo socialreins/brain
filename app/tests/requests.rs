@@ -1992,6 +1992,29 @@ mod teams {
 
     #[tokio::test]
     #[serial]
+    async fn concurrent_team_creations_stop_exactly_at_the_cap() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, cookie, id) = user(&s, &db).await;
+        // The test client is not Send, so the 15 requests interleave on one local task set.
+        let local = tokio::task::LocalSet::new();
+        let codes = local
+            .run_until(async {
+                let mut set = tokio::task::JoinSet::new();
+                for _ in 0..15 {
+                    let call =
+                        req(&s, Method::POST, "/v1/teams", &cookie).json(&json!({"name": "Race"}));
+                    set.spawn_local(async move { call.await.status_code().as_u16() });
+                }
+                set.join_all().await
+            })
+            .await;
+        assert_eq!(codes.iter().filter(|&&c| c == 201).count(), 10, "{codes:?}");
+        assert_eq!(codes.iter().filter(|&&c| c == 429).count(), 5, "{codes:?}");
+        assert_eq!(memberships(&db, id).await, 11, "personal team plus 10");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn team_names_are_bounded() {
         let (s, db) = server_where(|_| {}).await;
         let (_, cookie, _) = user(&s, &db).await;
