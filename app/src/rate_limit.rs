@@ -1,12 +1,16 @@
-//! Fixed-window counters per client network, plus the client IP extractor they key on.
-//! shortcut: in-process memory, so each replica counts on its own; move to Postgres or Redis
-//! once brain runs more than one instance.
+//! Rate limits and the client IP extractor they key on. `RateLimiter` is a fixed-window counter
+//! for short bursts. shortcut: in-process memory, so each replica counts on its own; move to
+//! Postgres or Redis once brain runs more than one instance. Daily caps (`daily_under`,
+//! `daily_record`) are counted in Postgres.
 use std::{
     collections::HashMap,
     convert::Infallible,
     hash::Hash,
     net::{IpAddr, Ipv6Addr, SocketAddr},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -15,7 +19,7 @@ use axum::{
     http::request::Parts,
 };
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement};
 
 use crate::state::AppState;
 
@@ -100,29 +104,24 @@ impl<K: Hash + Eq + Clone> RateLimiter<K> {
     }
 }
 
+/// When `prune_daily` last ran, in Unix seconds.
+static LAST_PRUNE: AtomicI64 = AtomicI64::new(0);
+
+fn bind(sql: &str, v: &str) -> Statement {
+    Statement::from_sql_and_values(DbBackend::Postgres, sql, [v.to_owned().into()])
+}
+
 /// Daily caps kept in Postgres (`rate_limit_hits`), so they hold across restarts and replicas,
-/// cannot be evicted, and do not reset when what they count is deleted. Counts one hit in every
-/// `(bucket, cap)` when none has reached its cap in the last 24 hours; false otherwise. The
-/// buckets are locked in sorted order, so concurrent calls cannot both pass a cap.
-pub async fn daily_allow(db: &DatabaseConnection, caps: &[(String, i64)]) -> Result<bool, DbErr> {
-    let stmt = |sql: &str, v: &str| {
-        Statement::from_sql_and_values(DbBackend::Postgres, sql, [v.to_owned().into()])
-    };
-    let mut caps = caps.to_vec();
-    caps.sort();
-    let txn = db.begin().await?;
-    txn.execute_unprepared(
-        "DELETE FROM rate_limit_hits WHERE created_at < now() - interval '1 day'",
-    )
-    .await?;
-    for (bucket, _) in &caps {
-        txn.execute_raw(stmt("SELECT pg_advisory_xact_lock(hashtext($1))", bucket))
-            .await?;
-    }
-    for (bucket, cap) in &caps {
+/// cannot be evicted, and do not reset when what they count is deleted. True when every
+/// `(bucket, cap)` has fewer than `cap` hits in the last 24 hours. Callers check first and
+/// `daily_record` once the action succeeded, so a failed action costs nothing.
+/// shortcut: check and record are not atomic, so concurrent requests can pass a cap by a few;
+/// fine for abuse caps, lock the buckets if one ever needs to be exact.
+pub async fn daily_under(db: &DatabaseConnection, caps: &[(String, i64)]) -> Result<bool, DbErr> {
+    for (bucket, cap) in caps {
         let sql = "SELECT count(*) AS n FROM rate_limit_hits \
                    WHERE bucket = $1 AND created_at > now() - interval '1 day'";
-        let n: i64 = match txn.query_one_raw(stmt(sql, bucket)).await? {
+        let n: i64 = match db.query_one_raw(bind(sql, bucket)).await? {
             Some(row) => row.try_get("", "n")?,
             None => 0,
         };
@@ -130,15 +129,29 @@ pub async fn daily_allow(db: &DatabaseConnection, caps: &[(String, i64)]) -> Res
             return Ok(false);
         }
     }
-    for (bucket, _) in &caps {
-        txn.execute_raw(stmt(
-            "INSERT INTO rate_limit_hits (bucket) VALUES ($1)",
-            bucket,
-        ))
-        .await?;
-    }
-    txn.commit().await?;
     Ok(true)
+}
+
+/// Counts one hit in each bucket, and prunes day-old hits at most once an hour.
+pub async fn daily_record(db: &DatabaseConnection, buckets: &[String]) -> Result<(), DbErr> {
+    for bucket in buckets {
+        let sql = "INSERT INTO rate_limit_hits (bucket) VALUES ($1)";
+        db.execute_raw(bind(sql, bucket)).await?;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let last = LAST_PRUNE.load(Ordering::Relaxed);
+    let due = now - last >= 3600;
+    if due
+        && LAST_PRUNE
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        let sql = "DELETE FROM rate_limit_hits WHERE created_at < now() - interval '1 day'";
+        if let Err(e) = db.execute_unprepared(sql).await {
+            tracing::warn!(error = %e, "rate limit prune failed");
+        }
+    }
+    Ok(())
 }
 
 /// The client address. With `TRUST_PROXY=true` (behind Railway's edge, the one trusted proxy)

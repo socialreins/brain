@@ -12,8 +12,9 @@ use axum::{
 };
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, SqlErr, TransactionTrait,
+    ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, DbErr,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, SqlErr, Statement,
+    TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use socialreins_core::{
@@ -32,14 +33,15 @@ use super::{
 };
 use crate::{
     models::{social_sets, team_invitations, team_user, teams, users},
-    rate_limit::daily_allow,
+    rate_limit::{daily_record, daily_under},
     state::AppState,
 };
 
 const INVITATION_DAYS: i64 = 7;
 /// Daily caps (`rate_limit::daily_allow`).
 const TEAMS_PER_DAY: i64 = 10;
-const INVITES_PER_EMAIL: i64 = 3;
+const INVITES_PER_TEAM_EMAIL: i64 = 3;
+const INVITES_PER_EMAIL: i64 = 20;
 const INVITES_PER_TEAM: i64 = 50;
 const INVITES_PER_INVITER: i64 = 50;
 
@@ -307,13 +309,17 @@ impl FromRequestParts<AppState> for InTeam {
 
 /// A live invitation for `email` exists, so a sign-in link may create the account even when
 /// registration is closed.
+/// Like `live_invitation`, the inviter must still be an owner or admin of the team.
 pub(crate) async fn invited(db: &DatabaseConnection, email: &str) -> Result<bool, DbErr> {
-    let live = team_invitations::Entity::find()
-        .filter(team_invitations::Column::Email.eq(email))
-        .filter(team_invitations::Column::ExpiresAt.gt(Utc::now().fixed_offset()))
-        .count(db)
-        .await?;
-    Ok(live > 0)
+    let sql = "SELECT EXISTS (SELECT 1 FROM team_invitations i JOIN team_user m \
+               ON m.team_id = i.team_id AND m.user_id = i.invited_by \
+               WHERE i.email = $1 AND i.expires_at > now() \
+               AND m.role IN ('owner', 'admin')) AS ok";
+    let stmt = Statement::from_sql_and_values(DbBackend::Postgres, sql, [email.into()]);
+    match db.query_one_raw(stmt).await? {
+        Some(row) => row.try_get("", "ok"),
+        None => Ok(false),
+    }
 }
 
 /// Creates a team with its Default set; the caller becomes its owner and switches to it. At
@@ -330,8 +336,8 @@ async fn create(
     let Some(name) = team::name(&body.name) else {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name");
     };
-    let caps = [(format!("team:create:{}", user.id), TEAMS_PER_DAY)];
-    match daily_allow(&app.db, &caps).await {
+    let bucket = format!("team:create:{}", user.id);
+    match daily_under(&app.db, &[(bucket.clone(), TEAMS_PER_DAY)]).await {
         Ok(true) => {}
         Ok(false) => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
         Err(e) => return internal(e, "team cap"),
@@ -339,7 +345,8 @@ async fn create(
     let made = async {
         let txn = app.db.begin().await?;
         let team = create_team(&txn, user.id, &name).await?;
-        txn.commit().await.map(|_| team)
+        txn.commit().await?;
+        daily_record(&app.db, &[bucket]).await.map(|_| team)
     };
     match made.await {
         Ok(team) => (StatusCode::CREATED, Json(team_json(&team, Role::Owner))).into_response(),
@@ -454,6 +461,16 @@ async fn destroy(
     let user_id = t.current.0.id;
     let deleted = async {
         let txn = app.db.begin().await?;
+        // The team row lock orders this against role changes (see `change_member`), so the
+        // owner check below cannot be stale.
+        teams::Entity::find_by_id(t.team.id)
+            .lock_exclusive()
+            .one(&txn)
+            .await?;
+        let owner = membership(&txn, t.team.id, user_id).await?;
+        if !owner.is_some_and(|m| role_of(&m) == Role::Owner) {
+            return Ok(Some((StatusCode::FORBIDDEN, "forbidden")));
+        }
         // Serializes this user's team deletes, so two at once cannot remove their last team.
         users::Entity::find_by_id(user_id)
             .lock_exclusive()
@@ -464,16 +481,16 @@ async fn destroy(
             .count(&txn)
             .await?;
         if teams < 2 {
-            return Ok(false);
+            return Ok(Some((StatusCode::CONFLICT, "last_team")));
         }
         // TODO tokens: API tokens are a polymorphic relation with no cascading foreign key, so
         // delete this team's tokens here explicitly once they exist.
         teams::Entity::delete_by_id(t.team.id).exec(&txn).await?;
-        txn.commit().await.map(|_| true)
+        txn.commit().await.map(|_| None)
     };
     match deleted.await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => reply(StatusCode::CONFLICT, "last_team"),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Some((status, code))) => reply(status, code),
         Err(e) => internal(e, "team delete"),
     }
 }
@@ -625,7 +642,7 @@ async fn remove(
 /// Invites an email to the current team as `admin` or `member` and emails a link to
 /// `{WEB_URL}/invitations/{token}`, valid 7 days, replacing a pending invitation of the same
 /// email. Owners and admins. At most 10 a minute and 50 a day per inviter, 50 a day per team,
-/// and 3 a day per email across all teams.
+/// 3 a day per email in one team and 20 a day per email overall.
 #[utoipa::path(post, path = "/team/invitations", tag = "teams", request_body = NewInvitation,
     responses((status = 201, body = Invitation), (status = 401, body = Error),
         (status = 403, body = Error), (status = 409, body = Error), (status = 422, body = Error),
@@ -661,14 +678,18 @@ async fn invite(
         Ok(_) => return reply(StatusCode::CONFLICT, "already_member"),
         Err(e) => return internal(e, "member lookup"),
     }
-    // Daily caps per recipient (across all teams), per team and per inviter, so neither many
-    // teams nor many inviters can flood one inbox.
+    // Daily caps per address in this team, per address overall (a ceiling high enough that
+    // throwaway teams cannot use it to block real invitations), per team and per inviter.
     let caps = [
+        (
+            format!("invite:team-email:{}:{email}", t.team.id),
+            INVITES_PER_TEAM_EMAIL,
+        ),
         (format!("invite:email:{email}"), INVITES_PER_EMAIL),
         (format!("invite:team:{}", t.team.id), INVITES_PER_TEAM),
         (format!("invite:user:{}", inviter.id), INVITES_PER_INVITER),
     ];
-    match daily_allow(&app.db, &caps).await {
+    match daily_under(&app.db, &caps).await {
         Ok(true) => {}
         Ok(false) => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
         Err(e) => return internal(e, "invitation cap"),
@@ -734,6 +755,11 @@ async fn invite(
             return internal(e, "invitation delete");
         }
         return reply(StatusCode::BAD_GATEWAY, "mail_failed");
+    }
+    // Only a sent invitation counts against the caps.
+    let buckets: Vec<String> = caps.into_iter().map(|(b, _)| b).collect();
+    if let Err(e) = daily_record(&app.db, &buckets).await {
+        return internal(e, "invitation cap record");
     }
     (StatusCode::CREATED, Json(invitation_json(row))).into_response()
 }
