@@ -34,6 +34,7 @@ pub struct AppState {
     pub web_origins: Vec<HeaderValue>,
     pub webauthn: Arc<Webauthn>,
     pub registration_disabled: bool,
+    pub owner_email: Option<String>,
     pub mailer: Mailer,
 }
 
@@ -54,6 +55,7 @@ impl AppState {
             web_origins: config.cors_origins.clone(),
             webauthn: config.webauthn.clone(),
             registration_disabled: config.registration_disabled,
+            owner_email: config.owner_email.clone(),
             mailer: config.mailer.clone(),
         }
     }

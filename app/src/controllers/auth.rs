@@ -152,16 +152,56 @@ pub(crate) async fn find_user(
         .await
 }
 
-/// A new account for `email` is allowed: registration is open, or closed
-/// (`REGISTRATION_DISABLED`) but this is the install's first account or an invited email.
-/// shortcut: two strangers racing for the first account on a closed install could both get one;
-/// lock or count in a transaction if that ever matters.
-async fn may_sign_up(app: &AppState, email: &str) -> Result<bool, DbErr> {
-    if !app.registration_disabled {
-        return Ok(true);
+/// Whether a new account for `email` may be created.
+enum SignUp {
+    Allowed,
+    /// Closed registration without `OWNER_EMAIL`: only if no account exists yet.
+    FirstOnly,
+    Refused,
+}
+
+/// Open registration admits anyone. Closed (`REGISTRATION_DISABLED`) admits `OWNER_EMAIL` and
+/// invited emails, or, with no `OWNER_EMAIL`, whoever signs up first.
+async fn sign_up(app: &AppState, email: &str) -> Result<SignUp, DbErr> {
+    if !app.registration_disabled
+        || app.owner_email.as_deref() == Some(email)
+        || teams::invited(&app.db, email).await?
+    {
+        return Ok(SignUp::Allowed);
     }
-    Ok(users::Entity::find().one(&app.db).await?.is_none()
-        || teams::invited(&app.db, email).await?)
+    Ok(match app.owner_email {
+        None => SignUp::FirstOnly,
+        Some(_) => SignUp::Refused,
+    })
+}
+
+/// `sign_up` as a yes or no, without the lock `create_first_user` takes: for deciding whether
+/// to send a link at all.
+async fn may_sign_up(app: &AppState, email: &str) -> Result<bool, DbErr> {
+    Ok(match sign_up(app, email).await? {
+        SignUp::Allowed => true,
+        SignUp::FirstOnly => users::Entity::find().one(&app.db).await?.is_none(),
+        SignUp::Refused => false,
+    })
+}
+
+/// `SignUp::FirstOnly`: creates the account only if none exists. The advisory lock makes
+/// concurrent first sign-ups take turns, so exactly one sees an empty `users` table.
+async fn create_first_user(app: &AppState, email: &str) -> Result<Option<users::Model>, DbErr> {
+    const FIRST_ACCOUNT_LOCK: i64 = 0x0053_5246_4952_5354; // "SRFIRST"
+    let txn = app.db.begin().await?;
+    txn.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT pg_advisory_xact_lock($1)",
+        [FIRST_ACCOUNT_LOCK.into()],
+    ))
+    .await?;
+    if users::Entity::find().one(&txn).await?.is_some() {
+        return Ok(None);
+    }
+    let user = create_user(&txn, email).await?;
+    txn.commit().await?;
+    Ok(Some(user))
 }
 
 /// Lands on `{WEB_URL}/login?error=...` when the link cannot be used.
@@ -236,13 +276,15 @@ async fn redeem(
     let user = match find_user(&app, &link.email).await {
         Ok(Some(user)) => user,
         Ok(None) => {
-            match may_sign_up(&app, &link.email).await {
-                Ok(true) => {}
-                Ok(false) => return refused(&app, "registration_disabled"),
+            let created = match sign_up(&app, &link.email).await {
+                Ok(SignUp::Allowed) => create_user(&app.db, &link.email).await.map(Some),
+                Ok(SignUp::FirstOnly) => create_first_user(&app, &link.email).await,
+                Ok(SignUp::Refused) => Ok(None),
                 Err(e) => return internal(e, "sign-up check"),
-            }
-            match create_user(&app, &link.email).await {
-                Ok(user) => user,
+            };
+            match created {
+                Ok(Some(user)) => user,
+                Ok(None) => return refused(&app, "registration_disabled"),
                 Err(e) => return internal(e, "user insert"),
             }
         }
@@ -340,7 +382,7 @@ impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for Body<T> {
     }
 }
 
-async fn create_user(app: &AppState, email: &str) -> Result<users::Model, sea_orm::DbErr> {
+async fn create_user(db: &impl ConnectionTrait, email: &str) -> Result<users::Model, DbErr> {
     let name = email.split('@').next().unwrap_or_default().to_owned();
     let row = users::ActiveModel {
         id: Set(uuid::Uuid::now_v7()),
@@ -351,9 +393,11 @@ async fn create_user(app: &AppState, email: &str) -> Result<users::Model, sea_or
     // Two links for one new email redeemed at once: the second insert is a no-op.
     users::Entity::insert(row)
         .on_conflict_do_nothing_on([users::Column::Email])
-        .exec_without_returning(&app.db)
+        .exec_without_returning(db)
         .await?;
-    find_user(app, email)
+    users::Entity::find()
+        .filter(users::Column::Email.eq(email))
+        .one(db)
         .await?
         .ok_or_else(|| sea_orm::DbErr::RecordNotFound("user vanished after insert".into()))
 }

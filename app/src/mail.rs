@@ -1,4 +1,4 @@
-//! Outgoing mail: Resend, any SMTP server, or the log (no mail configured, single-user self-host).
+//! Outgoing mail: Resend, any SMTP server, or the log (`MAIL_LOG=true`, single-user self-host).
 use std::time::Duration;
 
 use lettre::{message::Mailbox, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
@@ -7,7 +7,7 @@ const RESEND_API: &str = "https://api.resend.com/emails";
 
 #[derive(Clone)]
 pub enum Mailer {
-    /// No Resend or SMTP: each message, sign-in link included, is written to the log at info level.
+    /// `MAIL_LOG=true`: each message, sign-in link included, is written to the log at info level.
     Log,
     Smtp {
         transport: AsyncSmtpTransport<Tokio1Executor>,
@@ -60,7 +60,7 @@ impl Mailer {
                     to,
                     subject,
                     body,
-                    "no mail configured: logging mail instead of sending"
+                    "MAIL_LOG: logging mail instead of sending"
                 );
                 return Ok(());
             }

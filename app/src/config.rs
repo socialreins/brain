@@ -22,11 +22,13 @@ pub struct Config {
     /// `WEB_URL`: the web app's public base URL, where sign-in lands. An `http://` URL turns
     /// off the cookie's `Secure` flag for local dev. No trailing slash.
     pub web_url: String,
-    /// `REGISTRATION_DISABLED=true`: magic links create only the first account and invited ones;
-    /// existing users still sign in.
+    /// `REGISTRATION_DISABLED=true`: magic links create only `OWNER_EMAIL`'s account (or, with
+    /// no `OWNER_EMAIL`, the first account) and invited ones; existing users still sign in.
     pub registration_disabled: bool,
-    /// `RESEND_API_KEY`, else `SMTP_URL` (either needs `MAIL_FROM`), else the log, with a loud
-    /// warning at boot unless `MAIL_LOG=true` says that is intended.
+    /// `OWNER_EMAIL`, normalized: the one stranger a closed install still lets sign up.
+    pub owner_email: Option<String>,
+    /// `RESEND_API_KEY`, else `SMTP_URL` (either needs `MAIL_FROM`), else the log, which needs
+    /// `MAIL_LOG=true` so sign-in links never reach the log by accident.
     pub mailer: Mailer,
     /// WebAuthn relying party: `PASSKEY_RP_ID` (default: the host of `WEB_URL`) is the domain
     /// web and brain share, `PASSKEY_RP_ORIGIN` (default: the origin of `WEB_URL`) is where the
@@ -51,15 +53,14 @@ impl Config {
         let mailer = match (var("RESEND_API_KEY"), var("SMTP_URL")) {
             (Some(key), _) => Mailer::resend(&key, &from()?)?,
             (None, Some(url)) => Mailer::smtp(&url, &from()?)?,
+            (None, None) if flag("MAIL_LOG")? => Mailer::Log,
+            // Fail closed: a lost RESEND_API_KEY must not quietly put sign-in links in the log.
             (None, None) => {
-                if !flag("MAIL_LOG")? {
-                    tracing::warn!(
-                        "NO MAIL CONFIGURED: sign-in links are written to this log. Set \
-                         RESEND_API_KEY or SMTP_URL to send mail, or MAIL_LOG=true to keep \
-                         logging without this warning"
-                    );
-                }
-                Mailer::Log
+                return Err(
+                    "no mail configured: set RESEND_API_KEY or SMTP_URL, or MAIL_LOG=true \
+                            to write sign-in links to the log (single-user self-host)"
+                        .into(),
+                )
             }
         };
         let web_url = base_url("WEB_URL", var("WEB_URL"), "http://localhost:3000")?;
@@ -78,10 +79,17 @@ impl Config {
             brain_url: base_url("BRAIN_URL", var("BRAIN_URL"), "http://localhost:8080")?,
             web_url,
             registration_disabled: flag("REGISTRATION_DISABLED")?,
+            owner_email: owner_email(var("OWNER_EMAIL"))?,
             mailer,
             webauthn,
         })
     }
+}
+
+/// `OWNER_EMAIL`, trimmed and lowercased like every sign-in email, so it matches in any case.
+fn owner_email(raw: Option<String>) -> Result<Option<String>, &'static str> {
+    raw.map(|e| socialreins_core::email::normalize(&e).ok_or("OWNER_EMAIL: not an email address"))
+        .transpose()
 }
 
 fn base_url(name: &str, value: Option<String>, default: &str) -> Result<String, String> {
@@ -152,6 +160,17 @@ mod tests {
         assert!(id("example.com").is_ok());
         assert!(id("other.com").is_err());
         assert!(id("ample.com").is_err());
+    }
+
+    #[test]
+    fn owner_email_is_normalized_and_checked() {
+        let owner = |v: &str| super::owner_email(Some(v.into()));
+        assert_eq!(
+            owner(" Me@Example.COM ").unwrap().as_deref(),
+            Some("me@example.com")
+        );
+        assert!(owner("not-an-email").is_err());
+        assert_eq!(super::owner_email(None).unwrap(), None);
     }
 
     #[test]
