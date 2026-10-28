@@ -89,9 +89,10 @@ or leave (`409 last_owner`), and a user's last team cannot be deleted (`409 last
 Deleting a team needs a sign-in from the last 10 minutes or the password. Invitations email a
 link to `WEB_URL/invitations/{token}` that works once within 7 days, for the invited email only
 (`403 email_mismatch`); only its SHA-256 is stored. An invited email may sign up even with
-`REGISTRATION_DISABLED`. Each user sends at most 10 invitations a minute, each team 50 a day,
-and one address gets at most 3 a day from one team; re-inviting a pending address replaces its
-invitation. Team names are 1 to 60 characters. An invitation dies with its inviter's right to
+`REGISTRATION_DISABLED`. Each user sends at most 10 invitations a minute and 50 a day, each
+team 50 a day, and one address gets at most 3 a day across all teams; re-inviting a pending
+address replaces its invitation. Each user creates at most 10 teams a day. The daily caps are
+counted in Postgres (`rate_limit_hits`), so deletes and restarts do not reset them. Team names are 1 to 60 characters. An invitation dies with its inviter's right to
 invite: when they are removed, leave or drop below admin, theirs are deleted.
 
 ## Local development

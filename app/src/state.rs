@@ -1,6 +1,4 @@
-use std::{sync::Arc, time::Duration};
-
-const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+use std::sync::Arc;
 
 use axum::http::HeaderValue;
 use sea_orm::DatabaseConnection;
@@ -26,12 +24,9 @@ pub struct AppState {
     /// Per-user budget of failed password checks by a signed-in user (`PUT /auth/password`, the
     /// confirm on passkey registration). Keyed by user id, so outside traffic cannot drain it.
     pub account_limiter: Arc<RateLimiter<uuid::Uuid>>,
-    /// Per-user limit on `POST /v1/team/invitations`, each of which sends an email.
+    /// Per-user burst limit on `POST /v1/team/invitations`, each of which sends an email. The
+    /// daily caps live in Postgres (`rate_limit::daily_allow`).
     pub invitation_limiter: Arc<RateLimiter<uuid::Uuid>>,
-    /// Per-team daily cap on invitations sent.
-    pub team_invitation_limiter: Arc<RateLimiter<uuid::Uuid>>,
-    /// Per-team, per-recipient daily cap on invitations sent.
-    pub recipient_invitation_limiter: Arc<RateLimiter<(uuid::Uuid, String)>>,
     pub brain_url: String,
     pub web_url: String,
     /// `CORS_ORIGINS`: the web app's origins, the only ones that may call its state-changing
@@ -54,8 +49,6 @@ impl AppState {
             login_email_limiter: Arc::new(RateLimiter::per_minute(5)),
             account_limiter: Arc::new(RateLimiter::per_minute(5)),
             invitation_limiter: Arc::new(RateLimiter::per_minute(10)),
-            team_invitation_limiter: Arc::new(RateLimiter::new(50, DAY, 10_000)),
-            recipient_invitation_limiter: Arc::new(RateLimiter::new(3, DAY, 10_000)),
             brain_url: config.brain_url.clone(),
             web_url: config.web_url.clone(),
             web_origins: config.cors_origins.clone(),

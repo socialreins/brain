@@ -53,24 +53,19 @@ pub fn name(raw: &str) -> Option<String> {
     ok.then(|| name.to_owned())
 }
 
-/// `text` for a plain-text email, unable to pass as a link: `://` is dropped and a `.` between
-/// two letters or digits becomes `[.]`, so `evil.com` reads `evil[.]com`.
+/// `text` for a plain-text email, unable to pass as a link: every character other than a
+/// letter, a digit, a space, `_`, `'` or `-` becomes a space, so no dot of any script, slash or
+/// colon survives to form a domain or URL.
 pub fn inert(text: &str) -> String {
-    let text = text.replace("://", " ");
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    for (i, &c) in chars.iter().enumerate() {
-        let word = |j: Option<usize>| {
-            j.and_then(|j| chars.get(j))
-                .is_some_and(|c| c.is_alphanumeric())
-        };
-        if c == '.' && word(i.checked_sub(1)) && word(Some(i + 1)) {
-            out.push_str("[.]");
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    text.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || " _'-".contains(c) {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -81,10 +76,22 @@ mod tests {
     fn inert_names_cannot_pass_as_links() {
         assert_eq!(
             inert("https://evil.example/login"),
-            "https evil[.]example/login"
+            "https   evil example login"
         );
-        assert_eq!(inert("john.doe"), "john[.]doe");
-        assert_eq!(inert("Acme Inc. ..."), "Acme Inc. ...");
+        assert_eq!(inert("O'Brien-Smith Team_1"), "O'Brien-Smith Team_1");
+        assert_eq!(inert("Ünïcode 東京"), "Ünïcode 東京");
+        // ASCII, ideographic, fullwidth, halfwidth, one dot leader, small full stop, and others.
+        for dot in [
+            '.', '\u{3002}', '\u{FF0E}', '\u{FF61}', '\u{2024}', '\u{FE52}', '\u{00B7}',
+            '\u{0701}', '\u{2E3C}', '\u{FF1A}', '\u{FF0F}', '@',
+        ] {
+            assert_eq!(
+                inert(&format!("evil{dot}com")),
+                "evil com",
+                "U+{:04X}",
+                dot as u32
+            );
+        }
     }
 
     #[test]

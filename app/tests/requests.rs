@@ -1812,6 +1812,73 @@ mod teams {
 
     #[tokio::test]
     #[serial]
+    async fn daily_invitation_caps_span_teams_and_restarts() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, a, _) = user(&s, &db).await;
+        let (_, b, _) = user(&s, &db).await;
+        let invite = |s: &TestServer, cookie: &str, email: &str| {
+            req(s, Method::POST, "/v1/team/invitations", cookie)
+                .json(&json!({"email": email, "role": "member"}))
+        };
+        // One address, three different teams (two owners, one with a second team): 3 a day.
+        let target = unique_email();
+        assert_eq!(invite(&s, &a, &target).await.status_code(), 201);
+        assert_eq!(invite(&s, &b, &target).await.status_code(), 201);
+        req(&s, Method::POST, "/v1/teams", &b)
+            .json(&json!({"name": "Second"}))
+            .await
+            .assert_status(axum::http::StatusCode::CREATED);
+        assert_eq!(invite(&s, &b, &target).await.status_code(), 201);
+        let res = invite(&s, &a, &target).await;
+        assert_eq!(res.status_code(), 429);
+        res.assert_json(&json!({"error": "rate_limited"}));
+
+        // One inviter: 50 a day, across teams and across fresh servers (fresh memory limiters).
+        let mut sent = 1;
+        for round in 0..5 {
+            let (s, _) = server_where(|_| {}).await;
+            if round == 2 {
+                req(&s, Method::POST, "/v1/teams", &a)
+                    .json(&json!({"name": "Other"}))
+                    .await
+                    .assert_status(axum::http::StatusCode::CREATED);
+            }
+            for _ in 0..10 {
+                if sent == 50 {
+                    break;
+                }
+                assert_eq!(invite(&s, &a, &unique_email()).await.status_code(), 201);
+                sent += 1;
+            }
+        }
+        let (s, _) = server_where(|_| {}).await;
+        assert_eq!(invite(&s, &a, &unique_email()).await.status_code(), 429);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_user_creates_at_most_10_teams_a_day() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, cookie, _) = user(&s, &db).await;
+        let create = |s: &TestServer| {
+            req(s, Method::POST, "/v1/teams", &cookie).json(&json!({"name": "Spam"}))
+        };
+        for _ in 0..10 {
+            assert_eq!(create(&s).await.status_code(), 201);
+        }
+        // Deleting a team does not give its slot back, and a restart does not reset the count.
+        req(&s, Method::DELETE, "/v1/team", &cookie)
+            .json(&json!({}))
+            .await
+            .assert_status(axum::http::StatusCode::NO_CONTENT);
+        let (s, _) = server_where(|_| {}).await;
+        let res = create(&s).await;
+        assert_eq!(res.status_code(), 429);
+        res.assert_json(&json!({"error": "rate_limited"}));
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn team_names_are_bounded() {
         let (s, db) = server_where(|_| {}).await;
         let (_, cookie, _) = user(&s, &db).await;

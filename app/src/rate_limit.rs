@@ -15,6 +15,8 @@ use axum::{
     http::request::Parts,
 };
 
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait};
+
 use crate::state::AppState;
 
 /// Most networks tracked at once; past it the oldest window is evicted, so memory stays bounded.
@@ -96,6 +98,47 @@ impl<K: Hash + Eq + Clone> RateLimiter<K> {
     pub fn tracked(&self) -> usize {
         self.hits.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
+}
+
+/// Daily caps kept in Postgres (`rate_limit_hits`), so they hold across restarts and replicas,
+/// cannot be evicted, and do not reset when what they count is deleted. Counts one hit in every
+/// `(bucket, cap)` when none has reached its cap in the last 24 hours; false otherwise. The
+/// buckets are locked in sorted order, so concurrent calls cannot both pass a cap.
+pub async fn daily_allow(db: &DatabaseConnection, caps: &[(String, i64)]) -> Result<bool, DbErr> {
+    let stmt = |sql: &str, v: &str| {
+        Statement::from_sql_and_values(DbBackend::Postgres, sql, [v.to_owned().into()])
+    };
+    let mut caps = caps.to_vec();
+    caps.sort();
+    let txn = db.begin().await?;
+    txn.execute_unprepared(
+        "DELETE FROM rate_limit_hits WHERE created_at < now() - interval '1 day'",
+    )
+    .await?;
+    for (bucket, _) in &caps {
+        txn.execute_raw(stmt("SELECT pg_advisory_xact_lock(hashtext($1))", bucket))
+            .await?;
+    }
+    for (bucket, cap) in &caps {
+        let sql = "SELECT count(*) AS n FROM rate_limit_hits \
+                   WHERE bucket = $1 AND created_at > now() - interval '1 day'";
+        let n: i64 = match txn.query_one_raw(stmt(sql, bucket)).await? {
+            Some(row) => row.try_get("", "n")?,
+            None => 0,
+        };
+        if n >= *cap {
+            return Ok(false);
+        }
+    }
+    for (bucket, _) in &caps {
+        txn.execute_raw(stmt(
+            "INSERT INTO rate_limit_hits (bucket) VALUES ($1)",
+            bucket,
+        ))
+        .await?;
+    }
+    txn.commit().await?;
+    Ok(true)
 }
 
 /// The client address. With `TRUST_PROXY=true` (behind Railway's edge, the one trusted proxy)

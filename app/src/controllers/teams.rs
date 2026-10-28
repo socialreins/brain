@@ -32,10 +32,16 @@ use super::{
 };
 use crate::{
     models::{social_sets, team_invitations, team_user, teams, users},
+    rate_limit::daily_allow,
     state::AppState,
 };
 
 const INVITATION_DAYS: i64 = 7;
+/// Daily caps (`rate_limit::daily_allow`).
+const TEAMS_PER_DAY: i64 = 10;
+const INVITES_PER_EMAIL: i64 = 3;
+const INVITES_PER_TEAM: i64 = 50;
+const INVITES_PER_INVITER: i64 = 50;
 
 #[derive(Serialize, ToSchema)]
 pub struct Team {
@@ -310,10 +316,11 @@ pub(crate) async fn invited(db: &DatabaseConnection, email: &str) -> Result<bool
     Ok(live > 0)
 }
 
-/// Creates a team with its Default set; the caller becomes its owner and switches to it.
+/// Creates a team with its Default set; the caller becomes its owner and switches to it. At
+/// most 10 a day per user.
 #[utoipa::path(post, path = "/teams", tag = "teams", request_body = TeamName,
     responses((status = 201, body = Team), (status = 401, body = Error),
-        (status = 403, body = Error), (status = 422, body = Error)))]
+        (status = 403, body = Error), (status = 422, body = Error), (status = 429, body = Error)))]
 async fn create(
     _: FromWeb,
     State(app): State<AppState>,
@@ -323,6 +330,12 @@ async fn create(
     let Some(name) = team::name(&body.name) else {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name");
     };
+    let caps = [(format!("team:create:{}", user.id), TEAMS_PER_DAY)];
+    match daily_allow(&app.db, &caps).await {
+        Ok(true) => {}
+        Ok(false) => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+        Err(e) => return internal(e, "team cap"),
+    }
     let made = async {
         let txn = app.db.begin().await?;
         let team = create_team(&txn, user.id, &name).await?;
@@ -611,8 +624,8 @@ async fn remove(
 
 /// Invites an email to the current team as `admin` or `member` and emails a link to
 /// `{WEB_URL}/invitations/{token}`, valid 7 days, replacing a pending invitation of the same
-/// email. Owners and admins. At most 10 a minute per user, 50 a day per team and 3 a day per
-/// email in one team.
+/// email. Owners and admins. At most 10 a minute and 50 a day per inviter, 50 a day per team,
+/// and 3 a day per email across all teams.
 #[utoipa::path(post, path = "/team/invitations", tag = "teams", request_body = NewInvitation,
     responses((status = 201, body = Invitation), (status = 401, body = Error),
         (status = 403, body = Error), (status = 409, body = Error), (status = 422, body = Error),
@@ -648,14 +661,17 @@ async fn invite(
         Ok(_) => return reply(StatusCode::CONFLICT, "already_member"),
         Err(e) => return internal(e, "member lookup"),
     }
-    // Caps mail per team and per recipient, so a team cannot be used to flood an inbox. Both
-    // are counted in memory, so revoking and re-inviting does not reset them.
-    if !app.team_invitation_limiter.hit(t.team.id)
-        || !app
-            .recipient_invitation_limiter
-            .hit((t.team.id, email.clone()))
-    {
-        return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    // Daily caps per recipient (across all teams), per team and per inviter, so neither many
+    // teams nor many inviters can flood one inbox.
+    let caps = [
+        (format!("invite:email:{email}"), INVITES_PER_EMAIL),
+        (format!("invite:team:{}", t.team.id), INVITES_PER_TEAM),
+        (format!("invite:user:{}", inviter.id), INVITES_PER_INVITER),
+    ];
+    match daily_allow(&app.db, &caps).await {
+        Ok(true) => {}
+        Ok(false) => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+        Err(e) => return internal(e, "invitation cap"),
     }
     let now = Utc::now().fixed_offset();
     let swept = team_invitations::Entity::delete_many()
