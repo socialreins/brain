@@ -74,14 +74,13 @@ async fn request_link(
 
 /// Errors carry the failure only, never the email or the token.
 async fn send_link(app: &AppState, email: String) -> Result<(), String> {
-    if app.registration_disabled
+    if !may_sign_up(app, &email)
+        .await
+        .map_err(|e| format!("sign-up check: {e}"))?
         && find_user(app, &email)
             .await
             .map_err(|e| format!("user lookup: {e}"))?
             .is_none()
-        && !teams::invited(&app.db, &email)
-            .await
-            .map_err(|e| format!("invitation lookup: {e}"))?
     {
         return Ok(());
     }
@@ -151,6 +150,18 @@ pub(crate) async fn find_user(
         .filter(users::Column::Email.eq(email))
         .one(&app.db)
         .await
+}
+
+/// A new account for `email` is allowed: registration is open, or closed
+/// (`REGISTRATION_DISABLED`) but this is the install's first account or an invited email.
+/// shortcut: two strangers racing for the first account on a closed install could both get one;
+/// lock or count in a transaction if that ever matters.
+async fn may_sign_up(app: &AppState, email: &str) -> Result<bool, DbErr> {
+    if !app.registration_disabled {
+        return Ok(true);
+    }
+    Ok(users::Entity::find().one(&app.db).await?.is_none()
+        || teams::invited(&app.db, email).await?)
 }
 
 /// Lands on `{WEB_URL}/login?error=...` when the link cannot be used.
@@ -225,13 +236,10 @@ async fn redeem(
     let user = match find_user(&app, &link.email).await {
         Ok(Some(user)) => user,
         Ok(None) => {
-            // Closed registration still lets an invited email in.
-            if app.registration_disabled {
-                match teams::invited(&app.db, &link.email).await {
-                    Ok(true) => {}
-                    Ok(false) => return refused(&app, "registration_disabled"),
-                    Err(e) => return internal(e, "invitation lookup"),
-                }
+            match may_sign_up(&app, &link.email).await {
+                Ok(true) => {}
+                Ok(false) => return refused(&app, "registration_disabled"),
+                Err(e) => return internal(e, "sign-up check"),
             }
             match create_user(&app, &link.email).await {
                 Ok(user) => user,

@@ -852,6 +852,39 @@ mod auth {
             .contains("PUT"));
     }
 
+    /// A closed install still lets its first account in, then no stranger after it. Runs on a
+    /// throwaway database because the shared test database already has users.
+    #[tokio::test]
+    #[serial]
+    async fn closed_registration_admits_only_the_first_account() {
+        use sea_orm::ConnectionTrait;
+        let base = Config::from_env().unwrap().database_url;
+        let name = format!("brain_first_{}", uuid::Uuid::now_v7().simple());
+        let admin = sea_orm::Database::connect(&base).await.unwrap();
+        admin
+            .execute_unprepared(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap();
+        let url = format!("{}/{name}", &base[..base.rfind('/').unwrap()]);
+        let (s, db) = server_where(|c| {
+            c.database_url = url;
+            c.registration_disabled = true;
+        })
+        .await;
+        let first = unique_email();
+        let (_, cookie) = open(&s, &link(&db, &first, Duration::minutes(15)).await).await;
+        assert!(cookie.is_some(), "the first account signs up");
+        let second = unique_email();
+        let (to, cookie) = open(&s, &link(&db, &second, Duration::minutes(15)).await).await;
+        assert!(to.ends_with("/login?error=registration_disabled"));
+        assert!(cookie.is_none() && user(&db, &second).await.is_none());
+        db.close().await.unwrap();
+        admin
+            .execute_unprepared(&format!("DROP DATABASE {name}"))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     #[serial]
     async fn registration_disabled_does_not_change_password_login() {
