@@ -33,7 +33,7 @@ use super::{
 };
 use crate::{
     models::{social_sets, team_invitations, team_user, teams, users},
-    rate_limit::{daily_record, daily_under},
+    rate_limit::{daily_refund, daily_reserve},
     state::AppState,
 };
 
@@ -336,21 +336,23 @@ async fn create(
     let Some(name) = team::name(&body.name) else {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name");
     };
-    let bucket = format!("team:create:{}", user.id);
-    match daily_under(&app.db, &[(bucket.clone(), TEAMS_PER_DAY)]).await {
-        Ok(true) => {}
-        Ok(false) => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+    let caps = [(format!("team:create:{}", user.id), TEAMS_PER_DAY)];
+    let reserved = match daily_reserve(&app.db, &caps).await {
+        Ok(Some(ids)) => ids,
+        Ok(None) => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
         Err(e) => return internal(e, "team cap"),
-    }
+    };
     let made = async {
         let txn = app.db.begin().await?;
         let team = create_team(&txn, user.id, &name).await?;
-        txn.commit().await?;
-        daily_record(&app.db, &[bucket]).await.map(|_| team)
+        txn.commit().await.map(|_| team)
     };
     match made.await {
         Ok(team) => (StatusCode::CREATED, Json(team_json(&team, Role::Owner))).into_response(),
-        Err(e) => internal(e, "team insert"),
+        Err(e) => {
+            daily_refund(&app.db, &reserved).await;
+            internal(e, "team insert")
+        }
     }
 }
 
@@ -689,11 +691,22 @@ async fn invite(
         (format!("invite:team:{}", t.team.id), INVITES_PER_TEAM),
         (format!("invite:user:{}", inviter.id), INVITES_PER_INVITER),
     ];
-    match daily_under(&app.db, &caps).await {
-        Ok(true) => {}
-        Ok(false) => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+    let reserved = match daily_reserve(&app.db, &caps).await {
+        Ok(Some(ids)) => ids,
+        Ok(None) => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
         Err(e) => return internal(e, "invitation cap"),
+    };
+    // Only a sent invitation counts against the caps.
+    let res = send_invitation(&app, &t, email, role).await;
+    if res.status() != StatusCode::CREATED {
+        daily_refund(&app.db, &reserved).await;
     }
+    res
+}
+
+/// Stores the invitation (replacing a pending one for the address) and emails its link; `201`
+/// with the invitation, or the error reply.
+async fn send_invitation(app: &AppState, t: &InTeam, email: String, role: Role) -> Response {
     let now = Utc::now().fixed_offset();
     let swept = team_invitations::Entity::delete_many()
         .filter(team_invitations::Column::ExpiresAt.lt(now))
@@ -709,7 +722,7 @@ async fn invite(
         email: Set(email.clone()),
         role: Set(role.as_str().into()),
         token_hash: Set(token::hash(&secret)),
-        invited_by: Set(Some(inviter.id)),
+        invited_by: Set(Some(t.current.0.id)),
         expires_at: Set(now + Duration::days(INVITATION_DAYS)),
         ..Default::default()
     };
@@ -740,7 +753,7 @@ async fn invite(
         "{} invited you to join the team \"{}\" on SocialReins as {}.\n\nOpen this link to \
          accept:\n\n{url}\n\nIt expires in {INVITATION_DAYS} days. If you did not expect it, \
          ignore this email.\n",
-        team::inert(&inviter.name),
+        team::inert(&t.current.0.name),
         team::inert(&t.team.name),
         role.as_str()
     );
@@ -755,11 +768,6 @@ async fn invite(
             return internal(e, "invitation delete");
         }
         return reply(StatusCode::BAD_GATEWAY, "mail_failed");
-    }
-    // Only a sent invitation counts against the caps.
-    let buckets: Vec<String> = caps.into_iter().map(|(b, _)| b).collect();
-    if let Err(e) = daily_record(&app.db, &buckets).await {
-        return internal(e, "invitation cap record");
     }
     (StatusCode::CREATED, Json(invitation_json(row))).into_response()
 }

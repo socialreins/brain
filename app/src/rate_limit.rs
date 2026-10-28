@@ -1,7 +1,7 @@
 //! Rate limits and the client IP extractor they key on. `RateLimiter` is a fixed-window counter
 //! for short bursts. shortcut: in-process memory, so each replica counts on its own; move to
-//! Postgres or Redis once brain runs more than one instance. Daily caps (`daily_under`,
-//! `daily_record`) are counted in Postgres.
+//! Postgres or Redis once brain runs more than one instance. Daily caps (`daily_reserve`,
+//! `daily_refund`) are counted in Postgres.
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -19,7 +19,7 @@ use axum::{
     http::request::Parts,
 };
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait};
 
 use crate::state::AppState;
 
@@ -112,32 +112,62 @@ fn bind(sql: &str, v: &str) -> Statement {
 }
 
 /// Daily caps kept in Postgres (`rate_limit_hits`), so they hold across restarts and replicas,
-/// cannot be evicted, and do not reset when what they count is deleted. True when every
-/// `(bucket, cap)` has fewer than `cap` hits in the last 24 hours. Callers check first and
-/// `daily_record` once the action succeeded, so a failed action costs nothing.
-/// shortcut: check and record are not atomic, so concurrent requests can pass a cap by a few;
-/// fine for abuse caps, lock the buckets if one ever needs to be exact.
-pub async fn daily_under(db: &DatabaseConnection, caps: &[(String, i64)]) -> Result<bool, DbErr> {
-    for (bucket, cap) in caps {
+/// cannot be evicted, and do not reset when what they count is deleted. Reserves one hit in
+/// every `(bucket, cap)` when each has fewer than `cap` hits in the last 24 hours, and returns
+/// the reserved row ids; `None` when one is at its cap. The buckets are locked in sorted order
+/// for the count and insert, so concurrent requests cannot pass a cap. A caller whose action
+/// then fails gives the hits back with `daily_refund`, so only completed actions count.
+pub async fn daily_reserve(
+    db: &DatabaseConnection,
+    caps: &[(String, i64)],
+) -> Result<Option<Vec<i64>>, DbErr> {
+    let mut caps = caps.to_vec();
+    caps.sort();
+    let txn = db.begin().await?;
+    for (bucket, _) in &caps {
+        let sql = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
+        txn.execute_raw(bind(sql, bucket)).await?;
+    }
+    for (bucket, cap) in &caps {
         let sql = "SELECT count(*) AS n FROM rate_limit_hits \
                    WHERE bucket = $1 AND created_at > now() - interval '1 day'";
-        let n: i64 = match db.query_one_raw(bind(sql, bucket)).await? {
+        let n: i64 = match txn.query_one_raw(bind(sql, bucket)).await? {
             Some(row) => row.try_get("", "n")?,
             None => 0,
         };
         if n >= *cap {
-            return Ok(false);
+            return Ok(None);
         }
     }
-    Ok(true)
+    let mut ids = Vec::with_capacity(caps.len());
+    for (bucket, _) in &caps {
+        let sql = "INSERT INTO rate_limit_hits (bucket) VALUES ($1) RETURNING id";
+        if let Some(row) = txn.query_one_raw(bind(sql, bucket)).await? {
+            ids.push(row.try_get("", "id")?);
+        }
+    }
+    txn.commit().await?;
+    prune_daily(db).await;
+    Ok(Some(ids))
 }
 
-/// Counts one hit in each bucket, and prunes day-old hits at most once an hour.
-pub async fn daily_record(db: &DatabaseConnection, buckets: &[String]) -> Result<(), DbErr> {
-    for bucket in buckets {
-        let sql = "INSERT INTO rate_limit_hits (bucket) VALUES ($1)";
-        db.execute_raw(bind(sql, bucket)).await?;
+/// Gives back hits from `daily_reserve` after the action failed. Logged, not returned: a lost
+/// refund only costs the caller one slot until it ages out.
+pub async fn daily_refund(db: &DatabaseConnection, ids: &[i64]) {
+    for &id in ids {
+        let stmt = Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "DELETE FROM rate_limit_hits WHERE id = $1",
+            [id.into()],
+        );
+        if let Err(e) = db.execute_raw(stmt).await {
+            tracing::warn!(error = %e, "rate limit refund failed");
+        }
     }
+}
+
+/// Deletes day-old hits, at most once an hour per process, outside any caller's transaction.
+async fn prune_daily(db: &DatabaseConnection) {
     let now = chrono::Utc::now().timestamp();
     let last = LAST_PRUNE.load(Ordering::Relaxed);
     let due = now - last >= 3600;
@@ -151,7 +181,6 @@ pub async fn daily_record(db: &DatabaseConnection, buckets: &[String]) -> Result
             tracing::warn!(error = %e, "rate limit prune failed");
         }
     }
-    Ok(())
 }
 
 /// The client address. With `TRUST_PROXY=true` (behind Railway's edge, the one trusted proxy)
