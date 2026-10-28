@@ -19,7 +19,7 @@ tokio = { version = "1.45", default-features = false, features = ["rt-multi-thre
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-utoipa = { version = "6", features = ["uuid"] }
+utoipa = { version = "6", features = ["uuid", "chrono"] }
 utoipa-axum = "0.3"
 uuid = { version = "1", features = ["v7"] }
 webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation", "conditional-ui"] }

@@ -41,6 +41,14 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | POST | `/auth/passkeys/login/finish` | `{"challenge_id","credential"}`: sets the session cookie, returns the user |
 | GET | `/auth/passkeys` | The signed-in user's passkeys |
 | DELETE | `/auth/passkeys/{id}` | Deletes one of the signed-in user's passkeys, `204`, else `404` |
+| POST, GET | `/v1/teams` | Create a team (`{"name"}`, with its Default set; caller owns it and switches to it), or list mine |
+| PUT | `/v1/current-team` | `{"team_id"}`: switch to one of my teams |
+| GET, PATCH, DELETE | `/v1/team` | The current team; rename it (owner, admin); delete it (owner, `{}` or `{"password"}`) |
+| GET | `/v1/team/members` | The current team's members |
+| PATCH, DELETE | `/v1/team/members/{user_id}` | `{"role"}`: change a role (owner, admin); remove a member, or leave |
+| POST, GET | `/v1/team/invitations` | `{"email","role"}`: invite as `admin` or `member` (owner, admin); list pending |
+| DELETE | `/v1/team/invitations/{id}` | Withdraw an invitation (owner, admin) |
+| GET, POST | `/v1/invitations/{token}` | Public preview of an invitation; accept it as the signed-in invited email |
 
 `POST /v1/waitlist` answers `200 {"status":"ok"}` for a new email and for one already on the
 list, so it never reveals who signed up. A bad email gets `422 {"error":"invalid_email"}`. Each
@@ -72,6 +80,20 @@ Passkeys use WebAuthn through the web app's pages: each `start` keeps the ceremo
 Postgres for 5 minutes and the matching `finish` uses it once. The state-changing endpoints in
 this section only accept requests whose `Origin` (or `Referer`) is one of `CORS_ORIGINS`, else
 `403 {"error":"forbidden_origin"}`.
+
+Teams: every sign-in gives a user with no team a personal team, owned by them, with its Default
+social set. The team routes use the session cookie, and the state-changing ones the same origin
+check. They only reach the caller's own teams: anything else is `404 {"error":"not_found"}`,
+and a role that may not act gets `403 {"error":"forbidden"}`. The last owner cannot be demoted
+or leave (`409 last_owner`), and a user's last team cannot be deleted (`409 last_team`).
+Deleting a team needs a sign-in from the last 10 minutes or the password. Invitations email a
+link to `WEB_URL/invitations/{token}` that works once within 7 days, for the invited email only
+(`403 email_mismatch`); only its SHA-256 is stored. An invited email may sign up even with
+`REGISTRATION_DISABLED`. Each user sends at most 10 invitations a minute and 50 a day, each
+team 50 a day, and one address gets at most 3 a day from one team and 20 a day overall; only
+sent invitations count. Re-inviting a pending address replaces its invitation. Each user creates at most 10 teams a day. The daily caps are
+counted in Postgres (`rate_limit_hits`), so deletes and restarts do not reset them. Team names are 1 to 60 characters. An invitation dies with its inviter's right to
+invite: when they are removed, leave or drop below admin, theirs are deleted.
 
 ## Local development
 

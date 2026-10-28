@@ -28,8 +28,9 @@ pub struct Status {
 
 #[derive(Serialize, ToSchema)]
 pub struct Error {
-    /// `invalid_json`, `invalid_body`, `unsupported_media_type`, `payload_too_large`,
-    /// `invalid_email`, `invalid_source`, `rate_limited`, or `internal`.
+    /// A machine-readable code. Every route may answer `invalid_json`, `invalid_body`,
+    /// `unsupported_media_type`, `payload_too_large` or `internal`; the others are per route,
+    /// e.g. `invalid_email`, `rate_limited`, `unauthorized`, `forbidden_origin`, `not_found`.
     pub error: String,
 }
 

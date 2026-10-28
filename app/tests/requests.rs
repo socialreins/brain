@@ -1099,3 +1099,929 @@ mod auth {
         }
     }
 }
+
+mod teams {
+    use super::*;
+    use axum::http::Method;
+    use axum_test::TestRequest;
+    use chrono::{Duration, Utc};
+    use sea_orm::{ActiveValue::Set, DatabaseConnection};
+    use socialreins_brain::models::{sessions, social_sets, team_invitations, team_user, users};
+    use socialreins_core::token;
+
+    const WEB: &str = "http://localhost:3000";
+
+    async fn server_where(edit: impl FnOnce(&mut Config)) -> (TestServer, DatabaseConnection) {
+        let mut config = Config::from_env().expect("DATABASE_URL must point at a test Postgres");
+        // Lets `sign_in` spread over client IPs, so making many users stays under the link limit.
+        config.trust_proxy = true;
+        edit(&mut config);
+        let db = connect(&config).await.expect("database reachable");
+        let app = controllers::router(AppState::new(db.clone(), &config), &config);
+        (TestServer::new(app).unwrap(), db)
+    }
+
+    /// Signs `email` in by link (creating the account), returning the `sr_session=...` cookie.
+    async fn sign_in(s: &TestServer, db: &DatabaseConnection, email: &str) -> Option<String> {
+        let secret = token::new();
+        let b = token::new().into_bytes();
+        let row = socialreins_brain::models::magic_links::ActiveModel {
+            token_hash: Set(token::hash(&secret)),
+            email: Set(email.into()),
+            expires_at: Set((Utc::now() + Duration::minutes(15)).fixed_offset()),
+            ..Default::default()
+        };
+        socialreins_brain::models::magic_links::Entity::insert(row)
+            .exec_without_returning(db)
+            .await
+            .unwrap();
+        let res = s
+            .post("/auth/magic")
+            .add_header("origin", "http://localhost:8080")
+            .add_header("x-forwarded-for", format!("10.{}.{}.{}", b[0], b[1], b[2]))
+            .form(&[("token", secret.as_str())])
+            .await;
+        res.maybe_header("set-cookie")
+            .map(|c| c.to_str().unwrap().split(';').next().unwrap().to_owned())
+    }
+
+    /// A new signed-in user: (email, cookie, user id).
+    async fn user(s: &TestServer, db: &DatabaseConnection) -> (String, String, uuid::Uuid) {
+        let email = unique_email();
+        let cookie = sign_in(s, db, &email).await.unwrap();
+        let me = s.get("/auth/me").add_header("cookie", &cookie).await;
+        let id = me.json::<Value>()["id"].as_str().unwrap().parse().unwrap();
+        (email, cookie, id)
+    }
+
+    /// A request from the web app with `cookie`.
+    fn req(s: &TestServer, method: Method, path: &str, cookie: &str) -> TestRequest {
+        s.method(method, path)
+            .add_header("origin", WEB)
+            .add_header("cookie", cookie.to_owned())
+    }
+
+    async fn current(s: &TestServer, cookie: &str) -> Value {
+        let res = s
+            .get("/v1/team")
+            .add_header("cookie", cookie.to_owned())
+            .await;
+        res.assert_status_ok();
+        res.json()
+    }
+
+    async fn memberships(db: &DatabaseConnection, user_id: uuid::Uuid) -> u64 {
+        team_user::Entity::find()
+            .filter(team_user::Column::UserId.eq(user_id))
+            .count(db)
+            .await
+            .unwrap()
+    }
+
+    /// Stores an invitation the way `POST /v1/team/invitations` does and returns its token.
+    async fn invitation(
+        db: &DatabaseConnection,
+        team_id: &str,
+        email: &str,
+        role: &str,
+        inviter: Option<uuid::Uuid>,
+        valid_for: Duration,
+    ) -> String {
+        let secret = token::new();
+        let row = team_invitations::ActiveModel {
+            id: Set(uuid::Uuid::now_v7()),
+            team_id: Set(team_id.parse().unwrap()),
+            email: Set(email.into()),
+            role: Set(role.into()),
+            token_hash: Set(token::hash(&secret)),
+            invited_by: Set(inviter),
+            expires_at: Set((Utc::now() + valid_for).fixed_offset()),
+            ..Default::default()
+        };
+        team_invitations::Entity::insert(row)
+            .exec_without_returning(db)
+            .await
+            .unwrap();
+        secret
+    }
+
+    /// A new user who joined `team_id` with `role`: (cookie, user id).
+    async fn joined(
+        s: &TestServer,
+        db: &DatabaseConnection,
+        team_id: &str,
+        role: &str,
+    ) -> (String, uuid::Uuid) {
+        let (email, cookie, id) = user(s, db).await;
+        let owner = team_user::Entity::find()
+            .filter(team_user::Column::TeamId.eq(team_id.parse::<uuid::Uuid>().unwrap()))
+            .filter(team_user::Column::Role.eq("owner"))
+            .one(db)
+            .await
+            .unwrap()
+            .map(|m| m.user_id);
+        let secret = invitation(db, team_id, &email, role, owner, Duration::days(7)).await;
+        let res = req(
+            s,
+            Method::POST,
+            &format!("/v1/invitations/{secret}"),
+            &cookie,
+        )
+        .await;
+        res.assert_status_ok();
+        (cookie, id)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn first_sign_in_makes_one_personal_team_with_a_default_set() {
+        let (s, db) = server_where(|_| {}).await;
+        let email = unique_email();
+        // Two links of one new user redeemed at once still make one team.
+        let (a, b) = tokio::join!(sign_in(&s, &db, &email), sign_in(&s, &db, &email));
+        let cookie = a.or(b).unwrap();
+        sign_in(&s, &db, &email).await.unwrap();
+        let me = s.get("/auth/me").add_header("cookie", &cookie).await;
+        let me = me.json::<Value>();
+        let team = &me["current_team"];
+        assert_eq!(team["role"], "owner", "{me}");
+        let id: uuid::Uuid = me["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(memberships(&db, id).await, 1);
+        let row = users::Entity::find_by_id(id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.current_team_id.unwrap().to_string(), team["id"]);
+        let team_id: uuid::Uuid = team["id"].as_str().unwrap().parse().unwrap();
+        let sets = social_sets::Entity::find()
+            .filter(social_sets::Column::TeamId.eq(team_id))
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(sets.len(), 1);
+        assert!(sets[0].is_default && sets[0].name == "Default");
+        // The partial unique index allows one Default set per team.
+        let second = social_sets::ActiveModel {
+            id: Set(uuid::Uuid::now_v7()),
+            team_id: Set(team_id),
+            name: Set("Other".into()),
+            is_default: Set(true),
+            ..Default::default()
+        };
+        assert!(social_sets::Entity::insert(second)
+            .exec_without_returning(&db)
+            .await
+            .is_err());
+        let list = s.get("/v1/teams").add_header("cookie", &cookie).await;
+        assert_eq!(list.json::<Value>().as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn create_switch_rename_and_delete() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, cookie, id) = user(&s, &db).await;
+        let personal = current(&s, &cookie).await;
+        let made = req(&s, Method::POST, "/v1/teams", &cookie)
+            .json(&json!({"name": "  Acme  "}))
+            .await;
+        assert_eq!(made.status_code(), 201);
+        let acme = made.json::<Value>();
+        assert_eq!(
+            (acme["name"].clone(), acme["role"].clone()),
+            (json!("Acme"), json!("owner"))
+        );
+        assert_eq!(current(&s, &cookie).await["id"], acme["id"]);
+        let me = s.get("/auth/me").add_header("cookie", &cookie).await;
+        assert_eq!(me.json::<Value>()["current_team"], acme);
+        let acme_id: uuid::Uuid = acme["id"].as_str().unwrap().parse().unwrap();
+        let defaults = social_sets::Entity::find()
+            .filter(social_sets::Column::TeamId.eq(acme_id))
+            .filter(social_sets::Column::IsDefault.eq(true))
+            .count(&db)
+            .await
+            .unwrap();
+        assert_eq!(defaults, 1);
+        let list = s.get("/v1/teams").add_header("cookie", &cookie).await;
+        assert_eq!(list.json::<Value>().as_array().unwrap().len(), 2);
+
+        let blank = req(&s, Method::POST, "/v1/teams", &cookie)
+            .json(&json!({"name": " "}))
+            .await;
+        assert_eq!(blank.status_code(), 422);
+        blank.assert_json(&json!({"error": "invalid_name"}));
+
+        let switch = |team: Value| {
+            req(&s, Method::PUT, "/v1/current-team", &cookie).json(&json!({"team_id": team}))
+        };
+        switch(personal["id"].clone()).await.assert_status_ok();
+        assert_eq!(current(&s, &cookie).await["id"], personal["id"]);
+        let res = switch(json!(uuid::Uuid::now_v7())).await;
+        assert_eq!(res.status_code(), 404);
+        res.assert_json(&json!({"error": "not_found"}));
+        switch(acme["id"].clone()).await.assert_status_ok();
+
+        let rename = req(&s, Method::PATCH, "/v1/team", &cookie)
+            .json(&json!({"name": "Acme Co"}))
+            .await;
+        rename.assert_status_ok();
+        assert_eq!(rename.json::<Value>()["name"], "Acme Co");
+
+        // Deleting needs a recent sign-in (or the password).
+        let hash = token::hash(cookie.trim_start_matches("sr_session="));
+        let aged = sessions::ActiveModel {
+            token_hash: Set(hash.clone()),
+            created_at: Set((Utc::now() - Duration::minutes(11)).fixed_offset()),
+            ..Default::default()
+        };
+        sessions::Entity::update(aged).exec(&db).await.unwrap();
+        let delete = || req(&s, Method::DELETE, "/v1/team", &cookie).json(&json!({}));
+        let res = delete().await;
+        assert_eq!(res.status_code(), 403);
+        res.assert_json(&json!({"error": "reauth_required"}));
+        let fresh = sessions::ActiveModel {
+            token_hash: Set(hash),
+            created_at: Set(Utc::now().fixed_offset()),
+            ..Default::default()
+        };
+        sessions::Entity::update(fresh).exec(&db).await.unwrap();
+        assert_eq!(delete().await.status_code(), 204);
+        assert_eq!(memberships(&db, id).await, 1);
+        assert_eq!(current(&s, &cookie).await["id"], personal["id"]);
+        let res = delete().await;
+        assert_eq!(res.status_code(), 409);
+        res.assert_json(&json!({"error": "last_team"}));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn invitations_are_emailed_previewed_and_used_once() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, owner, owner_id) = user(&s, &db).await;
+        let team = current(&s, &owner).await;
+        let team_id = team["id"].as_str().unwrap();
+        let invitee = unique_email();
+        let invite =
+            |body: Value| req(&s, Method::POST, "/v1/team/invitations", &owner).json(&body);
+        let bad = invite(json!({"email": invitee, "role": "owner"})).await;
+        assert_eq!(bad.status_code(), 422);
+        bad.assert_json(&json!({"error": "invalid_role"}));
+        let made = invite(json!({"email": invitee.to_uppercase(), "role": "admin"})).await;
+        assert_eq!(made.status_code(), 201, "{}", made.text());
+        let made = made.json::<Value>();
+        assert_eq!(
+            (made["email"].clone(), made["role"].clone()),
+            (json!(invitee), json!("admin"))
+        );
+        assert!(made.get("token").is_none() && made.get("token_hash").is_none());
+        let row = team_invitations::Entity::find()
+            .filter(team_invitations::Column::Email.eq(&invitee))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.token_hash.len(), 64);
+        let valid = (row.expires_at - row.created_at).num_minutes();
+        assert!((7 * 24 * 60 - 1..=7 * 24 * 60).contains(&valid), "{valid}");
+        // Re-inviting replaces the pending invitation instead of adding one.
+        let again = invite(json!({"email": invitee, "role": "member"})).await;
+        assert_eq!(again.status_code(), 201);
+        let again = again.json::<Value>();
+        assert_ne!(again["id"], made["id"]);
+        let pending = team_invitations::Entity::find()
+            .filter(team_invitations::Column::Email.eq(&invitee))
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].role, "member");
+        // A third send to the same address the same day is the last.
+        let third = invite(json!({"email": invitee, "role": "member"})).await;
+        assert_eq!(third.status_code(), 201);
+        let made = third.json::<Value>();
+        let fourth = invite(json!({"email": invitee, "role": "member"})).await;
+        assert_eq!(fourth.status_code(), 429);
+        fourth.assert_json(&json!({"error": "rate_limited"}));
+        let listed = s
+            .get("/v1/team/invitations")
+            .add_header("cookie", &owner)
+            .await;
+        assert_eq!(listed.json::<Value>()[0]["id"], made["id"]);
+
+        // The emailed token is not observable here, so accept one stored the same way.
+        let (invited_email, invited, invited_id) = user(&s, &db).await;
+        let secret = invitation(
+            &db,
+            team_id,
+            &invited_email,
+            "admin",
+            Some(owner_id),
+            Duration::days(7),
+        )
+        .await;
+        let preview = s.get(&format!("/v1/invitations/{secret}")).await;
+        preview.assert_status_ok();
+        let preview = preview.json::<Value>();
+        assert_eq!(preview["team"], team["name"]);
+        assert_eq!(preview["role"], "admin");
+        assert_eq!(preview["email"], invited_email);
+        assert!(preview["invited_by"].is_string() && preview["expires_at"].is_string());
+        for junk in ["nope", &token::new()] {
+            let res = s.get(&format!("/v1/invitations/{junk}")).await;
+            assert_eq!(res.status_code(), 404);
+        }
+        let expired = invitation(
+            &db,
+            team_id,
+            &unique_email(),
+            "member",
+            None,
+            Duration::minutes(-1),
+        )
+        .await;
+        assert_eq!(
+            s.get(&format!("/v1/invitations/{expired}"))
+                .await
+                .status_code(),
+            404
+        );
+
+        let accept = |cookie: &str| {
+            req(
+                &s,
+                Method::POST,
+                &format!("/v1/invitations/{secret}"),
+                cookie,
+            )
+        };
+        let (_, stranger, _) = user(&s, &db).await;
+        let res = accept(&stranger).await;
+        assert_eq!(res.status_code(), 403);
+        res.assert_json(&json!({"error": "email_mismatch"}));
+        let ok = accept(&invited).await;
+        ok.assert_status_ok();
+        assert_eq!(
+            ok.json::<Value>(),
+            json!({"id": team["id"], "name": team["name"], "role": "admin"})
+        );
+        assert_eq!(current(&s, &invited).await["id"], team["id"]);
+        assert_eq!(memberships(&db, invited_id).await, 2);
+        assert_eq!(accept(&invited).await.status_code(), 404, "used once");
+        let members = s.get("/v1/team/members").add_header("cookie", &owner).await;
+        let members = members.json::<Value>();
+        assert_eq!(members.as_array().unwrap().len(), 2);
+        assert_eq!(members[1]["email"], invited_email);
+        assert_eq!(members[1]["role"], "admin");
+
+        let joined = invite(json!({"email": invited_email, "role": "member"})).await;
+        assert_eq!(joined.status_code(), 409);
+        joined.assert_json(&json!({"error": "already_member"}));
+        let id = made["id"].as_str().unwrap();
+        let revoke = |cookie: &str| {
+            req(
+                &s,
+                Method::DELETE,
+                &format!("/v1/team/invitations/{id}"),
+                cookie,
+            )
+        };
+        assert_eq!(
+            revoke(&stranger).await.status_code(),
+            404,
+            "another team's invitation"
+        );
+        assert_eq!(revoke(&owner).await.status_code(), 204);
+        assert_eq!(revoke(&owner).await.status_code(), 404);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn roles_and_the_last_owner() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, owner, owner_id) = user(&s, &db).await;
+        let team = current(&s, &owner).await;
+        let team_id = team["id"].as_str().unwrap();
+        let (admin, admin_id) = joined(&s, &db, team_id, "admin").await;
+        let (member, member_id) = joined(&s, &db, team_id, "member").await;
+        let set = |cookie: &str, who: uuid::Uuid, role: &str| {
+            req(
+                &s,
+                Method::PATCH,
+                &format!("/v1/team/members/{who}"),
+                cookie,
+            )
+            .json(&json!({"role": role}))
+        };
+        let remove = |cookie: &str, who: uuid::Uuid| {
+            req(
+                &s,
+                Method::DELETE,
+                &format!("/v1/team/members/{who}"),
+                cookie,
+            )
+        };
+        let status = |r: axum_test::TestResponse| r.status_code().as_u16();
+
+        assert_eq!(status(set(&member, admin_id, "member").await), 403);
+        assert_eq!(
+            status(set(&admin, member_id, "owner").await),
+            403,
+            "admins cannot grant owner"
+        );
+        assert_eq!(status(set(&admin, owner_id, "member").await), 403);
+        assert_eq!(status(remove(&admin, owner_id).await), 403);
+        assert_eq!(status(set(&admin, member_id, "boss").await), 422);
+        let promoted = set(&admin, member_id, "admin").await;
+        promoted.assert_status_ok();
+        assert_eq!(promoted.json::<Value>()["role"], "admin");
+        assert_eq!(status(set(&admin, member_id, "member").await), 200);
+
+        let last = set(&owner, owner_id, "admin").await;
+        assert_eq!(last.status_code(), 409);
+        last.assert_json(&json!({"error": "last_owner"}));
+        assert_eq!(
+            status(remove(&owner, owner_id).await),
+            409,
+            "last owner cannot leave"
+        );
+        assert_eq!(status(set(&owner, admin_id, "owner").await), 200);
+        assert_eq!(
+            status(remove(&owner, owner_id).await),
+            204,
+            "a second owner lets them leave"
+        );
+        assert_ne!(current(&s, &owner).await["id"], team["id"]);
+
+        // Outside the team everything is 404.
+        assert_eq!(status(set(&owner, member_id, "admin").await), 404);
+        let (_, stranger, stranger_id) = user(&s, &db).await;
+        assert_eq!(status(set(&admin, stranger_id, "admin").await), 404);
+        assert_eq!(status(remove(&stranger, member_id).await), 404);
+
+        // The member leaves on their own; the new owner removes nobody else's way.
+        assert_eq!(status(remove(&member, member_id).await), 204);
+        let members = s.get("/v1/team/members").add_header("cookie", &admin).await;
+        assert_eq!(members.json::<Value>().as_array().unwrap().len(), 1);
+        let invite = req(&s, Method::POST, "/v1/team/invitations", &member)
+            .json(&json!({"email": unique_email(), "role": "member"}))
+            .await;
+        assert_eq!(
+            invite.status_code(),
+            201,
+            "back in their personal team, as owner"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn members_cannot_manage_the_team() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, owner, _) = user(&s, &db).await;
+        let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+        let (member, _) = joined(&s, &db, &team_id, "member").await;
+        let calls = [
+            req(&s, Method::PATCH, "/v1/team", &member).json(&json!({"name": "Mine"})),
+            req(&s, Method::DELETE, "/v1/team", &member).json(&json!({})),
+            req(&s, Method::POST, "/v1/team/invitations", &member)
+                .json(&json!({"email": unique_email(), "role": "member"})),
+            req(&s, Method::GET, "/v1/team/invitations", &member),
+        ];
+        for call in calls {
+            let res = call.await;
+            assert_eq!(res.status_code(), 403);
+            res.assert_json(&json!({"error": "forbidden"}));
+        }
+        let members = s
+            .get("/v1/team/members")
+            .add_header("cookie", &member)
+            .await;
+        members.assert_status_ok();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn team_endpoints_need_a_session_and_the_web_origin() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, cookie, _) = user(&s, &db).await;
+        for path in [
+            "/v1/teams",
+            "/v1/team",
+            "/v1/team/members",
+            "/v1/team/invitations",
+        ] {
+            assert_eq!(s.get(path).await.status_code(), 401, "{path}");
+        }
+        let id = uuid::Uuid::now_v7();
+        let calls = [
+            (Method::POST, "/v1/teams".to_owned()),
+            (Method::PUT, "/v1/current-team".to_owned()),
+            (Method::PATCH, "/v1/team".to_owned()),
+            (Method::DELETE, "/v1/team".to_owned()),
+            (Method::PATCH, format!("/v1/team/members/{id}")),
+            (Method::DELETE, format!("/v1/team/members/{id}")),
+            (Method::POST, "/v1/team/invitations".to_owned()),
+            (Method::DELETE, format!("/v1/team/invitations/{id}")),
+            (Method::POST, format!("/v1/invitations/{}", token::new())),
+        ];
+        for (method, path) in calls {
+            let res = s
+                .method(method, &path)
+                .add_header("origin", "https://evil.example")
+                .add_header("cookie", &cookie)
+                .json(&json!({}))
+                .await;
+            assert_eq!(res.status_code(), 403, "{path}");
+            res.assert_json(&json!({"error": "forbidden_origin"}));
+        }
+        let preflight = s
+            .method(Method::OPTIONS, "/v1/team")
+            .add_header("origin", WEB)
+            .add_header("access-control-request-method", "PATCH")
+            .await;
+        assert!(preflight
+            .header("access-control-allow-methods")
+            .to_str()
+            .unwrap()
+            .contains("PATCH"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn invitations_are_rate_limited_per_user() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, cookie, _) = user(&s, &db).await;
+        let invite = || {
+            req(&s, Method::POST, "/v1/team/invitations", &cookie)
+                .json(&json!({"email": unique_email(), "role": "member"}))
+        };
+        for _ in 0..10 {
+            assert_eq!(invite().await.status_code(), 201);
+        }
+        let res = invite().await;
+        assert_eq!(res.status_code(), 429);
+        res.assert_json(&json!({"error": "rate_limited"}));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn closed_registration_still_admits_invited_emails() {
+        let (open, db) = server_where(|_| {}).await;
+        let (_, owner, owner_id) = user(&open, &db).await;
+        let team_id = current(&open, &owner).await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (s, _) = server_where(|c| c.registration_disabled = true).await;
+        assert!(sign_in(&s, &db, &unique_email()).await.is_none());
+        let invited = unique_email();
+        let secret = invitation(
+            &db,
+            &team_id,
+            &invited,
+            "member",
+            Some(owner_id),
+            Duration::days(7),
+        )
+        .await;
+        let cookie = sign_in(&s, &db, &invited)
+            .await
+            .expect("invited email signs up");
+        let res = req(
+            &s,
+            Method::POST,
+            &format!("/v1/invitations/{secret}"),
+            &cookie,
+        )
+        .await;
+        res.assert_status_ok();
+        assert_eq!(res.json::<Value>()["role"], "member");
+    }
+
+    async fn pending(db: &DatabaseConnection, inviter: uuid::Uuid) -> u64 {
+        team_invitations::Entity::find()
+            .filter(team_invitations::Column::InvitedBy.eq(inviter))
+            .count(db)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn invitations_die_with_the_inviters_rights() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, owner, _) = user(&s, &db).await;
+        let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+        let invite = |cookie: &str| {
+            req(&s, Method::POST, "/v1/team/invitations", cookie)
+                .json(&json!({"email": unique_email(), "role": "member"}))
+        };
+        // Demoted below admin, or removed: their pending invitations go in the same change.
+        let (admin, admin_id) = joined(&s, &db, &team_id, "admin").await;
+        assert_eq!(invite(&admin).await.status_code(), 201);
+        let demote = req(
+            &s,
+            Method::PATCH,
+            &format!("/v1/team/members/{admin_id}"),
+            &owner,
+        )
+        .json(&json!({"role": "member"}));
+        demote.await.assert_status_ok();
+        assert_eq!(pending(&db, admin_id).await, 0);
+        let (other, other_id) = joined(&s, &db, &team_id, "admin").await;
+        assert_eq!(invite(&other).await.status_code(), 201);
+        let removal = req(
+            &s,
+            Method::DELETE,
+            &format!("/v1/team/members/{other_id}"),
+            &owner,
+        );
+        assert_eq!(removal.await.status_code(), 204);
+        assert_eq!(pending(&db, other_id).await, 0);
+        // A promotion keeps them.
+        let (third, third_id) = joined(&s, &db, &team_id, "admin").await;
+        assert_eq!(invite(&third).await.status_code(), 201);
+        req(
+            &s,
+            Method::PATCH,
+            &format!("/v1/team/members/{third_id}"),
+            &owner,
+        )
+        .json(&json!({"role": "owner"}))
+        .await
+        .assert_status_ok();
+        assert_eq!(pending(&db, third_id).await, 1);
+
+        // An inviter who lost the right some other way: the link is dead and the row goes.
+        let (_, stale_id) = joined(&s, &db, &team_id, "admin").await;
+        let (email, cookie, _) = user(&s, &db).await;
+        let secret = invitation(
+            &db,
+            &team_id,
+            &email,
+            "admin",
+            Some(stale_id),
+            Duration::days(7),
+        )
+        .await;
+        let row = team_user::ActiveModel {
+            team_id: Set(team_id.parse().unwrap()),
+            user_id: Set(stale_id),
+            role: Set("member".into()),
+            ..Default::default()
+        };
+        team_user::Entity::update(row).exec(&db).await.unwrap();
+        let path = format!("/v1/invitations/{secret}");
+        assert_eq!(
+            req(&s, Method::POST, &path, &cookie).await.status_code(),
+            404
+        );
+        assert_eq!(pending(&db, stale_id).await, 0);
+        assert_eq!(s.get(&path).await.status_code(), 404);
+        // No inviter left at all is the same.
+        let orphan = invitation(&db, &team_id, &email, "member", None, Duration::days(7)).await;
+        let path = format!("/v1/invitations/{orphan}");
+        assert_eq!(s.get(&path).await.status_code(), 404);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_team_sends_at_most_50_invitations_a_day() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, owner, _) = user(&s, &db).await;
+        let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+        let mut admins = vec![owner];
+        for _ in 0..4 {
+            admins.push(joined(&s, &db, &team_id, "admin").await.0);
+        }
+        // Five senders at 10 a minute each fill the team's 50.
+        for cookie in &admins {
+            for _ in 0..10 {
+                let res = req(&s, Method::POST, "/v1/team/invitations", cookie)
+                    .json(&json!({"email": unique_email(), "role": "member"}))
+                    .await;
+                assert_eq!(res.status_code(), 201);
+            }
+        }
+        let extra = joined(&s, &db, &team_id, "admin").await.0;
+        let res = req(&s, Method::POST, "/v1/team/invitations", &extra)
+            .json(&json!({"email": unique_email(), "role": "member"}))
+            .await;
+        assert_eq!(res.status_code(), 429);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn daily_invitation_caps_span_teams_and_restarts() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, a, _) = user(&s, &db).await;
+        let (_, b, _) = user(&s, &db).await;
+        let invite = |s: &TestServer, cookie: &str, email: &str| {
+            req(s, Method::POST, "/v1/team/invitations", cookie)
+                .json(&json!({"email": email, "role": "member"}))
+        };
+        // One address: 20 a day across all teams, however many teams ask.
+        let target = unique_email();
+        assert_eq!(invite(&s, &a, &target).await.status_code(), 201);
+        assert_eq!(invite(&s, &b, &target).await.status_code(), 201);
+        for _ in 0..18 {
+            let (_, other, _) = user(&s, &db).await;
+            assert_eq!(invite(&s, &other, &target).await.status_code(), 201);
+        }
+        let (_, late, _) = user(&s, &db).await;
+        let res = invite(&s, &late, &target).await;
+        assert_eq!(res.status_code(), 429);
+        res.assert_json(&json!({"error": "rate_limited"}));
+
+        // One inviter: 50 a day, across teams and across fresh servers (fresh memory limiters).
+        let mut sent = 1;
+        for round in 0..5 {
+            let (s, _) = server_where(|_| {}).await;
+            if round == 2 {
+                req(&s, Method::POST, "/v1/teams", &a)
+                    .json(&json!({"name": "Other"}))
+                    .await
+                    .assert_status(axum::http::StatusCode::CREATED);
+            }
+            for _ in 0..10 {
+                if sent == 50 {
+                    break;
+                }
+                assert_eq!(invite(&s, &a, &unique_email()).await.status_code(), 201);
+                sent += 1;
+            }
+        }
+        let (s, _) = server_where(|_| {}).await;
+        assert_eq!(invite(&s, &a, &unique_email()).await.status_code(), 429);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_user_creates_at_most_10_teams_a_day() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, cookie, _) = user(&s, &db).await;
+        let create = |s: &TestServer| {
+            req(s, Method::POST, "/v1/teams", &cookie).json(&json!({"name": "Spam"}))
+        };
+        for _ in 0..10 {
+            assert_eq!(create(&s).await.status_code(), 201);
+        }
+        // Deleting a team does not give its slot back, and a restart does not reset the count.
+        req(&s, Method::DELETE, "/v1/team", &cookie)
+            .json(&json!({}))
+            .await
+            .assert_status(axum::http::StatusCode::NO_CONTENT);
+        let (s, _) = server_where(|_| {}).await;
+        let res = create(&s).await;
+        assert_eq!(res.status_code(), 429);
+        res.assert_json(&json!({"error": "rate_limited"}));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn two_owners_demoting_each_other_at_once_leave_one_owner() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, a, a_id) = user(&s, &db).await;
+        let team_id = current(&s, &a).await["id"].as_str().unwrap().to_owned();
+        let (b, b_id) = joined(&s, &db, &team_id, "admin").await;
+        req(&s, Method::PATCH, &format!("/v1/team/members/{b_id}"), &a)
+            .json(&json!({"role": "owner"}))
+            .await
+            .assert_status_ok();
+        let demote = |cookie: &str, who: uuid::Uuid| {
+            req(
+                &s,
+                Method::PATCH,
+                &format!("/v1/team/members/{who}"),
+                cookie,
+            )
+            .json(&json!({"role": "admin"}))
+        };
+        let (x, y) = tokio::join!(demote(&a, b_id), demote(&b, a_id));
+        let codes = [x.status_code().as_u16(), y.status_code().as_u16()];
+        assert_eq!(codes.iter().filter(|&&c| c == 200).count(), 1, "{codes:?}");
+        let owners = team_user::Entity::find()
+            .filter(team_user::Column::TeamId.eq(team_id.parse::<uuid::Uuid>().unwrap()))
+            .filter(team_user::Column::Role.eq("owner"))
+            .count(&db)
+            .await
+            .unwrap();
+        assert_eq!(owners, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn an_invitation_is_accepted_once_under_concurrency() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, owner, owner_id) = user(&s, &db).await;
+        let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+        let (email, cookie, _) = user(&s, &db).await;
+        let secret = invitation(
+            &db,
+            &team_id,
+            &email,
+            "member",
+            Some(owner_id),
+            Duration::days(7),
+        )
+        .await;
+        let path = format!("/v1/invitations/{secret}");
+        let (x, y) = tokio::join!(
+            req(&s, Method::POST, &path, &cookie),
+            req(&s, Method::POST, &path, &cookie)
+        );
+        let mut codes = [x.status_code().as_u16(), y.status_code().as_u16()];
+        codes.sort();
+        assert_eq!(codes, [200, 404]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn concurrent_invitations_of_one_address_leave_one() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, owner, _) = user(&s, &db).await;
+        let email = unique_email();
+        let invite = || {
+            req(&s, Method::POST, "/v1/team/invitations", &owner)
+                .json(&json!({"email": email, "role": "member"}))
+        };
+        let (x, y) = tokio::join!(invite(), invite());
+        let codes = [x.status_code().as_u16(), y.status_code().as_u16()];
+        assert!(codes.contains(&201), "{codes:?}");
+        for res in [x, y] {
+            if res.status_code() == 409 {
+                res.assert_json(&json!({"error": "already_invited"}));
+            } else {
+                assert_eq!(res.status_code(), 201);
+            }
+        }
+        let rows = team_invitations::Entity::find()
+            .filter(team_invitations::Column::Email.eq(&email))
+            .count(&db)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_demoted_owner_cannot_delete_the_team() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, a, _) = user(&s, &db).await;
+        let team_id = current(&s, &a).await["id"].as_str().unwrap().to_owned();
+        let (b, b_id) = joined(&s, &db, &team_id, "admin").await;
+        let set = |role: &str| {
+            req(&s, Method::PATCH, &format!("/v1/team/members/{b_id}"), &a)
+                .json(&json!({"role": role}))
+        };
+        let delete = || req(&s, Method::DELETE, "/v1/team", &b).json(&json!({}));
+        set("owner").await.assert_status_ok();
+        set("admin").await.assert_status_ok();
+        let res = delete().await;
+        assert_eq!(res.status_code(), 403);
+        res.assert_json(&json!({"error": "forbidden"}));
+        // Raced: the demotion and the delete never both win.
+        set("owner").await.assert_status_ok();
+        let (demoted, deleted) = tokio::join!(set("admin"), delete());
+        let both = (
+            demoted.status_code().as_u16(),
+            deleted.status_code().as_u16(),
+        );
+        assert!(matches!(both, (200, 403) | (404, 204)), "{both:?}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn team_names_are_bounded() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, cookie, _) = user(&s, &db).await;
+        for bad in ["a".repeat(61), "Acme\nhttps://evil".into()] {
+            let res = req(&s, Method::POST, "/v1/teams", &cookie)
+                .json(&json!({"name": bad}))
+                .await;
+            assert_eq!(res.status_code(), 422);
+            let res = req(&s, Method::PATCH, "/v1/team", &cookie)
+                .json(&json!({"name": bad}))
+                .await;
+            assert_eq!(res.status_code(), 422);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn openapi_documents_the_team_routes() {
+        let (s, _) = server_where(|_| {}).await;
+        let doc = s.get("/openapi.json").await.json::<Value>();
+        for (path, method) in [
+            ("/teams", "post"),
+            ("/teams", "get"),
+            ("/current-team", "put"),
+            ("/team", "delete"),
+            ("/team/members/{user_id}", "patch"),
+            ("/team/invitations/{id}", "delete"),
+            ("/invitations/{token}", "post"),
+        ] {
+            assert!(doc["paths"][path][method].is_object(), "{path} {method}");
+        }
+    }
+}
