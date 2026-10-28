@@ -24,6 +24,8 @@ pub struct AppState {
     /// Per-user budget of failed password checks by a signed-in user (`PUT /auth/password`, the
     /// confirm on passkey registration). Keyed by user id, so outside traffic cannot drain it.
     pub account_limiter: Arc<RateLimiter<uuid::Uuid>>,
+    /// Per-user limit on `POST /v1/team/invitations`, each of which sends an email.
+    pub invitation_limiter: Arc<RateLimiter<uuid::Uuid>>,
     pub brain_url: String,
     pub web_url: String,
     /// `CORS_ORIGINS`: the web app's origins, the only ones that may call its state-changing
@@ -45,6 +47,7 @@ impl AppState {
             login_limiter: Arc::new(RateLimiter::per_minute(10)),
             login_email_limiter: Arc::new(RateLimiter::per_minute(5)),
             account_limiter: Arc::new(RateLimiter::per_minute(5)),
+            invitation_limiter: Arc::new(RateLimiter::per_minute(10)),
             brain_url: config.brain_url.clone(),
             web_url: config.web_url.clone(),
             web_origins: config.cors_origins.clone(),

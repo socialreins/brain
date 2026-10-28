@@ -102,6 +102,21 @@ pub(crate) async fn confirm_password(
     Some(ok)
 }
 
+/// A sign-in from the last 10 minutes, or the account password when the user has one and sent
+/// it: the gate for changes a stolen old cookie must not make. `None`: over the password budget.
+pub(crate) async fn reauthenticated(
+    app: &AppState,
+    current: &CurrentUser,
+    password: Option<String>,
+) -> Option<bool> {
+    let user = &current.0;
+    let confirmed = match (password, &user.password_hash) {
+        (Some(given), Some(_)) => confirm_password(app, user, given).await?,
+        _ => false,
+    };
+    Some(confirmed || current.recent())
+}
+
 fn rate_limited() -> Response {
     error(StatusCode::TOO_MANY_REQUESTS, "rate_limited").into_response()
 }

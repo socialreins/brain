@@ -2,6 +2,7 @@
 //!
 //! `POST /auth/link` emails a link, `GET /auth/magic/{token}` shows a sign-in button that posts
 //! it to `POST /auth/magic`, which uses it once and sets the session cookie, `GET /auth/me` returns the signed-in user, `POST /auth/logout` ends it.
+//! Every sign-in gives a user without a team a personal one (see `teams::ensure_team`).
 use axum::{
     extract::{Form, FromRequest, FromRequestParts, Path, Request, State},
     http::{header, request::Parts, HeaderMap, StatusCode},
@@ -18,7 +19,10 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::json;
 use socialreins_core::{email, token};
 
-use super::waitlist::{error, rejected, Reply};
+use super::{
+    teams,
+    waitlist::{error, rejected, Reply},
+};
 use crate::{
     config::origin,
     models::{magic_links, sessions, users},
@@ -75,6 +79,9 @@ async fn send_link(app: &AppState, email: String) -> Result<(), String> {
             .await
             .map_err(|e| format!("user lookup: {e}"))?
             .is_none()
+        && !teams::invited(&app.db, &email)
+            .await
+            .map_err(|e| format!("invitation lookup: {e}"))?
     {
         return Ok(());
     }
@@ -217,11 +224,20 @@ async fn redeem(
     }
     let user = match find_user(&app, &link.email).await {
         Ok(Some(user)) => user,
-        Ok(None) if app.registration_disabled => return refused(&app, "registration_disabled"),
-        Ok(None) => match create_user(&app, &link.email).await {
-            Ok(user) => user,
-            Err(e) => return internal(e, "user insert"),
-        },
+        Ok(None) => {
+            // Closed registration still lets an invited email in.
+            if app.registration_disabled {
+                match teams::invited(&app.db, &link.email).await {
+                    Ok(true) => {}
+                    Ok(false) => return refused(&app, "registration_disabled"),
+                    Err(e) => return internal(e, "invitation lookup"),
+                }
+            }
+            match create_user(&app, &link.email).await {
+                Ok(user) => user,
+                Err(e) => return internal(e, "user insert"),
+            }
+        }
         Err(e) => return internal(e, "user lookup"),
     };
     match start_session(&app, user.id).await {
@@ -230,8 +246,10 @@ async fn redeem(
     }
 }
 
-/// Stores a new 30-day session for `user_id` and returns its `Set-Cookie` value.
+/// Stores a new 30-day session for `user_id` and returns its `Set-Cookie` value. Every sign-in
+/// method ends here, so this is where a user without a team gets their personal one.
 pub(crate) async fn start_session(app: &AppState, user_id: uuid::Uuid) -> Result<String, DbErr> {
+    teams::ensure_team(&app.db, user_id).await?;
     let secret = token::new();
     let now = Utc::now().fixed_offset();
     let expired = sessions::Entity::delete_many()
@@ -402,8 +420,15 @@ pub(crate) fn user_json(user: &users::Model) -> Json<serde_json::Value> {
     }))
 }
 
-async fn me(CurrentUser(user, _): CurrentUser) -> Reply {
-    (StatusCode::OK, user_json(&user))
+/// The user, plus `current_team` `{id, name, role}`.
+async fn me(State(app): State<AppState>, CurrentUser(user, _): CurrentUser) -> Response {
+    let (team, role) = match teams::current_team(&app.db, &user).await {
+        Ok(found) => found,
+        Err(e) => return internal(e, "current team lookup"),
+    };
+    let Json(mut body) = user_json(&user);
+    body["current_team"] = json!({"id": team.id, "name": team.name, "role": role.as_str()});
+    Json(body).into_response()
 }
 
 /// `POST /auth/logout`: only the web app's origins, so another site cannot sign a user out.

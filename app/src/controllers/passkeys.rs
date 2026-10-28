@@ -23,7 +23,7 @@ use webauthn_rs::prelude::{
 
 use super::{
     auth::{end_other_sessions, internal, start_session, user_json, Body, CurrentUser, FromWeb},
-    password::confirm_password,
+    password::reauthenticated,
     waitlist::error,
 };
 use crate::{
@@ -98,17 +98,12 @@ async fn register_start(
     current: CurrentUser,
     Body(body): Body<Confirm>,
 ) -> Response {
-    let user = &current.0;
-    let confirmed = match (body.password, &user.password_hash) {
-        (Some(given), Some(_)) => match confirm_password(&app, user, given).await {
-            Some(ok) => ok,
-            None => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
-        },
-        _ => false,
-    };
-    if !(confirmed || current.recent()) {
-        return reply(StatusCode::FORBIDDEN, "reauth_required");
+    match reauthenticated(&app, &current, body.password).await {
+        Some(true) => {}
+        Some(false) => return reply(StatusCode::FORBIDDEN, "reauth_required"),
+        None => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
     }
+    let user = &current.0;
     let existing = match own_passkeys(&app, user.id).await {
         Ok(rows) => rows,
         Err(e) => return internal(e, "passkey list"),

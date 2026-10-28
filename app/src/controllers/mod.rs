@@ -1,8 +1,10 @@
-//! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, and the documented `/v1` API.
+//! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, and the documented `/v1` API
+//! (waitlist, teams).
 pub mod auth;
 pub mod health;
 pub mod passkeys;
 pub mod password;
+pub mod teams;
 pub mod waitlist;
 
 use axum::{
@@ -38,15 +40,19 @@ fn api() -> OpenApiRouter<AppState> {
     // utoipa fills these from Cargo metadata, which has none to give.
     doc.info.description = None;
     doc.info.license = None;
-    OpenApiRouter::with_openapi(doc).merge(waitlist::api())
+    OpenApiRouter::with_openapi(doc)
+        .merge(waitlist::api())
+        .merge(teams::api())
 }
 
-/// The request span. Logs the path only (no query), with the token in `/auth/magic/{token}`
-/// replaced, so a sign-in link never reaches the log.
+/// The request span. Logs the path only (no query), with the token in `/auth/magic/{token}` and
+/// `/v1/invitations/{token}` replaced, so a sign-in or invitation link never reaches the log.
 fn span(req: &axum::http::Request<axum::body::Body>) -> tracing::Span {
     let path = req.uri().path();
     let path = if path.starts_with("/auth/magic/") {
         "/auth/magic/{token}"
+    } else if path.starts_with("/v1/invitations/") {
+        "/v1/invitations/{token}"
     } else {
         path
     };
@@ -57,7 +63,13 @@ pub fn router(state: AppState, config: &Config) -> Router {
     let (v1, doc) = api().split_for_parts();
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(config.cors_origins.clone()))
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ])
         .allow_headers([header::CONTENT_TYPE])
         // The web app sends the session cookie on cross-origin calls to `/auth/*`.
         .allow_credentials(true);
