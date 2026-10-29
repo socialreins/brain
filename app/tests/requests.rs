@@ -556,7 +556,6 @@ mod auth {
     }
 
     const WEB: &str = "http://localhost:3000";
-    const PASSWORD: &str = "correct horse battery";
 
     /// Signs a new user in by link, returning their email and the `sr_session=...` cookie.
     async fn signed_in(s: &TestServer, db: &DatabaseConnection) -> (String, String) {
@@ -576,95 +575,12 @@ mod auth {
         sessions::Entity::update(row).exec(db).await.unwrap();
     }
 
-    async fn set_password(s: &TestServer, cookie: &str, body: Value) -> axum_test::TestResponse {
-        s.put("/auth/password")
-            .add_header("origin", WEB)
-            .add_header("cookie", cookie)
-            .json(&body)
-            .await
-    }
-
-    async fn login(s: &TestServer, email: &str, password: &str) -> axum_test::TestResponse {
-        s.post("/auth/login")
-            .add_header("origin", WEB)
-            .json(&json!({"email": email, "password": password}))
-            .await
-    }
-
     #[tokio::test]
     #[serial]
-    async fn password_login_answers_one_way_for_every_failure() {
+    async fn passkey_enrolment_needs_a_recent_sign_in() {
         let (s, db) = server_where(|_| {}).await;
-        let (email, cookie) = signed_in(&s, &db).await;
-        let (linkless, _) = signed_in(&s, &db).await;
-        let short = set_password(&s, &cookie, json!({"password": "short"})).await;
-        assert_eq!(short.status_code(), 422);
-        short.assert_json(&json!({"error": "invalid_password"}));
-        let set = set_password(&s, &cookie, json!({"password": PASSWORD})).await;
-        assert_eq!(set.status_code(), 204);
-        let me = s.get("/auth/me").add_header("cookie", &cookie).await;
-        assert_eq!(me.json::<Value>()["has_password"], true);
-        let stored = user(&db, &email).await.unwrap().password_hash.unwrap();
-        assert!(stored.starts_with("$argon2id$"));
-
-        for (who, pw) in [
-            (email.as_str(), "wrong password here"),
-            (&unique_email(), PASSWORD),
-            (&linkless, PASSWORD),
-        ] {
-            let res = login(&s, who, pw).await;
-            assert_eq!(res.status_code(), 401, "{who}");
-            res.assert_json(&json!({"error": "invalid_credentials"}));
-            assert!(res.maybe_header("set-cookie").is_none());
-        }
-        let ok = login(&s, &email.to_uppercase(), PASSWORD).await;
-        ok.assert_status_ok();
-        assert_eq!(ok.json::<Value>()["email"], email);
-        let fresh = session(ok.header("set-cookie").to_str().unwrap());
-        let me = s.get("/auth/me").add_header("cookie", fresh).await;
-        me.assert_status_ok();
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn changing_a_password_needs_the_current_one() {
-        let (s, db) = server_where(|_| {}).await;
-        let (email, cookie) = signed_in(&s, &db).await;
-        set_password(&s, &cookie, json!({"password": PASSWORD}))
-            .await
-            .assert_status(axum::http::StatusCode::NO_CONTENT);
-        // An old session does not matter once a password exists: the current one is the check.
-        age(&db, &cookie, Duration::hours(1)).await;
-        let new = "a different long password";
-        for current in [None, Some("not the password")] {
-            let res = set_password(
-                &s,
-                &cookie,
-                json!({"password": new, "current_password": current}),
-            )
-            .await;
-            assert_eq!(res.status_code(), 403);
-            res.assert_json(&json!({"error": "invalid_current_password"}));
-        }
-        let res = set_password(
-            &s,
-            &cookie,
-            json!({"password": new, "current_password": PASSWORD}),
-        )
-        .await;
-        assert_eq!(res.status_code(), 204);
-        login(&s, &email, new).await.assert_status_ok();
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn first_password_and_passkey_need_a_recent_sign_in() {
-        let (s, db) = server_where(|_| {}).await;
-        let (email, cookie) = signed_in(&s, &db).await;
+        let (_, cookie) = signed_in(&s, &db).await;
         age(&db, &cookie, Duration::minutes(11)).await;
-        let res = set_password(&s, &cookie, json!({"password": PASSWORD})).await;
-        assert_eq!(res.status_code(), 403);
-        res.assert_json(&json!({"error": "reauth_required"}));
         let start = s
             .post("/auth/passkeys/register/start")
             .add_header("origin", WEB)
@@ -673,152 +589,24 @@ mod auth {
             .await;
         assert_eq!(start.status_code(), 403);
         start.assert_json(&json!({"error": "reauth_required"}));
-        assert!(user(&db, &email).await.unwrap().password_hash.is_none());
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn login_is_rate_limited_per_email_and_per_ip() {
-        let (s, _) = server_where(|_| {}).await;
-        let email = unique_email();
-        for _ in 0..5 {
-            assert_eq!(login(&s, &email, PASSWORD).await.status_code(), 401);
-        }
-        let res = login(&s, &email, PASSWORD).await;
-        assert_eq!(res.status_code(), 429);
-        res.assert_json(&json!({"error": "rate_limited"}));
-        // Six attempts so far from this client; the per-IP cap of 10 stops new emails too.
-        for _ in 0..4 {
-            assert_eq!(
-                login(&s, &unique_email(), PASSWORD).await.status_code(),
-                401
-            );
-        }
-        assert_eq!(
-            login(&s, &unique_email(), PASSWORD).await.status_code(),
-            429
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn only_failed_logins_count_per_email() {
-        let (s, db) = server_where(|c| c.trust_proxy = true).await;
-        let (email, cookie) = signed_in(&s, &db).await;
-        set_password(&s, &cookie, json!({"password": PASSWORD}))
-            .await
-            .assert_status(axum::http::StatusCode::NO_CONTENT);
-        let from = |ip: &str, pw: &str| {
-            s.post("/auth/login")
+        // A fresh sign-in is enough; there are no passwords.
+        age(&db, &cookie, Duration::zero()).await;
+        let start = s
+            .post("/auth/passkeys/register/start")
+            .add_header("origin", WEB)
+            .add_header("cookie", &cookie)
+            .await;
+        start.assert_status_ok();
+        for gone in ["/auth/login", "/auth/password"] {
+            let res = s
+                .post(gone)
                 .add_header("origin", WEB)
-                .add_header("x-forwarded-for", ip.to_owned())
-                .json(&json!({"email": email, "password": pw}))
-        };
-        // Another IP's failures under the cap do not stop the owner, and a success clears them.
-        for _ in 0..4 {
-            assert_eq!(
-                from("198.51.100.1", "wrong guess here").await.status_code(),
-                401
-            );
+                .json(&json!({}))
+                .await;
+            assert_eq!(res.status_code(), 404, "{gone}");
         }
-        from("198.51.100.2", PASSWORD).await.assert_status_ok();
-        for _ in 0..4 {
-            assert_eq!(
-                from("198.51.100.3", "wrong guess here").await.status_code(),
-                401
-            );
-        }
-        from("198.51.100.2", PASSWORD).await.assert_status_ok();
-        // Five failures in a row, from any IPs, close the email for the window.
-        for i in 0..5 {
-            let ip = format!("198.51.100.{}", 10 + i);
-            assert_eq!(from(&ip, "wrong guess here").await.status_code(), 401);
-        }
-        let res = from("198.51.100.20", PASSWORD).await;
-        assert_eq!(res.status_code(), 429);
-        res.assert_json(&json!({"error": "rate_limited"}));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn concurrent_wrong_guesses_cannot_pass_the_cap() {
-        let (s, db) = server_where(|c| c.trust_proxy = true).await;
-        let (email, cookie) = signed_in(&s, &db).await;
-        set_password(&s, &cookie, json!({"password": PASSWORD}))
-            .await
-            .assert_status(axum::http::StatusCode::NO_CONTENT);
-        let guess = |i: u8| {
-            s.post("/auth/login")
-                .add_header("origin", WEB)
-                .add_header("x-forwarded-for", format!("198.51.100.{i}"))
-                .json(&json!({"email": email, "password": "wrong guess here"}))
-        };
-        // Argon2 runs on blocking threads, so these verify in parallel.
-        let res = tokio::join!(
-            guess(1),
-            guess(2),
-            guess(3),
-            guess(4),
-            guess(5),
-            guess(6),
-            guess(7),
-            guess(8)
-        );
-        let codes = [res.0, res.1, res.2, res.3, res.4, res.5, res.6, res.7]
-            .map(|r| r.status_code().as_u16());
-        assert_eq!(codes.iter().filter(|&&c| c == 401).count(), 5, "{codes:?}");
-        assert_eq!(codes.iter().filter(|&&c| c == 429).count(), 3, "{codes:?}");
-        // Outsiders filling the email's login budget do not block the signed-in owner.
-        let res = set_password(
-            &s,
-            &cookie,
-            json!({"password": "another long password", "current_password": PASSWORD}),
-        )
-        .await;
-        assert_eq!(res.status_code(), 204);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn a_session_cannot_guess_the_current_password_faster_than_its_cap() {
-        let (s, db) = server_where(|_| {}).await;
-        let (email, cookie) = signed_in(&s, &db).await;
-        set_password(&s, &cookie, json!({"password": PASSWORD}))
-            .await
-            .assert_status(axum::http::StatusCode::NO_CONTENT);
-        let change = |current: &str| {
-            set_password(
-                &s,
-                &cookie,
-                json!({"password": "another long password", "current_password": current}),
-            )
-        };
-        for _ in 0..5 {
-            assert_eq!(change("wrong guess here").await.status_code(), 403);
-        }
-        assert_eq!(change(PASSWORD).await.status_code(), 429);
-        // The failures were charged to the email's login budget as well.
-        assert_eq!(login(&s, &email, PASSWORD).await.status_code(), 429);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn setting_a_password_ends_other_sessions_and_links() {
-        let (s, db) = server_where(|_| {}).await;
-        let (email, cookie) = signed_in(&s, &db).await;
-        let (_, other) = open(&s, &link(&db, &email, Duration::minutes(15)).await).await;
-        let other = session(&other.unwrap());
-        let me = |c: &str| s.get("/auth/me").add_header("cookie", c.to_owned());
-        me(&other).await.assert_status_ok();
-        let pending = link(&db, &email, Duration::minutes(15)).await;
-        set_password(&s, &cookie, json!({"password": PASSWORD}))
-            .await
-            .assert_status(axum::http::StatusCode::NO_CONTENT);
-        assert_eq!(me(&other).await.status_code(), 401);
-        me(&cookie).await.assert_status_ok();
-        assert_eq!(links(&db, &email).await, 0, "outstanding links are revoked");
-        let (to, _) = open(&s, &pending).await;
-        assert!(to.ends_with("/login?error=invalid_link"));
+        let me = s.get("/auth/me").add_header("cookie", &cookie).await;
+        assert!(me.json::<Value>().get("has_password").is_none());
     }
 
     #[tokio::test]
@@ -826,17 +614,12 @@ mod auth {
     async fn credential_endpoints_only_answer_the_web_origin() {
         let (s, db) = server_where(|_| {}).await;
         let (_, cookie) = signed_in(&s, &db).await;
-        let body = json!({"email": unique_email(), "password": PASSWORD});
         for origin in [
             None,
             Some("https://evil.example"),
             Some("http://localhost:8080"),
         ] {
             let calls = [
-                s.post("/auth/login").json(&body),
-                s.put("/auth/password")
-                    .add_header("cookie", &cookie)
-                    .json(&json!({"password": PASSWORD})),
                 s.post("/auth/passkeys/login/start"),
                 s.post("/auth/passkeys/register/start")
                     .add_header("cookie", &cookie)
@@ -854,7 +637,7 @@ mod auth {
             }
         }
         let preflight = s
-            .method(axum::http::Method::OPTIONS, "/auth/password")
+            .method(axum::http::Method::OPTIONS, "/v1/team")
             .add_header("origin", WEB)
             .add_header("access-control-request-method", "PUT")
             .await;
@@ -980,19 +763,315 @@ mod auth {
         drop_db(db, &name).await;
     }
 
-    #[tokio::test]
-    #[serial]
-    async fn registration_disabled_does_not_change_password_login() {
-        let (open_server, db) = server_where(|_| {}).await;
-        let (email, cookie) = signed_in(&open_server, &db).await;
-        set_password(&open_server, &cookie, json!({"password": PASSWORD}))
+    /// Google sign-in against a mock token endpoint. The test passes the id_token claims as the
+    /// `code`; the mock adds issuer, audience and expiry unless the claims set them.
+    mod google {
+        use super::*;
+        use axum::{routing::post, Form, Json, Router};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use socialreins_brain::connectors::google::Google;
+        use std::collections::HashMap;
+
+        static VERIFIERS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+        async fn mock_token() -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let token = |Form(f): Form<HashMap<String, String>>| async move {
+                let ok = f.get("client_secret").map(String::as_str) == Some("secret")
+                    && f.get("grant_type").map(String::as_str) == Some("authorization_code");
+                let code = f.get("code").cloned().unwrap_or_default();
+                let claims = URL_SAFE_NO_PAD
+                    .decode(&code)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+                let (true, Some(Value::Object(given))) = (ok, claims) else {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(json!({"error": "invalid_grant"})),
+                    );
+                };
+                VERIFIERS
+                    .lock()
+                    .unwrap()
+                    .push(f.get("code_verifier").cloned().unwrap_or_default());
+                let mut c = json!({"iss": "https://accounts.google.com", "aud": "cid",
+                    "exp": Utc::now().timestamp() + 3600});
+                for (k, v) in given {
+                    c[k] = v;
+                }
+                let jwt = format!("e30.{}.sig", URL_SAFE_NO_PAD.encode(c.to_string()));
+                (
+                    axum::http::StatusCode::OK,
+                    Json(json!({"id_token": jwt, "access_token": "at"})),
+                )
+            };
+            let app = Router::new().route("/token", post(token));
+            tokio::spawn(async move { axum::serve(listener, app).await });
+            base
+        }
+
+        async fn google_server(edit: impl FnOnce(&mut Config)) -> (TestServer, DatabaseConnection) {
+            let base = mock_token().await;
+            server_where(|c| {
+                let mut g = Google::new("cid", "secret").unwrap();
+                g.token_url = format!("{base}/token");
+                c.google = Some(g);
+                edit(c);
+            })
             .await
-            .assert_status(axum::http::StatusCode::NO_CONTENT);
-        let (s, _) = server_where(|c| c.registration_disabled = true).await;
-        login(&s, &email, PASSWORD).await.assert_status_ok();
-        let stranger = unique_email();
-        assert_eq!(login(&s, &stranger, PASSWORD).await.status_code(), 401);
-        assert!(user(&db, &stranger).await.is_none());
+        }
+
+        /// The cookie `name=value` among the response's `Set-Cookie` headers.
+        fn set_cookie(res: &axum_test::TestResponse, name: &str) -> Option<String> {
+            res.iter_headers_by_name("set-cookie")
+                .map(|v| v.to_str().unwrap().to_owned())
+                .find(|c| c.starts_with(&format!("{name}=")))
+        }
+
+        struct Started {
+            state: String,
+            nonce: String,
+            challenge: String,
+            cookie: String,
+        }
+
+        async fn begin(s: &TestServer, next: &str) -> Started {
+            let res = s.get(&format!("/auth/google/start{next}")).await;
+            assert_eq!(res.status_code(), 303);
+            let to = reqwest::Url::parse(res.header("location").to_str().unwrap()).unwrap();
+            assert_eq!(to.host_str(), Some("accounts.google.com"));
+            let q: HashMap<_, _> = to.query_pairs().into_owned().collect();
+            assert_eq!(
+                q["redirect_uri"],
+                "http://localhost:8080/auth/google/callback"
+            );
+            assert_eq!(q["scope"], "openid email profile");
+            assert_eq!(q["code_challenge_method"], "S256");
+            let cookie = set_cookie(&res, "sr_google").unwrap();
+            assert!(cookie.contains("HttpOnly") && cookie.contains("Path=/auth/google"));
+            Started {
+                state: q["state"].clone(),
+                nonce: q["nonce"].clone(),
+                challenge: q["code_challenge"].clone(),
+                cookie: cookie.split(';').next().unwrap().to_owned(),
+            }
+        }
+
+        fn claims(st: &Started, sub: &str, email: &str) -> Value {
+            json!({"sub": sub, "email": email, "email_verified": true, "nonce": st.nonce,
+                "name": "Ann Lee"})
+        }
+
+        /// Google's redirect back: (where it lands, the session cookie if one was set).
+        async fn finish(
+            s: &TestServer,
+            state: &str,
+            cookie: Option<&str>,
+            claims: &Value,
+        ) -> (String, Option<String>) {
+            let code = URL_SAFE_NO_PAD.encode(claims.to_string());
+            let mut req = s.get(&format!("/auth/google/callback?code={code}&state={state}"));
+            if let Some(c) = cookie {
+                req = req.add_header("cookie", c);
+            }
+            let res = req.await;
+            assert_eq!(res.status_code(), 303);
+            let cleared = set_cookie(&res, "sr_google").unwrap();
+            assert!(cleared.contains("Max-Age=0"), "the state cookie is cleared");
+            let session = set_cookie(&res, "sr_session").map(|c| session(&c));
+            (res.header("location").to_str().unwrap().to_owned(), session)
+        }
+
+        fn sub() -> String {
+            uuid::Uuid::now_v7().simple().to_string()
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn without_credentials_google_is_off() {
+            let (s, _) = server_where(|c| c.google = None).await;
+            s.get("/auth/providers")
+                .await
+                .assert_json(&json!({"google": false}));
+            assert_eq!(s.get("/auth/google/start").await.status_code(), 404);
+            assert_eq!(s.get("/auth/google/callback").await.status_code(), 404);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn a_new_google_account_signs_up_and_lands_on_welcome() {
+            let (s, db) = google_server(|_| {}).await;
+            s.get("/auth/providers")
+                .await
+                .assert_json(&json!({"google": true}));
+            let st = begin(&s, "?next=/app/team").await;
+            let email = unique_email();
+            let id = sub();
+            let (to, session) = finish(
+                &s,
+                &st.state,
+                Some(&st.cookie),
+                &claims(&st, &id, &email.to_uppercase()),
+            )
+            .await;
+            assert_eq!(to, "http://localhost:3000/welcome");
+            let verifier = VERIFIERS.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(
+                socialreins_core::oauth::pkce_challenge(&verifier),
+                st.challenge
+            );
+            let me = s
+                .get("/auth/me")
+                .add_header("cookie", session.unwrap())
+                .await;
+            me.assert_status_ok();
+            assert_eq!(me.json::<Value>()["email"], email);
+            assert_eq!(me.json::<Value>()["name"], "Ann Lee");
+            assert_eq!(user(&db, &email).await.unwrap().google_sub, Some(id));
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn existing_accounts_match_by_sub_then_by_verified_email() {
+            let (s, db) = google_server(|_| {}).await;
+            let (email, _) = signed_in(&s, &db).await;
+            let id = sub();
+            let st = begin(&s, "?next=/app/team?tab=members").await;
+            let (to, session) =
+                finish(&s, &st.state, Some(&st.cookie), &claims(&st, &id, &email)).await;
+            assert_eq!(to, "http://localhost:3000/app/team?tab=members");
+            assert!(session.is_some());
+            let linked = user(&db, &email).await.unwrap();
+            assert_eq!(linked.google_sub.as_deref(), Some(id.as_str()));
+            // The Google account's email changed: the linked sub still finds the account.
+            let st = begin(&s, "?next=//evil.example").await;
+            let (to, session) = finish(
+                &s,
+                &st.state,
+                Some(&st.cookie),
+                &claims(&st, &id, &unique_email()),
+            )
+            .await;
+            assert_eq!(
+                to, "http://localhost:3000/app",
+                "an off-site next falls back to /app"
+            );
+            let me = s
+                .get("/auth/me")
+                .add_header("cookie", session.unwrap())
+                .await;
+            assert_eq!(me.json::<Value>()["id"], json!(linked.id));
+            // Another Google account with the same email cannot take it over.
+            let st = begin(&s, "").await;
+            let (to, session) = finish(
+                &s,
+                &st.state,
+                Some(&st.cookie),
+                &claims(&st, &sub(), &email),
+            )
+            .await;
+            assert_eq!(to, "http://localhost:3000/login?error=google_failed");
+            assert!(session.is_none());
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn state_cookie_nonce_and_verified_email_are_required() {
+            let (s, db) = google_server(|_| {}).await;
+            let fail = "http://localhost:3000/login?error=google_failed";
+            let st = begin(&s, "").await;
+            let email = unique_email();
+            // No cookie, or another browser's cookie: refused, and the state is not used up.
+            assert_eq!(
+                finish(&s, &st.state, None, &claims(&st, &sub(), &email))
+                    .await
+                    .0,
+                fail
+            );
+            let other = begin(&s, "").await;
+            assert_eq!(
+                finish(
+                    &s,
+                    &st.state,
+                    Some(&other.cookie),
+                    &claims(&st, &sub(), &email)
+                )
+                .await
+                .0,
+                fail
+            );
+            let mut unverified = claims(&st, &sub(), &email);
+            unverified["email_verified"] = json!(false);
+            assert_eq!(
+                finish(&s, &st.state, Some(&st.cookie), &unverified).await.0,
+                fail
+            );
+            // That attempt used the state: a replay fails even with good claims.
+            assert_eq!(
+                finish(
+                    &s,
+                    &st.state,
+                    Some(&st.cookie),
+                    &claims(&st, &sub(), &email)
+                )
+                .await
+                .0,
+                fail
+            );
+            let st = begin(&s, "").await;
+            let mut wrong_nonce = claims(&st, &sub(), &email);
+            wrong_nonce["nonce"] = json!("not-the-nonce");
+            assert_eq!(
+                finish(&s, &st.state, Some(&st.cookie), &wrong_nonce)
+                    .await
+                    .0,
+                fail
+            );
+            let st = begin(&s, "").await;
+            let mut wrong_aud = claims(&st, &sub(), &email);
+            wrong_aud["aud"] = json!("someone-else");
+            assert_eq!(
+                finish(&s, &st.state, Some(&st.cookie), &wrong_aud).await.0,
+                fail
+            );
+            assert!(user(&db, &email).await.is_none(), "no account was made");
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn closed_registration_refuses_new_google_accounts() {
+            let (s, db) = google_server(|c| c.registration_disabled = true).await;
+            let st = begin(&s, "").await;
+            let email = unique_email();
+            let (to, session) = finish(
+                &s,
+                &st.state,
+                Some(&st.cookie),
+                &claims(&st, &sub(), &email),
+            )
+            .await;
+            assert_eq!(
+                to,
+                "http://localhost:3000/login?error=registration_disabled"
+            );
+            assert!(session.is_none());
+            assert!(user(&db, &email).await.is_none());
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn google_sign_in_shares_the_login_limit() {
+            let (s, _) = google_server(|_| {}).await;
+            for _ in 0..10 {
+                assert_eq!(s.get("/auth/google/start").await.status_code(), 303);
+            }
+            let res = s.get("/auth/google/start").await;
+            assert_eq!(
+                res.header("location").to_str().unwrap(),
+                "http://localhost:3000/login?error=google_failed"
+            );
+        }
     }
 
     mod passkeys {
@@ -1456,7 +1535,7 @@ mod teams {
         rename.assert_status_ok();
         assert_eq!(rename.json::<Value>()["name"], "Acme Co");
 
-        // Deleting needs a recent sign-in (or the password).
+        // Deleting needs a recent sign-in.
         let hash = token::hash(cookie.trim_start_matches("sr_session="));
         let aged = sessions::ActiveModel {
             token_hash: Set(hash.clone()),
@@ -3036,29 +3115,6 @@ mod teams {
                 assert_eq!(res.status_code(), 403);
                 res.assert_json(&json!({"error": "reauth_required"}));
                 assert_eq!(sets(&s, &cookie, "").await.len(), 2, "still there");
-            }
-
-            #[tokio::test]
-            #[serial]
-            async fn delete_with_the_password_after_a_stale_sign_in() {
-                let (s, db) = server_where(|_| {}).await;
-                let (_, cookie, _) = user(&s, &db).await;
-                let res = req(&s, Method::PUT, "/auth/password", &cookie)
-                    .json(&json!({"password": "correct horse battery"}))
-                    .await;
-                assert_eq!(res.status_code(), 204);
-                let id = id_of(&make(&s, &cookie, "Old").await);
-                let path = format!("/v1/social-sets/{id}");
-                stale(&db, &cookie).await;
-                let wrong = req(&s, Method::DELETE, &path, &cookie)
-                    .json(&json!({"password": "nope nope nope"}))
-                    .await;
-                assert_eq!(wrong.status_code(), 403);
-                let res = req(&s, Method::DELETE, &path, &cookie)
-                    .json(&json!({"password": "correct horse battery"}))
-                    .await;
-                assert_eq!(res.status_code(), 204);
-                assert_eq!(sets(&s, &cookie, "").await.len(), 1);
             }
 
             #[tokio::test]

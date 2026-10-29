@@ -28,7 +28,6 @@ use uuid::Uuid;
 
 use super::{
     auth::{internal, Body, CurrentUser, FromWeb},
-    password::reauthenticated,
     waitlist::{error, Error, Reply},
 };
 use crate::{
@@ -108,12 +107,6 @@ pub struct NewInvitation {
     pub email: String,
     /// `admin` or `member`.
     pub role: String,
-}
-
-#[derive(Deserialize, ToSchema)]
-pub struct DeleteTeam {
-    /// The account password; not needed within 10 minutes of signing in.
-    pub password: Option<String>,
 }
 
 fn reply(status: StatusCode, code: &str) -> Response {
@@ -442,23 +435,17 @@ async fn rename(
 }
 
 /// Deletes the current team with its members, invitations and sets. Owner only, with a sign-in
-/// from the last 10 minutes or the account password. The caller's last team cannot go.
-#[utoipa::path(delete, path = "/team", tag = "teams", request_body = DeleteTeam,
+/// from the last 10 minutes (else `403 reauth_required`). The caller's last team cannot go.
+/// Any body is ignored.
+#[utoipa::path(delete, path = "/team", tag = "teams",
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
-        (status = 409, body = Error), (status = 429, body = Error)))]
-async fn destroy(
-    _: FromWeb,
-    State(app): State<AppState>,
-    t: InTeam,
-    Body(body): Body<DeleteTeam>,
-) -> Response {
+        (status = 409, body = Error)))]
+async fn destroy(_: FromWeb, State(app): State<AppState>, t: InTeam) -> Response {
     if t.role != Role::Owner {
         return forbidden();
     }
-    match reauthenticated(&app, &t.current, body.password).await {
-        Some(true) => {}
-        Some(false) => return reply(StatusCode::FORBIDDEN, "reauth_required"),
-        None => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+    if !t.current.recent() {
+        return reply(StatusCode::FORBIDDEN, "reauth_required");
     }
     let user_id = t.current.0.id;
     let deleted = async {

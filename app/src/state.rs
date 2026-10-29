@@ -17,14 +17,8 @@ pub struct AppState {
     pub waitlist_limiter: Arc<RateLimiter>,
     /// Per-IP limit shared by `POST /auth/link` and `POST /auth/magic`.
     pub magic_link_limiter: Arc<RateLimiter>,
-    /// Per-IP limit on every password and passkey sign-in attempt.
+    /// Per-IP limit on every passkey and Google sign-in attempt.
     pub login_limiter: Arc<RateLimiter>,
-    /// Per-email budget of failed `/auth/login` passwords (signed-in failures are charged too); a
-    /// success clears it. Never refuses a signed-in request.
-    pub login_email_limiter: Arc<RateLimiter<String>>,
-    /// Per-user budget of failed password checks by a signed-in user (`PUT /auth/password`, the
-    /// confirm on passkey registration). Keyed by user id, so outside traffic cannot drain it.
-    pub account_limiter: Arc<RateLimiter<uuid::Uuid>>,
     /// Per-user burst limit on `POST /v1/team/invitations`, each of which sends an email. The
     /// daily caps live in Postgres (`rate_limit::daily_allow`).
     pub invitation_limiter: Arc<RateLimiter<uuid::Uuid>>,
@@ -45,6 +39,7 @@ pub struct AppState {
     pub cipher: Arc<Cipher>,
     pub bluesky: Bluesky,
     pub providers: Vec<(&'static str, bool)>,
+    pub google: Option<crate::connectors::google::Google>,
 }
 
 impl AppState {
@@ -56,8 +51,6 @@ impl AppState {
             waitlist_limiter: Arc::new(RateLimiter::per_minute(10)),
             magic_link_limiter: Arc::new(RateLimiter::per_minute(5)),
             login_limiter: Arc::new(RateLimiter::per_minute(10)),
-            login_email_limiter: Arc::new(RateLimiter::per_minute(5)),
-            account_limiter: Arc::new(RateLimiter::per_minute(5)),
             invitation_limiter: Arc::new(RateLimiter::per_minute(10)),
             connect_limiter: Arc::new(RateLimiter::per_minute(5)),
             post_limiter: Arc::new(RateLimiter::per_minute(10)),
@@ -71,6 +64,7 @@ impl AppState {
             cipher: config.cipher.clone(),
             bluesky: config.bluesky.clone(),
             providers: config.providers.clone(),
+            google: config.google.clone(),
         }
     }
 }

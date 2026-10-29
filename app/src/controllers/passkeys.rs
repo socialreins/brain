@@ -23,7 +23,6 @@ use webauthn_rs::prelude::{
 
 use super::{
     auth::{end_other_sessions, internal, start_session, user_json, Body, CurrentUser, FromWeb},
-    password::reauthenticated,
     waitlist::error,
 };
 use crate::{
@@ -84,24 +83,11 @@ async fn take_challenge<T: DeserializeOwned>(
         .flatten())
 }
 
-#[derive(Deserialize)]
-struct Confirm {
-    /// Lets a user with a password confirm it instead of signing in again.
-    password: Option<String>,
-}
-
-/// `POST /auth/passkeys/register/start`: needs a session from the last 10 minutes or the
-/// account password, so a stolen old cookie cannot add a passkey.
-async fn register_start(
-    _: FromWeb,
-    State(app): State<AppState>,
-    current: CurrentUser,
-    Body(body): Body<Confirm>,
-) -> Response {
-    match reauthenticated(&app, &current, body.password).await {
-        Some(true) => {}
-        Some(false) => return reply(StatusCode::FORBIDDEN, "reauth_required"),
-        None => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+/// `POST /auth/passkeys/register/start`: needs a sign-in from the last 10 minutes, so a stolen
+/// old cookie cannot add a passkey. Any body is ignored.
+async fn register_start(_: FromWeb, State(app): State<AppState>, current: CurrentUser) -> Response {
+    if !current.recent() {
+        return reply(StatusCode::FORBIDDEN, "reauth_required");
     }
     let user = &current.0;
     let existing = match own_passkeys(&app, user.id).await {

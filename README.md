@@ -33,9 +33,10 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | POST | `/auth/magic` | Form field `token`: uses the link, sets the session cookie, redirects to `WEB_URL` |
 | GET | `/auth/me` | The signed-in user, or `401 {"error":"unauthorized"}` |
 | POST | `/auth/logout` | Deletes the session, `204`. Origin must be in `CORS_ORIGINS` |
-| POST | `/auth/login` | `{"email","password"}`: sets the session cookie, returns the user |
-| PUT | `/auth/password` | `{"password","current_password"}`: sets or changes the signed-in user's password, `204` |
-| POST | `/auth/passkeys/register/start` | `{}` or `{"password"}`: `{"challenge_id","options"}` for `navigator.credentials.create` |
+| GET | `/auth/providers` | `{"google":bool}`: the optional sign-in methods this install offers |
+| GET | `/auth/google/start?next=/path` | Redirects to Google (`404` when Google is not configured). `next` must be a path on the web app, else `/app` |
+| GET | `/auth/google/callback` | Google's redirect back: sets the session cookie and redirects to `WEB_URL` + `next`, or `WEB_URL/welcome` for a new account, or `WEB_URL/login?error=google_failed` (or `registration_disabled`) |
+| POST | `/auth/passkeys/register/start` | Needs a sign-in from the last 10 minutes: `{"challenge_id","options"}` for `navigator.credentials.create` |
 | POST | `/auth/passkeys/register/finish` | `{"challenge_id","credential","name"}`: stores the passkey, `201` |
 | POST | `/auth/passkeys/login/start` | `{"challenge_id","options"}` for `navigator.credentials.get` (discoverable, no email) |
 | POST | `/auth/passkeys/login/finish` | `{"challenge_id","credential"}`: sets the session cookie, returns the user |
@@ -43,7 +44,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | DELETE | `/auth/passkeys/{id}` | Deletes one of the signed-in user's passkeys, `204`, else `404` |
 | POST, GET | `/v1/teams` | Create a team (`{"name"}`, with its Default set; caller owns it and switches to it), or list mine |
 | PUT | `/v1/current-team` | `{"team_id"}`: switch to one of my teams |
-| GET, PATCH, DELETE | `/v1/team` | The current team; rename it (owner, admin); delete it (owner, `{}` or `{"password"}`) |
+| GET, PATCH, DELETE | `/v1/team` | The current team; rename it (owner, admin); delete it (owner, sign-in from the last 10 minutes) |
 | GET | `/v1/team/members` | The current team's members |
 | PATCH, DELETE | `/v1/team/members/{user_id}` | `{"role"}`: change a role (owner, admin); remove a member, or leave |
 | POST, GET | `/v1/team/invitations` | `{"email","role"}`: invite as `admin` or `member` (owner, admin); list pending |
@@ -55,7 +56,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | PUT | `/v1/connections/{id}/sets` | `{"set_ids"}` (owner, admin): the sets of the current team holding the account; must include the Default set |
 | DELETE | `/v1/connections/{id}` | Disconnect an account (owner, admin), `204` |
 | GET, POST | `/v1/social-sets` | The current team's live sets with `account_ids`, Default first (`?deleted=true`: deleted ones still restorable); create one (`{"name"}`, owner, admin) |
-| PATCH, DELETE | `/v1/social-sets/{id}` | Rename (`{"name"}`, the Default set too); delete (`{}` or `{"password"}`, not the Default set), restorable for 30 days. Owner, admin |
+| PATCH, DELETE | `/v1/social-sets/{id}` | Rename (`{"name"}`, the Default set too); delete (sign-in from the last 10 minutes, not the Default set), restorable for 30 days. Owner, admin |
 | POST | `/v1/social-sets/{id}/restore` | Restore a set deleted in the last 30 days, with its accounts (owner, admin) |
 | GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&from=&to=` on `scheduled_at`), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"scheduled_at"}`; any member) |
 | GET, PUT, DELETE | `/v1/posts/{id}` | One post with its `targets`; replace a `draft` or `scheduled` one; delete (`204` for draft or scheduled, `200` after taking a published one down, `422 takedown_failed` with a `message`, `409` for queued or failed) |
@@ -65,7 +66,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 list, so it never reveals who signed up. A bad email gets `422 {"error":"invalid_email"}`. Each
 client IP (IPv6 by /64) gets 10 requests a minute, then `429`.
 
-Sign-in is by magic link, password or passkey. `POST /auth/link` answers the same `202`, at the same speed,
+Sign-in is by magic link, Google or passkey; there are no passwords. `POST /auth/link` answers the same `202`, at the same speed,
 whether or not the email has an account (or is refused by `REGISTRATION_DISABLED`): the lookup
 and the mail run after the reply. Opening the link shows a button that posts it back, so mail
 scanners that prefetch links cannot use it up, and `POST /auth/magic` only accepts a post
@@ -75,17 +76,20 @@ SameSite=Lax `sr_session` cookie (`Secure` unless `BRAIN_URL` is `http://`). A d
 redirects to `WEB_URL/login?error=invalid_link` (or `registration_disabled`). Only SHA-256
 hashes of link and session tokens are stored. `POST /auth/link` and `POST /auth/magic` share 5 requests a minute per IP.
 
-Passwords are optional and hashed with Argon2id (12 to 256 characters). `POST /auth/login`
-answers the same `401 {"error":"invalid_credentials"}` for an unknown email, an account without
-a password and a wrong password, and takes about as long for each. Changing a password needs the
-current one; setting the first one, or adding or deleting a passkey, needs a session started in the last 10
-minutes (sign in again otherwise; adding a passkey also accepts the password). Password and
-passkey sign-in share 10 attempts a minute per IP. Per email only failed passwords count: 5 a
-minute closes the email until the window ends, and a success clears the count, so strangers
-cannot lock out an owner who knows the password. A signed-in user's current-password checks
-have their own budget of 5 failures a minute per account, which outsiders cannot drain; each
-failure also counts against the email's login budget. Setting or changing a password, or deleting a passkey, ends every other
-session of the user; setting or changing a password also voids unused sign-in links.
+Google sign-in (when `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are set) uses the
+authorization code flow with PKCE, a state and a nonce. The attempt is kept in Postgres for 10
+minutes and used once; the browser holds the state in an HttpOnly cookie scoped to
+`/auth/google`, so only the browser that started can finish (login CSRF). The id_token comes
+straight from Google's token endpoint over TLS, so brain checks its issuer, audience, expiry,
+nonce and `email_verified` but not its signature. An account is found by its linked Google
+`sub`, else by the verified email (which links the `sub`; an email already linked to another
+Google account is refused), else created under the same rules as a magic link. Errors redirect
+with no details. Register `{BRAIN_URL}/auth/google/callback` as the redirect URI.
+
+Adding a passkey, deleting one, deleting a team and deleting a social set need a session
+started in the last 10 minutes (`403 reauth_required`: sign in again). Passkey and Google
+sign-in share 10 attempts a minute per IP. Deleting a passkey ends every other session of the
+user.
 
 Passkeys use WebAuthn through the web app's pages: each `start` keeps the ceremony state in
 Postgres for 5 minutes and the matching `finish` uses it once. The state-changing endpoints in
@@ -97,7 +101,7 @@ social set. The team routes use the session cookie, and the state-changing ones 
 check. They only reach the caller's own teams: anything else is `404 {"error":"not_found"}`,
 and a role that may not act gets `403 {"error":"forbidden"}`. The last owner cannot be demoted
 or leave (`409 last_owner`), and a user's last team cannot be deleted (`409 last_team`).
-Deleting a team needs a sign-in from the last 10 minutes or the password. Invitations email a
+Deleting a team needs a sign-in from the last 10 minutes. Invitations email a
 link to `WEB_URL/invitations/{token}` that works once within 7 days, for the invited email only
 (`403 email_mismatch`); only its SHA-256 is stored. An invited email may sign up even with
 `REGISTRATION_DISABLED`. Each user sends at most 10 invitations a minute and 50 a day, each
@@ -109,7 +113,7 @@ invite: when they are removed, leave or drop below admin, theirs are deleted.
 Social sets group a team's accounts. Names follow the team name rules and are unique among a
 team's live sets in any case (`409 name_taken`); a team holds at most 50 live sets
 (`409 too_many_sets`). The Default set holds every account; it can be renamed but not deleted
-(`409 default_set`). Deleting a set needs a sign-in from the last 10 minutes or the password;
+(`409 default_set`). Deleting a set needs a sign-in from the last 10 minutes;
 it keeps its account links, hidden, so a restore within 30 days brings them back. An hourly
 job in brain hard-deletes sets deleted over 30 days ago, one instance at a time (advisory lock).
 
@@ -185,7 +189,7 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET` | no | Offer LinkedIn (connector not built yet) |
 | `X_CLIENT_ID`, `X_CLIENT_SECRET` | no | Offer X (connector not built yet) |
 | `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET` | no | Offer TikTok (connector not built yet) |
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | no | Offer YouTube (connector not built yet) |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | no | Both or neither. Turn on Google sign-in (OAuth client of type Web application, redirect URI `{BRAIN_URL}/auth/google/callback`); YouTube will use them too |
 
 ## Deploy
 

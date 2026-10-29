@@ -23,7 +23,6 @@ use uuid::Uuid;
 
 use super::{
     auth::{internal, Body, FromWeb},
-    password::reauthenticated,
     teams::InTeam,
     waitlist::{error, Error},
 };
@@ -54,12 +53,6 @@ pub struct SetName {
     /// 1 to 60 characters after trimming, no control characters, unique among the team's live
     /// sets in any case.
     pub name: String,
-}
-
-#[derive(Deserialize, ToSchema)]
-pub struct DeleteSet {
-    /// The account password; not needed within 10 minutes of signing in.
-    pub password: Option<String>,
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -282,17 +275,17 @@ async fn rename(
 }
 
 /// Deletes a set, restorable for 30 days. Owners and admins, with a sign-in from the last 10
-/// minutes or the account password. The Default set cannot go (`409 default_set`).
-#[utoipa::path(delete, path = "/social-sets/{id}", tag = "social-sets", request_body = DeleteSet,
+/// minutes (else `403 reauth_required`). The Default set cannot go (`409 default_set`). Any
+/// body is ignored.
+#[utoipa::path(delete, path = "/social-sets/{id}", tag = "social-sets",
     params(("id" = Uuid, Path)),
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
-        (status = 404, body = Error), (status = 409, body = Error), (status = 429, body = Error)))]
+        (status = 404, body = Error), (status = 409, body = Error)))]
 async fn destroy(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
     Path(id): Path<Uuid>,
-    Body(body): Body<DeleteSet>,
 ) -> Response {
     if !t.role.manages() {
         return forbidden();
@@ -303,10 +296,8 @@ async fn destroy(
         Ok(None) => return not_found(),
         Err(e) => return internal(e, "social set lookup"),
     }
-    match reauthenticated(&app, &t.current, body.password).await {
-        Some(true) => {}
-        Some(false) => return reply(StatusCode::FORBIDDEN, "reauth_required"),
-        None => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+    if !t.current.recent() {
+        return reply(StatusCode::FORBIDDEN, "reauth_required");
     }
     // TODO tokens: once API tokens exist, revoke the ones limited to this set here.
     let now = Utc::now().fixed_offset();

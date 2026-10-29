@@ -204,8 +204,25 @@ async fn create_first_user(app: &AppState, email: &str) -> Result<Option<users::
     Ok(Some(user))
 }
 
+/// The account for `email`, created under the sign-up rules when there is none (`true` when it
+/// was); `None` when sign-up is closed to it. Every sign-in method creates accounts here.
+pub(crate) async fn user_for_sign_in(
+    app: &AppState,
+    email: &str,
+) -> Result<Option<(users::Model, bool)>, DbErr> {
+    if let Some(user) = find_user(app, email).await? {
+        return Ok(Some((user, false)));
+    }
+    let created = match sign_up(app, email).await? {
+        SignUp::Allowed => Some(create_user(&app.db, email).await?),
+        SignUp::FirstOnly => create_first_user(app, email).await?,
+        SignUp::Refused => None,
+    };
+    Ok(created.map(|user| (user, true)))
+}
+
 /// Lands on `{WEB_URL}/login?error=...` when the link cannot be used.
-fn refused(app: &AppState, code: &str) -> Response {
+pub(crate) fn refused(app: &AppState, code: &str) -> Response {
     Redirect::to(&format!("{}/login?error={code}", app.web_url)).into_response()
 }
 
@@ -274,22 +291,10 @@ async fn redeem(
     if link.expires_at < Utc::now() {
         return refused(&app, "invalid_link");
     }
-    let user = match find_user(&app, &link.email).await {
-        Ok(Some(user)) => user,
-        Ok(None) => {
-            let created = match sign_up(&app, &link.email).await {
-                Ok(SignUp::Allowed) => create_user(&app.db, &link.email).await.map(Some),
-                Ok(SignUp::FirstOnly) => create_first_user(&app, &link.email).await,
-                Ok(SignUp::Refused) => Ok(None),
-                Err(e) => return internal(e, "sign-up check"),
-            };
-            match created {
-                Ok(Some(user)) => user,
-                Ok(None) => return refused(&app, "registration_disabled"),
-                Err(e) => return internal(e, "user insert"),
-            }
-        }
-        Err(e) => return internal(e, "user lookup"),
+    let user = match user_for_sign_in(&app, &link.email).await {
+        Ok(Some((user, _))) => user,
+        Ok(None) => return refused(&app, "registration_disabled"),
+        Err(e) => return internal(e, "sign-in user"),
     };
     match start_session(&app, user.id).await {
         Ok(cookie) => ([(header::SET_COOKIE, cookie)], Redirect::to(&app.web_url)).into_response(),
@@ -404,23 +409,39 @@ async fn create_user(db: &impl ConnectionTrait, email: &str) -> Result<users::Mo
 }
 
 fn cookie(app: &AppState, value: &str, max_age: i64) -> String {
+    named_cookie(app, SESSION_COOKIE, "/", value, max_age)
+}
+
+/// An HttpOnly, SameSite=Lax cookie; `Secure` unless `BRAIN_URL` is plain http (local dev).
+pub(crate) fn named_cookie(
+    app: &AppState,
+    name: &str,
+    path: &str,
+    value: &str,
+    max_age: i64,
+) -> String {
     let secure = if app.brain_url.starts_with("http://") {
         ""
     } else {
         "; Secure"
     };
-    format!("{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}")
+    format!("{name}={value}; Path={path}; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}")
 }
 
-fn session_token(headers: &HeaderMap) -> Option<&str> {
+/// The value of cookie `name`.
+pub(crate) fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .filter_map(|c| c.trim().split_once('='))
-        .find(|(name, _)| *name == SESSION_COOKIE)
+        .find(|(n, _)| *n == name)
         .map(|(_, value)| value)
+}
+
+fn session_token(headers: &HeaderMap) -> Option<&str> {
+    cookie_value(headers, SESSION_COOKIE)
 }
 
 /// The signed-in user and their session, from an unexpired session cookie;
@@ -469,7 +490,6 @@ pub(crate) fn user_json(user: &users::Model) -> Json<serde_json::Value> {
         "email": user.email,
         "name": user.name,
         "username": user.username,
-        "has_password": user.password_hash.is_some(),
     }))
 }
 
