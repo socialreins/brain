@@ -3601,8 +3601,9 @@ mod teams {
                 }
                 let (a, b) = tokio::join!(publish::claim_due(&db), publish::claim_due(&db));
                 let (a, b) = (a.unwrap(), b.unwrap());
+                assert!(a.len() <= 50 && b.len() <= 50, "batches are capped");
                 for id in &mine {
-                    let n = a.iter().chain(&b).filter(|x| *x == id).count();
+                    let n = a.iter().chain(&b).filter(|x| x.0 == *id).count();
                     assert_eq!(n, 1, "each due post is claimed once");
                 }
                 // Two runs of one queued post: every target is claimed once, one record each.
@@ -3635,6 +3636,83 @@ mod teams {
                     !p.unwrap() && !q.unwrap(),
                     "a target with a remote id is never claimed"
                 );
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn the_daily_quota_holds_back_publishes_and_past_times_mean_now() {
+                use sea_orm::{ConnectionTrait, DbBackend, Statement};
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let t0 = Utc::now() - Duration::seconds(1);
+                let hour_ago = (Utc::now() - Duration::hours(1)).to_rfc3339();
+                let res = create(&s, &cookie, input(&set, "past", Some(&hour_ago))).await;
+                let p = res.json::<Value>();
+                let at: chrono::DateTime<Utc> =
+                    p["scheduled_at"].as_str().unwrap().parse().unwrap();
+                assert!(at >= t0, "a past scheduled_at is clamped to now");
+                let id = p["id"].as_str().unwrap().to_owned();
+
+                let bucket = publish::quota_bucket(team_id.parse().unwrap());
+                for _ in 0..publish::PUBLISHES_PER_DAY {
+                    let sql = "INSERT INTO rate_limit_hits (bucket) VALUES ($1)";
+                    let stmt = Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        sql,
+                        [bucket.clone().into()],
+                    );
+                    db.execute_raw(stmt).await.unwrap();
+                }
+                publish::tick(&state).await.unwrap();
+                assert_eq!(
+                    get_post(&s, &cookie, &id).await["status"],
+                    "scheduled",
+                    "held back"
+                );
+                let draft = id_of(&create(&s, &cookie, input(&set, "now", None)).await);
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/posts/{draft}/publish"),
+                    &cookie,
+                )
+                .await;
+                assert_eq!(res.status_code(), 429);
+                res.assert_json(&json!({"error": "publish_quota"}));
+                assert_eq!(get_post(&s, &cookie, &draft).await["status"], "draft");
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_tick_claims_at_most_50_posts() {
+                let (s, db, _) = on_mock().await;
+                let (_, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let mut mine = Vec::new();
+                for _ in 0..51 {
+                    let id = queued_post(&db, &team_id, &set).await;
+                    let row = posts::ActiveModel {
+                        id: Set(id),
+                        status: Set("scheduled".into()),
+                        ..Default::default()
+                    };
+                    posts::Entity::update(row).exec(&db).await.unwrap();
+                    mine.push(id);
+                }
+                let first = publish::claim_due(&db).await.unwrap();
+                assert_eq!(first.len(), 50);
+                let mut claimed: Vec<uuid::Uuid> = first.iter().map(|c| c.0).collect();
+                loop {
+                    let next = publish::claim_due(&db).await.unwrap();
+                    if next.is_empty() {
+                        break;
+                    }
+                    claimed.extend(next.iter().map(|c| c.0));
+                }
+                for id in &mine {
+                    assert_eq!(claimed.iter().filter(|c| *c == id).count(), 1);
+                }
             }
 
             async fn queued_post(db: &DatabaseConnection, team: &str, set: &str) -> uuid::Uuid {

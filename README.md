@@ -121,7 +121,10 @@ target per account and claims each target once, so nothing posts twice; a publis
 retried. A target cut off mid-publish for 15 minutes fails as "unknown, check the account".
 Posts of a deleted set are hidden and held back until it is restored. Errors never carry URLs
 or tokens. A team keeps at most 2000 posts that are not deleted; publish now and take-down are
-10 a minute per user.
+10 a minute per user. A team publishes at most 100 posts a day, scheduled or now (`429
+publish_quota` on publish now); a due post over the limit stays `scheduled` and goes out once
+it frees up. A tick claims at most 50 posts; 8 posts and 8 targets publish at once. A past
+`scheduled_at` means now.
 
 Connections are the current team's social accounts. Members list them; owners and admins connect,
 regroup and disconnect them. Tokens are sealed with `ENCRYPTION_KEY` and never returned. Every

@@ -30,6 +30,7 @@ use super::{
 use crate::{
     models::{post_targets, posts, social_sets, teams},
     publish,
+    rate_limit::{daily_refund, daily_reserve},
     state::AppState,
 };
 
@@ -202,6 +203,12 @@ async fn checked(
     })
 }
 
+/// `scheduled_at`, with a past time meaning now (as the old app did).
+fn when(input: &PostInput) -> Option<DateTime<FixedOffset>> {
+    let now = Utc::now().fixed_offset();
+    input.scheduled_at.map(|t| t.max(now))
+}
+
 fn status_for(input: &PostInput) -> &'static str {
     if input.scheduled_at.is_some() {
         "scheduled"
@@ -284,7 +291,8 @@ async fn show(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> R
     }
 }
 
-/// Creates a post; `scheduled` with `scheduled_at`, else `draft`. At most 2000 per team.
+/// Creates a post; `scheduled` with `scheduled_at` (a past time means now), else `draft`. At
+/// most 2000 per team.
 #[utoipa::path(post, path = "/posts", tag = "posts", request_body = PostInput,
     responses((status = 201, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 409, body = Error), (status = 422, body = Error)))]
@@ -320,7 +328,7 @@ async fn create(
             body: Set(input.body.clone()),
             media: Set(serde_json::json!(input.media)),
             status: Set(status_for(&input).into()),
-            scheduled_at: Set(input.scheduled_at),
+            scheduled_at: Set(when(&input)),
             created_by: Set(Some(t.current.0.id)),
             ..Default::default()
         };
@@ -366,7 +374,7 @@ async fn update(
             .col_expr(posts::Column::Body, input.body.clone().into())
             .col_expr(posts::Column::Media, serde_json::json!(input.media).into())
             .col_expr(posts::Column::Status, status_for(&input).into())
-            .col_expr(posts::Column::ScheduledAt, input.scheduled_at.into())
+            .col_expr(posts::Column::ScheduledAt, when(&input).into())
             .col_expr(posts::Column::UpdatedAt, Utc::now().fixed_offset().into())
             .filter(posts::Column::Id.eq(id))
             .filter(posts::Column::Status.is_in(["draft", "scheduled"]))
@@ -389,7 +397,8 @@ async fn update(
 
 /// Publishes a `draft` or `scheduled` post now: `scheduled_at` becomes now and the post is
 /// claimed (`queued`) and sent in the background. `202` with the queued post; poll it for the
-/// result. At most 10 publish or take-down calls a minute per user.
+/// result. At most 10 publish or take-down calls a minute per user; with scheduled posts, at
+/// most 100 published a day per team (`429 publish_quota`).
 #[utoipa::path(post, path = "/posts/{id}/publish", tag = "posts", params(("id" = Uuid, Path)),
     responses((status = 202, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
@@ -407,6 +416,11 @@ async fn publish_now(
         if find(&app.db, t.team.id, id).await?.is_none() {
             return Ok(Err(not_found()));
         }
+        // Counts against the same daily cap as scheduled publishes.
+        let cap = [(publish::quota_bucket(t.team.id), publish::PUBLISHES_PER_DAY)];
+        let Some(reserved) = daily_reserve(&app.db, &cap).await? else {
+            return Ok(Err(reply(StatusCode::TOO_MANY_REQUESTS, "publish_quota")));
+        };
         let stmt = Statement::from_sql_and_values(
             DbBackend::Postgres,
             "UPDATE posts p SET status = 'queued', scheduled_at = now(), updated_at = now() \
@@ -416,6 +430,7 @@ async fn publish_now(
             [id.into()],
         );
         if app.db.execute_raw(stmt).await?.rows_affected() == 0 {
+            daily_refund(&app.db, &reserved).await;
             return Ok(Err(reply(StatusCode::CONFLICT, "not_editable")));
         }
         match find(&app.db, t.team.id, id).await? {
