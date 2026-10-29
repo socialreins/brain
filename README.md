@@ -106,11 +106,12 @@ account sits in the team's Default set, which `PUT /v1/connections/{id}/sets` ca
 (`422 default_set_required`). Bluesky needs no app: brain resolves the handle to a DID
 (`public.api.bsky.app`), the DID to its PDS (`plc.directory` or the domain's `did.json`), then
 opens a session there with the app password, which is sent only to that PDS over https with
-redirects off. An account password is refused (`422 app_password_required`). Errors:
+redirects off. A wrong password and an account password get the same `invalid_credentials`. Errors:
 `invalid_handle`, `unsupported_pds`, `invalid_credentials` (all 422), `rate_limited`,
 `bluesky_unreachable` (502). Attempts count like sign-in: per IP, 5 a minute per user, and 30
-a day per user and 10 a day per handle in one team. Names that resolve to private addresses
-are refused.
+a day per user, 10 a day per handle in one team, and 20 refused passwords a day per handle
+across all teams. Bluesky hosts must resolve to public addresses (`unsupported_pds`), and
+responses over 64 KiB are dropped.
 
 ## Local development
 

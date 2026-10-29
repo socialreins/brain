@@ -2205,6 +2205,10 @@ mod teams {
             let resolve = |Query(q): Query<HashMap<String, String>>| async move {
                 let h = q.get("handle").cloned().unwrap_or_default();
                 match h.strip_suffix(".test") {
+                    Some("big") => (
+                        axum::http::StatusCode::OK,
+                        Json(json!({"did": "did:plc:big", "pad": "x".repeat(100_000)})),
+                    ),
                     Some("down") => (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         Json(json!({"error": "Unavailable"})),
@@ -2219,7 +2223,13 @@ mod teams {
                     ),
                 }
             };
+            // `did:plc:rebind` names its PDS `localhost`, which the resolver must refuse.
             let doc = |State(base): State<String>, Path(did): Path<String>| async move {
+                let base = if did == "did:plc:rebind" {
+                    base.replace("127.0.0.1", "localhost")
+                } else {
+                    base
+                };
                 Json(json!({
                     "id": did,
                     "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer",
@@ -2397,8 +2407,8 @@ mod teams {
             let cases = [
                 (new_handle(), "wrong-pass", 422, "invalid_credentials"),
                 (new_handle(), "", 422, "invalid_credentials"),
-                (new_handle(), ACCOUNT_PASSWORD, 422, "app_password_required"),
-                (new_handle(), "needs-2fa", 422, "app_password_required"),
+                (new_handle(), ACCOUNT_PASSWORD, 422, "invalid_credentials"),
+                (new_handle(), "needs-2fa", 422, "invalid_credentials"),
                 ("nobody.test".into(), APP_PASSWORD, 422, "invalid_handle"),
                 ("not a handle".into(), APP_PASSWORD, 422, "invalid_handle"),
             ];
@@ -2481,6 +2491,57 @@ mod teams {
             assert_eq!(hits(&db, &format!("bluesky:user:{user_id}")).await, 0);
             let bucket = format!("bluesky:handle:{team_id}:down.test");
             assert_eq!(hits(&db, &bucket).await, 0);
+            assert_eq!(hits(&db, "bluesky:failed:down.test").await, 0);
+            // Only refused passwords stay in the cross-team failure count.
+            let failed = format!("bluesky:failed:{handle}");
+            assert_eq!(hits(&db, &failed).await, 0, "a success is not a failure");
+            let wrong = new_handle();
+            let (_, third, _) = user(&s, &db).await;
+            let res = connect(&s, &third, &wrong, "wrong-pass").await;
+            assert_eq!(res.status_code(), 422);
+            assert_eq!(hits(&db, &format!("bluesky:failed:{wrong}")).await, 1);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn failures_on_one_handle_are_capped_across_teams() {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            let (s, db) = server_on_mock(false).await;
+            let handle = new_handle();
+            let bucket = format!("bluesky:failed:{handle}");
+            for _ in 0..20 {
+                let sql = "INSERT INTO rate_limit_hits (bucket) VALUES ($1)";
+                let stmt = Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    sql,
+                    [bucket.clone().into()],
+                );
+                db.execute_raw(stmt).await.unwrap();
+            }
+            let (_, cookie, user_id) = user(&s, &db).await;
+            let res = connect(&s, &cookie, &handle, APP_PASSWORD).await;
+            assert_eq!(res.status_code(), 429);
+            res.assert_json(&json!({"error": "rate_limited"}));
+            assert_eq!(hits(&db, &bucket).await, 20);
+            assert_eq!(
+                hits(&db, &format!("bluesky:user:{user_id}")).await,
+                0,
+                "refunded"
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn private_addresses_and_huge_bodies_are_refused() {
+            let (s, db) = server_on_mock(false).await;
+            let (_, cookie, _) = user(&s, &db).await;
+            let res = connect(&s, &cookie, "rebind.test", APP_PASSWORD).await;
+            assert_eq!(res.status_code(), 422);
+            res.assert_json(&json!({"error": "unsupported_pds"}));
+            let res = connect(&s, &cookie, "big.test", APP_PASSWORD).await;
+            assert_eq!(res.status_code(), 502);
+            res.assert_json(&json!({"error": "bluesky_unreachable"}));
+            assert!(list(&s, &cookie).await.is_empty());
         }
 
         #[tokio::test]

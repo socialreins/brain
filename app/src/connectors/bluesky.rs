@@ -9,7 +9,7 @@ use std::{
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use reqwest::{StatusCode, Url};
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 
 /// Where handles are resolved and profiles read, and where `did:plc` documents live.
@@ -17,7 +17,8 @@ use serde_json::Value;
 pub struct Bluesky {
     pub appview: String,
     pub plc: String,
-    /// Tests only: lets the PDS be a plain `http://127.0.0.1` mock.
+    /// Tests only, never read from the environment: lets the PDS be a plain `http://127.0.0.1`
+    /// mock. Names still resolve to public addresses only.
     pub allow_insecure_pds: bool,
     client: reqwest::Client,
 }
@@ -27,9 +28,9 @@ pub enum Error {
     InvalidHandle,
     /// The PDS is not a public https URL.
     UnsupportedPds,
+    /// A wrong password, or the account password instead of an app password: one answer, so
+    /// the endpoint does not tell them apart.
     InvalidCredentials,
-    /// The password opened a full session: it is the account password, not an app password.
-    AppPasswordRequired,
     RateLimited,
     Unreachable,
 }
@@ -40,7 +41,6 @@ impl Error {
             Self::InvalidHandle => "invalid_handle",
             Self::UnsupportedPds => "unsupported_pds",
             Self::InvalidCredentials => "invalid_credentials",
-            Self::AppPasswordRequired => "app_password_required",
             Self::RateLimited => "rate_limited",
             Self::Unreachable => "bluesky_unreachable",
         }
@@ -69,9 +69,43 @@ pub fn handle(raw: &str) -> Option<String> {
     (h.len() <= 253 && h.contains('.') && h.split('.').all(label_ok)).then_some(h)
 }
 
+/// Largest response body read from any Bluesky server.
+const MAX_BODY: usize = 64 * 1024;
+
 fn unreachable(e: impl std::fmt::Display, what: &str) -> Error {
     tracing::warn!(error = %e, what, "bluesky call failed");
     Error::Unreachable
+}
+
+/// A request that never got a response: `unsupported_pds` when `PublicOnly` refused the host.
+fn send_failed(e: reqwest::Error, what: &str) -> Error {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+    while let Some(c) = cause {
+        if c.is::<NotPublic>() || c.to_string() == NOT_PUBLIC {
+            return Error::UnsupportedPds;
+        }
+        cause = c.source();
+    }
+    unreachable(e, what)
+}
+
+/// The JSON body, read up to `MAX_BODY` bytes.
+async fn json_body<T: DeserializeOwned>(
+    mut res: reqwest::Response,
+    what: &str,
+) -> Result<T, Error> {
+    let too_large = || unreachable("body over 64 KiB", what);
+    if res.content_length().is_some_and(|n| n > MAX_BODY as u64) {
+        return Err(too_large());
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = res.chunk().await.map_err(|e| unreachable(e, what))? {
+        if buf.len() + chunk.len() > MAX_BODY {
+            return Err(too_large());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&buf).map_err(|e| unreachable(e, what))
 }
 
 #[derive(Deserialize)]
@@ -149,17 +183,13 @@ impl Bluesky {
             .query(&[("handle", handle)])
             .send()
             .await
-            .map_err(|e| unreachable(e, "resolveHandle"))?;
+            .map_err(|e| send_failed(e, "resolveHandle"))?;
         match res.status() {
             StatusCode::OK => {}
             StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND => return Err(Error::InvalidHandle),
             s => return Err(unreachable(s, "resolveHandle")),
         }
-        let did = res
-            .json::<Resolved>()
-            .await
-            .map_err(|e| unreachable(e, "resolveHandle body"))?
-            .did;
+        let did = json_body::<Resolved>(res, "resolveHandle body").await?.did;
         let well_formed = |rest: &str| {
             !rest.is_empty()
                 && rest
@@ -187,16 +217,13 @@ impl Bluesky {
             .get(url)
             .send()
             .await
-            .map_err(|e| unreachable(e, "did document"))?;
+            .map_err(|e| send_failed(e, "did document"))?;
         match res.status() {
             StatusCode::OK => {}
             StatusCode::NOT_FOUND | StatusCode::GONE => return Err(Error::InvalidHandle),
             s => return Err(unreachable(s, "did document")),
         }
-        let doc = res
-            .json::<DidDoc>()
-            .await
-            .map_err(|e| unreachable(e, "did document body"))?;
+        let doc = json_body::<DidDoc>(res, "did document body").await?;
         let endpoint = doc
             .service
             .iter()
@@ -235,31 +262,24 @@ impl Bluesky {
             .json(&body)
             .send()
             .await
-            .map_err(|e| unreachable(e, "createSession"))?;
+            .map_err(|e| send_failed(e, "createSession"))?;
         let status = res.status();
         if status == StatusCode::TOO_MANY_REQUESTS {
             return Err(Error::RateLimited);
         }
+        // Includes `AuthFactorTokenRequired`, which only an account password with 2FA gets.
         if status == StatusCode::BAD_REQUEST || status == StatusCode::UNAUTHORIZED {
-            // Only an account password with email 2FA asks for a second factor.
-            let err = res.json::<Value>().await.unwrap_or_default();
-            return Err(match err["error"].as_str() {
-                Some("AuthFactorTokenRequired") => Error::AppPasswordRequired,
-                _ => Error::InvalidCredentials,
-            });
+            return Err(Error::InvalidCredentials);
         }
         if status != StatusCode::OK {
             return Err(unreachable(status, "createSession"));
         }
-        let session = res
-            .json::<Session>()
-            .await
-            .map_err(|e| unreachable(e, "createSession body"))?;
+        let session = json_body::<Session>(res, "createSession body").await?;
         if session.did != did {
             return Err(Error::InvalidCredentials);
         }
         if full_access(&session.access_jwt) {
-            return Err(Error::AppPasswordRequired);
+            return Err(Error::InvalidCredentials);
         }
         Ok(())
     }
@@ -270,7 +290,7 @@ impl Bluesky {
         let url = format!("{}/xrpc/app.bsky.actor.getProfile", self.appview);
         let res = self.client.get(url).query(&[("actor", did)]).send().await;
         match res {
-            Ok(r) if r.status() == StatusCode::OK => r.json().await.ok(),
+            Ok(r) if r.status() == StatusCode::OK => json_body(r, "getProfile body").await.ok(),
             Ok(r) => {
                 tracing::warn!(status = %r.status(), "bluesky profile missing");
                 None
@@ -283,19 +303,40 @@ impl Bluesky {
     }
 }
 
-/// Resolves names only to public addresses, so a DID document cannot point brain at its own
-/// network. IP literals skip the resolver; `checked_pds` refuses those.
+/// Resolves names with the system resolver and keeps only public addresses, so a DID document
+/// cannot point brain at its own network. reqwest connects to exactly these addresses, so a
+/// rebinding name cannot swap in another afterwards. IP literals skip the resolver;
+/// `checked_pds` refuses those.
 struct PublicOnly;
+
+const NOT_PUBLIC: &str = "name has no public address";
+
+#[derive(Debug)]
+struct NotPublic;
+
+impl std::fmt::Display for NotPublic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(NOT_PUBLIC)
+    }
+}
+
+impl std::error::Error for NotPublic {}
+
+fn public_only(addrs: impl Iterator<Item = SocketAddr>) -> Result<Vec<SocketAddr>, NotPublic> {
+    let kept: Vec<SocketAddr> = addrs.filter(|a| public(a.ip())).collect();
+    if kept.is_empty() {
+        Err(NotPublic)
+    } else {
+        Ok(kept)
+    }
+}
 
 impl reqwest::dns::Resolve for PublicOnly {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         Box::pin(async move {
-            let addrs: Vec<SocketAddr> =
-                tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
-            if addrs.is_empty() || !addrs.iter().all(|a| public(a.ip())) {
-                return Err("name resolves to a non-public address".into());
-            }
-            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+            let found = tokio::net::lookup_host((name.as_str(), 0)).await?;
+            let kept = public_only(found)?;
+            Ok(Box::new(kept.into_iter()) as reqwest::dns::Addrs)
         })
     }
 }
@@ -316,15 +357,15 @@ fn public(ip: IpAddr) -> bool {
                 || a >= 240
                 || (a == 100 && (64..128).contains(&b)))
         }
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+        // IPv4-mapped and IPv4-compatible addresses are judged as the IPv4 address they hold.
+        IpAddr::V6(v6) => match v6.to_ipv4() {
             Some(v4) => public(IpAddr::V4(v4)),
             None => {
-                let first = v6.segments()[0];
-                !(v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_multicast()
+                let [first, second, ..] = v6.segments();
+                !(v6.is_multicast()
                     || (first & 0xfe00) == 0xfc00
-                    || (first & 0xffc0) == 0xfe80)
+                    || (first & 0xffc0) == 0xfe80
+                    || (first == 0x2001 && second == 0x0db8))
             }
         },
     }
@@ -399,9 +440,24 @@ mod tests {
             "fd00::1",
             "fe80::1",
             "::ffff:10.0.0.1",
+            "::ffff:169.254.169.254",
+            "2001:db8::1",
+            "ff02::1",
+            "192.0.2.1",
+            "224.0.0.1",
         ] {
             assert!(!public(bad.parse().unwrap()), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_resolver_keeps_public_addresses_or_fails() {
+        let addr = |s: &str| SocketAddr::new(s.parse().unwrap(), 0);
+        let mixed = [addr("10.0.0.1"), addr("8.8.8.8"), addr("::1")];
+        assert_eq!(public_only(mixed.into_iter()).unwrap(), [addr("8.8.8.8")]);
+        let private = [addr("127.0.0.1"), addr("169.254.169.254")];
+        assert!(public_only(private.into_iter()).is_err());
+        assert!(public_only(std::iter::empty()).is_err());
     }
 
     #[test]

@@ -17,8 +17,6 @@ env:
   CARGO_INCREMENTAL: "0"
   DATABASE_URL: postgres://brain:brain@localhost:5432/socialreins_brain_test
   MAIL_LOG: "true"
-  # A throwaway key for tests only.
-  ENCRYPTION_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
 
 jobs:
   lint:
@@ -57,6 +55,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Throwaway ENCRYPTION_KEY
+        run: echo "ENCRYPTION_KEY=$(openssl rand -base64 32)" >> "$GITHUB_ENV"
       - run: cargo test --workspace
 
   # The production image builds and boots: migrates and serves /health within 60s.
@@ -73,6 +73,8 @@ jobs:
           --health-cmd "pg_isready -U brain" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
+      - name: Throwaway ENCRYPTION_KEY
+        run: echo "ENCRYPTION_KEY=$(openssl rand -base64 32)" >> "$GITHUB_ENV"
       - run: docker build -t brain .
       - run: |
           docker run -d --name api --network host \
