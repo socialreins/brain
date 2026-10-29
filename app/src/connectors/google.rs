@@ -30,6 +30,26 @@ pub struct Identity {
     pub sub: String,
     pub email: String,
     pub name: Option<String>,
+    /// The Google Workspace domain, when the account belongs to one.
+    pub hd: Option<String>,
+}
+
+impl Identity {
+    /// Google vouches for the mailbox itself, not only that it was verified once: a Gmail
+    /// address, or an address on the account's own Workspace domain (`hd`). Anything else may
+    /// have changed hands since Google verified it.
+    pub fn owns_email(&self) -> bool {
+        let Some((_, domain)) = self.email.rsplit_once('@') else {
+            return false;
+        };
+        let domain = domain.to_ascii_lowercase();
+        domain == "gmail.com"
+            || domain == "googlemail.com"
+            || self
+                .hd
+                .as_deref()
+                .is_some_and(|hd| hd.eq_ignore_ascii_case(&domain))
+    }
 }
 
 #[derive(Deserialize)]
@@ -174,10 +194,15 @@ fn check(c: &Value, client_id: &str, nonce: &str, now: i64) -> Result<Identity, 
         .map(str::trim)
         .filter(|n| !n.is_empty())
         .map(str::to_owned);
+    let hd = c["hd"]
+        .as_str()
+        .filter(|h| !h.is_empty())
+        .map(str::to_owned);
     Ok(Identity {
         sub: sub.into(),
         email: email.into(),
         name,
+        hd,
     })
 }
 
@@ -224,6 +249,24 @@ mod tests {
             c[key] = value;
             assert_eq!(check(&c, "cid", "n1", 1000), Err(why), "{key}");
         }
+    }
+
+    #[test]
+    fn only_gmail_or_the_workspace_domain_proves_the_mailbox() {
+        let id = |email: &str, hd: Option<&str>| Identity {
+            sub: "1".into(),
+            email: email.into(),
+            name: None,
+            hd: hd.map(str::to_owned),
+        };
+        assert!(id("a@gmail.com", None).owns_email());
+        assert!(id("a@GoogleMail.com", None).owns_email());
+        assert!(id("a@acme.co", Some("acme.co")).owns_email());
+        assert!(id("a@Acme.Co", Some("acme.co")).owns_email());
+        assert!(!id("a@acme.co", None).owns_email());
+        assert!(!id("a@acme.co", Some("other.co")).owns_email());
+        assert!(!id("a@sub.acme.co", Some("acme.co")).owns_email());
+        assert!(!id("not-an-email", Some("acme.co")).owns_email());
     }
 
     #[test]

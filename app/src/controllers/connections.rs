@@ -439,7 +439,8 @@ async fn update_sets(
     }
 }
 
-/// Disconnects an account and deletes its stored token. Owners and admins.
+/// Disconnects an account and deletes its stored token. Owners and admins, with a sign-in from
+/// the last 10 minutes (else `403 reauth_required`).
 #[utoipa::path(delete, path = "/connections/{id}", tag = "connections",
     params(("id" = Uuid, Path)),
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
@@ -452,6 +453,9 @@ async fn disconnect(
 ) -> Response {
     if !t.role.manages() {
         return forbidden();
+    }
+    if !t.current.recent() {
+        return reply(StatusCode::FORBIDDEN, "reauth_required");
     }
     let deleted = social_accounts::Entity::delete_many()
         .filter(social_accounts::Column::Id.eq(id))

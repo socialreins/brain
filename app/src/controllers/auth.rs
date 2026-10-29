@@ -462,25 +462,36 @@ impl FromRequestParts<AppState> for CurrentUser {
     type Rejection = Reply;
 
     async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, Reply> {
-        let unauthorized = || error(StatusCode::UNAUTHORIZED, "unauthorized");
-        let internal = |e: sea_orm::DbErr| {
-            tracing::error!(error = %e, "session lookup failed");
-            error(StatusCode::INTERNAL_SERVER_ERROR, "internal")
-        };
-        let secret = session_token(&parts.headers).ok_or_else(unauthorized)?;
-        let session = sessions::Entity::find_by_id(token::hash(secret))
-            .filter(sessions::Column::ExpiresAt.gt(Utc::now().fixed_offset()))
-            .one(&app.db)
-            .await
-            .map_err(internal)?
-            .ok_or_else(unauthorized)?;
-        let user = users::Entity::find_by_id(session.user_id)
-            .one(&app.db)
-            .await
-            .map_err(internal)?
-            .ok_or_else(unauthorized)?;
-        Ok(Self(user, session))
+        match signed_in(app, &parts.headers).await {
+            Ok(Some(current)) => Ok(current),
+            Ok(None) => Err(error(StatusCode::UNAUTHORIZED, "unauthorized")),
+            Err(e) => {
+                tracing::error!(error = %e, "session lookup failed");
+                Err(error(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+            }
+        }
     }
+}
+
+/// The user of an unexpired session cookie in `headers`, if any.
+pub(crate) async fn signed_in(
+    app: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<CurrentUser>, DbErr> {
+    let Some(secret) = session_token(headers) else {
+        return Ok(None);
+    };
+    let session = sessions::Entity::find_by_id(token::hash(secret))
+        .filter(sessions::Column::ExpiresAt.gt(Utc::now().fixed_offset()))
+        .one(&app.db)
+        .await?;
+    let Some(session) = session else {
+        return Ok(None);
+    };
+    let user = users::Entity::find_by_id(session.user_id)
+        .one(&app.db)
+        .await?;
+    Ok(user.map(|u| CurrentUser(u, session)))
 }
 
 /// The public fields of `user`, as `GET /auth/me` returns them.

@@ -21,7 +21,7 @@ use serde_json::json;
 use socialreins_core::{email, oauth, team, token};
 
 use super::{
-    auth::{cookie_value, named_cookie, refused, start_session, user_for_sign_in},
+    auth::{cookie_value, named_cookie, refused, signed_in, start_session, user_for_sign_in},
     waitlist::error,
 };
 use crate::{connectors::google::Identity, models::users, rate_limit::ClientIp, state::AppState};
@@ -138,9 +138,15 @@ enum Outcome {
     Conflict,
 }
 
-/// The account a Google identity signs in to: its linked `sub`, else its verified email (and
-/// the `sub` gets linked), else a new account under the magic link's sign-up rules.
-async fn account_for(app: &AppState, id: &Identity) -> Result<Outcome, DbErr> {
+/// The account a Google identity signs in to: its linked `sub`; else, when Google vouches for
+/// the mailbox (`Identity::owns_email`), the account of that email (linking the `sub`) or a new
+/// one under the magic link's sign-up rules. Any other address links only to the account
+/// signed in on this browser in the last 10 minutes with that same email (e.g. by magic link).
+async fn account_for(
+    app: &AppState,
+    id: &Identity,
+    current: Option<&super::auth::CurrentUser>,
+) -> Result<Outcome, DbErr> {
     let linked = users::Entity::find()
         .filter(users::Column::GoogleSub.eq(&id.sub))
         .one(&app.db)
@@ -151,8 +157,16 @@ async fn account_for(app: &AppState, id: &Identity) -> Result<Outcome, DbErr> {
     let Some(email) = email::normalize(&id.email) else {
         return Ok(Outcome::Conflict);
     };
-    let Some((user, created)) = user_for_sign_in(app, &email).await? else {
-        return Ok(Outcome::Closed);
+    let (user, created) = if id.owns_email() {
+        match user_for_sign_in(app, &email).await? {
+            Some(found) => found,
+            None => return Ok(Outcome::Closed),
+        }
+    } else {
+        match current {
+            Some(c) if c.recent() && c.0.email == email => (c.0.clone(), false),
+            _ => return Ok(Outcome::Conflict),
+        }
     };
     match &user.google_sub {
         Some(sub) if *sub == id.sub => {}
@@ -227,7 +241,14 @@ async fn callback(
     else {
         return fail("google_failed");
     };
-    let (user, created) = match account_for(&app, &identity).await {
+    let current = match signed_in(&app, &headers).await {
+        Ok(current) => current,
+        Err(e) => {
+            tracing::error!(error = %e, "session lookup failed");
+            return fail("google_failed");
+        }
+    };
+    let (user, created) = match account_for(&app, &identity, current.as_ref()).await {
         Ok(Outcome::User(user, created)) => (user, created),
         Ok(Outcome::Closed) => return fail("registration_disabled"),
         Ok(Outcome::Conflict) => return fail("google_failed"),
@@ -243,12 +264,16 @@ async fn callback(
             return fail("google_failed");
         }
     };
-    let to = if created {
-        format!("{}/welcome", app.web_url)
-    } else {
-        // `next` passed `safe_next` before it was stored; checked again on the way out.
-        let next = oauth::safe_next(&next).unwrap_or(DEFAULT_NEXT);
-        format!("{}{next}", app.web_url)
+    // `next` passed `safe_next` before it was stored; checked again on the way out.
+    let next = oauth::safe_next(&next).unwrap_or(DEFAULT_NEXT);
+    let to = match (created, next) {
+        (false, next) => format!("{}{next}", app.web_url),
+        (true, DEFAULT_NEXT) => format!("{}/welcome", app.web_url),
+        // A new account keeps where it was going, e.g. an invitation.
+        (true, next) => {
+            reqwest::Url::parse_with_params(&format!("{}/welcome", app.web_url), [("next", next)])
+                .map_or_else(|_| format!("{}/welcome", app.web_url), String::from)
+        }
     };
     (
         AppendHeaders([(header::SET_COOKIE, session), (header::SET_COOKIE, clear)]),

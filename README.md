@@ -82,12 +82,17 @@ minutes and used once; the browser holds the state in an HttpOnly cookie scoped 
 `/auth/google`, so only the browser that started can finish (login CSRF). The id_token comes
 straight from Google's token endpoint over TLS, so brain checks its issuer, audience, expiry,
 nonce and `email_verified` but not its signature. An account is found by its linked Google
-`sub`, else by the verified email (which links the `sub`; an email already linked to another
-Google account is refused), else created under the same rules as a magic link. Errors redirect
-with no details. Register `{BRAIN_URL}/auth/google/callback` as the redirect URI.
+`sub`. Otherwise the email counts only when Google vouches for the mailbox itself (a gmail.com
+or googlemail.com address, or an address on the account's Workspace domain `hd`): then it finds
+the account of that email (linking the `sub`; an email linked to another Google account is
+refused) or creates one under the same rules as a magic link, `OWNER_EMAIL` included. Any other
+address links only to the account signed in on that browser in the last 10 minutes with the
+same email (sign in by magic link once, then use Google). A new account lands on
+`WEB_URL/welcome`, with `?next=` when it was going elsewhere. Errors redirect with no details. Register `{BRAIN_URL}/auth/google/callback` as the redirect URI.
 
-Adding a passkey, deleting one, deleting a team and deleting a social set need a session
-started in the last 10 minutes (`403 reauth_required`: sign in again). Passkey and Google
+Adding a passkey, deleting one, deleting a team or a social set, changing a member's role,
+removing another member, inviting an admin and disconnecting an account need a session started
+in the last 10 minutes (`403 reauth_required`: sign in again). Passkey and Google
 sign-in share 10 attempts a minute per IP. Deleting a passkey ends every other session of the
 user.
 

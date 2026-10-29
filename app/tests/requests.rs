@@ -859,8 +859,9 @@ mod auth {
         }
 
         fn claims(st: &Started, sub: &str, email: &str) -> Value {
+            // `unique_email()` is on example.com, so the account is that Workspace domain's.
             json!({"sub": sub, "email": email, "email_verified": true, "nonce": st.nonce,
-                "name": "Ann Lee"})
+                "name": "Ann Lee", "hd": "example.com"})
         }
 
         /// Google's redirect back: (where it lands, the session cookie if one was set).
@@ -915,7 +916,7 @@ mod auth {
                 &claims(&st, &id, &email.to_uppercase()),
             )
             .await;
-            assert_eq!(to, "http://localhost:3000/welcome");
+            assert_eq!(to, "http://localhost:3000/welcome?next=%2Fapp%2Fteam");
             let verifier = VERIFIERS.lock().unwrap().last().cloned().unwrap();
             assert_eq!(
                 socialreins_core::oauth::pkce_challenge(&verifier),
@@ -1036,6 +1037,101 @@ mod auth {
                 fail
             );
             assert!(user(&db, &email).await.is_none(), "no account was made");
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn only_gmail_or_the_workspace_domain_links_by_email() {
+            let (s, db) = google_server(|_| {}).await;
+            let fail = "http://localhost:3000/login?error=google_failed";
+            let (existing, _) = signed_in(&s, &db).await;
+            for (email, hd) in [
+                (unique_email(), None),
+                (existing.clone(), None),
+                (unique_email(), Some("other.example")),
+            ] {
+                let st = begin(&s, "").await;
+                let mut c = claims(&st, &sub(), &email);
+                c["hd"] = json!(hd);
+                let (to, session) = finish(&s, &st.state, Some(&st.cookie), &c).await;
+                assert_eq!(to, fail, "{email} {hd:?}");
+                assert!(session.is_none());
+            }
+            assert!(
+                user(&db, &existing).await.unwrap().google_sub.is_none(),
+                "not linked"
+            );
+            // A Gmail address needs no hd; a new one signs up and lands on welcome.
+            let gmail = format!("{}@gmail.com", sub());
+            let st = begin(&s, "").await;
+            let mut c = claims(&st, &sub(), &gmail);
+            c["hd"] = Value::Null;
+            let (to, _) = finish(&s, &st.state, Some(&st.cookie), &c).await;
+            assert_eq!(to, "http://localhost:3000/welcome");
+            assert!(user(&db, &gmail).await.is_some());
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn a_fresh_sign_in_links_any_address_to_itself() {
+            let (s, db) = google_server(|_| {}).await;
+            let (email, session) = signed_in(&s, &db).await;
+            let id = sub();
+            let both = |st: &Started| format!("{}; {session}", st.cookie);
+            let st = begin(&s, "?next=/app/security").await;
+            let mut c = claims(&st, &id, &email);
+            c["hd"] = Value::Null;
+            let (to, _) = finish(&s, &st.state, Some(&both(&st)), &c).await;
+            assert_eq!(to, "http://localhost:3000/app/security");
+            assert_eq!(
+                user(&db, &email).await.unwrap().google_sub,
+                Some(id.clone())
+            );
+            // Linked: the sub alone signs in from now on, with no session.
+            let st = begin(&s, "").await;
+            let mut c = claims(&st, &id, &email);
+            c["hd"] = Value::Null;
+            assert_eq!(
+                finish(&s, &st.state, Some(&st.cookie), &c).await.0,
+                "http://localhost:3000/app"
+            );
+            // An old session does not link.
+            let (other, old) = signed_in(&s, &db).await;
+            age(&db, &old, Duration::minutes(11)).await;
+            let st = begin(&s, "").await;
+            let mut c = claims(&st, &sub(), &other);
+            c["hd"] = Value::Null;
+            let (to, _) = finish(&s, &st.state, Some(&format!("{}; {old}", st.cookie)), &c).await;
+            assert_eq!(to, "http://localhost:3000/login?error=google_failed");
+            assert!(user(&db, &other).await.unwrap().google_sub.is_none());
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn owner_email_needs_a_mailbox_google_vouches_for() {
+            let owner = unique_email();
+            let o = owner.clone();
+            let (s, db) = google_server(move |c| {
+                c.registration_disabled = true;
+                c.owner_email = Some(o);
+            })
+            .await;
+            let st = begin(&s, "").await;
+            let mut c = claims(&st, &sub(), &owner);
+            c["hd"] = Value::Null;
+            let (to, _) = finish(&s, &st.state, Some(&st.cookie), &c).await;
+            assert_eq!(to, "http://localhost:3000/login?error=google_failed");
+            assert!(user(&db, &owner).await.is_none());
+            let st = begin(&s, "").await;
+            let (to, _) = finish(
+                &s,
+                &st.state,
+                Some(&st.cookie),
+                &claims(&st, &sub(), &owner),
+            )
+            .await;
+            assert_eq!(to, "http://localhost:3000/welcome");
+            assert!(user(&db, &owner).await.is_some());
         }
 
         #[tokio::test]
@@ -1804,6 +1900,52 @@ mod teams {
             .add_header("cookie", &member)
             .await;
         members.assert_status_ok();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn privilege_changes_need_a_fresh_sign_in() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, owner, _) = user(&s, &db).await;
+        let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+        let (admin, _) = joined(&s, &db, &team_id, "admin").await;
+        let (_, member_id) = joined(&s, &db, &team_id, "member").await;
+        let stale = |cookie: String| {
+            let db = db.clone();
+            async move {
+                let row = sessions::ActiveModel {
+                    token_hash: Set(token::hash(cookie.trim_start_matches("sr_session="))),
+                    created_at: Set((Utc::now() - Duration::minutes(11)).fixed_offset()),
+                    ..Default::default()
+                };
+                sessions::Entity::update(row).exec(&db).await.unwrap();
+            }
+        };
+        stale(owner.clone()).await;
+        let path = format!("/v1/team/members/{member_id}");
+        let calls = [
+            req(&s, Method::PATCH, &path, &owner).json(&json!({"role": "admin"})),
+            req(&s, Method::DELETE, &path, &owner),
+            req(&s, Method::POST, "/v1/team/invitations", &owner)
+                .json(&json!({"email": unique_email(), "role": "admin"})),
+        ];
+        for call in calls {
+            let res = call.await;
+            assert_eq!(res.status_code(), 403);
+            res.assert_json(&json!({"error": "reauth_required"}));
+        }
+        // Inviting a member, or leaving, needs no fresh sign-in.
+        let res = req(&s, Method::POST, "/v1/team/invitations", &owner)
+            .json(&json!({"email": unique_email(), "role": "member"}))
+            .await;
+        assert_eq!(res.status_code(), 201);
+        stale(admin.clone()).await;
+        let me: Value = s.get("/auth/me").add_header("cookie", &admin).await.json();
+        let leave = format!("/v1/team/members/{}", me["id"].as_str().unwrap());
+        assert_eq!(
+            req(&s, Method::DELETE, &leave, &admin).await.status_code(),
+            204
+        );
     }
 
     #[tokio::test]
@@ -2793,6 +2935,16 @@ mod teams {
             }
             assert_eq!(list(&s, &member).await.len(), 1);
             let (admin, _) = joined(&s, &db, &team_id, "admin").await;
+            // Disconnecting needs a fresh sign-in.
+            let row = sessions::ActiveModel {
+                token_hash: Set(token::hash(owner.trim_start_matches("sr_session="))),
+                created_at: Set((Utc::now() - Duration::minutes(11)).fixed_offset()),
+                ..Default::default()
+            };
+            sessions::Entity::update(row).exec(&db).await.unwrap();
+            let res = req(&s, Method::DELETE, &format!("/v1/connections/{id}"), &owner).await;
+            assert_eq!(res.status_code(), 403);
+            res.assert_json(&json!({"error": "reauth_required"}));
             let res = req(&s, Method::DELETE, &format!("/v1/connections/{id}"), &admin).await;
             assert_eq!(res.status_code(), 204);
             assert!(list(&s, &owner).await.is_empty());
