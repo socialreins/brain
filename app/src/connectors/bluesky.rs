@@ -2,7 +2,7 @@
 //! DID, the DID to its PDS, and opening a session on that PDS. The app password only ever goes
 //! to the resolved PDS, over https, with redirects off.
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
@@ -109,12 +109,21 @@ async fn json_body<T: DeserializeOwned>(
 }
 
 #[derive(Deserialize)]
-struct Resolved {
+struct HandleDid {
     did: String,
 }
 
+/// A handle's DID and PDS, confirmed both ways; no credentials used yet.
+pub struct Identity {
+    pub did: String,
+    pds: String,
+}
+
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DidDoc {
+    #[serde(default)]
+    also_known_as: Vec<String>,
     #[serde(default)]
     service: Vec<Service>,
 }
@@ -159,23 +168,34 @@ impl Bluesky {
         })
     }
 
-    /// Checks `app_password` on the account `handle` (already normalized by [`handle`]).
-    pub async fn verify(&self, handle: &str, app_password: &str) -> Result<Account, Error> {
-        let did = self.resolve(handle).await?;
-        let pds = self.pds(&did).await?;
-        self.session(&pds, &did, app_password).await?;
-        let profile = self.profile(&did).await;
+    /// The DID and PDS of `handle` (already normalized by [`handle`]), with the DID document
+    /// claiming the handle back.
+    pub async fn resolve(&self, handle: &str) -> Result<Identity, Error> {
+        let did = self.did(handle).await?;
+        let pds = self.pds(&did, handle).await?;
+        Ok(Identity { did, pds })
+    }
+
+    /// Checks `app_password` on the resolved account by opening a session on its PDS.
+    pub async fn connect(
+        &self,
+        id: Identity,
+        handle: &str,
+        app_password: &str,
+    ) -> Result<Account, Error> {
+        self.session(&id.pds, &id.did, app_password).await?;
+        let profile = self.profile(&id.did).await;
         Ok(Account {
-            did,
-            // The handle the AppView resolved to this DID; the PDS's own claim is not trusted.
+            // The handle confirmed both ways in `resolve`; the PDS's own claim is not trusted.
             handle: handle.to_owned(),
             display_name: profile.as_ref().and_then(|p| p.display_name.clone()),
             avatar: profile.and_then(|p| p.avatar),
-            pds,
+            did: id.did,
+            pds: id.pds,
         })
     }
 
-    async fn resolve(&self, handle: &str) -> Result<String, Error> {
+    async fn did(&self, handle: &str) -> Result<String, Error> {
         let url = format!("{}/xrpc/com.atproto.identity.resolveHandle", self.appview);
         let res = self
             .client
@@ -189,7 +209,7 @@ impl Bluesky {
             StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND => return Err(Error::InvalidHandle),
             s => return Err(unreachable(s, "resolveHandle")),
         }
-        let did = json_body::<Resolved>(res, "resolveHandle body").await?.did;
+        let did = json_body::<HandleDid>(res, "resolveHandle body").await?.did;
         let well_formed = |rest: &str| {
             !rest.is_empty()
                 && rest
@@ -204,7 +224,7 @@ impl Bluesky {
 
     /// The PDS endpoint in the DID document: `plc.directory` for `did:plc`, the domain's
     /// `/.well-known/did.json` for `did:web`.
-    async fn pds(&self, did: &str) -> Result<String, Error> {
+    async fn pds(&self, did: &str, handle: &str) -> Result<String, Error> {
         let url = match did.strip_prefix("did:web:") {
             Some(host) => format!(
                 "{}/.well-known/did.json",
@@ -224,6 +244,14 @@ impl Bluesky {
             s => return Err(unreachable(s, "did document")),
         }
         let doc = json_body::<DidDoc>(res, "did document body").await?;
+        let claimed = format!("at://{handle}");
+        if !doc
+            .also_known_as
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(&claimed))
+        {
+            return Err(Error::InvalidHandle);
+        }
         let endpoint = doc
             .service
             .iter()
@@ -357,17 +385,42 @@ fn public(ip: IpAddr) -> bool {
                 || a >= 240
                 || (a == 100 && (64..128).contains(&b)))
         }
-        // IPv4-mapped and IPv4-compatible addresses are judged as the IPv4 address they hold.
-        IpAddr::V6(v6) => match v6.to_ipv4() {
+        IpAddr::V6(v6) => match embedded_v4(v6) {
             Some(v4) => public(IpAddr::V4(v4)),
             None => {
-                let [first, second, ..] = v6.segments();
-                !(v6.is_multicast()
-                    || (first & 0xfe00) == 0xfc00
-                    || (first & 0xffc0) == 0xfe80
-                    || (first == 0x2001 && second == 0x0db8))
+                let [a, b, c, d, ..] = v6.segments();
+                !(v6.to_bits() >> 32 == 0 // ::/128, ::1 and IPv4-compatible ::/96
+                    || v6.is_multicast()
+                    || (a & 0xfe00) == 0xfc00 // ULA
+                    || (a & 0xffc0) == 0xfe80 // link-local
+                    || (a == 0x2001 && b == 0x0db8) // documentation
+                    || (a == 0x2001 && b == 0) // Teredo
+                    || (a == 0x2001 && (b & 0xfff0) == 0x0010) // ORCHID
+                    || (a == 0x2001 && (b & 0xfff0) == 0x0020) // ORCHIDv2
+                    || (a == 0x0100 && b == 0 && c == 0 && d == 0)) // discard
             }
         },
+    }
+}
+
+/// The IPv4 address inside an IPv4-mapped (`::ffff:0:0/96`), NAT64 (`64:ff9b::/96`, local-use
+/// `64:ff9b:1::/48`) or 6to4 (`2002::/16`) address, which is where a connection really goes.
+fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = v6.segments();
+    let pair = |hi: u16, lo: u16| Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo));
+    let [o0, o1] = s[3].to_be_bytes();
+    match s {
+        _ if v6.to_ipv4_mapped().is_some() => v6.to_ipv4_mapped(),
+        [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] => Some(pair(hi, lo)),
+        // RFC 6052 /48 layout: octets in bits 48..64 and 72..88, skipping the u octet.
+        [0x64, 0xff9b, 0x0001, ..] => Some(Ipv4Addr::new(
+            o0,
+            o1,
+            s[4].to_be_bytes()[1],
+            s[5].to_be_bytes()[0],
+        )),
+        [0x2002, hi, lo, ..] => Some(pair(hi, lo)),
+        _ => None,
     }
 }
 
@@ -447,6 +500,40 @@ mod tests {
             "224.0.0.1",
         ] {
             assert!(!public(bad.parse().unwrap()), "{bad}");
+        }
+    }
+
+    #[test]
+    fn ipv6_special_ranges_are_judged_by_what_they_reach() {
+        let table = [
+            ("2606:4700::1111", true),
+            ("::ffff:8.8.8.8", true),
+            ("::ffff:10.0.0.1", false),
+            ("64:ff9b::808:808", true),
+            ("64:ff9b::a00:1", false),
+            ("64:ff9b::7f00:1", false),
+            ("64:ff9b:1:808:8:800::", true),
+            ("64:ff9b:1:a00:0:100::", false),
+            ("2002:808:808::1", true),
+            ("2002:a9fe:a9fe::1", false),
+            ("2002:7f00:1::1", false),
+            ("2001::1", false),
+            ("2001:0:4136:e378::1", false),
+            ("100::1", false),
+            ("2001:10::1", false),
+            ("2001:1f::1", false),
+            ("2001:20::1", false),
+            ("2001:2f::1", false),
+            ("2001:db8::1", false),
+            ("::", false),
+            ("::1", false),
+            ("::8.8.8.8", false),
+            ("fc00::1", false),
+            ("fe80::1", false),
+            ("ff02::1", false),
+        ];
+        for (ip, want) in table {
+            assert_eq!(public(ip.parse().unwrap()), want, "{ip}");
         }
     }
 

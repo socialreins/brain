@@ -109,8 +109,9 @@ opens a session there with the app password, which is sent only to that PDS over
 redirects off. A wrong password and an account password get the same `invalid_credentials`. Errors:
 `invalid_handle`, `unsupported_pds`, `invalid_credentials` (all 422), `rate_limited`,
 `bluesky_unreachable` (502). Attempts count like sign-in: per IP, 5 a minute per user, and 30
-a day per user, 10 a day per handle in one team, and 20 refused passwords a day per handle
-across all teams. Bluesky hosts must resolve to public addresses (`unsupported_pds`), and
+a day per user, 10 a day per account (DID) in one team, and 20 refused passwords a day per
+account across all teams, which a team already holding the account is exempt from. The DID
+document must list the handle (`alsoKnownAs`), or the answer is `invalid_handle`. Bluesky hosts must resolve to public addresses (`unsupported_pds`), and
 responses over 64 KiB are dropped.
 
 ## Local development

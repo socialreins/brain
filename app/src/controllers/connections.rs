@@ -12,7 +12,7 @@ use axum::{
 use chrono::{DateTime, FixedOffset, Utc};
 use sea_orm::{
     sea_query::OnConflict, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait,
-    QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -33,10 +33,10 @@ use crate::{
 
 /// Daily caps on Bluesky connect attempts (`rate_limit::daily_reserve`), failures included.
 const BLUESKY_PER_USER: i64 = 30;
-const BLUESKY_PER_HANDLE: i64 = 10;
-/// Failed passwords on one handle across every team, so many teams cannot brute-force it.
-/// Only failures stay counted, so a flood ages out within a day.
-const BLUESKY_FAILURES_PER_HANDLE: i64 = 20;
+const BLUESKY_PER_DID: i64 = 10;
+/// Failed passwords on one account (DID) across every team, so many teams cannot brute-force
+/// it. Only failures stay counted, so a flood ages out within a day.
+const BLUESKY_FAILURES_PER_DID: i64 = 20;
 
 #[derive(Serialize, ToSchema)]
 pub struct Connection {
@@ -82,6 +82,18 @@ fn reply(status: StatusCode, code: &str) -> Response {
 
 fn forbidden() -> Response {
     reply(StatusCode::FORBIDDEN, "forbidden")
+}
+
+fn bluesky_error(e: BlueskyError) -> Response {
+    let status = match e {
+        // Not 401: the web app reads that as a lost session.
+        BlueskyError::InvalidHandle
+        | BlueskyError::UnsupportedPds
+        | BlueskyError::InvalidCredentials => StatusCode::UNPROCESSABLE_ENTITY,
+        BlueskyError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+        BlueskyError::Unreachable => StatusCode::BAD_GATEWAY,
+    };
+    reply(status, e.code())
 }
 
 fn not_found() -> Response {
@@ -185,8 +197,9 @@ async fn providers(State(app): State<AppState>, _: CurrentUser) -> Json<Vec<Prov
 
 /// Connects a Bluesky account with an app password, or replaces the stored app password when
 /// the team already has it (`200` instead of `201`). Owners and admins. Throttled like sign-in:
-/// per IP and 5 a minute per user, 30 a day per user, 10 a day per handle in one team, and 20
-/// refused passwords a day per handle across all teams. A wrong password and an account password
+/// per IP and 5 a minute per user, 30 a day per user, 10 a day per account in one team, and 20
+/// refused passwords a day per account across all teams (not counted against a team that
+/// already holds the account). A wrong password and an account password
 /// both answer `invalid_credentials`, so web should say "use an app password" there.
 #[utoipa::path(post, path = "/connections/bluesky", tag = "connections", request_body = BlueskyLogin,
     responses((status = 201, body = Connection), (status = 200, body = Connection),
@@ -212,37 +225,56 @@ async fn connect_bluesky(
     if body.app_password.is_empty() || body.app_password.len() > 256 {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_credentials");
     }
+    // No credentials leave brain until the handle and its DID point at each other.
+    let id = match app.bluesky.resolve(&handle).await {
+        Ok(id) => id,
+        Err(e) => return bluesky_error(e),
+    };
+    // Caps key on the DID: one account can have many handles, and a handle can move.
+    let did = id.did.clone();
     let caps = [
         (format!("bluesky:user:{user_id}"), BLUESKY_PER_USER),
-        // Per team, so strangers failing on a handle cannot lock its owner's team out.
-        (
-            format!("bluesky:handle:{}:{handle}", t.team.id),
-            BLUESKY_PER_HANDLE,
-        ),
+        // Per team, so strangers failing on an account cannot lock its owner's team out.
+        (format!("bluesky:did:{}:{did}", t.team.id), BLUESKY_PER_DID),
     ];
     let reserved = match daily_reserve(&app.db, &caps).await {
         Ok(Some(ids)) => ids,
         Ok(None) => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
         Err(e) => return internal(e, "bluesky cap"),
     };
-    // Reserved up front so parallel guesses cannot pass it, and given back unless the password
-    // was refused.
-    let failure_cap = [(
-        format!("bluesky:failed:{handle}"),
-        BLUESKY_FAILURES_PER_HANDLE,
-    )];
-    let failure = match daily_reserve(&app.db, &failure_cap).await {
-        Ok(Some(ids)) => ids,
-        Ok(None) => {
-            daily_refund(&app.db, &reserved).await;
-            return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
-        }
+    let held = social_accounts::Entity::find()
+        .filter(social_accounts::Column::TeamId.eq(t.team.id))
+        .filter(social_accounts::Column::Provider.eq("bluesky"))
+        .filter(social_accounts::Column::ExternalId.eq(&did))
+        .count(&app.db)
+        .await;
+    let held = match held {
+        Ok(n) => n > 0,
         Err(e) => {
             daily_refund(&app.db, &reserved).await;
-            return internal(e, "bluesky cap");
+            return internal(e, "bluesky account lookup");
         }
     };
-    let verified = app.bluesky.verify(&handle, &body.app_password).await;
+    // Reserved up front so parallel guesses cannot pass it, and given back unless the password
+    // was refused. A team reconnecting an account it holds is exempt, so a failure flood from
+    // elsewhere cannot keep it from replacing its own app password.
+    let failure = if held {
+        Vec::new()
+    } else {
+        let failure_cap = [(format!("bluesky:failed:{did}"), BLUESKY_FAILURES_PER_DID)];
+        match daily_reserve(&app.db, &failure_cap).await {
+            Ok(Some(ids)) => ids,
+            Ok(None) => {
+                daily_refund(&app.db, &reserved).await;
+                return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+            }
+            Err(e) => {
+                daily_refund(&app.db, &reserved).await;
+                return internal(e, "bluesky cap");
+            }
+        }
+    };
+    let verified = app.bluesky.connect(id, &handle, &body.app_password).await;
     if !matches!(verified, Err(BlueskyError::InvalidCredentials)) {
         daily_refund(&app.db, &failure).await;
     }
@@ -253,15 +285,7 @@ async fn connect_bluesky(
             if e == BlueskyError::Unreachable {
                 daily_refund(&app.db, &reserved).await;
             }
-            let status = match e {
-                // Not 401: the web app reads that as a lost session.
-                BlueskyError::InvalidHandle
-                | BlueskyError::UnsupportedPds
-                | BlueskyError::InvalidCredentials => StatusCode::UNPROCESSABLE_ENTITY,
-                BlueskyError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
-                BlueskyError::Unreachable => StatusCode::BAD_GATEWAY,
-            };
-            return reply(status, e.code());
+            return bluesky_error(e);
         }
     };
     let now = Utc::now().fixed_offset();

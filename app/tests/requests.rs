@@ -2230,8 +2230,16 @@ mod teams {
                 } else {
                     base
                 };
+                // The document claims the handle back, in any case, except for `liar.test`.
+                let label = did.trim_start_matches("did:plc:");
+                let aka = if label == "liar" {
+                    "at://someone.else".to_owned()
+                } else {
+                    format!("at://{}.test", label.to_uppercase())
+                };
                 Json(json!({
                     "id": did,
+                    "alsoKnownAs": [aka],
                     "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer",
                         "serviceEndpoint": base}],
                 }))
@@ -2450,6 +2458,10 @@ mod teams {
             res.assert_json(&json!({"error": "rate_limited"}));
         }
 
+        fn did_of(handle: &str) -> String {
+            format!("did:plc:{}", handle.trim_end_matches(".test"))
+        }
+
         async fn hits(db: &DatabaseConnection, bucket: &str) -> i64 {
             use sea_orm::{ConnectionTrait, DbBackend, Statement};
             let sql = "SELECT count(*) AS n FROM rate_limit_hits WHERE bucket = $1";
@@ -2460,7 +2472,7 @@ mod teams {
 
         #[tokio::test]
         #[serial]
-        async fn the_daily_handle_cap_is_per_team_and_outages_are_refunded() {
+        async fn the_daily_account_cap_is_per_team_and_outages_are_refunded() {
             use sea_orm::{ConnectionTrait, DbBackend, Statement};
             let (s, db) = server_on_mock(false).await;
             let (_, cookie, user_id) = user(&s, &db).await;
@@ -2469,7 +2481,7 @@ mod teams {
                 .unwrap()
                 .to_owned();
             let handle = new_handle();
-            let bucket = format!("bluesky:handle:{team_id}:{handle}");
+            let bucket = format!("bluesky:did:{team_id}:{}", did_of(&handle));
             for _ in 0..10 {
                 let sql = "INSERT INTO rate_limit_hits (bucket) VALUES ($1)";
                 let stmt = Statement::from_sql_and_values(
@@ -2489,26 +2501,33 @@ mod teams {
             assert_eq!(res.status_code(), 502);
             res.assert_json(&json!({"error": "bluesky_unreachable"}));
             assert_eq!(hits(&db, &format!("bluesky:user:{user_id}")).await, 0);
-            let bucket = format!("bluesky:handle:{team_id}:down.test");
-            assert_eq!(hits(&db, &bucket).await, 0);
-            assert_eq!(hits(&db, "bluesky:failed:down.test").await, 0);
             // Only refused passwords stay in the cross-team failure count.
-            let failed = format!("bluesky:failed:{handle}");
+            let failed = format!("bluesky:failed:{}", did_of(&handle));
             assert_eq!(hits(&db, &failed).await, 0, "a success is not a failure");
             let wrong = new_handle();
             let (_, third, _) = user(&s, &db).await;
             let res = connect(&s, &third, &wrong, "wrong-pass").await;
             assert_eq!(res.status_code(), 422);
-            assert_eq!(hits(&db, &format!("bluesky:failed:{wrong}")).await, 1);
+            assert_eq!(
+                hits(&db, &format!("bluesky:failed:{}", did_of(&wrong))).await,
+                1
+            );
         }
 
         #[tokio::test]
         #[serial]
-        async fn failures_on_one_handle_are_capped_across_teams() {
+        async fn failures_on_one_account_are_capped_across_teams() {
             use sea_orm::{ConnectionTrait, DbBackend, Statement};
             let (s, db) = server_on_mock(false).await;
             let handle = new_handle();
-            let bucket = format!("bluesky:failed:{handle}");
+            let (_, holder, _) = user(&s, &db).await;
+            assert_eq!(
+                connect(&s, &holder, &handle, APP_PASSWORD)
+                    .await
+                    .status_code(),
+                201
+            );
+            let bucket = format!("bluesky:failed:{}", did_of(&handle));
             for _ in 0..20 {
                 let sql = "INSERT INTO rate_limit_hits (bucket) VALUES ($1)";
                 let stmt = Statement::from_sql_and_values(
@@ -2523,6 +2542,9 @@ mod teams {
             assert_eq!(res.status_code(), 429);
             res.assert_json(&json!({"error": "rate_limited"}));
             assert_eq!(hits(&db, &bucket).await, 20);
+            // The team that holds the account still replaces its app password.
+            let res = connect(&s, &holder, &handle, NEW_APP_PASSWORD).await;
+            assert_eq!(res.status_code(), 200);
             assert_eq!(
                 hits(&db, &format!("bluesky:user:{user_id}")).await,
                 0,
@@ -2535,6 +2557,9 @@ mod teams {
         async fn private_addresses_and_huge_bodies_are_refused() {
             let (s, db) = server_on_mock(false).await;
             let (_, cookie, _) = user(&s, &db).await;
+            let res = connect(&s, &cookie, "liar.test", APP_PASSWORD).await;
+            assert_eq!(res.status_code(), 422, "the DID must claim the handle back");
+            res.assert_json(&json!({"error": "invalid_handle"}));
             let res = connect(&s, &cookie, "rebind.test", APP_PASSWORD).await;
             assert_eq!(res.status_code(), 422);
             res.assert_json(&json!({"error": "unsupported_pds"}));
