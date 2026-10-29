@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{rejection::QueryRejection, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -157,8 +157,16 @@ async fn live_count_locked(db: &impl ConnectionTrait, team_id: Uuid) -> Result<u
 /// The current team's live sets, Default first, then oldest first, with their accounts. With
 /// `?deleted=true`, the deleted sets that can still be restored, newest deletion first.
 #[utoipa::path(get, path = "/social-sets", tag = "social-sets", params(ListQuery),
-    responses((status = 200, body = [SocialSet]), (status = 401, body = Error)))]
-async fn list(State(app): State<AppState>, t: InTeam, Query(q): Query<ListQuery>) -> Response {
+    responses((status = 200, body = [SocialSet]), (status = 401, body = Error),
+        (status = 422, body = Error)))]
+async fn list(
+    State(app): State<AppState>,
+    t: InTeam,
+    q: Result<Query<ListQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(q)) = q else {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
+    };
     let found = async {
         let base = social_sets::Entity::find().filter(social_sets::Column::TeamId.eq(t.team.id));
         let sets = if q.deleted {
@@ -245,17 +253,25 @@ async fn rename(
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name");
     };
     let renamed = async {
-        if live_set(&app.db, t.team.id, id).await?.is_none() {
+        // One statement, so a concurrent delete cannot slip between a check and the write.
+        let done = social_sets::Entity::update_many()
+            .col_expr(social_sets::Column::Name, name.into())
+            .col_expr(
+                social_sets::Column::UpdatedAt,
+                Utc::now().fixed_offset().into(),
+            )
+            .filter(social_sets::Column::Id.eq(id))
+            .filter(social_sets::Column::TeamId.eq(t.team.id))
+            .filter(social_sets::Column::DeletedAt.is_null())
+            .exec(&app.db)
+            .await?;
+        if done.rows_affected == 0 {
             return Ok(None);
         }
-        let row = social_sets::ActiveModel {
-            id: Set(id),
-            name: Set(name),
-            updated_at: Set(Utc::now().fixed_offset()),
-            ..Default::default()
-        };
-        let set = social_sets::Entity::update(row).exec(&app.db).await?;
-        one_json(&app.db, set).await.map(Some)
+        match live_set(&app.db, t.team.id, id).await? {
+            Some(set) => one_json(&app.db, set).await.map(Some),
+            None => Ok(None),
+        }
     };
     match renamed.await {
         Ok(Some(json)) => Json(json).into_response(),

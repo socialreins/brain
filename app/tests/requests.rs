@@ -2874,6 +2874,25 @@ mod teams {
                 assert_eq!(res.json::<Value>()["is_default"], true);
                 let res = rename(uuid::Uuid::now_v7().to_string(), "Nope").await;
                 assert_eq!(res.status_code(), 404);
+                // A deleted set cannot be renamed.
+                req(
+                    &s,
+                    Method::DELETE,
+                    &format!("/v1/social-sets/{id}"),
+                    &cookie,
+                )
+                .json(&json!({}))
+                .await
+                .assert_status(axum::http::StatusCode::NO_CONTENT);
+                let res = rename(id.into(), "Ghost").await;
+                assert_eq!(res.status_code(), 404);
+                res.assert_json(&json!({"error": "not_found"}));
+                let res = s
+                    .get("/v1/social-sets?deleted=maybe")
+                    .add_header("cookie", &cookie)
+                    .await;
+                assert_eq!(res.status_code(), 422);
+                res.assert_json(&json!({"error": "invalid_query"}));
             }
 
             #[tokio::test]
