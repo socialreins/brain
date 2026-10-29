@@ -3685,6 +3685,72 @@ mod teams {
 
             #[tokio::test]
             #[serial]
+            async fn recovered_queued_posts_never_skip_the_quota() {
+                use sea_orm::{ConnectionTrait, DbBackend, Statement};
+                let (s, db, state) = on_mock().await;
+                let (_, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let bucket = publish::quota_bucket(team_id.parse().unwrap());
+                // Left `queued` 20 minutes ago with no reservation recorded.
+                let stale = |id: uuid::Uuid| posts::ActiveModel {
+                    id: Set(id),
+                    updated_at: Set((Utc::now() - Duration::minutes(20)).fixed_offset()),
+                    ..Default::default()
+                };
+                let first = queued_post(&db, &team_id, &set).await;
+                posts::Entity::update(stale(first)).exec(&db).await.unwrap();
+                let before = RECORDS.lock().unwrap().len();
+                publish::tick(&state).await.unwrap();
+                let p = posts::Entity::find_by_id(first)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(p.status, "published");
+                assert!(p.quota_reserved, "reserved before it went out");
+                assert_eq!(hits(&db, &bucket).await, 1);
+                assert_eq!(RECORDS.lock().unwrap().len(), before + 1);
+
+                // At the cap, the recovered post goes back to scheduled and nothing is sent.
+                for _ in 1..publish::PUBLISHES_PER_DAY {
+                    let sql = "INSERT INTO rate_limit_hits (bucket) VALUES ($1)";
+                    let stmt = Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        sql,
+                        [bucket.clone().into()],
+                    );
+                    db.execute_raw(stmt).await.unwrap();
+                }
+                let second = queued_post(&db, &team_id, &set).await;
+                posts::Entity::update(stale(second))
+                    .exec(&db)
+                    .await
+                    .unwrap();
+                publish::tick(&state).await.unwrap();
+                let p = posts::Entity::find_by_id(second)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(p.status, "scheduled");
+                assert!(!p.quota_reserved);
+                assert!(p.error.unwrap().contains("limit of 100"));
+                assert_eq!(hits(&db, &bucket).await, publish::PUBLISHES_PER_DAY);
+                assert_eq!(
+                    RECORDS.lock().unwrap().len(),
+                    before + 1,
+                    "nothing more was sent"
+                );
+                let none = post_targets::Entity::find()
+                    .filter(post_targets::Column::PostId.eq(second))
+                    .count(&db)
+                    .await
+                    .unwrap();
+                assert_eq!(none, 0);
+            }
+
+            #[tokio::test]
+            #[serial]
             async fn a_tick_claims_at_most_50_posts() {
                 let (s, db, _) = on_mock().await;
                 let (_, team_id, _) = owner_with_account(&s, &db).await;

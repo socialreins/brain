@@ -30,7 +30,6 @@ use super::{
 use crate::{
     models::{post_targets, posts, social_sets, teams},
     publish,
-    rate_limit::{daily_refund, daily_reserve},
     state::AppState,
 };
 
@@ -413,25 +412,26 @@ async fn publish_now(
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let claimed = async {
-        if find(&app.db, t.team.id, id).await?.is_none() {
+        let Some(post) = find(&app.db, t.team.id, id).await? else {
             return Ok(Err(not_found()));
-        }
-        // Counts against the same daily cap as scheduled publishes.
-        let cap = [(publish::quota_bucket(t.team.id), publish::PUBLISHES_PER_DAY)];
-        let Some(reserved) = daily_reserve(&app.db, &cap).await? else {
-            return Ok(Err(reply(StatusCode::TOO_MANY_REQUESTS, "publish_quota")));
         };
-        let stmt = Statement::from_sql_and_values(
+        // The claim and its hit of the daily cap (shared with scheduled publishes) commit
+        // together. `quota_reserved = $2` keeps a stale read from skipping the reserve.
+        let claim = Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "UPDATE posts p SET status = 'queued', scheduled_at = now(), updated_at = now() \
-             WHERE p.id = $1 AND p.status IN ('draft', 'scheduled') \
+            "UPDATE posts p SET status = 'queued', quota_reserved = true, \
+             scheduled_at = now(), updated_at = now() \
+             WHERE p.id = $1 AND p.status IN ('draft', 'scheduled') AND p.quota_reserved = $2 \
              AND EXISTS (SELECT 1 FROM social_sets s \
                          WHERE s.id = p.social_set_id AND s.deleted_at IS NULL)",
-            [id.into()],
+            [id.into(), post.quota_reserved.into()],
         );
-        if app.db.execute_raw(stmt).await?.rows_affected() == 0 {
-            daily_refund(&app.db, &reserved).await;
-            return Ok(Err(reply(StatusCode::CONFLICT, "not_editable")));
+        match publish::reserve_and(&app.db, t.team.id, post.quota_reserved, claim).await? {
+            publish::Quota::Reserved => {}
+            publish::Quota::Over => {
+                return Ok(Err(reply(StatusCode::TOO_MANY_REQUESTS, "publish_quota")))
+            }
+            publish::Quota::Lost => return Ok(Err(reply(StatusCode::CONFLICT, "not_editable"))),
         }
         match find(&app.db, t.team.id, id).await? {
             Some(p) => one_json(&app.db, p).await.map(Ok),

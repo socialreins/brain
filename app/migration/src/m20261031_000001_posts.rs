@@ -6,7 +6,8 @@ pub struct Migration;
 // One post per platform; one target per account it goes to. A target's remote_id is saved the
 // moment the platform accepts the post, and a target is only claimed while it has none, so a
 // post is never sent twice. Targets outlive a disconnected account (social_account_id goes null)
-// so published history stays.
+// so published history stays. quota_reserved is set in the same transaction that records the
+// post's hit against the team's daily publish cap; nothing publishes without it.
 const UP: &str = r#"CREATE TABLE posts (
   id uuid PRIMARY KEY,
   team_id uuid NOT NULL REFERENCES teams (id) ON DELETE CASCADE,
@@ -20,6 +21,7 @@ const UP: &str = r#"CREATE TABLE posts (
   scheduled_at timestamptz,
   published_at timestamptz,
   error text,
+  quota_reserved boolean NOT NULL DEFAULT false,
   created_by uuid REFERENCES users (id) ON DELETE SET NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),

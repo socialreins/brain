@@ -22,6 +22,8 @@ pub struct Model {
     pub published_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(column_type = "Text", nullable)]
     pub error: Option<String>,
+    /// The post holds a hit of its team's daily publish cap.
+    pub quota_reserved: bool,
     pub created_by: Option<Uuid>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,

@@ -19,7 +19,7 @@ use crate::{
     models::{
         post_targets, posts, social_account_social_set as membership, social_accounts, social_sets,
     },
-    rate_limit::daily_reserve,
+    rate_limit::reserve_in,
     state::AppState,
 };
 
@@ -138,19 +138,8 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
         return Ok(());
     }
     recover_stuck(&app.db).await?;
-    let mut due = Vec::new();
-    for (id, team_id) in claim_due(&app.db).await? {
-        // Reserved after the claim; `claim_due` already skips teams at the cap, so this only
-        // refuses when two claims race for a team's last slot.
-        match daily_reserve(&app.db, &[(quota_bucket(team_id), PUBLISHES_PER_DAY)]).await {
-            Ok(Some(_)) => due.push(id),
-            Ok(None) => unclaim(&app.db, id, Some(OVER_QUOTA)).await?,
-            Err(e) => {
-                tracing::warn!(error = %e, "publish quota check failed");
-                unclaim(&app.db, id, None).await?;
-            }
-        }
-    }
+    // The quota is reserved per post in `publish_post`, together with marking it reserved.
+    let mut due: Vec<Uuid> = claim_due(&app.db).await?.into_iter().map(|c| c.0).collect();
     // Posts left `queued` by a crash between claim and settle: fan-out and claims are
     // idempotent, so running them again only finishes the job.
     let stmt = sql(
@@ -179,9 +168,9 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
 /// Claims up to 50 due `scheduled` posts, oldest first, `scheduled` to `queued`: only posts of
 /// a live set, of a team under its daily publish cap. Returns `(post, team)`.
 pub async fn claim_due(db: &DatabaseConnection) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
+    // A CTE runs once; a LIMIT inside `IN (...)` may be re-run and claim more.
     let stmt = sql(
-        "UPDATE posts p SET status = 'queued', updated_at = now() \
-         WHERE p.status = 'scheduled' AND p.id IN ( \
+        "WITH due AS ( \
            SELECT d.id FROM posts d \
            WHERE d.status = 'scheduled' AND d.scheduled_at <= now() \
            AND EXISTS (SELECT 1 FROM social_sets s \
@@ -191,6 +180,8 @@ pub async fn claim_due(db: &DatabaseConnection) -> Result<Vec<(Uuid, Uuid)>, DbE
                 AND h.created_at > now() - interval '1 day') < $1 \
            ORDER BY d.scheduled_at, d.id LIMIT $2 \
            FOR UPDATE SKIP LOCKED) \
+         UPDATE posts p SET status = 'queued', updated_at = now() FROM due \
+         WHERE p.id = due.id AND p.status = 'scheduled' \
          RETURNING p.id, p.team_id",
         vec![PUBLISHES_PER_DAY.into(), CLAIM_BATCH.into()],
     );
@@ -198,6 +189,37 @@ pub async fn claim_due(db: &DatabaseConnection) -> Result<Vec<(Uuid, Uuid)>, DbE
     rows.iter()
         .map(|r| Ok((r.try_get("", "id")?, r.try_get("", "team_id")?)))
         .collect()
+}
+
+pub enum Quota {
+    Reserved,
+    /// The team is at its daily cap.
+    Over,
+    /// The post changed meanwhile; nothing was reserved.
+    Lost,
+}
+
+/// In one transaction: reserve a hit of the team's daily publish cap (unless the post already
+/// holds one) and run `update`, which must set `quota_reserved = true` on exactly this post.
+/// The hit is rolled back when the update touches nothing.
+pub async fn reserve_and(
+    db: &DatabaseConnection,
+    team_id: Uuid,
+    already: bool,
+    update: Statement,
+) -> Result<Quota, DbErr> {
+    let txn = db.begin().await?;
+    if !already {
+        let cap = [(quota_bucket(team_id), PUBLISHES_PER_DAY)];
+        if reserve_in(&txn, &cap).await?.is_none() {
+            return Ok(Quota::Over);
+        }
+    }
+    if txn.execute_raw(update).await?.rows_affected() != 1 {
+        return Ok(Quota::Lost);
+    }
+    txn.commit().await?;
+    Ok(Quota::Reserved)
 }
 
 /// Puts a claimed post back to `scheduled`, with `error` saying why.
@@ -248,6 +270,26 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
     };
     if post.status != "queued" {
         return Ok(());
+    }
+    // Whatever queued it (a tick, publish now, recovery), nothing publishes without its hit.
+    if !post.quota_reserved {
+        let mark = sql(
+            "UPDATE posts SET quota_reserved = true \
+             WHERE id = $1 AND status = 'queued' AND NOT quota_reserved",
+            vec![id.into()],
+        );
+        let back = match reserve_and(db, post.team_id, false, mark).await {
+            Ok(Quota::Reserved) => None,
+            Ok(Quota::Over) => Some(Some(OVER_QUOTA)),
+            Ok(Quota::Lost) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(error = %e, post = %id, "publish quota reserve failed");
+                Some(None)
+            }
+        };
+        if let Some(error) = back {
+            return unclaim(db, id, error).await;
+        }
     }
     let set_live = social_sets::Entity::find_by_id(post.social_set_id)
         .filter(social_sets::Column::DeletedAt.is_null())
