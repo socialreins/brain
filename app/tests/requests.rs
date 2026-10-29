@@ -47,6 +47,19 @@ async fn health_and_version() {
 
 #[tokio::test]
 #[serial]
+async fn favicon_and_icon_are_served() {
+    let (s, _) = server().await;
+    let ico = s.get("/favicon.ico").await;
+    ico.assert_status_ok();
+    assert_eq!(ico.header("content-type"), "image/x-icon");
+    let svg = s.get("/icon.svg").await;
+    svg.assert_status_ok();
+    assert_eq!(svg.header("content-type"), "image/svg+xml");
+    assert!(svg.text().contains("#ff5b22"));
+}
+
+#[tokio::test]
+#[serial]
 async fn waitlist_signup_is_stored_lowercased() {
     let (s, db) = server().await;
     let email = unique_email();

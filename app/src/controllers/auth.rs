@@ -219,7 +219,8 @@ async fn confirm_page(State(app): State<AppState>, Path(secret): Path<String>) -
     }
     let page = format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width\"><title>Sign in</title></head>\
+         <meta name=\"viewport\" content=\"width=device-width\"><title>Sign in</title>\
+         <link rel=\"icon\" href=\"/icon.svg\" type=\"image/svg+xml\"></head>\
          <body><form method=\"post\" action=\"/auth/magic\">\
          <input type=\"hidden\" name=\"token\" value=\"{secret}\">\
          <button type=\"submit\">Sign in to SocialReins</button></form></body></html>"
