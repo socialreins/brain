@@ -1,8 +1,11 @@
-//! Background jobs. shortcut: an hourly in-process tick, run by one instance at a time through
-//! an advisory lock; move to a real scheduler once there are jobs that need exact times.
+//! Background jobs, in process: publishing due posts every minute (the old app ran every 5) and
+//! purging deleted sets every hour, each run by one instance at a time through an advisory
+//! lock. shortcut: no job queue; move to one if jobs need retries or exact times.
 use std::time::Duration;
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait};
+
+use crate::{publish, state::AppState};
 
 /// How long a deleted social set can be restored before the purge removes it.
 pub const RESTORE_DAYS: i64 = 30;
@@ -10,8 +13,20 @@ pub const RESTORE_DAYS: i64 = 30;
 /// Advisory lock key held by the instance that purges.
 const PURGE_LOCK: i64 = 0x0050_5552_4745_5345;
 
-/// Starts the hourly jobs; the first run is right away.
-pub fn spawn(db: DatabaseConnection) {
+/// Starts the jobs; each first runs right away, so a restart also fails targets cut off
+/// mid-publish.
+pub fn spawn(app: AppState) {
+    let db = app.db.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if let Err(e) = publish::tick(&app).await {
+                tracing::warn!(error = %e, "publish tick failed");
+            }
+        }
+    });
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(3600));
         loop {

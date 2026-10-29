@@ -1,6 +1,8 @@
 pub mod magic_links;
 pub mod passkey_challenges;
 pub mod passkeys;
+pub mod post_targets;
+pub mod posts;
 pub mod sessions;
 pub mod social_account_social_set;
 pub mod social_accounts;

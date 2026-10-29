@@ -3,6 +3,7 @@ pub mod connectors;
 pub mod controllers;
 pub mod mail;
 pub mod models;
+pub mod publish;
 pub mod rate_limit;
 pub mod scheduler;
 pub mod state;

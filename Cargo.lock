@@ -2960,6 +2960,7 @@ dependencies = [
 name = "socialreins-brain"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "axum-test",
  "base64 0.22.1",
@@ -2993,6 +2994,7 @@ dependencies = [
  "hex",
  "ring",
  "sha2 0.10.9",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -3638,6 +3640,12 @@ name = "unicode-properties"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "unicode-xid"

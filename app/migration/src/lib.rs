@@ -7,6 +7,7 @@ mod m20261028_000002_teams;
 mod m20261028_000003_rate_limit_hits;
 mod m20261029_000001_social_accounts;
 mod m20261030_000001_social_set_names;
+mod m20261031_000001_posts;
 
 pub struct Migrator;
 
@@ -21,6 +22,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261028_000003_rate_limit_hits::Migration),
             Box::new(m20261029_000001_social_accounts::Migration),
             Box::new(m20261030_000001_social_set_names::Migration),
+            Box::new(m20261031_000001_posts::Migration),
             // inject-above (do not remove this comment)
         ]
     }

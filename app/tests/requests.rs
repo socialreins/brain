@@ -2276,10 +2276,97 @@ mod teams {
                 .route("/xrpc/com.atproto.identity.resolveHandle", get(resolve))
                 .route("/xrpc/com.atproto.server.createSession", post(session))
                 .route("/xrpc/app.bsky.actor.getProfile", get(profile))
+                .route("/xrpc/com.atproto.repo.uploadBlob", post(upload_blob))
+                .route("/xrpc/com.atproto.repo.createRecord", post(create_record))
+                .route("/xrpc/com.atproto.repo.deleteRecord", post(delete_record))
+                .route("/img.png", get(|| async { image("image/png", 64) }))
+                .route("/big.png", get(|| async { image("image/png", 1_000_001) }))
+                .route("/page.html", get(|| async { image("text/html", 64) }))
                 .route("/{did}", get(doc))
                 .with_state(base.clone());
             tokio::spawn(async move { axum::serve(listener, app).await });
             base
+        }
+
+        /// Every `createRecord` body the mock took, newest last.
+        static RECORDS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+
+        fn image(content_type: &'static str, len: usize) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            ([("content-type", content_type)], vec![7u8; len]).into_response()
+        }
+
+        fn authorized(headers: &axum::http::HeaderMap) -> bool {
+            headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("Bearer e30."))
+        }
+
+        async fn upload_blob(
+            headers: axum::http::HeaderMap,
+            bytes: axum::body::Bytes,
+        ) -> (axum::http::StatusCode, Json<Value>) {
+            if !authorized(&headers) {
+                return (axum::http::StatusCode::UNAUTHORIZED, Json(json!({})));
+            }
+            let mime = headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let blob = json!({"$type": "blob", "ref": {"$link": "bafkmock"},
+                "mimeType": mime, "size": bytes.len()});
+            (axum::http::StatusCode::OK, Json(json!({ "blob": blob })))
+        }
+
+        /// Text with `REJECT` is refused with a leaky message; text with `STICKY` gets a
+        /// record key that cannot be deleted.
+        async fn create_record(
+            headers: axum::http::HeaderMap,
+            Json(b): Json<Value>,
+        ) -> (axum::http::StatusCode, Json<Value>) {
+            if !authorized(&headers) {
+                return (axum::http::StatusCode::UNAUTHORIZED, Json(json!({})));
+            }
+            let text = b["record"]["text"].as_str().unwrap_or_default().to_owned();
+            if text.contains("REJECT") {
+                let leak = json!({"error": "InvalidRequest",
+                    "message": "see https://secret.example/?token=abc"});
+                return (axum::http::StatusCode::BAD_REQUEST, Json(leak));
+            }
+            RECORDS.lock().unwrap().push(b.clone());
+            let prefix = if text.contains("STICKY") {
+                "sticky"
+            } else {
+                "r"
+            };
+            let rkey = format!(
+                "{prefix}{}",
+                &uuid::Uuid::now_v7().simple().to_string()[20..]
+            );
+            let uri = format!(
+                "at://{}/app.bsky.feed.post/{rkey}",
+                b["repo"].as_str().unwrap()
+            );
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({"uri": uri, "cid": "bafycid"})),
+            )
+        }
+
+        async fn delete_record(
+            headers: axum::http::HeaderMap,
+            Json(b): Json<Value>,
+        ) -> (axum::http::StatusCode, Json<Value>) {
+            if !authorized(&headers) {
+                return (axum::http::StatusCode::UNAUTHORIZED, Json(json!({})));
+            }
+            if b["rkey"].as_str().unwrap_or_default().starts_with("sticky") {
+                let err = json!({"error": "InternalServerError"});
+                return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(err));
+            }
+            (axum::http::StatusCode::OK, Json(json!({})))
         }
 
         /// A brain whose Bluesky calls go to the mock; `secure` keeps the https-only PDS rule.
@@ -3116,6 +3203,836 @@ mod teams {
                 ] {
                     assert!(doc["paths"][p][m].is_object(), "{p} {m}");
                 }
+            }
+        }
+
+        /// `/v1/posts` and the publish pipeline, against the mock PDS.
+        mod posts_api {
+            use super::*;
+            use socialreins_brain::{
+                models::{post_targets, posts},
+                publish,
+            };
+
+            /// A brain on the mock, with its state for driving the publish pipeline directly.
+            async fn on_mock() -> (TestServer, DatabaseConnection, AppState) {
+                let base = mock_bluesky().await;
+                let mut config = Config::from_env().expect("test config");
+                config.trust_proxy = true;
+                config.bluesky.appview = base.clone();
+                config.bluesky.plc = base;
+                config.bluesky.allow_insecure_pds = true;
+                let db = socialreins_brain::connect(&config)
+                    .await
+                    .expect("database reachable");
+                let state = AppState::new(db.clone(), &config);
+                let app = controllers::router(state.clone(), &config);
+                (TestServer::new(app).unwrap(), db, state)
+            }
+
+            fn input(set: &str, body: &str, at: Option<&str>) -> Value {
+                json!({"social_set_id": set, "platform": "bluesky", "body": body,
+                    "media": [], "scheduled_at": at})
+            }
+
+            async fn create(s: &TestServer, cookie: &str, body: Value) -> axum_test::TestResponse {
+                req(s, Method::POST, "/v1/posts", cookie).json(&body).await
+            }
+
+            async fn get_post(s: &TestServer, cookie: &str, id: &str) -> Value {
+                let res = s
+                    .get(&format!("/v1/posts/{id}"))
+                    .add_header("cookie", cookie)
+                    .await;
+                res.assert_status_ok();
+                res.json()
+            }
+
+            /// Polls until the post leaves `queued` (publish now runs in the background).
+            async fn settled(s: &TestServer, cookie: &str, id: &str) -> Value {
+                for _ in 0..100 {
+                    let p = get_post(s, cookie, id).await;
+                    if p["status"] != "queued" {
+                        return p;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                panic!("post {id} stayed queued");
+            }
+
+            fn past() -> String {
+                (Utc::now() - Duration::minutes(1)).to_rfc3339()
+            }
+
+            /// Points a post's media at the mock (http on loopback, which only tests allow).
+            async fn set_media(db: &DatabaseConnection, s_base: &str, id: &str, paths: &[&str]) {
+                let urls: Vec<String> = paths.iter().map(|p| format!("{s_base}{p}")).collect();
+                let row = posts::ActiveModel {
+                    id: Set(id.parse().unwrap()),
+                    media: Set(json!(urls)),
+                    ..Default::default()
+                };
+                posts::Entity::update(row).exec(db).await.unwrap();
+            }
+
+            async fn pds_of(db: &DatabaseConnection, team_id: &str) -> String {
+                let a = social_accounts::Entity::find()
+                    .filter(
+                        social_accounts::Column::TeamId.eq(team_id.parse::<uuid::Uuid>().unwrap()),
+                    )
+                    .one(db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                a.meta["pds"].as_str().unwrap().to_owned()
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn posts_are_validated_listed_and_edited_by_members() {
+                let (s, db, _) = on_mock().await;
+                let (_, owner, _) = user(&s, &db).await;
+                let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+                let set = default_set(&db, &team_id).await.to_string();
+                let (member, _) = joined(&s, &db, &team_id, "member").await;
+
+                let res = create(&s, &member, input(&set, "draft one", None)).await;
+                assert_eq!(res.status_code(), 201, "members write posts");
+                let draft = res.json::<Value>();
+                assert_eq!(draft["status"], "draft");
+                let at = (Utc::now() + Duration::days(3)).to_rfc3339();
+                let sched = create(&s, &owner, input(&set, "later", Some(&at))).await;
+                assert_eq!(sched.json::<Value>()["status"], "scheduled");
+
+                let five: Vec<String> = (0..5)
+                    .map(|i| format!("https://a.example/{i}.png"))
+                    .collect();
+                let mut bad_media = input(&set, "x", None);
+                bad_media["media"] = json!(["http://a.example/i.png"]);
+                let mut too_many = input(&set, "x", None);
+                too_many["media"] = json!(five);
+                let mut other_platform = input(&set, "x", None);
+                other_platform["platform"] = json!("x");
+                for (body, code) in [
+                    (input(&set, &"a".repeat(301), None), "too_long"),
+                    (input(&set, "  ", None), "empty_post"),
+                    (bad_media, "invalid_media"),
+                    (too_many, "too_many_images"),
+                    (other_platform, "unsupported_platform"),
+                    (
+                        input(&uuid::Uuid::now_v7().to_string(), "x", None),
+                        "invalid_set",
+                    ),
+                ] {
+                    let res = create(&s, &owner, body).await;
+                    assert_eq!(res.status_code(), 422, "{code}");
+                    res.assert_json(&json!({ "error": code }));
+                }
+
+                let list = |q: String| {
+                    let s = &s;
+                    let owner = owner.clone();
+                    async move {
+                        let res = s
+                            .get(&format!("/v1/posts{q}"))
+                            .add_header("cookie", owner)
+                            .await;
+                        res.assert_status_ok();
+                        res.json::<Vec<Value>>()
+                    }
+                };
+                assert_eq!(list(String::new()).await.len(), 2);
+                assert_eq!(list("?status=draft".into()).await.len(), 1);
+                let from = Utc::now().to_rfc3339().replace('+', "%2B");
+                let to = (Utc::now() + Duration::days(7))
+                    .to_rfc3339()
+                    .replace('+', "%2B");
+                let window = list(format!("?from={from}&to={to}&social_set_id={set}")).await;
+                assert_eq!(window.len(), 1);
+                assert_eq!(window[0]["body"], "later");
+                let res = s
+                    .get("/v1/posts?status=nope")
+                    .add_header("cookie", &owner)
+                    .await;
+                assert_eq!(res.status_code(), 422);
+
+                let id = draft["id"].as_str().unwrap();
+                let path = format!("/v1/posts/{id}");
+                let res = req(&s, Method::PUT, &path, &member)
+                    .json(&input(&set, "now scheduled", Some(&at)))
+                    .await;
+                res.assert_status_ok();
+                assert_eq!(res.json::<Value>()["status"], "scheduled");
+                let res = req(&s, Method::PUT, &path, &member)
+                    .json(&input(&set, "back to draft", None))
+                    .await;
+                assert_eq!(res.json::<Value>()["status"], "draft");
+
+                // Another team sees nothing.
+                let (_, stranger, _) = user(&s, &db).await;
+                let res = req(&s, Method::PUT, &path, &stranger)
+                    .json(&input(&set, "mine", None))
+                    .await;
+                assert_eq!(res.status_code(), 404);
+                assert_eq!(
+                    req(&s, Method::DELETE, &path, &stranger)
+                        .await
+                        .status_code(),
+                    404
+                );
+
+                // A deleted set hides its posts until it is restored.
+                let other = id_of(
+                    &req(&s, Method::POST, "/v1/social-sets", &owner)
+                        .json(&json!({"name": "Clients"}))
+                        .await,
+                );
+                let p = create(&s, &owner, input(&other, "in clients", None)).await;
+                let pid = p.json::<Value>()["id"].as_str().unwrap().to_owned();
+                req(
+                    &s,
+                    Method::DELETE,
+                    &format!("/v1/social-sets/{other}"),
+                    &owner,
+                )
+                .json(&json!({}))
+                .await;
+                assert_eq!(list(String::new()).await.len(), 2);
+                let res = s
+                    .get(&format!("/v1/posts/{pid}"))
+                    .add_header("cookie", &owner)
+                    .await;
+                assert_eq!(res.status_code(), 404);
+                req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/social-sets/{other}/restore"),
+                    &owner,
+                )
+                .await;
+                assert_eq!(list(String::new()).await.len(), 3);
+
+                assert_eq!(
+                    req(&s, Method::DELETE, &path, &member).await.status_code(),
+                    204
+                );
+                assert_eq!(list(String::new()).await.len(), 2);
+            }
+
+            fn id_of(res: &axum_test::TestResponse) -> String {
+                res.json::<Value>()["id"].as_str().unwrap().to_owned()
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn publish_now_posts_with_link_facets_and_takedown_deletes() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let text = "🦀 read https://example.com/a. ok";
+                let id = id_of(&create(&s, &cookie, input(&set, text, None)).await);
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/posts/{id}/publish"),
+                    &cookie,
+                )
+                .await;
+                assert_eq!(res.status_code(), 202);
+                assert_eq!(res.json::<Value>()["status"], "queued");
+                let p = settled(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "published", "{p}");
+                assert!(p["published_at"].is_string() && p["scheduled_at"].is_string());
+                let t = &p["targets"][0];
+                assert_eq!(t["status"], "published");
+                let uri = t["remote_id"].as_str().unwrap();
+                assert!(uri.starts_with("at://did:plc:"));
+                assert!(t["remote_url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("https://bsky.app/profile/did:plc:"));
+                let record = RECORDS.lock().unwrap().last().cloned().unwrap();
+                assert_eq!(record["record"]["text"], text);
+                let facet = &record["record"]["facets"][0];
+                assert_eq!(facet["index"]["byteStart"], "🦀 read ".len());
+                assert_eq!(facet["features"][0]["uri"], "https://example.com/a");
+                assert!(record["record"].get("embed").is_none());
+
+                let path = format!("/v1/posts/{id}");
+                let res = req(&s, Method::PUT, &path, &cookie)
+                    .json(&input(&set, "edit", None))
+                    .await;
+                assert_eq!(res.status_code(), 409);
+                res.assert_json(&json!({"error": "not_editable"}));
+                let res = req(&s, Method::POST, &format!("{path}/publish"), &cookie).await;
+                assert_eq!(res.status_code(), 409, "published once only");
+
+                let res = req(&s, Method::DELETE, &path, &cookie).await;
+                res.assert_status_ok();
+                let body = res.json::<Value>();
+                assert_eq!(body["status"], "deleted");
+                assert_eq!(body["targets"][0]["status"], "deleted");
+                let res = req(&s, Method::DELETE, &path, &cookie).await;
+                res.assert_status_ok();
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn the_tick_publishes_due_posts_with_images() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let base = pds_of(&db, &team_id).await;
+                let id =
+                    id_of(&create(&s, &cookie, input(&set, "with images", Some(&past()))).await);
+                set_media(&db, &base, &id, &["/img.png", "/img.png"]).await;
+                let later = (Utc::now() + Duration::hours(1)).to_rfc3339();
+                let not_due = id_of(&create(&s, &cookie, input(&set, "later", Some(&later))).await);
+                publish::tick(&state).await.unwrap();
+                let p = get_post(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "published", "{p}");
+                let record = RECORDS.lock().unwrap().last().cloned().unwrap();
+                let images = &record["record"]["embed"]["images"];
+                assert_eq!(record["record"]["embed"]["$type"], "app.bsky.embed.images");
+                assert_eq!(images.as_array().unwrap().len(), 2);
+                assert_eq!(images[0]["alt"], "");
+                assert_eq!(images[0]["image"]["mimeType"], "image/png");
+                assert_eq!(get_post(&s, &cookie, &not_due).await["status"], "scheduled");
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn failures_are_scrubbed_and_name_the_account() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, account) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let base = pds_of(&db, &team_id).await;
+                let handle = list(&s, &cookie).await[0]["handle"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let cases = [
+                    ("REJECT me", vec![], "Bluesky refused it (InvalidRequest)."),
+                    (
+                        "big",
+                        vec!["/big.png"],
+                        "Image 1 is over 1 MB, Bluesky's limit.",
+                    ),
+                    (
+                        "html",
+                        vec!["/page.html"],
+                        "Image 1 is not a JPEG, PNG, WebP or GIF.",
+                    ),
+                ];
+                for (text, media, msg) in cases {
+                    let id = id_of(&create(&s, &cookie, input(&set, text, Some(&past()))).await);
+                    set_media(&db, &base, &id, &media).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed", "{text}");
+                    assert_eq!(p["targets"][0]["error"], msg);
+                    assert_eq!(p["error"], format!("@{handle}: {msg}"));
+                    assert!(!p.to_string().contains("secret.example"));
+                    let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                    assert_eq!(res.status_code(), 409);
+                    res.assert_json(&json!({"error": "not_deletable"}));
+                }
+
+                // A refused app password asks for a reconnect, on publish and on takedown.
+                let id = id_of(&create(&s, &cookie, input(&set, "fine", Some(&past()))).await);
+                publish::tick(&state).await.unwrap();
+                assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                let row = social_accounts::ActiveModel {
+                    id: Set(account.parse().unwrap()),
+                    access_token: Set(cipher().encrypt(b"revoked-pass")),
+                    ..Default::default()
+                };
+                social_accounts::Entity::update(row)
+                    .exec(&db)
+                    .await
+                    .unwrap();
+                let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                assert_eq!(res.status_code(), 422);
+                let body = res.json::<Value>();
+                assert_eq!(body["error"], "takedown_failed");
+                assert!(body["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Reconnect the account"));
+                assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                let id = id_of(&create(&s, &cookie, input(&set, "after", Some(&past()))).await);
+                publish::tick(&state).await.unwrap();
+                let p = get_post(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "failed");
+                assert_eq!(p["targets"][0]["error"], publish::RECONNECT);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_failed_takedown_keeps_the_rest_for_a_retry() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let id = id_of(&create(&s, &cookie, input(&set, "STICKY", Some(&past()))).await);
+                publish::tick(&state).await.unwrap();
+                let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                assert_eq!(res.status_code(), 422);
+                let msg = res.json::<Value>()["message"].as_str().unwrap().to_owned();
+                assert!(
+                    msg.contains("InternalServerError") && msg.contains("Bluesky app"),
+                    "{msg}"
+                );
+                let p = get_post(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "published");
+                assert_eq!(p["targets"][0]["status"], "published");
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn claims_never_double_publish() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let mut mine = Vec::new();
+                for i in 0..5 {
+                    let res =
+                        create(&s, &cookie, input(&set, &format!("due {i}"), Some(&past()))).await;
+                    mine.push(id_of(&res).parse::<uuid::Uuid>().unwrap());
+                }
+                let (a, b) = tokio::join!(publish::claim_due(&db), publish::claim_due(&db));
+                let (a, b) = (a.unwrap(), b.unwrap());
+                assert!(a.len() <= 50 && b.len() <= 50, "batches are capped");
+                for id in &mine {
+                    let n = a.iter().chain(&b).filter(|x| x.0 == *id).count();
+                    assert_eq!(n, 1, "each due post is claimed once");
+                }
+                // Two runs of one queued post: every target is claimed once, one record each.
+                let before = RECORDS.lock().unwrap().len();
+                let (x, y) = tokio::join!(
+                    publish::publish_post(&state, mine[0]),
+                    publish::publish_post(&state, mine[0])
+                );
+                x.unwrap();
+                y.unwrap();
+                assert_eq!(RECORDS.lock().unwrap().len(), before + 1);
+                let targets = post_targets::Entity::find()
+                    .filter(post_targets::Column::PostId.eq(mine[0]))
+                    .all(&db)
+                    .await
+                    .unwrap();
+                assert_eq!(targets.len(), 1);
+                let target = targets[0].id;
+                let reset = post_targets::ActiveModel {
+                    id: Set(target),
+                    status: Set("pending".into()),
+                    ..Default::default()
+                };
+                post_targets::Entity::update(reset).exec(&db).await.unwrap();
+                let (p, q) = tokio::join!(
+                    publish::claim_target(&db, target),
+                    publish::claim_target(&db, target)
+                );
+                assert!(
+                    !p.unwrap() && !q.unwrap(),
+                    "a target with a remote id is never claimed"
+                );
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn the_daily_quota_holds_back_publishes_and_past_times_mean_now() {
+                use sea_orm::{ConnectionTrait, DbBackend, Statement};
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let t0 = Utc::now() - Duration::seconds(1);
+                let hour_ago = (Utc::now() - Duration::hours(1)).to_rfc3339();
+                let res = create(&s, &cookie, input(&set, "past", Some(&hour_ago))).await;
+                let p = res.json::<Value>();
+                let at: chrono::DateTime<Utc> =
+                    p["scheduled_at"].as_str().unwrap().parse().unwrap();
+                assert!(at >= t0, "a past scheduled_at is clamped to now");
+                let id = p["id"].as_str().unwrap().to_owned();
+
+                let bucket = publish::quota_bucket(team_id.parse().unwrap());
+                for _ in 0..publish::PUBLISHES_PER_DAY {
+                    let sql = "INSERT INTO rate_limit_hits (bucket) VALUES ($1)";
+                    let stmt = Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        sql,
+                        [bucket.clone().into()],
+                    );
+                    db.execute_raw(stmt).await.unwrap();
+                }
+                publish::tick(&state).await.unwrap();
+                assert_eq!(
+                    get_post(&s, &cookie, &id).await["status"],
+                    "scheduled",
+                    "held back"
+                );
+                let draft = id_of(&create(&s, &cookie, input(&set, "now", None)).await);
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/posts/{draft}/publish"),
+                    &cookie,
+                )
+                .await;
+                assert_eq!(res.status_code(), 429);
+                res.assert_json(&json!({"error": "publish_quota"}));
+                assert_eq!(get_post(&s, &cookie, &draft).await["status"], "draft");
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_stuck_target_with_a_remote_id_is_published_and_can_come_down() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, account) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let account: uuid::Uuid = account.parse().unwrap();
+                let did = list(&s, &cookie).await[0]["external_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let post = queued_post(&db, &team_id, &set).await;
+                let id = uuid::Uuid::now_v7();
+                let uri = format!("at://{did}/app.bsky.feed.post/r3stuck");
+                let row = post_targets::ActiveModel {
+                    id: Set(id),
+                    post_id: Set(post),
+                    social_account_id: Set(Some(account)),
+                    status: Set("publishing".into()),
+                    remote_id: Set(Some(uri)),
+                    updated_at: Set((Utc::now() - Duration::minutes(20)).fixed_offset()),
+                    ..Default::default()
+                };
+                post_targets::Entity::insert(row)
+                    .exec_without_returning(&db)
+                    .await
+                    .unwrap();
+                publish::recover_stuck(&db).await.unwrap();
+                let t = post_targets::Entity::find_by_id(id)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(t.status, "published");
+                assert_eq!(
+                    t.remote_url.as_deref(),
+                    Some(format!("https://bsky.app/profile/{did}/post/r3stuck").as_str())
+                );
+                let p = posts::Entity::find_by_id(post)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(p.status, "published");
+                let res = req(&s, Method::DELETE, &format!("/v1/posts/{post}"), &cookie).await;
+                res.assert_status_ok();
+                assert_eq!(res.json::<Value>()["status"], "deleted");
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn recovered_queued_posts_never_skip_the_quota() {
+                use sea_orm::{ConnectionTrait, DbBackend, Statement};
+                let (s, db, state) = on_mock().await;
+                let (_, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let bucket = publish::quota_bucket(team_id.parse().unwrap());
+                // Left `queued` 20 minutes ago with no reservation recorded.
+                let stale = |id: uuid::Uuid| posts::ActiveModel {
+                    id: Set(id),
+                    updated_at: Set((Utc::now() - Duration::minutes(20)).fixed_offset()),
+                    ..Default::default()
+                };
+                let first = queued_post(&db, &team_id, &set).await;
+                posts::Entity::update(stale(first)).exec(&db).await.unwrap();
+                let before = RECORDS.lock().unwrap().len();
+                publish::tick(&state).await.unwrap();
+                let p = posts::Entity::find_by_id(first)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(p.status, "published");
+                assert!(p.quota_reserved, "reserved before it went out");
+                assert_eq!(hits(&db, &bucket).await, 1);
+                assert_eq!(RECORDS.lock().unwrap().len(), before + 1);
+
+                // At the cap, the recovered post goes back to scheduled and nothing is sent.
+                for _ in 1..publish::PUBLISHES_PER_DAY {
+                    let sql = "INSERT INTO rate_limit_hits (bucket) VALUES ($1)";
+                    let stmt = Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        sql,
+                        [bucket.clone().into()],
+                    );
+                    db.execute_raw(stmt).await.unwrap();
+                }
+                let second = queued_post(&db, &team_id, &set).await;
+                posts::Entity::update(stale(second))
+                    .exec(&db)
+                    .await
+                    .unwrap();
+                publish::tick(&state).await.unwrap();
+                let p = posts::Entity::find_by_id(second)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(p.status, "scheduled");
+                assert!(!p.quota_reserved);
+                assert!(p.error.unwrap().contains("limit of 100"));
+                assert_eq!(hits(&db, &bucket).await, publish::PUBLISHES_PER_DAY);
+                assert_eq!(
+                    RECORDS.lock().unwrap().len(),
+                    before + 1,
+                    "nothing more was sent"
+                );
+                let none = post_targets::Entity::find()
+                    .filter(post_targets::Column::PostId.eq(second))
+                    .count(&db)
+                    .await
+                    .unwrap();
+                assert_eq!(none, 0);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_tick_claims_at_most_50_posts() {
+                let (s, db, _) = on_mock().await;
+                let (_, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let mut mine = Vec::new();
+                for _ in 0..51 {
+                    let id = queued_post(&db, &team_id, &set).await;
+                    let row = posts::ActiveModel {
+                        id: Set(id),
+                        status: Set("scheduled".into()),
+                        ..Default::default()
+                    };
+                    posts::Entity::update(row).exec(&db).await.unwrap();
+                    mine.push(id);
+                }
+                let first = publish::claim_due(&db).await.unwrap();
+                assert_eq!(first.len(), 50);
+                let mut claimed: Vec<uuid::Uuid> = first.iter().map(|c| c.0).collect();
+                loop {
+                    let next = publish::claim_due(&db).await.unwrap();
+                    if next.is_empty() {
+                        break;
+                    }
+                    claimed.extend(next.iter().map(|c| c.0));
+                }
+                for id in &mine {
+                    assert_eq!(claimed.iter().filter(|c| *c == id).count(), 1);
+                }
+            }
+
+            async fn queued_post(db: &DatabaseConnection, team: &str, set: &str) -> uuid::Uuid {
+                let id = uuid::Uuid::now_v7();
+                let row = posts::ActiveModel {
+                    id: Set(id),
+                    team_id: Set(team.parse().unwrap()),
+                    social_set_id: Set(set.parse().unwrap()),
+                    platform: Set("bluesky".into()),
+                    body: Set("x".into()),
+                    media: Set(json!([])),
+                    status: Set("queued".into()),
+                    scheduled_at: Set(Some(Utc::now().fixed_offset())),
+                    ..Default::default()
+                };
+                posts::Entity::insert(row)
+                    .exec_without_returning(db)
+                    .await
+                    .unwrap();
+                id
+            }
+
+            async fn target(
+                db: &DatabaseConnection,
+                post: uuid::Uuid,
+                account: Option<uuid::Uuid>,
+                status: &str,
+                updated: chrono::DateTime<Utc>,
+            ) {
+                let row = post_targets::ActiveModel {
+                    id: Set(uuid::Uuid::now_v7()),
+                    post_id: Set(post),
+                    social_account_id: Set(account),
+                    status: Set(status.into()),
+                    error: Set((status == "failed").then(|| "Boom.".to_owned())),
+                    updated_at: Set(updated.fixed_offset()),
+                    ..Default::default()
+                };
+                post_targets::Entity::insert(row)
+                    .exec_without_returning(db)
+                    .await
+                    .unwrap();
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn settle_races_agree_and_stuck_targets_fail_without_republishing() {
+                let (s, db, state) = on_mock().await;
+                let (_, team_id, account) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let account: uuid::Uuid = account.parse().unwrap();
+                let post = queued_post(&db, &team_id, &set).await;
+                target(&db, post, Some(account), "published", Utc::now()).await;
+                target(&db, post, None, "failed", Utc::now()).await;
+                let (a, b) = tokio::join!(publish::settle(&db, post), publish::settle(&db, post));
+                a.unwrap();
+                b.unwrap();
+                let p = posts::Entity::find_by_id(post)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    p.status, "published",
+                    "partly failed still counts as published"
+                );
+                assert_eq!(p.error.as_deref(), Some("A disconnected account: Boom."));
+                assert!(p.published_at.is_some());
+
+                // A target cut off mid-publish 20 minutes ago fails and is never resent.
+                let stuck = queued_post(&db, &team_id, &set).await;
+                target(
+                    &db,
+                    stuck,
+                    Some(account),
+                    "publishing",
+                    Utc::now() - Duration::minutes(20),
+                )
+                .await;
+                let fresh = queued_post(&db, &team_id, &set).await;
+                target(&db, fresh, Some(account), "publishing", Utc::now()).await;
+                let before = RECORDS.lock().unwrap().len();
+                publish::recover_stuck(&db).await.unwrap();
+                publish::tick(&state).await.unwrap();
+                let p = posts::Entity::find_by_id(stuck)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(p.status, "failed");
+                assert!(p.error.unwrap().contains("Unknown, check the account"));
+                let f = posts::Entity::find_by_id(fresh)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(f.status, "queued", "a recent publish is left alone");
+                assert_eq!(
+                    RECORDS.lock().unwrap().len(),
+                    before,
+                    "nothing was republished"
+                );
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn deleted_sets_hold_posts_back() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, _) = owner_with_account(&s, &db).await;
+                let other = id_of(
+                    &req(&s, Method::POST, "/v1/social-sets", &cookie)
+                        .json(&json!({"name": "Held"}))
+                        .await,
+                );
+                let id = id_of(&create(&s, &cookie, input(&other, "held", Some(&past()))).await);
+                req(
+                    &s,
+                    Method::DELETE,
+                    &format!("/v1/social-sets/{other}"),
+                    &cookie,
+                )
+                .json(&json!({}))
+                .await;
+                publish::tick(&state).await.unwrap();
+                let p = posts::Entity::find_by_id(id.parse::<uuid::Uuid>().unwrap())
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    p.status, "scheduled",
+                    "not claimed while its set is deleted"
+                );
+                // A set deleted after the claim sends the post back to scheduled.
+                let row = posts::ActiveModel {
+                    id: Set(p.id),
+                    status: Set("queued".into()),
+                    ..Default::default()
+                };
+                posts::Entity::update(row).exec(&db).await.unwrap();
+                publish::publish_post(&state, p.id).await.unwrap();
+                let p = posts::Entity::find_by_id(p.id)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(p.status, "scheduled");
+                assert!(!p.quota_reserved, "it reserves again when claimed next");
+                // An empty set fails the post with a message.
+                req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/social-sets/{other}/restore"),
+                    &cookie,
+                )
+                .await;
+                publish::tick(&state).await.unwrap();
+                let p = get_post(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "failed");
+                assert_eq!(p["error"], "No bluesky account is in this post's set.");
+            }
+
+            /// Publishes a text post with one image to the real Bluesky test account and deletes
+            /// it. Needs BLUESKY_TEST_HANDLE and BLUESKY_TEST_APP_PASSWORD.
+            #[tokio::test]
+            #[serial]
+            #[ignore = "calls the real Bluesky"]
+            async fn live_bluesky_publish_and_takedown() {
+                let handle = std::env::var("BLUESKY_TEST_HANDLE").expect("BLUESKY_TEST_HANDLE");
+                let password =
+                    std::env::var("BLUESKY_TEST_APP_PASSWORD").expect("BLUESKY_TEST_APP_PASSWORD");
+                let (s, db) = server_where(|_| {}).await;
+                let (_, cookie, _) = user(&s, &db).await;
+                let team_id = current(&s, &cookie).await["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let res = connect(&s, &cookie, &handle, &password).await;
+                assert!(res.status_code().is_success(), "connect: {}", res.text());
+                let set = default_set(&db, &team_id).await.to_string();
+                let mut body = input(
+                    &set,
+                    "SocialReins live test, deleted right away: https://socialreins.com",
+                    None,
+                );
+                body["media"] =
+                    json!(["https://avatars.githubusercontent.com/u/5430905?s=200&v=4"]);
+                let id = id_of(&create(&s, &cookie, body).await);
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/posts/{id}/publish"),
+                    &cookie,
+                )
+                .await;
+                assert_eq!(res.status_code(), 202);
+                let p = settled(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "published", "{}", p["error"]);
+                assert!(p["targets"][0]["remote_url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("https://bsky.app/profile/"));
+                let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                assert_eq!(res.json::<Value>()["status"], "deleted");
             }
         }
     }

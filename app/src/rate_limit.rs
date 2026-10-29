@@ -121,9 +121,23 @@ pub async fn daily_reserve(
     db: &DatabaseConnection,
     caps: &[(String, i64)],
 ) -> Result<Option<Vec<i64>>, DbErr> {
+    let txn = db.begin().await?;
+    let Some(ids) = reserve_in(&txn, caps).await? else {
+        return Ok(None);
+    };
+    txn.commit().await?;
+    prune_daily(db).await;
+    Ok(Some(ids))
+}
+
+/// `daily_reserve` inside the caller's transaction, so the hits commit or roll back with the
+/// action they pay for.
+pub async fn reserve_in(
+    txn: &impl ConnectionTrait,
+    caps: &[(String, i64)],
+) -> Result<Option<Vec<i64>>, DbErr> {
     let mut caps = caps.to_vec();
     caps.sort();
-    let txn = db.begin().await?;
     for (bucket, _) in &caps {
         let sql = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
         txn.execute_raw(bind(sql, bucket)).await?;
@@ -146,8 +160,6 @@ pub async fn daily_reserve(
             ids.push(row.try_get("", "id")?);
         }
     }
-    txn.commit().await?;
-    prune_daily(db).await;
     Ok(Some(ids))
 }
 
