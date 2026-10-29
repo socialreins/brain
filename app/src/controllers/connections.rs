@@ -182,7 +182,7 @@ async fn providers(State(app): State<AppState>, _: CurrentUser) -> Json<Vec<Prov
 
 /// Connects a Bluesky account with an app password, or replaces the stored app password when
 /// the team already has it (`200` instead of `201`). Owners and admins. Throttled like sign-in:
-/// per IP and 5 a minute per user, 30 a day per user and 10 a day per handle.
+/// per IP and 5 a minute per user, 30 a day per user and 10 a day per handle in one team.
 #[utoipa::path(post, path = "/connections/bluesky", tag = "connections", request_body = BlueskyLogin,
     responses((status = 201, body = Connection), (status = 200, body = Connection),
         (status = 401, body = Error), (status = 403, body = Error), (status = 422, body = Error),
@@ -205,11 +205,15 @@ async fn connect_bluesky(
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_handle");
     };
     if body.app_password.is_empty() || body.app_password.len() > 256 {
-        return reply(StatusCode::UNAUTHORIZED, "invalid_credentials");
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_credentials");
     }
     let caps = [
         (format!("bluesky:user:{user_id}"), BLUESKY_PER_USER),
-        (format!("bluesky:handle:{handle}"), BLUESKY_PER_HANDLE),
+        // Per team, so strangers failing on a handle cannot lock its owner's team out.
+        (
+            format!("bluesky:handle:{}:{handle}", t.team.id),
+            BLUESKY_PER_HANDLE,
+        ),
     ];
     let reserved = match daily_reserve(&app.db, &caps).await {
         Ok(Some(ids)) => ids,
@@ -224,10 +228,11 @@ async fn connect_bluesky(
                 daily_refund(&app.db, &reserved).await;
             }
             let status = match e {
+                // Not 401: the web app reads that as a lost session.
                 BlueskyError::InvalidHandle
                 | BlueskyError::UnsupportedPds
+                | BlueskyError::InvalidCredentials
                 | BlueskyError::AppPasswordRequired => StatusCode::UNPROCESSABLE_ENTITY,
-                BlueskyError::InvalidCredentials => StatusCode::UNAUTHORIZED,
                 BlueskyError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
                 BlueskyError::Unreachable => StatusCode::BAD_GATEWAY,
             };

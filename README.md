@@ -107,9 +107,10 @@ account sits in the team's Default set, which `PUT /v1/connections/{id}/sets` ca
 (`public.api.bsky.app`), the DID to its PDS (`plc.directory` or the domain's `did.json`), then
 opens a session there with the app password, which is sent only to that PDS over https with
 redirects off. An account password is refused (`422 app_password_required`). Errors:
-`invalid_handle`, `unsupported_pds`, `invalid_credentials` (401), `rate_limited`,
+`invalid_handle`, `unsupported_pds`, `invalid_credentials` (all 422), `rate_limited`,
 `bluesky_unreachable` (502). Attempts count like sign-in: per IP, 5 a minute per user, and 30
-a day per user and 10 a day per handle.
+a day per user and 10 a day per handle in one team. Names that resolve to private addresses
+are refused.
 
 ## Local development
 

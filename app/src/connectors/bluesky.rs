@@ -1,7 +1,11 @@
 //! Bluesky: no OAuth. A handle and an app password are checked by resolving the handle to a
 //! DID, the DID to its PDS, and opening a session on that PDS. The app password only ever goes
 //! to the resolved PDS, over https, with redirects off.
-use std::{net::IpAddr, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use reqwest::{StatusCode, Url};
@@ -92,7 +96,6 @@ struct Service {
 #[serde(rename_all = "camelCase")]
 struct Session {
     did: String,
-    handle: String,
     access_jwt: String,
 }
 
@@ -110,6 +113,7 @@ impl Bluesky {
             .timeout(Duration::from_secs(10))
             // A redirect could carry the password to another host.
             .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(Arc::new(PublicOnly))
             .user_agent("SocialReins")
             .build()
             .map_err(|e| format!("http client: {e}"))?;
@@ -125,11 +129,12 @@ impl Bluesky {
     pub async fn verify(&self, handle: &str, app_password: &str) -> Result<Account, Error> {
         let did = self.resolve(handle).await?;
         let pds = self.pds(&did).await?;
-        let session = self.session(&pds, &did, app_password).await?;
+        self.session(&pds, &did, app_password).await?;
         let profile = self.profile(&did).await;
         Ok(Account {
             did,
-            handle: session.handle,
+            // The handle the AppView resolved to this DID; the PDS's own claim is not trusted.
+            handle: handle.to_owned(),
             display_name: profile.as_ref().and_then(|p| p.display_name.clone()),
             avatar: profile.and_then(|p| p.avatar),
             pds,
@@ -221,7 +226,7 @@ impl Bluesky {
         }
     }
 
-    async fn session(&self, pds: &str, did: &str, password: &str) -> Result<Session, Error> {
+    async fn session(&self, pds: &str, did: &str, password: &str) -> Result<(), Error> {
         let url = format!("{pds}/xrpc/com.atproto.server.createSession");
         let body = serde_json::json!({"identifier": did, "password": password});
         let res = self
@@ -256,7 +261,7 @@ impl Bluesky {
         if full_access(&session.access_jwt) {
             return Err(Error::AppPasswordRequired);
         }
-        Ok(session)
+        Ok(())
     }
 
     /// Display name and avatar from the public AppView; `None` when it has none to give, which
@@ -275,6 +280,53 @@ impl Bluesky {
                 None
             }
         }
+    }
+}
+
+/// Resolves names only to public addresses, so a DID document cannot point brain at its own
+/// network. IP literals skip the resolver; `checked_pds` refuses those.
+struct PublicOnly;
+
+impl reqwest::dns::Resolve for PublicOnly {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> =
+                tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
+            if addrs.is_empty() || !addrs.iter().all(|a| public(a.ip())) {
+                return Err("name resolves to a non-public address".into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Not loopback, private, link-local, carrier-grade NAT, multicast or otherwise reserved.
+fn public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || a == 0
+                || a >= 240
+                || (a == 100 && (64..128).contains(&b)))
+        }
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => public(IpAddr::V4(v4)),
+            None => {
+                let first = v6.segments()[0];
+                !(v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_multicast()
+                    || (first & 0xfe00) == 0xfc00
+                    || (first & 0xffc0) == 0xfe80)
+            }
+        },
     }
 }
 
@@ -326,6 +378,29 @@ mod tests {
             "not a url",
         ] {
             assert_eq!(b.checked_pds(bad), Err(Error::UnsupportedPds), "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_public_addresses_resolve() {
+        for ok in ["8.8.8.8", "2606:4700::1111"] {
+            assert!(public(ok.parse().unwrap()), "{ok}");
+        }
+        for bad in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(!public(bad.parse().unwrap()), "{bad}");
         }
     }
 

@@ -2205,6 +2205,10 @@ mod teams {
             let resolve = |Query(q): Query<HashMap<String, String>>| async move {
                 let h = q.get("handle").cloned().unwrap_or_default();
                 match h.strip_suffix(".test") {
+                    Some("down") => (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error": "Unavailable"})),
+                    ),
                     Some(label) if label != "nobody" => (
                         axum::http::StatusCode::OK,
                         Json(json!({"did": format!("did:plc:{label}")})),
@@ -2228,6 +2232,12 @@ mod teams {
                 let scope = match b["password"].as_str() {
                     Some(APP_PASSWORD | NEW_APP_PASSWORD) => "com.atproto.appPass",
                     Some(ACCOUNT_PASSWORD) => "com.atproto.access",
+                    Some("needs-2fa") => {
+                        return (
+                            axum::http::StatusCode::UNAUTHORIZED,
+                            Json(json!({"error": "AuthFactorTokenRequired"})),
+                        )
+                    }
                     _ => {
                         return (
                             axum::http::StatusCode::UNAUTHORIZED,
@@ -2385,13 +2395,20 @@ mod teams {
             let (s, db) = server_on_mock(false).await;
             let (_, cookie, _) = user(&s, &db).await;
             let cases = [
-                (new_handle(), "wrong-pass", 401, "invalid_credentials"),
-                (new_handle(), "", 401, "invalid_credentials"),
+                (new_handle(), "wrong-pass", 422, "invalid_credentials"),
+                (new_handle(), "", 422, "invalid_credentials"),
                 (new_handle(), ACCOUNT_PASSWORD, 422, "app_password_required"),
+                (new_handle(), "needs-2fa", 422, "app_password_required"),
                 ("nobody.test".into(), APP_PASSWORD, 422, "invalid_handle"),
                 ("not a handle".into(), APP_PASSWORD, 422, "invalid_handle"),
             ];
-            for (handle, pw, status, code) in cases {
+            for (i, (handle, pw, status, code)) in cases.into_iter().enumerate() {
+                // Past 5 attempts the per-user limit would answer instead.
+                let cookie = if i < 5 {
+                    cookie.clone()
+                } else {
+                    user(&s, &db).await.1
+                };
                 let res = connect(&s, &cookie, &handle, pw).await;
                 assert_eq!(res.status_code(), status, "{code}");
                 res.assert_json(&json!({"error": code}));
@@ -2416,11 +2433,54 @@ mod teams {
             let (_, cookie, _) = user(&s, &db).await;
             for _ in 0..5 {
                 let res = connect(&s, &cookie, &new_handle(), "wrong").await;
-                assert_eq!(res.status_code(), 401);
+                assert_eq!(res.status_code(), 422);
             }
             let res = connect(&s, &cookie, &new_handle(), APP_PASSWORD).await;
             assert_eq!(res.status_code(), 429);
             res.assert_json(&json!({"error": "rate_limited"}));
+        }
+
+        async fn hits(db: &DatabaseConnection, bucket: &str) -> i64 {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            let sql = "SELECT count(*) AS n FROM rate_limit_hits WHERE bucket = $1";
+            let stmt = Statement::from_sql_and_values(DbBackend::Postgres, sql, [bucket.into()]);
+            let row = db.query_one_raw(stmt).await.unwrap().unwrap();
+            row.try_get("", "n").unwrap()
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn the_daily_handle_cap_is_per_team_and_outages_are_refunded() {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            let (s, db) = server_on_mock(false).await;
+            let (_, cookie, user_id) = user(&s, &db).await;
+            let team_id = current(&s, &cookie).await["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let handle = new_handle();
+            let bucket = format!("bluesky:handle:{team_id}:{handle}");
+            for _ in 0..10 {
+                let sql = "INSERT INTO rate_limit_hits (bucket) VALUES ($1)";
+                let stmt = Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    sql,
+                    [bucket.clone().into()],
+                );
+                db.execute_raw(stmt).await.unwrap();
+            }
+            let res = connect(&s, &cookie, &handle, APP_PASSWORD).await;
+            assert_eq!(res.status_code(), 429);
+            let (_, other, _) = user(&s, &db).await;
+            let res = connect(&s, &other, &handle, APP_PASSWORD).await;
+            assert_eq!(res.status_code(), 201, "another team is not blocked");
+
+            let res = connect(&s, &cookie, "down.test", APP_PASSWORD).await;
+            assert_eq!(res.status_code(), 502);
+            res.assert_json(&json!({"error": "bluesky_unreachable"}));
+            assert_eq!(hits(&db, &format!("bluesky:user:{user_id}")).await, 0);
+            let bucket = format!("bluesky:handle:{team_id}:down.test");
+            assert_eq!(hits(&db, &bucket).await, 0);
         }
 
         #[tokio::test]
