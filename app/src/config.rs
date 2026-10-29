@@ -6,7 +6,10 @@ use webauthn_rs::{prelude::Url, Webauthn, WebauthnBuilder};
 
 use socialreins_core::crypto::Cipher;
 
-use crate::{connectors::bluesky::Bluesky, mail::Mailer};
+use crate::{
+    connectors::{bluesky::Bluesky, google::Google},
+    mail::Mailer,
+};
 
 /// Public Bluesky AppView (handle resolution, profiles) and the `did:plc` directory.
 const BLUESKY_APPVIEW: &str = "https://public.api.bsky.app";
@@ -56,6 +59,9 @@ pub struct Config {
     /// Every provider and whether it can be connected: Bluesky always, the others once their
     /// app id and secret are set (`PROVIDER_APPS`).
     pub providers: Vec<(&'static str, bool)>,
+    /// `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` (both or neither): Google sign-in, with
+    /// the redirect URI `{BRAIN_URL}/auth/google/callback`.
+    pub google: Option<Google>,
 }
 
 impl Config {
@@ -91,6 +97,13 @@ impl Config {
         let rp_origin = var("PASSKEY_RP_ORIGIN").unwrap_or_else(|| origin(&web_url).into());
         let webauthn = webauthn(var("PASSKEY_RP_ID"), &rp_origin)?;
         let cipher = cipher(var("ENCRYPTION_KEY"))?;
+        let google = match (var("GOOGLE_CLIENT_ID"), var("GOOGLE_CLIENT_SECRET")) {
+            (Some(id), Some(secret)) => Some(Google::new(&id, &secret)?),
+            (None, None) => None,
+            _ => {
+                return Err("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET: set both or neither".into())
+            }
+        };
         let mut providers = vec![("bluesky", true)];
         providers.extend(
             PROVIDER_APPS.map(|(name, vars)| (name, vars.iter().all(|v| var(v).is_some()))),
@@ -112,6 +125,7 @@ impl Config {
             cipher: Arc::new(cipher),
             bluesky: Bluesky::new(BLUESKY_APPVIEW, PLC_DIRECTORY)?,
             providers,
+            google,
         })
     }
 }

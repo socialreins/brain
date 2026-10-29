@@ -2,9 +2,9 @@
 //! (waitlist, teams, connections, social sets, posts).
 pub mod auth;
 pub mod connections;
+pub mod google;
 pub mod health;
 pub mod passkeys;
-pub mod password;
 pub mod posts;
 pub mod social_sets;
 pub mod teams;
@@ -83,7 +83,7 @@ pub fn router(state: AppState, config: &Config) -> Router {
         .merge(health::routes())
         .merge(
             auth::routes()
-                .merge(password::routes())
+                .merge(google::routes())
                 .layer(DefaultBodyLimit::max(MAX_BODY_BYTES)),
         )
         .merge(passkeys::routes().layer(DefaultBodyLimit::max(MAX_PASSKEY_BODY_BYTES)))

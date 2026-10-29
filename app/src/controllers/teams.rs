@@ -28,7 +28,6 @@ use uuid::Uuid;
 
 use super::{
     auth::{internal, Body, CurrentUser, FromWeb},
-    password::reauthenticated,
     waitlist::{error, Error, Reply},
 };
 use crate::{
@@ -108,12 +107,6 @@ pub struct NewInvitation {
     pub email: String,
     /// `admin` or `member`.
     pub role: String,
-}
-
-#[derive(Deserialize, ToSchema)]
-pub struct DeleteTeam {
-    /// The account password; not needed within 10 minutes of signing in.
-    pub password: Option<String>,
 }
 
 fn reply(status: StatusCode, code: &str) -> Response {
@@ -442,23 +435,17 @@ async fn rename(
 }
 
 /// Deletes the current team with its members, invitations and sets. Owner only, with a sign-in
-/// from the last 10 minutes or the account password. The caller's last team cannot go.
-#[utoipa::path(delete, path = "/team", tag = "teams", request_body = DeleteTeam,
+/// from the last 10 minutes (else `403 reauth_required`). The caller's last team cannot go.
+/// Any body is ignored.
+#[utoipa::path(delete, path = "/team", tag = "teams",
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
-        (status = 409, body = Error), (status = 429, body = Error)))]
-async fn destroy(
-    _: FromWeb,
-    State(app): State<AppState>,
-    t: InTeam,
-    Body(body): Body<DeleteTeam>,
-) -> Response {
+        (status = 409, body = Error)))]
+async fn destroy(_: FromWeb, State(app): State<AppState>, t: InTeam) -> Response {
     if t.role != Role::Owner {
         return forbidden();
     }
-    match reauthenticated(&app, &t.current, body.password).await {
-        Some(true) => {}
-        Some(false) => return reply(StatusCode::FORBIDDEN, "reauth_required"),
-        None => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+    if !t.current.recent() {
+        return reply(StatusCode::FORBIDDEN, "reauth_required");
     }
     let user_id = t.current.0.id;
     let deleted = async {
@@ -606,8 +593,9 @@ fn change_reply(change: Result<Change, DbErr>) -> Response {
     }
 }
 
-/// Changes a member's role. Owners and admins; only an owner grants or takes away `owner`, and
-/// the last owner cannot be demoted.
+/// Changes a member's role. Owners and admins, with a sign-in from the last 10 minutes (else
+/// `403 reauth_required`); only an owner grants or takes away `owner`, and the last owner
+/// cannot be demoted.
 #[utoipa::path(patch, path = "/team/members/{user_id}", tag = "teams", request_body = RoleChange,
     params(("user_id" = Uuid, Path)),
     responses((status = 200, body = Member), (status = 401, body = Error),
@@ -623,11 +611,16 @@ async fn set_role(
     let Some(role) = Role::parse(&body.role) else {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_role");
     };
+    // A stolen old cookie must not hand out or take away rights.
+    if t.role.manages() && !t.current.recent() {
+        return reply(StatusCode::FORBIDDEN, "reauth_required");
+    }
     change_reply(change_member(&app.db, t.team.id, t.current.0.id, user_id, Some(role)).await)
 }
 
 /// Removes a member, or leaves the team when `user_id` is the caller. Removing someone else
-/// needs owner or admin (only an owner removes an owner); the last owner cannot go.
+/// needs owner or admin (only an owner removes an owner) and a sign-in from the last 10
+/// minutes; the last owner cannot go.
 #[utoipa::path(delete, path = "/team/members/{user_id}", tag = "teams",
     params(("user_id" = Uuid, Path)),
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
@@ -638,12 +631,16 @@ async fn remove(
     t: InTeam,
     Path(user_id): Path<Uuid>,
 ) -> Response {
+    // Leaving needs no fresh sign-in; removing someone else does.
+    if user_id != t.current.0.id && t.role.manages() && !t.current.recent() {
+        return reply(StatusCode::FORBIDDEN, "reauth_required");
+    }
     change_reply(change_member(&app.db, t.team.id, t.current.0.id, user_id, None).await)
 }
 
 /// Invites an email to the current team as `admin` or `member` and emails a link to
 /// `{WEB_URL}/invitations/{token}`, valid 7 days, replacing a pending invitation of the same
-/// email. Owners and admins. At most 10 a minute and 50 a day per inviter, 50 a day per team,
+/// email. Owners and admins; inviting an admin needs a sign-in from the last 10 minutes. At most 10 a minute and 50 a day per inviter, 50 a day per team,
 /// 3 a day per email in one team and 20 a day per email overall.
 #[utoipa::path(post, path = "/team/invitations", tag = "teams", request_body = NewInvitation,
     responses((status = 201, body = Invitation), (status = 401, body = Error),
@@ -669,6 +666,9 @@ async fn invite(
         Some(r @ (Role::Admin | Role::Member)) => r,
         _ => return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_role"),
     };
+    if role == Role::Admin && !t.current.recent() {
+        return reply(StatusCode::FORBIDDEN, "reauth_required");
+    }
     let member = team_user::Entity::find()
         .filter(team_user::Column::TeamId.eq(t.team.id))
         .inner_join(users::Entity)

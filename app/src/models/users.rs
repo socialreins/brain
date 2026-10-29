@@ -13,9 +13,9 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable, unique)]
     pub username: Option<String>,
     pub current_team_id: Option<Uuid>,
-    /// Argon2id PHC string, `None` until the user sets a password.
-    #[sea_orm(column_type = "Text", nullable)]
-    pub password_hash: Option<String>,
+    /// The Google account (`sub`) linked by Google sign-in.
+    #[sea_orm(column_type = "Text", nullable, unique)]
+    pub google_sub: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }
