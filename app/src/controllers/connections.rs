@@ -225,23 +225,39 @@ async fn connect_bluesky(
     if body.app_password.is_empty() || body.app_password.len() > 256 {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_credentials");
     }
-    // No credentials leave brain until the handle and its DID point at each other.
-    let id = match app.bluesky.resolve(&handle).await {
-        Ok(id) => id,
-        Err(e) => return bluesky_error(e),
-    };
-    // Caps key on the DID: one account can have many handles, and a handle can move.
-    let did = id.did.clone();
-    let caps = [
-        (format!("bluesky:user:{user_id}"), BLUESKY_PER_USER),
-        // Per team, so strangers failing on an account cannot lock its owner's team out.
-        (format!("bluesky:did:{}:{did}", t.team.id), BLUESKY_PER_DID),
-    ];
-    let reserved = match daily_reserve(&app.db, &caps).await {
+    // Counted before resolving, so lookups of handles that do not resolve use it up too.
+    let user_cap = [(format!("bluesky:user:{user_id}"), BLUESKY_PER_USER)];
+    let mut reserved = match daily_reserve(&app.db, &user_cap).await {
         Ok(Some(ids)) => ids,
         Ok(None) => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
         Err(e) => return internal(e, "bluesky cap"),
     };
+    // No credentials leave brain until the handle and its DID point at each other.
+    let id = match app.bluesky.resolve(&handle).await {
+        Ok(id) => id,
+        Err(e) => {
+            // An outage is not the caller's attempt.
+            if e == BlueskyError::Unreachable {
+                daily_refund(&app.db, &reserved).await;
+            }
+            return bluesky_error(e);
+        }
+    };
+    // Caps key on the DID: one account can have many handles, and a handle can move.
+    let did = id.did.clone();
+    // Per team, so strangers failing on an account cannot lock its owner's team out.
+    let did_cap = [(format!("bluesky:did:{}:{did}", t.team.id), BLUESKY_PER_DID)];
+    match daily_reserve(&app.db, &did_cap).await {
+        Ok(Some(ids)) => reserved.extend(ids),
+        Ok(None) => {
+            daily_refund(&app.db, &reserved).await;
+            return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+        }
+        Err(e) => {
+            daily_refund(&app.db, &reserved).await;
+            return internal(e, "bluesky cap");
+        }
+    }
     let held = social_accounts::Entity::find()
         .filter(social_accounts::Column::TeamId.eq(t.team.id))
         .filter(social_accounts::Column::Provider.eq("bluesky"))
