@@ -57,6 +57,9 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET, POST | `/v1/social-sets` | The current team's live sets with `account_ids`, Default first (`?deleted=true`: deleted ones still restorable); create one (`{"name"}`, owner, admin) |
 | PATCH, DELETE | `/v1/social-sets/{id}` | Rename (`{"name"}`, the Default set too); delete (`{}` or `{"password"}`, not the Default set), restorable for 30 days. Owner, admin |
 | POST | `/v1/social-sets/{id}/restore` | Restore a set deleted in the last 30 days, with its accounts (owner, admin) |
+| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&from=&to=` on `scheduled_at`), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"scheduled_at"}`; any member) |
+| GET, PUT, DELETE | `/v1/posts/{id}` | One post with its `targets`; replace a `draft` or `scheduled` one; delete (`204` for draft or scheduled, `200` after taking a published one down, `422 takedown_failed` with a `message`, `409` for queued or failed) |
+| POST | `/v1/posts/{id}/publish` | Publish a draft or scheduled post now: `202` with the post `queued`; poll it for the result |
 
 `POST /v1/waitlist` answers `200 {"status":"ok"}` for a new email and for one already on the
 list, so it never reveals who signed up. A bad email gets `422 {"error":"invalid_email"}`. Each
@@ -109,6 +112,16 @@ team's live sets in any case (`409 name_taken`); a team holds at most 50 live se
 (`409 default_set`). Deleting a set needs a sign-in from the last 10 minutes or the password;
 it keeps its account links, hidden, so a restore within 30 days brings them back. An hourly
 job in brain hard-deletes sets deleted over 30 days ago, one instance at a time (advisory lock).
+
+Posts go to every account of their platform in their social set; only Bluesky publishes
+today (300 graphemes, 4 images of at most 1 MB from public https URLs, links become facets).
+Saving with `scheduled_at` makes a post `scheduled`, else `draft`; only those two can change.
+A tick every minute claims due posts (one instance at a time, advisory lock), creates one
+target per account and claims each target once, so nothing posts twice; a publish is never
+retried. A target cut off mid-publish for 15 minutes fails as "unknown, check the account".
+Posts of a deleted set are hidden and held back until it is restored. Errors never carry URLs
+or tokens. A team keeps at most 2000 posts that are not deleted; publish now and take-down are
+10 a minute per user.
 
 Connections are the current team's social accounts. Members list them; owners and admins connect,
 regroup and disconnect them. Tokens are sealed with `ENCRYPTION_KEY` and never returned. Every

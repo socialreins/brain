@@ -86,25 +86,36 @@ fn send_failed(e: reqwest::Error, what: &str) -> Error {
         }
         cause = c.source();
     }
-    unreachable(e, what)
+    unreachable(e.without_url(), what)
 }
 
-/// The JSON body, read up to `MAX_BODY` bytes.
-async fn json_body<T: DeserializeOwned>(
-    mut res: reqwest::Response,
-    what: &str,
-) -> Result<T, Error> {
-    let too_large = || unreachable("body over 64 KiB", what);
-    if res.content_length().is_some_and(|n| n > MAX_BODY as u64) {
-        return Err(too_large());
+enum Read {
+    TooLarge,
+    Failed(reqwest::Error),
+}
+
+/// The body, at most `cap` bytes (checked against `Content-Length`, then while reading).
+async fn read_capped(mut res: reqwest::Response, cap: usize) -> Result<Vec<u8>, Read> {
+    if res.content_length().is_some_and(|n| n > cap as u64) {
+        return Err(Read::TooLarge);
     }
     let mut buf = Vec::new();
-    while let Some(chunk) = res.chunk().await.map_err(|e| unreachable(e, what))? {
-        if buf.len() + chunk.len() > MAX_BODY {
-            return Err(too_large());
+    while let Some(chunk) = res.chunk().await.map_err(Read::Failed)? {
+        if buf.len() + chunk.len() > cap {
+            return Err(Read::TooLarge);
         }
         buf.extend_from_slice(&chunk);
     }
+    Ok(buf)
+}
+
+/// The JSON body, read up to `MAX_BODY` bytes.
+async fn json_body<T: DeserializeOwned>(res: reqwest::Response, what: &str) -> Result<T, Error> {
+    let buf = match read_capped(res, MAX_BODY).await {
+        Ok(buf) => buf,
+        Err(Read::TooLarge) => return Err(unreachable("body over 64 KiB", what)),
+        Err(Read::Failed(e)) => return Err(unreachable(e.without_url(), what)),
+    };
     serde_json::from_slice(&buf).map_err(|e| unreachable(e, what))
 }
 
@@ -183,7 +194,10 @@ impl Bluesky {
         handle: &str,
         app_password: &str,
     ) -> Result<Account, Error> {
-        self.session(&id.pds, &id.did, app_password).await?;
+        let jwt = self.session(&id.pds, &id.did, app_password).await?;
+        if full_access(&jwt) {
+            return Err(Error::InvalidCredentials);
+        }
         let profile = self.profile(&id.did).await;
         Ok(Account {
             // The handle confirmed both ways in `resolve`; the PDS's own claim is not trusted.
@@ -281,7 +295,8 @@ impl Bluesky {
         }
     }
 
-    async fn session(&self, pds: &str, did: &str, password: &str) -> Result<(), Error> {
+    /// Opens a session on `pds` and returns its access token.
+    async fn session(&self, pds: &str, did: &str, password: &str) -> Result<String, Error> {
         let url = format!("{pds}/xrpc/com.atproto.server.createSession");
         let body = serde_json::json!({"identifier": did, "password": password});
         let res = self
@@ -306,10 +321,7 @@ impl Bluesky {
         if session.did != did {
             return Err(Error::InvalidCredentials);
         }
-        if full_access(&session.access_jwt) {
-            return Err(Error::InvalidCredentials);
-        }
-        Ok(())
+        Ok(session.access_jwt)
     }
 
     /// Display name and avatar from the public AppView; `None` when it has none to give, which
@@ -328,6 +340,249 @@ impl Bluesky {
                 None
             }
         }
+    }
+}
+
+/// Bluesky's limit for one image blob.
+pub const MAX_IMAGE_BYTES: usize = 1_000_000;
+const IMAGE_TYPES: [&str; 4] = ["image/jpeg", "image/png", "image/webp", "image/gif"];
+const POST_COLLECTION: &str = "app.bsky.feed.post";
+
+/// Why a publish or takedown did not happen. Messages are safe to store and show: they never
+/// hold a URL, token or secret.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PostError {
+    /// The app password was refused: the account must be connected again.
+    Reconnect,
+    Failed(String),
+}
+
+fn failed(msg: impl Into<String>) -> PostError {
+    PostError::Failed(msg.into())
+}
+
+/// An XRPC error name (`InvalidRequest`), kept only when it is a plain word, else the status.
+fn xrpc_code(body: &Value, status: StatusCode) -> String {
+    match body["error"].as_str() {
+        Some(e)
+            if !e.is_empty() && e.len() <= 40 && e.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            e.to_owned()
+        }
+        _ => format!("HTTP {}", status.as_u16()),
+    }
+}
+
+/// `https://bsky.app/profile/{did}/post/{rkey}` for a post's `at://` URI.
+pub fn post_url(uri: &str) -> Option<String> {
+    let (did, rkey) = post_key(uri)?;
+    Some(format!("https://bsky.app/profile/{did}/post/{rkey}"))
+}
+
+/// The repo DID and record key of `at://{did}/app.bsky.feed.post/{rkey}`.
+fn post_key(uri: &str) -> Option<(&str, &str)> {
+    let rest = uri.strip_prefix("at://")?;
+    let mut parts = rest.split('/');
+    let (did, collection, rkey) = (parts.next()?, parts.next()?, parts.next()?);
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '-' | '_' | '~'))
+    };
+    (parts.next().is_none() && collection == POST_COLLECTION && plain(did) && plain(rkey))
+        .then_some((did, rkey))
+}
+
+impl Bluesky {
+    /// A session on the account's PDS (`meta.pds`, checked again) with its app password.
+    async fn login(
+        &self,
+        pds: &str,
+        did: &str,
+        password: &str,
+    ) -> Result<(String, String), PostError> {
+        let pds = self
+            .checked_pds(pds)
+            .map_err(|_| failed("The account's Bluesky server is not supported."))?;
+        match self.session(&pds, did, password).await {
+            Ok(jwt) => Ok((pds, jwt)),
+            Err(Error::InvalidCredentials) => Err(PostError::Reconnect),
+            Err(Error::RateLimited) => Err(failed("Bluesky is rate limiting this account.")),
+            Err(Error::UnsupportedPds) => {
+                Err(failed("The account's Bluesky server is not supported."))
+            }
+            Err(_) => Err(failed("Bluesky could not be reached.")),
+        }
+    }
+
+    /// POSTs an XRPC call with the session token and returns the JSON answer.
+    async fn call(
+        &self,
+        pds: &str,
+        jwt: &str,
+        method: &str,
+        body: reqwest::Body,
+        content_type: &str,
+    ) -> Result<Value, PostError> {
+        let res = self
+            .client
+            .post(format!("{pds}/xrpc/{method}"))
+            .bearer_auth(jwt)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e.without_url(), method, "bluesky call failed");
+                failed("Bluesky could not be reached.")
+            })?;
+        let status = res.status();
+        let answer: Value = json_body(res, method).await.unwrap_or_default();
+        match status {
+            StatusCode::OK => Ok(answer),
+            StatusCode::UNAUTHORIZED => Err(PostError::Reconnect),
+            StatusCode::TOO_MANY_REQUESTS => Err(failed("Bluesky is rate limiting this account.")),
+            s => Err(failed(format!(
+                "Bluesky refused it ({}).",
+                xrpc_code(&answer, s)
+            ))),
+        }
+    }
+
+    async fn call_json(
+        &self,
+        pds: &str,
+        jwt: &str,
+        method: &str,
+        body: &Value,
+    ) -> Result<Value, PostError> {
+        let bytes = serde_json::to_vec(body).unwrap_or_default();
+        self.call(pds, jwt, method, bytes.into(), "application/json")
+            .await
+    }
+
+    /// Downloads image `n` (1-based, for messages) of a post: https only, a public address,
+    /// an image type Bluesky takes, at most 1 MB.
+    async fn image(&self, n: usize, url: &str) -> Result<(Vec<u8>, String), PostError> {
+        let bad = || failed(format!("Image {n} is not a public https URL."));
+        let parsed = Url::parse(url).map_err(|_| bad())?;
+        let host = parsed.host_str().unwrap_or_default();
+        let named = !host.is_empty() && host.trim_matches(['[', ']']).parse::<IpAddr>().is_err();
+        let secure = parsed.scheme() == "https" && named;
+        if !parsed.username().is_empty() || !(secure || self.allow_insecure_pds) {
+            return Err(bad());
+        }
+        let res = self.client.get(parsed).send().await.map_err(|e| {
+            tracing::warn!(error = %e.without_url(), n, "image download failed");
+            failed(format!("Image {n} could not be downloaded."))
+        })?;
+        if res.status() != StatusCode::OK {
+            return Err(failed(format!(
+                "Image {n} could not be downloaded (HTTP {}).",
+                res.status().as_u16()
+            )));
+        }
+        let mime = res
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| {
+                v.split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase()
+            })
+            .unwrap_or_default();
+        if !IMAGE_TYPES.contains(&mime.as_str()) {
+            return Err(failed(format!(
+                "Image {n} is not a JPEG, PNG, WebP or GIF."
+            )));
+        }
+        match read_capped(res, MAX_IMAGE_BYTES).await {
+            Ok(bytes) => Ok((bytes, mime)),
+            Err(Read::TooLarge) => Err(failed(format!("Image {n} is over 1 MB, Bluesky's limit."))),
+            Err(Read::Failed(e)) => {
+                tracing::warn!(error = %e.without_url(), n, "image download failed");
+                Err(failed(format!("Image {n} could not be downloaded.")))
+            }
+        }
+    }
+
+    /// Publishes a post with up to 4 images; returns its `at://` URI.
+    pub async fn publish_post(
+        &self,
+        pds: &str,
+        did: &str,
+        password: &str,
+        text: &str,
+        media: &[String],
+    ) -> Result<String, PostError> {
+        let (pds, jwt) = self.login(pds, did, password).await?;
+        let mut images = Vec::new();
+        for (i, url) in media.iter().enumerate() {
+            let (bytes, mime) = self.image(i + 1, url).await?;
+            let up = self
+                .call(
+                    &pds,
+                    &jwt,
+                    "com.atproto.repo.uploadBlob",
+                    bytes.into(),
+                    &mime,
+                )
+                .await?;
+            if !up["blob"].is_object() {
+                return Err(failed("Bluesky did not take an image."));
+            }
+            images.push(serde_json::json!({ "alt": "", "image": up["blob"] }));
+        }
+        let facets: Vec<Value> = socialreins_core::post::links(text)
+            .into_iter()
+            .map(|l| {
+                serde_json::json!({
+                    "index": { "byteStart": l.start, "byteEnd": l.end },
+                    "features": [{ "$type": "app.bsky.richtext.facet#link", "uri": l.url }],
+                })
+            })
+            .collect();
+        let created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let mut record = serde_json::json!({
+            "$type": POST_COLLECTION, "text": text, "createdAt": created,
+        });
+        if !facets.is_empty() {
+            record["facets"] = facets.into();
+        }
+        if !images.is_empty() {
+            record["embed"] =
+                serde_json::json!({ "$type": "app.bsky.embed.images", "images": images });
+        }
+        let body =
+            serde_json::json!({ "repo": did, "collection": POST_COLLECTION, "record": record });
+        let made = self
+            .call_json(&pds, &jwt, "com.atproto.repo.createRecord", &body)
+            .await?;
+        match made["uri"].as_str() {
+            Some(uri) if post_key(uri).is_some() => Ok(uri.to_owned()),
+            _ => Err(failed("Bluesky did not return the post's id.")),
+        }
+    }
+
+    /// Deletes the post at `uri` from the account's repo.
+    pub async fn delete_post(
+        &self,
+        pds: &str,
+        did: &str,
+        password: &str,
+        uri: &str,
+    ) -> Result<(), PostError> {
+        let Some((repo, rkey)) = post_key(uri).filter(|(repo, _)| *repo == did) else {
+            return Err(failed("This post does not belong to the account."));
+        };
+        let (pds, jwt) = self.login(pds, did, password).await?;
+        let body = serde_json::json!({ "repo": repo, "collection": POST_COLLECTION, "rkey": rkey });
+        self.call_json(&pds, &jwt, "com.atproto.repo.deleteRecord", &body)
+            .await
+            .map(|_| ())
     }
 }
 
@@ -439,6 +694,36 @@ fn full_access(jwt: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn post_urls_come_from_at_uris() {
+        let uri = "at://did:plc:abc123/app.bsky.feed.post/3kxyz";
+        assert_eq!(
+            post_url(uri).as_deref(),
+            Some("https://bsky.app/profile/did:plc:abc123/post/3kxyz")
+        );
+        for bad in [
+            "at://did:plc:abc/app.bsky.feed.like/3k",
+            "at://did:plc:abc/app.bsky.feed.post/",
+            "at://did:plc:abc/app.bsky.feed.post/3k/x",
+            "https://bsky.app/x",
+            "at://did:plc:a b/app.bsky.feed.post/3k",
+        ] {
+            assert_eq!(post_url(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn xrpc_codes_are_scrubbed() {
+        let s = StatusCode::BAD_REQUEST;
+        assert_eq!(
+            xrpc_code(&serde_json::json!({"error": "InvalidRequest"}), s),
+            "InvalidRequest"
+        );
+        let leaky = serde_json::json!({"error": "see https://x.io?token=abc"});
+        assert_eq!(xrpc_code(&leaky, s), "HTTP 400");
+        assert_eq!(xrpc_code(&Value::Null, s), "HTTP 400");
+    }
 
     #[test]
     fn handles_are_normalized_domains() {

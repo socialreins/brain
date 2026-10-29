@@ -1,10 +1,11 @@
 //! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, and the documented `/v1` API
-//! (waitlist, teams, connections, social sets).
+//! (waitlist, teams, connections, social sets, posts).
 pub mod auth;
 pub mod connections;
 pub mod health;
 pub mod passkeys;
 pub mod password;
+pub mod posts;
 pub mod social_sets;
 pub mod teams;
 pub mod waitlist;
@@ -47,6 +48,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(teams::api())
         .merge(connections::api())
         .merge(social_sets::api())
+        .merge(posts::api())
 }
 
 /// The request span. Logs the path only (no query), with the token in `/auth/magic/{token}` and

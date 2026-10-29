@@ -31,6 +31,8 @@ pub struct AppState {
     /// Per-user burst limit on `POST /v1/connections/bluesky`, each of which tries a password
     /// on a Bluesky server. Per IP it shares `login_limiter`; daily caps live in Postgres.
     pub connect_limiter: Arc<RateLimiter<uuid::Uuid>>,
+    /// Per-user limit on publish-now and take-down calls, each of which calls a platform.
+    pub post_limiter: Arc<RateLimiter<uuid::Uuid>>,
     pub brain_url: String,
     pub web_url: String,
     /// `CORS_ORIGINS`: the web app's origins, the only ones that may call its state-changing
@@ -58,6 +60,7 @@ impl AppState {
             account_limiter: Arc::new(RateLimiter::per_minute(5)),
             invitation_limiter: Arc::new(RateLimiter::per_minute(10)),
             connect_limiter: Arc::new(RateLimiter::per_minute(5)),
+            post_limiter: Arc::new(RateLimiter::per_minute(10)),
             brain_url: config.brain_url.clone(),
             web_url: config.web_url.clone(),
             web_origins: config.cors_origins.clone(),

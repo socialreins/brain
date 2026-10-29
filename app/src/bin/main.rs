@@ -19,8 +19,9 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let db = connect(&config).await?;
-    scheduler::spawn(db.clone());
-    let app = controllers::router(AppState::new(db, &config), &config);
+    let state = AppState::new(db, &config);
+    scheduler::spawn(state.clone());
+    let app = controllers::router(state, &config);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port)).await?;
     let ip_source = if config.trust_proxy {
         "x-forwarded-for, then socket"
