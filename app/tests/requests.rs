@@ -2516,6 +2516,33 @@ mod teams {
 
         #[tokio::test]
         #[serial]
+        async fn handles_that_do_not_resolve_count_against_the_user_cap() {
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            let (s, db) = server_on_mock(false).await;
+            let (_, cookie, user_id) = user(&s, &db).await;
+            let bucket = format!("bluesky:user:{user_id}");
+            // 29 of the 30 a day used; the burst limit allows only 5 a minute.
+            for _ in 0..29 {
+                let sql = "INSERT INTO rate_limit_hits (bucket) VALUES ($1)";
+                let stmt = Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    sql,
+                    [bucket.clone().into()],
+                );
+                db.execute_raw(stmt).await.unwrap();
+            }
+            let res = connect(&s, &cookie, "nobody.test", APP_PASSWORD).await;
+            assert_eq!(res.status_code(), 422);
+            res.assert_json(&json!({"error": "invalid_handle"}));
+            assert_eq!(hits(&db, &bucket).await, 30);
+            let res = connect(&s, &cookie, "nobody.test", APP_PASSWORD).await;
+            assert_eq!(res.status_code(), 429);
+            res.assert_json(&json!({"error": "rate_limited"}));
+            assert_eq!(hits(&db, &bucket).await, 30);
+        }
+
+        #[tokio::test]
+        #[serial]
         async fn failures_on_one_account_are_capped_across_teams() {
             use sea_orm::{ConnectionTrait, DbBackend, Statement};
             let (s, db) = server_on_mock(false).await;
