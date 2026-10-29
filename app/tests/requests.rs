@@ -3685,6 +3685,55 @@ mod teams {
 
             #[tokio::test]
             #[serial]
+            async fn a_stuck_target_with_a_remote_id_is_published_and_can_come_down() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, account) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let account: uuid::Uuid = account.parse().unwrap();
+                let did = list(&s, &cookie).await[0]["external_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let post = queued_post(&db, &team_id, &set).await;
+                let id = uuid::Uuid::now_v7();
+                let uri = format!("at://{did}/app.bsky.feed.post/r3stuck");
+                let row = post_targets::ActiveModel {
+                    id: Set(id),
+                    post_id: Set(post),
+                    social_account_id: Set(Some(account)),
+                    status: Set("publishing".into()),
+                    remote_id: Set(Some(uri)),
+                    updated_at: Set((Utc::now() - Duration::minutes(20)).fixed_offset()),
+                    ..Default::default()
+                };
+                post_targets::Entity::insert(row)
+                    .exec_without_returning(&db)
+                    .await
+                    .unwrap();
+                publish::recover_stuck(&db).await.unwrap();
+                let t = post_targets::Entity::find_by_id(id)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(t.status, "published");
+                assert_eq!(
+                    t.remote_url.as_deref(),
+                    Some(format!("https://bsky.app/profile/{did}/post/r3stuck").as_str())
+                );
+                let p = posts::Entity::find_by_id(post)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(p.status, "published");
+                let res = req(&s, Method::DELETE, &format!("/v1/posts/{post}"), &cookie).await;
+                res.assert_status_ok();
+                assert_eq!(res.json::<Value>()["status"], "deleted");
+            }
+
+            #[tokio::test]
+            #[serial]
             async fn recovered_queued_posts_never_skip_the_quota() {
                 use sea_orm::{ConnectionTrait, DbBackend, Statement};
                 let (s, db, state) = on_mock().await;
@@ -3926,6 +3975,7 @@ mod teams {
                     .unwrap()
                     .unwrap();
                 assert_eq!(p.status, "scheduled");
+                assert!(!p.quota_reserved, "it reserves again when claimed next");
                 // An empty set fails the post with a message.
                 req(
                     &s,

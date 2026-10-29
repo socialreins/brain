@@ -3,6 +3,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 /// Bluesky: 300 graphemes, 4 images.
 pub const BLUESKY_MAX_GRAPHEMES: usize = 300;
+/// Bluesky also caps the text at 3000 UTF-8 bytes.
+pub const BLUESKY_MAX_BYTES: usize = 3000;
 pub const BLUESKY_MAX_IMAGES: usize = 4;
 const MAX_URL_LEN: usize = 2048;
 
@@ -48,7 +50,7 @@ pub fn validate(platform: &str, body: &str, media: &[String]) -> Result<(), Inva
     if body.trim().is_empty() && media.is_empty() {
         return Err(Invalid::Empty);
     }
-    if body.graphemes(true).count() > BLUESKY_MAX_GRAPHEMES {
+    if body.len() > BLUESKY_MAX_BYTES || body.graphemes(true).count() > BLUESKY_MAX_GRAPHEMES {
         return Err(Invalid::TooLong);
     }
     if media.len() > BLUESKY_MAX_IMAGES {
@@ -124,8 +126,18 @@ mod tests {
         assert_eq!(ok("hello", &[]), Ok(()));
         assert_eq!(ok("", &["https://a.example/i.png"]), Ok(()));
         assert_eq!(ok("  ", &[]), Err(Invalid::Empty));
-        // 300 family emoji are 300 graphemes but far more chars and bytes.
-        assert_eq!(ok(&"👨‍👩‍👧".repeat(300), &[]), Ok(()));
+        // Graphemes, not chars: 300 "e" plus a combining accent are 600 chars but 300 graphemes.
+        assert_eq!(ok(&"e\u{301}".repeat(300), &[]), Ok(()));
+        // And bytes: a family emoji is one grapheme of 18 bytes.
+        let family = "👨‍👩‍👧";
+        assert_eq!(family.len(), 18);
+        assert_eq!(ok(&family.repeat(166), &[]), Ok(()), "2988 bytes");
+        assert_eq!(
+            ok(&family.repeat(167), &[]),
+            Err(Invalid::TooLong),
+            "3006 bytes"
+        );
+        assert_eq!(ok(&family.repeat(300), &[]), Err(Invalid::TooLong));
         assert_eq!(ok(&"a".repeat(301), &[]), Err(Invalid::TooLong));
         let five = ["https://a.example/1.png"; 5];
         assert_eq!(ok("x", &five), Err(Invalid::TooManyImages));

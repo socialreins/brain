@@ -225,10 +225,12 @@ pub async fn reserve_and(
     Ok(Quota::Reserved)
 }
 
-/// Puts a claimed post back to `scheduled`, with `error` saying why.
+/// Puts a claimed post back to `scheduled`, with `error` saying why. It reserves again when it
+/// is next claimed.
 async fn unclaim(db: &DatabaseConnection, id: Uuid, error: Option<&str>) -> Result<(), DbErr> {
     let stmt = sql(
-        "UPDATE posts SET status = 'scheduled', error = COALESCE($2, error), updated_at = now() \
+        "UPDATE posts SET status = 'scheduled', error = COALESCE($2, error), \
+         quota_reserved = false, updated_at = now() \
          WHERE id = $1 AND status = 'queued'",
         vec![id.into(), error.map(str::to_owned).into()],
     );
@@ -237,13 +239,40 @@ async fn unclaim(db: &DatabaseConnection, id: Uuid, error: Option<&str>) -> Resu
 
 /// Targets cut off mid-publish become `failed` and are never sent again; their posts settle.
 pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
+    // Cut off after the platform took it (the remote id is saved first): it is live, so it is
+    // published, and stays takeable down.
+    let stmt = sql(
+        "SELECT id, post_id, remote_id FROM post_targets \
+         WHERE status = 'publishing' AND remote_id IS NOT NULL \
+         AND updated_at < now() - make_interval(mins => $1)",
+        vec![(STUCK_MINUTES as i32).into()],
+    );
+    let mut posts = Vec::new();
+    for row in db.query_all_raw(stmt).await? {
+        let (id, post, remote): (Uuid, Uuid, String) = (
+            row.try_get("", "id")?,
+            row.try_get("", "post_id")?,
+            row.try_get("", "remote_id")?,
+        );
+        // shortcut: Bluesky is the only publisher; use the platform's `url` once there are more.
+        let url = bluesky::post_url(&remote);
+        let stmt = sql(
+            "UPDATE post_targets SET status = 'published', remote_url = $2, error = NULL, \
+             published_at = COALESCE(published_at, now()), updated_at = now() \
+             WHERE id = $1 AND status = 'publishing'",
+            vec![id.into(), url.into()],
+        );
+        db.execute_raw(stmt).await?;
+        posts.push(post);
+    }
     let stmt = sql(
         "UPDATE post_targets SET status = 'failed', error = $1, updated_at = now() \
-         WHERE status = 'publishing' AND updated_at < now() - make_interval(mins => $2) \
+         WHERE status = 'publishing' AND remote_id IS NULL \
+         AND updated_at < now() - make_interval(mins => $2) \
          RETURNING post_id",
         vec![STUCK.into(), (STUCK_MINUTES as i32).into()],
     );
-    let mut posts = ids(db, stmt, "post_id").await?;
+    posts.extend(ids(db, stmt, "post_id").await?);
     posts.sort();
     posts.dedup();
     for id in posts {
