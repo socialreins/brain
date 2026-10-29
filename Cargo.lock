@@ -2962,6 +2962,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "axum-test",
+ "base64 0.22.1",
  "chrono",
  "lettre",
  "migration",
@@ -2987,8 +2988,10 @@ name = "socialreins-core"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "base64 0.22.1",
  "getrandom 0.3.4",
  "hex",
+ "ring",
  "sha2 0.10.9",
 ]
 

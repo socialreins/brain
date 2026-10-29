@@ -2,6 +2,8 @@ pub mod magic_links;
 pub mod passkey_challenges;
 pub mod passkeys;
 pub mod sessions;
+pub mod social_account_social_set;
+pub mod social_accounts;
 pub mod social_sets;
 pub mod team_invitations;
 pub mod team_user;

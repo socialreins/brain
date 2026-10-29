@@ -49,6 +49,11 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | POST, GET | `/v1/team/invitations` | `{"email","role"}`: invite as `admin` or `member` (owner, admin); list pending |
 | DELETE | `/v1/team/invitations/{id}` | Withdraw an invitation (owner, admin) |
 | GET, POST | `/v1/invitations/{token}` | Public preview of an invitation; accept it as the signed-in invited email |
+| GET | `/v1/connections` | The current team's connected accounts with their `set_ids`; never tokens |
+| GET | `/v1/connections/providers` | Each provider with `configured`: Bluesky always, the others once their app id and secret are set |
+| POST | `/v1/connections/bluesky` | `{"handle","app_password"}` (owner, admin): checks it on the account's PDS, stores it encrypted, joins the Default set; `201`, or `200` when it replaces the password of an account the team already has |
+| PUT | `/v1/connections/{id}/sets` | `{"set_ids"}` (owner, admin): the sets of the current team holding the account; must include the Default set |
+| DELETE | `/v1/connections/{id}` | Disconnect an account (owner, admin), `204` |
 
 `POST /v1/waitlist` answers `200 {"status":"ok"}` for a new email and for one already on the
 list, so it never reveals who signed up. A bad email gets `422 {"error":"invalid_email"}`. Each
@@ -95,6 +100,20 @@ sent invitations count. Re-inviting a pending address replaces its invitation. E
 counted in Postgres (`rate_limit_hits`), so deletes and restarts do not reset them. Team names are 1 to 60 characters. An invitation dies with its inviter's right to
 invite: when they are removed, leave or drop below admin, theirs are deleted.
 
+Connections are the current team's social accounts. Members list them; owners and admins connect,
+regroup and disconnect them. Tokens are sealed with `ENCRYPTION_KEY` and never returned. Every
+account sits in the team's Default set, which `PUT /v1/connections/{id}/sets` cannot drop
+(`422 default_set_required`). Bluesky needs no app: brain resolves the handle to a DID
+(`public.api.bsky.app`), the DID to its PDS (`plc.directory` or the domain's `did.json`), then
+opens a session there with the app password, which is sent only to that PDS over https with
+redirects off. A wrong password and an account password get the same `invalid_credentials`. Errors:
+`invalid_handle`, `unsupported_pds`, `invalid_credentials` (all 422), `rate_limited`,
+`bluesky_unreachable` (502). Attempts count like sign-in: per IP, 5 a minute per user, and 30
+a day per user, 10 a day per account (DID) in one team, and 20 refused passwords a day per
+account across all teams, which a team already holding the account is exempt from. The DID
+document must list the handle (`alsoKnownAs`), or the answer is `invalid_handle`. Bluesky hosts must resolve to public addresses (`unsupported_pds`), and
+responses over 64 KiB are dropped.
+
 ## Local development
 
 You need Rust (stable) and Docker.
@@ -103,6 +122,7 @@ You need Rust (stable) and Docker.
 docker compose up -d postgres
 export DATABASE_URL=postgres://brain:brain@localhost:5432/socialreins_brain
 export MAIL_LOG=true                  # sign-in links go to the log
+export ENCRYPTION_KEY=$(openssl rand -base64 32)
 # or: cp .env.example .env and load it with your shell or direnv
 cargo run -p socialreins-brain        # http://localhost:8080
 cargo test --workspace                # uses the same DATABASE_URL
@@ -117,6 +137,7 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | Variable | Required | Default |
 |---|---|---|
 | `DATABASE_URL` | yes | |
+| `ENCRYPTION_KEY` | yes | Encrypts platform tokens and Bluesky app passwords at rest (AES-256-GCM). 32 bytes, base64: `openssl rand -base64 32`. brain refuses to start without a valid one. Keep it with your database backups: losing or changing it makes every connected account need reconnecting |
 | `PORT` | no | `8080` |
 | `CORS_ORIGINS` | no | The origin of `WEB_URL`. Comma-separated; hosted sets `https://socialreins.com,https://www.socialreins.com` |
 | `TRUST_PROXY` | no | `false`. Set `true` on Railway so the rate limit keys on the real client IP from `X-Forwarded-For`; leave it off anywhere a client could reach brain directly |
@@ -133,6 +154,12 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `RAILWAY_GIT_COMMIT_SHA` | no | Commit `/version` reports (Railway sets it) |
 | `GIT_COMMIT` | no | Used when `RAILWAY_GIT_COMMIT_SHA` is unset; baked into published images. Else `dev` |
 | `RUST_LOG` | no | `info` |
+| `META_APP_ID`, `META_APP_SECRET` | no | Offer Facebook and Instagram (connector not built yet) |
+| `THREADS_APP_ID`, `THREADS_APP_SECRET` | no | Offer Threads (connector not built yet) |
+| `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET` | no | Offer LinkedIn (connector not built yet) |
+| `X_CLIENT_ID`, `X_CLIENT_SECRET` | no | Offer X (connector not built yet) |
+| `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET` | no | Offer TikTok (connector not built yet) |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | no | Offer YouTube (connector not built yet) |
 
 ## Deploy
 

@@ -1,4 +1,5 @@
 pub mod config;
+pub mod connectors;
 pub mod controllers;
 pub mod mail;
 pub mod models;

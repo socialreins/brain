@@ -7,6 +7,7 @@ default-run = "socialreins-brain"
 
 [dependencies]
 axum = "0.8"
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "pool", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
 migration = { path = "migration" }
