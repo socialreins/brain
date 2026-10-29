@@ -4,6 +4,7 @@ pub mod controllers;
 pub mod mail;
 pub mod models;
 pub mod rate_limit;
+pub mod scheduler;
 pub mod state;
 
 use migration::{Migrator, MigratorTrait};

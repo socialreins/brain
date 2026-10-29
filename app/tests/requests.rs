@@ -2787,5 +2787,317 @@ mod teams {
                 assert!(doc["paths"][path][method].is_object(), "{path} {method}");
             }
         }
+
+        /// `/v1/social-sets`.
+        mod sets {
+            use super::*;
+            use socialreins_brain::models::sessions;
+            use socialreins_brain::scheduler;
+
+            async fn make(s: &TestServer, cookie: &str, name: &str) -> axum_test::TestResponse {
+                req(s, Method::POST, "/v1/social-sets", cookie)
+                    .json(&json!({ "name": name }))
+                    .await
+            }
+
+            async fn sets(s: &TestServer, cookie: &str, query: &str) -> Vec<Value> {
+                let res = s
+                    .get(&format!("/v1/social-sets{query}"))
+                    .add_header("cookie", cookie)
+                    .await;
+                res.assert_status_ok();
+                res.json()
+            }
+
+            fn id_of(res: &axum_test::TestResponse) -> String {
+                res.json::<Value>()["id"].as_str().unwrap().to_owned()
+            }
+
+            /// Makes the session older than the 10-minute fresh sign-in window.
+            async fn stale(db: &DatabaseConnection, cookie: &str) {
+                let row = sessions::ActiveModel {
+                    token_hash: Set(token::hash(cookie.trim_start_matches("sr_session="))),
+                    created_at: Set((Utc::now() - Duration::minutes(11)).fixed_offset()),
+                    ..Default::default()
+                };
+                sessions::Entity::update(row).exec(db).await.unwrap();
+            }
+
+            async fn deleted_days_ago(db: &DatabaseConnection, id: &str, days: i64) {
+                let row = social_sets::ActiveModel {
+                    id: Set(id.parse().unwrap()),
+                    deleted_at: Set(Some((Utc::now() - Duration::days(days)).fixed_offset())),
+                    ..Default::default()
+                };
+                social_sets::Entity::update(row).exec(db).await.unwrap();
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn create_list_and_rename() {
+                let (s, db) = server_where(|_| {}).await;
+                let (_, cookie, _) = user(&s, &db).await;
+                let res = make(&s, &cookie, "  Clients ").await;
+                assert_eq!(res.status_code(), 201);
+                let body = res.json::<Value>();
+                assert_eq!(body["name"], "Clients");
+                assert_eq!(body["is_default"], false);
+                assert_eq!(body["account_count"], 0);
+                let all = sets(&s, &cookie, "").await;
+                let names: Vec<&str> = all.iter().map(|s| s["name"].as_str().unwrap()).collect();
+                assert_eq!(names, ["Default", "Clients"], "Default first");
+
+                for (name, status, code) in [
+                    ("CLIENTS", 409, "name_taken"),
+                    ("default", 409, "name_taken"),
+                    ("   ", 422, "invalid_name"),
+                    (&"x".repeat(61)[..], 422, "invalid_name"),
+                ] {
+                    let res = make(&s, &cookie, name).await;
+                    assert_eq!(res.status_code(), status, "{name}");
+                    res.assert_json(&json!({ "error": code }));
+                }
+
+                let id = body["id"].as_str().unwrap();
+                let rename = |id: String, name: &'static str| {
+                    req(&s, Method::PATCH, &format!("/v1/social-sets/{id}"), &cookie)
+                        .json(&json!({ "name": name }))
+                };
+                let res = rename(id.into(), "Agency").await;
+                res.assert_status_ok();
+                assert_eq!(res.json::<Value>()["name"], "Agency");
+                assert_eq!(rename(id.into(), "DEFAULT").await.status_code(), 409);
+                // The Default set is pinned, not named: it can be renamed.
+                let default = all[0]["id"].as_str().unwrap().to_owned();
+                let res = rename(default, "Everything").await;
+                res.assert_status_ok();
+                assert_eq!(res.json::<Value>()["is_default"], true);
+                let res = rename(uuid::Uuid::now_v7().to_string(), "Nope").await;
+                assert_eq!(res.status_code(), 404);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_team_holds_at_most_50_live_sets() {
+                let (s, db) = server_where(|_| {}).await;
+                let (_, cookie, _) = user(&s, &db).await;
+                let mut last = String::new();
+                for i in 1..50 {
+                    let res = make(&s, &cookie, &format!("Set {i}")).await;
+                    assert_eq!(res.status_code(), 201);
+                    last = id_of(&res);
+                }
+                let res = make(&s, &cookie, "One too many").await;
+                assert_eq!(res.status_code(), 409);
+                res.assert_json(&json!({"error": "too_many_sets"}));
+                let path = format!("/v1/social-sets/{last}");
+                let res = req(&s, Method::DELETE, &path, &cookie)
+                    .json(&json!({}))
+                    .await;
+                assert_eq!(res.status_code(), 204);
+                assert_eq!(make(&s, &cookie, "Room again").await.status_code(), 201);
+                let res = req(&s, Method::POST, &format!("{path}/restore"), &cookie).await;
+                assert_eq!(res.status_code(), 409);
+                res.assert_json(&json!({"error": "too_many_sets"}));
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn delete_needs_a_fresh_sign_in_and_spares_the_default() {
+                let (s, db) = server_where(|_| {}).await;
+                let (_, cookie, _) = user(&s, &db).await;
+                let default = sets(&s, &cookie, "").await[0]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let res = req(
+                    &s,
+                    Method::DELETE,
+                    &format!("/v1/social-sets/{default}"),
+                    &cookie,
+                )
+                .json(&json!({}))
+                .await;
+                assert_eq!(res.status_code(), 409);
+                res.assert_json(&json!({"error": "default_set"}));
+
+                let id = id_of(&make(&s, &cookie, "Old").await);
+                let path = format!("/v1/social-sets/{id}");
+                stale(&db, &cookie).await;
+                let res = req(&s, Method::DELETE, &path, &cookie)
+                    .json(&json!({}))
+                    .await;
+                assert_eq!(res.status_code(), 403);
+                res.assert_json(&json!({"error": "reauth_required"}));
+                assert_eq!(sets(&s, &cookie, "").await.len(), 2, "still there");
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn delete_with_the_password_after_a_stale_sign_in() {
+                let (s, db) = server_where(|_| {}).await;
+                let (_, cookie, _) = user(&s, &db).await;
+                let res = req(&s, Method::PUT, "/auth/password", &cookie)
+                    .json(&json!({"password": "correct horse battery"}))
+                    .await;
+                assert_eq!(res.status_code(), 204);
+                let id = id_of(&make(&s, &cookie, "Old").await);
+                let path = format!("/v1/social-sets/{id}");
+                stale(&db, &cookie).await;
+                let wrong = req(&s, Method::DELETE, &path, &cookie)
+                    .json(&json!({"password": "nope nope nope"}))
+                    .await;
+                assert_eq!(wrong.status_code(), 403);
+                let res = req(&s, Method::DELETE, &path, &cookie)
+                    .json(&json!({"password": "correct horse battery"}))
+                    .await;
+                assert_eq!(res.status_code(), 204);
+                assert_eq!(sets(&s, &cookie, "").await.len(), 1);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn deleted_sets_keep_accounts_for_restore_then_get_purged() {
+                let (s, db) = server_on_mock(false).await;
+                let (cookie, team_id, account) = owner_with_account(&s, &db).await;
+                let default = default_set(&db, &team_id).await.to_string();
+                let id = id_of(&make(&s, &cookie, "Clients").await);
+                let put = |ids: Value| {
+                    req(
+                        &s,
+                        Method::PUT,
+                        &format!("/v1/connections/{account}/sets"),
+                        &cookie,
+                    )
+                    .json(&json!({ "set_ids": ids }))
+                };
+                put(json!([default, id])).await.assert_status_ok();
+                let path = format!("/v1/social-sets/{id}");
+                let res = req(&s, Method::DELETE, &path, &cookie)
+                    .json(&json!({}))
+                    .await;
+                assert_eq!(res.status_code(), 204);
+                assert_eq!(sets(&s, &cookie, "").await.len(), 1);
+                let trash = sets(&s, &cookie, "?deleted=true").await;
+                assert_eq!(trash.len(), 1);
+                assert_eq!(trash[0]["account_count"], 1);
+                assert!(trash[0]["deleted_at"].is_string());
+                assert_eq!(list(&s, &cookie).await[0]["set_ids"], json!([default]));
+                let res = put(json!([default, id])).await;
+                assert_eq!(res.status_code(), 422, "a deleted set cannot be chosen");
+                res.assert_json(&json!({"error": "invalid_sets"}));
+                put(json!([default])).await.assert_status_ok();
+                // A name freed by a delete can be taken; restoring then collides.
+                let twin = id_of(&make(&s, &cookie, "clients").await);
+                let restore = format!("{path}/restore");
+                let res = req(&s, Method::POST, &restore, &cookie).await;
+                assert_eq!(res.status_code(), 409);
+                res.assert_json(&json!({"error": "name_taken"}));
+                let twin_path = format!("/v1/social-sets/{twin}");
+                req(&s, Method::DELETE, &twin_path, &cookie)
+                    .json(&json!({}))
+                    .await;
+                let res = req(&s, Method::POST, &restore, &cookie).await;
+                res.assert_status_ok();
+                let body = res.json::<Value>();
+                assert_eq!(
+                    body["account_ids"],
+                    json!([account]),
+                    "links kept while deleted"
+                );
+                assert!(body["deleted_at"].is_null());
+                let mut want = vec![default.clone(), id.clone()];
+                want.sort();
+                assert_eq!(list(&s, &cookie).await[0]["set_ids"], json!(want));
+                let res = req(&s, Method::POST, &restore, &cookie).await;
+                assert_eq!(res.status_code(), 404, "a live set has nothing to restore");
+
+                // Past 30 days: no restore, and the purge removes it with its links.
+                req(&s, Method::DELETE, &path, &cookie)
+                    .json(&json!({}))
+                    .await;
+                deleted_days_ago(&db, &id, 31).await;
+                deleted_days_ago(&db, &twin, 29).await;
+                assert_eq!(
+                    req(&s, Method::POST, &restore, &cookie).await.status_code(),
+                    404
+                );
+                assert!(scheduler::purge_deleted_sets(&db).await.unwrap() >= 1);
+                let gone = social_sets::Entity::find_by_id(id.parse::<uuid::Uuid>().unwrap())
+                    .one(&db)
+                    .await
+                    .unwrap();
+                assert!(gone.is_none());
+                let links = social_account_social_set::Entity::find()
+                    .filter(
+                        social_account_social_set::Column::SocialSetId
+                            .eq(id.parse::<uuid::Uuid>().unwrap()),
+                    )
+                    .count(&db)
+                    .await
+                    .unwrap();
+                assert_eq!(links, 0);
+                let kept = social_sets::Entity::find_by_id(twin.parse::<uuid::Uuid>().unwrap())
+                    .one(&db)
+                    .await
+                    .unwrap();
+                assert!(kept.is_some(), "29 days old stays restorable");
+                assert_eq!(
+                    scheduler::purge_deleted_sets(&db).await.unwrap(),
+                    0,
+                    "idempotent"
+                );
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn members_read_and_strangers_get_404() {
+                let (s, db) = server_where(|_| {}).await;
+                let (_, owner, _) = user(&s, &db).await;
+                let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+                let id = id_of(&make(&s, &owner, "Clients").await);
+                let path = format!("/v1/social-sets/{id}");
+                let (member, _) = joined(&s, &db, &team_id, "member").await;
+                let (_, stranger, _) = user(&s, &db).await;
+                for (who, status, code) in
+                    [(&member, 403, "forbidden"), (&stranger, 404, "not_found")]
+                {
+                    let calls = [
+                        req(&s, Method::PATCH, &path, who)
+                            .json(&json!({"name": "X"}))
+                            .await,
+                        req(&s, Method::DELETE, &path, who).json(&json!({})).await,
+                        req(&s, Method::POST, &format!("{path}/restore"), who).await,
+                    ];
+                    for res in calls {
+                        assert_eq!(res.status_code(), status);
+                        res.assert_json(&json!({ "error": code }));
+                    }
+                }
+                let res = make(&s, &member, "Mine").await;
+                assert_eq!(res.status_code(), 403);
+                assert_eq!(sets(&s, &member, "").await.len(), 2);
+                assert_eq!(
+                    sets(&s, &stranger, "").await.len(),
+                    1,
+                    "only their own Default"
+                );
+                assert_eq!(
+                    make(&s, &stranger, "Clients").await.status_code(),
+                    201,
+                    "names are per team"
+                );
+                let doc = s.get("/openapi.json").await.json::<Value>();
+                for (p, m) in [
+                    ("/social-sets", "get"),
+                    ("/social-sets", "post"),
+                    ("/social-sets/{id}", "patch"),
+                    ("/social-sets/{id}", "delete"),
+                    ("/social-sets/{id}/restore", "post"),
+                ] {
+                    assert!(doc["paths"][p][m].is_object(), "{p} {m}");
+                }
+            }
+        }
     }
 }
