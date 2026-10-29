@@ -54,6 +54,9 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | POST | `/v1/connections/bluesky` | `{"handle","app_password"}` (owner, admin): checks it on the account's PDS, stores it encrypted, joins the Default set; `201`, or `200` when it replaces the password of an account the team already has |
 | PUT | `/v1/connections/{id}/sets` | `{"set_ids"}` (owner, admin): the sets of the current team holding the account; must include the Default set |
 | DELETE | `/v1/connections/{id}` | Disconnect an account (owner, admin), `204` |
+| GET, POST | `/v1/social-sets` | The current team's live sets with `account_ids`, Default first (`?deleted=true`: deleted ones still restorable); create one (`{"name"}`, owner, admin) |
+| PATCH, DELETE | `/v1/social-sets/{id}` | Rename (`{"name"}`, the Default set too); delete (`{}` or `{"password"}`, not the Default set), restorable for 30 days. Owner, admin |
+| POST | `/v1/social-sets/{id}/restore` | Restore a set deleted in the last 30 days, with its accounts (owner, admin) |
 
 `POST /v1/waitlist` answers `200 {"status":"ok"}` for a new email and for one already on the
 list, so it never reveals who signed up. A bad email gets `422 {"error":"invalid_email"}`. Each
@@ -99,6 +102,13 @@ team 50 a day, and one address gets at most 3 a day from one team and 20 a day o
 sent invitations count. Re-inviting a pending address replaces its invitation. Each user creates at most 10 teams a day. The daily caps are
 counted in Postgres (`rate_limit_hits`), so deletes and restarts do not reset them. Team names are 1 to 60 characters. An invitation dies with its inviter's right to
 invite: when they are removed, leave or drop below admin, theirs are deleted.
+
+Social sets group a team's accounts. Names follow the team name rules and are unique among a
+team's live sets in any case (`409 name_taken`); a team holds at most 50 live sets
+(`409 too_many_sets`). The Default set holds every account; it can be renamed but not deleted
+(`409 default_set`). Deleting a set needs a sign-in from the last 10 minutes or the password;
+it keeps its account links, hidden, so a restore within 30 days brings them back. An hourly
+job in brain hard-deletes sets deleted over 30 days ago, one instance at a time (advisory lock).
 
 Connections are the current team's social accounts. Members list them; owners and admins connect,
 regroup and disconnect them. Tokens are sealed with `ENCRYPTION_KEY` and never returned. Every

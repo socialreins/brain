@@ -11,8 +11,10 @@ use axum::{
 };
 use chrono::{DateTime, FixedOffset, Utc};
 use sea_orm::{
-    sea_query::OnConflict, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
+    sea_query::{OnConflict, Query, SelectStatement},
+    ActiveValue::Set,
+    ColumnTrait, ConnectionTrait, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -100,13 +102,23 @@ fn not_found() -> Response {
     reply(StatusCode::NOT_FOUND, "not_found")
 }
 
-/// Set ids per account, for `accounts`.
+/// Ids of every live (not deleted) set; links to deleted sets are kept for a restore but hidden.
+pub(crate) fn live_sets() -> SelectStatement {
+    Query::select()
+        .column(social_sets::Column::Id)
+        .from(social_sets::Entity)
+        .and_where(social_sets::Column::DeletedAt.is_null())
+        .to_owned()
+}
+
+/// Live set ids per account, for `accounts`.
 async fn set_ids(
     db: &impl ConnectionTrait,
     accounts: &[Uuid],
 ) -> Result<HashMap<Uuid, Vec<Uuid>>, DbErr> {
     let rows = membership::Entity::find()
         .filter(membership::Column::SocialAccountId.is_in(accounts.iter().copied()))
+        .filter(membership::Column::SocialSetId.in_subquery(live_sets()))
         .order_by_asc(membership::Column::SocialSetId)
         .all(db)
         .await?;
@@ -403,8 +415,10 @@ async fn update_sets(
             let code = "default_set_required";
             return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, code)));
         }
+        // Links to deleted sets stay, so restoring a set brings its accounts back.
         membership::Entity::delete_many()
             .filter(membership::Column::SocialAccountId.eq(id))
+            .filter(membership::Column::SocialSetId.in_subquery(live_sets()))
             .exec(&txn)
             .await?;
         let links = sets.iter().map(|s| membership::ActiveModel {

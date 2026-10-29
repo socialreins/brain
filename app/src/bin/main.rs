@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use socialreins_brain::{config::Config, connect, controllers, state::AppState};
+use socialreins_brain::{config::Config, connect, controllers, scheduler, state::AppState};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -19,6 +19,7 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let db = connect(&config).await?;
+    scheduler::spawn(db.clone());
     let app = controllers::router(AppState::new(db, &config), &config);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port)).await?;
     let ip_source = if config.trust_proxy {
