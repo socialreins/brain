@@ -137,7 +137,10 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
     if !locked {
         return Ok(());
     }
-    recover_stuck(&app.db).await?;
+    // One failing step is logged and the tick goes on; per-post work never aborts it.
+    if let Err(e) = recover_stuck(&app.db).await {
+        tracing::warn!(error = %e, "stuck target recovery failed");
+    }
     // The quota is reserved per post in `publish_post`, together with marking it reserved.
     let mut due: Vec<Uuid> = claim_due(&app.db).await?.into_iter().map(|c| c.0).collect();
     // Posts left `queued` by a crash between claim and settle: fan-out and claims are
@@ -244,7 +247,9 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
     posts.sort();
     posts.dedup();
     for id in posts {
-        settle(db, id).await?;
+        if let Err(e) = settle(db, id).await {
+            tracing::warn!(error = %e, post = %id, "settle after recovery failed");
+        }
     }
     Ok(())
 }
