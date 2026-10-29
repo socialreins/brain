@@ -2175,4 +2175,444 @@ mod teams {
             assert!(doc["paths"][path][method].is_object(), "{path} {method}");
         }
     }
+
+    /// `/v1/connections`, against a mock Bluesky (AppView, PLC directory and PDS in one local
+    /// server), so tests never reach the real network.
+    mod connections {
+        use super::*;
+        use axum::{
+            extract::{Path, Query, State},
+            routing::{get, post},
+            Json, Router,
+        };
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use socialreins_brain::models::{social_account_social_set, social_accounts};
+        use std::collections::HashMap;
+
+        const APP_PASSWORD: &str = "abcd-efgh-ijkl-mnop";
+        const NEW_APP_PASSWORD: &str = "qrst-uvwx-yzab-cdef";
+        const ACCOUNT_PASSWORD: &str = "the-account-password";
+
+        fn jwt(scope: &str) -> String {
+            let claims = json!({ "scope": scope }).to_string();
+            format!("e30.{}.sig", URL_SAFE_NO_PAD.encode(claims))
+        }
+
+        /// Handles `*.test` resolve to `did:plc:<first label>`, except `nobody.test`.
+        async fn mock_bluesky() -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let resolve = |Query(q): Query<HashMap<String, String>>| async move {
+                let h = q.get("handle").cloned().unwrap_or_default();
+                match h.strip_suffix(".test") {
+                    Some(label) if label != "nobody" => (
+                        axum::http::StatusCode::OK,
+                        Json(json!({"did": format!("did:plc:{label}")})),
+                    ),
+                    _ => (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(json!({"error": "InvalidRequest"})),
+                    ),
+                }
+            };
+            let doc = |State(base): State<String>, Path(did): Path<String>| async move {
+                Json(json!({
+                    "id": did,
+                    "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer",
+                        "serviceEndpoint": base}],
+                }))
+            };
+            let session = |Json(b): Json<Value>| async move {
+                let did = b["identifier"].as_str().unwrap_or_default().to_owned();
+                let handle = format!("{}.test", did.trim_start_matches("did:plc:"));
+                let scope = match b["password"].as_str() {
+                    Some(APP_PASSWORD | NEW_APP_PASSWORD) => "com.atproto.appPass",
+                    Some(ACCOUNT_PASSWORD) => "com.atproto.access",
+                    _ => {
+                        return (
+                            axum::http::StatusCode::UNAUTHORIZED,
+                            Json(json!({"error": "AuthenticationRequired"})),
+                        )
+                    }
+                };
+                let body = json!({"did": did, "handle": handle, "accessJwt": jwt(scope),
+                    "refreshJwt": "r"});
+                (axum::http::StatusCode::OK, Json(body))
+            };
+            let profile = |Query(q): Query<HashMap<String, String>>| async move {
+                let did = q.get("actor").cloned().unwrap_or_default();
+                Json(json!({"did": did, "displayName": format!("Name of {did}"),
+                    "avatar": "https://cdn.example.com/a.jpg"}))
+            };
+            let app = Router::new()
+                .route("/xrpc/com.atproto.identity.resolveHandle", get(resolve))
+                .route("/xrpc/com.atproto.server.createSession", post(session))
+                .route("/xrpc/app.bsky.actor.getProfile", get(profile))
+                .route("/{did}", get(doc))
+                .with_state(base.clone());
+            tokio::spawn(async move { axum::serve(listener, app).await });
+            base
+        }
+
+        /// A brain whose Bluesky calls go to the mock; `secure` keeps the https-only PDS rule.
+        async fn server_on_mock(secure: bool) -> (TestServer, DatabaseConnection) {
+            let base = mock_bluesky().await;
+            server_where(|c| {
+                c.bluesky.appview = base.clone();
+                c.bluesky.plc = base;
+                c.bluesky.allow_insecure_pds = !secure;
+            })
+            .await
+        }
+
+        fn new_handle() -> String {
+            format!("u{}.test", &uuid::Uuid::now_v7().simple().to_string()[20..])
+        }
+
+        async fn connect(
+            s: &TestServer,
+            cookie: &str,
+            handle: &str,
+            pw: &str,
+        ) -> axum_test::TestResponse {
+            req(s, Method::POST, "/v1/connections/bluesky", cookie)
+                .json(&json!({"handle": handle, "app_password": pw}))
+                .await
+        }
+
+        async fn default_set(db: &DatabaseConnection, team_id: &str) -> uuid::Uuid {
+            social_sets::Entity::find()
+                .filter(social_sets::Column::TeamId.eq(team_id.parse::<uuid::Uuid>().unwrap()))
+                .filter(social_sets::Column::IsDefault.eq(true))
+                .one(db)
+                .await
+                .unwrap()
+                .unwrap()
+                .id
+        }
+
+        async fn list(s: &TestServer, cookie: &str) -> Vec<Value> {
+            let res = s.get("/v1/connections").add_header("cookie", cookie).await;
+            res.assert_status_ok();
+            res.json()
+        }
+
+        fn cipher() -> socialreins_core::crypto::Cipher {
+            let key = std::env::var("ENCRYPTION_KEY").unwrap();
+            socialreins_core::crypto::Cipher::from_base64(&key).unwrap()
+        }
+
+        /// An owner with one connected account: (cookie, team id, account id).
+        async fn owner_with_account(
+            s: &TestServer,
+            db: &DatabaseConnection,
+        ) -> (String, String, String) {
+            let (_, cookie, _) = user(s, db).await;
+            let team_id = current(s, &cookie).await["id"].as_str().unwrap().to_owned();
+            let res = connect(s, &cookie, &new_handle(), APP_PASSWORD).await;
+            assert_eq!(res.status_code(), 201);
+            let id = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+            (cookie, team_id, id)
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn connect_joins_the_default_set_and_reconnect_updates() {
+            let (s, db) = server_on_mock(false).await;
+            let (_, cookie, user_id) = user(&s, &db).await;
+            let team_id = current(&s, &cookie).await["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let handle = new_handle();
+            let label = handle.trim_end_matches(".test");
+            let res = connect(
+                &s,
+                &cookie,
+                &format!(" @{}", handle.to_uppercase()),
+                APP_PASSWORD,
+            )
+            .await;
+            assert_eq!(res.status_code(), 201);
+            let body = res.json::<Value>();
+            let set = default_set(&db, &team_id).await;
+            assert_eq!(body["provider"], "bluesky");
+            assert_eq!(body["external_id"], format!("did:plc:{label}"));
+            assert_eq!(body["handle"], handle);
+            assert_eq!(body["display_name"], format!("Name of did:plc:{label}"));
+            assert_eq!(body["avatar_url"], "https://cdn.example.com/a.jpg");
+            assert_eq!(body["set_ids"], json!([set.to_string()]));
+            assert!(body.get("access_token").is_none() && body.get("meta").is_none());
+
+            let id: uuid::Uuid = body["id"].as_str().unwrap().parse().unwrap();
+            let row = social_accounts::Entity::find_by_id(id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.created_by, Some(user_id));
+            assert!(!row.access_token.windows(4).any(|w| w == b"abcd"));
+            assert_eq!(
+                cipher().decrypt(&row.access_token).unwrap(),
+                APP_PASSWORD.as_bytes()
+            );
+            assert!(row.meta["pds"]
+                .as_str()
+                .unwrap()
+                .starts_with("http://127.0.0.1:"));
+
+            let again = connect(&s, &cookie, &handle, NEW_APP_PASSWORD).await;
+            assert_eq!(again.status_code(), 200);
+            assert_eq!(again.json::<Value>()["id"], body["id"]);
+            let all = list(&s, &cookie).await;
+            assert_eq!(all.len(), 1);
+            assert_eq!(all[0]["set_ids"], json!([set.to_string()]));
+            assert!(all[0].get("access_token").is_none());
+            let row = social_accounts::Entity::find_by_id(id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                cipher().decrypt(&row.access_token).unwrap(),
+                NEW_APP_PASSWORD.as_bytes()
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn wrong_passwords_and_handles_are_refused() {
+            let (s, db) = server_on_mock(false).await;
+            let (_, cookie, _) = user(&s, &db).await;
+            let cases = [
+                (new_handle(), "wrong-pass", 401, "invalid_credentials"),
+                (new_handle(), "", 401, "invalid_credentials"),
+                (new_handle(), ACCOUNT_PASSWORD, 422, "app_password_required"),
+                ("nobody.test".into(), APP_PASSWORD, 422, "invalid_handle"),
+                ("not a handle".into(), APP_PASSWORD, 422, "invalid_handle"),
+            ];
+            for (handle, pw, status, code) in cases {
+                let res = connect(&s, &cookie, &handle, pw).await;
+                assert_eq!(res.status_code(), status, "{code}");
+                res.assert_json(&json!({"error": code}));
+            }
+            assert!(list(&s, &cookie).await.is_empty());
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn a_pds_must_be_https() {
+            let (s, db) = server_on_mock(true).await;
+            let (_, cookie, _) = user(&s, &db).await;
+            let res = connect(&s, &cookie, &new_handle(), APP_PASSWORD).await;
+            assert_eq!(res.status_code(), 422);
+            res.assert_json(&json!({"error": "unsupported_pds"}));
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn connect_attempts_are_throttled_per_user() {
+            let (s, db) = server_on_mock(false).await;
+            let (_, cookie, _) = user(&s, &db).await;
+            for _ in 0..5 {
+                let res = connect(&s, &cookie, &new_handle(), "wrong").await;
+                assert_eq!(res.status_code(), 401);
+            }
+            let res = connect(&s, &cookie, &new_handle(), APP_PASSWORD).await;
+            assert_eq!(res.status_code(), 429);
+            res.assert_json(&json!({"error": "rate_limited"}));
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn members_list_but_cannot_manage() {
+            let (s, db) = server_on_mock(false).await;
+            let (owner, team_id, id) = owner_with_account(&s, &db).await;
+            let (member, _) = joined(&s, &db, &team_id, "member").await;
+            let set = default_set(&db, &team_id).await;
+            let calls = [
+                connect(&s, &member, &new_handle(), APP_PASSWORD).await,
+                req(
+                    &s,
+                    Method::PUT,
+                    &format!("/v1/connections/{id}/sets"),
+                    &member,
+                )
+                .json(&json!({"set_ids": [set]}))
+                .await,
+                req(
+                    &s,
+                    Method::DELETE,
+                    &format!("/v1/connections/{id}"),
+                    &member,
+                )
+                .await,
+            ];
+            for res in calls {
+                assert_eq!(res.status_code(), 403);
+                res.assert_json(&json!({"error": "forbidden"}));
+            }
+            assert_eq!(list(&s, &member).await.len(), 1);
+            let (admin, _) = joined(&s, &db, &team_id, "admin").await;
+            let res = req(&s, Method::DELETE, &format!("/v1/connections/{id}"), &admin).await;
+            assert_eq!(res.status_code(), 204);
+            assert!(list(&s, &owner).await.is_empty());
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn another_teams_account_is_not_found() {
+            let (s, db) = server_on_mock(false).await;
+            let (_, team_id, id) = owner_with_account(&s, &db).await;
+            let (_, stranger, _) = user(&s, &db).await;
+            let set = default_set(&db, &team_id).await;
+            let res = req(
+                &s,
+                Method::PUT,
+                &format!("/v1/connections/{id}/sets"),
+                &stranger,
+            )
+            .json(&json!({"set_ids": [set]}))
+            .await;
+            assert_eq!(res.status_code(), 404);
+            let res = req(
+                &s,
+                Method::DELETE,
+                &format!("/v1/connections/{id}"),
+                &stranger,
+            )
+            .await;
+            assert_eq!(res.status_code(), 404);
+            res.assert_json(&json!({"error": "not_found"}));
+            assert!(list(&s, &stranger).await.is_empty());
+            let still = social_accounts::Entity::find_by_id(id.parse::<uuid::Uuid>().unwrap())
+                .one(&db)
+                .await
+                .unwrap();
+            assert!(still.is_some());
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn sets_must_be_the_teams_and_keep_the_default() {
+            let (s, db) = server_on_mock(false).await;
+            let (cookie, team_id, id) = owner_with_account(&s, &db).await;
+            let default = default_set(&db, &team_id).await;
+            let new_set = |team: uuid::Uuid| social_sets::ActiveModel {
+                id: Set(uuid::Uuid::now_v7()),
+                team_id: Set(team),
+                name: Set("Clients".into()),
+                is_default: Set(false),
+                ..Default::default()
+            };
+            let other = social_sets::Entity::insert(new_set(team_id.parse().unwrap()))
+                .exec_with_returning(&db)
+                .await
+                .unwrap()
+                .id;
+            let (_, stranger, _) = user(&s, &db).await;
+            let foreign_team = current(&s, &stranger).await["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let foreign = default_set(&db, &foreign_team).await;
+            let put = |sets: Value| {
+                req(
+                    &s,
+                    Method::PUT,
+                    &format!("/v1/connections/{id}/sets"),
+                    &cookie,
+                )
+                .json(&json!({ "set_ids": sets }))
+            };
+            let res = put(json!([other, default, other])).await;
+            res.assert_status_ok();
+            let mut want = vec![default.to_string(), other.to_string()];
+            want.sort();
+            assert_eq!(res.json::<Value>()["set_ids"], json!(want));
+            for (sets, code) in [
+                (json!([other]), "default_set_required"),
+                (json!([]), "default_set_required"),
+                (json!([default, foreign]), "invalid_sets"),
+                (json!([default, uuid::Uuid::now_v7()]), "invalid_sets"),
+            ] {
+                let res = put(sets).await;
+                assert_eq!(res.status_code(), 422, "{code}");
+                res.assert_json(&json!({"error": code}));
+            }
+            assert_eq!(list(&s, &cookie).await[0]["set_ids"], json!(want));
+            let res = put(json!([default])).await;
+            res.assert_status_ok();
+            assert_eq!(res.json::<Value>()["set_ids"], json!([default.to_string()]));
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn delete_removes_the_account_and_its_sets() {
+            let (s, db) = server_on_mock(false).await;
+            let (cookie, _, id) = owner_with_account(&s, &db).await;
+            let path = format!("/v1/connections/{id}");
+            assert_eq!(
+                req(&s, Method::DELETE, &path, &cookie).await.status_code(),
+                204
+            );
+            assert!(list(&s, &cookie).await.is_empty());
+            let links = social_account_social_set::Entity::find()
+                .filter(
+                    social_account_social_set::Column::SocialAccountId
+                        .eq(id.parse::<uuid::Uuid>().unwrap()),
+                )
+                .count(&db)
+                .await
+                .unwrap();
+            assert_eq!(links, 0);
+            assert_eq!(
+                req(&s, Method::DELETE, &path, &cookie).await.status_code(),
+                404
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn providers_and_routes_need_a_session() {
+            let (s, db) = server_on_mock(false).await;
+            for path in ["/v1/connections", "/v1/connections/providers"] {
+                assert_eq!(s.get(path).await.status_code(), 401, "{path}");
+            }
+            let (_, cookie, _) = user(&s, &db).await;
+            let res = s
+                .get("/v1/connections/providers")
+                .add_header("cookie", &cookie)
+                .await;
+            res.assert_status_ok();
+            let body = res.json::<Vec<Value>>();
+            let names: Vec<&str> = body
+                .iter()
+                .map(|p| p["provider"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                names,
+                ["bluesky", "meta", "threads", "linkedin", "x", "tiktok", "youtube"]
+            );
+            assert_eq!(body[0]["configured"], true);
+            // The web origin check on a state-changing route.
+            let res = s
+                .post("/v1/connections/bluesky")
+                .add_header("cookie", &cookie)
+                .json(&json!({"handle": new_handle(), "app_password": APP_PASSWORD}))
+                .await;
+            assert_eq!(res.status_code(), 403);
+            res.assert_json(&json!({"error": "forbidden_origin"}));
+            let doc = s.get("/openapi.json").await.json::<Value>();
+            for (path, method) in [
+                ("/connections", "get"),
+                ("/connections/providers", "get"),
+                ("/connections/bluesky", "post"),
+                ("/connections/{id}/sets", "put"),
+                ("/connections/{id}", "delete"),
+            ] {
+                assert!(doc["paths"][path][method].is_object(), "{path} {method}");
+            }
+        }
+    }
 }

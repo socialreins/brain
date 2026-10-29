@@ -10,6 +10,7 @@ replaces (`~/Code/social-media-manager`) is a read-only reference: read it, neve
 docker compose up -d postgres
 export DATABASE_URL=postgres://brain:brain@localhost:5432/socialreins_brain
 export MAIL_LOG=true   # sign-in links go to the log
+export ENCRYPTION_KEY=$(openssl rand -base64 32)
 cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p socialreins-brain

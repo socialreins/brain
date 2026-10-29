@@ -7,8 +7,11 @@ publish = false
 # Domain crate: keep framework-free (no axum, no sea-orm).
 [dependencies]
 argon2 = "0.5"
+base64 = "0.22"
 getrandom = "0.3"
 hex = "0.4"
+# Already in the tree through rustls; its AES-256-GCM seals tokens at rest.
+ring = "0.17"
 sha2 = "0.10"
 
 [lints]
