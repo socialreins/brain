@@ -569,14 +569,15 @@ fn send_error(e: &InboxError) -> Response {
 
 /// Replies to an item from its account, once (never retried): a public reply in the thread for
 /// a comment or mention, a DM in the conversation for a DM. `201` with the item and its
-/// replies. Every member; at most 10 a minute per user, shared with publishing. Failures:
+/// replies. Every member; at most 10 a minute per user, shared with publishing; `409
+/// reply_in_progress` while another reply to the item is going out. Failures:
 /// `422` with `error` (`reconnect_required`, `no_dm_access`, `dm_not_allowed`, `too_long`,
 /// `not_repliable`, `bluesky_refused`, `bluesky_unreachable`) and a `message`, or `429`.
 #[utoipa::path(post, path = "/inbox-items/{id}/reply", tag = "inbox", request_body = ReplyInput,
     params(("id" = Uuid, Path)),
     responses((status = 201, body = Item), (status = 401, body = Error),
-        (status = 403, body = Error), (status = 404, body = Error), (status = 422, body = Error),
-        (status = 429, body = Error)))]
+        (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
+        (status = 422, body = Error), (status = 429, body = Error)))]
 async fn send_reply(
     _: FromWeb,
     State(app): State<AppState>,
@@ -610,7 +611,29 @@ async fn send_reply(
         Err(e) => return internal(e, "account read"),
     };
     let user = Some(t.current.0.id);
-    match inbox::send(&app, &account, &item, via, text, user, None).await {
+    // One reply per item at a time, so a double click cannot send twice: the lock lives in
+    // this transaction, held across the send.
+    let guard = async {
+        let txn = app.db.begin().await?;
+        let stmt = Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 1)) AS ok",
+            [item.id.to_string().into()],
+        );
+        let ok: bool = match txn.query_one_raw(stmt).await? {
+            Some(r) => r.try_get("", "ok")?,
+            None => false,
+        };
+        Ok::<_, DbErr>(ok.then_some(txn))
+    };
+    let guard = match guard.await {
+        Ok(Some(txn)) => txn,
+        Ok(None) => return reply(StatusCode::CONFLICT, "reply_in_progress"),
+        Err(e) => return internal(e, "inbox reply lock"),
+    };
+    let sent = inbox::send(&app, &account, &item, via, text, &[], user, None).await;
+    let _ = guard.commit().await;
+    match sent {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => return send_error(&e),
         Err(e) => return internal(e, "inbox reply"),

@@ -6,6 +6,8 @@ use sea_orm::{
     sea_query::Query, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, DbErr,
     EntityTrait, QueryFilter, QueryOrder, Statement, TransactionTrait, Value,
 };
+use std::ops::Range;
+
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -111,15 +113,17 @@ pub fn validate(
     if actions.is_empty() || kinds.len() != actions.len() {
         return Err("invalid_actions");
     }
+    // Checked with every `{name}` at its longest, so a long name never makes it too long.
+    let longest = |t: &str| t.replace("{name}", &"n".repeat(MAX_NAME_CHARS));
     for a in actions {
         let (via, text) = a.via_text();
-        if !inbox::fits(via, text) {
+        if !inbox::fits(via, &longest(text)) {
             return Err("invalid_text");
         }
     }
     if let Some(f) = fallback {
         let dm = actions.iter().any(|a| matches!(a, Action::SendDm { .. }));
-        if !dm || !inbox::fits(Via::Public, f) {
+        if !dm || !inbox::fits(Via::Public, &longest(f)) {
             return Err("invalid_fallback");
         }
     }
@@ -151,17 +155,32 @@ pub fn matches(c: &Conditions, f: &Facts<'_>) -> bool {
     set_ok && account_ok && post_ok && keyword_ok && (!c.first_per_author || f.first_from_author)
 }
 
-/// `template` with each `{name}` replaced by the author's display name, else handle, else
-/// "there", cut to 64 characters.
-pub fn render(template: &str, name: Option<&str>, handle: Option<&str>) -> String {
-    let pick = [name, handle]
-        .into_iter()
-        .flatten()
-        .map(str::trim)
-        .find(|s| !s.is_empty())
-        .unwrap_or("there");
-    let pick: String = pick.chars().take(MAX_NAME_CHARS).collect();
-    template.replace("{name}", &pick)
+/// The commenter's display name when it is plainly a name: letters, digits, spaces, `'`, `-`
+/// and `_` only, so it cannot carry a link, domain or mention (`evil.com`, `@someone`, `a/b`),
+/// cut to 64 characters. Handles are never used: they are domains.
+fn safe_name(name: Option<&str>) -> Option<String> {
+    let name = name?.trim();
+    let plain = name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == ' ' || matches!(c, '\'' | '-' | '_'));
+    (plain && !name.is_empty()).then(|| name.chars().take(MAX_NAME_CHARS).collect())
+}
+
+/// `template` with each `{name}` replaced by the author's display name when safe (see
+/// `safe_name`), else "there"; and the byte ranges filled in, which must never become links.
+pub fn render(template: &str, name: Option<&str>) -> (String, Vec<Range<usize>>) {
+    let name = safe_name(name).unwrap_or_else(|| "there".to_owned());
+    let mut out = String::new();
+    let mut filled = Vec::new();
+    let mut parts = template.split("{name}").peekable();
+    while let Some(part) = parts.next() {
+        out.push_str(part);
+        if parts.peek().is_some() {
+            filled.push(out.len()..out.len() + name.len());
+            out.push_str(&name);
+        }
+    }
+    (out, filled)
 }
 
 fn sql(sql: &str, values: Vec<Value>) -> Statement {
@@ -195,7 +214,19 @@ pub async fn run(
         .order_by_asc(automations::Column::CreatedAt)
         .all(db)
         .await?;
-    if autos.is_empty() {
+    // Comments from before the account was connected (a first read goes back 7 days) never
+    // run automations.
+    if autos.is_empty() || item.received_at < account.created_at {
+        return Ok(());
+    }
+    // Comments by the team's own accounts never run them either, so two automated accounts
+    // cannot answer each other in a loop.
+    let own = social_accounts::Entity::find()
+        .filter(social_accounts::Column::TeamId.eq(item.team_id))
+        .filter(social_accounts::Column::ExternalId.eq(&item.author_id))
+        .one(db)
+        .await?;
+    if own.is_some() {
         return Ok(());
     }
     let in_live = Query::select()
@@ -328,12 +359,11 @@ async fn act(
     actions: &[Action],
 ) -> Vec<ActionResult> {
     let name = item.author_name.as_deref();
-    let handle = item.author_handle.as_deref();
     let mut results = Vec::new();
     for action in actions {
         let (via, template) = action.via_text();
-        let text = render(template, name, handle);
-        let sent = inbox::send(app, account, item, via, &text, None, Some(a.id)).await;
+        let (text, filled) = render(template, name);
+        let sent = inbox::send(app, account, item, via, &text, &filled, None, Some(a.id)).await;
         results.push(outcome(
             action.kind(),
             sent.map(|r| r.map(|m| m.remote_id.unwrap_or_default())),
@@ -347,8 +377,18 @@ async fn act(
         .iter()
         .any(|r| r.kind == "reply_publicly" && r.status == "sent");
     if let (true, false, Some(f)) = (dm_refused, replied, &a.fallback_public_reply) {
-        let text = render(f, name, handle);
-        let sent = inbox::send(app, account, item, Via::Public, &text, None, Some(a.id)).await;
+        let (text, filled) = render(f, name);
+        let sent = inbox::send(
+            app,
+            account,
+            item,
+            Via::Public,
+            &text,
+            &filled,
+            None,
+            Some(a.id),
+        )
+        .await;
         results.push(outcome(
             "fallback_public_reply",
             sent.map(|r| r.map(|m| m.remote_id.unwrap_or_default())),
@@ -451,23 +491,41 @@ mod tests {
 
     #[test]
     fn names_fill_placeholders() {
+        let (text, filled) = render("Hi {name}, {name}!", Some(" Ada "));
+        assert_eq!(text, "Hi Ada, Ada!");
+        assert_eq!(filled, [3..6, 8..11]);
+        assert_eq!(render("Hi {name}", Some("  ")).0, "Hi there");
+        assert_eq!(render("Hi {name}", None).0, "Hi there");
         assert_eq!(
-            render("Hi {name}, {name}!", Some("Ada"), Some("ada.test")),
-            "Hi Ada, Ada!"
+            render("Hi {name}", Some("José O'Neil-Ng")).0,
+            "Hi José O'Neil-Ng"
         );
+        assert_eq!(render("Hi {name}", Some(&"n".repeat(99))).0.len(), 3 + 64);
         assert_eq!(
-            render("Hi {name}", Some("  "), Some("ada.test")),
-            "Hi ada.test"
+            render("no placeholder", Some("Ada")),
+            ("no placeholder".into(), vec![])
         );
-        assert_eq!(render("Hi {name}", None, None), "Hi there");
-        assert_eq!(
-            render("Hi {name}", Some(&"n".repeat(99)), None).len(),
-            3 + 64
-        );
-        assert_eq!(
-            render("no placeholder", Some("Ada"), None),
-            "no placeholder"
-        );
+    }
+
+    #[test]
+    fn names_that_could_link_or_mention_fall_back() {
+        for bad in [
+            "claim prize at evil.com",
+            "https://evil.example/x",
+            "@someone",
+            "a/b",
+            "evil。com",
+            "line\nbreak",
+            "tab\there",
+        ] {
+            let (text, filled) = render("Hi {name}, see https://x.io", Some(bad));
+            assert_eq!(text, "Hi there, see https://x.io", "{bad}");
+            // No link is found inside the filled-in name.
+            let links = socialreins_core::post::links(&text);
+            assert!(links
+                .iter()
+                .all(|l| filled.iter().all(|r| l.end <= r.start || l.start >= r.end)));
+        }
     }
 
     #[test]

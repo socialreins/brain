@@ -322,7 +322,13 @@ pub async fn ingest(app: &AppState, account: social_accounts::Model) -> Result<(
             }
             true
         }
-        Err(InboxError::NoDmAccess | InboxError::Refused { .. }) => false,
+        // An outage (5xx) keeps what was known; only a refusal means no access.
+        Err(
+            InboxError::NoDmAccess
+            | InboxError::Refused {
+                status: 400..=403, ..
+            },
+        ) => false,
         Err(e) => {
             tracing::warn!(code = e.code(), account = %account.id, "messages failed");
             account.dm_access
@@ -455,12 +461,15 @@ pub fn fits(via: Via, text: &str) -> bool {
 
 /// Sends `text` for `item` from `account`, once, and records it on the item (a reply row and
 /// `replied_at`). The inner `Err` says why nothing was sent.
+/// `skip`: byte ranges of `text` filled in from someone else, which never become links.
+#[allow(clippy::too_many_arguments)]
 pub async fn send(
     app: &AppState,
     account: &social_accounts::Model,
     item: &inbox_items::Model,
     via: Via,
     text: &str,
+    skip: &[std::ops::Range<usize>],
     sent_by: Option<Uuid>,
     automation_id: Option<Uuid>,
 ) -> Result<Result<inbox_replies::Model, InboxError>, DbErr> {
@@ -493,14 +502,16 @@ pub async fn send(
                 .zip(item.root_remote_cid.as_deref());
             match (item.kind.as_str(), parent, root) {
                 ("comment" | "mention", Some(parent), Some(root)) => {
-                    app.bluesky.reply(&c, text, parent, root).await
+                    app.bluesky.reply(&c, text, skip, parent, root).await
                 }
                 _ => Err(InboxError::Invalid("not_repliable")),
             }
         }
         Via::Dm => {
             let convo = item.convo_id.as_deref();
-            app.bluesky.send_dm(&c, convo, &item.author_id, text).await
+            app.bluesky
+                .send_dm(&c, convo, &item.author_id, text, skip)
+                .await
         }
     };
     let remote_id = match sent {
@@ -512,7 +523,7 @@ pub async fn send(
         inbox_item_id: sea_orm::ActiveValue::Set(item.id),
         kind: sea_orm::ActiveValue::Set(via.as_str().into()),
         text: sea_orm::ActiveValue::Set(text.to_owned()),
-        remote_id: sea_orm::ActiveValue::Set(Some(remote_id)),
+        remote_id: sea_orm::ActiveValue::Set(Some(remote_id).filter(|r| !r.is_empty())),
         sent_by: sea_orm::ActiveValue::Set(sent_by),
         automation_id: sea_orm::ActiveValue::Set(automation_id),
         created_at: sea_orm::ActiveValue::Set(Utc::now().fixed_offset()),

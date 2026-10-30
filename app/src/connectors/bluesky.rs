@@ -4,6 +4,7 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    ops::Range,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -556,7 +557,7 @@ impl Bluesky {
             }
             images.push(serde_json::json!({ "alt": "", "image": up["blob"] }));
         }
-        let mut record = post_record(text, None);
+        let mut record = post_record(text, &[], None);
         if !images.is_empty() {
             record["embed"] =
                 serde_json::json!({ "$type": "app.bsky.embed.images", "images": images });
@@ -969,34 +970,36 @@ impl Bluesky {
         Ok((found, newest))
     }
 
-    /// Replies to `parent` in the thread of `root`; returns the reply's `at://` URI.
+    /// Replies to `parent` in the thread of `root`; returns the reply's `at://` URI, empty when
+    /// Bluesky took it without saying which (it was still sent). `skip`: see `facets`.
     pub async fn reply(
         &self,
         c: &Creds<'_>,
         text: &str,
+        skip: &[Range<usize>],
         parent: Ref<'_>,
         root: Ref<'_>,
     ) -> Result<String, InboxError> {
-        let record = post_record(text, Some((parent, root)));
+        let record = post_record(text, skip, Some((parent, root)));
         let body =
             serde_json::json!({ "repo": c.did, "collection": POST_COLLECTION, "record": record });
         let made = self
             .xrpc(c, "com.atproto.repo.createRecord", &[], Some(&body))
             .await?;
-        match made["uri"].as_str() {
-            Some(uri) if post_key(uri).is_some() => Ok(uri.to_owned()),
-            _ => Err(InboxError::Invalid("no_remote_id")),
-        }
+        let uri = made["uri"].as_str().filter(|u| post_key(u).is_some());
+        Ok(uri.unwrap_or_default().to_owned())
     }
 
     /// Sends a DM in `convo`, or to `to` (a DID) when there is none yet; returns the message
-    /// id. `dm_not_allowed` when the recipient does not take messages from the account.
+    /// id, empty when Bluesky did not say (it was still sent). `dm_not_allowed` when the
+    /// recipient does not take messages from the account. `skip`: see `facets`.
     pub async fn send_dm(
         &self,
         c: &Creds<'_>,
         convo: Option<&str>,
         to: &str,
         text: &str,
+        skip: &[Range<usize>],
     ) -> Result<String, InboxError> {
         let convo = match convo {
             Some(id) => id.to_owned(),
@@ -1023,7 +1026,7 @@ impl Bluesky {
             }
         };
         let mut message = serde_json::json!({ "text": text });
-        let facets = facets(text);
+        let facets = facets(text, skip);
         if !facets.is_empty() {
             message["facets"] = facets.into();
         }
@@ -1036,10 +1039,7 @@ impl Bluesky {
                 InboxError::Refused { status: 400, .. } => InboxError::DmNotAllowed,
                 e => e,
             })?;
-        sent["id"]
-            .as_str()
-            .map(str::to_owned)
-            .ok_or(InboxError::Invalid("no_remote_id"))
+        Ok(sent["id"].as_str().unwrap_or_default().to_owned())
     }
 }
 
@@ -1136,10 +1136,13 @@ fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     }
 }
 
-/// Link facets for `text`, as posts and chat messages take them.
-fn facets(text: &str) -> Vec<Value> {
+/// Link facets for `text`, as posts and chat messages take them, leaving out any link that
+/// touches a byte range in `skip` (text filled in from someone else, e.g. a commenter's name),
+/// so nobody can make us send a live link.
+fn facets(text: &str, skip: &[Range<usize>]) -> Vec<Value> {
     socialreins_core::post::links(text)
         .into_iter()
+        .filter(|l| !skip.iter().any(|r| l.start < r.end && r.start < l.end))
         .map(|l| {
             serde_json::json!({
                 "index": { "byteStart": l.start, "byteEnd": l.end },
@@ -1150,12 +1153,12 @@ fn facets(text: &str) -> Vec<Value> {
 }
 
 /// A post record, a reply when `reply` holds `(parent, root)` as `(uri, cid)` pairs.
-pub fn post_record(text: &str, reply: Option<(Ref<'_>, Ref<'_>)>) -> Value {
+pub fn post_record(text: &str, skip: &[Range<usize>], reply: Option<(Ref<'_>, Ref<'_>)>) -> Value {
     let created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let mut record = serde_json::json!({
         "$type": POST_COLLECTION, "text": text, "createdAt": created,
     });
-    let facets = facets(text);
+    let facets = facets(text, skip);
     if !facets.is_empty() {
         record["facets"] = facets.into();
     }
@@ -1371,6 +1374,7 @@ mod tests {
     fn reply_records_point_at_parent_and_root() {
         let r = post_record(
             "thanks https://x.io",
+            &[],
             Some((("at://p", "cp"), ("at://r", "cr"))),
         );
         assert_eq!(r["$type"], POST_COLLECTION);
@@ -1383,7 +1387,12 @@ mod tests {
             serde_json::json!({"uri": "at://r", "cid": "cr"})
         );
         assert_eq!(r["facets"][0]["features"][0]["uri"], "https://x.io");
-        assert!(post_record("plain", None).get("reply").is_none());
+        assert!(post_record("plain", &[], None).get("reply").is_none());
+        // A link touching filled-in text gets no facet; the template's own link keeps one.
+        let text = "Hi https://evil.example see https://x.io";
+        let r = post_record(text, std::slice::from_ref(&(3..23)), None);
+        assert_eq!(r["facets"].as_array().unwrap().len(), 1);
+        assert_eq!(r["facets"][0]["features"][0]["uri"], "https://x.io");
     }
 
     #[test]
