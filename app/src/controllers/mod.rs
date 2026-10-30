@@ -1,9 +1,11 @@
 //! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, and the documented `/v1` API
-//! (waitlist, teams, connections, social sets, posts).
+//! (waitlist, teams, connections, social sets, posts, inboxes, automations).
 pub mod auth;
+pub mod automations;
 pub mod connections;
 pub mod google;
 pub mod health;
+pub mod inbox;
 pub mod passkeys;
 pub mod posts;
 pub mod social_sets;
@@ -29,6 +31,7 @@ use crate::{config::Config, state::AppState};
 const MAX_BODY_BYTES: usize = 4096;
 /// Passkey bodies carry an attestation or assertion, which can run past 4 KiB.
 const MAX_PASSKEY_BODY_BYTES: usize = 16 * 1024;
+const MAX_AUTOMATION_BODY_BYTES: usize = 32 * 1024;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -49,6 +52,9 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(connections::api())
         .merge(social_sets::api())
         .merge(posts::api())
+        .merge(inbox::api())
+        // Two DM texts of 1000 graphemes can pass 4 KiB.
+        .merge(automations::api().layer(DefaultBodyLimit::max(MAX_AUTOMATION_BODY_BYTES)))
 }
 
 /// The request span. Logs the path only (no query), with the token in `/auth/magic/{token}` and

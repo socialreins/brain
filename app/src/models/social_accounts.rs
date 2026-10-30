@@ -23,6 +23,13 @@ pub struct Model {
     pub token_expires_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(column_type = "JsonBinary")]
     pub meta: Json,
+    /// The app password may read and send DMs (Bluesky: "Allow access to your direct messages").
+    pub dm_access: bool,
+    /// Ingest cursors: the newest notification and DM already read.
+    pub notifications_seen_at: Option<DateTimeWithTimeZone>,
+    pub messages_seen_at: Option<DateTimeWithTimeZone>,
+    /// The platform refused the stored password at ingest; ingest pauses for an hour.
+    pub inbox_error_at: Option<DateTimeWithTimeZone>,
     pub created_by: Option<Uuid>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,

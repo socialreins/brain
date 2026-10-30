@@ -1,6 +1,8 @@
+pub mod automations;
 pub mod config;
 pub mod connectors;
 pub mod controllers;
+pub mod inbox;
 pub mod mail;
 pub mod models;
 pub mod publish;

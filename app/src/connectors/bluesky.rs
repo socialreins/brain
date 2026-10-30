@@ -2,12 +2,15 @@
 //! DID, the DID to its PDS, and opening a session on that PDS. The app password only ever goes
 //! to the resolved PDS, over https, with redirects off.
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
+    ops::Range,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use chrono::{DateTime, FixedOffset};
 use reqwest::{StatusCode, Url};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
@@ -21,6 +24,8 @@ pub struct Bluesky {
     /// mock. Names still resolve to public addresses only.
     pub allow_insecure_pds: bool,
     client: reqwest::Client,
+    /// Inbox sessions by DID and password hash (see `live`).
+    sessions: Arc<Mutex<HashMap<String, Live>>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -54,6 +59,8 @@ pub struct Account {
     pub display_name: Option<String>,
     pub avatar: Option<String>,
     pub pds: String,
+    /// The app password may use DMs.
+    pub dm_access: bool,
 }
 
 /// A handle as typed (`@Alice.bsky.social`), trimmed and lowercased; `None` when it cannot be a
@@ -76,6 +83,9 @@ fn unreachable(e: impl std::fmt::Display, what: &str) -> Error {
     tracing::warn!(error = %e, what, "bluesky call failed");
     Error::Unreachable
 }
+
+/// Largest list (notifications, conversations, messages) read from Bluesky.
+const MAX_LIST_BODY: usize = 1024 * 1024;
 
 /// A request that never got a response: `unsupported_pds` when `PublicOnly` refused the host.
 fn send_failed(e: reqwest::Error, what: &str) -> Error {
@@ -111,9 +121,17 @@ async fn read_capped(mut res: reqwest::Response, cap: usize) -> Result<Vec<u8>, 
 
 /// The JSON body, read up to `MAX_BODY` bytes.
 async fn json_body<T: DeserializeOwned>(res: reqwest::Response, what: &str) -> Result<T, Error> {
-    let buf = match read_capped(res, MAX_BODY).await {
+    json_capped(res, MAX_BODY, what).await
+}
+
+async fn json_capped<T: DeserializeOwned>(
+    res: reqwest::Response,
+    cap: usize,
+    what: &str,
+) -> Result<T, Error> {
+    let buf = match read_capped(res, cap).await {
         Ok(buf) => buf,
-        Err(Read::TooLarge) => return Err(unreachable("body over 64 KiB", what)),
+        Err(Read::TooLarge) => return Err(unreachable("body over the cap", what)),
         Err(Read::Failed(e)) => return Err(unreachable(e.without_url(), what)),
     };
     serde_json::from_slice(&buf).map_err(|e| unreachable(e, what))
@@ -176,6 +194,7 @@ impl Bluesky {
             plc: plc.into(),
             allow_insecure_pds: false,
             client,
+            sessions: Arc::default(),
         })
     }
 
@@ -199,7 +218,9 @@ impl Bluesky {
             return Err(Error::InvalidCredentials);
         }
         let profile = self.profile(&id.did).await;
+        let dm_access = privileged(&jwt) && self.chat_ok(&id.pds, &jwt).await;
         Ok(Account {
+            dm_access,
             // The handle confirmed both ways in `resolve`; the PDS's own claim is not trusted.
             handle: handle.to_owned(),
             display_name: profile.as_ref().and_then(|p| p.display_name.clone()),
@@ -536,22 +557,7 @@ impl Bluesky {
             }
             images.push(serde_json::json!({ "alt": "", "image": up["blob"] }));
         }
-        let facets: Vec<Value> = socialreins_core::post::links(text)
-            .into_iter()
-            .map(|l| {
-                serde_json::json!({
-                    "index": { "byteStart": l.start, "byteEnd": l.end },
-                    "features": [{ "$type": "app.bsky.richtext.facet#link", "uri": l.url }],
-                })
-            })
-            .collect();
-        let created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let mut record = serde_json::json!({
-            "$type": POST_COLLECTION, "text": text, "createdAt": created,
-        });
-        if !facets.is_empty() {
-            record["facets"] = facets.into();
-        }
+        let mut record = post_record(text, &[], None);
         if !images.is_empty() {
             record["embed"] =
                 serde_json::json!({ "$type": "app.bsky.embed.images", "images": images });
@@ -583,6 +589,457 @@ impl Bluesky {
         self.call_json(&pds, &jwt, "com.atproto.repo.deleteRecord", &body)
             .await
             .map(|_| ())
+    }
+}
+
+/// Chat calls go to the account's PDS, which forwards them to Bluesky's chat service.
+const CHAT_PROXY: &str = "did:web:api.bsky.chat#bsky_chat";
+/// Ingest reads at most this many notifications, and messages of this many conversations, a
+/// round; a first round reads back at most `inbox::FIRST_DAYS`.
+const MAX_NOTIFICATIONS: usize = 300;
+const MAX_CONVOS: usize = 20;
+
+/// Why an inbox call failed. `code` is stored on automation runs and sent to the API.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InboxError {
+    /// The app password was refused: the account must be connected again.
+    Reconnect,
+    /// The app password was made without DM access.
+    NoDmAccess,
+    /// The recipient's settings do not take DMs from this account.
+    DmNotAllowed,
+    RateLimited,
+    /// Bluesky answered with an error; `code` is a scrubbed XRPC error name.
+    Refused {
+        status: u16,
+        code: String,
+    },
+    Unreachable,
+    /// Not sent, for a reason found before calling (e.g. `unsupported_pds`, `too_long`).
+    Invalid(&'static str),
+}
+
+impl InboxError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Reconnect => "reconnect_required",
+            Self::NoDmAccess => "no_dm_access",
+            Self::DmNotAllowed => "dm_not_allowed",
+            Self::RateLimited => "rate_limited",
+            Self::Refused { .. } => "bluesky_refused",
+            Self::Unreachable => "bluesky_unreachable",
+            Self::Invalid(code) => code,
+        }
+    }
+
+    /// What to tell a person; never holds a URL, token or secret.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Reconnect => {
+                "Bluesky refused the app password. Reconnect the account under Connections.".into()
+            }
+            Self::NoDmAccess => "The app password has no DM access. Make one with \"Allow access \
+                                 to your direct messages\" and reconnect the account."
+                .into(),
+            Self::DmNotAllowed => "Bluesky did not take the DM: the recipient's settings do not \
+                                   allow messages from this account."
+                .into(),
+            Self::RateLimited => "Bluesky is rate limiting this account.".into(),
+            Self::Refused { code, .. } => format!("Bluesky refused it ({code})."),
+            Self::Unreachable => "Bluesky could not be reached.".into(),
+            Self::Invalid(code) => format!("Not sent ({code})."),
+        }
+    }
+}
+
+/// An open session, kept until 5 minutes before it expires: polling every minute must not open
+/// a session each time (Bluesky allows 300 a day per account).
+#[derive(Clone)]
+struct Live {
+    pds: String,
+    jwt: String,
+    exp: i64,
+    privileged: bool,
+}
+
+/// An account's PDS (`meta.pds`, checked again), DID and app password.
+pub struct Creds<'a> {
+    pub pds: &'a str,
+    pub did: &'a str,
+    pub password: &'a str,
+}
+
+/// Someone on Bluesky.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Author {
+    pub did: String,
+    pub handle: Option<String>,
+    pub display_name: Option<String>,
+    pub avatar: Option<String>,
+}
+
+fn author(v: &Value) -> Option<Author> {
+    let text = |k: &str| v[k].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+    Some(Author {
+        did: text("did")?,
+        handle: text("handle"),
+        display_name: text("displayName"),
+        avatar: text("avatar"),
+    })
+}
+
+/// A reply to the account (`comment`) or a mention or quote of it (`mention`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Notification {
+    pub kind: &'static str,
+    pub uri: String,
+    pub cid: Option<String>,
+    pub author: Author,
+    pub text: String,
+    pub parent_uri: Option<String>,
+    /// The thread root; the post itself when it is not a reply.
+    pub root: (String, Option<String>),
+    pub indexed_at: DateTime<FixedOffset>,
+}
+
+fn time(v: &Value) -> Option<DateTime<FixedOffset>> {
+    DateTime::parse_from_rfc3339(v.as_str()?).ok()
+}
+
+/// One `listNotifications` entry; `None` for other reasons or a malformed entry.
+pub fn notification(n: &Value) -> Option<Notification> {
+    let kind = match n["reason"].as_str()? {
+        "reply" => "comment",
+        "mention" | "quote" => "mention",
+        _ => return None,
+    };
+    let uri = n["uri"].as_str()?.to_owned();
+    let cid = n["cid"].as_str().map(str::to_owned);
+    let reply = &n["record"]["reply"];
+    let root = match reply["root"]["uri"].as_str() {
+        Some(r) => (
+            r.to_owned(),
+            reply["root"]["cid"].as_str().map(str::to_owned),
+        ),
+        None => (uri.clone(), cid.clone()),
+    };
+    Some(Notification {
+        kind,
+        cid,
+        author: author(&n["author"])?,
+        text: n["record"]["text"].as_str().unwrap_or_default().to_owned(),
+        parent_uri: reply["parent"]["uri"].as_str().map(str::to_owned),
+        root,
+        indexed_at: time(&n["indexedAt"])?,
+        uri,
+    })
+}
+
+/// A DM someone sent the account.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Message {
+    pub convo_id: String,
+    pub id: String,
+    pub sender: Author,
+    pub text: String,
+    pub sent_at: DateTime<FixedOffset>,
+}
+
+fn now_secs() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn login_error(e: Error) -> InboxError {
+    match e {
+        Error::InvalidCredentials => InboxError::Reconnect,
+        Error::RateLimited => InboxError::RateLimited,
+        Error::UnsupportedPds => InboxError::Invalid("unsupported_pds"),
+        Error::InvalidHandle | Error::Unreachable => InboxError::Unreachable,
+    }
+}
+
+impl Bluesky {
+    /// A cached session for `c`, or a new one when `fresh` or none is left.
+    async fn live(&self, c: &Creds<'_>, fresh: bool) -> Result<Live, InboxError> {
+        let key = format!("{}:{}", c.did, socialreins_core::token::hash(c.password));
+        let now = now_secs();
+        if !fresh {
+            let cached = self.sessions.lock().ok().and_then(|m| m.get(&key).cloned());
+            if let Some(s) = cached.filter(|s| s.exp > now + 300) {
+                return Ok(s);
+            }
+        }
+        let pds = self.checked_pds(c.pds).map_err(login_error)?;
+        let jwt = self
+            .session(&pds, c.did, c.password)
+            .await
+            .map_err(login_error)?;
+        let exp = claims(&jwt)
+            .and_then(|c| c["exp"].as_i64())
+            .unwrap_or(now + 600);
+        let live = Live {
+            privileged: privileged(&jwt),
+            pds,
+            jwt,
+            exp,
+        };
+        if let Ok(mut m) = self.sessions.lock() {
+            m.retain(|_, s| s.exp > now);
+            m.insert(key, live.clone());
+        }
+        Ok(live)
+    }
+
+    fn forget(&self, c: &Creds<'_>) {
+        let key = format!("{}:{}", c.did, socialreins_core::token::hash(c.password));
+        if let Ok(mut m) = self.sessions.lock() {
+            m.remove(&key);
+        }
+    }
+
+    /// An XRPC call on the account's PDS: a GET with `query`, or a POST of `body`. `chat.*`
+    /// methods go through the chat proxy and need DM access. A rejected session is opened again
+    /// once: the call never ran, so this cannot send twice.
+    async fn xrpc(
+        &self,
+        c: &Creds<'_>,
+        method: &str,
+        query: &[(&str, &str)],
+        body: Option<&Value>,
+    ) -> Result<Value, InboxError> {
+        let chat = method.starts_with("chat.");
+        for fresh in [false, true] {
+            let s = self.live(c, fresh).await?;
+            if chat && !s.privileged {
+                return Err(InboxError::NoDmAccess);
+            }
+            let url = format!("{}/xrpc/{method}", s.pds);
+            let mut req = match body {
+                Some(b) => self.client.post(url).json(b),
+                None => self.client.get(url).query(query),
+            };
+            req = req.bearer_auth(&s.jwt);
+            if chat {
+                req = req.header("atproto-proxy", CHAT_PROXY);
+            }
+            let res = req.send().await.map_err(|e| {
+                tracing::warn!(error = %e.without_url(), method, "bluesky call failed");
+                InboxError::Unreachable
+            })?;
+            let status = res.status();
+            let answer: Value = json_capped(res, MAX_LIST_BODY, method)
+                .await
+                .unwrap_or_default();
+            let code = xrpc_code(&answer, status);
+            let expired = status == StatusCode::UNAUTHORIZED
+                || (status == StatusCode::BAD_REQUEST
+                    && matches!(code.as_str(), "ExpiredToken" | "InvalidToken"));
+            match status {
+                StatusCode::OK => return Ok(answer),
+                _ if expired => self.forget(c),
+                StatusCode::TOO_MANY_REQUESTS => return Err(InboxError::RateLimited),
+                s => {
+                    return Err(InboxError::Refused {
+                        status: s.as_u16(),
+                        code,
+                    })
+                }
+            }
+        }
+        Err(InboxError::Reconnect)
+    }
+
+    /// Replies and mentions newer than `since`, newest first, at most `MAX_NOTIFICATIONS`.
+    /// Never marks them read.
+    pub async fn notifications(
+        &self,
+        c: &Creds<'_>,
+        since: DateTime<FixedOffset>,
+    ) -> Result<Vec<Notification>, InboxError> {
+        let mut found = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut read = 0;
+        while read < MAX_NOTIFICATIONS {
+            let mut query = vec![
+                ("limit", "100"),
+                ("reasons", "reply"),
+                ("reasons", "mention"),
+                ("reasons", "quote"),
+            ];
+            if let Some(c) = &cursor {
+                query.push(("cursor", c));
+            }
+            let page = self
+                .xrpc(c, "app.bsky.notification.listNotifications", &query, None)
+                .await?;
+            let list = page["notifications"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            read += list.len();
+            for n in &list {
+                if time(&n["indexedAt"]).is_some_and(|t| t <= since) {
+                    return Ok(found);
+                }
+                found.extend(notification(n));
+            }
+            cursor = page["cursor"].as_str().map(str::to_owned);
+            if list.is_empty() || cursor.is_none() {
+                break;
+            }
+        }
+        Ok(found)
+    }
+
+    /// Whether the account can use DMs: a privileged app password that the chat service takes.
+    /// An outage is `Err`, so a caller can keep what it knew.
+    pub async fn check_dm_access(&self, c: &Creds<'_>) -> Result<bool, InboxError> {
+        let q = [("limit", "1")];
+        match self.xrpc(c, "chat.bsky.convo.listConvos", &q, None).await {
+            Ok(_) => Ok(true),
+            Err(InboxError::NoDmAccess | InboxError::Refused { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `listConvos` with a token from `connect`, for the connection's `dm_access`.
+    async fn chat_ok(&self, pds: &str, jwt: &str) -> bool {
+        let url = format!("{pds}/xrpc/chat.bsky.convo.listConvos");
+        let res = self
+            .client
+            .get(url)
+            .query(&[("limit", "1")])
+            .bearer_auth(jwt)
+            .header("atproto-proxy", CHAT_PROXY)
+            .send()
+            .await;
+        matches!(res, Ok(r) if r.status() == StatusCode::OK)
+    }
+
+    /// DMs others sent the account after `since`, and the newest message time seen (ours
+    /// included), the next `since`. Reads the 50 latest conversations, and messages of at most
+    /// `MAX_CONVOS` of them.
+    pub async fn messages(
+        &self,
+        c: &Creds<'_>,
+        since: DateTime<FixedOffset>,
+    ) -> Result<(Vec<Message>, Option<DateTime<FixedOffset>>), InboxError> {
+        let q = [("limit", "50")];
+        let page = self.xrpc(c, "chat.bsky.convo.listConvos", &q, None).await?;
+        let mut found = Vec::new();
+        let mut newest: Option<DateTime<FixedOffset>> = None;
+        let convos = page["convos"].as_array().cloned().unwrap_or_default();
+        let fresh = convos.iter().filter_map(|convo| {
+            let last = time(&convo["lastMessage"]["sentAt"])?;
+            (last > since).then_some((convo, last))
+        });
+        for (convo, last) in fresh.take(MAX_CONVOS) {
+            let Some(id) = convo["id"].as_str() else {
+                continue;
+            };
+            let q = [("convoId", id), ("limit", "50")];
+            let msgs = self
+                .xrpc(c, "chat.bsky.convo.getMessages", &q, None)
+                .await?;
+            newest = newest.max(Some(last));
+            let members = convo["members"].as_array().cloned().unwrap_or_default();
+            for m in msgs["messages"].as_array().into_iter().flatten() {
+                if m["$type"] != "chat.bsky.convo.defs#messageView" {
+                    continue;
+                }
+                let (Some(mid), Some(sent_at)) = (m["id"].as_str(), time(&m["sentAt"])) else {
+                    continue;
+                };
+                let sender = m["sender"]["did"].as_str().unwrap_or_default();
+                if sent_at <= since || sender == c.did || sender.is_empty() {
+                    continue;
+                }
+                let profile = members.iter().find(|p| p["did"] == sender);
+                found.push(Message {
+                    convo_id: id.to_owned(),
+                    id: mid.to_owned(),
+                    sender: profile.and_then(author).unwrap_or_else(|| Author {
+                        did: sender.to_owned(),
+                        ..Author::default()
+                    }),
+                    text: m["text"].as_str().unwrap_or_default().to_owned(),
+                    sent_at,
+                });
+            }
+        }
+        Ok((found, newest))
+    }
+
+    /// Replies to `parent` in the thread of `root`; returns the reply's `at://` URI, empty when
+    /// Bluesky took it without saying which (it was still sent). `skip`: see `facets`.
+    pub async fn reply(
+        &self,
+        c: &Creds<'_>,
+        text: &str,
+        skip: &[Range<usize>],
+        parent: Ref<'_>,
+        root: Ref<'_>,
+    ) -> Result<String, InboxError> {
+        let record = post_record(text, skip, Some((parent, root)));
+        let body =
+            serde_json::json!({ "repo": c.did, "collection": POST_COLLECTION, "record": record });
+        let made = self
+            .xrpc(c, "com.atproto.repo.createRecord", &[], Some(&body))
+            .await?;
+        let uri = made["uri"].as_str().filter(|u| post_key(u).is_some());
+        Ok(uri.unwrap_or_default().to_owned())
+    }
+
+    /// Sends a DM in `convo`, or to `to` (a DID) when there is none yet; returns the message
+    /// id, empty when Bluesky did not say (it was still sent). `dm_not_allowed` when the
+    /// recipient does not take messages from the account. `skip`: see `facets`.
+    pub async fn send_dm(
+        &self,
+        c: &Creds<'_>,
+        convo: Option<&str>,
+        to: &str,
+        text: &str,
+        skip: &[Range<usize>],
+    ) -> Result<String, InboxError> {
+        let convo = match convo {
+            Some(id) => id.to_owned(),
+            None => {
+                let q = [("members", to)];
+                let can = self
+                    .xrpc(c, "chat.bsky.convo.getConvoAvailability", &q, None)
+                    .await?;
+                if can["canChat"] != true {
+                    return Err(InboxError::DmNotAllowed);
+                }
+                match can["convo"]["id"].as_str() {
+                    Some(id) => id.to_owned(),
+                    None => {
+                        let made = self
+                            .xrpc(c, "chat.bsky.convo.getConvoForMembers", &q, None)
+                            .await?;
+                        made["convo"]["id"]
+                            .as_str()
+                            .ok_or(InboxError::Invalid("no_convo"))?
+                            .to_owned()
+                    }
+                }
+            }
+        };
+        let mut message = serde_json::json!({ "text": text });
+        let facets = facets(text, skip);
+        if !facets.is_empty() {
+            message["facets"] = facets.into();
+        }
+        let body = serde_json::json!({ "convoId": convo, "message": message });
+        let sent = self
+            .xrpc(c, "chat.bsky.convo.sendMessage", &[], Some(&body))
+            .await
+            .map_err(|e| match e {
+                // The chat service answers 400 when the recipient's settings refuse the sender.
+                InboxError::Refused { status: 400, .. } => InboxError::DmNotAllowed,
+                e => e,
+            })?;
+        Ok(sent["id"].as_str().unwrap_or_default().to_owned())
     }
 }
 
@@ -679,16 +1136,62 @@ fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     }
 }
 
+/// Link facets for `text`, as posts and chat messages take them, leaving out any link that
+/// touches a byte range in `skip` (text filled in from someone else, e.g. a commenter's name),
+/// so nobody can make us send a live link.
+fn facets(text: &str, skip: &[Range<usize>]) -> Vec<Value> {
+    socialreins_core::post::links(text)
+        .into_iter()
+        .filter(|l| !skip.iter().any(|r| l.start < r.end && r.start < l.end))
+        .map(|l| {
+            serde_json::json!({
+                "index": { "byteStart": l.start, "byteEnd": l.end },
+                "features": [{ "$type": "app.bsky.richtext.facet#link", "uri": l.url }],
+            })
+        })
+        .collect()
+}
+
+/// A post record, a reply when `reply` holds `(parent, root)` as `(uri, cid)` pairs.
+pub fn post_record(text: &str, skip: &[Range<usize>], reply: Option<(Ref<'_>, Ref<'_>)>) -> Value {
+    let created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let mut record = serde_json::json!({
+        "$type": POST_COLLECTION, "text": text, "createdAt": created,
+    });
+    let facets = facets(text, skip);
+    if !facets.is_empty() {
+        record["facets"] = facets.into();
+    }
+    if let Some((parent, root)) = reply {
+        record["reply"] = serde_json::json!({
+            "root": { "uri": root.0, "cid": root.1 },
+            "parent": { "uri": parent.0, "cid": parent.1 },
+        });
+    }
+    record
+}
+
+/// A post's `(at:// uri, cid)`.
+pub type Ref<'a> = (&'a str, &'a str);
+
+/// The access token's claims; `None` when unreadable.
+fn claims(jwt: &str) -> Option<Value> {
+    jwt.split('.')
+        .nth(1)
+        .and_then(|p| URL_SAFE_NO_PAD.decode(p.trim_end_matches('=')).ok())
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+}
+
+/// An app password made with "Allow access to your direct messages".
+fn privileged(jwt: &str) -> bool {
+    claims(jwt).is_some_and(|c| c["scope"] == "com.atproto.appPassPrivileged")
+}
+
 /// The session's access token carries the account password's full scope
 /// (`com.atproto.access`); an app password gets `com.atproto.appPass` or
 /// `com.atproto.appPassPrivileged`. An unreadable token is not treated as full access.
 fn full_access(jwt: &str) -> bool {
-    let claims = jwt
-        .split('.')
-        .nth(1)
-        .and_then(|p| URL_SAFE_NO_PAD.decode(p.trim_end_matches('=')).ok())
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
-    claims.is_some_and(|c| c["scope"] == "com.atproto.access")
+    claims(jwt).is_some_and(|c| c["scope"] == "com.atproto.access")
 }
 
 #[cfg(test)]
@@ -833,6 +1336,66 @@ mod tests {
     }
 
     #[test]
+    fn notifications_parse_into_comments_and_mentions() {
+        let n = serde_json::json!({
+            "uri": "at://did:plc:fan/app.bsky.feed.post/r1", "cid": "c1", "reason": "reply",
+            "author": {"did": "did:plc:fan", "handle": "fan.test", "displayName": "Fan"},
+            "record": {"text": "hi", "reply": {
+                "root": {"uri": "at://did:plc:me/app.bsky.feed.post/p0", "cid": "c0"},
+                "parent": {"uri": "at://did:plc:me/app.bsky.feed.post/p1", "cid": "cp"}}},
+            "indexedAt": "2026-10-30T10:00:00.000Z",
+        });
+        let got = notification(&n).unwrap();
+        assert_eq!(got.kind, "comment");
+        assert_eq!(got.author.display_name.as_deref(), Some("Fan"));
+        assert_eq!(
+            got.parent_uri.as_deref(),
+            Some("at://did:plc:me/app.bsky.feed.post/p1")
+        );
+        assert_eq!(got.root.0, "at://did:plc:me/app.bsky.feed.post/p0");
+        let mut quote = n.clone();
+        quote["reason"] = "quote".into();
+        quote["record"] = serde_json::json!({"text": "look"});
+        let got = notification(&quote).unwrap();
+        assert_eq!(got.kind, "mention");
+        assert_eq!(
+            got.root,
+            (
+                "at://did:plc:fan/app.bsky.feed.post/r1".into(),
+                Some("c1".into())
+            )
+        );
+        let mut like = n;
+        like["reason"] = "like".into();
+        assert_eq!(notification(&like), None);
+    }
+
+    #[test]
+    fn reply_records_point_at_parent_and_root() {
+        let r = post_record(
+            "thanks https://x.io",
+            &[],
+            Some((("at://p", "cp"), ("at://r", "cr"))),
+        );
+        assert_eq!(r["$type"], POST_COLLECTION);
+        assert_eq!(
+            r["reply"]["parent"],
+            serde_json::json!({"uri": "at://p", "cid": "cp"})
+        );
+        assert_eq!(
+            r["reply"]["root"],
+            serde_json::json!({"uri": "at://r", "cid": "cr"})
+        );
+        assert_eq!(r["facets"][0]["features"][0]["uri"], "https://x.io");
+        assert!(post_record("plain", &[], None).get("reply").is_none());
+        // A link touching filled-in text gets no facet; the template's own link keeps one.
+        let text = "Hi https://evil.example see https://x.io";
+        let r = post_record(text, std::slice::from_ref(&(3..23)), None);
+        assert_eq!(r["facets"].as_array().unwrap().len(), 1);
+        assert_eq!(r["facets"][0]["features"][0]["uri"], "https://x.io");
+    }
+
+    #[test]
     fn only_the_full_access_scope_counts_as_an_account_password() {
         let jwt = |scope: &str| {
             let claims = serde_json::json!({ "scope": scope }).to_string();
@@ -842,5 +1405,7 @@ mod tests {
         assert!(!full_access(&jwt("com.atproto.appPass")));
         assert!(!full_access(&jwt("com.atproto.appPassPrivileged")));
         assert!(!full_access("garbage"));
+        assert!(privileged(&jwt("com.atproto.appPassPrivileged")));
+        assert!(!privileged(&jwt("com.atproto.appPass")));
     }
 }
