@@ -51,6 +51,15 @@ pub struct Automation {
     pub created_by: Option<Uuid>,
     pub created_at: DateTime<FixedOffset>,
     pub updated_at: DateTime<FixedOffset>,
+    /// How often it ran; only in the list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runs: Option<RunStats>,
+}
+
+#[derive(Serialize, ToSchema, Default)]
+pub struct RunStats {
+    pub count: i64,
+    pub last_at: Option<DateTime<FixedOffset>>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -129,6 +138,7 @@ fn automation_json(a: automations::Model) -> Automation {
         created_by: a.created_by,
         created_at: a.created_at,
         updated_at: a.updated_at,
+        runs: None,
     }
 }
 
@@ -175,18 +185,49 @@ async fn checked(
     Ok(Ok((name, input)))
 }
 
-/// The team's automations, oldest first.
+/// The team's automations, oldest first, each with its run count and last run.
 #[utoipa::path(get, path = "/automations", tag = "automations",
     responses((status = 200, body = [Automation]), (status = 401, body = Error)))]
 async fn list(State(app): State<AppState>, t: InTeam) -> Response {
-    let rows = automations::Entity::find()
-        .filter(automations::Column::TeamId.eq(t.team.id))
-        .order_by_asc(automations::Column::CreatedAt)
-        .order_by_asc(automations::Column::Id)
-        .all(&app.db)
-        .await;
-    match rows {
-        Ok(rows) => Json(rows.into_iter().map(automation_json).collect::<Vec<_>>()).into_response(),
+    let found = async {
+        let rows = automations::Entity::find()
+            .filter(automations::Column::TeamId.eq(t.team.id))
+            .order_by_asc(automations::Column::CreatedAt)
+            .order_by_asc(automations::Column::Id)
+            .all(&app.db)
+            .await?;
+        let stats = app
+            .db
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT automation_id, COUNT(*) AS count, MAX(created_at) AS last_at \
+                 FROM automation_runs WHERE team_id = $1 GROUP BY automation_id",
+                [t.team.id.into()],
+            ))
+            .await?;
+        let mut stats = stats
+            .iter()
+            .map(|r| {
+                let id: Uuid = r.try_get("", "automation_id")?;
+                let count = r.try_get("", "count")?;
+                let last_at = r.try_get("", "last_at")?;
+                Ok((id, RunStats { count, last_at }))
+            })
+            .collect::<Result<std::collections::HashMap<_, _>, DbErr>>()?;
+        Ok::<_, DbErr>(
+            rows.into_iter()
+                .map(|a| {
+                    let runs = stats.remove(&a.id).unwrap_or_default();
+                    Automation {
+                        runs: Some(runs),
+                        ..automation_json(a)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    match found.await {
+        Ok(list) => Json(list).into_response(),
         Err(e) => internal(e, "automation list"),
     }
 }

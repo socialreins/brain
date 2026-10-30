@@ -4563,6 +4563,15 @@ mod teams {
                     .add_header("cookie", &cookie)
                     .await;
                 assert_eq!(res.status_code(), 422);
+                // Kind narrows the page server-side; an unknown kind is refused.
+                let mentions = items(&s, &cookie, all_id, "?kind=mention").await;
+                assert_eq!(mentions["items"].as_array().unwrap().len(), 1);
+                assert_eq!(mentions["items"][0]["kind"], "mention");
+                let res = s
+                    .get(&format!("/v1/inboxes/{all_id}/items?kind=like"))
+                    .add_header("cookie", &cookie)
+                    .await;
+                assert_eq!(res.status_code(), 422);
 
                 // A filtered inbox: DMs and keyword matches only show where they match.
                 let res = req(&s, Method::POST, "/v1/inboxes", &cookie)
@@ -4867,6 +4876,10 @@ mod teams {
                 ingest(&db, &state, &account).await;
                 let got = runs(&s, &member, &id).await;
                 assert_eq!(got.len(), 2, "first comment of fan1, and closed1: {got:?}");
+                let res = s.get("/v1/automations").add_header("cookie", &member).await;
+                let listed = &res.json::<Value>()[0];
+                assert_eq!(listed["runs"]["count"], 2);
+                assert_eq!(listed["runs"]["last_at"], got[0]["created_at"]);
                 // Newest first: closed1 got the fallback reply, fan1 the DM.
                 assert_eq!(got[0]["status"], "sent", "{got:?}");
                 assert_eq!(got[0]["reason"], "dm_not_allowed", "{got:?}");

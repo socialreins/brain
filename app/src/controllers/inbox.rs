@@ -124,6 +124,8 @@ pub struct ItemPage {
 pub struct ItemQuery {
     /// `open` or `done`; both when absent.
     pub state: Option<String>,
+    /// `comment`, `mention` or `dm`, within the inbox's own filters; every kind when absent.
+    pub kind: Option<String>,
     /// `next_cursor` of the previous page.
     pub cursor: Option<Uuid>,
     /// 1 to 100, default 50.
@@ -430,6 +432,7 @@ pub fn items_sql(
     team_id: Uuid,
     filters: &Filters,
     state: Option<&str>,
+    kind: Option<&str>,
     cursor: Option<Uuid>,
     limit: u64,
 ) -> Statement {
@@ -439,6 +442,10 @@ pub fn items_sql(
     if let Some(state) = state {
         values.push(state.to_owned().into());
         sql += &format!(" AND i.state = ${}", values.len());
+    }
+    if let Some(kind) = kind {
+        values.push(kind.to_owned().into());
+        sql += &format!(" AND i.kind = ${}", values.len());
     }
     if let Some(c) = cursor {
         values.push(c.into());
@@ -475,7 +482,11 @@ async fn items(
         .state
         .as_deref()
         .is_none_or(|s| s == "open" || s == "done");
-    if !state_ok || !(1..=MAX_PAGE).contains(&limit) {
+    let kind_ok = q
+        .kind
+        .as_deref()
+        .is_none_or(|k| matches!(k, "comment" | "mention" | "dm"));
+    if !state_ok || !kind_ok || !(1..=MAX_PAGE).contains(&limit) {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     }
     let found = async {
@@ -483,7 +494,14 @@ async fn items(
             return Ok(None);
         };
         let filters: Filters = serde_json::from_value(found.filters).unwrap_or_default();
-        let stmt = items_sql(t.team.id, &filters, q.state.as_deref(), q.cursor, limit);
+        let stmt = items_sql(
+            t.team.id,
+            &filters,
+            q.state.as_deref(),
+            q.kind.as_deref(),
+            q.cursor,
+            limit,
+        );
         let mut rows = inbox_items::Entity::find()
             .from_raw_sql(stmt)
             .all(&app.db)
@@ -668,16 +686,16 @@ mod tests {
             kinds: vec!["dm".into()],
             ..Filters::default()
         };
-        let stmt = items_sql(team, &f, Some("open"), Some(Uuid::nil()), 50);
+        let stmt = items_sql(team, &f, Some("open"), Some("dm"), Some(Uuid::nil()), 50);
         assert_eq!(
             stmt.sql,
             "SELECT i.* FROM inbox_items i WHERE i.team_id = $1 AND i.kind IN ($2) \
-             AND i.state = $3 AND (i.received_at, i.id) < (SELECT c.received_at, c.id \
-             FROM inbox_items c WHERE c.id = $4 AND c.team_id = $1) \
-             ORDER BY i.received_at DESC, i.id DESC LIMIT $5"
+             AND i.state = $3 AND i.kind = $4 AND (i.received_at, i.id) < (SELECT c.received_at, c.id \
+             FROM inbox_items c WHERE c.id = $5 AND c.team_id = $1) \
+             ORDER BY i.received_at DESC, i.id DESC LIMIT $6"
         );
         let values = stmt.values.unwrap().0;
-        assert_eq!(values.len(), 5);
-        assert_eq!(values[4], Value::from(51i64));
+        assert_eq!(values.len(), 6);
+        assert_eq!(values[5], Value::from(51i64));
     }
 }
