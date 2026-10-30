@@ -1,3 +1,8 @@
+pub mod automation_runs;
+pub mod automations;
+pub mod inbox_items;
+pub mod inbox_replies;
+pub mod inboxes;
 pub mod magic_links;
 pub mod passkey_challenges;
 pub mod passkeys;

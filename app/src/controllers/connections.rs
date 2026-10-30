@@ -51,6 +51,10 @@ pub struct Connection {
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
     pub token_expires_at: Option<DateTime<FixedOffset>>,
+    /// The app password may read and send DMs. On Bluesky that needs an app password made with
+    /// "Allow access to your direct messages"; without it comments and mentions still arrive.
+    /// Checked on connect and again on every inbox poll.
+    pub dm_access: bool,
     /// The social sets holding the account; the team's Default set is always one of them.
     pub set_ids: Vec<Uuid>,
     pub created_at: DateTime<FixedOffset>,
@@ -140,6 +144,7 @@ fn connection_json(a: social_accounts::Model, set_ids: Vec<Uuid>) -> Connection 
         display_name: a.display_name,
         avatar_url: a.avatar_url,
         token_expires_at: a.token_expires_at,
+        dm_access: a.dm_access,
         set_ids,
         created_at: a.created_at,
     }
@@ -329,9 +334,12 @@ async fn connect_bluesky(
         access_token: Set(app.cipher.encrypt(body.app_password.as_bytes())),
         token_expires_at: Set(None),
         meta: Set(serde_json::json!({ "pds": verified.pds })),
+        dm_access: Set(verified.dm_access),
+        inbox_error_at: Set(None),
         created_by: Set(Some(user_id)),
         created_at: Set(now),
         updated_at: Set(now),
+        ..Default::default()
     };
     let saved = async {
         let txn = app.db.begin().await?;
@@ -348,6 +356,8 @@ async fn connect_bluesky(
             social_accounts::Column::AvatarUrl,
             social_accounts::Column::AccessToken,
             social_accounts::Column::Meta,
+            social_accounts::Column::DmAccess,
+            social_accounts::Column::InboxErrorAt,
             social_accounts::Column::UpdatedAt,
         ])
         .to_owned();

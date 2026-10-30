@@ -2414,8 +2414,12 @@ mod teams {
         const NEW_APP_PASSWORD: &str = "qrst-uvwx-yzab-cdef";
         const ACCOUNT_PASSWORD: &str = "the-account-password";
 
-        fn jwt(scope: &str) -> String {
-            let claims = json!({ "scope": scope }).to_string();
+        /// An app password made with DM access.
+        const DM_APP_PASSWORD: &str = "dmdm-efgh-ijkl-mnop";
+
+        /// A token naming its account in `sub`, so the mock can answer per account.
+        fn jwt_for(scope: &str, did: &str) -> String {
+            let claims = json!({ "scope": scope, "sub": did }).to_string();
             format!("e30.{}.sig", URL_SAFE_NO_PAD.encode(claims))
         }
 
@@ -2470,6 +2474,7 @@ mod teams {
                 let handle = format!("{}.test", did.trim_start_matches("did:plc:"));
                 let scope = match b["password"].as_str() {
                     Some(APP_PASSWORD | NEW_APP_PASSWORD) => "com.atproto.appPass",
+                    Some(DM_APP_PASSWORD) => "com.atproto.appPassPrivileged",
                     Some(ACCOUNT_PASSWORD) => "com.atproto.access",
                     Some("needs-2fa") => {
                         return (
@@ -2484,7 +2489,7 @@ mod teams {
                         )
                     }
                 };
-                let body = json!({"did": did, "handle": handle, "accessJwt": jwt(scope),
+                let body = json!({"did": did, "handle": handle, "accessJwt": jwt_for(scope, &did),
                     "refreshJwt": "r"});
                 (axum::http::StatusCode::OK, Json(body))
             };
@@ -2500,6 +2505,21 @@ mod teams {
                 .route("/xrpc/com.atproto.repo.uploadBlob", post(upload_blob))
                 .route("/xrpc/com.atproto.repo.createRecord", post(create_record))
                 .route("/xrpc/com.atproto.repo.deleteRecord", post(delete_record))
+                .route(
+                    "/xrpc/app.bsky.notification.listNotifications",
+                    get(list_notifications),
+                )
+                .route("/xrpc/chat.bsky.convo.listConvos", get(list_convos))
+                .route("/xrpc/chat.bsky.convo.getMessages", get(get_messages))
+                .route(
+                    "/xrpc/chat.bsky.convo.getConvoAvailability",
+                    get(convo_availability),
+                )
+                .route(
+                    "/xrpc/chat.bsky.convo.getConvoForMembers",
+                    get(convo_for_members),
+                )
+                .route("/xrpc/chat.bsky.convo.sendMessage", post(send_message))
                 .route("/img.png", get(|| async { image("image/png", 64) }))
                 .route("/big.png", get(|| async { image("image/png", 1_000_001) }))
                 .route("/page.html", get(|| async { image("text/html", 64) }))
@@ -2507,6 +2527,140 @@ mod teams {
                 .with_state(base.clone());
             tokio::spawn(async move { axum::serve(listener, app).await });
             base
+        }
+
+        /// What the mock's inbox endpoints answer, per account DID: `notifications` (a list),
+        /// `convos` (a list) and `messages` (convo id to list).
+        static INBOX: std::sync::Mutex<Option<HashMap<String, Value>>> =
+            std::sync::Mutex::new(None);
+        /// Every `sendMessage` body the mock took, newest last.
+        static SENT: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+
+        fn set_inbox(did: &str, data: Value) {
+            INBOX
+                .lock()
+                .unwrap()
+                .get_or_insert_with(HashMap::new)
+                .insert(did.to_owned(), data);
+        }
+
+        /// The account a request's token names, and whether the token has DM access.
+        fn caller(headers: &axum::http::HeaderMap) -> Option<(String, bool)> {
+            let jwt = headers.get("authorization")?.to_str().ok()?;
+            let part = jwt.strip_prefix("Bearer ")?.split('.').nth(1)?;
+            let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(part).ok()?).ok()?;
+            let privileged = claims["scope"] == "com.atproto.appPassPrivileged";
+            Some((claims["sub"].as_str()?.to_owned(), privileged))
+        }
+
+        fn inbox_of(did: &str) -> Value {
+            INBOX
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|m| m.get(did).cloned())
+                .unwrap_or_else(|| json!({}))
+        }
+
+        type Answer = (axum::http::StatusCode, Json<Value>);
+
+        fn refused(status: u16, error: &str) -> Answer {
+            (
+                axum::http::StatusCode::from_u16(status).unwrap(),
+                Json(json!({ "error": error })),
+            )
+        }
+
+        async fn list_notifications(headers: axum::http::HeaderMap) -> Answer {
+            let Some((did, _)) = caller(&headers) else {
+                return refused(401, "AuthenticationRequired");
+            };
+            let list = inbox_of(&did)["notifications"].clone();
+            let list = if list.is_null() { json!([]) } else { list };
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({ "notifications": list })),
+            )
+        }
+
+        /// The chat proxy: refuses tokens without DM access, like Bluesky.
+        fn chat_caller(headers: &axum::http::HeaderMap) -> Result<String, Answer> {
+            let proxied = headers
+                .get("atproto-proxy")
+                .is_some_and(|v| v == "did:web:api.bsky.chat#bsky_chat");
+            match caller(headers) {
+                Some((did, true)) if proxied => Ok(did),
+                Some(_) => Err(refused(400, "InvalidToken")),
+                None => Err(refused(401, "AuthenticationRequired")),
+            }
+        }
+
+        async fn list_convos(headers: axum::http::HeaderMap) -> Answer {
+            let did = match chat_caller(&headers) {
+                Ok(d) => d,
+                Err(a) => return a,
+            };
+            let list = inbox_of(&did)["convos"].clone();
+            let list = if list.is_null() { json!([]) } else { list };
+            (axum::http::StatusCode::OK, Json(json!({ "convos": list })))
+        }
+
+        async fn get_messages(
+            headers: axum::http::HeaderMap,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> Answer {
+            let did = match chat_caller(&headers) {
+                Ok(d) => d,
+                Err(a) => return a,
+            };
+            let convo = q.get("convoId").cloned().unwrap_or_default();
+            let list = inbox_of(&did)["messages"][&convo].clone();
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({ "messages": list })),
+            )
+        }
+
+        /// Members whose DID starts with `did:plc:closed` take no DMs.
+        async fn convo_availability(
+            headers: axum::http::HeaderMap,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> Answer {
+            if let Err(a) = chat_caller(&headers) {
+                return a;
+            }
+            let to = q.get("members").cloned().unwrap_or_default();
+            let can = !to.starts_with("did:plc:closed");
+            (axum::http::StatusCode::OK, Json(json!({ "canChat": can })))
+        }
+
+        async fn convo_for_members(
+            headers: axum::http::HeaderMap,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> Answer {
+            if let Err(a) = chat_caller(&headers) {
+                return a;
+            }
+            let to = q.get("members").cloned().unwrap_or_default();
+            let convo = json!({ "id": format!("convo-{to}") });
+            (axum::http::StatusCode::OK, Json(json!({ "convo": convo })))
+        }
+
+        /// Text with `BLOCKED` is refused the way the chat service refuses a closed inbox.
+        async fn send_message(headers: axum::http::HeaderMap, Json(b): Json<Value>) -> Answer {
+            if let Err(a) = chat_caller(&headers) {
+                return a;
+            }
+            if b["message"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("BLOCKED")
+            {
+                return refused(400, "InvalidRequest");
+            }
+            SENT.lock().unwrap().push(b);
+            let id = format!("m{}", &uuid::Uuid::now_v7().simple().to_string()[20..]);
+            (axum::http::StatusCode::OK, Json(json!({ "id": id })))
         }
 
         /// Every `createRecord` body the mock took, newest last.
@@ -4241,6 +4395,632 @@ mod teams {
                 let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
                 assert_eq!(res.status_code(), 200, "{}", res.text());
                 assert_eq!(res.json::<Value>()["status"], "deleted");
+            }
+        }
+
+        /// `/v1/inboxes`, `/v1/inbox-items` and `/v1/automations`, with ingest driven directly
+        /// against the mock (notifications, chat proxy, replies).
+        mod inbox_api {
+            use super::*;
+            use socialreins_brain::{inbox, models::inbox_items};
+
+            async fn on_mock() -> (TestServer, DatabaseConnection, AppState) {
+                let base = mock_bluesky().await;
+                let mut config = Config::from_env().expect("test config");
+                config.trust_proxy = true;
+                config.bluesky.appview = base.clone();
+                config.bluesky.plc = base;
+                config.bluesky.allow_insecure_pds = true;
+                let db = socialreins_brain::connect(&config)
+                    .await
+                    .expect("database reachable");
+                let state = AppState::new(db.clone(), &config);
+                let app = controllers::router(state.clone(), &config);
+                (TestServer::new(app).unwrap(), db, state)
+            }
+
+            /// An owner whose account has DM access: (cookie, team id, account id, DID).
+            async fn owner(
+                s: &TestServer,
+                db: &DatabaseConnection,
+            ) -> (String, String, String, String) {
+                let (_, cookie, _) = user(s, db).await;
+                let team_id = current(s, &cookie).await["id"].as_str().unwrap().to_owned();
+                let res = connect(s, &cookie, &new_handle(), DM_APP_PASSWORD).await;
+                assert_eq!(res.status_code(), 201);
+                let body = res.json::<Value>();
+                assert_eq!(body["dm_access"], true);
+                let id = body["id"].as_str().unwrap().to_owned();
+                (
+                    cookie,
+                    team_id,
+                    id,
+                    body["external_id"].as_str().unwrap().to_owned(),
+                )
+            }
+
+            async fn ingest(db: &DatabaseConnection, state: &AppState, account: &str) {
+                let a = social_accounts::Entity::find_by_id(account.parse::<uuid::Uuid>().unwrap())
+                    .one(db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                inbox::ingest(state, a).await.unwrap();
+            }
+
+            fn at(ago_secs: i64) -> String {
+                (Utc::now() - Duration::seconds(ago_secs))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            }
+
+            fn note(
+                reason: &str,
+                from: &str,
+                rkey: &str,
+                text: &str,
+                when: &str,
+                me: &str,
+            ) -> Value {
+                json!({
+                    "uri": format!("at://{from}/app.bsky.feed.post/{rkey}"),
+                    "cid": format!("cid-{rkey}"),
+                    "reason": reason,
+                    "author": {"did": from, "handle": format!("{rkey}.fan.test"),
+                        "displayName": format!("Fan {rkey}")},
+                    "record": {"text": text, "reply": {
+                        "root": {"uri": format!("at://{me}/app.bsky.feed.post/root"), "cid": "cid-root"},
+                        "parent": {"uri": format!("at://{me}/app.bsky.feed.post/root"), "cid": "cid-root"}}},
+                    "indexedAt": when,
+                })
+            }
+
+            async fn all_inbox(s: &TestServer, cookie: &str) -> Value {
+                let res = s.get("/v1/inboxes").add_header("cookie", cookie).await;
+                res.assert_status_ok();
+                let list = res.json::<Value>();
+                assert_eq!(list[0]["is_all"], true);
+                list[0].clone()
+            }
+
+            async fn items(s: &TestServer, cookie: &str, inbox: &str, query: &str) -> Value {
+                let res = s
+                    .get(&format!("/v1/inboxes/{inbox}/items{query}"))
+                    .add_header("cookie", cookie)
+                    .await;
+                res.assert_status_ok();
+                res.json()
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn ingest_stores_items_once_and_inboxes_filter_them() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
+                set_inbox(
+                    &me,
+                    json!({
+                        "notifications": [
+                            note("reply", "did:plc:fan1", "c1", "Love it, GUIDE please", &at(10), &me),
+                            note("mention", "did:plc:fan2", "m1", "cc @me", &at(20), &me),
+                            note("like", "did:plc:fan3", "l1", "", &at(30), &me),
+                            note("reply", &me, "self", "my own reply", &at(40), &me),
+                            note("reply", "did:plc:old", "o1", "too old", &at(8 * 86400), &me),
+                        ],
+                        "convos": [{"id": "cv1", "members": [
+                            {"did": me, "handle": "me.test"},
+                            {"did": "did:plc:dmer", "handle": "dmer.test", "displayName": "DMer"}],
+                            "lastMessage": {"sentAt": at(5)}}],
+                        "messages": {"cv1": [
+                            {"$type": "chat.bsky.convo.defs#messageView", "id": "msg2",
+                             "text": "thanks", "sender": {"did": me}, "sentAt": at(5)},
+                            {"$type": "chat.bsky.convo.defs#messageView", "id": "msg1",
+                             "text": "hello there", "sender": {"did": "did:plc:dmer"}, "sentAt": at(8)},
+                        ]},
+                    }),
+                );
+                ingest(&db, &state, &account).await;
+                ingest(&db, &state, &account).await;
+                let team: uuid::Uuid = team_id.parse().unwrap();
+                let stored = inbox_items::Entity::find()
+                    .filter(inbox_items::Column::TeamId.eq(team))
+                    .count(&db)
+                    .await
+                    .unwrap();
+                assert_eq!(stored, 3, "comment, mention and DM, each once");
+
+                let all = all_inbox(&s, &cookie).await;
+                let all_id = all["id"].as_str().unwrap();
+                let page = items(&s, &cookie, all_id, "").await;
+                let kinds: Vec<&str> = page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| i["kind"].as_str().unwrap())
+                    .collect();
+                assert_eq!(kinds, ["dm", "comment", "mention"]);
+                let dm = &page["items"][0];
+                assert_eq!(dm["convo_id"], "cv1");
+                assert_eq!(dm["author"]["name"], "DMer");
+                let comment = &page["items"][1];
+                assert_eq!(comment["author"]["handle"], "c1.fan.test");
+                assert_eq!(
+                    comment["root_remote_id"],
+                    format!("at://{me}/app.bsky.feed.post/root")
+                );
+                assert!(comment["remote_url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("https://bsky.app/"));
+
+                // Paging: one at a time, newest first.
+                let p1 = items(&s, &cookie, all_id, "?limit=1").await;
+                let cursor = p1["next_cursor"].as_str().unwrap();
+                let p2 = items(&s, &cookie, all_id, &format!("?limit=2&cursor={cursor}")).await;
+                assert_eq!(p2["items"][0]["kind"], "comment");
+                assert!(p2["next_cursor"].is_null());
+                let res = s
+                    .get(&format!("/v1/inboxes/{all_id}/items?state=closed"))
+                    .add_header("cookie", &cookie)
+                    .await;
+                assert_eq!(res.status_code(), 422);
+
+                // A filtered inbox: DMs and keyword matches only show where they match.
+                let res = req(&s, Method::POST, "/v1/inboxes", &cookie)
+                    .json(&json!({"name": "DMs", "filters": {"kinds": ["dm"],
+                        "account_ids": [account]}}))
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let dms = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                let got = items(&s, &cookie, &dms, "").await;
+                assert_eq!(got["items"].as_array().unwrap().len(), 1);
+                let res = req(&s, Method::PUT, &format!("/v1/inboxes/{dms}"), &cookie)
+                    .json(&json!({"name": "Guides", "filters": {"keywords": ["guide"]}}))
+                    .await;
+                assert_eq!(res.status_code(), 200);
+                let got = items(&s, &cookie, &dms, "").await;
+                assert_eq!(got["items"][0]["text"], "Love it, GUIDE please");
+                assert_eq!(got["items"].as_array().unwrap().len(), 1);
+
+                // Shapes and ids are checked; "All" stays.
+                for (body, code) in [
+                    (
+                        json!({"name": "x", "filters": {"kinds": ["like"]}}),
+                        "invalid_filters",
+                    ),
+                    (
+                        json!({"name": "x", "filters": {"account_ids": [uuid::Uuid::now_v7()]}}),
+                        "invalid_filters",
+                    ),
+                    (json!({"name": " ", "filters": {}}), "invalid_name"),
+                    (
+                        json!({"name": "x", "filters": {"kind": ["dm"]}}),
+                        "invalid_body",
+                    ),
+                ] {
+                    let res = req(&s, Method::POST, "/v1/inboxes", &cookie)
+                        .json(&body)
+                        .await;
+                    assert_eq!(res.status_code(), 422, "{body}");
+                    assert_eq!(res.json::<Value>()["error"], code, "{body}");
+                }
+                let res = req(
+                    &s,
+                    Method::DELETE,
+                    &format!("/v1/inboxes/{all_id}"),
+                    &cookie,
+                )
+                .await;
+                assert_eq!(res.status_code(), 409);
+                let res = req(&s, Method::PUT, &format!("/v1/inboxes/{all_id}"), &cookie)
+                    .json(&json!({"name": "Mine"}))
+                    .await;
+                assert_eq!(res.status_code(), 409);
+
+                // Members read and mark done, but do not manage inboxes; strangers see nothing.
+                let (member, _) = joined(&s, &db, &team_id, "member").await;
+                let res = req(&s, Method::POST, "/v1/inboxes", &member)
+                    .json(&json!({"name": "Nope"}))
+                    .await;
+                assert_eq!(res.status_code(), 403);
+                let item = comment["id"].as_str().unwrap();
+                let res = req(
+                    &s,
+                    Method::PATCH,
+                    &format!("/v1/inbox-items/{item}"),
+                    &member,
+                )
+                .json(&json!({"state": "done"}))
+                .await;
+                assert_eq!(res.status_code(), 200);
+                assert_eq!(res.json::<Value>()["state"], "done");
+                let open = items(&s, &cookie, all_id, "?state=open").await;
+                assert_eq!(open["items"].as_array().unwrap().len(), 2);
+                let (_, stranger, _) = user(&s, &db).await;
+                let res = s
+                    .get(&format!("/v1/inbox-items/{item}"))
+                    .add_header("cookie", &stranger)
+                    .await;
+                assert_eq!(res.status_code(), 404);
+                let res = req(&s, Method::DELETE, &format!("/v1/inboxes/{dms}"), &cookie).await;
+                assert_eq!(res.status_code(), 204);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn replies_go_out_in_the_thread_or_the_conversation() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                set_inbox(
+                    &me,
+                    json!({
+                        "notifications": [note("reply", "did:plc:fan1", "c1", "hi", &at(10), &me)],
+                        "convos": [{"id": "cv9", "members": [], "lastMessage": {"sentAt": at(5)}}],
+                        "messages": {"cv9": [{"$type": "chat.bsky.convo.defs#messageView",
+                            "id": "msg9", "text": "yo", "sender": {"did": "did:plc:dmer"},
+                            "sentAt": at(5)}]},
+                    }),
+                );
+                ingest(&db, &state, &account).await;
+                let all = all_inbox(&s, &cookie).await;
+                let page = items(&s, &cookie, all["id"].as_str().unwrap(), "").await;
+                let dm = page["items"][0]["id"].as_str().unwrap().to_owned();
+                let comment = page["items"][1]["id"].as_str().unwrap().to_owned();
+
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/inbox-items/{comment}/reply"),
+                    &cookie,
+                )
+                .json(&json!({"text": "Thanks! https://socialreins.com"}))
+                .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let item = res.json::<Value>();
+                assert!(item["replied_at"].is_string());
+                assert_eq!(item["replies"][0]["kind"], "public");
+                assert!(item["replies"][0]["remote_url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("https://bsky.app/"));
+                let record = RECORDS.lock().unwrap().last().cloned().unwrap();
+                assert_eq!(
+                    record["record"]["reply"]["parent"],
+                    json!({"uri": "at://did:plc:fan1/app.bsky.feed.post/c1", "cid": "cid-c1"})
+                );
+                assert_eq!(
+                    record["record"]["reply"]["root"],
+                    json!({"uri": format!("at://{me}/app.bsky.feed.post/root"), "cid": "cid-root"})
+                );
+
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/inbox-items/{dm}/reply"),
+                    &cookie,
+                )
+                .json(&json!({"text": "Hello back"}))
+                .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                assert_eq!(res.json::<Value>()["replies"][0]["kind"], "dm");
+                let sent = SENT.lock().unwrap().last().cloned().unwrap();
+                assert_eq!(sent["convoId"], "cv9");
+                assert_eq!(sent["message"]["text"], "Hello back");
+
+                // Answered items drop out of an unanswered inbox.
+                let res = req(&s, Method::POST, "/v1/inboxes", &cookie)
+                    .json(&json!({"name": "Todo", "filters": {"unanswered": true}}))
+                    .await;
+                let todo = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                assert_eq!(items(&s, &cookie, &todo, "").await["items"], json!([]));
+
+                // What cannot go out says why, as 422 with a message.
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/inbox-items/{comment}/reply"),
+                    &cookie,
+                )
+                .json(&json!({"text": "a".repeat(301)}))
+                .await;
+                assert_eq!(res.status_code(), 422);
+                assert_eq!(res.json::<Value>()["error"], "invalid_text");
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/inbox-items/{dm}/reply"),
+                    &cookie,
+                )
+                .json(&json!({"text": "BLOCKED"}))
+                .await;
+                assert_eq!(res.status_code(), 422);
+                assert_eq!(res.json::<Value>()["error"], "dm_not_allowed");
+                let row = social_accounts::ActiveModel {
+                    id: Set(account.parse().unwrap()),
+                    dm_access: Set(false),
+                    ..Default::default()
+                };
+                social_accounts::Entity::update(row)
+                    .exec(&db)
+                    .await
+                    .unwrap();
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/inbox-items/{dm}/reply"),
+                    &cookie,
+                )
+                .json(&json!({"text": "again"}))
+                .await;
+                assert_eq!(res.status_code(), 422);
+                let body = res.json::<Value>();
+                assert_eq!(body["error"], "no_dm_access");
+                assert!(body["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("direct messages"));
+                // The next poll sees the DM access again.
+                ingest(&db, &state, &account).await;
+                let res = s.get("/v1/connections").add_header("cookie", &cookie).await;
+                assert_eq!(res.json::<Value>()[0]["dm_access"], true);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn an_app_password_without_dm_access_still_gets_comments() {
+                let (s, db, state) = on_mock().await;
+                let (_, cookie, _) = user(&s, &db).await;
+                let res = connect(&s, &cookie, &new_handle(), APP_PASSWORD).await;
+                let body = res.json::<Value>();
+                assert_eq!(body["dm_access"], false);
+                let me = body["external_id"].as_str().unwrap().to_owned();
+                set_inbox(
+                    &me,
+                    json!({"notifications": [
+                    note("reply", "did:plc:fan1", "c1", "hi", &at(10), &me)]}),
+                );
+                ingest(&db, &state, body["id"].as_str().unwrap()).await;
+                let all = all_inbox(&s, &cookie).await;
+                let page = items(&s, &cookie, all["id"].as_str().unwrap(), "").await;
+                assert_eq!(page["items"].as_array().unwrap().len(), 1);
+            }
+
+            fn comment_to_dm() -> Value {
+                json!({
+                    "name": "Guide by DM",
+                    "trigger": "comment_received",
+                    "conditions": {"keywords": ["guide"], "first_per_author": true},
+                    "actions": [{"type": "send_dm", "text": "Hi {name}, here it is: https://x.io"}],
+                    "fallback_public_reply": "{name}, open your DMs and comment again!",
+                })
+            }
+
+            async fn runs(s: &TestServer, cookie: &str, id: &str) -> Vec<Value> {
+                let res = s
+                    .get(&format!("/v1/automations/{id}/runs"))
+                    .add_header("cookie", cookie)
+                    .await;
+                res.assert_status_ok();
+                res.json::<Value>()["runs"].as_array().unwrap().clone()
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn automations_are_strict_and_run_once_per_comment() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
+
+                for (patch, code) in [
+                    (json!({"trigger": "follow"}), "invalid_trigger"),
+                    (json!({"actions": []}), "invalid_actions"),
+                    (json!({"actions": [{"type": "like"}]}), "invalid_body"),
+                    (json!({"conditions": {"keyword": ["x"]}}), "invalid_body"),
+                    (
+                        json!({"conditions": {"account_ids": [uuid::Uuid::now_v7()]}}),
+                        "invalid_conditions",
+                    ),
+                    (
+                        json!({"actions": [{"type": "reply_publicly", "text": "x"}]}),
+                        "invalid_fallback",
+                    ),
+                    (json!({"surprise": true}), "invalid_body"),
+                ] {
+                    let mut body = comment_to_dm();
+                    for (k, v) in patch.as_object().unwrap() {
+                        body[k] = v.clone();
+                    }
+                    let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                        .json(&body)
+                        .await;
+                    assert_eq!(res.status_code(), 422, "{patch}");
+                    assert_eq!(res.json::<Value>()["error"], code, "{patch}");
+                }
+                let (member, _) = joined(&s, &db, &team_id, "member").await;
+                let res = req(&s, Method::POST, "/v1/automations", &member)
+                    .json(&comment_to_dm())
+                    .await;
+                assert_eq!(res.status_code(), 403);
+
+                let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                    .json(&comment_to_dm())
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let auto = res.json::<Value>();
+                assert_eq!(auto["active"], true);
+                assert_eq!(auto["actions"][0]["type"], "send_dm");
+                let id = auto["id"].as_str().unwrap().to_owned();
+                // Members read automations and runs.
+                let res = s.get("/v1/automations").add_header("cookie", &member).await;
+                assert_eq!(res.json::<Value>().as_array().unwrap().len(), 1);
+
+                set_inbox(
+                    &me,
+                    // Newest first, as Bluesky lists them.
+                    json!({"notifications": [
+                        note("reply", "did:plc:fan4", "c4", "nice", &at(-4), &me),
+                        note("reply", "did:plc:closed1", "c3", "guide?", &at(-3), &me),
+                        note("reply", "did:plc:fan1", "c2", "guide again", &at(-2), &me),
+                        note("reply", "did:plc:fan1", "c1", "the GUIDE please", &at(-1), &me),
+                    ]}),
+                );
+                let sent_before = SENT.lock().unwrap().len();
+                ingest(&db, &state, &account).await;
+                ingest(&db, &state, &account).await;
+                let got = runs(&s, &member, &id).await;
+                assert_eq!(got.len(), 2, "first comment of fan1, and closed1: {got:?}");
+                // Newest first: closed1 got the fallback reply, fan1 the DM.
+                assert_eq!(got[0]["status"], "sent", "{got:?}");
+                assert_eq!(got[0]["reason"], "dm_not_allowed", "{got:?}");
+                assert_eq!(got[0]["results"][1]["type"], "fallback_public_reply");
+                assert_eq!(got[1]["status"], "sent");
+                assert!(got[1]["reason"].is_null());
+                let sent = SENT.lock().unwrap().clone();
+                assert_eq!(sent.len(), sent_before + 1);
+                assert_eq!(
+                    sent.last().unwrap()["message"]["text"],
+                    "Hi Fan c1, here it is: https://x.io"
+                );
+                assert_eq!(sent.last().unwrap()["convoId"], "convo-did:plc:fan1");
+                let record = RECORDS.lock().unwrap().last().cloned().unwrap();
+                assert_eq!(
+                    record["record"]["text"],
+                    "Fan c3, open your DMs and comment again!"
+                );
+
+                // Off: new comments do not run it; on again: only comments from then on.
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/automations/{id}/disable"),
+                    &cookie,
+                )
+                .await;
+                assert_eq!(res.json::<Value>()["active"], false);
+                set_inbox(
+                    &me,
+                    json!({"notifications": [
+                    note("reply", "did:plc:fan5", "c5", "guide", &at(-5), &me)]}),
+                );
+                ingest(&db, &state, &account).await;
+                assert_eq!(runs(&s, &cookie, &id).await.len(), 2);
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/automations/{id}/enable"),
+                    &cookie,
+                )
+                .await;
+                assert_eq!(res.json::<Value>()["active"], true);
+
+                // Past the daily cap a run is skipped, never sent later.
+                let bucket = format!("automation:team:{team_id}");
+                let stmt = sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DbBackend::Postgres,
+                    "INSERT INTO rate_limit_hits (bucket) SELECT $1 FROM generate_series(1, 500)",
+                    [bucket.clone().into()],
+                );
+                sea_orm::ConnectionTrait::execute_raw(&db, stmt)
+                    .await
+                    .unwrap();
+                set_inbox(
+                    &me,
+                    json!({"notifications": [
+                    note("reply", "did:plc:fan6", "c6", "guide", &at(-60), &me)]}),
+                );
+                ingest(&db, &state, &account).await;
+                let got = runs(&s, &cookie, &id).await;
+                assert_eq!(got.len(), 3);
+                assert_eq!(got[0]["status"], "skipped");
+                assert_eq!(got[0]["reason"], "daily_cap");
+                let stmt = sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DbBackend::Postgres,
+                    "DELETE FROM rate_limit_hits WHERE bucket = $1",
+                    [bucket.into()],
+                );
+                sea_orm::ConnectionTrait::execute_raw(&db, stmt)
+                    .await
+                    .unwrap();
+
+                // Replace and delete.
+                let mut body = comment_to_dm();
+                body["name"] = "Renamed".into();
+                body["active"] = false.into();
+                let res = req(&s, Method::PUT, &format!("/v1/automations/{id}"), &cookie)
+                    .json(&body)
+                    .await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                assert_eq!(res.json::<Value>()["name"], "Renamed");
+                let res = req(
+                    &s,
+                    Method::DELETE,
+                    &format!("/v1/automations/{id}"),
+                    &member,
+                )
+                .await;
+                assert_eq!(res.status_code(), 403);
+                let res = req(
+                    &s,
+                    Method::DELETE,
+                    &format!("/v1/automations/{id}"),
+                    &cookie,
+                )
+                .await;
+                assert_eq!(res.status_code(), 204);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn the_tick_takes_the_lock_and_openapi_documents_the_routes() {
+                let (s, _, state) = on_mock().await;
+                inbox::tick(&state).await.unwrap();
+                let doc = s.get("/openapi.json").await.json::<Value>();
+                for (p, m) in [
+                    ("/inboxes", "get"),
+                    ("/inboxes", "post"),
+                    ("/inboxes/{id}", "put"),
+                    ("/inboxes/{id}", "delete"),
+                    ("/inboxes/{id}/items", "get"),
+                    ("/inbox-items/{id}", "get"),
+                    ("/inbox-items/{id}", "patch"),
+                    ("/inbox-items/{id}/reply", "post"),
+                    ("/automations", "get"),
+                    ("/automations", "post"),
+                    ("/automations/{id}", "get"),
+                    ("/automations/{id}", "put"),
+                    ("/automations/{id}", "delete"),
+                    ("/automations/{id}/enable", "post"),
+                    ("/automations/{id}/disable", "post"),
+                    ("/automations/{id}/runs", "get"),
+                ] {
+                    assert!(doc["paths"][p][m].is_object(), "{p} {m}");
+                }
+            }
+
+            /// Reads the real Bluesky test account's notifications and DMs, read-only. Needs
+            /// BLUESKY_TEST_HANDLE and BLUESKY_TEST_APP_PASSWORD.
+            #[tokio::test]
+            #[serial]
+            #[ignore = "calls the real Bluesky"]
+            async fn live_bluesky_ingest() {
+                let handle = std::env::var("BLUESKY_TEST_HANDLE").expect("BLUESKY_TEST_HANDLE");
+                let password =
+                    std::env::var("BLUESKY_TEST_APP_PASSWORD").expect("BLUESKY_TEST_APP_PASSWORD");
+                let config = Config::from_env().expect("test config");
+                let db = socialreins_brain::connect(&config).await.unwrap();
+                let state = AppState::new(db.clone(), &config);
+                let s = TestServer::new(controllers::router(state.clone(), &config)).unwrap();
+                let (_, cookie, _) = user(&s, &db).await;
+                let res = connect(&s, &cookie, &handle, &password).await;
+                assert!(res.status_code().is_success(), "connect: {}", res.text());
+                let body = res.json::<Value>();
+                let account = body["id"].as_str().unwrap().to_owned();
+                ingest(&db, &state, &account).await;
+                let a = social_accounts::Entity::find_by_id(account.parse::<uuid::Uuid>().unwrap())
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(a.inbox_error_at, None);
+                assert_eq!(a.dm_access, body["dm_access"] == true);
             }
         }
     }

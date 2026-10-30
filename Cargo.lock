@@ -2938,6 +2938,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
  "utoipa",
  "utoipa-axum",
  "uuid",
