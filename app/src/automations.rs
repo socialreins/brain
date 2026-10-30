@@ -157,13 +157,28 @@ pub fn matches(c: &Conditions, f: &Facts<'_>) -> bool {
 
 /// The commenter's display name when it is plainly a name: letters, digits, spaces, `'`, `-`
 /// and `_` only, so it cannot carry a link, domain or mention (`evil.com`, `@someone`, `a/b`),
-/// cut to 64 characters. Handles are never used: they are domains.
+/// cut to 64 characters. A name with other punctuation ("Ada R. Lovelace - ...") gives its
+/// first word, unless anything in it could link or mention. Handles are never used: they are
+/// domains.
 fn safe_name(name: Option<&str>) -> Option<String> {
     let name = name?.trim();
-    let plain = name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == ' ' || matches!(c, '\'' | '-' | '_'));
-    (plain && !name.is_empty()).then(|| name.chars().take(MAX_NAME_CHARS).collect())
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_alphanumeric() || c == ' ' || matches!(c, '\'' | '-' | '_'))
+    };
+    if plain(name) {
+        return Some(name.chars().take(MAX_NAME_CHARS).collect());
+    }
+    let chars: Vec<char> = name.chars().collect();
+    let dot = |c: char| matches!(c, '.' | '\u{3002}' | '\u{FF0E}' | '\u{FF61}');
+    let linky = chars.iter().enumerate().any(|(i, &c)| {
+        c.is_control()
+            || matches!(c, '@' | '\u{FF20}' | '/' | ':' | '#')
+            || (dot(c) && chars.get(i + 1).is_some_and(|n| n.is_alphanumeric()))
+    });
+    let first = name.split_whitespace().next()?.trim_end_matches([',', ';']);
+    (!linky && plain(first)).then(|| first.chars().take(MAX_NAME_CHARS).collect())
 }
 
 /// `template` with each `{name}` replaced by the author's display name when safe (see
@@ -508,6 +523,18 @@ mod tests {
     }
 
     #[test]
+    fn punctuated_names_give_their_first_word() {
+        let hi = |n: &str| render("Hi {name}", Some(n)).0;
+        assert_eq!(
+            hi("Harun R. Rayhan - \u{09b9}\u{09be}\u{09b0}\u{09c1}\u{09a8}"),
+            "Hi Harun"
+        );
+        assert_eq!(hi("Ada (she/her)"), "Hi there");
+        assert_eq!(hi("Dr. Ada"), "Hi there");
+        assert_eq!(hi("Ada, PhD."), "Hi Ada");
+    }
+
+    #[test]
     fn names_that_could_link_or_mention_fall_back() {
         for bad in [
             "claim prize at evil.com",
@@ -517,6 +544,9 @@ mod tests {
             "evil。com",
             "line\nbreak",
             "tab\there",
+            "Ada evil.com",
+            "Ada @someone",
+            "Ada #promo",
         ] {
             let (text, filled) = render("Hi {name}, see https://x.io", Some(bad));
             assert_eq!(text, "Hi there, see https://x.io", "{bad}");
