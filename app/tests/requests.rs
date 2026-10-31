@@ -2665,6 +2665,9 @@ mod teams {
 
         /// Every `createRecord` body the mock took, newest last.
         static RECORDS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+        /// Set: the next `createRecord` is refused as an expired session.
+        static EXPIRE_NEXT: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         /// The record key of every `deleteRecord` the mock took, newest last.
         static DELETED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -2705,6 +2708,10 @@ mod teams {
         ) -> (axum::http::StatusCode, Json<Value>) {
             if !authorized(&headers) {
                 return (axum::http::StatusCode::UNAUTHORIZED, Json(json!({})));
+            }
+            if EXPIRE_NEXT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                let err = json!({"error": "ExpiredToken"});
+                return (axum::http::StatusCode::BAD_REQUEST, Json(err));
             }
             let text = b["record"]["text"].as_str().unwrap_or_default().to_owned();
             if text.contains("REJECT") {
@@ -4396,6 +4403,28 @@ mod teams {
                         rkey(&root),
                     ]
                 );
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn an_expired_cached_session_is_opened_again() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let body = thread_input(&set, "one", &["two"]);
+                let first = id_of(&create(&s, &cookie, body).await);
+                publish::tick(&state).await.unwrap();
+                assert_eq!(get_post(&s, &cookie, &first).await["status"], "published");
+                // The cached session now answers 400 ExpiredToken once, mid-thread.
+                let id = id_of(&create(&s, &cookie, thread_input(&set, "a", &["b"])).await);
+                let before = RECORDS.lock().unwrap().len();
+                EXPIRE_NEXT.store(true, std::sync::atomic::Ordering::SeqCst);
+                publish::tick(&state).await.unwrap();
+                let p = get_post(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "published", "{p}");
+                assert_eq!(p["targets"][0]["parts"].as_array().unwrap().len(), 1);
+                assert_eq!(RECORDS.lock().unwrap().len(), before + 2, "each sent once");
+                assert!(!EXPIRE_NEXT.load(std::sync::atomic::Ordering::SeqCst));
             }
 
             #[tokio::test]

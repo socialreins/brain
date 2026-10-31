@@ -541,7 +541,17 @@ async fn publish_target(app: &AppState, post: &posts::Model, id: Uuid) -> Result
             "UPDATE post_targets SET parts = parts || $2, updated_at = now() WHERE id = $1",
             vec![id.into(), saved.into()],
         );
-        db.execute_raw(stmt).await?;
+        if let Err(e) = db.execute_raw(stmt).await {
+            let msg = format!(
+                "Thread post {} of {} went out but could not be saved: it may be live, check \
+                 the account.",
+                i + 1,
+                thread.len()
+            );
+            // Best effort: with the database down, recovery fails it later with a like message.
+            let _ = fail_target(db, id, &msg).await;
+            return Err(e);
+        }
         parent = made;
     }
     let stmt = sql(

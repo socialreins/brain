@@ -438,14 +438,16 @@ impl Bluesky {
             })?;
         let status = res.status();
         let answer: Value = json_body(res, method).await.unwrap_or_default();
+        let code = xrpc_code(&answer, status);
+        // An expired or revoked session answers 400 with these, as in `xrpc`.
+        let expired = status == StatusCode::BAD_REQUEST
+            && matches!(code.as_str(), "ExpiredToken" | "InvalidToken");
         match status {
             StatusCode::OK => Ok(answer),
             StatusCode::UNAUTHORIZED => Err(PostError::Reconnect),
+            _ if expired => Err(PostError::Reconnect),
             StatusCode::TOO_MANY_REQUESTS => Err(failed("Bluesky is rate limiting this account.")),
-            s => Err(failed(format!(
-                "Bluesky refused it ({}).",
-                xrpc_code(&answer, s)
-            ))),
+            _ => Err(failed(format!("Bluesky refused it ({code})."))),
         }
     }
 
@@ -510,8 +512,8 @@ impl Bluesky {
     }
 
     /// Runs `call` with the account's session (cached, see `live`, so a thread logs in once).
-    /// A cached session the PDS refuses is opened again once: a `401` means nothing was made,
-    /// so this cannot post twice.
+    /// A cached session the PDS refuses (`401`, or `400 ExpiredToken`/`InvalidToken`) is opened
+    /// again once: a refused session made nothing, so this cannot post twice.
     async fn with_session<T, F, Fut>(&self, c: &Creds<'_>, call: F) -> Result<T, PostError>
     where
         F: Fn(Live) -> Fut,
