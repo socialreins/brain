@@ -37,7 +37,7 @@ use crate::{
         posts::{PostGroupInput, PostInput, PostQuery},
         social_sets::{self, ListQuery},
         waitlist::error,
-        MAX_BODY_BYTES,
+        MAX_GROUP_BODY_BYTES,
     },
     state::AppState,
 };
@@ -131,7 +131,7 @@ pub struct McpServer {
 }
 
 /// The service mounted at `/mcp` (behind `auth::layer`): stateless, JSON responses, and the
-/// `/v1` body limit.
+/// largest `/v1` body limit (a post group's); each tool's service fn re-validates its input.
 pub fn service(app: &AppState) -> StreamableHttpService<McpServer, NeverSessionManager> {
     let server = McpServer { app: app.clone() };
     let config = StreamableHttpServerConfig::default()
@@ -139,7 +139,7 @@ pub fn service(app: &AppState) -> StreamableHttpService<McpServer, NeverSessionM
         .disable_allowed_hosts()
         .with_legacy_session_mode(false)
         .with_json_response(true)
-        .with_max_request_body_bytes(MAX_BODY_BYTES);
+        .with_max_request_body_bytes(MAX_GROUP_BODY_BYTES);
     StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(NeverSessionManager::default()),
