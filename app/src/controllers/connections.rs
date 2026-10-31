@@ -1,6 +1,7 @@
 //! Connected social accounts of the current team. Members list them; owners and admins connect,
 //! regroup and disconnect them. Tokens never leave brain: they are sealed at rest and absent from
-//! every response. Every account stays in the team's Default set.
+//! every response. Every account stays in the team's Default set. The list takes an API token
+//! too; a set token sees only its set's accounts, each showing that set alone.
 use std::collections::{HashMap, HashSet};
 
 use axum::{
@@ -22,6 +23,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use super::{
+    api_tokens::Actor,
     auth::{internal, Body, CurrentUser, FromWeb},
     teams::InTeam,
     waitlist::{error, Error},
@@ -171,11 +173,21 @@ async fn default_set(db: &impl ConnectionTrait, team_id: Uuid) -> Result<Uuid, D
 
 /// The current team's connected accounts, oldest first. Never includes tokens.
 #[utoipa::path(get, path = "/connections", tag = "connections",
+    security(("session" = []), ("api_token" = [])),
     responses((status = 200, body = [Connection]), (status = 401, body = Error)))]
-async fn list(State(app): State<AppState>, t: InTeam) -> Response {
+async fn list(State(app): State<AppState>, a: Actor) -> Response {
     let found = async {
-        let rows = social_accounts::Entity::find()
-            .filter(social_accounts::Column::TeamId.eq(t.team.id))
+        let mut sel =
+            social_accounts::Entity::find().filter(social_accounts::Column::TeamId.eq(a.team.id));
+        if let Some(own) = a.set_id() {
+            let in_set = Query::select()
+                .column(membership::Column::SocialAccountId)
+                .from(membership::Entity)
+                .and_where(membership::Column::SocialSetId.eq(own))
+                .to_owned();
+            sel = sel.filter(social_accounts::Column::Id.in_subquery(in_set));
+        }
+        let rows = sel
             .order_by_asc(social_accounts::Column::CreatedAt)
             .order_by_asc(social_accounts::Column::Id)
             .all(&app.db)
@@ -184,9 +196,13 @@ async fn list(State(app): State<AppState>, t: InTeam) -> Response {
         let mut sets = set_ids(&app.db, &ids).await?;
         Ok::<_, DbErr>(
             rows.into_iter()
-                .map(|a| {
-                    let ids = sets.remove(&a.id).unwrap_or_default();
-                    connection_json(a, ids)
+                .map(|acc| {
+                    let mut ids = sets.remove(&acc.id).unwrap_or_default();
+                    // A set token learns of no other set.
+                    if let Some(own) = a.set_id() {
+                        ids.retain(|&id| id == own);
+                    }
+                    connection_json(acc, ids)
                 })
                 .collect::<Vec<_>>(),
         )

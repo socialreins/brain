@@ -69,6 +69,12 @@ impl<K: Hash + Eq + Clone> RateLimiter<K> {
 
     /// Counts one hit for `key`; false once it is over the cap for the current window.
     pub fn hit(&self, key: K) -> bool {
+        self.wait(key).is_none()
+    }
+
+    /// `hit`, answering how long until the window resets when `key` is over the cap (for a
+    /// `Retry-After` header), else `None`.
+    pub fn wait(&self, key: K) -> Option<Duration> {
         let now = Instant::now();
         let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         if !hits.contains_key(&key) && hits.len() >= self.max_keys {
@@ -88,7 +94,7 @@ impl<K: Hash + Eq + Clone> RateLimiter<K> {
             *entry = (now, 0);
         }
         entry.1 += 1;
-        entry.1 <= self.cap
+        (entry.1 > self.cap).then(|| self.window.saturating_sub(now.duration_since(entry.0)))
     }
 
     /// Forgets `key`, e.g. after a successful sign-in.
@@ -266,6 +272,14 @@ mod tests {
         assert!(l.hit(k.clone()) && !l.hit(k.clone()));
         l.clear(&k);
         assert!(l.hit(k));
+    }
+
+    #[test]
+    fn wait_says_how_long_until_the_window_resets() {
+        let l: RateLimiter<u8> = RateLimiter::per_minute(1);
+        assert_eq!(l.wait(1), None);
+        let left = l.wait(1).expect("over the cap");
+        assert!(left > Duration::from_secs(58) && left <= Duration::from_secs(60));
     }
 
     #[test]

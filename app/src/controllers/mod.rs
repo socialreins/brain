@@ -1,5 +1,6 @@
 //! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, and the documented `/v1` API
-//! (waitlist, teams, connections, social sets, posts, inboxes, automations).
+//! (waitlist, teams, API tokens, connections, social sets, posts, inboxes, automations).
+pub mod api_tokens;
 pub mod auth;
 pub mod automations;
 pub mod connections;
@@ -22,7 +23,10 @@ use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
 };
-use utoipa::OpenApi;
+use utoipa::{
+    openapi::security::{ApiKey, ApiKeyValue, Http, HttpAuthScheme, SecurityScheme},
+    OpenApi,
+};
 use utoipa_axum::router::OpenApiRouter;
 
 use crate::{config::Config, state::AppState};
@@ -49,6 +53,7 @@ fn api() -> OpenApiRouter<AppState> {
     OpenApiRouter::with_openapi(doc)
         .merge(waitlist::api())
         .merge(teams::api())
+        .merge(api_tokens::api())
         .merge(connections::api())
         .merge(social_sets::api())
         .merge(posts::api())
@@ -59,6 +64,7 @@ fn api() -> OpenApiRouter<AppState> {
 
 /// The request span. Logs the path only (no query), with the token in `/auth/magic/{token}` and
 /// `/v1/invitations/{token}` replaced, so a sign-in or invitation link never reaches the log.
+/// Headers are not logged, so neither is an API token's `Authorization` header.
 fn span(req: &axum::http::Request<axum::body::Body>) -> tracing::Span {
     let path = req.uri().path();
     let path = if path.starts_with("/auth/magic/") {
@@ -72,7 +78,16 @@ fn span(req: &axum::http::Request<axum::body::Body>) -> tracing::Span {
 }
 
 pub fn router(state: AppState, config: &Config) -> Router {
-    let (v1, doc) = api().split_for_parts();
+    let (v1, mut doc) = api().split_for_parts();
+    let components = doc.components.get_or_insert_default();
+    components.add_security_scheme(
+        "session",
+        SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new(auth::SESSION_COOKIE))),
+    );
+    components.add_security_scheme(
+        "api_token",
+        SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
+    );
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(config.cors_origins.clone()))
         .allow_methods([

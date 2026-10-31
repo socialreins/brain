@@ -1,7 +1,8 @@
 //! Posts of the current team: every member writes them. One post per platform (Bluesky today);
 //! a post goes to every account of its platform in its social set. Only `draft` and
 //! `scheduled` posts change; saving with `scheduled_at` makes one `scheduled`, else `draft`.
-//! Posts of a deleted set are hidden (and held back) until the set is restored.
+//! Posts of a deleted set are hidden (and held back) until the set is restored. Every route
+//! takes an API token too (`Actor`); a set token only sees and writes its set's posts.
 use std::collections::HashMap;
 
 use axum::{
@@ -12,8 +13,8 @@ use axum::{
 };
 use chrono::{DateTime, FixedOffset, Utc};
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, DbErr, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
+    ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait, DbBackend, DbErr, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use socialreins_core::post;
@@ -22,9 +23,9 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use super::{
-    auth::{internal, Body, FromWeb},
+    api_tokens::Actor,
+    auth::{internal, Body},
     connections::live_sets,
-    teams::InTeam,
     waitlist::{error, Error},
 };
 use crate::{
@@ -83,8 +84,9 @@ pub struct Target {
 
 #[derive(Deserialize, ToSchema)]
 pub struct PostInput {
-    /// A live set of the current team.
-    pub social_set_id: Uuid,
+    /// A live set of the current team. Required, except with a set token, where absent means
+    /// the token's set and any other set is `invalid_set`.
+    pub social_set_id: Option<Uuid>,
     /// `bluesky` (the only platform that publishes today).
     pub platform: String,
     /// At most 300 graphemes on Bluesky.
@@ -169,36 +171,53 @@ async fn one_json(db: &impl ConnectionTrait, p: posts::Model) -> Result<Post, Db
     Ok(post_json(p, t))
 }
 
-/// The team's post `id`, unless its set is deleted.
-async fn find(
-    db: &impl ConnectionTrait,
-    team_id: Uuid,
-    id: Uuid,
-) -> Result<Option<posts::Model>, DbErr> {
-    posts::Entity::find_by_id(id)
-        .filter(posts::Column::TeamId.eq(team_id))
-        .filter(posts::Column::SocialSetId.in_subquery(live_sets()))
-        .one(db)
-        .await
+/// Posts a set token may touch: its set's. Re-checked in writes, so a concurrent move of the
+/// post to another set cannot widen the token's reach.
+fn in_scope(a: &Actor) -> Condition {
+    match a.set_id() {
+        Some(set) => Condition::all().add(posts::Column::SocialSetId.eq(set)),
+        None => Condition::all(),
+    }
 }
 
-/// Checks a post body for saving: platform rules, then a live set of the team.
+/// The caller's post `id`, unless its set is deleted or outside a set token's set.
+async fn find(
+    db: &impl ConnectionTrait,
+    a: &Actor,
+    id: Uuid,
+) -> Result<Option<posts::Model>, DbErr> {
+    let sel = posts::Entity::find_by_id(id)
+        .filter(posts::Column::TeamId.eq(a.team.id))
+        .filter(posts::Column::SocialSetId.in_subquery(live_sets()));
+    sel.filter(in_scope(a)).one(db).await
+}
+
+/// Checks a post body for saving: platform rules, then a live set of the team the caller may
+/// write to. Answers that set's id.
 async fn checked(
     db: &impl ConnectionTrait,
-    team_id: Uuid,
+    a: &Actor,
     input: &PostInput,
-) -> Result<Result<(), Response>, DbErr> {
+) -> Result<Result<Uuid, Response>, DbErr> {
+    let invalid_set = || reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_set");
     if let Err(e) = post::validate(&input.platform, &input.body, &input.media) {
         return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, e.code())));
     }
-    let set = social_sets::Entity::find_by_id(input.social_set_id)
-        .filter(social_sets::Column::TeamId.eq(team_id))
+    // Another set than a set token's own answers like a missing one.
+    let id = match (a.set_id(), input.social_set_id) {
+        (Some(own), None) => own,
+        (Some(own), Some(id)) if id == own => own,
+        (None, Some(id)) => id,
+        _ => return Ok(Err(invalid_set())),
+    };
+    let set = social_sets::Entity::find_by_id(id)
+        .filter(social_sets::Column::TeamId.eq(a.team.id))
         .filter(social_sets::Column::DeletedAt.is_null())
         .one(db)
         .await?;
     Ok(match set {
-        Some(_) => Ok(()),
-        None => Err(reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_set")),
+        Some(_) => Ok(id),
+        None => Err(invalid_set()),
     })
 }
 
@@ -218,12 +237,13 @@ fn status_for(input: &PostInput) -> &'static str {
 
 /// The current team's posts, by `scheduled_at` (unscheduled last), at most 2000. For a calendar,
 /// pass `from` and `to`.
-#[utoipa::path(get, path = "/posts", tag = "posts", params(PostQuery),
+#[utoipa::path(get, path = "/posts", tag = "posts",
+    security(("session" = []), ("api_token" = [])), params(PostQuery),
     responses((status = 200, body = [Post]), (status = 401, body = Error),
         (status = 422, body = Error)))]
 async fn list(
     State(app): State<AppState>,
-    t: InTeam,
+    a: Actor,
     q: Result<Query<PostQuery>, QueryRejection>,
 ) -> Response {
     let Ok(Query(q)) = q else {
@@ -234,8 +254,9 @@ async fn list(
     }
     let found = async {
         let mut sel = posts::Entity::find()
-            .filter(posts::Column::TeamId.eq(t.team.id))
-            .filter(posts::Column::SocialSetId.in_subquery(live_sets()));
+            .filter(posts::Column::TeamId.eq(a.team.id))
+            .filter(posts::Column::SocialSetId.in_subquery(live_sets()))
+            .filter(in_scope(&a));
         if let Some(set) = q.social_set_id {
             sel = sel.filter(posts::Column::SocialSetId.eq(set));
         }
@@ -273,12 +294,13 @@ async fn list(
 }
 
 /// One post with its targets.
-#[utoipa::path(get, path = "/posts/{id}", tag = "posts", params(("id" = Uuid, Path)),
+#[utoipa::path(get, path = "/posts/{id}", tag = "posts",
+    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path)),
     responses((status = 200, body = Post), (status = 401, body = Error),
         (status = 404, body = Error)))]
-async fn show(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> Response {
+async fn show(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
     let found = async {
-        match find(&app.db, t.team.id, id).await? {
+        match find(&app.db, &a, id).await? {
             Some(p) => one_json(&app.db, p).await.map(Some),
             None => Ok(None),
         }
@@ -292,27 +314,24 @@ async fn show(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> R
 
 /// Creates a post; `scheduled` with `scheduled_at` (a past time means now), else `draft`. At
 /// most 2000 per team.
-#[utoipa::path(post, path = "/posts", tag = "posts", request_body = PostInput,
+#[utoipa::path(post, path = "/posts", tag = "posts",
+    security(("session" = []), ("api_token" = [])), request_body = PostInput,
     responses((status = 201, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 409, body = Error), (status = 422, body = Error)))]
-async fn create(
-    _: FromWeb,
-    State(app): State<AppState>,
-    t: InTeam,
-    Body(input): Body<PostInput>,
-) -> Response {
+async fn create(State(app): State<AppState>, a: Actor, Body(input): Body<PostInput>) -> Response {
     let made = async {
-        if let Err(res) = checked(&app.db, t.team.id, &input).await? {
-            return Ok(Err(res));
-        }
+        let set = match checked(&app.db, &a, &input).await? {
+            Ok(set) => set,
+            Err(res) => return Ok(Err(res)),
+        };
         let txn = app.db.begin().await?;
         // The team row lock keeps concurrent creates under the cap.
-        teams::Entity::find_by_id(t.team.id)
+        teams::Entity::find_by_id(a.team.id)
             .lock_exclusive()
             .one(&txn)
             .await?;
         let live = posts::Entity::find()
-            .filter(posts::Column::TeamId.eq(t.team.id))
+            .filter(posts::Column::TeamId.eq(a.team.id))
             .filter(posts::Column::Status.ne("deleted"))
             .count(&txn)
             .await?;
@@ -321,14 +340,14 @@ async fn create(
         }
         let row = posts::ActiveModel {
             id: Set(Uuid::now_v7()),
-            team_id: Set(t.team.id),
-            social_set_id: Set(input.social_set_id),
+            team_id: Set(a.team.id),
+            social_set_id: Set(set),
             platform: Set(input.platform.clone()),
             body: Set(input.body.clone()),
             media: Set(serde_json::json!(input.media)),
             status: Set(status_for(&input).into()),
             scheduled_at: Set(when(&input)),
-            created_by: Set(Some(t.current.0.id)),
+            created_by: Set(a.user_id),
             ..Default::default()
         };
         let p = posts::Entity::insert(row).exec_with_returning(&txn).await?;
@@ -344,31 +363,32 @@ async fn create(
 
 /// Replaces a `draft` or `scheduled` post's set, platform, body, media and time; anything else
 /// is `409 not_editable`.
-#[utoipa::path(put, path = "/posts/{id}", tag = "posts", request_body = PostInput,
+#[utoipa::path(put, path = "/posts/{id}", tag = "posts",
+    security(("session" = []), ("api_token" = [])), request_body = PostInput,
     params(("id" = Uuid, Path)),
     responses((status = 200, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error)))]
 async fn update(
-    _: FromWeb,
     State(app): State<AppState>,
-    t: InTeam,
+    a: Actor,
     Path(id): Path<Uuid>,
     Body(input): Body<PostInput>,
 ) -> Response {
     let saved = async {
-        let Some(found) = find(&app.db, t.team.id, id).await? else {
+        let Some(found) = find(&app.db, &a, id).await? else {
             return Ok(Err(not_found()));
         };
         if !editable(&found.status) {
             return Ok(Err(reply(StatusCode::CONFLICT, "not_editable")));
         }
-        if let Err(res) = checked(&app.db, t.team.id, &input).await? {
-            return Ok(Err(res));
-        }
+        let set = match checked(&app.db, &a, &input).await? {
+            Ok(set) => set,
+            Err(res) => return Ok(Err(res)),
+        };
         // One conditional statement, so a tick claiming the post cannot interleave.
         let done = posts::Entity::update_many()
-            .col_expr(posts::Column::SocialSetId, input.social_set_id.into())
+            .col_expr(posts::Column::SocialSetId, set.into())
             .col_expr(posts::Column::Platform, input.platform.clone().into())
             .col_expr(posts::Column::Body, input.body.clone().into())
             .col_expr(posts::Column::Media, serde_json::json!(input.media).into())
@@ -377,12 +397,13 @@ async fn update(
             .col_expr(posts::Column::UpdatedAt, Utc::now().fixed_offset().into())
             .filter(posts::Column::Id.eq(id))
             .filter(posts::Column::Status.is_in(["draft", "scheduled"]))
+            .filter(in_scope(&a))
             .exec(&app.db)
             .await?;
         if done.rows_affected == 0 {
             return Ok(Err(reply(StatusCode::CONFLICT, "not_editable")));
         }
-        match find(&app.db, t.team.id, id).await? {
+        match find(&app.db, &a, id).await? {
             Some(p) => one_json(&app.db, p).await.map(Ok),
             None => Ok(Err(not_found())),
         }
@@ -398,21 +419,17 @@ async fn update(
 /// claimed (`queued`) and sent in the background. `202` with the queued post; poll it for the
 /// result. At most 10 publish or take-down calls a minute per user; with scheduled posts, at
 /// most 100 published a day per team (`429 publish_quota`).
-#[utoipa::path(post, path = "/posts/{id}/publish", tag = "posts", params(("id" = Uuid, Path)),
+#[utoipa::path(post, path = "/posts/{id}/publish", tag = "posts",
+    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path)),
     responses((status = 202, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 429, body = Error)))]
-async fn publish_now(
-    _: FromWeb,
-    State(app): State<AppState>,
-    t: InTeam,
-    Path(id): Path<Uuid>,
-) -> Response {
-    if !app.post_limiter.hit(t.current.0.id) {
+async fn publish_now(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
+    if !app.post_limiter.hit(a.key()) {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let claimed = async {
-        let Some(post) = find(&app.db, t.team.id, id).await? else {
+        let Some(post) = find(&app.db, &a, id).await? else {
             return Ok(Err(not_found()));
         };
         // The claim and its hit of the daily cap (shared with scheduled publishes) commit
@@ -422,18 +439,19 @@ async fn publish_now(
             "UPDATE posts p SET status = 'queued', quota_reserved = true, \
              scheduled_at = now(), updated_at = now() \
              WHERE p.id = $1 AND p.status IN ('draft', 'scheduled') AND p.quota_reserved = $2 \
+             AND ($3::uuid IS NULL OR p.social_set_id = $3) \
              AND EXISTS (SELECT 1 FROM social_sets s \
                          WHERE s.id = p.social_set_id AND s.deleted_at IS NULL)",
-            [id.into(), post.quota_reserved.into()],
+            [id.into(), post.quota_reserved.into(), a.set_id().into()],
         );
-        match publish::reserve_and(&app.db, t.team.id, post.quota_reserved, claim).await? {
+        match publish::reserve_and(&app.db, a.team.id, post.quota_reserved, claim).await? {
             publish::Quota::Reserved => {}
             publish::Quota::Over => {
                 return Ok(Err(reply(StatusCode::TOO_MANY_REQUESTS, "publish_quota")))
             }
             publish::Quota::Lost => return Ok(Err(reply(StatusCode::CONFLICT, "not_editable"))),
         }
-        match find(&app.db, t.team.id, id).await? {
+        match find(&app.db, &a, id).await? {
             Some(p) => one_json(&app.db, p).await.map(Ok),
             None => Ok(Err(not_found())),
         }
@@ -457,17 +475,13 @@ async fn publish_now(
 /// account and kept as `deleted` (`200`); when an account cannot take it down, `422
 /// {"error":"takedown_failed","message"}` says what to do, and a retry only tries what is still
 /// up. `queued` and `failed`: `409 not_deletable`.
-#[utoipa::path(delete, path = "/posts/{id}", tag = "posts", params(("id" = Uuid, Path)),
+#[utoipa::path(delete, path = "/posts/{id}", tag = "posts",
+    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path)),
     responses((status = 204), (status = 200, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error), (status = 429, body = Error)))]
-async fn destroy(
-    _: FromWeb,
-    State(app): State<AppState>,
-    t: InTeam,
-    Path(id): Path<Uuid>,
-) -> Response {
-    let found = match find(&app.db, t.team.id, id).await {
+async fn destroy(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
+    let found = match find(&app.db, &a, id).await {
         Ok(Some(p)) => p,
         Ok(None) => return not_found(),
         Err(e) => return internal(e, "post read"),
@@ -477,6 +491,7 @@ async fn destroy(
             let gone = posts::Entity::delete_many()
                 .filter(posts::Column::Id.eq(id))
                 .filter(posts::Column::Status.is_in(["draft", "scheduled"]))
+                .filter(in_scope(&a))
                 .exec(&app.db)
                 .await;
             match gone {
@@ -487,7 +502,7 @@ async fn destroy(
         }
         "published" | "deleted" => {
             if found.status == "published" {
-                if !app.post_limiter.hit(t.current.0.id) {
+                if !app.post_limiter.hit(a.key()) {
                     return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
                 }
                 match publish::takedown(&app, &found).await {
@@ -503,7 +518,7 @@ async fn destroy(
                     Err(e) => return internal(e, "post takedown"),
                 }
             }
-            match find(&app.db, t.team.id, id).await {
+            match find(&app.db, &a, id).await {
                 Ok(Some(p)) => match one_json(&app.db, p).await {
                     Ok(p) => Json(p).into_response(),
                     Err(e) => internal(e, "post read"),

@@ -472,8 +472,7 @@ async fn destroy(_: FromWeb, State(app): State<AppState>, t: InTeam) -> Response
         if teams < 2 {
             return Ok(Some((StatusCode::CONFLICT, "last_team")));
         }
-        // TODO tokens: API tokens are a polymorphic relation with no cascading foreign key, so
-        // delete this team's tokens here explicitly once they exist.
+        // API tokens go with the team through their cascading foreign key.
         teams::Entity::delete_by_id(t.team.id).exec(&txn).await?;
         txn.commit().await.map(|_| None)
     };
