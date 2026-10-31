@@ -151,29 +151,47 @@ impl Actor {
     }
 }
 
+/// The secret of an `Authorization: Bearer sr_...` header; `None` for any other value.
+pub fn bearer_secret(auth: &HeaderValue) -> Option<&str> {
+    auth.to_str()
+        .ok()
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|s| s.starts_with("sr_"))
+}
+
+/// The live (not revoked, not expired) token with this secret.
+pub async fn find_live(
+    app: &AppState,
+    secret: &str,
+) -> Result<Option<api_tokens::Model>, sea_orm::DbErr> {
+    api_tokens::Entity::find()
+        .filter(api_tokens::Column::TokenHash.eq(token::hash(secret)))
+        .filter(live())
+        .one(&app.db)
+        .await
+}
+
+/// Counts one request against the token's per-minute limit; the `429` once it is over.
+pub fn limited(app: &AppState, token: Uuid) -> Option<Response> {
+    let wait = app.api_token_limiter.wait(token)?;
+    let mut res = reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    let secs = HeaderValue::from(wait.as_secs().max(1));
+    res.headers_mut().insert(header::RETRY_AFTER, secs);
+    Some(res)
+}
+
 impl FromRequestParts<AppState> for Actor {
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, Response> {
         if let Some(auth) = parts.headers.get(header::AUTHORIZATION) {
-            let secret = auth
-                .to_str()
-                .ok()
-                .and_then(|v| v.strip_prefix("Bearer "))
-                .map(str::trim)
-                .filter(|s| s.starts_with("sr_"))
-                .ok_or_else(invalid_token)?;
-            let found = api_tokens::Entity::find()
-                .filter(api_tokens::Column::TokenHash.eq(token::hash(secret)))
-                .filter(live())
-                .one(&app.db)
+            let secret = bearer_secret(auth).ok_or_else(invalid_token)?;
+            let found = find_live(app, secret)
                 .await
                 .map_err(|e| internal(e, "api token lookup"))?;
             let row = found.ok_or_else(invalid_token)?;
-            if let Some(wait) = app.api_token_limiter.wait(row.id) {
-                let mut res = reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
-                let secs = HeaderValue::from(wait.as_secs().max(1));
-                res.headers_mut().insert(header::RETRY_AFTER, secs);
+            if let Some(res) = limited(app, row.id) {
                 return Err(res);
             }
             let team = teams::Entity::find_by_id(row.team_id)

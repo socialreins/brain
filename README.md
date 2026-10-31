@@ -144,6 +144,14 @@ publish_quota` on publish now); a due post over the limit stays `scheduled` and 
 it frees up. A tick claims at most 50 posts; 8 posts and 8 targets publish at once. A past
 `scheduled_at` means now.
 
+API token writes (`POST`, `PUT`, `PATCH`, `DELETE`) take an optional `Idempotency-Key` header,
+1 to 255 printable ASCII characters (else `422 invalid_idempotency_key`). Keys belong to the
+token's team. A retry with the same key, method, path and body gets the first answer again with
+`Idempotent-Replayed: true`, or `409 idempotency_in_progress` while the first still runs; the
+same key with anything else is `422 idempotency_key_reused`. 5xx and 429 answers are not kept,
+so a retry runs again; every other answer is kept for 30 days. A first run unfinished after 10
+minutes is taken as crashed and runs again. Sessions ignore the header.
+
 Connections are the current team's social accounts. Members list them; owners and admins connect,
 regroup and disconnect them. Tokens are sealed with `ENCRYPTION_KEY` and never returned. Every
 account sits in the team's Default set, which `PUT /v1/connections/{id}/sets` cannot drop

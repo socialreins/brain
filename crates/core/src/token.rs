@@ -10,7 +10,12 @@ pub fn new() -> String {
 
 /// SHA-256 of `token`, hex encoded. The only form a token is stored in.
 pub fn hash(token: &str) -> String {
-    hex::encode(Sha256::digest(token.as_bytes()))
+    digest(token.as_bytes())
+}
+
+/// SHA-256 of `bytes`, hex encoded.
+pub fn digest(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 #[cfg(test)]

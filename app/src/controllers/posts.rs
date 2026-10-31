@@ -2,7 +2,8 @@
 //! a post goes to every account of its platform in its social set. Only `draft` and
 //! `scheduled` posts change; saving with `scheduled_at` makes one `scheduled`, else `draft`.
 //! Posts of a deleted set are hidden (and held back) until the set is restored. Every route
-//! takes an API token too (`Actor`); a set token only sees and writes its set's posts.
+//! takes an API token too (`Actor`); a set token only sees and writes its set's posts. Token
+//! writes take an optional `Idempotency-Key` header (see `idempotency`).
 use std::collections::HashMap;
 
 use axum::{
@@ -316,6 +317,7 @@ async fn show(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Re
 /// most 2000 per team.
 #[utoipa::path(post, path = "/posts", tag = "posts",
     security(("session" = []), ("api_token" = [])), request_body = PostInput,
+    params(("Idempotency-Key" = Option<String>, Header, description = "With an API token: 1 to 255 printable ASCII characters. A retry with the same key, path and body replays the first answer for 30 days")),
     responses((status = 201, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 409, body = Error), (status = 422, body = Error)))]
 async fn create(State(app): State<AppState>, a: Actor, Body(input): Body<PostInput>) -> Response {
@@ -365,7 +367,7 @@ async fn create(State(app): State<AppState>, a: Actor, Body(input): Body<PostInp
 /// is `409 not_editable`.
 #[utoipa::path(put, path = "/posts/{id}", tag = "posts",
     security(("session" = []), ("api_token" = [])), request_body = PostInput,
-    params(("id" = Uuid, Path)),
+    params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = "With an API token: 1 to 255 printable ASCII characters. A retry with the same key, path and body replays the first answer for 30 days")),
     responses((status = 200, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error)))]
@@ -420,7 +422,7 @@ async fn update(
 /// result. At most 10 publish or take-down calls a minute per user; with scheduled posts, at
 /// most 100 published a day per team (`429 publish_quota`).
 #[utoipa::path(post, path = "/posts/{id}/publish", tag = "posts",
-    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path)),
+    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = "With an API token: 1 to 255 printable ASCII characters. A retry with the same key, path and body replays the first answer for 30 days")),
     responses((status = 202, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 429, body = Error)))]
@@ -476,7 +478,7 @@ async fn publish_now(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>
 /// {"error":"takedown_failed","message"}` says what to do, and a retry only tries what is still
 /// up. `queued` and `failed`: `409 not_deletable`.
 #[utoipa::path(delete, path = "/posts/{id}", tag = "posts",
-    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path)),
+    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = "With an API token: 1 to 255 printable ASCII characters. A retry with the same key, path and body replays the first answer for 30 days")),
     responses((status = 204), (status = 200, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error), (status = 429, body = Error)))]
