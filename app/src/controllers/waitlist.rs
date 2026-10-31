@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use crate::{models::waitlist_signups, rate_limit::ClientIp, state::AppState};
+use crate::{models::waitlist_signups, rate_limit::ClientIp, state::AppState, turnstile};
 
 const MAX_SOURCE_LEN: usize = 100;
 
@@ -18,6 +18,9 @@ pub struct NewSignup {
     pub email: String,
     /// Where the signup came from, e.g. `landing-hero`. At most 100 characters.
     pub source: Option<String>,
+    /// The Turnstile widget's token; required when `GET /auth/providers` gives a
+    /// `turnstile_site_key`, else ignored.
+    pub turnstile_token: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -30,7 +33,7 @@ pub struct Status {
 pub struct Error {
     /// A machine-readable code. Every route may answer `invalid_json`, `invalid_body`,
     /// `unsupported_media_type`, `payload_too_large` or `internal`; the others are per route,
-    /// e.g. `invalid_email`, `rate_limited`, `unauthorized`, `forbidden_origin`, `not_found`.
+    /// e.g. `invalid_email`, `captcha_failed`, `captcha_unavailable`, `rate_limited`, `unauthorized`, `forbidden_origin`, `not_found`.
     pub error: String,
 }
 
@@ -54,7 +57,7 @@ pub(crate) fn rejected(r: &JsonRejection) -> Reply {
 #[utoipa::path(post, path = "/waitlist", tag = "waitlist", request_body = NewSignup,
     responses((status = 200, body = Status), (status = 400, body = Error),
         (status = 413, body = Error), (status = 415, body = Error), (status = 422, body = Error),
-        (status = 429, body = Error), (status = 500, body = Error)))]
+        (status = 429, body = Error), (status = 500, body = Error), (status = 503, body = Error)))]
 async fn join(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Request) -> Reply {
     // Counted before the body is read, so malformed requests use up the limit too.
     if !app.waitlist_limiter.allow(ip) {
@@ -76,6 +79,10 @@ async fn join(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Requ
         .is_some_and(|s| s.chars().count() > MAX_SOURCE_LEN)
     {
         return error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_source");
+    }
+    let token = body.turnstile_token.as_deref();
+    if let Err(r) = turnstile::check(app.turnstile.as_ref(), token, ip).await {
+        return r;
     }
     let row = waitlist_signups::ActiveModel {
         id: Set(uuid::Uuid::now_v7()),

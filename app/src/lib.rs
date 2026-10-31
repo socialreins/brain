@@ -10,6 +10,7 @@ pub mod publish;
 pub mod rate_limit;
 pub mod scheduler;
 pub mod state;
+pub mod turnstile;
 pub mod webhooks;
 
 use migration::{Migrator, MigratorTrait};

@@ -54,10 +54,22 @@ impl Mailer {
 
     /// Errors name the failure kind and status code only, never the recipient, body or key.
     pub async fn send(&self, to: &str, subject: &str, body: String) -> Result<(), String> {
+        self.send_reply_to(to, None, subject, body).await
+    }
+
+    /// `send` with a `Reply-To` address, e.g. the sender of a contact form message.
+    pub async fn send_reply_to(
+        &self,
+        to: &str,
+        reply_to: Option<&str>,
+        subject: &str,
+        body: String,
+    ) -> Result<(), String> {
         let (transport, from) = match self {
             Self::Log => {
                 tracing::info!(
                     to,
+                    reply_to,
                     subject,
                     body,
                     "MAIL_LOG: logging mail instead of sending"
@@ -71,12 +83,15 @@ impl Mailer {
                 api_key,
                 from,
             } => {
-                let mail = serde_json::json!({
+                let mut mail = serde_json::json!({
                     "from": from.to_string(),
                     "to": [to],
                     "subject": subject,
                     "text": body,
                 });
+                if let Some(r) = reply_to {
+                    mail["reply_to"] = r.into();
+                }
                 let res = client
                     .post(endpoint)
                     .bearer_auth(api_key)
@@ -100,12 +115,14 @@ impl Mailer {
             }
         };
         let to = to.parse().map_err(|_| "recipient is not a mailbox")?;
-        let message = Message::builder()
+        let mut message = Message::builder()
             .from(from.clone())
             .to(to)
-            .subject(subject)
-            .body(body)
-            .map_err(|_| "message did not build")?;
+            .subject(subject);
+        if let Some(r) = reply_to {
+            message = message.reply_to(r.parse().map_err(|_| "reply-to is not a mailbox")?);
+        }
+        let message = message.body(body).map_err(|_| "message did not build")?;
         transport.send(message).await.map(|_| ()).map_err(|e| {
             let kind = if e.is_permanent() {
                 "permanent"
@@ -175,6 +192,16 @@ mod tests {
         let want = json!({"from": "Brain <login@example.com>", "to": ["a@example.com"],
             "subject": "Hi", "text": "Body"});
         assert_eq!(body, want);
+    }
+
+    #[tokio::test]
+    async fn resend_sends_reply_to_when_given() {
+        let (url, seen) = mock(StatusCode::OK).await;
+        let mailer = Mailer::resend_at(&url, "re_test", "login@example.com").unwrap();
+        let send = mailer.send_reply_to("a@example.com", Some("b@example.com"), "Hi", "B".into());
+        send.await.unwrap();
+        let (_, body) = seen.lock().unwrap().pop().unwrap();
+        assert_eq!(body["reply_to"], "b@example.com");
     }
 
     #[tokio::test]

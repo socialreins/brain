@@ -9,6 +9,7 @@ use socialreins_core::crypto::Cipher;
 use crate::{
     connectors::{bluesky::Bluesky, google::Google},
     mail::Mailer,
+    turnstile::Turnstile,
 };
 
 /// Public Bluesky AppView (handle resolution, profiles) and the `did:plc` directory.
@@ -62,6 +63,11 @@ pub struct Config {
     /// `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` (both or neither): Google sign-in, with
     /// the redirect URI `{BRAIN_URL}/auth/google/callback`.
     pub google: Option<Google>,
+    /// `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY` (both or neither): a Cloudflare
+    /// Turnstile captcha on sign-in links, the waitlist and the contact form. Off when unset.
+    pub turnstile: Option<Turnstile>,
+    /// `CONTACT_TO`, normalized: where `POST /v1/contact` mails messages. Off when unset.
+    pub contact_to: Option<String>,
 }
 
 impl Config {
@@ -104,6 +110,20 @@ impl Config {
                 return Err("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET: set both or neither".into())
             }
         };
+        let turnstile = match (var("TURNSTILE_SITE_KEY"), var("TURNSTILE_SECRET_KEY")) {
+            (Some(site), Some(secret)) => Some(Turnstile::new(&site, &secret)?),
+            (None, None) => None,
+            _ => {
+                return Err(
+                    "TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY: set both or neither".into(),
+                )
+            }
+        };
+        let contact_to = var("CONTACT_TO")
+            .map(|e| {
+                socialreins_core::email::normalize(&e).ok_or("CONTACT_TO: not an email address")
+            })
+            .transpose()?;
         let mut providers = vec![("bluesky", true)];
         providers.extend(
             PROVIDER_APPS.map(|(name, vars)| (name, vars.iter().all(|v| var(v).is_some()))),
@@ -126,6 +146,8 @@ impl Config {
             bluesky: Bluesky::new(BLUESKY_APPVIEW, PLC_DIRECTORY)?,
             providers,
             google,
+            turnstile,
+            contact_to,
         })
     }
 }

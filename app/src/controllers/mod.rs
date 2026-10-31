@@ -1,10 +1,11 @@
 //! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, the documented `/v1` API
-//! (waitlist, teams, API tokens, webhooks, connections, social sets, posts, lists, inboxes,
+//! (waitlist, contact, teams, API tokens, webhooks, connections, social sets, posts, lists, inboxes,
 //! automations), and `/mcp` (see `crate::mcp`).
 pub mod api_tokens;
 pub mod auth;
 pub mod automations;
 pub mod connections;
+pub mod contact;
 pub mod google;
 pub mod health;
 pub mod idempotency;
@@ -41,6 +42,8 @@ pub(crate) const MAX_BODY_BYTES: usize = 4096;
 /// Passkey bodies carry an attestation or assertion, which can run past 4 KiB.
 const MAX_PASSKEY_BODY_BYTES: usize = 16 * 1024;
 const MAX_AUTOMATION_BODY_BYTES: usize = 32 * 1024;
+/// A contact message of 5000 characters can pass 4 KiB.
+const MAX_CONTACT_BODY_BYTES: usize = 32 * 1024;
 /// A post group carries a body and media per platform, a post a thread of up to 26 posts;
 /// `/mcp` takes the same.
 pub(crate) const MAX_GROUP_BODY_BYTES: usize = 64 * 1024;
@@ -60,6 +63,7 @@ fn api() -> OpenApiRouter<AppState> {
     doc.info.license = None;
     OpenApiRouter::with_openapi(doc)
         .merge(waitlist::api())
+        .merge(contact::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
         .merge(teams::api())
         .merge(api_tokens::api())
         .merge(webhooks::api())
