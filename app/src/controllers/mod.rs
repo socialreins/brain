@@ -1,5 +1,5 @@
 //! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, the documented `/v1` API
-//! (waitlist, teams, API tokens, webhooks, connections, social sets, posts, inboxes,
+//! (waitlist, teams, API tokens, webhooks, connections, social sets, posts, lists, inboxes,
 //! automations), and `/mcp` (see `crate::mcp`).
 pub mod api_tokens;
 pub mod auth;
@@ -9,6 +9,7 @@ pub mod google;
 pub mod health;
 pub mod idempotency;
 pub mod inbox;
+pub mod lists;
 pub mod passkeys;
 pub mod posts;
 pub mod social_sets;
@@ -62,6 +63,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(connections::api())
         .merge(social_sets::api())
         .merge(posts::api())
+        .merge(lists::api())
         .merge(inbox::api())
         // Two DM texts of 1000 graphemes can pass 4 KiB.
         .merge(automations::api().layer(DefaultBodyLimit::max(MAX_AUTOMATION_BODY_BYTES)))

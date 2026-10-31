@@ -7,6 +7,7 @@ pub mod inboxes;
 pub mod magic_links;
 pub mod passkey_challenges;
 pub mod passkeys;
+pub mod post_lists;
 pub mod post_targets;
 pub mod posts;
 pub mod sessions;

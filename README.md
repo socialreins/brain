@@ -27,7 +27,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/health` | `{"status":"ok"}` |
 | GET | `/version` | `{"commit":"<sha>"}`, from `RAILWAY_GIT_COMMIT_SHA`, `dev` locally |
 | GET | `/openapi.json` | OpenAPI document for `/v1` |
-| POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, accounts and posts. Bearer API token only, same scope and per-token limit as `/v1`; `Idempotency-Key` does not apply |
+| POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, accounts, posts and lists. Bearer API token only, same scope and per-token limit as `/v1`; `Idempotency-Key` does not apply |
 | POST | `/v1/waitlist` | `{"email":"...","source":"..."}` joins the waitlist |
 | POST | `/auth/link` | `{"email":"..."}` emails a sign-in link, `202 {"status":"sent"}` |
 | GET | `/auth/magic/{token}` | The emailed link: a page with a sign-in button, does not use the link |
@@ -64,6 +64,11 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&from=&to=` on `scheduled_at`), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"scheduled_at"}`; any member) |
 | GET, PUT, DELETE | `/v1/posts/{id}` | One post with its `targets`; replace a `draft` or `scheduled` one; delete (`204` for draft or scheduled, `200` after taking a published one down, `422 takedown_failed` with a `message`, `409` for queued or failed) |
 | POST | `/v1/posts/{id}/publish` | Publish a draft or scheduled post now: `202` with the post `queued`; poll it for the result |
+| GET, POST | `/v1/lists` | Post lists (ordered groups such as a series), or create one (`{"name","social_set_id"}`; no set means team-wide, or the token's own set for a set token) |
+| GET, PATCH, DELETE | `/v1/lists/{id}` | One list with its `items` (`post_id`, 1-based `position`, `post`); rename (`{"name"}`); delete (posts stay) |
+| POST | `/v1/lists/{id}/posts` | Add a post (`{"post_id","position"}`; appends by default, an existing post moves) |
+| DELETE | `/v1/lists/{id}/posts/{post_id}` | Take a post out; later posts move up |
+| PUT | `/v1/lists/{id}/order` | Reorder (`{"post_ids"}`: every post of the list once, else `422 invalid_order`) |
 | GET, POST | `/v1/inboxes` | The team's inboxes, the undeletable "All" first; create one (`{"name","filters":{"social_set_id"\|"account_ids","kinds","platforms","keywords","unanswered"}}`, owner, admin) |
 | PUT, DELETE | `/v1/inboxes/{id}` | Replace name and filters; delete (owner, admin; not "All") |
 | GET | `/v1/inboxes/{id}/items` | `?state=open\|done&cursor=&limit=`: items newest first with their `replies`, and `next_cursor` |

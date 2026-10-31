@@ -5521,7 +5521,7 @@ mod teams {
                 }
 
                 /// A tool call: `(isError, the JSON the tool answered as text)`.
-                async fn call(
+                pub(super) async fn call(
                     s: &TestServer,
                     secret: &str,
                     tool: &str,
@@ -5595,12 +5595,18 @@ mod teams {
                     assert_eq!(
                         names,
                         [
+                            "add-post-to-list",
+                            "create-list",
                             "create-post",
                             "delete-post",
+                            "get-list",
                             "get-post",
+                            "list-lists",
                             "list-posts",
                             "list-social-accounts",
                             "list-social-sets",
+                            "remove-post-from-list",
+                            "reorder-list",
                             "update-post",
                         ]
                     );
@@ -5801,6 +5807,426 @@ mod teams {
                     let res = rpc(&s, Some(secret), "tools/list", json!({})).await;
                     assert_eq!(res.status_code(), 429);
                     res.assert_json(&json!({"error": "rate_limited"}));
+                }
+            }
+
+            /// Post lists: order, scope and the `lists` of every post.
+            mod lists {
+                use super::*;
+                use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+                /// Owner cookie, Default set, a "Clients" set, a team token and a Clients token.
+                async fn setup(
+                    s: &TestServer,
+                    db: &DatabaseConnection,
+                ) -> (String, String, String, String, String) {
+                    let (_, owner, _) = user(s, db).await;
+                    let team_id = current(s, &owner).await["id"].as_str().unwrap().to_owned();
+                    let default = default_set(db, &team_id).await.to_string();
+                    let clients = req(s, Method::POST, "/v1/social-sets", &owner)
+                        .json(&json!({"name": "Clients"}))
+                        .await
+                        .json::<Value>()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let team = make_token(s, &owner, json!({"name": "team"})).await;
+                    let set =
+                        make_token(s, &owner, json!({"name": "cm", "social_set_id": clients}))
+                            .await;
+                    let secret = |v: Value| v["secret"].as_str().unwrap().to_owned();
+                    (owner, default, clients, secret(team), secret(set))
+                }
+
+                async fn new_post(s: &TestServer, secret: &str, set: &str) -> String {
+                    let res = bearer(s, Method::POST, "/v1/posts", secret)
+                        .json(&post_body(Some(set), "part"))
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    res.json::<Value>()["id"].as_str().unwrap().to_owned()
+                }
+
+                async fn new_list(s: &TestServer, secret: &str, body: Value) -> String {
+                    let res = bearer(s, Method::POST, "/v1/lists", secret)
+                        .json(&body)
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    res.json::<Value>()["id"].as_str().unwrap().to_owned()
+                }
+
+                async fn add(
+                    s: &TestServer,
+                    secret: &str,
+                    list: &str,
+                    body: Value,
+                ) -> axum_test::TestResponse {
+                    bearer(s, Method::POST, &format!("/v1/lists/{list}/posts"), secret)
+                        .json(&body)
+                        .await
+                }
+
+                /// `(post id, position)` of each item the caller sees.
+                async fn items(s: &TestServer, secret: &str, list: &str) -> Vec<(String, i64)> {
+                    let res = bearer(s, Method::GET, &format!("/v1/lists/{list}"), secret).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let body = res.json::<Value>();
+                    body["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|i| {
+                            assert_eq!(i["post"]["id"], i["post_id"]);
+                            let id = i["post_id"].as_str().unwrap().to_owned();
+                            (id, i["position"].as_i64().unwrap())
+                        })
+                        .collect()
+                }
+
+                fn ranked(ids: &[&String]) -> Vec<(String, i64)> {
+                    ids.iter()
+                        .enumerate()
+                        .map(|(i, id)| ((*id).clone(), i as i64 + 1))
+                        .collect()
+                }
+
+                async fn reorder(
+                    s: &TestServer,
+                    secret: &str,
+                    list: &str,
+                    ids: &[&String],
+                ) -> axum_test::TestResponse {
+                    bearer(s, Method::PUT, &format!("/v1/lists/{list}/order"), secret)
+                        .json(&json!({"post_ids": ids}))
+                        .await
+                }
+
+                async fn post_lists(s: &TestServer, secret: &str, post: &str) -> Value {
+                    let res = bearer(s, Method::GET, &format!("/v1/posts/{post}"), secret).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    res.json::<Value>()["lists"].clone()
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn lists_keep_order_and_posts_carry_them() {
+                    let (s, db) = on_mock(1000).await;
+                    let (owner, default, clients, team, _) = setup(&s, &db).await;
+                    let (p1, p2, p3) = (
+                        new_post(&s, &team, &default).await,
+                        new_post(&s, &team, &default).await,
+                        new_post(&s, &team, &default).await,
+                    );
+
+                    // A session creates a team-wide list.
+                    let res = req(&s, Method::POST, "/v1/lists", &owner)
+                        .json(&json!({"name": "  Series  "}))
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let made = res.json::<Value>();
+                    assert_eq!(made["name"], "Series");
+                    assert_eq!(made["social_set_id"], Value::Null);
+                    assert_eq!(made["remote_ids"], json!({}));
+                    assert_eq!(made["items"], json!([]));
+                    let list = made["id"].as_str().unwrap().to_owned();
+
+                    // Adding appends; adding again moves.
+                    for p in [&p1, &p2, &p3] {
+                        add(&s, &team, &list, json!({"post_id": p}))
+                            .await
+                            .assert_status_ok();
+                    }
+                    assert_eq!(items(&s, &team, &list).await, ranked(&[&p1, &p2, &p3]));
+                    let res = add(&s, &team, &list, json!({"post_id": p3, "position": 1})).await;
+                    res.assert_status_ok();
+                    assert_eq!(res.json::<Value>()["items"][0]["post_id"], p3.as_str());
+                    assert_eq!(items(&s, &team, &list).await, ranked(&[&p3, &p1, &p2]));
+                    let res = add(&s, &team, &list, json!({"post_id": p3, "position": 9})).await;
+                    res.assert_status_ok();
+                    assert_eq!(items(&s, &team, &list).await, ranked(&[&p1, &p2, &p3]));
+                    let res = add(&s, &team, &list, json!({"post_id": p3, "position": 0})).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "invalid_position"}));
+                    let res = add(&s, &team, &list, json!({"post_id": uuid::Uuid::now_v7()})).await;
+                    res.assert_json(&json!({"error": "invalid_post"}));
+
+                    // Every post carries its lists, in the single and the list answer.
+                    let want = json!([{"id": list, "name": "Series", "position": 2}]);
+                    assert_eq!(post_lists(&s, &team, &p2).await, want);
+                    let all = bearer(&s, Method::GET, "/v1/posts", &team)
+                        .await
+                        .json::<Value>();
+                    let p2_json = all
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|p| p["id"] == p2.as_str());
+                    assert_eq!(p2_json.unwrap()["lists"], want);
+
+                    // Removing compacts.
+                    let path = format!("/v1/lists/{list}/posts/{p1}");
+                    let res = bearer(&s, Method::DELETE, &path, &team).await;
+                    assert_eq!(res.status_code(), 204);
+                    assert_eq!(items(&s, &team, &list).await, ranked(&[&p2, &p3]));
+                    let res = bearer(&s, Method::DELETE, &path, &team).await;
+                    assert_eq!(res.status_code(), 404);
+                    assert_eq!(post_lists(&s, &team, &p1).await, json!([]));
+
+                    // A reorder names every post once.
+                    reorder(&s, &team, &list, &[&p3, &p2])
+                        .await
+                        .assert_status_ok();
+                    assert_eq!(items(&s, &team, &list).await, ranked(&[&p3, &p2]));
+                    for bad in [vec![&p3], vec![&p3, &p3], vec![&p3, &p2, &p1], vec![]] {
+                        let res = reorder(&s, &team, &list, &bad).await;
+                        assert_eq!(res.status_code(), 422, "{bad:?}");
+                        res.assert_json(&json!({"error": "invalid_order"}));
+                    }
+
+                    // Rename.
+                    let res = bearer(&s, Method::PATCH, &format!("/v1/lists/{list}"), &team)
+                        .json(&json!({"name": "Season 1"}))
+                        .await;
+                    res.assert_status_ok();
+                    assert_eq!(res.json::<Value>()["name"], "Season 1");
+                    let res = bearer(&s, Method::PATCH, &format!("/v1/lists/{list}"), &team)
+                        .json(&json!({"name": " "}))
+                        .await;
+                    res.assert_json(&json!({"error": "invalid_name"}));
+
+                    // A post is created into a list, and moved into another by PUT.
+                    let mut body = post_body(Some(&default), "new part");
+                    body["list_id"] = json!(list);
+                    body["position"] = json!(1);
+                    let res = bearer(&s, Method::POST, "/v1/posts", &team)
+                        .json(&body)
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let made = res.json::<Value>();
+                    let p4 = made["id"].as_str().unwrap().to_owned();
+                    assert_eq!(made["lists"][0]["position"], 1);
+                    assert_eq!(items(&s, &team, &list).await, ranked(&[&p4, &p3, &p2]));
+                    let other = new_list(&s, &team, json!({"name": "Other"})).await;
+                    let mut body = post_body(Some(&default), "edited");
+                    body["list_id"] = json!(other);
+                    let res = bearer(&s, Method::PUT, &format!("/v1/posts/{p2}"), &team)
+                        .json(&body)
+                        .await;
+                    res.assert_status_ok();
+                    let positions: Vec<(String, i64)> = res.json::<Value>()["lists"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|l| {
+                            (
+                                l["id"].as_str().unwrap().to_owned(),
+                                l["position"].as_i64().unwrap(),
+                            )
+                        })
+                        .collect();
+                    assert_eq!(positions, vec![(list.clone(), 3), (other.clone(), 1)]);
+                    // A list unknown to the post's write rolls the create back.
+                    let mut body = post_body(Some(&default), "orphan");
+                    body["list_id"] = json!(uuid::Uuid::now_v7());
+                    let before = bearer(&s, Method::GET, "/v1/posts", &team)
+                        .await
+                        .json::<Vec<Value>>()
+                        .len();
+                    let res = bearer(&s, Method::POST, "/v1/posts", &team)
+                        .json(&body)
+                        .await;
+                    assert_eq!(res.status_code(), 404);
+                    let after = bearer(&s, Method::GET, "/v1/posts", &team)
+                        .await
+                        .json::<Vec<Value>>()
+                        .len();
+                    assert_eq!(before, after);
+
+                    // A taken-down post drops out and a deleted draft leaves; the rest close up.
+                    db.execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "UPDATE posts SET status = 'deleted' WHERE id = $1",
+                        [p3.parse::<uuid::Uuid>().unwrap().into()],
+                    ))
+                    .await
+                    .unwrap();
+                    assert_eq!(items(&s, &team, &list).await, ranked(&[&p4, &p2]));
+                    let res = add(&s, &team, &list, json!({"post_id": p3})).await;
+                    res.assert_json(&json!({"error": "invalid_post"}));
+                    let res = bearer(&s, Method::DELETE, &format!("/v1/posts/{p4}"), &team).await;
+                    assert_eq!(res.status_code(), 204);
+                    assert_eq!(items(&s, &team, &list).await, ranked(&[&p2]));
+                    assert_eq!(post_lists(&s, &team, &p2).await[0]["position"], 1);
+
+                    // A set-tied list takes only its set's posts.
+                    let tied =
+                        new_list(&s, &team, json!({"name": "C", "social_set_id": clients})).await;
+                    let res = add(&s, &team, &tied, json!({"post_id": p2})).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "invalid_set"}));
+                    for set in [uuid::Uuid::now_v7().to_string(), "nope".into()] {
+                        let res = bearer(&s, Method::POST, "/v1/lists", &team)
+                            .json(&json!({"name": "x", "social_set_id": set}))
+                            .await;
+                        assert_eq!(res.status_code(), 422);
+                    }
+
+                    // A deleted list is gone; its posts stay.
+                    let res = bearer(&s, Method::DELETE, &format!("/v1/lists/{list}"), &team).await;
+                    assert_eq!(res.status_code(), 204);
+                    let res = bearer(&s, Method::GET, &format!("/v1/lists/{list}"), &team).await;
+                    assert_eq!(res.status_code(), 404);
+                    let res = add(&s, &team, &list, json!({"post_id": p2})).await;
+                    assert_eq!(res.status_code(), 404);
+                    let all = bearer(&s, Method::GET, "/v1/lists", &team)
+                        .await
+                        .json::<Value>();
+                    assert_eq!(ids(&all), vec![other.clone(), tied]);
+                    let left = post_lists(&s, &team, &p2).await;
+                    assert_eq!(left, json!([{"id": other, "name": "Other", "position": 1}]));
+
+                    // Token writes take an Idempotency-Key.
+                    let p5 = new_post(&s, &team, &default).await;
+                    for replayed in [false, true] {
+                        let res =
+                            bearer(&s, Method::POST, &format!("/v1/lists/{other}/posts"), &team)
+                                .add_header("idempotency-key", "add-p5")
+                                .json(&json!({"post_id": p5}))
+                                .await;
+                        res.assert_status_ok();
+                        assert_eq!(res.maybe_header("idempotent-replayed").is_some(), replayed);
+                    }
+
+                    let doc = s.get("/openapi.json").await.json::<Value>();
+                    for (p, m) in [
+                        ("/lists", "get"),
+                        ("/lists", "post"),
+                        ("/lists/{id}", "get"),
+                        ("/lists/{id}", "patch"),
+                        ("/lists/{id}", "delete"),
+                        ("/lists/{id}/posts", "post"),
+                        ("/lists/{id}/posts/{post_id}", "delete"),
+                        ("/lists/{id}/order", "put"),
+                    ] {
+                        let sec = doc["paths"][p][m]["security"].to_string();
+                        assert!(sec.contains("api_token"), "{p} {m} {sec}");
+                    }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn set_tokens_see_team_wide_lists_but_only_their_posts() {
+                    let (s, db) = on_mock(1000).await;
+                    let (_, default, clients, team, set) = setup(&s, &db).await;
+                    let d1 = new_post(&s, &team, &default).await;
+                    let d2 = new_post(&s, &team, &default).await;
+                    let c1 = new_post(&s, &set, &clients).await;
+                    let c2 = new_post(&s, &set, &clients).await;
+                    let wide = new_list(&s, &team, json!({"name": "Wide"})).await;
+                    for p in [&d1, &c1] {
+                        add(&s, &team, &wide, json!({"post_id": p}))
+                            .await
+                            .assert_status_ok();
+                    }
+                    let mine =
+                        new_list(&s, &set, json!({"name": "Mine", "social_set_id": clients})).await;
+                    let theirs =
+                        new_list(&s, &team, json!({"name": "D", "social_set_id": default})).await;
+
+                    let seen = bearer(&s, Method::GET, "/v1/lists", &set)
+                        .await
+                        .json::<Value>();
+                    assert_eq!(ids(&seen), vec![wide.clone(), mine.clone()]);
+                    let res = bearer(&s, Method::GET, &format!("/v1/lists/{theirs}"), &set).await;
+                    assert_eq!(res.status_code(), 404);
+                    let res = add(&s, &set, &theirs, json!({"post_id": c1})).await;
+                    assert_eq!(res.status_code(), 404);
+                    assert_eq!(items(&s, &set, &wide).await, ranked(&[&c1]));
+                    assert_eq!(items(&s, &team, &wide).await, ranked(&[&d1, &c1]));
+
+                    // A set token's list defaults to its own set; another set is refused.
+                    let res = bearer(&s, Method::POST, "/v1/lists", &set)
+                        .json(&json!({"name": "x"}))
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    assert_eq!(res.json::<Value>()["social_set_id"], clients.as_str());
+                    let res = bearer(&s, Method::POST, "/v1/lists", &set)
+                        .json(&json!({"name": "x", "social_set_id": default}))
+                        .await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "invalid_set"}));
+
+                    // Another set's post cannot go in; its own can, and orders among its own.
+                    let res = add(&s, &set, &wide, json!({"post_id": d2})).await;
+                    res.assert_json(&json!({"error": "invalid_post"}));
+                    add(&s, &set, &wide, json!({"post_id": c2}))
+                        .await
+                        .assert_status_ok();
+                    assert_eq!(items(&s, &set, &wide).await, ranked(&[&c1, &c2]));
+                    assert_eq!(items(&s, &team, &wide).await, ranked(&[&d1, &c1, &c2]));
+                    let res = reorder(&s, &set, &wide, &[&c2, &c1, &d1]).await;
+                    res.assert_json(&json!({"error": "invalid_order"}));
+                    reorder(&s, &set, &wide, &[&c2, &c1])
+                        .await
+                        .assert_status_ok();
+                    assert_eq!(items(&s, &team, &wide).await, ranked(&[&d1, &c2, &c1]));
+                    assert_eq!(post_lists(&s, &set, &c1).await[0]["position"], 2);
+                    assert_eq!(post_lists(&s, &team, &c1).await[0]["position"], 3);
+                    let path = format!("/v1/lists/{wide}/posts/{d1}");
+                    let res = bearer(&s, Method::DELETE, &path, &set).await;
+                    assert_eq!(res.status_code(), 404);
+
+                    // The team-wide list itself is not the set token's to change.
+                    let res = bearer(&s, Method::PATCH, &format!("/v1/lists/{wide}"), &set)
+                        .json(&json!({"name": "mine now"}))
+                        .await;
+                    assert_eq!(res.status_code(), 403);
+                    let res = bearer(&s, Method::DELETE, &format!("/v1/lists/{wide}"), &set).await;
+                    assert_eq!(res.status_code(), 403);
+                    let res = bearer(&s, Method::PATCH, &format!("/v1/lists/{mine}"), &set)
+                        .json(&json!({"name": "Renamed"}))
+                        .await;
+                    res.assert_status_ok();
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn mcp_list_tools_match_rest() {
+                    let (s, db) = on_mock(1000).await;
+                    let (_, default, _, team, _) = setup(&s, &db).await;
+                    let (p1, p2) = (
+                        new_post(&s, &team, &default).await,
+                        new_post(&s, &team, &default).await,
+                    );
+                    let (err, made) =
+                        super::mcp::call(&s, &team, "create-list", json!({"name": "Via MCP"}))
+                            .await;
+                    assert!(!err, "{made}");
+                    let list = made["id"].as_str().unwrap().to_owned();
+                    for p in [&p1, &p2] {
+                        let args = json!({"id": list, "post_id": p});
+                        let (err, got) =
+                            super::mcp::call(&s, &team, "add-post-to-list", args).await;
+                        assert!(!err, "{got}");
+                    }
+                    let args = json!({"id": list, "post_ids": [p2, p1]});
+                    let (err, _) = super::mcp::call(&s, &team, "reorder-list", args).await;
+                    assert!(!err);
+                    let (_, got) =
+                        super::mcp::call(&s, &team, "get-list", json!({"id": list})).await;
+                    let rest = bearer(&s, Method::GET, &format!("/v1/lists/{list}"), &team).await;
+                    assert_eq!(got, rest.json::<Value>());
+                    assert_eq!(items(&s, &team, &list).await, ranked(&[&p2, &p1]));
+                    let args = json!({"id": list, "post_ids": [p2]});
+                    let (err, got) = super::mcp::call(&s, &team, "reorder-list", args).await;
+                    assert!(err);
+                    assert_eq!(got, json!({"error": "invalid_order"}));
+                    let args = json!({"id": list, "post_id": p2});
+                    let (err, got) =
+                        super::mcp::call(&s, &team, "remove-post-from-list", args).await;
+                    assert!(!err && got == json!({"ok": true}), "{got}");
+                    let (_, all) = super::mcp::call(&s, &team, "list-lists", json!({})).await;
+                    let rest = bearer(&s, Method::GET, "/v1/lists", &team).await;
+                    assert_eq!(all, rest.json::<Value>());
                 }
             }
 
