@@ -6143,17 +6143,17 @@ mod teams {
                     assert_eq!(items(&s, &set, &wide).await, ranked(&[&c1]));
                     assert_eq!(items(&s, &team, &wide).await, ranked(&[&d1, &c1]));
 
-                    // No team-wide or other-set list from a set token.
-                    for body in [
-                        json!({"name": "x"}),
-                        json!({"name": "x", "social_set_id": default}),
-                    ] {
-                        let res = bearer(&s, Method::POST, "/v1/lists", &set)
-                            .json(&body)
-                            .await;
-                        assert_eq!(res.status_code(), 422);
-                        res.assert_json(&json!({"error": "invalid_set"}));
-                    }
+                    // A set token's list defaults to its own set; another set is refused.
+                    let res = bearer(&s, Method::POST, "/v1/lists", &set)
+                        .json(&json!({"name": "x"}))
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    assert_eq!(res.json::<Value>()["social_set_id"], clients.as_str());
+                    let res = bearer(&s, Method::POST, "/v1/lists", &set)
+                        .json(&json!({"name": "x", "social_set_id": default}))
+                        .await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "invalid_set"}));
 
                     // Another set's post cannot go in; its own can, and orders among its own.
                     let res = add(&s, &set, &wide, json!({"post_id": d2})).await;

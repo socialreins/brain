@@ -81,7 +81,7 @@ pub struct ListRef {
 pub struct ListInput {
     /// 1 to 60 characters.
     pub name: String,
-    /// A live set of the team; absent for a team-wide list. A set token must name its own set.
+    /// A live set of the team; absent for a team-wide list, or a set token's own set.
     pub social_set_id: Option<Uuid>,
 }
 
@@ -396,8 +396,8 @@ pub async fn list_lists(app: &AppState, a: &Actor) -> Response {
     }
 }
 
-/// Creates a list, team-wide or tied to one set. A set token must name its own set (else `422
-/// invalid_set`).
+/// Creates a list, team-wide or tied to one set. A set token's list defaults to its own set; another
+/// set is `422 invalid_set`.
 #[utoipa::path(post, path = "/lists", tag = "lists",
     security(("session" = []), ("api_token" = [])), request_body = ListInput,
     params(("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
@@ -413,6 +413,7 @@ pub async fn create_list(app: &AppState, a: &Actor, input: ListInput) -> Respons
         return invalid("invalid_name");
     };
     let set = match (a.set_id(), input.social_set_id) {
+        (Some(own), None) => Some(own),
         (Some(own), Some(id)) if id == own => Some(own),
         (Some(_), _) => return invalid("invalid_set"),
         (None, set) => set,
