@@ -5036,5 +5036,458 @@ mod teams {
                 assert_eq!(a.dm_access, body["dm_access"] == true);
             }
         }
+
+        /// `/v1/api-tokens` and bearer access to `/v1/me`, sets, connections and posts.
+        mod api_tokens_api {
+            use super::*;
+            use socialreins_brain::{models::api_tokens, rate_limit::RateLimiter};
+            use std::sync::Arc;
+
+            /// A brain on the mock whose API token limit is `per_minute`.
+            async fn on_mock(per_minute: u32) -> (TestServer, DatabaseConnection) {
+                let base = mock_bluesky().await;
+                let mut config = Config::from_env().expect("test config");
+                config.trust_proxy = true;
+                config.bluesky.appview = base.clone();
+                config.bluesky.plc = base;
+                config.bluesky.allow_insecure_pds = true;
+                let db = socialreins_brain::connect(&config)
+                    .await
+                    .expect("database reachable");
+                let mut state = AppState::new(db.clone(), &config);
+                state.api_token_limiter = Arc::new(RateLimiter::per_minute(per_minute));
+                let app = controllers::router(state, &config);
+                (TestServer::new(app).unwrap(), db)
+            }
+
+            async fn make_token(s: &TestServer, cookie: &str, body: Value) -> Value {
+                let res = req(s, Method::POST, "/v1/api-tokens", cookie)
+                    .json(&body)
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                res.json()
+            }
+
+            /// A request with `Authorization: Bearer <secret>` and no cookie or origin.
+            fn bearer(s: &TestServer, method: Method, path: &str, secret: &str) -> TestRequest {
+                s.method(method, path)
+                    .add_header("authorization", format!("Bearer {secret}"))
+            }
+
+            fn post_body(set: Option<&str>, body: &str) -> Value {
+                let mut v = json!({"platform": "bluesky", "body": body});
+                if let Some(set) = set {
+                    v["social_set_id"] = json!(set);
+                }
+                v
+            }
+
+            fn ids(list: &Value) -> Vec<String> {
+                list.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v["id"].as_str().unwrap().to_owned())
+                    .collect()
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn create_shows_the_secret_once_and_only_managers_handle_tokens() {
+                let (s, db) = on_mock(120).await;
+                let (_, owner, _) = user(&s, &db).await;
+                let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+                let (member, _) = joined(&s, &db, &team_id, "member").await;
+
+                let made = make_token(&s, &owner, json!({"name": "  Content Machine "})).await;
+                let secret = made["secret"].as_str().unwrap().to_owned();
+                assert!(secret.starts_with("sr_team_live_"), "{secret}");
+                assert_eq!(secret.len(), "sr_team_live_".len() + 48);
+                let t = &made["token"];
+                assert_eq!(t["name"], "Content Machine");
+                assert_eq!(t["social_set_id"], Value::Null);
+                assert_eq!(t["prefix_hint"], secret[..17]);
+                assert!(t.get("secret").is_none() && t.get("token_hash").is_none());
+                let id = t["id"].as_str().unwrap().to_owned();
+
+                let res = s.get("/v1/api-tokens").add_header("cookie", &owner).await;
+                res.assert_status_ok();
+                assert!(
+                    !res.text().contains(&secret[13..]),
+                    "list never shows the secret"
+                );
+                assert!(!res.text().contains("secret"));
+                assert_eq!(ids(&res.json()), vec![id.clone()]);
+
+                // Members cannot list, create or revoke.
+                let res = s.get("/v1/api-tokens").add_header("cookie", &member).await;
+                assert_eq!(res.status_code(), 403);
+                let res = req(&s, Method::POST, "/v1/api-tokens", &member)
+                    .json(&json!({"name": "x"}))
+                    .await;
+                assert_eq!(res.status_code(), 403);
+                let path = format!("/v1/api-tokens/{id}");
+                assert_eq!(
+                    req(&s, Method::DELETE, &path, &member).await.status_code(),
+                    403
+                );
+
+                // Validation, the web origin and a fresh sign-in.
+                let (_, stranger, _) = user(&s, &db).await;
+                let foreign = current(&s, &stranger).await["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let foreign_set = default_set(&db, &foreign).await.to_string();
+                for (body, code) in [
+                    (json!({"name": " "}), "invalid_name"),
+                    (json!({"name": "a".repeat(61)}), "invalid_name"),
+                    (json!({"name": "x", "expires_in_days": 0}), "invalid_expiry"),
+                    (
+                        json!({"name": "x", "social_set_id": foreign_set}),
+                        "invalid_set",
+                    ),
+                ] {
+                    let res = req(&s, Method::POST, "/v1/api-tokens", &owner)
+                        .json(&body)
+                        .await;
+                    assert_eq!(res.status_code(), 422, "{code}");
+                    res.assert_json(&json!({ "error": code }));
+                }
+                let res = s
+                    .post("/v1/api-tokens")
+                    .add_header("cookie", &owner)
+                    .json(&json!({"name": "x"}))
+                    .await;
+                res.assert_json(&json!({"error": "forbidden_origin"}));
+                let (admin, _) = joined(&s, &db, &team_id, "admin").await;
+                let row = sessions::ActiveModel {
+                    token_hash: Set(token::hash(admin.trim_start_matches("sr_session="))),
+                    created_at: Set((Utc::now() - Duration::minutes(11)).fixed_offset()),
+                    ..Default::default()
+                };
+                sessions::Entity::update(row).exec(&db).await.unwrap();
+                let res = req(&s, Method::POST, "/v1/api-tokens", &admin)
+                    .json(&json!({"name": "x"}))
+                    .await;
+                res.assert_json(&json!({"error": "reauth_required"}));
+                let res = s.get("/v1/api-tokens").add_header("cookie", &admin).await;
+                res.assert_status_ok();
+
+                // The token works, unknown ones do not, and a bearer header never falls back
+                // to the cookie.
+                let me = bearer(&s, Method::GET, "/v1/me", &secret).await;
+                me.assert_status_ok();
+                let me = me.json::<Value>();
+                assert_eq!(me["team"]["id"], team_id.as_str());
+                assert_eq!(me["team"]["role"], "admin");
+                assert_eq!(me["token_name"], "Content Machine");
+                let used = api_tokens::Entity::find_by_id(id.parse::<uuid::Uuid>().unwrap())
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(used.last_used_at.is_some());
+                for bad in ["sr_team_live_nope", "nope", ""] {
+                    let res = bearer(&s, Method::GET, "/v1/me", bad)
+                        .add_header("cookie", &owner)
+                        .await;
+                    assert_eq!(res.status_code(), 401, "{bad}");
+                    res.assert_json(&json!({"error": "invalid_token"}));
+                }
+                let res = s.get("/v1/me").add_header("cookie", &owner).await;
+                assert_eq!(res.json::<Value>()["token_name"], Value::Null);
+
+                // Revoked and expired tokens are refused and leave the list.
+                assert_eq!(
+                    req(&s, Method::DELETE, &path, &owner).await.status_code(),
+                    204
+                );
+                assert_eq!(
+                    req(&s, Method::DELETE, &path, &owner).await.status_code(),
+                    404
+                );
+                let res = bearer(&s, Method::GET, "/v1/me", &secret).await;
+                assert_eq!(res.status_code(), 401);
+                res.assert_json(&json!({"error": "invalid_token"}));
+                let later =
+                    make_token(&s, &owner, json!({"name": "later", "expires_in_days": 1})).await;
+                let later_secret = later["secret"].as_str().unwrap();
+                bearer(&s, Method::GET, "/v1/me", later_secret)
+                    .await
+                    .assert_status_ok();
+                let row = api_tokens::ActiveModel {
+                    id: Set(later["token"]["id"].as_str().unwrap().parse().unwrap()),
+                    expires_at: Set(Some((Utc::now() - Duration::seconds(1)).fixed_offset())),
+                    ..Default::default()
+                };
+                api_tokens::Entity::update(row).exec(&db).await.unwrap();
+                let res = bearer(&s, Method::GET, "/v1/me", later_secret).await;
+                assert_eq!(res.status_code(), 401);
+                let res = s.get("/v1/api-tokens").add_header("cookie", &owner).await;
+                assert!(res.json::<Vec<Value>>().is_empty());
+
+                // At most 20 live tokens.
+                for i in 0..20 {
+                    make_token(&s, &owner, json!({"name": format!("t{i}")})).await;
+                }
+                let res = req(&s, Method::POST, "/v1/api-tokens", &owner)
+                    .json(&json!({"name": "one more"}))
+                    .await;
+                assert_eq!(res.status_code(), 409);
+                res.assert_json(&json!({"error": "too_many_tokens"}));
+
+                // Session-only routes refuse a token.
+                let live = make_token(&s, &stranger, json!({"name": "s"})).await;
+                let live = live["secret"].as_str().unwrap();
+                for path in [
+                    "/v1/inboxes",
+                    "/v1/automations",
+                    "/v1/team",
+                    "/v1/api-tokens",
+                    "/v1/connections/providers",
+                ] {
+                    let res = bearer(&s, Method::GET, path, live).await;
+                    assert_eq!(res.status_code(), 401, "{path}");
+                }
+                let res = bearer(&s, Method::POST, "/v1/social-sets", live)
+                    .json(&json!({"name": "nope"}))
+                    .await;
+                assert_eq!(
+                    res.status_code(),
+                    403,
+                    "session writes still need the origin"
+                );
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn set_tokens_see_and_write_only_their_set() {
+                let (s, db) = on_mock(120).await;
+                let (owner, team_id, first) = owner_with_account(&s, &db).await;
+                let default = default_set(&db, &team_id).await.to_string();
+                let clients = req(&s, Method::POST, "/v1/social-sets", &owner)
+                    .json(&json!({"name": "Clients"}))
+                    .await
+                    .json::<Value>()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let res = connect(&s, &owner, &new_handle(), APP_PASSWORD).await;
+                let second = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                req(
+                    &s,
+                    Method::PUT,
+                    &format!("/v1/connections/{second}/sets"),
+                    &owner,
+                )
+                .json(&json!({"set_ids": [default, clients]}))
+                .await
+                .assert_status_ok();
+
+                let team = make_token(&s, &owner, json!({"name": "team"})).await;
+                let team = team["secret"].as_str().unwrap().to_owned();
+                let set =
+                    make_token(&s, &owner, json!({"name": "cm", "social_set_id": clients})).await;
+                assert!(set["secret"].as_str().unwrap().starts_with("sr_set_live_"));
+                let set = set["secret"].as_str().unwrap().to_owned();
+
+                // A whole-team token must name the set; writes need no Origin header.
+                let res = bearer(&s, Method::POST, "/v1/posts", &team)
+                    .json(&post_body(None, "no set"))
+                    .await;
+                res.assert_json(&json!({"error": "invalid_set"}));
+                let res = bearer(&s, Method::POST, "/v1/posts", &team)
+                    .json(&post_body(Some(&default), "from the team token"))
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let p = res.json::<Value>();
+                assert_eq!(p["created_by"], Value::Null);
+                let outside = p["id"].as_str().unwrap().to_owned();
+                let res = bearer(&s, Method::PUT, &format!("/v1/posts/{outside}"), &team)
+                    .json(&post_body(Some(&default), "edited"))
+                    .await;
+                res.assert_status_ok();
+
+                // A set token: its set by default, never another.
+                let me = bearer(&s, Method::GET, "/v1/me", &set)
+                    .await
+                    .json::<Value>();
+                assert_eq!(me["social_set"]["id"], clients.as_str());
+                assert_eq!(me["social_set"]["name"], "Clients");
+                let res = bearer(&s, Method::POST, "/v1/posts", &set)
+                    .json(&post_body(None, "mine"))
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let mine = res.json::<Value>();
+                assert_eq!(mine["social_set_id"], clients.as_str());
+                let mine = mine["id"].as_str().unwrap().to_owned();
+                let res = bearer(&s, Method::POST, "/v1/posts", &set)
+                    .json(&post_body(Some(&clients), "mine too"))
+                    .await;
+                assert_eq!(res.status_code(), 201);
+                let res = bearer(&s, Method::POST, "/v1/posts", &set)
+                    .json(&post_body(Some(&default), "elsewhere"))
+                    .await;
+                assert_eq!(res.status_code(), 422);
+                res.assert_json(&json!({"error": "invalid_set"}));
+                let res = bearer(&s, Method::PUT, &format!("/v1/posts/{mine}"), &set)
+                    .json(&post_body(Some(&default), "move it out"))
+                    .await;
+                res.assert_json(&json!({"error": "invalid_set"}));
+
+                let list = |secret: String, q: &'static str| {
+                    let s = &s;
+                    async move {
+                        let res = bearer(s, Method::GET, &format!("/v1/posts{q}"), &secret).await;
+                        res.assert_status_ok();
+                        res.json::<Value>()
+                    }
+                };
+                assert_eq!(list(team.clone(), "").await.as_array().unwrap().len(), 3);
+                let only = list(set.clone(), "").await;
+                assert_eq!(only.as_array().unwrap().len(), 2);
+                assert!(only
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|p| p["social_set_id"] == clients.as_str()));
+                let q = Box::leak(format!("?social_set_id={default}").into_boxed_str());
+                assert!(list(set.clone(), q).await.as_array().unwrap().is_empty());
+
+                // Another set's post is missing: get, update, delete, publish.
+                let path = format!("/v1/posts/{outside}");
+                for (method, path) in [
+                    (Method::GET, path.clone()),
+                    (Method::PUT, path.clone()),
+                    (Method::DELETE, path.clone()),
+                    (Method::POST, format!("{path}/publish")),
+                ] {
+                    let res = bearer(&s, method.clone(), &path, &set)
+                        .json(&post_body(None, "x"))
+                        .await;
+                    assert_eq!(res.status_code(), 404, "{method} {path}");
+                    res.assert_json(&json!({"error": "not_found"}));
+                }
+                bearer(&s, Method::GET, &format!("/v1/posts/{mine}"), &set)
+                    .await
+                    .assert_status_ok();
+                bearer(&s, Method::GET, &path, &team)
+                    .await
+                    .assert_status_ok();
+
+                // Sets and connections are filtered to the token's set.
+                let sets = bearer(&s, Method::GET, "/v1/social-sets", &set).await;
+                assert_eq!(ids(&sets.json()), vec![clients.clone()]);
+                let sets = bearer(&s, Method::GET, "/v1/social-sets", &team).await;
+                assert_eq!(ids(&sets.json()).len(), 2);
+                let conns = bearer(&s, Method::GET, "/v1/connections", &set)
+                    .await
+                    .json::<Value>();
+                assert_eq!(ids(&conns), vec![second.clone()]);
+                assert_eq!(conns[0]["set_ids"], json!([clients]));
+                let conns = bearer(&s, Method::GET, "/v1/connections", &team)
+                    .await
+                    .json::<Value>();
+                assert_eq!(ids(&conns), vec![first, second]);
+
+                // The set token may delete its own draft.
+                let res = bearer(&s, Method::DELETE, &format!("/v1/posts/{mine}"), &set).await;
+                assert_eq!(res.status_code(), 204);
+
+                // Deleting the set revokes its tokens; a restore does not bring them back.
+                req(
+                    &s,
+                    Method::DELETE,
+                    &format!("/v1/social-sets/{clients}"),
+                    &owner,
+                )
+                .await
+                .assert_status(axum::http::StatusCode::NO_CONTENT);
+                let res = bearer(&s, Method::GET, "/v1/me", &set).await;
+                assert_eq!(res.status_code(), 401);
+                req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/social-sets/{clients}/restore"),
+                    &owner,
+                )
+                .await
+                .assert_status_ok();
+                let res = bearer(&s, Method::GET, "/v1/me", &set).await;
+                assert_eq!(res.status_code(), 401);
+                bearer(&s, Method::GET, "/v1/me", &team)
+                    .await
+                    .assert_status_ok();
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn tokens_are_rate_limited_per_token() {
+                let (s, db) = on_mock(3).await;
+                let (_, owner, _) = user(&s, &db).await;
+                let a = make_token(&s, &owner, json!({"name": "a"})).await;
+                let b = make_token(&s, &owner, json!({"name": "b"})).await;
+                let (a, b) = (a["secret"].as_str().unwrap(), b["secret"].as_str().unwrap());
+                for _ in 0..3 {
+                    bearer(&s, Method::GET, "/v1/posts", a)
+                        .await
+                        .assert_status_ok();
+                }
+                let res = bearer(&s, Method::GET, "/v1/posts", a).await;
+                assert_eq!(res.status_code(), 429);
+                res.assert_json(&json!({"error": "rate_limited"}));
+                let wait: u64 = res.header("retry-after").to_str().unwrap().parse().unwrap();
+                assert!((1..=60).contains(&wait), "{wait}");
+                bearer(&s, Method::GET, "/v1/posts", b)
+                    .await
+                    .assert_status_ok();
+                // Sessions are not counted against tokens.
+                for _ in 0..5 {
+                    s.get("/v1/posts")
+                        .add_header("cookie", &owner)
+                        .await
+                        .assert_status_ok();
+                }
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn openapi_documents_the_routes_and_the_bearer_scheme() {
+                let (s, _) = on_mock(120).await;
+                let doc = s.get("/openapi.json").await.json::<Value>();
+                for (p, m) in [
+                    ("/me", "get"),
+                    ("/api-tokens", "get"),
+                    ("/api-tokens", "post"),
+                    ("/api-tokens/{id}", "delete"),
+                ] {
+                    assert!(doc["paths"][p][m].is_object(), "{p} {m}");
+                }
+                let schemes = &doc["components"]["securitySchemes"];
+                assert_eq!(schemes["api_token"]["scheme"], "bearer");
+                assert_eq!(schemes["session"]["in"], "cookie");
+                for (p, m) in [
+                    ("/me", "get"),
+                    ("/social-sets", "get"),
+                    ("/connections", "get"),
+                    ("/posts", "get"),
+                    ("/posts", "post"),
+                    ("/posts/{id}", "get"),
+                    ("/posts/{id}", "put"),
+                    ("/posts/{id}", "delete"),
+                    ("/posts/{id}/publish", "post"),
+                ] {
+                    let sec = doc["paths"][p][m]["security"].to_string();
+                    assert!(sec.contains("api_token"), "{p} {m} {sec}");
+                }
+                for (p, m) in [
+                    ("/api-tokens", "get"),
+                    ("/inboxes", "get"),
+                    ("/team", "get"),
+                ] {
+                    assert!(doc["paths"][p][m]["security"].is_null(), "{p} {m}");
+                }
+            }
+        }
     }
 }

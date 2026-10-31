@@ -1,7 +1,8 @@
 //! Social sets of the current team: groups of connected accounts. Members list them; owners and
 //! admins create, rename, delete and restore them. The Default set holds every account and
 //! cannot be deleted; it can be renamed. A deleted set keeps its account links and can be
-//! restored for 30 days, then `scheduler` purges it.
+//! restored for 30 days, then `scheduler` purges it. The list takes an API token too; a set token
+//! sees only its own set. Deleting a set revokes its set tokens for good.
 use std::collections::HashMap;
 
 use axum::{
@@ -22,12 +23,13 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use super::{
+    api_tokens::Actor,
     auth::{internal, Body, FromWeb},
     teams::InTeam,
     waitlist::{error, Error},
 };
 use crate::{
-    models::{social_account_social_set as membership, social_sets, teams},
+    models::{api_tokens, social_account_social_set as membership, social_sets, teams},
     scheduler::RESTORE_DAYS,
     state::AppState,
 };
@@ -150,18 +152,23 @@ async fn live_count_locked(db: &impl ConnectionTrait, team_id: Uuid) -> Result<u
 /// The current team's live sets, Default first, then oldest first, with their accounts. With
 /// `?deleted=true`, the deleted sets that can still be restored, newest deletion first.
 #[utoipa::path(get, path = "/social-sets", tag = "social-sets", params(ListQuery),
+    security(("session" = []), ("api_token" = [])),
     responses((status = 200, body = [SocialSet]), (status = 401, body = Error),
         (status = 422, body = Error)))]
 async fn list(
     State(app): State<AppState>,
-    t: InTeam,
+    a: Actor,
     q: Result<Query<ListQuery>, QueryRejection>,
 ) -> Response {
     let Ok(Query(q)) = q else {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     };
     let found = async {
-        let base = social_sets::Entity::find().filter(social_sets::Column::TeamId.eq(t.team.id));
+        let mut base =
+            social_sets::Entity::find().filter(social_sets::Column::TeamId.eq(a.team.id));
+        if let Some(own) = a.set_id() {
+            base = base.filter(social_sets::Column::Id.eq(own));
+        }
         let sets = if q.deleted {
             base.filter(social_sets::Column::DeletedAt.gt(restorable_since()))
                 .order_by_desc(social_sets::Column::DeletedAt)
@@ -275,8 +282,8 @@ async fn rename(
 }
 
 /// Deletes a set, restorable for 30 days. Owners and admins, with a sign-in from the last 10
-/// minutes (else `403 reauth_required`). The Default set cannot go (`409 default_set`). Any
-/// body is ignored.
+/// minutes (else `403 reauth_required`). The Default set cannot go (`409 default_set`). Revokes
+/// the API tokens limited to the set; a restore does not bring them back. Any body is ignored.
 #[utoipa::path(delete, path = "/social-sets/{id}", tag = "social-sets",
     params(("id" = Uuid, Path)),
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
@@ -299,19 +306,31 @@ async fn destroy(
     if !t.current.recent() {
         return reply(StatusCode::FORBIDDEN, "reauth_required");
     }
-    // TODO tokens: once API tokens exist, revoke the ones limited to this set here.
     let now = Utc::now().fixed_offset();
-    let deleted = social_sets::Entity::update_many()
-        .col_expr(social_sets::Column::DeletedAt, now.into())
-        .col_expr(social_sets::Column::UpdatedAt, now.into())
-        .filter(social_sets::Column::Id.eq(id))
-        .filter(social_sets::Column::IsDefault.eq(false))
-        .filter(social_sets::Column::DeletedAt.is_null())
-        .exec(&app.db)
-        .await;
-    match deleted {
-        Ok(r) if r.rows_affected == 1 => StatusCode::NO_CONTENT.into_response(),
-        Ok(_) => not_found(),
+    let deleted = async {
+        let txn = app.db.begin().await?;
+        let r = social_sets::Entity::update_many()
+            .col_expr(social_sets::Column::DeletedAt, now.into())
+            .col_expr(social_sets::Column::UpdatedAt, now.into())
+            .filter(social_sets::Column::Id.eq(id))
+            .filter(social_sets::Column::IsDefault.eq(false))
+            .filter(social_sets::Column::DeletedAt.is_null())
+            .exec(&txn)
+            .await?;
+        if r.rows_affected != 1 {
+            return Ok(false);
+        }
+        api_tokens::Entity::update_many()
+            .col_expr(api_tokens::Column::RevokedAt, now.into())
+            .filter(api_tokens::Column::SocialSetId.eq(id))
+            .filter(api_tokens::Column::RevokedAt.is_null())
+            .exec(&txn)
+            .await?;
+        txn.commit().await.map(|_| true)
+    };
+    match deleted.await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => not_found(),
         Err(e) => internal(e, "social set delete"),
     }
 }

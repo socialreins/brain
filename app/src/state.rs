@@ -27,6 +27,8 @@ pub struct AppState {
     pub connect_limiter: Arc<RateLimiter<uuid::Uuid>>,
     /// Per-user limit on publish-now and take-down calls, each of which calls a platform.
     pub post_limiter: Arc<RateLimiter<uuid::Uuid>>,
+    /// Per-token limit on every request made with an API token.
+    pub api_token_limiter: Arc<RateLimiter<uuid::Uuid>>,
     pub brain_url: String,
     pub web_url: String,
     /// `CORS_ORIGINS`: the web app's origins, the only ones that may call its state-changing
@@ -54,6 +56,7 @@ impl AppState {
             invitation_limiter: Arc::new(RateLimiter::per_minute(10)),
             connect_limiter: Arc::new(RateLimiter::per_minute(5)),
             post_limiter: Arc::new(RateLimiter::per_minute(10)),
+            api_token_limiter: Arc::new(RateLimiter::per_minute(120)),
             brain_url: config.brain_url.clone(),
             web_url: config.web_url.clone(),
             web_origins: config.cors_origins.clone(),
