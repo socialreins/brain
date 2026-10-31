@@ -31,7 +31,9 @@ use uuid::Uuid;
 use crate::{
     controllers::{
         api_tokens::Actor,
-        connections, posts,
+        connections,
+        lists::{self, AddPost, ListInput, Order},
+        posts,
         posts::{PostInput, PostQuery},
         social_sets::{self, ListQuery},
         waitlist::error,
@@ -55,6 +57,34 @@ struct UpdatePost {
 #[derive(Deserialize, JsonSchema)]
 struct NoArgs {}
 
+#[derive(Deserialize, JsonSchema)]
+struct ListId {
+    id: Uuid,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct AddToList {
+    /// The list.
+    id: Uuid,
+    #[serde(flatten)]
+    add: AddPost,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RemoveFromList {
+    /// The list.
+    id: Uuid,
+    post_id: Uuid,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct Reorder {
+    /// The list.
+    id: Uuid,
+    #[serde(flatten)]
+    order: Order,
+}
+
 /// Name, description, argument schema and read-only hint of each tool.
 fn specs() -> Vec<(&'static str, &'static str, Value, bool)> {
     fn schema<T: JsonSchema>() -> Value {
@@ -68,6 +98,12 @@ fn specs() -> Vec<(&'static str, &'static str, Value, bool)> {
         ("create-post", "Creates a post: scheduled with scheduled_at, else draft. Same as POST /v1/posts.", schema::<PostInput>(), false),
         ("update-post", "Replaces a draft or scheduled post. Same as PUT /v1/posts/{id}.", schema::<UpdatePost>(), false),
         ("delete-post", "Deletes a draft or scheduled post, or takes a published one down. Same as DELETE /v1/posts/{id}.", schema::<PostId>(), false),
+        ("list-lists", "The team's post lists (ordered groups of posts, such as a series), without their posts. Same as GET /v1/lists.", schema::<NoArgs>(), true),
+        ("create-list", "Creates a post list, team-wide or tied to one set. Same as POST /v1/lists.", schema::<ListInput>(), false),
+        ("get-list", "One post list with its posts in order; a post's position is its Part N. Same as GET /v1/lists/{id}.", schema::<ListId>(), true),
+        ("add-post-to-list", "Adds a post to a list at a 1-based position, appending by default; a post already there moves. Same as POST /v1/lists/{id}/posts.", schema::<AddToList>(), false),
+        ("remove-post-from-list", "Takes a post out of a list; the post stays. Same as DELETE /v1/lists/{id}/posts/{post_id}.", schema::<RemoveFromList>(), false),
+        ("reorder-list", "Reorders a list: post_ids holds every post of the list, each once. Same as PUT /v1/lists/{id}/order.", schema::<Reorder>(), false),
     ]
 }
 
@@ -82,7 +118,7 @@ fn to_mcp(
     t.annotations = Some(
         ToolAnnotations::new()
             .read_only(read_only)
-            .destructive(name == "delete-post")
+            .destructive(matches!(name, "delete-post" | "remove-post-from-list"))
             .open_world(false),
     );
     t
@@ -145,6 +181,27 @@ async fn run(app: &AppState, a: &Actor, name: &str, v: Value) -> Option<Response
         },
         "delete-post" => match args::<PostId>(v) {
             Some(p) => posts::delete_post(app, a, p.id).await,
+            None => invalid("invalid_body"),
+        },
+        "list-lists" => lists::list_lists(app, a).await,
+        "create-list" => match args(v) {
+            Some(l) => lists::create_list(app, a, l).await,
+            None => invalid("invalid_body"),
+        },
+        "get-list" => match args::<ListId>(v) {
+            Some(l) => lists::get_list(app, a, l.id).await,
+            None => invalid("invalid_body"),
+        },
+        "add-post-to-list" => match args::<AddToList>(v) {
+            Some(l) => lists::add_post(app, a, l.id, l.add).await,
+            None => invalid("invalid_body"),
+        },
+        "remove-post-from-list" => match args::<RemoveFromList>(v) {
+            Some(l) => lists::remove_post(app, a, l.id, l.post_id).await,
+            None => invalid("invalid_body"),
+        },
+        "reorder-list" => match args::<Reorder>(v) {
+            Some(l) => lists::reorder_list(app, a, l.id, l.order).await,
             None => invalid("invalid_body"),
         },
         _ => return None,

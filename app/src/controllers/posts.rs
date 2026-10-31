@@ -28,6 +28,7 @@ use super::{
     api_tokens::Actor,
     auth::{internal, Body},
     connections::live_sets,
+    lists::{self, lists_of, ListRef},
     waitlist::{error, Error},
 };
 use crate::{
@@ -66,6 +67,8 @@ pub struct Post {
     pub created_at: DateTime<FixedOffset>,
     pub updated_at: DateTime<FixedOffset>,
     pub targets: Vec<Target>,
+    /// The lists the post is in, with its position (its "Part N") in each.
+    pub lists: Vec<ListRef>,
 }
 
 /// One account a post went (or is going) to.
@@ -99,6 +102,10 @@ pub struct PostInput {
     pub media: Vec<String>,
     /// When to publish. Set: `scheduled`; absent or `null`: `draft`.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
+    /// A list to put the post in (moving it there when it already is).
+    pub list_id: Option<Uuid>,
+    /// With `list_id`: the 1-based position; absent appends.
+    pub position: Option<i32>,
 }
 
 #[derive(Deserialize, IntoParams, JsonSchema)]
@@ -149,7 +156,7 @@ async fn targets_of(
     Ok(map)
 }
 
-fn post_json(p: posts::Model, targets: Vec<Target>) -> Post {
+fn post_json(p: posts::Model, targets: Vec<Target>, lists: Vec<ListRef>) -> Post {
     Post {
         id: p.id,
         social_set_id: p.social_set_id,
@@ -164,13 +171,32 @@ fn post_json(p: posts::Model, targets: Vec<Target>) -> Post {
         created_at: p.created_at,
         updated_at: p.updated_at,
         targets,
+        lists,
     }
 }
 
-async fn one_json(db: &impl ConnectionTrait, p: posts::Model) -> Result<Post, DbErr> {
-    let mut targets = targets_of(db, &[p.id]).await?;
-    let t = targets.remove(&p.id).unwrap_or_default();
-    Ok(post_json(p, t))
+/// The JSON of `rows`, in order, with their targets and lists batched.
+pub(crate) async fn posts_json(
+    db: &impl ConnectionTrait,
+    a: &Actor,
+    rows: Vec<posts::Model>,
+) -> Result<Vec<Post>, DbErr> {
+    let ids: Vec<Uuid> = rows.iter().map(|p| p.id).collect();
+    let mut targets = targets_of(db, &ids).await?;
+    let mut in_lists = lists_of(db, a, &ids).await?;
+    Ok(rows
+        .into_iter()
+        .map(|p| {
+            let t = targets.remove(&p.id).unwrap_or_default();
+            let l = in_lists.remove(&p.id).unwrap_or_default();
+            post_json(p, t, l)
+        })
+        .collect())
+}
+
+async fn one_json(db: &impl ConnectionTrait, a: &Actor, p: posts::Model) -> Result<Post, DbErr> {
+    let mut one = posts_json(db, a, vec![p]).await?;
+    Ok(one.remove(0))
 }
 
 /// Posts a set token may touch: its set's. Re-checked in writes, so a concurrent move of the
@@ -183,7 +209,7 @@ fn in_scope(a: &Actor) -> Condition {
 }
 
 /// The caller's post `id`, unless its set is deleted or outside a set token's set.
-async fn find(
+pub(crate) async fn find(
     db: &impl ConnectionTrait,
     a: &Actor,
     id: Uuid,
@@ -283,16 +309,7 @@ pub async fn list_posts(app: &AppState, a: &Actor, q: PostQuery) -> Response {
             .limit(MAX_POSTS)
             .all(&app.db)
             .await?;
-        let ids: Vec<Uuid> = rows.iter().map(|p| p.id).collect();
-        let mut targets = targets_of(&app.db, &ids).await?;
-        Ok::<_, DbErr>(
-            rows.into_iter()
-                .map(|p| {
-                    let t = targets.remove(&p.id).unwrap_or_default();
-                    post_json(p, t)
-                })
-                .collect::<Vec<_>>(),
-        )
+        posts_json(&app.db, a, rows).await
     };
     match found.await {
         Ok(list) => Json(list).into_response(),
@@ -313,7 +330,7 @@ async fn show(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Re
 pub async fn get_post(app: &AppState, a: &Actor, id: Uuid) -> Response {
     let found = async {
         match find(&app.db, a, id).await? {
-            Some(p) => one_json(&app.db, p).await.map(Some),
+            Some(p) => one_json(&app.db, a, p).await.map(Some),
             None => Ok(None),
         }
     };
@@ -369,8 +386,13 @@ pub async fn create_post(app: &AppState, a: &Actor, input: PostInput) -> Respons
             ..Default::default()
         };
         let p = posts::Entity::insert(row).exec_with_returning(&txn).await?;
+        if let Some(list) = input.list_id {
+            if let Err(res) = lists::place(&txn, a, list, &p, input.position).await? {
+                return Ok(Err(res));
+            }
+        }
         txn.commit().await?;
-        Ok::<_, DbErr>(Ok(post_json(p, Vec::new())))
+        one_json(&app.db, a, p).await.map(Ok)
     };
     match made.await {
         Ok(Ok(p)) => (StatusCode::CREATED, Json(p)).into_response(),
@@ -409,6 +431,7 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) 
             Ok(set) => set,
             Err(res) => return Ok(Err(res)),
         };
+        let txn = app.db.begin().await?;
         // One conditional statement, so a tick claiming the post cannot interleave.
         let done = posts::Entity::update_many()
             .col_expr(posts::Column::SocialSetId, set.into())
@@ -421,13 +444,30 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) 
             .filter(posts::Column::Id.eq(id))
             .filter(posts::Column::Status.is_in(["draft", "scheduled"]))
             .filter(in_scope(a))
-            .exec(&app.db)
+            .exec(&txn)
             .await?;
         if done.rows_affected == 0 {
             return Ok(Err(reply(StatusCode::CONFLICT, "not_editable")));
         }
+        // A post moved to another set leaves the lists tied to its old set.
+        let leave = Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "DELETE FROM post_list_items i USING post_lists l WHERE i.list_id = l.id \
+             AND i.post_id = $1 AND l.social_set_id IS NOT NULL AND l.social_set_id <> $2",
+            [id.into(), set.into()],
+        );
+        txn.execute_raw(leave).await?;
+        if let Some(list) = input.list_id {
+            let Some(p) = find(&txn, a, id).await? else {
+                return Ok(Err(not_found()));
+            };
+            if let Err(res) = lists::place(&txn, a, list, &p, input.position).await? {
+                return Ok(Err(res));
+            }
+        }
+        txn.commit().await?;
         match find(&app.db, a, id).await? {
-            Some(p) => one_json(&app.db, p).await.map(Ok),
+            Some(p) => one_json(&app.db, a, p).await.map(Ok),
             None => Ok(Err(not_found())),
         }
     };
@@ -475,7 +515,7 @@ async fn publish_now(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>
             publish::Quota::Lost => return Ok(Err(reply(StatusCode::CONFLICT, "not_editable"))),
         }
         match find(&app.db, &a, id).await? {
-            Some(p) => one_json(&app.db, p).await.map(Ok),
+            Some(p) => one_json(&app.db, &a, p).await.map(Ok),
             None => Ok(Err(not_found())),
         }
     };
@@ -547,7 +587,7 @@ pub async fn delete_post(app: &AppState, a: &Actor, id: Uuid) -> Response {
                 }
             }
             match find(&app.db, a, id).await {
-                Ok(Some(p)) => match one_json(&app.db, p).await {
+                Ok(Some(p)) => match one_json(&app.db, a, p).await {
                     Ok(p) => Json(p).into_response(),
                     Err(e) => internal(e, "post read"),
                 },
