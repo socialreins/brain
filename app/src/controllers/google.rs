@@ -41,7 +41,8 @@ fn not_configured() -> Response {
 
 /// `GET /auth/providers`: the optional sign-in methods this install offers.
 async fn providers(State(app): State<AppState>) -> Json<serde_json::Value> {
-    Json(json!({ "google": app.google.is_some() }))
+    let turnstile_site_key = app.turnstile.as_ref().map(|t| &t.site_key);
+    Json(json!({ "google": app.google.is_some(), "turnstile_site_key": turnstile_site_key }))
 }
 
 #[derive(Deserialize)]

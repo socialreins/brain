@@ -894,7 +894,7 @@ mod auth {
             let (s, _) = server_where(|c| c.google = None).await;
             s.get("/auth/providers")
                 .await
-                .assert_json(&json!({"google": false}));
+                .assert_json(&json!({"google": false, "turnstile_site_key": null}));
             assert_eq!(s.get("/auth/google/start").await.status_code(), 404);
             assert_eq!(s.get("/auth/google/callback").await.status_code(), 404);
         }
@@ -905,7 +905,7 @@ mod auth {
             let (s, db) = google_server(|_| {}).await;
             s.get("/auth/providers")
                 .await
-                .assert_json(&json!({"google": true}));
+                .assert_json(&json!({"google": true, "turnstile_site_key": null}));
             let st = begin(&s, "?next=/app/team").await;
             let email = unique_email();
             let id = sub();
@@ -7550,5 +7550,262 @@ mod teams {
                 assert!(deliveries(&db, &team_id).await.is_empty());
             }
         }
+    }
+}
+
+/// Turnstile on the public forms and `POST /v1/contact`, against a local fake siteverify (it
+/// passes the token `good` sent with the secret `sec`) and a fake Resend.
+mod captcha_and_contact {
+    use super::*;
+    use axum::{routing::post, Form, Json, Router};
+    use sea_orm::DatabaseConnection;
+    use socialreins_brain::{mail::Mailer, turnstile::Turnstile};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+
+    type Seen = Arc<Mutex<Vec<Value>>>;
+    const TO: &str = "inbox@example.com";
+
+    async fn serve(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        base
+    }
+
+    async fn siteverify() -> String {
+        let verify = |Form(f): Form<HashMap<String, String>>| async move {
+            let get = |k: &str| f.get(k).map(String::as_str);
+            Json(
+                json!({"success": get("secret") == Some("sec") && get("response") == Some("good")}),
+            )
+        };
+        serve(Router::new().route("/v", post(verify))).await + "/v"
+    }
+
+    /// A port nothing listens on.
+    async fn down() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v", listener.local_addr().unwrap());
+        drop(listener);
+        url
+    }
+
+    async fn resend() -> (String, Seen) {
+        let seen = Seen::default();
+        let log = seen.clone();
+        let app = Router::new().route(
+            "/emails",
+            post(move |Json(body): Json<Value>| async move {
+                log.lock().unwrap().push(body);
+                Json(json!({"id": "x"}))
+            }),
+        );
+        (serve(app).await + "/emails", seen)
+    }
+
+    /// Turnstile verifying at `verify` (off when `None`), contact mail to `TO` through a fake
+    /// Resend, and `X-Forwarded-For` trusted so tests can pick the client IP.
+    async fn app(verify: Option<String>) -> (TestServer, DatabaseConnection, Seen) {
+        let mut config = Config::from_env().expect("DATABASE_URL must point at a test Postgres");
+        config.trust_proxy = true;
+        config.turnstile = verify.map(|url| {
+            let mut t = Turnstile::new("site", "sec").unwrap();
+            t.verify_url = url;
+            t
+        });
+        config.contact_to = Some(TO.into());
+        let (url, seen) = resend().await;
+        config.mailer = Mailer::resend_at(&url, "re_test", "brain@example.com").unwrap();
+        let db = connect(&config).await.expect("database reachable");
+        let app = controllers::router(AppState::new(db.clone(), &config), &config);
+        (TestServer::new(app).unwrap(), db, seen)
+    }
+
+    fn contact_body(token: Option<&str>) -> Value {
+        json!({"name": "Jane", "email": unique_email(), "message": "Hi", "turnstile_token": token})
+    }
+
+    /// Each form with `token`: its path, body and success status.
+    fn forms(token: Option<&str>) -> [(&'static str, Value, u16); 3] {
+        let email = json!({"email": unique_email(), "turnstile_token": token});
+        [
+            ("/auth/link", email.clone(), 202),
+            ("/v1/waitlist", email, 200),
+            ("/v1/contact", contact_body(token), 202),
+        ]
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn providers_give_the_site_key_or_null() {
+        let (s, _, _) = app(Some(siteverify().await)).await;
+        let on = s.get("/auth/providers").await.json::<Value>();
+        assert_eq!(on["turnstile_site_key"], "site");
+        let (s, _, _) = app(None).await;
+        let off = s.get("/auth/providers").await.json::<Value>();
+        assert_eq!(off["turnstile_site_key"], Value::Null);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn forms_need_a_good_token_when_turnstile_is_on() {
+        let (s, db, seen) = app(Some(siteverify().await)).await;
+        for token in [None, Some(""), Some("bad")] {
+            for (path, body, _) in forms(token) {
+                let res = s.post(path).json(&body).await;
+                assert_eq!(res.status_code(), 422, "{path} {token:?}");
+                res.assert_json(&json!({"error": "captcha_failed"}));
+                if path == "/v1/waitlist" {
+                    assert_eq!(rows(&db, body["email"].as_str().unwrap()).await, 0);
+                }
+            }
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no mail before the captcha"
+        );
+        let (s, _, _) = app(Some(siteverify().await)).await;
+        for (path, body, status) in forms(Some("good")) {
+            let res = s.post(path).json(&body).await;
+            assert_eq!(res.status_code(), status, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn forms_fail_closed_when_siteverify_is_down() {
+        let (s, _, _) = app(Some(down().await)).await;
+        for (path, body, _) in forms(Some("good")) {
+            let res = s.post(path).json(&body).await;
+            assert_eq!(res.status_code(), 503, "{path}");
+            res.assert_json(&json!({"error": "captcha_unavailable"}));
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn forms_ignore_the_token_when_turnstile_is_off() {
+        let (s, _, _) = app(None).await;
+        for token in [None, Some("anything")] {
+            for (path, body, status) in forms(token) {
+                let res = s.post(path).json(&body).await;
+                assert_eq!(res.status_code(), status, "{path} {token:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn contact_mails_contact_to_with_reply_to() {
+        let (s, _, seen) = app(None).await;
+        let message = "é".repeat(5000);
+        let body = json!({"name": "  Jane Doe ", "email": "Jane@Example.com", "message": message});
+        let res = s.post("/v1/contact").json(&body).await;
+        assert_eq!(res.status_code(), 202);
+        res.assert_json(&json!({}));
+        let mail = seen.lock().unwrap().pop().expect("mail sent");
+        assert_eq!(mail["to"], json!([TO]));
+        assert_eq!(mail["reply_to"], "jane@example.com");
+        assert_eq!(mail["subject"], "Contact form: Jane Doe");
+        let text = mail["text"].as_str().unwrap();
+        assert!(text.contains("Jane Doe") && text.contains("jane@example.com"));
+        assert!(text.contains(&message));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn contact_rejects_bad_fields() {
+        let (s, _, seen) = app(None).await;
+        let long_name = "a".repeat(101);
+        let long_message = "a".repeat(5001);
+        let cases = [
+            (
+                json!({"name": " ", "email": "a@example.com", "message": "Hi"}),
+                "invalid_name",
+            ),
+            (
+                json!({"name": long_name, "email": "a@example.com", "message": "Hi"}),
+                "invalid_name",
+            ),
+            (
+                json!({"name": "A\r\nBcc: x@evil.com", "email": "a@example.com", "message": "Hi"}),
+                "invalid_name",
+            ),
+            (
+                json!({"name": "A", "email": "nope", "message": "Hi"}),
+                "invalid_email",
+            ),
+            (
+                json!({"name": "A", "email": "a@example.com\r\nBcc: x@evil.com", "message": "Hi"}),
+                "invalid_email",
+            ),
+            (
+                json!({"name": "A", "email": "a@example.com\n", "message": "Hi"}),
+                "invalid_email",
+            ),
+            (
+                json!({"name": "A", "email": "a@example.com", "message": "  "}),
+                "invalid_message",
+            ),
+            (
+                json!({"name": "A", "email": "a@example.com", "message": long_message}),
+                "invalid_message",
+            ),
+        ];
+        for (i, (body, code)) in cases.into_iter().enumerate() {
+            let res = s
+                .post("/v1/contact")
+                .add_header("x-forwarded-for", format!("198.51.100.{i}"))
+                .json(&body)
+                .await;
+            assert_eq!(res.status_code(), 422, "{code} {body}");
+            res.assert_json(&json!({"error": code}));
+        }
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn contact_is_off_without_contact_to() {
+        let mut config = Config::from_env().unwrap();
+        config.contact_to = None;
+        let db = connect(&config).await.unwrap();
+        let app = controllers::router(AppState::new(db, &config), &config);
+        let res = TestServer::new(app)
+            .unwrap()
+            .post("/v1/contact")
+            .json(&contact_body(None))
+            .await;
+        assert_eq!(res.status_code(), 503);
+        res.assert_json(&json!({"error": "contact_unavailable"}));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn contact_allows_5_an_hour_per_ip() {
+        let (s, _, _) = app(None).await;
+        let post = |ip: &'static str| {
+            s.post("/v1/contact")
+                .add_header("x-forwarded-for", ip)
+                .json(&contact_body(None))
+        };
+        for _ in 0..5 {
+            assert_eq!(post("203.0.113.20").await.status_code(), 202);
+        }
+        let res = post("203.0.113.20").await;
+        assert_eq!(res.status_code(), 429);
+        res.assert_json(&json!({"error": "rate_limited"}));
+        assert_eq!(post("203.0.113.21").await.status_code(), 202);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn openapi_documents_contact() {
+        let (s, _, _) = app(None).await;
+        let doc = s.get("/openapi.json").await.json::<Value>();
+        assert!(doc["paths"]["/contact"]["post"].is_object());
     }
 }

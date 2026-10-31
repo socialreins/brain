@@ -28,6 +28,7 @@ use crate::{
     models::{magic_links, sessions, users},
     rate_limit::ClientIp,
     state::AppState,
+    turnstile,
 };
 
 pub const SESSION_COOKIE: &str = "sr_session";
@@ -39,6 +40,7 @@ const MAX_LIVE_LINKS: u64 = 3;
 #[derive(Deserialize)]
 struct LinkRequest {
     email: String,
+    turnstile_token: Option<String>,
 }
 
 pub(crate) fn internal(e: impl std::fmt::Display, what: &str) -> Response {
@@ -64,6 +66,10 @@ async fn request_link(
     let Some(email) = email::normalize(&body.email) else {
         return error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_email").into_response();
     };
+    let token = body.turnstile_token.as_deref();
+    if let Err(r) = turnstile::check(app.turnstile.as_ref(), token, ip).await {
+        return r.into_response();
+    }
     tokio::spawn(async move {
         if let Err(e) = send_link(&app, email).await {
             tracing::error!(error = %e, "magic link not sent");

@@ -43,6 +43,10 @@ pub struct AppState {
     pub providers: Vec<(&'static str, bool)>,
     pub google: Option<crate::connectors::google::Google>,
     pub webhooks: crate::webhooks::Webhooks,
+    pub turnstile: Option<crate::turnstile::Turnstile>,
+    pub contact_to: Option<String>,
+    /// Per-IP limit on `POST /v1/contact`, each of which sends an email.
+    pub contact_limiter: Arc<RateLimiter>,
 }
 
 impl AppState {
@@ -70,6 +74,13 @@ impl AppState {
             providers: config.providers.clone(),
             google: config.google.clone(),
             webhooks: crate::webhooks::Webhooks::default(),
+            turnstile: config.turnstile.clone(),
+            contact_to: config.contact_to.clone(),
+            contact_limiter: Arc::new(RateLimiter::new(
+                5,
+                std::time::Duration::from_secs(3600),
+                crate::rate_limit::MAX_KEYS,
+            )),
         }
     }
 }

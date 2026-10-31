@@ -24,7 +24,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, 
 use crate::state::AppState;
 
 /// Most networks tracked at once; past it the oldest window is evicted, so memory stays bounded.
-const MAX_KEYS: usize = 10_000;
+pub const MAX_KEYS: usize = 10_000;
 
 /// Keyed by client network by default; `RateLimiter<String>` keys on anything else, e.g. an email.
 pub struct RateLimiter<K = Option<IpAddr>> {

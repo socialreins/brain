@@ -29,12 +29,13 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/openapi.json` | OpenAPI document for `/v1` |
 | POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, accounts, posts and lists. Bearer API token only, same scope and per-token limit as `/v1`, bodies up to 64 KiB; `Idempotency-Key` does not apply |
 | POST | `/v1/waitlist` | `{"email":"...","source":"..."}` joins the waitlist |
+| POST | `/v1/contact` | `{"name","email","message"}` mails `CONTACT_TO`, `202 {}` |
 | POST | `/auth/link` | `{"email":"..."}` emails a sign-in link, `202 {"status":"sent"}` |
 | GET | `/auth/magic/{token}` | The emailed link: a page with a sign-in button, does not use the link |
 | POST | `/auth/magic` | Form field `token`: uses the link, sets the session cookie, redirects to `WEB_URL` |
 | GET | `/auth/me` | The signed-in user, or `401 {"error":"unauthorized"}` |
 | POST | `/auth/logout` | Deletes the session, `204`. Origin must be in `CORS_ORIGINS` |
-| GET | `/auth/providers` | `{"google":bool}`: the optional sign-in methods this install offers |
+| GET | `/auth/providers` | `{"google":bool,"turnstile_site_key":"..."\|null}`: the optional sign-in methods this install offers, and the Turnstile key when the captcha is on |
 | GET | `/auth/google/start?next=/path` | Redirects to Google (`404` when Google is not configured). `next` must be a path on the web app, else `/app` |
 | GET | `/auth/google/callback` | Google's redirect back: sets the session cookie and redirects to `WEB_URL` + `next`, or `WEB_URL/welcome` for a new account, or `WEB_URL/login?error=google_failed` (or `registration_disabled`) |
 | POST | `/auth/passkeys/register/start` | Needs a sign-in from the last 10 minutes: `{"challenge_id","options"}` for `navigator.credentials.create` |
@@ -83,6 +84,17 @@ crates/core/     framework-free domain rules (email checks, tokens)
 `POST /v1/waitlist` answers `200 {"status":"ok"}` for a new email and for one already on the
 list, so it never reveals who signed up. A bad email gets `422 {"error":"invalid_email"}`. Each
 client IP (IPv6 by /64) gets 10 requests a minute, then `429`.
+
+`POST /v1/contact` (on when `CONTACT_TO` is set, else `503 {"error":"contact_unavailable"}`)
+takes a name of 1 to 100 characters on one line, an email and a message of 1 to 5000
+characters (`422` `invalid_name`, `invalid_email` or `invalid_message`), and mails them to
+`CONTACT_TO` with the sender as Reply-To. Each client IP gets 5 an hour, then `429`.
+
+With `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY` set, `POST /auth/link`, `/v1/waitlist`
+and `/v1/contact` need a `turnstile_token` from the widget, checked with Cloudflare after the
+rate limit and before anything is stored or sent: a missing or rejected token gets
+`422 {"error":"captcha_failed"}`, and Cloudflare unreachable for 5 seconds gets
+`503 {"error":"captcha_unavailable"}`. With Turnstile off the field is ignored.
 
 Sign-in is by magic link, Google or passkey; there are no passwords. `POST /auth/link` answers the same `202`, at the same speed,
 whether or not the email has an account (or is refused by `REGISTRATION_DISABLED`): the lookup
@@ -248,6 +260,8 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `X_CLIENT_ID`, `X_CLIENT_SECRET` | no | Offer X (connector not built yet) |
 | `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET` | no | Offer TikTok (connector not built yet) |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | no | Both or neither. Turn on Google sign-in (OAuth client of type Web application, redirect URI `{BRAIN_URL}/auth/google/callback`); YouTube will use them too |
+| `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | no | Both or neither. Turn on a Cloudflare Turnstile captcha: `POST /auth/link`, `/v1/waitlist` and `/v1/contact` then need a `turnstile_token`. Off when unset |
+| `CONTACT_TO` | no | Turn on `POST /v1/contact`, which mails each message to this address (Reply-To: the sender). Off when unset |
 
 ## Deploy
 
