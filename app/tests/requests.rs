@@ -2665,6 +2665,11 @@ mod teams {
 
         /// Every `createRecord` body the mock took, newest last.
         static RECORDS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+        /// Set: the next `createRecord` is refused as an expired session.
+        static EXPIRE_NEXT: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        /// The record key of every `deleteRecord` the mock took, newest last.
+        static DELETED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
         fn image(content_type: &'static str, len: usize) -> axum::response::Response {
             use axum::response::IntoResponse;
@@ -2704,6 +2709,10 @@ mod teams {
             if !authorized(&headers) {
                 return (axum::http::StatusCode::UNAUTHORIZED, Json(json!({})));
             }
+            if EXPIRE_NEXT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                let err = json!({"error": "ExpiredToken"});
+                return (axum::http::StatusCode::BAD_REQUEST, Json(err));
+            }
             let text = b["record"]["text"].as_str().unwrap_or_default().to_owned();
             if text.contains("REJECT") {
                 let leak = json!({"error": "InvalidRequest",
@@ -2741,6 +2750,10 @@ mod teams {
                 let err = json!({"error": "InternalServerError"});
                 return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(err));
             }
+            DELETED
+                .lock()
+                .unwrap()
+                .push(b["rkey"].as_str().unwrap_or_default().to_owned());
             (axum::http::StatusCode::OK, Json(json!({})))
         }
 
@@ -4253,6 +4266,301 @@ mod teams {
                 let res = req(&s, Method::DELETE, &format!("/v1/posts/{post}"), &cookie).await;
                 res.assert_status_ok();
                 assert_eq!(res.json::<Value>()["status"], "deleted");
+            }
+
+            fn thread_input(set: &str, body: &str, parts: &[&str]) -> Value {
+                let mut v = input(set, body, Some(&past()));
+                v["thread"] = parts.iter().map(|p| json!({"body": p})).collect();
+                v
+            }
+
+            fn rkey(uri: &str) -> String {
+                uri.rsplit('/').next().unwrap().to_owned()
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn threads_are_validated_and_round_trip() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let long = "a".repeat(301);
+                let mut five_images = thread_input(&set, "root", &["ok", "ok"]);
+                five_images["thread"][1]["media"] = json!(vec!["https://a.example/1.png"; 5]);
+                let many: Vec<&str> = vec!["x"; 26];
+                for (body, want) in [
+                    (
+                        thread_input(&set, "root", &many),
+                        json!({"error": "too_many_parts"}),
+                    ),
+                    (
+                        thread_input(&set, "root", &["ok", &long]),
+                        json!({"error": "too_long", "part": 2}),
+                    ),
+                    (five_images, json!({"error": "too_many_images", "part": 2})),
+                    (
+                        thread_input(&set, "root", &[" "]),
+                        json!({"error": "empty_post", "part": 1}),
+                    ),
+                ] {
+                    let res = create(&s, &cookie, body).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&want);
+                }
+                let mut body = input(&set, "root", None);
+                body["thread"] = json!([{"body": "two", "media": ["https://a.example/i.png"]},
+                    {"body": "three"}]);
+                let res = create(&s, &cookie, body).await;
+                assert_eq!(res.status_code(), 201);
+                let p = res.json::<Value>();
+                assert_eq!(
+                    p["thread"],
+                    json!([{"body": "two", "media": ["https://a.example/i.png"]},
+                        {"body": "three", "media": []}])
+                );
+                let id = id_of_post(&p);
+                assert_eq!(get_post(&s, &cookie, &id).await["thread"], p["thread"]);
+                let path = format!("/v1/posts/{id}");
+                let res = req(&s, Method::PUT, &path, &cookie)
+                    .json(&thread_input(&set, "root", &["only"]))
+                    .await;
+                res.assert_status_ok();
+                assert_eq!(
+                    res.json::<Value>()["thread"],
+                    json!([{"body": "only", "media": []}])
+                );
+                // A full thread fits the body limit.
+                let full = "🦀".repeat(300);
+                let parts: Vec<&str> = vec![&full; 25];
+                let res = req(&s, Method::PUT, &path, &cookie)
+                    .json(&thread_input(&set, "root", &parts))
+                    .await;
+                res.assert_status_ok();
+                let res = req(&s, Method::PUT, &path, &cookie)
+                    .json(&input(&set, "no thread", None))
+                    .await;
+                assert_eq!(res.json::<Value>()["thread"], json!([]));
+            }
+
+            fn id_of_post(p: &Value) -> String {
+                p["id"].as_str().unwrap().to_owned()
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_thread_goes_out_as_replies_and_comes_down_children_first() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let id =
+                    id_of(&create(&s, &cookie, thread_input(&set, "one", &["two", "three"])).await);
+                let before = RECORDS.lock().unwrap().len();
+                publish::tick(&state).await.unwrap();
+                let p = get_post(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "published", "{p}");
+                let t = &p["targets"][0];
+                assert_eq!(t["status"], "published");
+                let root = t["remote_id"].as_str().unwrap().to_owned();
+                let parts = t["parts"].as_array().unwrap();
+                assert_eq!(parts.len(), 2);
+                assert!(parts[1]["remote_url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("https://bsky.app/profile/"));
+                let records: Vec<Value> = RECORDS.lock().unwrap()[before..].to_vec();
+                let texts: Vec<&str> = records
+                    .iter()
+                    .map(|r| r["record"]["text"].as_str().unwrap())
+                    .collect();
+                assert_eq!(texts, ["one", "two", "three"]);
+                assert!(records[0]["record"].get("reply").is_none());
+                let reply = |i: usize| records[i]["record"]["reply"].clone();
+                assert_eq!(reply(1)["root"], json!({"uri": root, "cid": "bafycid"}));
+                assert_eq!(reply(1)["parent"]["uri"], root.as_str());
+                assert_eq!(reply(2)["root"]["uri"], root.as_str());
+                assert_eq!(reply(2)["parent"]["uri"], parts[0]["remote_id"]);
+                let row = post_targets::Entity::find()
+                    .filter(post_targets::Column::PostId.eq(id.parse::<uuid::Uuid>().unwrap()))
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(row.remote_cid.as_deref(), Some("bafycid"));
+                assert_eq!(row.parts[0]["cid"], "bafycid");
+
+                let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                res.assert_status_ok();
+                let body = res.json::<Value>();
+                assert_eq!(body["status"], "deleted");
+                assert_eq!(body["targets"][0]["parts"], json!([]));
+                let deleted = DELETED.lock().unwrap().clone();
+                let n = deleted.len();
+                assert_eq!(
+                    deleted[n - 3..],
+                    [
+                        rkey(parts[1]["remote_id"].as_str().unwrap()),
+                        rkey(parts[0]["remote_id"].as_str().unwrap()),
+                        rkey(&root),
+                    ]
+                );
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn an_expired_cached_session_is_opened_again() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let body = thread_input(&set, "one", &["two"]);
+                let first = id_of(&create(&s, &cookie, body).await);
+                publish::tick(&state).await.unwrap();
+                assert_eq!(get_post(&s, &cookie, &first).await["status"], "published");
+                // The cached session now answers 400 ExpiredToken once, mid-thread.
+                let id = id_of(&create(&s, &cookie, thread_input(&set, "a", &["b"])).await);
+                let before = RECORDS.lock().unwrap().len();
+                EXPIRE_NEXT.store(true, std::sync::atomic::Ordering::SeqCst);
+                publish::tick(&state).await.unwrap();
+                let p = get_post(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "published", "{p}");
+                assert_eq!(p["targets"][0]["parts"].as_array().unwrap().len(), 1);
+                assert_eq!(RECORDS.lock().unwrap().len(), before + 2, "each sent once");
+                assert!(!EXPIRE_NEXT.load(std::sync::atomic::Ordering::SeqCst));
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_failed_part_keeps_the_parts_before_it() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let body = thread_input(&set, "one", &["two", "REJECT three", "four"]);
+                let id = id_of(&create(&s, &cookie, body).await);
+                let before = RECORDS.lock().unwrap().len();
+                publish::tick(&state).await.unwrap();
+                assert_eq!(RECORDS.lock().unwrap().len(), before + 2, "four never went");
+                let p = get_post(&s, &cookie, &id).await;
+                // The root is up, so the post is published and can come down.
+                assert_eq!(p["status"], "published", "{p}");
+                let t = &p["targets"][0];
+                assert_eq!(t["status"], "failed");
+                assert_eq!(
+                    t["error"],
+                    "Thread post 2 of 3: Bluesky refused it (InvalidRequest). The posts before \
+                     it are up."
+                );
+                assert!(p["error"].as_str().unwrap().contains("Thread post 2 of 3"));
+                assert_eq!(t["parts"].as_array().unwrap().len(), 1);
+                assert!(t["remote_url"].is_string());
+
+                // Never sent again: the target stays failed with its saved part.
+                publish::publish_post(&state, id.parse().unwrap())
+                    .await
+                    .unwrap();
+                publish::recover_stuck(&db).await.unwrap();
+                assert_eq!(RECORDS.lock().unwrap().len(), before + 2);
+
+                let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                res.assert_status_ok();
+                let body = res.json::<Value>();
+                assert_eq!(body["status"], "deleted");
+                assert_eq!(body["targets"][0]["status"], "deleted");
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_part_that_will_not_come_down_keeps_the_root_up() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let body = thread_input(&set, "one", &["STICKY two", "three"]);
+                let id = id_of(&create(&s, &cookie, body).await);
+                publish::tick(&state).await.unwrap();
+                let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                assert_eq!(res.status_code(), 422);
+                let p = get_post(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "published");
+                let t = &p["targets"][0];
+                assert_eq!(t["status"], "published");
+                let parts = t["parts"].as_array().unwrap();
+                assert_eq!(parts.len(), 1, "three came down, the sticky part stays");
+                assert!(parts[0]["remote_id"].as_str().unwrap().contains("sticky"));
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_thread_cut_off_midway_fails_naming_the_next_part() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, account) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let did = list(&s, &cookie).await[0]["external_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let post = queued_post(&db, &team_id, &set).await;
+                let row = posts::ActiveModel {
+                    id: Set(post),
+                    thread: Set(json!([{"body": "a"}, {"body": "b"}])),
+                    ..Default::default()
+                };
+                posts::Entity::update(row).exec(&db).await.unwrap();
+                let id = uuid::Uuid::now_v7();
+                let row = post_targets::ActiveModel {
+                    id: Set(id),
+                    post_id: Set(post),
+                    social_account_id: Set(Some(account.parse().unwrap())),
+                    status: Set("publishing".into()),
+                    remote_id: Set(Some(format!("at://{did}/app.bsky.feed.post/r3root"))),
+                    parts: Set(
+                        json!([{"remote_id": format!("at://{did}/app.bsky.feed.post/r3a"),
+                        "cid": "c"}]),
+                    ),
+                    updated_at: Set((Utc::now() - Duration::minutes(20)).fixed_offset()),
+                    ..Default::default()
+                };
+                post_targets::Entity::insert(row)
+                    .exec_without_returning(&db)
+                    .await
+                    .unwrap();
+                publish::recover_stuck(&db).await.unwrap();
+                let t = post_targets::Entity::find_by_id(id)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(t.status, "failed");
+                assert!(t.error.unwrap().contains("thread post 2 of 2"));
+                let p = get_post(&s, &cookie, &post.to_string()).await;
+                assert_eq!(p["status"], "published");
+                let res = req(&s, Method::DELETE, &format!("/v1/posts/{post}"), &cookie).await;
+                res.assert_status_ok();
+                let deleted = DELETED.lock().unwrap().clone();
+                assert_eq!(deleted[deleted.len() - 2..], ["r3a", "r3root"]);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn post_group_overrides_carry_a_thread() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let res = req(&s, Method::POST, "/v1/post-groups", &cookie)
+                    .json(&json!({"social_set_id": set, "body": "hi",
+                        "thread": [{"body": "shared"}],
+                        "overrides": {"bluesky": {"thread": [{"body": "own"}, {"body": "two"}]}}}))
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let g = res.json::<Value>();
+                assert_eq!(
+                    g["posts"][0]["thread"],
+                    json!([{"body": "own", "media": []}, {"body": "two", "media": []}])
+                );
+                let long = "a".repeat(301);
+                let res = req(&s, Method::POST, "/v1/post-groups", &cookie)
+                    .json(&json!({"social_set_id": set, "body": "hi",
+                        "thread": [{"body": long}]}))
+                    .await;
+                assert_eq!(res.status_code(), 422);
+                res.assert_json(&json!({"error": "too_long", "part": 1, "platform": "bluesky"}));
             }
 
             #[tokio::test]
@@ -5844,6 +6152,14 @@ mod teams {
                             "update-post",
                         ]
                     );
+                    let tools = body["result"]["tools"].as_array().unwrap();
+                    for name in ["create-post", "update-post", "create-post-group"] {
+                        let tool = tools.iter().find(|t| t["name"] == name).unwrap();
+                        assert!(
+                            tool["inputSchema"]["properties"]["thread"].is_object(),
+                            "{name}: {tool}"
+                        );
+                    }
 
                     let (err, p) = call(
                         &s,
@@ -6636,7 +6952,7 @@ mod teams {
                     // A body too large to buffer counts too.
                     let (s, db) = on_mock(2).await;
                     let (_, set, cm) = team(&s, &db).await;
-                    let big = post_body(Some(&set), &"x".repeat(40 * 1024));
+                    let big = post_body(Some(&set), &"x".repeat(65 * 1024));
                     let res = create(&s, &cm, "big", &big).await;
                     assert_eq!(res.status_code(), 413);
                     let body = post_body(Some(&set), "x");

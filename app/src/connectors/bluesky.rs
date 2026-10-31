@@ -415,27 +415,6 @@ fn post_key(uri: &str) -> Option<(&str, &str)> {
 }
 
 impl Bluesky {
-    /// A session on the account's PDS (`meta.pds`, checked again) with its app password.
-    async fn login(
-        &self,
-        pds: &str,
-        did: &str,
-        password: &str,
-    ) -> Result<(String, String), PostError> {
-        let pds = self
-            .checked_pds(pds)
-            .map_err(|_| failed("The account's Bluesky server is not supported."))?;
-        match self.session(&pds, did, password).await {
-            Ok(jwt) => Ok((pds, jwt)),
-            Err(Error::InvalidCredentials) => Err(PostError::Reconnect),
-            Err(Error::RateLimited) => Err(failed("Bluesky is rate limiting this account.")),
-            Err(Error::UnsupportedPds) => {
-                Err(failed("The account's Bluesky server is not supported."))
-            }
-            Err(_) => Err(failed("Bluesky could not be reached.")),
-        }
-    }
-
     /// POSTs an XRPC call with the session token and returns the JSON answer.
     async fn call(
         &self,
@@ -459,14 +438,16 @@ impl Bluesky {
             })?;
         let status = res.status();
         let answer: Value = json_body(res, method).await.unwrap_or_default();
+        let code = xrpc_code(&answer, status);
+        // An expired or revoked session answers 400 with these, as in `xrpc`.
+        let expired = status == StatusCode::BAD_REQUEST
+            && matches!(code.as_str(), "ExpiredToken" | "InvalidToken");
         match status {
             StatusCode::OK => Ok(answer),
             StatusCode::UNAUTHORIZED => Err(PostError::Reconnect),
+            _ if expired => Err(PostError::Reconnect),
             StatusCode::TOO_MANY_REQUESTS => Err(failed("Bluesky is rate limiting this account.")),
-            s => Err(failed(format!(
-                "Bluesky refused it ({}).",
-                xrpc_code(&answer, s)
-            ))),
+            _ => Err(failed(format!("Bluesky refused it ({code})."))),
         }
     }
 
@@ -530,34 +511,63 @@ impl Bluesky {
         }
     }
 
-    /// Publishes a post with up to 4 images; returns its `at://` URI.
+    /// Runs `call` with the account's session (cached, see `live`, so a thread logs in once).
+    /// A cached session the PDS refuses (`401`, or `400 ExpiredToken`/`InvalidToken`) is opened
+    /// again once: a refused session made nothing, so this cannot post twice.
+    async fn with_session<T, F, Fut>(&self, c: &Creds<'_>, call: F) -> Result<T, PostError>
+    where
+        F: Fn(Live) -> Fut,
+        Fut: std::future::Future<Output = Result<T, PostError>>,
+    {
+        for fresh in [false, true] {
+            let s = self.live(c, fresh).await.map_err(|e| match e {
+                InboxError::Reconnect => PostError::Reconnect,
+                InboxError::RateLimited => failed("Bluesky is rate limiting this account."),
+                InboxError::Invalid(_) => failed("The account's Bluesky server is not supported."),
+                _ => failed("Bluesky could not be reached."),
+            })?;
+            match call(s).await {
+                Err(PostError::Reconnect) if !fresh => self.forget(c),
+                done => return done,
+            }
+        }
+        Err(PostError::Reconnect)
+    }
+
+    /// Publishes a post with up to 4 images, a reply when `reply` holds `(parent, root)`;
+    /// returns its `(at:// uri, cid)`.
     pub async fn publish_post(
         &self,
-        pds: &str,
-        did: &str,
-        password: &str,
+        c: &Creds<'_>,
         text: &str,
         media: &[String],
-    ) -> Result<String, PostError> {
-        let (pds, jwt) = self.login(pds, did, password).await?;
+        reply: Option<(Ref<'_>, Ref<'_>)>,
+    ) -> Result<(String, String), PostError> {
+        self.with_session(c, |s| self.create_post(s, c.did, text, media, reply))
+            .await
+    }
+
+    async fn create_post(
+        &self,
+        s: Live,
+        did: &str,
+        text: &str,
+        media: &[String],
+        reply: Option<(Ref<'_>, Ref<'_>)>,
+    ) -> Result<(String, String), PostError> {
+        let (pds, jwt) = (&s.pds, &s.jwt);
         let mut images = Vec::new();
         for (i, url) in media.iter().enumerate() {
             let (bytes, mime) = self.image(i + 1, url).await?;
             let up = self
-                .call(
-                    &pds,
-                    &jwt,
-                    "com.atproto.repo.uploadBlob",
-                    bytes.into(),
-                    &mime,
-                )
+                .call(pds, jwt, "com.atproto.repo.uploadBlob", bytes.into(), &mime)
                 .await?;
             if !up["blob"].is_object() {
                 return Err(failed("Bluesky did not take an image."));
             }
             images.push(serde_json::json!({ "alt": "", "image": up["blob"] }));
         }
-        let mut record = post_record(text, &[], None);
+        let mut record = post_record(text, &[], reply);
         if !images.is_empty() {
             record["embed"] =
                 serde_json::json!({ "$type": "app.bsky.embed.images", "images": images });
@@ -565,30 +575,29 @@ impl Bluesky {
         let body =
             serde_json::json!({ "repo": did, "collection": POST_COLLECTION, "record": record });
         let made = self
-            .call_json(&pds, &jwt, "com.atproto.repo.createRecord", &body)
+            .call_json(pds, jwt, "com.atproto.repo.createRecord", &body)
             .await?;
-        match made["uri"].as_str() {
-            Some(uri) if post_key(uri).is_some() => Ok(uri.to_owned()),
+        match (made["uri"].as_str(), made["cid"].as_str()) {
+            (Some(uri), Some(cid)) if post_key(uri).is_some() => {
+                Ok((uri.to_owned(), cid.to_owned()))
+            }
             _ => Err(failed("Bluesky did not return the post's id.")),
         }
     }
 
     /// Deletes the post at `uri` from the account's repo.
-    pub async fn delete_post(
-        &self,
-        pds: &str,
-        did: &str,
-        password: &str,
-        uri: &str,
-    ) -> Result<(), PostError> {
-        let Some((repo, rkey)) = post_key(uri).filter(|(repo, _)| *repo == did) else {
+    pub async fn delete_post(&self, c: &Creds<'_>, uri: &str) -> Result<(), PostError> {
+        let Some((repo, rkey)) = post_key(uri).filter(|(repo, _)| *repo == c.did) else {
             return Err(failed("This post does not belong to the account."));
         };
-        let (pds, jwt) = self.login(pds, did, password).await?;
         let body = serde_json::json!({ "repo": repo, "collection": POST_COLLECTION, "rkey": rkey });
-        self.call_json(&pds, &jwt, "com.atproto.repo.deleteRecord", &body)
-            .await
-            .map(|_| ())
+        let body = &body;
+        self.with_session(c, |s| async move {
+            self.call_json(&s.pds, &s.jwt, "com.atproto.repo.deleteRecord", body)
+                .await
+                .map(|_| ())
+        })
+        .await
     }
 }
 

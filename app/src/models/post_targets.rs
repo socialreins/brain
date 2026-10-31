@@ -19,6 +19,13 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub error: Option<String>,
     pub published_at: Option<DateTimeWithTimeZone>,
+    /// Bluesky's content hash of the root post, which a reply names with its URI.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub remote_cid: Option<String>,
+    /// The thread parts published so far, in order: `[{remote_id, cid, remote_url,
+    /// published_at}]`.
+    #[sea_orm(column_type = "JsonBinary")]
+    pub parts: Json,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }
