@@ -6,6 +6,8 @@ pub const BLUESKY_MAX_GRAPHEMES: usize = 300;
 /// Bluesky also caps the text at 3000 UTF-8 bytes.
 pub const BLUESKY_MAX_BYTES: usize = 3000;
 pub const BLUESKY_MAX_IMAGES: usize = 4;
+/// Follow-up parts a thread may have after its first post.
+pub const MAX_THREAD_PARTS: usize = 25;
 const MAX_URL_LEN: usize = 2048;
 
 /// Why a post cannot be saved; `code` is the API error.
@@ -16,6 +18,9 @@ pub enum Invalid {
     TooLong,
     TooManyImages,
     InvalidMedia,
+    TooManyParts,
+    /// The platform's publisher cannot post threads yet.
+    ThreadUnsupported,
 }
 
 impl Invalid {
@@ -26,6 +31,8 @@ impl Invalid {
             Self::TooLong => "too_long",
             Self::TooManyImages => "too_many_images",
             Self::InvalidMedia => "invalid_media",
+            Self::TooManyParts => "too_many_parts",
+            Self::ThreadUnsupported => "thread_not_supported",
         }
     }
 }
@@ -58,6 +65,27 @@ pub fn validate(platform: &str, body: &str, media: &[String]) -> Result<(), Inva
     }
     if !media.iter().all(|m| https_url(m)) {
         return Err(Invalid::InvalidMedia);
+    }
+    Ok(())
+}
+
+/// Checks a thread's follow-up parts `(body, media)` for `platform`, each as a post of its own.
+/// A part's error comes with its 1-based number.
+pub fn validate_thread(
+    platform: &str,
+    parts: &[(&str, &[String])],
+) -> Result<(), (Invalid, Option<usize>)> {
+    if parts.is_empty() {
+        return Ok(());
+    }
+    if platform != "bluesky" {
+        return Err((Invalid::ThreadUnsupported, None));
+    }
+    if parts.len() > MAX_THREAD_PARTS {
+        return Err((Invalid::TooManyParts, None));
+    }
+    for (i, (body, media)) in parts.iter().enumerate() {
+        validate(platform, body, media).map_err(|e| (e, Some(i + 1)))?;
     }
     Ok(())
 }
@@ -153,6 +181,39 @@ mod tests {
             assert_eq!(ok("x", &[bad]), Err(Invalid::InvalidMedia), "{bad}");
         }
         assert_eq!(validate("x", "hi", &[]), Err(Invalid::UnsupportedPlatform));
+    }
+
+    #[test]
+    fn thread_parts_follow_the_platform_rules() {
+        let img = vec!["https://a.example/1.png".to_owned(); 5];
+        let part = |body: &'static str, n: usize| (body, &img[..n]);
+        assert_eq!(validate_thread("bluesky", &[]), Ok(()));
+        assert_eq!(validate_thread("x", &[]), Ok(()));
+        assert_eq!(
+            validate_thread("x", &[part("hi", 0)]),
+            Err((Invalid::ThreadUnsupported, None))
+        );
+        let full = vec![part("hi", 4); MAX_THREAD_PARTS];
+        assert_eq!(validate_thread("bluesky", &full), Ok(()));
+        let over = vec![part("hi", 0); MAX_THREAD_PARTS + 1];
+        assert_eq!(
+            validate_thread("bluesky", &over),
+            Err((Invalid::TooManyParts, None))
+        );
+        let long = "a".repeat(301);
+        let parts = [part("ok", 0), (long.as_str(), &img[..0])];
+        assert_eq!(
+            validate_thread("bluesky", &parts),
+            Err((Invalid::TooLong, Some(2)))
+        );
+        assert_eq!(
+            validate_thread("bluesky", &[part("ok", 5)]),
+            Err((Invalid::TooManyImages, Some(1)))
+        );
+        assert_eq!(
+            validate_thread("bluesky", &[part(" ", 0)]),
+            Err((Invalid::Empty, Some(1)))
+        );
     }
 
     #[test]

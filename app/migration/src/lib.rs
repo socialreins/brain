@@ -15,6 +15,7 @@ mod m20261104_000001_idempotency_keys;
 mod m20261105_000001_webhooks;
 mod m20261106_000001_post_lists;
 mod m20261107_000001_post_groups;
+mod m20261108_000001_thread_posts;
 
 pub struct Migrator;
 
@@ -37,6 +38,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261105_000001_webhooks::Migration),
             Box::new(m20261106_000001_post_lists::Migration),
             Box::new(m20261107_000001_post_groups::Migration),
+            Box::new(m20261108_000001_thread_posts::Migration),
             // inject-above (do not remove this comment)
         ]
     }

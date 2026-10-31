@@ -1,7 +1,8 @@
 //! Publishing: claim due posts, fan each out to its set's accounts, publish every target once,
-//! settle the post; and take published posts down. Every step is a conditional update, so two
-//! instances (or a tick and "publish now") never send a post twice. A publish is never retried:
-//! a retry could post twice. Each target status change queues its webhook event in the same
+//! settle the post; and take published posts down. A thread goes out root first, then each
+//! part as a reply to the one before, each saved on its target the moment the platform takes
+//! it. Every step is a conditional update, so two instances (or a tick and "publish now") never
+//! send a post twice. A publish is never retried: a retry could post twice. Each target status change queues its webhook event in the same
 //! statement (`webhooks::with_event`).
 use std::{sync::LazyLock, time::Duration};
 
@@ -17,6 +18,7 @@ use uuid::Uuid;
 pub use crate::connectors::bluesky::PostError as PublishError;
 use crate::{
     connectors::bluesky::{self, Bluesky},
+    controllers::posts::ThreadPart,
     models::{
         post_targets, posts, social_account_social_set as membership, social_accounts, social_sets,
     },
@@ -25,17 +27,25 @@ use crate::{
     webhooks::with_event,
 };
 
+/// A published post: the platform's id and, where a reply must name it (Bluesky), its cid.
+#[derive(Clone)]
+pub struct Remote {
+    pub id: String,
+    pub cid: String,
+}
+
 /// One publisher per platform.
 #[async_trait]
 pub trait Publisher: Send + Sync {
-    /// Publishes and returns the platform's id for the post.
+    /// Publishes, as a reply when `reply` holds `(parent, root)`, and returns the post.
     async fn publish(
         &self,
         account: &social_accounts::Model,
         secret: &str,
         body: &str,
         media: &[String],
-    ) -> Result<String, PublishError>;
+        reply: Option<(&Remote, &Remote)>,
+    ) -> Result<Remote, PublishError>;
 
     async fn delete(
         &self,
@@ -48,8 +58,12 @@ pub trait Publisher: Send + Sync {
     fn url(&self, account: &social_accounts::Model, remote_id: &str) -> Option<String>;
 }
 
-fn pds(account: &social_accounts::Model) -> &str {
-    account.meta["pds"].as_str().unwrap_or_default()
+fn creds<'a>(account: &'a social_accounts::Model, secret: &'a str) -> bluesky::Creds<'a> {
+    bluesky::Creds {
+        pds: account.meta["pds"].as_str().unwrap_or_default(),
+        did: &account.external_id,
+        password: secret,
+    }
 }
 
 #[async_trait]
@@ -60,9 +74,18 @@ impl Publisher for Bluesky {
         secret: &str,
         body: &str,
         media: &[String],
-    ) -> Result<String, PublishError> {
-        self.publish_post(pds(account), &account.external_id, secret, body, media)
-            .await
+        reply: Option<(&Remote, &Remote)>,
+    ) -> Result<Remote, PublishError> {
+        let reply = reply.map(|(p, r)| {
+            (
+                (p.id.as_str(), p.cid.as_str()),
+                (r.id.as_str(), r.cid.as_str()),
+            )
+        });
+        let (id, cid) = self
+            .publish_post(&creds(account, secret), body, media, reply)
+            .await?;
+        Ok(Remote { id, cid })
     }
 
     async fn delete(
@@ -71,8 +94,7 @@ impl Publisher for Bluesky {
         secret: &str,
         remote_id: &str,
     ) -> Result<(), PublishError> {
-        self.delete_post(pds(account), &account.external_id, secret, remote_id)
-            .await
+        self.delete_post(&creds(account, secret), remote_id).await
     }
 
     fn url(&self, _: &social_accounts::Model, remote_id: &str) -> Option<String> {
@@ -103,7 +125,7 @@ pub fn quota_bucket(team_id: Uuid) -> String {
     format!("publish:team:{team_id}")
 }
 
-/// Longest one target may take to publish or delete.
+/// Longest one post (or thread part) may take to publish or delete.
 const TARGET_TIMEOUT: Duration = Duration::from_secs(120);
 /// A target `publishing` this long was cut off (crash, restart) and may have posted.
 const STUCK_MINUTES: i64 = 15;
@@ -242,11 +264,14 @@ async fn unclaim(db: &DatabaseConnection, id: Uuid, error: Option<&str>) -> Resu
 /// Targets cut off mid-publish become `failed` and are never sent again; their posts settle.
 pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
     // Cut off after the platform took it (the remote id is saved first): it is live, so it is
-    // published, and stays takeable down.
+    // published, and stays takeable down. Cut off midway through a thread: failed, naming the
+    // part that may or may not have gone out; the saved parts stay takeable down.
     let stmt = sql(
-        "SELECT id, post_id, remote_id FROM post_targets \
-         WHERE status = 'publishing' AND remote_id IS NOT NULL \
-         AND updated_at < now() - make_interval(mins => $1)",
+        "SELECT t.id, t.post_id, t.remote_id, jsonb_array_length(t.parts) AS done, \
+         jsonb_array_length(p.thread) AS total FROM post_targets t \
+         JOIN posts p ON p.id = t.post_id \
+         WHERE t.status = 'publishing' AND t.remote_id IS NOT NULL \
+         AND t.updated_at < now() - make_interval(mins => $1)",
         vec![(STUCK_MINUTES as i32).into()],
     );
     let mut posts = Vec::new();
@@ -256,15 +281,26 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
             row.try_get("", "post_id")?,
             row.try_get("", "remote_id")?,
         );
+        let (done, total): (i32, i32) = (row.try_get("", "done")?, row.try_get("", "total")?);
+        let (status, error) = if done < total {
+            let msg = format!(
+                "Unknown, check the account: publishing stopped midway and thread post {} of \
+                 {total} may have posted.",
+                done + 1
+            );
+            ("failed", Some(msg))
+        } else {
+            ("published", None)
+        };
         // shortcut: Bluesky is the only publisher; use the platform's `url` once there are more.
         let url = bluesky::post_url(&remote);
         let stmt = sql(
             &with_event(
-                "UPDATE post_targets SET status = 'published', remote_url = $2, error = NULL, \
+                "UPDATE post_targets SET status = $3, remote_url = $2, error = $4, \
                  published_at = COALESCE(published_at, now()), updated_at = now() \
                  WHERE id = $1 AND status = 'publishing'",
             ),
-            vec![id.into(), url.into()],
+            vec![id.into(), url.into(), status.into(), error.into()],
         );
         db.execute_raw(stmt).await?;
         posts.push(post);
@@ -412,6 +448,23 @@ pub async fn claim_target(db: &DatabaseConnection, id: Uuid) -> Result<bool, DbE
     Ok(db.execute_raw(stmt).await?.rows_affected() == 1)
 }
 
+/// One post (or thread part) with its time limit; `Err` holds what to tell the user.
+async fn send(
+    publisher: &dyn Publisher,
+    account: &social_accounts::Model,
+    secret: &str,
+    (body, media): (&str, &[String]),
+    reply: Option<(&Remote, &Remote)>,
+) -> Result<Remote, String> {
+    let sent = publisher.publish(account, secret, body, media, reply);
+    match tokio::time::timeout(TARGET_TIMEOUT, sent).await {
+        Ok(Ok(remote)) => Ok(remote),
+        Ok(Err(PublishError::Reconnect)) => Err(RECONNECT.to_owned()),
+        Ok(Err(PublishError::Failed(msg))) => Err(msg),
+        Err(_) => Err("Timed out; it may have posted, check the account.".to_owned()),
+    }
+}
+
 async fn publish_target(app: &AppState, post: &posts::Model, id: Uuid) -> Result<(), DbErr> {
     let Ok(_slot) = TARGET_SLOTS.acquire().await else {
         return Ok(());
@@ -439,38 +492,70 @@ async fn publish_target(app: &AppState, post: &posts::Model, id: Uuid) -> Result
         return fail_target(db, id, RECONNECT).await;
     };
     let media: Vec<String> = serde_json::from_value(post.media.clone()).unwrap_or_default();
-    let sent = tokio::time::timeout(
-        TARGET_TIMEOUT,
-        publisher.publish(&account, &secret, &post.body, &media),
-    )
-    .await;
-    let remote_id = match sent {
-        Ok(Ok(remote_id)) => remote_id,
-        Ok(Err(PublishError::Reconnect)) => return fail_target(db, id, RECONNECT).await,
-        Ok(Err(PublishError::Failed(msg))) => return fail_target(db, id, &msg).await,
-        Err(_) => {
-            return fail_target(db, id, "Timed out; it may have posted, check the account.").await
-        }
+    let root = match send(publisher, &account, &secret, (&post.body, &media), None).await {
+        Ok(remote) => remote,
+        Err(msg) => return fail_target(db, id, &msg).await,
     };
     // The remote id first: whatever fails after this, the post is known to be live.
     let stmt = sql(
-        "UPDATE post_targets SET remote_id = $2, updated_at = now() WHERE id = $1",
-        vec![id.into(), remote_id.clone().into()],
+        "UPDATE post_targets SET remote_id = $2, remote_cid = $3, remote_url = $4, \
+         published_at = now(), updated_at = now() WHERE id = $1",
+        vec![
+            id.into(),
+            root.id.clone().into(),
+            root.cid.clone().into(),
+            publisher.url(&account, &root.id).into(),
+        ],
     );
     db.execute_raw(stmt).await?;
-    let url = publisher.url(&account, &remote_id);
+    // Each part right after the platform takes it, so its parent is always saved before it.
+    let thread: Vec<ThreadPart> = serde_json::from_value(post.thread.clone()).unwrap_or_default();
+    let mut parent = root.clone();
+    for (i, part) in thread.iter().enumerate() {
+        let content = (part.body.as_str(), part.media.as_slice());
+        let made = match send(
+            publisher,
+            &account,
+            &secret,
+            content,
+            Some((&parent, &root)),
+        )
+        .await
+        {
+            Ok(remote) => remote,
+            Err(msg) => {
+                let msg = format!(
+                    "Thread post {} of {}: {msg} The posts before it are up.",
+                    i + 1,
+                    thread.len()
+                );
+                return fail_target(db, id, &msg).await;
+            }
+        };
+        let saved = serde_json::json!([{
+            "remote_id": made.id, "cid": made.cid,
+            "remote_url": publisher.url(&account, &made.id),
+            "published_at": chrono::Utc::now().fixed_offset(),
+        }]);
+        let stmt = sql(
+            "UPDATE post_targets SET parts = parts || $2, updated_at = now() WHERE id = $1",
+            vec![id.into(), saved.into()],
+        );
+        db.execute_raw(stmt).await?;
+        parent = made;
+    }
     let stmt = sql(
         &with_event(
-            "UPDATE post_targets SET status = 'published', remote_url = $2, error = NULL, \
-             published_at = now(), updated_at = now() WHERE id = $1 AND status = 'publishing'",
+            "UPDATE post_targets SET status = 'published', error = NULL, updated_at = now() \
+             WHERE id = $1 AND status = 'publishing'",
         ),
-        vec![id.into(), url.into()],
+        vec![id.into()],
     );
     db.execute_raw(stmt).await.map(|_| ())
 }
 
 /// Settles a `queued` post once no target is `pending` or `publishing`: `failed` when every
-/// target failed, else `published`, with each failed account named in `error`. The post row
+/// target failed with nothing up, else `published`, with each failed account named in `error`. The post row
 /// is locked, so concurrent settles agree.
 pub async fn settle(db: &DatabaseConnection, id: Uuid) -> Result<(), DbErr> {
     let txn = db.begin().await?;
@@ -507,7 +592,8 @@ pub async fn settle(db: &DatabaseConnection, id: Uuid) -> Result<(), DbErr> {
             t.error.as_deref().unwrap_or("failed")
         ));
     }
-    let status = if failed.len() == targets.len() {
+    // A target that failed midway through a thread is still up, so its post is published.
+    let status = if failed.len() == targets.len() && targets.iter().all(|t| t.remote_id.is_none()) {
         "failed"
     } else {
         "published"
@@ -523,14 +609,17 @@ pub async fn settle(db: &DatabaseConnection, id: Uuid) -> Result<(), DbErr> {
     txn.commit().await
 }
 
-/// Takes a `published` post down from every account it is still up on. Each target that comes
-/// down is marked `deleted`, so a retry only tries the rest; the post becomes `deleted` once
-/// none is left. Returns what to tell the user about each target that stayed up.
+/// Takes a `published` post down from every account it is still up on, a thread's parts last
+/// first, then its root. Each part that comes down leaves the target's `parts` and each target
+/// whose root comes down is marked `deleted`, so a retry only tries the rest; the post becomes
+/// `deleted` once none is left. Returns what to tell the user about each target that stayed up.
 pub async fn takedown(app: &AppState, post: &posts::Model) -> Result<Vec<String>, DbErr> {
     let db = &app.db;
+    // A target that failed midway through a thread is up too.
     let up = post_targets::Entity::find()
         .filter(post_targets::Column::PostId.eq(post.id))
-        .filter(post_targets::Column::Status.eq("published"))
+        .filter(post_targets::Column::Status.is_in(["published", "failed"]))
+        .filter(post_targets::Column::RemoteId.is_not_null())
         .all(db)
         .await?;
     let mut problems = Vec::new();
@@ -550,7 +639,7 @@ pub async fn takedown(app: &AppState, post: &posts::Model) -> Result<Vec<String>
             .cipher
             .decrypt(&account.access_token)
             .and_then(|b| String::from_utf8(b).ok());
-        let (Some(publisher), Some(secret), Some(remote_id)) = (
+        let (Some(publisher), Some(secret), Some(root)) = (
             publisher(app, &post.platform),
             secret,
             t.remote_id.as_deref(),
@@ -560,41 +649,72 @@ pub async fn takedown(app: &AppState, post: &posts::Model) -> Result<Vec<String>
             ));
             continue;
         };
-        let done = tokio::time::timeout(
-            TARGET_TIMEOUT,
-            publisher.delete(&account, &secret, remote_id),
-        )
-        .await;
-        match done {
-            Ok(Ok(())) => {
+        let parts: Vec<serde_json::Value> =
+            serde_json::from_value(t.parts.clone()).unwrap_or_default();
+        let mut problem = None;
+        for (i, part) in parts.iter().enumerate().rev() {
+            let remote_id = part["remote_id"].as_str().unwrap_or_default();
+            problem = delete_one(publisher, &account, &secret, remote_id, &name).await;
+            if problem.is_some() {
+                break;
+            }
+            let stmt = sql(
+                "UPDATE post_targets SET parts = parts - $2::int, updated_at = now() \
+                 WHERE id = $1",
+                vec![t.id.into(), (i as i32).into()],
+            );
+            db.execute_raw(stmt).await?;
+        }
+        if problem.is_none() {
+            problem = delete_one(publisher, &account, &secret, root, &name).await;
+        }
+        match problem {
+            Some(p) => problems.push(p),
+            None => {
                 let stmt = sql(
                     &with_event(
                         "UPDATE post_targets SET status = 'deleted', updated_at = now() \
-                         WHERE id = $1 AND status = 'published'",
+                         WHERE id = $1 AND status IN ('published', 'failed')",
                     ),
                     vec![t.id.into()],
                 );
                 db.execute_raw(stmt).await?;
             }
-            Ok(Err(PublishError::Reconnect)) => problems.push(format!(
-                "{name}: {RECONNECT} Or delete the post in the Bluesky app."
-            )),
-            Ok(Err(PublishError::Failed(msg))) => problems.push(format!(
-                "{name}: {msg} Delete the post in the Bluesky app if it is still up."
-            )),
-            Err(_) => problems.push(format!(
-                "{name}: Bluesky did not answer in time. Try again, or delete it in the app."
-            )),
         }
     }
     if problems.is_empty() {
         let stmt = sql(
             "UPDATE posts SET status = 'deleted', updated_at = now() \
              WHERE id = $1 AND status = 'published' AND NOT EXISTS \
-             (SELECT 1 FROM post_targets WHERE post_id = $1 AND status = 'published')",
+             (SELECT 1 FROM post_targets WHERE post_id = $1 AND remote_id IS NOT NULL \
+              AND status IN ('published', 'failed'))",
             vec![post.id.into()],
         );
         db.execute_raw(stmt).await?;
     }
     Ok(problems)
+}
+
+/// Deletes one post on the platform; `Some` says what to tell the user when it stayed up.
+async fn delete_one(
+    publisher: &dyn Publisher,
+    account: &social_accounts::Model,
+    secret: &str,
+    remote_id: &str,
+    name: &str,
+) -> Option<String> {
+    let done =
+        tokio::time::timeout(TARGET_TIMEOUT, publisher.delete(account, secret, remote_id)).await;
+    match done {
+        Ok(Ok(())) => None,
+        Ok(Err(PublishError::Reconnect)) => Some(format!(
+            "{name}: {RECONNECT} Or delete the post in the Bluesky app."
+        )),
+        Ok(Err(PublishError::Failed(msg))) => Some(format!(
+            "{name}: {msg} Delete the post in the Bluesky app if it is still up."
+        )),
+        Err(_) => Some(format!(
+            "{name}: Bluesky did not answer in time. Try again, or delete it in the app."
+        )),
+    }
 }

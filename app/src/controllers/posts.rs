@@ -63,6 +63,8 @@ pub struct Post {
     pub body: String,
     /// Public `https://` image URLs.
     pub media: Vec<String>,
+    /// Follow-up posts, each a reply to the one before.
+    pub thread: Vec<ThreadPart>,
     /// `draft`, `scheduled`, `queued`, `published`, `failed` or `deleted`.
     pub status: String,
     pub scheduled_at: Option<DateTime<FixedOffset>>,
@@ -93,6 +95,28 @@ pub struct Target {
     pub remote_url: Option<String>,
     pub error: Option<String>,
     pub published_at: Option<DateTime<FixedOffset>>,
+    /// The thread posts published so far, in order; a failed target names the one that did
+    /// not go out.
+    pub parts: Vec<TargetPart>,
+}
+
+/// One follow-up post of a thread.
+#[derive(Clone, Serialize, Deserialize, ToSchema, JsonSchema)]
+pub struct ThreadPart {
+    /// The same limits as a post's body.
+    #[serde(default)]
+    pub body: String,
+    /// The same limits as a post's media.
+    #[serde(default)]
+    pub media: Vec<String>,
+}
+
+/// A thread post published on one account.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct TargetPart {
+    pub remote_id: String,
+    pub remote_url: Option<String>,
+    pub published_at: Option<DateTime<FixedOffset>>,
 }
 
 #[derive(Deserialize, ToSchema, JsonSchema)]
@@ -108,6 +132,11 @@ pub struct PostInput {
     /// At most 4 public `https://` image URLs (JPEG, PNG, WebP or GIF, 1 MB each on Bluesky).
     #[serde(default)]
     pub media: Vec<String>,
+    /// Follow-up posts of a thread (at most 25), each a reply to the one before and checked
+    /// like `body` and `media`. Platforms that cannot post threads yet answer
+    /// `thread_not_supported`; a bad part answers its 1-based `part` with the error.
+    #[serde(default)]
+    pub thread: Vec<ThreadPart>,
     /// When to publish. Set: `scheduled`; absent or `null`: `draft`.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
     /// A list to put the post in (moving it there when it already is).
@@ -142,6 +171,9 @@ pub struct PostGroupInput {
     /// Each post's media, unless its override has some.
     #[serde(default)]
     pub media: Vec<String>,
+    /// Each post's thread, unless its override has one.
+    #[serde(default)]
+    pub thread: Vec<ThreadPart>,
     /// As in `POST /posts`, for every post.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
     /// A list to put every post in, in platform order.
@@ -154,11 +186,12 @@ pub struct PostGroupInput {
     pub overrides: BTreeMap<String, Override>,
 }
 
-/// One platform's own body or media in a post group.
+/// One platform's own body, media or thread in a post group.
 #[derive(Deserialize, ToSchema, JsonSchema)]
 pub struct Override {
     pub body: Option<String>,
     pub media: Option<Vec<String>>,
+    pub thread: Option<Vec<ThreadPart>>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -200,6 +233,7 @@ async fn targets_of(
             remote_url: t.remote_url,
             error: t.error,
             published_at: t.published_at,
+            parts: serde_json::from_value(t.parts).unwrap_or_default(),
         });
     }
     Ok(map)
@@ -212,6 +246,7 @@ fn post_json(p: posts::Model, targets: Vec<Target>, lists: Vec<ListRef>) -> Post
         platform: p.platform,
         body: p.body,
         media: serde_json::from_value(p.media).unwrap_or_default(),
+        thread: serde_json::from_value(p.thread).unwrap_or_default(),
         status: p.status,
         scheduled_at: p.scheduled_at,
         published_at: p.published_at,
@@ -279,6 +314,20 @@ async fn checked(
 ) -> Result<Result<Uuid, Response>, DbErr> {
     if let Err(e) = post::validate(&input.platform, &input.body, &input.media) {
         return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, e.code())));
+    }
+    let parts: Vec<(&str, &[String])> = input
+        .thread
+        .iter()
+        .map(|p| (p.body.as_str(), p.media.as_slice()))
+        .collect();
+    if let Err((e, part)) = post::validate_thread(&input.platform, &parts) {
+        let mut body = serde_json::json!({ "error": e.code() });
+        if let Some(n) = part {
+            body["part"] = n.into();
+        }
+        return Ok(Err(
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
+        ));
     }
     set_for(db, a, input.social_set_id).await
 }
@@ -465,6 +514,7 @@ async fn insert(
         platform: Set(input.platform.clone()),
         body: Set(input.body.clone()),
         media: Set(serde_json::json!(input.media)),
+        thread: Set(serde_json::json!(input.thread)),
         status: Set(status_for(input).into()),
         scheduled_at: Set(when(input)),
         created_by: Set(a.user_id),
@@ -537,6 +587,9 @@ pub async fn create_post_group(app: &AppState, a: &Actor, input: PostGroupInput)
                 media: o
                     .and_then(|o| o.media.clone())
                     .unwrap_or_else(|| input.media.clone()),
+                thread: o
+                    .and_then(|o| o.thread.clone())
+                    .unwrap_or_else(|| input.thread.clone()),
                 platform,
                 scheduled_at: input.scheduled_at,
                 list_id: input.list_id,
@@ -596,7 +649,7 @@ async fn naming(res: Response, platform: &str) -> Response {
     (status, Json(v)).into_response()
 }
 
-/// Replaces a `draft` or `scheduled` post's set, platform, body, media and time; anything else
+/// Replaces a `draft` or `scheduled` post's set, platform, body, media, thread and time; anything else
 /// is `409 not_editable`.
 #[utoipa::path(put, path = "/posts/{id}", tag = "posts",
     security(("session" = []), ("api_token" = [])), request_body = PostInput,
@@ -633,6 +686,10 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) 
             .col_expr(posts::Column::Platform, input.platform.clone().into())
             .col_expr(posts::Column::Body, input.body.clone().into())
             .col_expr(posts::Column::Media, serde_json::json!(input.media).into())
+            .col_expr(
+                posts::Column::Thread,
+                serde_json::json!(input.thread).into(),
+            )
             .col_expr(posts::Column::Status, status_for(&input).into())
             .col_expr(posts::Column::ScheduledAt, when(&input).into())
             .col_expr(posts::Column::UpdatedAt, Utc::now().fixed_offset().into())
