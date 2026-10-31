@@ -61,8 +61,9 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET, POST | `/v1/social-sets` | The current team's live sets with `account_ids`, Default first (`?deleted=true`: deleted ones still restorable); create one (`{"name"}`, owner, admin) |
 | PATCH, DELETE | `/v1/social-sets/{id}` | Rename (`{"name"}`, the Default set too); delete (sign-in from the last 10 minutes, not the Default set), restorable for 30 days. Owner, admin |
 | POST | `/v1/social-sets/{id}/restore` | Restore a set deleted in the last 30 days, with its accounts (owner, admin) |
-| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&from=&to=` on `scheduled_at`), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"scheduled_at"}`; any member) |
+| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&group_id=&from=&to=` on `scheduled_at`), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"scheduled_at"}`; any member) |
 | GET, PUT, DELETE | `/v1/posts/{id}` | One post with its `targets`; replace a `draft` or `scheduled` one; delete (`204` for draft or scheduled, `200` after taking a published one down, `422 takedown_failed` with a `message`, `409` for queued or failed) |
+| POST | `/v1/post-groups` | One post per platform of a set in one call (`{"social_set_id","platforms","body","media","scheduled_at","list_id","position","overrides":{"<platform>":{"body","media"}}}`; `platforms` defaults to those with a connected account): `201 {"group_id","posts"}`; an invalid post creates nothing and its error names the `platform` |
 | POST | `/v1/posts/{id}/publish` | Publish a draft or scheduled post now: `202` with the post `queued`; poll it for the result |
 | GET, POST | `/v1/lists` | Post lists (ordered groups such as a series), or create one (`{"name","social_set_id"}`; no set means team-wide, or the token's own set for a set token) |
 | GET, PATCH, DELETE | `/v1/lists/{id}` | One list with its `items` (`post_id`, 1-based `position`, `post`); rename (`{"name"}`); delete (posts stay) |
@@ -190,7 +191,7 @@ id, the same on retries) and `SocialReins-Signature: t=<unix seconds>,v1=<hex>`.
 A 2xx answer within 10 seconds counts as delivered; redirects are not followed and the body is
 not read. Otherwise brain tries again after 1 minute, 5 minutes, 30 minutes, 2, 6, 12 and 24
 hours, then gives up. Brain only connects to public addresses, checked when the name resolves.
-`group_id` stays `null` until posts have groups. To verify a delivery, compute HMAC-SHA256 with
+`group_id` ties the posts of one `POST /v1/post-groups` call and is `null` for a single post. To verify a delivery, compute HMAC-SHA256 with
 the whole secret (`whsec_...`) as the key over `<t>.<raw body>` and compare it with `v1`;
 refuse a `t` more than 5 minutes old:
 
