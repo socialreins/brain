@@ -5672,6 +5672,17 @@ mod teams {
                         make_token(&s, &owner, json!({"name": "cm", "social_set_id": clients}))
                             .await;
                     let set = set["secret"].as_str().unwrap();
+                    let res = connect(&s, &owner, &new_handle(), APP_PASSWORD).await;
+                    let second = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                    req(
+                        &s,
+                        Method::PUT,
+                        &format!("/v1/connections/{second}/sets"),
+                        &owner,
+                    )
+                    .json(&json!({"set_ids": [default, clients]}))
+                    .await
+                    .assert_status_ok();
                     let (_, other) = call(
                         &s,
                         team,
@@ -5693,6 +5704,86 @@ mod teams {
                     let (err, p) = call(&s, set, "create-post", post_body(None, "mine")).await;
                     assert!(!err);
                     assert_eq!(p["social_set_id"], clients.as_str());
+                    let mine = p["id"].as_str().unwrap().to_owned();
+
+                    // Another set's post is not found for writes either.
+                    let mut edit = post_body(None, "hijack");
+                    edit["id"] = json!(other);
+                    let (err, e) = call(&s, set, "update-post", edit).await;
+                    assert!(err);
+                    assert_eq!(e, json!({"error": "not_found"}));
+                    let (err, e) = call(&s, set, "delete-post", json!({"id": other})).await;
+                    assert!(err);
+                    assert_eq!(e, json!({"error": "not_found"}));
+                    // Moving its own post out of its set is invalid_set, as on REST.
+                    let mut moved = post_body(Some(&default), "moved");
+                    moved["id"] = json!(mine);
+                    let (err, e) = call(&s, set, "update-post", moved).await;
+                    assert!(err);
+                    assert_eq!(e, json!({"error": "invalid_set"}));
+
+                    // Lists hold only its set.
+                    let (_, list) = call(&s, set, "list-posts", json!({})).await;
+                    assert_eq!(ids(&list), vec![mine.clone()]);
+                    let (_, accounts) = call(&s, set, "list-social-accounts", json!({})).await;
+                    assert_eq!(ids(&accounts), vec![second.clone()]);
+                    assert_eq!(accounts[0]["set_ids"], json!([clients]));
+
+                    // Another team's token cannot read it.
+                    let (_, stranger, _) = user(&s, &db).await;
+                    let theirs = make_token(&s, &stranger, json!({"name": "x"})).await;
+                    let theirs = theirs["secret"].as_str().unwrap();
+                    let (err, e) = call(&s, theirs, "get-post", json!({"id": mine})).await;
+                    assert!(err);
+                    assert_eq!(e, json!({"error": "not_found"}));
+                }
+
+                /// Over `MAX_BODY_BYTES` is 413, with a length header or chunked without one.
+                #[tokio::test]
+                #[serial]
+                async fn mcp_bodies_over_4_kib_are_refused() {
+                    use std::io::{Read, Write};
+                    let (s, db) = on_mock(120).await;
+                    let (_, owner, _) = user(&s, &db).await;
+                    let made = make_token(&s, &owner, json!({"name": "m"})).await;
+                    let secret = made["secret"].as_str().unwrap().to_owned();
+                    let big =
+                        json!({"name": "create-post", "arguments": {"body": "a".repeat(5000)}});
+                    let res = rpc(&s, Some(&secret), "tools/call", big.clone()).await;
+                    assert_eq!(res.status_code(), 413, "{}", res.text());
+
+                    let config = Config::from_env().expect("test config");
+                    let app = controllers::router(AppState::new(db.clone(), &config), &config);
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let addr = listener.local_addr().unwrap();
+                    tokio::spawn(async move { axum::serve(listener, app).await });
+                    let body =
+                        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": big})
+                            .to_string();
+                    let reply = tokio::task::spawn_blocking(move || {
+                        let mut c = std::net::TcpStream::connect(addr).unwrap();
+                        let head = format!(
+                            "POST /mcp HTTP/1.1\r\nhost: localhost\r\n\
+                             authorization: Bearer {secret}\r\n\
+                             content-type: application/json\r\n\
+                             accept: application/json, text/event-stream\r\n\
+                             transfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+                        );
+                        c.write_all(head.as_bytes()).unwrap();
+                        for part in body.as_bytes().chunks(1000) {
+                            let _ = c.write_all(format!("{:x}\r\n", part.len()).as_bytes());
+                            let _ = c.write_all(part);
+                            let _ = c.write_all(b"\r\n");
+                        }
+                        // The server may answer and close before the last chunk.
+                        let _ = c.write_all(b"0\r\n\r\n");
+                        let mut out = String::new();
+                        let _ = c.read_to_string(&mut out);
+                        out
+                    })
+                    .await
+                    .unwrap();
+                    assert!(reply.starts_with("HTTP/1.1 413"), "{reply}");
                 }
 
                 #[tokio::test]
