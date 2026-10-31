@@ -5,8 +5,9 @@ pub struct Migration;
 
 // One row per Idempotency-Key a team's API tokens sent: `in_progress` while the first request
 // runs, then `done` with the response to replay. Keys are per team, so tokens of one team share
-// them. The fingerprint is the SHA-256 hex of the method, path and raw body. Rows older than 30
-// days are purged hourly; the created_at index serves that purge.
+// them; social_set_id is the set of a set token (NULL for a whole-team token), so a replay
+// never crosses sets. The fingerprint is the SHA-256 hex of the method, path and raw body.
+// Rows older than 30 days are purged hourly; the created_at index serves that purge.
 const UP: &str = r#"CREATE TABLE idempotency_keys (
   team_id uuid NOT NULL REFERENCES teams (id) ON DELETE CASCADE,
   key text NOT NULL CHECK (char_length(key) BETWEEN 1 AND 255),
@@ -14,6 +15,7 @@ const UP: &str = r#"CREATE TABLE idempotency_keys (
   path text NOT NULL,
   fingerprint text NOT NULL,
   token_id uuid REFERENCES api_tokens (id) ON DELETE SET NULL,
+  social_set_id uuid,
   status text NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress', 'done')),
   response_status smallint,
   response_body bytea,

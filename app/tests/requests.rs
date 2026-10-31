@@ -5650,6 +5650,62 @@ mod teams {
                     let res = create(&s, &cm, "k", &body).await;
                     assert_eq!(res.status_code(), 429);
                     res.assert_json(&json!({"error": "rate_limited"}));
+
+                    // A body too large to buffer counts too.
+                    let (s, db) = on_mock(2).await;
+                    let (_, set, cm) = team(&s, &db).await;
+                    let big = post_body(Some(&set), &"x".repeat(40 * 1024));
+                    let res = create(&s, &cm, "big", &big).await;
+                    assert_eq!(res.status_code(), 413);
+                    let body = post_body(Some(&set), "x");
+                    create(&s, &cm, "k", &body).await.assert_status_success();
+                    let res = create(&s, &cm, "k2", &body).await;
+                    assert_eq!(res.status_code(), 429);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn set_tokens_never_share_answers() {
+                    let (s, db) = on_mock(120).await;
+                    let (owner, default, team_token) = team(&s, &db).await;
+                    let other = req(&s, Method::POST, "/v1/social-sets", &owner)
+                        .json(&json!({"name": "Clients"}))
+                        .await
+                        .json::<Value>()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let token_for = |set: String| {
+                        let (s, owner) = (&s, owner.clone());
+                        async move {
+                            let t =
+                                make_token(s, &owner, json!({"name": "set", "social_set_id": set}))
+                                    .await;
+                            t["secret"].as_str().unwrap().to_owned()
+                        }
+                    };
+                    let (a, b) = (
+                        token_for(default.clone()).await,
+                        token_for(other.clone()).await,
+                    );
+                    let body = post_body(None, "same body");
+
+                    let first = create(&s, &a, "shared", &body).await;
+                    assert_eq!(first.status_code(), 201, "{}", first.text());
+                    assert_eq!(first.json::<Value>()["social_set_id"], default.as_str());
+                    // Same team, path, body and key, another set: refused, nothing replayed.
+                    let res = create(&s, &b, "shared", &body).await;
+                    assert_eq!(res.status_code(), 422, "{}", res.text());
+                    res.assert_json(&json!({"error": "idempotency_key_reused"}));
+                    assert!(res.maybe_header("idempotent-replayed").is_none());
+                    // A whole-team token is not set A either.
+                    let res = create(&s, &team_token, "shared", &body).await;
+                    res.assert_json(&json!({"error": "idempotency_key_reused"}));
+                    // Set A itself still replays.
+                    let res = create(&s, &a, "shared", &body).await;
+                    assert_eq!(res.header("idempotent-replayed"), "true");
+                    let in_b = bearer(&s, Method::GET, "/v1/posts", &b).await;
+                    assert!(in_b.json::<Vec<Value>>().is_empty());
                 }
 
                 /// A route that answers `status` and counts its runs, behind the middleware.

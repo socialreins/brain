@@ -1,10 +1,10 @@
 //! `Idempotency-Key` on API token writes, so a client that lost a response can retry, even days
 //! later, without posting twice. A `POST`, `PUT`, `PATCH` or `DELETE` made with an API token and
 //! the header (1 to 255 printable ASCII characters, else `422 invalid_idempotency_key`) runs once
-//! per key and team; tokens of one team share keys. A repeat with the same method, path and body
-//! gets the stored status and body with `Idempotent-Replayed: true`, or `409
-//! idempotency_in_progress` while the first still runs; with anything else, `422
-//! idempotency_key_reused`. 5xx and 429 answers are not stored, so a retry runs again; every
+//! per key and team; tokens of one team share keys. A repeat with the same method, path, body and
+//! token set (a set token's set, or none for a whole-team token) gets the stored status and body
+//! with `Idempotent-Replayed: true`, or `409 idempotency_in_progress` while the first still runs;
+//! with anything else, `422 idempotency_key_reused`. 5xx and 429 answers are not stored, so a retry runs again; every
 //! other answer is. A first run left unfinished for 10 minutes (a crash) is run again. Keys live
 //! 30 days. Sessions ignore the header. A request this layer answers itself counts once against
 //! the token's rate limit, as the route would have.
@@ -25,7 +25,7 @@ use super::{
     auth::internal,
     waitlist::error,
 };
-use crate::state::AppState;
+use crate::{models::api_tokens, state::AppState};
 
 /// How long a key and its response are kept.
 pub const KEEP_DAYS: i64 = 30;
@@ -86,13 +86,13 @@ pub async fn layer(State(app): State<AppState>, req: Request, next: Next) -> Res
     };
     let (parts, body) = req.into_parts();
     let Ok(body) = to_bytes(body, MAX_BODY).await else {
-        return reply(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large");
+        return answer(reply(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"));
     };
     let method = parts.method.as_str().to_owned();
     let path = parts.uri.path().to_owned();
     let fingerprint = token::digest(&[method.as_bytes(), path.as_bytes(), &body].join(&b'\n'));
     let team = token.team_id;
-    let claimed = match claim(&app, team, &key, &method, &path, &fingerprint, token.id).await {
+    let claimed = match claim(&app, &token, &key, &method, &path, &fingerprint).await {
         Ok(c) => c,
         Err(e) => return internal(e, "idempotency claim"),
     };
@@ -125,32 +125,34 @@ pub async fn layer(State(app): State<AppState>, req: Request, next: Next) -> Res
 /// `409` or `422`).
 async fn claim(
     app: &AppState,
-    team: Uuid,
+    token: &api_tokens::Model,
     key: &str,
     method: &str,
     path: &str,
     fingerprint: &str,
-    token: Uuid,
 ) -> Result<Option<Response>, DbErr> {
+    let (team, set) = (token.team_id, token.social_set_id);
     // Twice at most: once more after removing an abandoned run.
     for _ in 0..2 {
         let insert = sql(
-            "INSERT INTO idempotency_keys (team_id, key, method, path, fingerprint, token_id) \
-             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+            "INSERT INTO idempotency_keys \
+             (team_id, key, method, path, fingerprint, token_id, social_set_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
             vec![
                 team.into(),
                 key.into(),
                 method.into(),
                 path.into(),
                 fingerprint.into(),
-                token.into(),
+                token.id.into(),
+                set.into(),
             ],
         );
         if app.db.execute_raw(insert).await?.rows_affected() == 1 {
             return Ok(None);
         }
         let found = sql(
-            "SELECT fingerprint, status, response_status, response_body, content_type, \
+            "SELECT fingerprint, social_set_id, status, response_status, response_body, content_type, \
              created_at < now() - make_interval(mins => $3) AS abandoned \
              FROM idempotency_keys WHERE team_id = $1 AND key = $2",
             vec![team.into(), key.into(), ABANDONED_MINUTES.into()],
@@ -159,7 +161,10 @@ async fn claim(
         let Some(row) = app.db.query_one_raw(found).await? else {
             continue;
         };
-        if row.try_get::<String>("", "fingerprint")? != fingerprint {
+        // A set token never sees an answer given to another set (or to a whole-team token).
+        if row.try_get::<String>("", "fingerprint")? != fingerprint
+            || row.try_get::<Option<Uuid>>("", "social_set_id")? != set
+        {
             let code = "idempotency_key_reused";
             return Ok(Some(reply(StatusCode::UNPROCESSABLE_ENTITY, code)));
         }
