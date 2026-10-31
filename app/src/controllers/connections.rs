@@ -176,6 +176,11 @@ async fn default_set(db: &impl ConnectionTrait, team_id: Uuid) -> Result<Uuid, D
     security(("session" = []), ("api_token" = [])),
     responses((status = 200, body = [Connection]), (status = 401, body = Error)))]
 async fn list(State(app): State<AppState>, a: Actor) -> Response {
+    list_connections(&app, &a).await
+}
+
+/// The body of `GET /connections`, shared with the MCP `list-social-accounts` tool.
+pub async fn list_connections(app: &AppState, a: &Actor) -> Response {
     let found = async {
         let mut sel =
             social_accounts::Entity::find().filter(social_accounts::Column::TeamId.eq(a.team.id));

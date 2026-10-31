@@ -4,6 +4,7 @@ pub mod connectors;
 pub mod controllers;
 pub mod inbox;
 pub mod mail;
+pub mod mcp;
 pub mod models;
 pub mod publish;
 pub mod rate_limit;

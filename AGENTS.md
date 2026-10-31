@@ -23,6 +23,7 @@ cargo run -p socialreins-brain
 - `app/migration/`: one file per migration, raw SQL, registered in `lib.rs`. Applied on boot.
 - `crates/*`: framework-free domain code. Never depend on `axum` or `sea-orm` there.
 - `/v1` routes carry `utoipa::path` annotations; `/openapi.json` is generated from them.
+- `app/src/mcp/`: `/mcp`, whose tools call the same service fns as their `/v1` routes.
 
 ## Rules
 

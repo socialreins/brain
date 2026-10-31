@@ -12,6 +12,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Duration, FixedOffset, Utc};
+use schemars::JsonSchema;
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, PaginatorTrait,
     QueryFilter, QueryOrder, QuerySelect, SqlErr, TransactionTrait,
@@ -57,7 +58,7 @@ pub struct SetName {
     pub name: String,
 }
 
-#[derive(Deserialize, IntoParams)]
+#[derive(Deserialize, IntoParams, JsonSchema)]
 pub struct ListQuery {
     /// `true`: the deleted sets that can still be restored, instead of the live ones.
     #[serde(default)]
@@ -163,6 +164,11 @@ async fn list(
     let Ok(Query(q)) = q else {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     };
+    list_sets(&app, &a, q).await
+}
+
+/// The body of `GET /social-sets`, shared with the MCP `list-social-sets` tool.
+pub async fn list_sets(app: &AppState, a: &Actor, q: ListQuery) -> Response {
     let found = async {
         let mut base =
             social_sets::Entity::find().filter(social_sets::Column::TeamId.eq(a.team.id));

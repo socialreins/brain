@@ -13,6 +13,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, FixedOffset, Utc};
+use schemars::JsonSchema;
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait, DbBackend, DbErr, EntityTrait,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
@@ -83,7 +84,7 @@ pub struct Target {
     pub published_at: Option<DateTime<FixedOffset>>,
 }
 
-#[derive(Deserialize, ToSchema)]
+#[derive(Deserialize, ToSchema, JsonSchema)]
 pub struct PostInput {
     /// A live set of the current team. Required, except with a set token, where absent means
     /// the token's set and any other set is `invalid_set`.
@@ -100,7 +101,7 @@ pub struct PostInput {
     pub scheduled_at: Option<DateTime<FixedOffset>>,
 }
 
-#[derive(Deserialize, IntoParams)]
+#[derive(Deserialize, IntoParams, JsonSchema)]
 pub struct PostQuery {
     pub social_set_id: Option<Uuid>,
     /// One of the post statuses.
@@ -250,6 +251,11 @@ async fn list(
     let Ok(Query(q)) = q else {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     };
+    list_posts(&app, &a, q).await
+}
+
+/// The body of `GET /posts`, shared with the MCP `list-posts` tool.
+pub async fn list_posts(app: &AppState, a: &Actor, q: PostQuery) -> Response {
     if q.status.as_deref().is_some_and(|s| !STATUSES.contains(&s)) {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     }
@@ -257,7 +263,7 @@ async fn list(
         let mut sel = posts::Entity::find()
             .filter(posts::Column::TeamId.eq(a.team.id))
             .filter(posts::Column::SocialSetId.in_subquery(live_sets()))
-            .filter(in_scope(&a));
+            .filter(in_scope(a));
         if let Some(set) = q.social_set_id {
             sel = sel.filter(posts::Column::SocialSetId.eq(set));
         }
@@ -300,8 +306,13 @@ async fn list(
     responses((status = 200, body = Post), (status = 401, body = Error),
         (status = 404, body = Error)))]
 async fn show(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
+    get_post(&app, &a, id).await
+}
+
+/// The body of `GET /posts/{id}`, shared with the MCP `get-post` tool.
+pub async fn get_post(app: &AppState, a: &Actor, id: Uuid) -> Response {
     let found = async {
-        match find(&app.db, &a, id).await? {
+        match find(&app.db, a, id).await? {
             Some(p) => one_json(&app.db, p).await.map(Some),
             None => Ok(None),
         }
@@ -321,8 +332,13 @@ async fn show(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Re
     responses((status = 201, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 409, body = Error), (status = 422, body = Error)))]
 async fn create(State(app): State<AppState>, a: Actor, Body(input): Body<PostInput>) -> Response {
+    create_post(&app, &a, input).await
+}
+
+/// The body of `POST /posts`, shared with the MCP `create-post` tool.
+pub async fn create_post(app: &AppState, a: &Actor, input: PostInput) -> Response {
     let made = async {
-        let set = match checked(&app.db, &a, &input).await? {
+        let set = match checked(&app.db, a, &input).await? {
             Ok(set) => set,
             Err(res) => return Ok(Err(res)),
         };
@@ -377,14 +393,19 @@ async fn update(
     Path(id): Path<Uuid>,
     Body(input): Body<PostInput>,
 ) -> Response {
+    update_post(&app, &a, id, input).await
+}
+
+/// The body of `PUT /posts/{id}`, shared with the MCP `update-post` tool.
+pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) -> Response {
     let saved = async {
-        let Some(found) = find(&app.db, &a, id).await? else {
+        let Some(found) = find(&app.db, a, id).await? else {
             return Ok(Err(not_found()));
         };
         if !editable(&found.status) {
             return Ok(Err(reply(StatusCode::CONFLICT, "not_editable")));
         }
-        let set = match checked(&app.db, &a, &input).await? {
+        let set = match checked(&app.db, a, &input).await? {
             Ok(set) => set,
             Err(res) => return Ok(Err(res)),
         };
@@ -399,13 +420,13 @@ async fn update(
             .col_expr(posts::Column::UpdatedAt, Utc::now().fixed_offset().into())
             .filter(posts::Column::Id.eq(id))
             .filter(posts::Column::Status.is_in(["draft", "scheduled"]))
-            .filter(in_scope(&a))
+            .filter(in_scope(a))
             .exec(&app.db)
             .await?;
         if done.rows_affected == 0 {
             return Ok(Err(reply(StatusCode::CONFLICT, "not_editable")));
         }
-        match find(&app.db, &a, id).await? {
+        match find(&app.db, a, id).await? {
             Some(p) => one_json(&app.db, p).await.map(Ok),
             None => Ok(Err(not_found())),
         }
@@ -483,7 +504,12 @@ async fn publish_now(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error), (status = 429, body = Error)))]
 async fn destroy(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
-    let found = match find(&app.db, &a, id).await {
+    delete_post(&app, &a, id).await
+}
+
+/// The body of `DELETE /posts/{id}`, shared with the MCP `delete-post` tool.
+pub async fn delete_post(app: &AppState, a: &Actor, id: Uuid) -> Response {
+    let found = match find(&app.db, a, id).await {
         Ok(Some(p)) => p,
         Ok(None) => return not_found(),
         Err(e) => return internal(e, "post read"),
@@ -493,7 +519,7 @@ async fn destroy(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) ->
             let gone = posts::Entity::delete_many()
                 .filter(posts::Column::Id.eq(id))
                 .filter(posts::Column::Status.is_in(["draft", "scheduled"]))
-                .filter(in_scope(&a))
+                .filter(in_scope(a))
                 .exec(&app.db)
                 .await;
             match gone {
@@ -507,7 +533,7 @@ async fn destroy(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) ->
                 if !app.post_limiter.hit(a.key()) {
                     return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
                 }
-                match publish::takedown(&app, &found).await {
+                match publish::takedown(app, &found).await {
                     Ok(problems) if problems.is_empty() => {}
                     // 422, never 502: a proxy may swap a 502 body for its own page.
                     Ok(problems) => {
@@ -520,7 +546,7 @@ async fn destroy(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) ->
                     Err(e) => return internal(e, "post takedown"),
                 }
             }
-            match find(&app.db, &a, id).await {
+            match find(&app.db, a, id).await {
                 Ok(Some(p)) => match one_json(&app.db, p).await {
                     Ok(p) => Json(p).into_response(),
                     Err(e) => internal(e, "post read"),

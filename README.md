@@ -27,6 +27,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/health` | `{"status":"ok"}` |
 | GET | `/version` | `{"commit":"<sha>"}`, from `RAILWAY_GIT_COMMIT_SHA`, `dev` locally |
 | GET | `/openapi.json` | OpenAPI document for `/v1` |
+| POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, accounts and posts. Bearer API token only, same scope and per-token limit as `/v1`; `Idempotency-Key` does not apply |
 | POST | `/v1/waitlist` | `{"email":"...","source":"..."}` joins the waitlist |
 | POST | `/auth/link` | `{"email":"..."}` emails a sign-in link, `202 {"status":"sent"}` |
 | GET | `/auth/magic/{token}` | The emailed link: a page with a sign-in button, does not use the link |
