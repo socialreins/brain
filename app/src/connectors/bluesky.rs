@@ -1047,9 +1047,9 @@ impl Bluesky {
 /// cannot point brain at its own network. reqwest connects to exactly these addresses, so a
 /// rebinding name cannot swap in another afterwards. IP literals skip the resolver;
 /// `checked_pds` refuses those.
-struct PublicOnly;
+pub(crate) struct PublicOnly;
 
-const NOT_PUBLIC: &str = "name has no public address";
+pub(crate) const NOT_PUBLIC: &str = "name has no public address";
 
 #[derive(Debug)]
 struct NotPublic;
@@ -1082,7 +1082,7 @@ impl reqwest::dns::Resolve for PublicOnly {
 }
 
 /// Not loopback, private, link-local, carrier-grade NAT, multicast or otherwise reserved.
-fn public(ip: IpAddr) -> bool {
+pub(crate) fn public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let [a, b, ..] = v4.octets();

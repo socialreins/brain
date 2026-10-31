@@ -24,6 +24,9 @@ cargo run -p socialreins-brain
 - `crates/*`: framework-free domain code. Never depend on `axum` or `sea-orm` there.
 - `/v1` routes carry `utoipa::path` annotations; `/openapi.json` is generated from them.
 - `app/src/mcp/`: `/mcp`, whose tools call the same service fns as their `/v1` routes.
+- `app/src/webhooks.rs`: outbound webhooks. Every `post_targets` status change goes through
+  `webhooks::with_event`, so its event is queued in the same statement; README documents the
+  payload and signature.
 
 ## Rules
 

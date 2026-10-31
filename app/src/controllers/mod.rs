@@ -1,6 +1,6 @@
 //! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, the documented `/v1` API
-//! (waitlist, teams, API tokens, connections, social sets, posts, inboxes, automations), and
-//! `/mcp` (see `crate::mcp`).
+//! (waitlist, teams, API tokens, webhooks, connections, social sets, posts, inboxes,
+//! automations), and `/mcp` (see `crate::mcp`).
 pub mod api_tokens;
 pub mod auth;
 pub mod automations;
@@ -14,6 +14,7 @@ pub mod posts;
 pub mod social_sets;
 pub mod teams;
 pub mod waitlist;
+pub mod webhooks;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -57,6 +58,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(waitlist::api())
         .merge(teams::api())
         .merge(api_tokens::api())
+        .merge(webhooks::api())
         .merge(connections::api())
         .merge(social_sets::api())
         .merge(posts::api())

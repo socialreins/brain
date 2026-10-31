@@ -1,11 +1,11 @@
 //! Background jobs, in process: publishing due posts and reading inboxes (then running
-//! automations) every minute (the old app ran every 5), and purging deleted sets and old
-//! idempotency keys every hour, each run by one instance at a time through an advisory lock. shortcut: no job queue; move to one if jobs need retries or exact times.
+//! automations) and sending webhooks every minute (the old app ran every 5), and purging deleted
+//! sets, old idempotency keys and old webhook deliveries every hour, each run by one instance at a time through an advisory lock. shortcut: no job queue; move to one if jobs need retries or exact times.
 use std::time::Duration;
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait};
 
-use crate::{controllers::idempotency, inbox, publish, state::AppState};
+use crate::{controllers::idempotency, inbox, publish, state::AppState, webhooks};
 
 /// How long a deleted social set can be restored before the purge removes it.
 pub const RESTORE_DAYS: i64 = 30;
@@ -18,6 +18,17 @@ const PURGE_LOCK: i64 = 0x0050_5552_4745_5345;
 pub fn spawn(app: AppState) {
     let db = app.db.clone();
     let inbox_app = app.clone();
+    let hook_app = app.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if let Err(e) = webhooks::tick(&hook_app).await {
+                tracing::warn!(error = %e, "webhook tick failed");
+            }
+        }
+    });
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -51,6 +62,11 @@ pub fn spawn(app: AppState) {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(keys = n, "purged old idempotency keys"),
                 Err(e) => tracing::warn!(error = %e, "idempotency key purge failed"),
+            }
+            match purge(&db, &webhooks::purge_sql()).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(deliveries = n, "purged old webhook deliveries"),
+                Err(e) => tracing::warn!(error = %e, "webhook delivery purge failed"),
             }
         }
     });
