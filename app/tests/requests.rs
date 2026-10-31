@@ -5481,11 +5481,301 @@ mod teams {
                     assert!(sec.contains("api_token"), "{p} {m} {sec}");
                 }
                 for (p, m) in [
+                    ("/posts", "post"),
+                    ("/posts/{id}", "put"),
+                    ("/posts/{id}", "delete"),
+                    ("/posts/{id}/publish", "post"),
+                ] {
+                    let params = doc["paths"][p][m]["parameters"].to_string();
+                    assert!(params.contains("\"Idempotency-Key\""), "{p} {m} {params}");
+                }
+                for (p, m) in [
                     ("/api-tokens", "get"),
                     ("/inboxes", "get"),
                     ("/team", "get"),
                 ] {
                     assert!(doc["paths"][p][m]["security"].is_null(), "{p} {m}");
+                }
+            }
+
+            /// `Idempotency-Key` on token writes.
+            mod idempotency {
+                use super::*;
+                use axum::{
+                    http::{HeaderValue, StatusCode},
+                    middleware::from_fn_with_state,
+                    routing::post,
+                };
+                use sea_orm::{ConnectionTrait, DbBackend, Statement};
+                use socialreins_brain::controllers::idempotency;
+                use std::future::IntoFuture;
+                use std::sync::atomic::{AtomicUsize, Ordering};
+
+                /// A team owner, the Default set id, and a whole-team token.
+                async fn team(s: &TestServer, db: &DatabaseConnection) -> (String, String, String) {
+                    let (_, owner, _) = user(s, db).await;
+                    let team_id = current(s, &owner).await["id"].as_str().unwrap().to_owned();
+                    let set = default_set(db, &team_id).await.to_string();
+                    let t = make_token(s, &owner, json!({"name": "cm"})).await;
+                    (owner, set, t["secret"].as_str().unwrap().to_owned())
+                }
+
+                fn create(s: &TestServer, secret: &str, key: &str, body: &Value) -> TestRequest {
+                    bearer(s, Method::POST, "/v1/posts", secret)
+                        .add_header("idempotency-key", key.to_owned())
+                        .json(body)
+                }
+
+                async fn posts(s: &TestServer, secret: &str) -> usize {
+                    let res = bearer(s, Method::GET, "/v1/posts", secret).await;
+                    res.json::<Vec<Value>>().len()
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_key_runs_once_per_team() {
+                    let (s, db) = on_mock(120).await;
+                    let (owner, set, cm) = team(&s, &db).await;
+                    let body = post_body(Some(&set), "once");
+
+                    let first = create(&s, &cm, "order-1", &body).await;
+                    assert_eq!(first.status_code(), 201, "{}", first.text());
+                    assert!(first.maybe_header("idempotent-replayed").is_none());
+                    let again = create(&s, &cm, "order-1", &body).await;
+                    assert_eq!(again.status_code(), 201);
+                    assert_eq!(again.header("idempotent-replayed"), "true");
+                    assert_eq!(again.header("content-type"), "application/json");
+                    assert_eq!(again.text(), first.text());
+                    assert_eq!(posts(&s, &cm).await, 1);
+
+                    // Another token of the same team shares the key.
+                    let other = make_token(&s, &owner, json!({"name": "cm2"})).await;
+                    let other = other["secret"].as_str().unwrap();
+                    let res = create(&s, other, "order-1", &body).await;
+                    assert_eq!(res.header("idempotent-replayed"), "true");
+
+                    // The same key with another body, method or path is refused.
+                    let res = create(&s, &cm, "order-1", &post_body(Some(&set), "twice")).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "idempotency_key_reused"}));
+                    let id = first.json::<Value>()["id"].as_str().unwrap().to_owned();
+                    let res = bearer(&s, Method::PUT, &format!("/v1/posts/{id}"), &cm)
+                        .add_header("idempotency-key", "order-1")
+                        .json(&body)
+                        .await;
+                    res.assert_json(&json!({"error": "idempotency_key_reused"}));
+
+                    // A new key runs again.
+                    let res = create(&s, &cm, "order-2", &body).await;
+                    assert_eq!(res.status_code(), 201);
+                    assert!(res.maybe_header("idempotent-replayed").is_none());
+                    assert_eq!(posts(&s, &cm).await, 2);
+
+                    // 4xx answers are kept too.
+                    let bad = post_body(None, "no set");
+                    let res = create(&s, &cm, "order-3", &bad).await;
+                    res.assert_json(&json!({"error": "invalid_set"}));
+                    let res = create(&s, &cm, "order-3", &bad).await;
+                    res.assert_json(&json!({"error": "invalid_set"}));
+                    assert_eq!(res.header("idempotent-replayed"), "true");
+
+                    // Another team has its own keys.
+                    let (_, theirs, them) = team(&s, &db).await;
+                    let res = create(&s, &them, "order-1", &post_body(Some(&theirs), "once")).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    assert!(res.maybe_header("idempotent-replayed").is_none());
+
+                    // Sessions ignore the header.
+                    for _ in 0..2 {
+                        let res = req(&s, Method::POST, "/v1/posts", &owner)
+                            .add_header("idempotency-key", "order-1")
+                            .json(&body)
+                            .await;
+                        assert_eq!(res.status_code(), 201, "{}", res.text());
+                        assert!(res.maybe_header("idempotent-replayed").is_none());
+                    }
+                    assert_eq!(posts(&s, &cm).await, 4);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn invalid_keys_are_refused() {
+                    let (s, db) = on_mock(120).await;
+                    let (_, set, cm) = team(&s, &db).await;
+                    let body = post_body(Some(&set), "x");
+                    let long = "k".repeat(256);
+                    for bad in [
+                        HeaderValue::from_static(""),
+                        HeaderValue::from_str(&long).unwrap(),
+                        HeaderValue::from_bytes("caf\u{e9}".as_bytes()).unwrap(),
+                    ] {
+                        let res = bearer(&s, Method::POST, "/v1/posts", &cm)
+                            .add_header("idempotency-key", bad.clone())
+                            .json(&body)
+                            .await;
+                        assert_eq!(res.status_code(), 422, "{bad:?}");
+                        res.assert_json(&json!({"error": "invalid_idempotency_key"}));
+                    }
+                    assert_eq!(posts(&s, &cm).await, 0);
+                    let res = create(&s, &cm, &"k".repeat(255), &body).await;
+                    assert_eq!(res.status_code(), 201);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn concurrent_duplicates_run_once() {
+                    let (s, db) = on_mock(120).await;
+                    let (_, set, cm) = team(&s, &db).await;
+                    let body = post_body(Some(&set), "race");
+                    let (a, b) = tokio::join!(
+                        create(&s, &cm, "race", &body).into_future(),
+                        create(&s, &cm, "race", &body).into_future()
+                    );
+                    let mut codes = [a.status_code().as_u16(), b.status_code().as_u16()];
+                    codes.sort();
+                    assert!(codes == [201, 201] || codes == [201, 409], "{codes:?}");
+                    assert_eq!(posts(&s, &cm).await, 1);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn replays_count_once_against_the_rate_limit() {
+                    let (s, db) = on_mock(3).await;
+                    let (_, set, cm) = team(&s, &db).await;
+                    let body = post_body(Some(&set), "x");
+                    for _ in 0..3 {
+                        let res = create(&s, &cm, "k", &body).await;
+                        assert_eq!(res.status_code(), 201);
+                    }
+                    let res = create(&s, &cm, "k", &body).await;
+                    assert_eq!(res.status_code(), 429);
+                    res.assert_json(&json!({"error": "rate_limited"}));
+
+                    // A body too large to buffer counts too.
+                    let (s, db) = on_mock(2).await;
+                    let (_, set, cm) = team(&s, &db).await;
+                    let big = post_body(Some(&set), &"x".repeat(40 * 1024));
+                    let res = create(&s, &cm, "big", &big).await;
+                    assert_eq!(res.status_code(), 413);
+                    let body = post_body(Some(&set), "x");
+                    create(&s, &cm, "k", &body).await.assert_status_success();
+                    let res = create(&s, &cm, "k2", &body).await;
+                    assert_eq!(res.status_code(), 429);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn set_tokens_never_share_answers() {
+                    let (s, db) = on_mock(120).await;
+                    let (owner, default, team_token) = team(&s, &db).await;
+                    let other = req(&s, Method::POST, "/v1/social-sets", &owner)
+                        .json(&json!({"name": "Clients"}))
+                        .await
+                        .json::<Value>()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let token_for = |set: String| {
+                        let (s, owner) = (&s, owner.clone());
+                        async move {
+                            let t =
+                                make_token(s, &owner, json!({"name": "set", "social_set_id": set}))
+                                    .await;
+                            t["secret"].as_str().unwrap().to_owned()
+                        }
+                    };
+                    let (a, b) = (
+                        token_for(default.clone()).await,
+                        token_for(other.clone()).await,
+                    );
+                    let body = post_body(None, "same body");
+
+                    let first = create(&s, &a, "shared", &body).await;
+                    assert_eq!(first.status_code(), 201, "{}", first.text());
+                    assert_eq!(first.json::<Value>()["social_set_id"], default.as_str());
+                    // Same team, path, body and key, another set: refused, nothing replayed.
+                    let res = create(&s, &b, "shared", &body).await;
+                    assert_eq!(res.status_code(), 422, "{}", res.text());
+                    res.assert_json(&json!({"error": "idempotency_key_reused"}));
+                    assert!(res.maybe_header("idempotent-replayed").is_none());
+                    // A whole-team token is not set A either.
+                    let res = create(&s, &team_token, "shared", &body).await;
+                    res.assert_json(&json!({"error": "idempotency_key_reused"}));
+                    // Set A itself still replays.
+                    let res = create(&s, &a, "shared", &body).await;
+                    assert_eq!(res.header("idempotent-replayed"), "true");
+                    let in_b = bearer(&s, Method::GET, "/v1/posts", &b).await;
+                    assert!(in_b.json::<Vec<Value>>().is_empty());
+                }
+
+                /// A route that answers `status` and counts its runs, behind the middleware.
+                fn counted(
+                    state: &AppState,
+                    status: StatusCode,
+                ) -> (TestServer, std::sync::Arc<AtomicUsize>) {
+                    let runs = std::sync::Arc::new(AtomicUsize::new(0));
+                    let r = runs.clone();
+                    let app = axum::Router::new()
+                        .route(
+                            "/run",
+                            post(move || {
+                                r.fetch_add(1, Ordering::SeqCst);
+                                async move { status }
+                            }),
+                        )
+                        .layer(from_fn_with_state(state.clone(), idempotency::layer));
+                    (TestServer::new(app).unwrap(), runs)
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn server_errors_and_abandoned_runs_run_again() {
+                    let config = Config::from_env().expect("test config");
+                    let db = socialreins_brain::connect(&config).await.unwrap();
+                    let state = AppState::new(db.clone(), &config);
+                    let s = TestServer::new(controllers::router(state.clone(), &config)).unwrap();
+                    let (_, owner, _) = user(&s, &db).await;
+                    let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+                    let cm = make_token(&s, &owner, json!({"name": "cm"})).await;
+                    let cm = cm["secret"].as_str().unwrap();
+                    let call = |s: &TestServer, key: &str| {
+                        bearer(s, Method::POST, "/run", cm)
+                            .add_header("idempotency-key", key.to_owned())
+                    };
+
+                    // A 5xx is not stored.
+                    let (boom, runs) = counted(&state, StatusCode::INTERNAL_SERVER_ERROR);
+                    for _ in 0..2 {
+                        assert_eq!(call(&boom, "boom").await.status_code(), 500);
+                    }
+                    assert_eq!(runs.load(Ordering::SeqCst), 2);
+
+                    // A run in progress answers 409; one left for over 10 minutes runs again.
+                    let (ok, runs) = counted(&state, StatusCode::OK);
+                    let fingerprint = token::digest(b"POST\n/run\n");
+                    for (key, age) in [("fresh", 0), ("stale", 11)] {
+                        let stmt = Statement::from_sql_and_values(
+                            DbBackend::Postgres,
+                            "INSERT INTO idempotency_keys (team_id, key, method, path, \
+                             fingerprint, created_at) \
+                             VALUES ($1, $2, 'POST', '/run', $3, now() - make_interval(mins => $4))",
+                            [
+                                team_id.parse::<uuid::Uuid>().unwrap().into(),
+                                key.into(),
+                                fingerprint.clone().into(),
+                                age.into(),
+                            ],
+                        );
+                        db.execute_raw(stmt).await.unwrap();
+                    }
+                    let res = call(&ok, "fresh").await;
+                    assert_eq!(res.status_code(), 409);
+                    res.assert_json(&json!({"error": "idempotency_in_progress"}));
+                    assert_eq!(runs.load(Ordering::SeqCst), 0);
+                    assert_eq!(call(&ok, "stale").await.status_code(), 200);
+                    let res = call(&ok, "stale").await;
+                    assert_eq!(res.header("idempotent-replayed"), "true");
+                    assert_eq!(runs.load(Ordering::SeqCst), 1);
                 }
             }
         }

@@ -1,11 +1,11 @@
 //! Background jobs, in process: publishing due posts and reading inboxes (then running
-//! automations) every minute (the old app ran every 5), and purging deleted sets every hour, each run by one instance at a time through an advisory
-//! lock. shortcut: no job queue; move to one if jobs need retries or exact times.
+//! automations) every minute (the old app ran every 5), and purging deleted sets and old
+//! idempotency keys every hour, each run by one instance at a time through an advisory lock. shortcut: no job queue; move to one if jobs need retries or exact times.
 use std::time::Duration;
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait};
 
-use crate::{inbox, publish, state::AppState};
+use crate::{controllers::idempotency, inbox, publish, state::AppState};
 
 /// How long a deleted social set can be restored before the purge removes it.
 pub const RESTORE_DAYS: i64 = 30;
@@ -47,6 +47,11 @@ pub fn spawn(app: AppState) {
                 Ok(n) => tracing::info!(sets = n, "purged deleted social sets"),
                 Err(e) => tracing::warn!(error = %e, "social set purge failed"),
             }
+            match purge_idempotency_keys(&db).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(keys = n, "purged old idempotency keys"),
+                Err(e) => tracing::warn!(error = %e, "idempotency key purge failed"),
+            }
         }
     });
 }
@@ -54,6 +59,19 @@ pub fn spawn(app: AppState) {
 /// Hard-deletes social sets deleted more than `RESTORE_DAYS` ago; their account links go by
 /// cascade. Idempotent. Skips (returns 0) while another instance holds the lock.
 pub async fn purge_deleted_sets(db: &DatabaseConnection) -> Result<u64, DbErr> {
+    let sql = format!(
+        "DELETE FROM social_sets WHERE deleted_at < now() - interval '{RESTORE_DAYS} days'"
+    );
+    purge(db, &sql).await
+}
+
+/// Deletes idempotency keys past their 30 days, like `purge_deleted_sets`.
+pub async fn purge_idempotency_keys(db: &DatabaseConnection) -> Result<u64, DbErr> {
+    purge(db, &idempotency::purge_sql()).await
+}
+
+/// Runs `sql` under the purge lock; 0 while another instance holds it.
+async fn purge(db: &DatabaseConnection, sql: &str) -> Result<u64, DbErr> {
     let txn = db.begin().await?;
     let lock = format!("SELECT pg_try_advisory_xact_lock({PURGE_LOCK}) AS ok");
     let row = txn
@@ -66,10 +84,7 @@ pub async fn purge_deleted_sets(db: &DatabaseConnection) -> Result<u64, DbErr> {
     if !locked {
         return Ok(0);
     }
-    let sql = format!(
-        "DELETE FROM social_sets WHERE deleted_at < now() - interval '{RESTORE_DAYS} days'"
-    );
-    let done = txn.execute_unprepared(&sql).await?;
+    let done = txn.execute_unprepared(sql).await?;
     txn.commit().await?;
     Ok(done.rows_affected())
 }

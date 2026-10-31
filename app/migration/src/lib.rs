@@ -11,6 +11,7 @@ mod m20261031_000001_posts;
 mod m20261101_000001_google_sign_in;
 mod m20261102_000001_inbox;
 mod m20261103_000001_api_tokens;
+mod m20261104_000001_idempotency_keys;
 
 pub struct Migrator;
 
@@ -29,6 +30,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261101_000001_google_sign_in::Migration),
             Box::new(m20261102_000001_inbox::Migration),
             Box::new(m20261103_000001_api_tokens::Migration),
+            Box::new(m20261104_000001_idempotency_keys::Migration),
             // inject-above (do not remove this comment)
         ]
     }

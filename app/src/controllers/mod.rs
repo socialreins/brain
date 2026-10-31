@@ -6,6 +6,7 @@ pub mod automations;
 pub mod connections;
 pub mod google;
 pub mod health;
+pub mod idempotency;
 pub mod inbox;
 pub mod passkeys;
 pub mod posts;
@@ -16,6 +17,7 @@ pub mod waitlist;
 use axum::{
     extract::DefaultBodyLimit,
     http::{header, Method},
+    middleware::from_fn_with_state,
     routing::get,
     Json, Router,
 };
@@ -108,7 +110,11 @@ pub fn router(state: AppState, config: &Config) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_BODY_BYTES)),
         )
         .merge(passkeys::routes().layer(DefaultBodyLimit::max(MAX_PASSKEY_BODY_BYTES)))
-        .nest("/v1", v1.layer(DefaultBodyLimit::max(MAX_BODY_BYTES)))
+        .nest(
+            "/v1",
+            v1.layer(from_fn_with_state(state.clone(), idempotency::layer))
+                .layer(DefaultBodyLimit::max(MAX_BODY_BYTES)),
+        )
         .route("/openapi.json", get(move || async move { Json(doc) }))
         .layer(cors)
         .layer(TraceLayer::new_for_http().make_span_with(span))
