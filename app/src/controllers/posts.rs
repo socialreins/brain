@@ -133,8 +133,8 @@ pub struct PostQuery {
 pub struct PostGroupInput {
     /// As in `POST /posts`.
     pub social_set_id: Option<Uuid>,
-    /// The platforms to post to, one post each. Absent: every platform with a connected
-    /// account in the set (`422 no_accounts` when there is none).
+    /// The platforms to post to, one post each. Absent: every platform brain publishes to
+    /// with a connected account in the set (`422 no_accounts` when there is none).
     pub platforms: Option<Vec<String>>,
     /// Each post's body, unless its override has one.
     #[serde(default)]
@@ -506,7 +506,12 @@ pub async fn create_post_group(app: &AppState, a: &Actor, input: PostGroupInput)
         };
         let mut platforms = match &input.platforms {
             Some(p) => p.clone(),
-            None => connected_platforms(&app.db, a.team.id, set).await?,
+            // Only platforms brain publishes to, so an account connected early breaks nothing.
+            None => connected_platforms(&app.db, a.team.id, set)
+                .await?
+                .into_iter()
+                .filter(|p| publish::publisher(app, p).is_some())
+                .collect(),
         };
         let mut seen = HashSet::new();
         platforms.retain(|p| seen.insert(p.clone()));
@@ -792,7 +797,11 @@ pub async fn delete_post(app: &AppState, a: &Actor, id: Uuid) -> Response {
 pub fn api() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(list, create))
-        .routes(routes!(create_group))
         .routes(routes!(show, update, destroy))
         .routes(routes!(publish_now))
+}
+
+/// `POST /post-groups`, apart so it can take a larger body than the rest of `/v1`.
+pub fn groups_api() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(create_group))
 }

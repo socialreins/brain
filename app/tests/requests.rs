@@ -3887,7 +3887,8 @@ mod teams {
                 res.assert_json(&json!({"error": "invalid_set"}));
                 assert_eq!(count().await, before);
 
-                // An account on another platform joins the default, which then fails on it.
+                // An account on a platform brain cannot publish to stays out of the default;
+                // naming that platform still fails.
                 let x = uuid::Uuid::now_v7();
                 let copy = sea_orm::Statement::from_sql_and_values(
                     sea_orm::DbBackend::Postgres,
@@ -3907,8 +3908,28 @@ mod teams {
                 .await
                 .unwrap();
                 let res = group(json!({"social_set_id": set, "body": "hi"})).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let platforms: Vec<Value> = res.json::<Value>()["posts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| p["platform"].clone())
+                    .collect();
+                assert_eq!(platforms, [json!("bluesky")]);
+                let res =
+                    group(json!({"social_set_id": set, "platforms": ["x"], "body": "hi"})).await;
                 res.assert_json(&json!({"error": "unsupported_platform", "platform": "x"}));
-                assert_eq!(count().await, before);
+                assert_eq!(count().await, before + 1);
+
+                // A group body may run well past the 4 KiB `/v1` limit.
+                let pad = " ".repeat(10 * 1024);
+                let big = format!(r#"{{"social_set_id":"{set}","body":"big"{pad}}}"#);
+                assert!(big.len() > 10 * 1024);
+                let res = req(&s, Method::POST, "/v1/post-groups", &owner)
+                    .content_type("application/json")
+                    .bytes(big.into())
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
 
                 // A set without accounts has no default.
                 let empty = req(&s, Method::POST, "/v1/social-sets", &owner)
