@@ -127,6 +127,7 @@ fn live() -> Condition {
 /// API token, which acts as an admin of its team. A request with an `Authorization` header is
 /// judged by that header alone, never by a cookie. Session writes need the web origin
 /// (`FromWeb`); token requests carry no cookie, so they skip it.
+#[derive(Clone)]
 pub struct Actor {
     pub team: teams::Model,
     pub role: Role,
@@ -181,12 +182,15 @@ pub fn limited(app: &AppState, token: Uuid) -> Option<Response> {
     Some(res)
 }
 
-impl FromRequestParts<AppState> for Actor {
-    type Rejection = Response;
-
-    async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, Response> {
-        if let Some(auth) = parts.headers.get(header::AUTHORIZATION) {
-            let secret = bearer_secret(auth).ok_or_else(invalid_token)?;
+impl Actor {
+    /// The token of an `Authorization` header (absent: `401 invalid_token`), counted against
+    /// its per-minute limit. `/v1` and `/mcp` both resolve tokens here.
+    pub async fn from_bearer(
+        app: &AppState,
+        auth: Option<&HeaderValue>,
+    ) -> Result<Self, Box<Response>> {
+        let resolved = async {
+            let secret = auth.and_then(bearer_secret).ok_or_else(invalid_token)?;
             let found = find_live(app, secret)
                 .await
                 .map_err(|e| internal(e, "api token lookup"))?;
@@ -200,12 +204,23 @@ impl FromRequestParts<AppState> for Actor {
                 .map_err(|e| internal(e, "api token team"))?
                 .ok_or_else(invalid_token)?;
             touch(app, &row).await;
-            return Ok(Self {
+            Ok::<_, Response>(Self {
                 team,
                 role: Role::Admin,
                 user_id: None,
                 token: Some(row),
-            });
+            })
+        };
+        resolved.await.map_err(Box::new)
+    }
+}
+
+impl FromRequestParts<AppState> for Actor {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, Response> {
+        if let Some(auth) = parts.headers.get(header::AUTHORIZATION) {
+            return Self::from_bearer(app, Some(auth)).await.map_err(|r| *r);
         }
         if !parts.method.is_safe() {
             FromWeb::from_request_parts(parts, app)

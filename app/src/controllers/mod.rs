@@ -1,5 +1,6 @@
-//! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, and the documented `/v1` API
-//! (waitlist, teams, API tokens, connections, social sets, posts, inboxes, automations).
+//! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, the documented `/v1` API
+//! (waitlist, teams, API tokens, connections, social sets, posts, inboxes, automations), and
+//! `/mcp` (see `crate::mcp`).
 pub mod api_tokens;
 pub mod auth;
 pub mod automations;
@@ -31,10 +32,10 @@ use utoipa::{
 };
 use utoipa_axum::router::OpenApiRouter;
 
-use crate::{config::Config, state::AppState};
+use crate::{config::Config, mcp, state::AppState};
 
 /// Largest `/v1` and `/auth` request body; a waitlist signup is well under 1 KB.
-const MAX_BODY_BYTES: usize = 4096;
+pub(crate) const MAX_BODY_BYTES: usize = 4096;
 /// Passkey bodies carry an attestation or assertion, which can run past 4 KiB.
 const MAX_PASSKEY_BODY_BYTES: usize = 16 * 1024;
 const MAX_AUTOMATION_BODY_BYTES: usize = 32 * 1024;
@@ -116,6 +117,11 @@ pub fn router(state: AppState, config: &Config) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_BODY_BYTES)),
         )
         .route("/openapi.json", get(move || async move { Json(doc) }))
+        .merge(
+            Router::new()
+                .nest_service("/mcp", mcp::service(&state))
+                .route_layer(from_fn_with_state(state.clone(), mcp::auth::layer)),
+        )
         .layer(cors)
         .layer(TraceLayer::new_for_http().make_span_with(span))
         .with_state(state)

@@ -5498,6 +5498,221 @@ mod teams {
                 }
             }
 
+            /// `/mcp`: the same tokens, scope and code as `/v1`.
+            mod mcp {
+                use super::*;
+                use axum_test::TestResponse;
+
+                async fn rpc(
+                    s: &TestServer,
+                    secret: Option<&str>,
+                    method: &str,
+                    params: Value,
+                ) -> TestResponse {
+                    let mut r = s
+                        .post("/mcp")
+                        .add_header("accept", "application/json, text/event-stream")
+                        .add_header("mcp-protocol-version", "2025-11-25");
+                    if let Some(t) = secret {
+                        r = r.add_header("authorization", format!("Bearer {t}"));
+                    }
+                    r.json(&json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}))
+                        .await
+                }
+
+                /// A tool call: `(isError, the JSON the tool answered as text)`.
+                async fn call(
+                    s: &TestServer,
+                    secret: &str,
+                    tool: &str,
+                    args: Value,
+                ) -> (bool, Value) {
+                    let params = json!({"name": tool, "arguments": args});
+                    let res = rpc(s, Some(secret), "tools/call", params).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let body = res.json::<Value>();
+                    let r = &body["result"];
+                    let text = r["content"][0]["text"].as_str().expect("text content");
+                    (r["isError"] == true, serde_json::from_str(text).unwrap())
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn mcp_needs_a_live_token_not_a_cookie() {
+                    let (s, db) = on_mock(120).await;
+                    let (_, owner, _) = user(&s, &db).await;
+                    let made = make_token(&s, &owner, json!({"name": "m"})).await;
+                    let secret = made["secret"].as_str().unwrap();
+                    for bad in [None, Some("sr_team_live_nope"), Some("nope")] {
+                        let res = rpc(&s, bad, "tools/list", json!({})).await;
+                        assert_eq!(res.status_code(), 401, "{bad:?}");
+                        res.assert_json(&json!({"error": "invalid_token"}));
+                        assert_eq!(res.header("www-authenticate"), "Bearer");
+                    }
+                    let res = s
+                        .post("/mcp")
+                        .add_header("cookie", &owner)
+                        .add_header("accept", "application/json, text/event-stream")
+                        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+                        .await;
+                    assert_eq!(res.status_code(), 401, "a session alone is refused");
+                    let id = made["token"]["id"].as_str().unwrap();
+                    req(&s, Method::DELETE, &format!("/v1/api-tokens/{id}"), &owner).await;
+                    let res = rpc(&s, Some(secret), "tools/list", json!({})).await;
+                    assert_eq!(res.status_code(), 401, "revoked");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn initialize_lists_the_tools_and_they_match_rest() {
+                    let (s, db) = on_mock(120).await;
+                    let (owner, team_id, _) = owner_with_account(&s, &db).await;
+                    let default = default_set(&db, &team_id).await.to_string();
+                    let made = make_token(&s, &owner, json!({"name": "m"})).await;
+                    let secret = made["secret"].as_str().unwrap();
+
+                    let init = json!({
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": {"name": "test", "version": "1"},
+                    });
+                    let res = rpc(&s, Some(secret), "initialize", init).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let body = res.json::<Value>();
+                    assert_eq!(
+                        body["result"]["serverInfo"]["name"], "socialreins",
+                        "{body}"
+                    );
+                    let res = rpc(&s, Some(secret), "tools/list", json!({})).await;
+                    let body = res.json::<Value>();
+                    let mut names: Vec<&str> = body["result"]["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|t| t["name"].as_str().unwrap())
+                        .collect();
+                    names.sort_unstable();
+                    assert_eq!(
+                        names,
+                        [
+                            "create-post",
+                            "delete-post",
+                            "get-post",
+                            "list-posts",
+                            "list-social-accounts",
+                            "list-social-sets",
+                            "update-post",
+                        ]
+                    );
+
+                    let (err, p) = call(
+                        &s,
+                        secret,
+                        "create-post",
+                        post_body(Some(&default), "via mcp"),
+                    )
+                    .await;
+                    assert!(!err, "{p}");
+                    let id = p["id"].as_str().unwrap().to_owned();
+                    let rest = bearer(&s, Method::GET, &format!("/v1/posts/{id}"), secret).await;
+                    assert_eq!(rest.json::<Value>(), p);
+                    let (_, got) = call(&s, secret, "get-post", json!({"id": id})).await;
+                    assert_eq!(got, p);
+                    let (_, list) = call(&s, secret, "list-posts", json!({})).await;
+                    let rest = bearer(&s, Method::GET, "/v1/posts", secret).await;
+                    assert_eq!(list, rest.json::<Value>());
+                    let (_, sets) = call(&s, secret, "list-social-sets", json!({})).await;
+                    let rest = bearer(&s, Method::GET, "/v1/social-sets", secret).await;
+                    assert_eq!(sets, rest.json::<Value>());
+                    let (_, accounts) = call(&s, secret, "list-social-accounts", json!({})).await;
+                    let rest = bearer(&s, Method::GET, "/v1/connections", secret).await;
+                    assert_eq!(accounts, rest.json::<Value>());
+
+                    let mut edit = post_body(Some(&default), "edited");
+                    edit["id"] = json!(id);
+                    let (err, p) = call(&s, secret, "update-post", edit).await;
+                    assert!(!err && p["body"] == "edited", "{p}");
+
+                    // REST's 422s come back as isError with the same JSON.
+                    for (args, code) in [
+                        (post_body(Some(&default), ""), "empty_post"),
+                        (json!({"body": "no platform"}), "invalid_body"),
+                    ] {
+                        let (err, e) = call(&s, secret, "create-post", args).await;
+                        assert!(err);
+                        assert_eq!(e, json!({"error": code}));
+                    }
+                    let (err, e) = call(&s, secret, "list-posts", json!({"status": "nope"})).await;
+                    assert!(err);
+                    assert_eq!(e, json!({"error": "invalid_query"}));
+
+                    let (err, _) = call(&s, secret, "delete-post", json!({"id": id})).await;
+                    assert!(!err);
+                    let (err, e) = call(&s, secret, "get-post", json!({"id": id})).await;
+                    assert!(err);
+                    assert_eq!(e, json!({"error": "not_found"}));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn set_tokens_stay_in_their_set() {
+                    let (s, db) = on_mock(120).await;
+                    let (owner, team_id, _) = owner_with_account(&s, &db).await;
+                    let default = default_set(&db, &team_id).await.to_string();
+                    let clients = req(&s, Method::POST, "/v1/social-sets", &owner)
+                        .json(&json!({"name": "Clients"}))
+                        .await
+                        .json::<Value>()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let team = make_token(&s, &owner, json!({"name": "team"})).await;
+                    let team = team["secret"].as_str().unwrap();
+                    let set =
+                        make_token(&s, &owner, json!({"name": "cm", "social_set_id": clients}))
+                            .await;
+                    let set = set["secret"].as_str().unwrap();
+                    let (_, other) = call(
+                        &s,
+                        team,
+                        "create-post",
+                        post_body(Some(&default), "elsewhere"),
+                    )
+                    .await;
+                    let other = other["id"].as_str().unwrap();
+
+                    let (_, sets) = call(&s, set, "list-social-sets", json!({})).await;
+                    assert_eq!(ids(&sets), vec![clients.clone()]);
+                    let (err, e) = call(&s, set, "get-post", json!({"id": other})).await;
+                    assert!(err);
+                    assert_eq!(e, json!({"error": "not_found"}));
+                    let (err, e) =
+                        call(&s, set, "create-post", post_body(Some(&default), "no")).await;
+                    assert!(err);
+                    assert_eq!(e, json!({"error": "invalid_set"}));
+                    let (err, p) = call(&s, set, "create-post", post_body(None, "mine")).await;
+                    assert!(!err);
+                    assert_eq!(p["social_set_id"], clients.as_str());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn mcp_shares_the_token_limit_with_v1() {
+                    let (s, db) = on_mock(2).await;
+                    let (_, owner, _) = user(&s, &db).await;
+                    let made = make_token(&s, &owner, json!({"name": "m"})).await;
+                    let secret = made["secret"].as_str().unwrap();
+                    bearer(&s, Method::GET, "/v1/posts", secret)
+                        .await
+                        .assert_status_ok();
+                    let res = rpc(&s, Some(secret), "tools/list", json!({})).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let res = rpc(&s, Some(secret), "tools/list", json!({})).await;
+                    assert_eq!(res.status_code(), 429);
+                    res.assert_json(&json!({"error": "rate_limited"}));
+                }
+            }
+
             /// `Idempotency-Key` on token writes.
             mod idempotency {
                 use super::*;
