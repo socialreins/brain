@@ -50,6 +50,8 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | PATCH, DELETE | `/v1/team/members/{user_id}` | `{"role"}`: change a role (owner, admin); remove a member, or leave |
 | POST, GET | `/v1/team/invitations` | `{"email","role"}`: invite as `admin` or `member` (owner, admin); list pending |
 | DELETE | `/v1/team/invitations/{id}` | Withdraw an invitation (owner, admin) |
+| GET, PUT, DELETE | `/v1/team/webhook` | The team's outbound webhook (owner, admin): read it (no secret, `404` when none); `{"url"}` sets it (sign-in from the last 10 minutes), `201` with the `secret` once when new, `200` when changing the URL; delete it, `204` |
+| POST | `/v1/team/webhook/test` | Sends a signed `ping` now: `{"status"}` from the receiver, or `{"error"}` (`blocked_address`, `timeout`, `unreachable`) |
 | GET, POST | `/v1/invitations/{token}` | Public preview of an invitation; accept it as the signed-in invited email |
 | GET | `/v1/connections` | The current team's connected accounts with their `set_ids`; never tokens |
 | GET | `/v1/connections/providers` | Each provider with `configured`: Bluesky always, the others once their app id and secret are set |
@@ -166,6 +168,33 @@ a day per user (handles that do not resolve included), 10 a day per account (DID
 account across all teams, which a team already holding the account is exempt from. The DID
 document must list the handle (`alsoKnownAs`), or the answer is `invalid_handle`. Bluesky hosts must resolve to public addresses (`unsupported_pds`), and
 responses over 64 KiB are dropped.
+
+Webhooks: a team may set one public `https://` URL (at most 2000 characters, no credentials,
+not `localhost` or a private address). Each post target fires `post.target.published`,
+`post.target.failed` and `post.target.deleted` at most once each, so a post that went out to
+some accounts and not others shows as one event per account. Every delivery is a `POST` of
+JSON with these headers: `SocialReins-Event` (the type), `SocialReins-Delivery` (the delivery
+id, the same on retries) and `SocialReins-Signature: t=<unix seconds>,v1=<hex>`. The body:
+
+```json
+{"id": "<delivery id>", "type": "post.target.published", "created_at": "<time>",
+ "data": {"post_id": "...", "group_id": null, "target_id": "...", "social_account_id": "...",
+          "platform": "bluesky", "status": "published", "remote_url": "https://...", "error": null}}
+```
+
+A 2xx answer within 10 seconds counts as delivered; redirects are not followed and the body is
+not read. Otherwise brain tries again after 1 minute, 5 minutes, 30 minutes, 2, 6, 12 and 24
+hours, then gives up. Brain only connects to public addresses, checked when the name resolves.
+`group_id` stays `null` until posts have groups. To verify a delivery, compute HMAC-SHA256 with
+the whole secret (`whsec_...`) as the key over `<t>.<raw body>` and compare it with `v1`;
+refuse a `t` more than 5 minutes old:
+
+```python
+import hashlib, hmac, time
+t, v1 = (p.split("=", 1)[1] for p in header.split(","))
+mac = hmac.new(secret.encode(), f"{t}.".encode() + raw_body, hashlib.sha256).hexdigest()
+assert hmac.compare_digest(mac, v1) and abs(time.time() - int(t)) < 300
+```
 
 ## Local development
 

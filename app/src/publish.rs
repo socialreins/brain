@@ -1,7 +1,8 @@
 //! Publishing: claim due posts, fan each out to its set's accounts, publish every target once,
 //! settle the post; and take published posts down. Every step is a conditional update, so two
 //! instances (or a tick and "publish now") never send a post twice. A publish is never retried:
-//! a retry could post twice.
+//! a retry could post twice. Each target status change queues its webhook event in the same
+//! statement (`webhooks::with_event`).
 use std::{sync::LazyLock, time::Duration};
 
 use tokio::sync::Semaphore;
@@ -21,6 +22,7 @@ use crate::{
     },
     rate_limit::reserve_in,
     state::AppState,
+    webhooks::with_event,
 };
 
 /// One publisher per platform.
@@ -257,19 +259,22 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
         // shortcut: Bluesky is the only publisher; use the platform's `url` once there are more.
         let url = bluesky::post_url(&remote);
         let stmt = sql(
-            "UPDATE post_targets SET status = 'published', remote_url = $2, error = NULL, \
-             published_at = COALESCE(published_at, now()), updated_at = now() \
-             WHERE id = $1 AND status = 'publishing'",
+            &with_event(
+                "UPDATE post_targets SET status = 'published', remote_url = $2, error = NULL, \
+                 published_at = COALESCE(published_at, now()), updated_at = now() \
+                 WHERE id = $1 AND status = 'publishing'",
+            ),
             vec![id.into(), url.into()],
         );
         db.execute_raw(stmt).await?;
         posts.push(post);
     }
     let stmt = sql(
-        "UPDATE post_targets SET status = 'failed', error = $1, updated_at = now() \
-         WHERE status = 'publishing' AND remote_id IS NULL \
-         AND updated_at < now() - make_interval(mins => $2) \
-         RETURNING post_id",
+        &with_event(
+            "UPDATE post_targets SET status = 'failed', error = $1, updated_at = now() \
+             WHERE status = 'publishing' AND remote_id IS NULL \
+             AND updated_at < now() - make_interval(mins => $2)",
+        ),
         vec![STUCK.into(), (STUCK_MINUTES as i32).into()],
     );
     posts.extend(ids(db, stmt, "post_id").await?);
@@ -388,8 +393,10 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
 
 async fn fail_target(db: &DatabaseConnection, id: Uuid, msg: &str) -> Result<(), DbErr> {
     let stmt = sql(
-        "UPDATE post_targets SET status = 'failed', error = $2, updated_at = now() \
-         WHERE id = $1 AND status = 'publishing'",
+        &with_event(
+            "UPDATE post_targets SET status = 'failed', error = $2, updated_at = now() \
+             WHERE id = $1 AND status = 'publishing'",
+        ),
         vec![id.into(), msg.into()],
     );
     db.execute_raw(stmt).await.map(|_| ())
@@ -453,8 +460,10 @@ async fn publish_target(app: &AppState, post: &posts::Model, id: Uuid) -> Result
     db.execute_raw(stmt).await?;
     let url = publisher.url(&account, &remote_id);
     let stmt = sql(
-        "UPDATE post_targets SET status = 'published', remote_url = $2, error = NULL, \
-         published_at = now(), updated_at = now() WHERE id = $1 AND status = 'publishing'",
+        &with_event(
+            "UPDATE post_targets SET status = 'published', remote_url = $2, error = NULL, \
+             published_at = now(), updated_at = now() WHERE id = $1 AND status = 'publishing'",
+        ),
         vec![id.into(), url.into()],
     );
     db.execute_raw(stmt).await.map(|_| ())
@@ -559,8 +568,10 @@ pub async fn takedown(app: &AppState, post: &posts::Model) -> Result<Vec<String>
         match done {
             Ok(Ok(())) => {
                 let stmt = sql(
-                    "UPDATE post_targets SET status = 'deleted', updated_at = now() \
-                     WHERE id = $1 AND status = 'published'",
+                    &with_event(
+                        "UPDATE post_targets SET status = 'deleted', updated_at = now() \
+                         WHERE id = $1 AND status = 'published'",
+                    ),
                     vec![t.id.into()],
                 );
                 db.execute_raw(stmt).await?;

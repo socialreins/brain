@@ -42,6 +42,7 @@ pub struct AppState {
     pub bluesky: Bluesky,
     pub providers: Vec<(&'static str, bool)>,
     pub google: Option<crate::connectors::google::Google>,
+    pub webhooks: crate::webhooks::Webhooks,
 }
 
 impl AppState {
@@ -68,6 +69,7 @@ impl AppState {
             bluesky: config.bluesky.clone(),
             providers: config.providers.clone(),
             google: config.google.clone(),
+            webhooks: crate::webhooks::Webhooks::default(),
         }
     }
 }

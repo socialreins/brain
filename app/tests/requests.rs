@@ -6085,5 +6085,443 @@ mod teams {
                 }
             }
         }
+
+        mod webhooks_api {
+            use super::*;
+            use axum::http::HeaderMap;
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+            use socialreins_brain::webhooks;
+
+            /// Every request the receiver took: (path, headers, body).
+            static HITS: std::sync::Mutex<Vec<(String, HeaderMap, String)>> =
+                std::sync::Mutex::new(Vec::new());
+
+            /// A receiver on 127.0.0.1: `/fail` answers 500, anything else 204.
+            async fn receiver() -> String {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let hit = |uri: axum::http::Uri, headers: HeaderMap, body: String| async move {
+                    let path = uri.path().to_owned();
+                    HITS.lock().unwrap().push((path.clone(), headers, body));
+                    if path == "/fail" {
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+                };
+                let app = Router::new().fallback(hit);
+                tokio::spawn(async move { axum::serve(listener, app).await });
+                base
+            }
+
+            /// A brain on the Bluesky mock whose webhooks may reach 127.0.0.1 (tests only).
+            async fn on_mock() -> (TestServer, DatabaseConnection, AppState) {
+                let base = mock_bluesky().await;
+                let mut config = Config::from_env().expect("test config");
+                config.trust_proxy = true;
+                config.bluesky.appview = base.clone();
+                config.bluesky.plc = base;
+                config.bluesky.allow_insecure_pds = true;
+                let db = socialreins_brain::connect(&config)
+                    .await
+                    .expect("database reachable");
+                let mut state = AppState::new(db.clone(), &config);
+                state.webhooks.allow_private = true;
+                let app = controllers::router(state.clone(), &config);
+                (TestServer::new(app).unwrap(), db, state)
+            }
+
+            async fn put(s: &TestServer, cookie: &str, url: &str) -> axum_test::TestResponse {
+                req(s, Method::PUT, "/v1/team/webhook", cookie)
+                    .json(&json!({ "url": url }))
+                    .await
+            }
+
+            /// (event, payload, attempts, delivered, last_status, last_error) of a team's
+            /// deliveries, oldest first.
+            async fn deliveries(
+                db: &DatabaseConnection,
+                team_id: &str,
+            ) -> Vec<(String, Value, i32, bool, Option<i32>, Option<String>)> {
+                let stmt = Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT event, payload, attempts, delivered_at IS NOT NULL AS done, \
+                     last_status, last_error FROM webhook_deliveries \
+                     WHERE team_id = $1 ORDER BY created_at, event",
+                    [team_id.parse::<uuid::Uuid>().unwrap().into()],
+                );
+                let rows = db.query_all_raw(stmt).await.unwrap();
+                rows.iter()
+                    .map(|r| {
+                        (
+                            r.try_get("", "event").unwrap(),
+                            r.try_get("", "payload").unwrap(),
+                            r.try_get("", "attempts").unwrap(),
+                            r.try_get("", "done").unwrap(),
+                            r.try_get("", "last_status").unwrap(),
+                            r.try_get("", "last_error").unwrap(),
+                        )
+                    })
+                    .collect()
+            }
+
+            async fn exec(db: &DatabaseConnection, sql: &str, team_id: &str) {
+                let stmt = Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    sql,
+                    [team_id.parse::<uuid::Uuid>().unwrap().into()],
+                );
+                db.execute_raw(stmt).await.unwrap();
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn managers_set_the_webhook_and_see_the_secret_once() {
+                let (s, db, _) = on_mock().await;
+                let mut strict = Config::from_env().expect("test config");
+                strict.trust_proxy = true;
+                let prod = TestServer::new(controllers::router(
+                    AppState::new(db.clone(), &strict),
+                    &strict,
+                ))
+                .unwrap();
+                let (_, owner, _) = user(&s, &db).await;
+                let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+                let (member, _) = joined(&s, &db, &team_id, "member").await;
+
+                let res = s.get("/v1/team/webhook").add_header("cookie", &owner).await;
+                assert_eq!(res.status_code(), 404);
+
+                // Production refuses plain http, private literals and localhost.
+                for bad in [
+                    "http://example.com/hook",
+                    "https://10.0.0.1/hook",
+                    "https://127.0.0.1/hook",
+                    "https://[::1]/hook",
+                    "https://localhost/hook",
+                    "https://user:pw@example.com/hook",
+                    "not a url",
+                ] {
+                    let res = put(&prod, &owner, bad).await;
+                    assert_eq!(res.status_code(), 422, "{bad}");
+                    res.assert_json(&json!({"error": "invalid_url"}));
+                }
+
+                let res = put(&prod, &owner, "https://hooks.example.com/a").await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let made = res.json::<Value>();
+                let secret = made["secret"].as_str().unwrap().to_owned();
+                assert!(
+                    secret.starts_with("whsec_") && secret.len() == 54,
+                    "{secret}"
+                );
+                assert_eq!(made["webhook"]["url"], "https://hooks.example.com/a");
+
+                let res = s.get("/v1/team/webhook").add_header("cookie", &owner).await;
+                res.assert_status_ok();
+                assert_eq!(res.json::<Value>()["url"], "https://hooks.example.com/a");
+                assert!(!res.text().contains("secret") && !res.text().contains(&secret[6..]));
+
+                // A new URL keeps the secret and does not show it.
+                let res = put(&prod, &owner, "https://hooks.example.com/b").await;
+                assert_eq!(res.status_code(), 200);
+                assert!(!res.text().contains("secret"));
+                let stmt = Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT secret FROM team_webhooks WHERE team_id = $1",
+                    [team_id.parse::<uuid::Uuid>().unwrap().into()],
+                );
+                let sealed: Vec<u8> = db
+                    .query_one_raw(stmt)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .try_get("", "secret")
+                    .unwrap();
+                assert_eq!(cipher().decrypt(&sealed).unwrap(), secret.as_bytes());
+
+                // Members may not touch it.
+                let res = s
+                    .get("/v1/team/webhook")
+                    .add_header("cookie", &member)
+                    .await;
+                assert_eq!(res.status_code(), 403);
+                for (m, path) in [
+                    (Method::PUT, "/v1/team/webhook"),
+                    (Method::DELETE, "/v1/team/webhook"),
+                    (Method::POST, "/v1/team/webhook/test"),
+                ] {
+                    let res = req(&s, m, path, &member)
+                        .json(&json!({"url": "https://example.com"}))
+                        .await;
+                    assert_eq!(res.status_code(), 403, "{path}");
+                    res.assert_json(&json!({"error": "forbidden"}));
+                }
+
+                // API tokens get the session-only answer.
+                let token = req(&s, Method::POST, "/v1/api-tokens", &owner)
+                    .json(&json!({"name": "t"}))
+                    .await
+                    .json::<Value>()["secret"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let res = s
+                    .get("/v1/team/webhook")
+                    .add_header("authorization", format!("Bearer {token}"))
+                    .await;
+                assert_eq!(res.status_code(), 401);
+                let res = s
+                    .put("/v1/team/webhook")
+                    .add_header("origin", WEB)
+                    .add_header("authorization", format!("Bearer {token}"))
+                    .json(&json!({"url": "https://example.com"}))
+                    .await;
+                assert_eq!(res.status_code(), 401);
+
+                // Setting it needs a fresh sign-in.
+                let (admin, _) = joined(&s, &db, &team_id, "admin").await;
+                let row = sessions::ActiveModel {
+                    token_hash: Set(token::hash(admin.trim_start_matches("sr_session="))),
+                    created_at: Set((Utc::now() - Duration::minutes(11)).fixed_offset()),
+                    ..Default::default()
+                };
+                sessions::Entity::update(row).exec(&db).await.unwrap();
+                let res = put(&s, &admin, "https://example.com/c").await;
+                assert_eq!(res.status_code(), 403);
+                res.assert_json(&json!({"error": "reauth_required"}));
+                let res = s.get("/v1/team/webhook").add_header("cookie", &admin).await;
+                res.assert_status_ok();
+
+                let res = s
+                    .delete("/v1/team/webhook")
+                    .add_header("cookie", &owner)
+                    .await;
+                res.assert_json(&json!({"error": "forbidden_origin"}));
+                let res = req(&s, Method::DELETE, "/v1/team/webhook", &admin).await;
+                assert_eq!(res.status_code(), 204);
+                let res = req(&s, Method::DELETE, "/v1/team/webhook", &owner).await;
+                assert_eq!(res.status_code(), 404);
+                let res = req(&s, Method::POST, "/v1/team/webhook/test", &owner).await;
+                assert_eq!(res.status_code(), 404);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn target_events_fire_once_signed_and_retry() {
+                let (s, db, state) = on_mock().await;
+                let hook = receiver().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let new_post = |body: &str| {
+                    let body = json!({"social_set_id": set, "platform": "bluesky",
+                        "body": body, "media": [], "scheduled_at": null});
+                    let (s, cookie) = (&s, cookie.clone());
+                    async move {
+                        let res = req(s, Method::POST, "/v1/posts", &cookie).json(&body).await;
+                        res.json::<Value>()["id"].as_str().unwrap().to_owned()
+                    }
+                };
+                let publish_now = |id: String| {
+                    let (s, cookie) = (&s, cookie.clone());
+                    async move {
+                        let path = format!("/v1/posts/{id}/publish");
+                        assert_eq!(
+                            req(s, Method::POST, &path, &cookie).await.status_code(),
+                            202
+                        );
+                        for _ in 0..100 {
+                            let p = s
+                                .get(&format!("/v1/posts/{id}"))
+                                .add_header("cookie", &cookie)
+                                .await
+                                .json::<Value>();
+                            if p["status"] != "queued" {
+                                return p;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        panic!("post {id} stayed queued");
+                    }
+                };
+
+                // No webhook: nothing is queued.
+                let quiet = new_post("before the webhook").await;
+                publish_now(quiet).await;
+                assert!(deliveries(&db, &team_id).await.is_empty());
+
+                let res = put(&s, &cookie, &format!("{hook}/hook")).await;
+                assert_eq!(res.status_code(), 201);
+                let secret = res.json::<Value>()["secret"].as_str().unwrap().to_owned();
+
+                let ok = new_post("hello").await;
+                let p = publish_now(ok.clone()).await;
+                assert_eq!(p["status"], "published");
+                let target = p["targets"][0]["id"].as_str().unwrap().to_owned();
+                let bad = new_post("REJECT me").await;
+                assert_eq!(publish_now(bad.clone()).await["status"], "failed");
+                let path = format!("/v1/posts/{ok}");
+                req(&s, Method::DELETE, &path, &cookie)
+                    .await
+                    .assert_status_ok();
+                req(&s, Method::DELETE, &path, &cookie)
+                    .await
+                    .assert_status_ok();
+                // The same change again (a second recovery, say) queues nothing new.
+                let again = Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    webhooks::with_event("UPDATE post_targets SET status = status WHERE id = $1"),
+                    [target.parse::<uuid::Uuid>().unwrap().into()],
+                );
+                db.execute_raw(again).await.unwrap();
+
+                let mut got = deliveries(&db, &team_id).await;
+                got.sort_by(|a, b| a.0.cmp(&b.0));
+                let events: Vec<&str> = got.iter().map(|d| d.0.as_str()).collect();
+                assert_eq!(
+                    events,
+                    [
+                        "post.target.deleted",
+                        "post.target.failed",
+                        "post.target.published"
+                    ]
+                );
+                let published = &got[2].1;
+                assert_eq!(published["type"], "post.target.published");
+                let data = &published["data"];
+                assert_eq!(data["post_id"], ok.as_str());
+                assert_eq!(data["target_id"], target.as_str());
+                assert_eq!(data["group_id"], Value::Null);
+                assert_eq!(data["platform"], "bluesky");
+                assert_eq!(data["status"], "published");
+                assert!(data["remote_url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("https://bsky.app/"));
+                assert!(data["social_account_id"].is_string());
+                assert_eq!(got[1].1["data"]["post_id"], bad.as_str());
+                assert!(got[1].1["data"]["error"].is_string());
+
+                // The tick sends each once, signed.
+                HITS.lock().unwrap().clear();
+                webhooks::tick(&state).await.unwrap();
+                let hits = HITS.lock().unwrap().clone();
+                assert_eq!(hits.len(), 3);
+                for (path, headers, body) in &hits {
+                    assert_eq!(path, "/hook");
+                    let sig = headers["socialreins-signature"].to_str().unwrap();
+                    let t: i64 = sig[2..sig.find(',').unwrap()].parse().unwrap();
+                    assert!((Utc::now().timestamp() - t).abs() < 60);
+                    assert_eq!(sig, socialreins_core::webhook::signature(&secret, t, body));
+                    let payload: Value = serde_json::from_str(body).unwrap();
+                    assert_eq!(
+                        headers["socialreins-event"],
+                        payload["type"].as_str().unwrap()
+                    );
+                    assert_eq!(
+                        headers["socialreins-delivery"],
+                        payload["id"].as_str().unwrap()
+                    );
+                    assert_eq!(headers["content-type"], "application/json");
+                }
+                assert!(deliveries(&db, &team_id)
+                    .await
+                    .iter()
+                    .all(|d| d.3 && d.2 == 1));
+                webhooks::tick(&state).await.unwrap();
+                assert_eq!(
+                    HITS.lock().unwrap().len(),
+                    3,
+                    "delivered rows are not resent"
+                );
+
+                // Ping.
+                let res = req(&s, Method::POST, "/v1/team/webhook/test", &cookie).await;
+                res.assert_status_ok();
+                res.assert_json(&json!({"status": 204, "error": null}));
+                let last = HITS.lock().unwrap().last().cloned().unwrap();
+                assert_eq!(last.1["socialreins-event"], "ping");
+
+                // A failing receiver: retried after a minute, then given up after 8 tries.
+                put(&s, &cookie, &format!("{hook}/fail"))
+                    .await
+                    .assert_status_ok();
+                exec(
+                    &db,
+                    "UPDATE webhook_deliveries SET delivered_at = NULL, attempts = 0 \
+                     WHERE team_id = $1 AND event = 'post.target.failed'",
+                    &team_id,
+                )
+                .await;
+                webhooks::tick(&state).await.unwrap();
+                let d = deliveries(&db, &team_id).await;
+                let failed = d.iter().find(|d| d.0 == "post.target.failed").unwrap();
+                assert_eq!((failed.2, failed.3, failed.4), (1, false, Some(500)));
+                assert_eq!(failed.5.as_deref(), Some("http_status"));
+                let stmt = Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT (next_attempt_at - now()) BETWEEN interval '50 seconds' \
+                     AND interval '61 seconds' AS ok FROM webhook_deliveries \
+                     WHERE team_id = $1 AND event = 'post.target.failed'",
+                    [team_id.parse::<uuid::Uuid>().unwrap().into()],
+                );
+                let ok_wait: bool = db
+                    .query_one_raw(stmt)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .try_get("", "ok")
+                    .unwrap();
+                assert!(ok_wait, "first retry waits a minute");
+                let before = HITS.lock().unwrap().len();
+                webhooks::tick(&state).await.unwrap();
+                assert_eq!(HITS.lock().unwrap().len(), before, "not due yet");
+                exec(
+                    &db,
+                    "UPDATE webhook_deliveries SET attempts = 7, next_attempt_at = now() \
+                     WHERE team_id = $1 AND event = 'post.target.failed'",
+                    &team_id,
+                )
+                .await;
+                webhooks::tick(&state).await.unwrap();
+                exec(
+                    &db,
+                    "UPDATE webhook_deliveries SET next_attempt_at = now() WHERE team_id = $1",
+                    &team_id,
+                )
+                .await;
+                webhooks::tick(&state).await.unwrap();
+                assert_eq!(HITS.lock().unwrap().len(), before + 1, "gave up after 8");
+                let d = deliveries(&db, &team_id).await;
+                let failed = d.iter().find(|d| d.0 == "post.target.failed").unwrap();
+                assert_eq!((failed.2, failed.3, failed.4), (8, false, Some(500)));
+
+                // Old finished rows are purged; deleting the webhook drops the rest.
+                exec(
+                    &db,
+                    "UPDATE webhook_deliveries SET created_at = now() - interval '31 days' \
+                     WHERE team_id = $1 AND event <> 'post.target.deleted'",
+                    &team_id,
+                )
+                .await;
+                exec(
+                    &db,
+                    "UPDATE webhook_deliveries SET delivered_at = NULL \
+                     WHERE team_id = $1 AND event = 'post.target.deleted'",
+                    &team_id,
+                )
+                .await;
+                db.execute_unprepared(&webhooks::purge_sql()).await.unwrap();
+                let left: Vec<String> = deliveries(&db, &team_id)
+                    .await
+                    .into_iter()
+                    .map(|d| d.0)
+                    .collect();
+                assert_eq!(left, ["post.target.deleted"]);
+                let res = req(&s, Method::DELETE, "/v1/team/webhook", &cookie).await;
+                assert_eq!(res.status_code(), 204);
+                assert!(deliveries(&db, &team_id).await.is_empty());
+            }
+        }
     }
 }
