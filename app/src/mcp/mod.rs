@@ -34,10 +34,10 @@ use crate::{
         connections,
         lists::{self, AddPost, ListInput, Order},
         posts,
-        posts::{PostInput, PostQuery},
+        posts::{PostGroupInput, PostInput, PostQuery},
         social_sets::{self, ListQuery},
         waitlist::error,
-        MAX_BODY_BYTES,
+        MAX_GROUP_BODY_BYTES,
     },
     state::AppState,
 };
@@ -96,6 +96,7 @@ fn specs() -> Vec<(&'static str, &'static str, Value, bool)> {
         ("list-posts", "The team's posts by scheduled_at, filtered by set, status and a from/to window on scheduled_at. Same as GET /v1/posts.", schema::<PostQuery>(), true),
         ("get-post", "One post with its targets. Same as GET /v1/posts/{id}.", schema::<PostId>(), true),
         ("create-post", "Creates a post: scheduled with scheduled_at, else draft. Same as POST /v1/posts.", schema::<PostInput>(), false),
+        ("create-post-group", "Creates one post per platform of a set (by default every platform with a connected account), with optional per-platform body and media overrides, tied by a group_id; any invalid post creates nothing. Same as POST /v1/post-groups.", schema::<PostGroupInput>(), false),
         ("update-post", "Replaces a draft or scheduled post. Same as PUT /v1/posts/{id}.", schema::<UpdatePost>(), false),
         ("delete-post", "Deletes a draft or scheduled post, or takes a published one down. Same as DELETE /v1/posts/{id}.", schema::<PostId>(), false),
         ("list-lists", "The team's post lists (ordered groups of posts, such as a series), without their posts. Same as GET /v1/lists.", schema::<NoArgs>(), true),
@@ -130,7 +131,7 @@ pub struct McpServer {
 }
 
 /// The service mounted at `/mcp` (behind `auth::layer`): stateless, JSON responses, and the
-/// `/v1` body limit.
+/// largest `/v1` body limit (a post group's); each tool's service fn re-validates its input.
 pub fn service(app: &AppState) -> StreamableHttpService<McpServer, NeverSessionManager> {
     let server = McpServer { app: app.clone() };
     let config = StreamableHttpServerConfig::default()
@@ -138,7 +139,7 @@ pub fn service(app: &AppState) -> StreamableHttpService<McpServer, NeverSessionM
         .disable_allowed_hosts()
         .with_legacy_session_mode(false)
         .with_json_response(true)
-        .with_max_request_body_bytes(MAX_BODY_BYTES);
+        .with_max_request_body_bytes(MAX_GROUP_BODY_BYTES);
     StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(NeverSessionManager::default()),
@@ -173,6 +174,10 @@ async fn run(app: &AppState, a: &Actor, name: &str, v: Value) -> Option<Response
         },
         "create-post" => match args(v) {
             Some(p) => posts::create_post(app, a, p).await,
+            None => invalid("invalid_body"),
+        },
+        "create-post-group" => match args(v) {
+            Some(g) => posts::create_post_group(app, a, g).await,
             None => invalid("invalid_body"),
         },
         "update-post" => match args::<UpdatePost>(v) {

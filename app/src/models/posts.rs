@@ -25,6 +25,8 @@ pub struct Model {
     /// The post holds a hit of its team's daily publish cap.
     pub quota_reserved: bool,
     pub created_by: Option<Uuid>,
+    /// Shared by the posts of one `POST /v1/post-groups` call; `None` for a single post.
+    pub group_id: Option<Uuid>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }

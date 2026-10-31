@@ -3787,6 +3787,167 @@ mod teams {
 
             #[tokio::test]
             #[serial]
+            async fn post_groups_make_one_post_per_platform_or_nothing() {
+                let (s, db, _) = on_mock().await;
+                let (owner, team_id, account) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let group = |body: Value| {
+                    let (s, owner) = (&s, owner.clone());
+                    async move {
+                        req(s, Method::POST, "/v1/post-groups", &owner)
+                            .json(&body)
+                            .await
+                    }
+                };
+                let count = || {
+                    let db = &db;
+                    async move { posts::Entity::find().count(db).await.unwrap() }
+                };
+
+                // No platforms: the set's connected ones, with each override applied.
+                let list = req(&s, Method::POST, "/v1/lists", &owner)
+                    .json(&json!({"name": "Series"}))
+                    .await
+                    .json::<Value>()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let res = group(json!({"social_set_id": set, "body": "everywhere",
+                    "list_id": list,
+                    "overrides": {"bluesky": {"body": "on bluesky",
+                        "media": ["https://a.example/1.png"]}}}))
+                .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let made = res.json::<Value>();
+                let gid = made["group_id"].as_str().unwrap().to_owned();
+                let ps = made["posts"].as_array().unwrap();
+                assert_eq!(ps.len(), 1);
+                assert_eq!(ps[0]["platform"], "bluesky");
+                assert_eq!(ps[0]["body"], "on bluesky");
+                assert_eq!(ps[0]["media"], json!(["https://a.example/1.png"]));
+                assert_eq!(ps[0]["group_id"], gid.as_str());
+                assert_eq!(ps[0]["status"], "draft");
+                assert_eq!(ps[0]["lists"][0]["position"], 1);
+
+                // Without an override every post takes the shared body; duplicates collapse.
+                let res = group(
+                    json!({"social_set_id": set, "platforms": ["bluesky", "bluesky"],
+                    "body": "shared"}),
+                )
+                .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let other = res.json::<Value>();
+                assert_eq!(other["posts"].as_array().unwrap().len(), 1);
+                assert_eq!(other["posts"][0]["body"], "shared");
+                assert_ne!(other["group_id"], made["group_id"]);
+
+                // `?group_id=` lists exactly the group's posts; single posts have none.
+                let single = create(&s, &owner, input(&set, "single", None)).await;
+                assert_eq!(single.json::<Value>()["group_id"], Value::Null);
+                let res = s
+                    .get(&format!("/v1/posts?group_id={gid}"))
+                    .add_header("cookie", &owner)
+                    .await;
+                let listed = res.json::<Vec<Value>>();
+                assert_eq!(listed.len(), 1);
+                assert_eq!(listed[0], ps[0]);
+
+                // One invalid post creates nothing and names its platform.
+                let before = count().await;
+                for (body, code, platform) in [
+                    (
+                        json!({"social_set_id": set, "platforms": ["bluesky", "x"],
+                            "body": "hi"}),
+                        "unsupported_platform",
+                        "x",
+                    ),
+                    (
+                        json!({"social_set_id": set, "body": "hi",
+                            "overrides": {"bluesky": {"body": "a".repeat(301)}}}),
+                        "too_long",
+                        "bluesky",
+                    ),
+                ] {
+                    let res = group(body).await;
+                    assert_eq!(res.status_code(), 422, "{code}");
+                    res.assert_json(&json!({"error": code, "platform": platform}));
+                }
+                // An unknown list fails the post, also named.
+                let res = group(json!({"social_set_id": set, "body": "hi",
+                    "list_id": uuid::Uuid::now_v7()}))
+                .await;
+                assert_eq!(res.status_code(), 404);
+                res.assert_json(&json!({"error": "not_found", "platform": "bluesky"}));
+                let res = group(json!({"social_set_id": set, "body": "hi",
+                    "overrides": {"x": {"body": "elsewhere"}}}))
+                .await;
+                assert_eq!(res.status_code(), 422);
+                res.assert_json(&json!({"error": "invalid_override"}));
+                let res = group(json!({"body": "hi"})).await;
+                res.assert_json(&json!({"error": "invalid_set"}));
+                assert_eq!(count().await, before);
+
+                // An account on a platform brain cannot publish to stays out of the default;
+                // naming that platform still fails.
+                let x = uuid::Uuid::now_v7();
+                let copy = sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DbBackend::Postgres,
+                    "INSERT INTO social_accounts (id, team_id, provider, external_id, \
+                     access_token) SELECT $1, team_id, 'x', external_id, access_token \
+                     FROM social_accounts WHERE id = $2",
+                    [x.into(), account.parse::<uuid::Uuid>().unwrap().into()],
+                );
+                sea_orm::ConnectionTrait::execute_raw(&db, copy)
+                    .await
+                    .unwrap();
+                social_account_social_set::Entity::insert(social_account_social_set::ActiveModel {
+                    social_account_id: Set(x),
+                    social_set_id: Set(set.parse().unwrap()),
+                })
+                .exec_without_returning(&db)
+                .await
+                .unwrap();
+                let res = group(json!({"social_set_id": set, "body": "hi"})).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let platforms: Vec<Value> = res.json::<Value>()["posts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| p["platform"].clone())
+                    .collect();
+                assert_eq!(platforms, [json!("bluesky")]);
+                let res =
+                    group(json!({"social_set_id": set, "platforms": ["x"], "body": "hi"})).await;
+                res.assert_json(&json!({"error": "unsupported_platform", "platform": "x"}));
+                assert_eq!(count().await, before + 1);
+
+                // A group body may run well past the 4 KiB `/v1` limit.
+                let pad = " ".repeat(10 * 1024);
+                let big = format!(r#"{{"social_set_id":"{set}","body":"big"{pad}}}"#);
+                assert!(big.len() > 10 * 1024);
+                let res = req(&s, Method::POST, "/v1/post-groups", &owner)
+                    .content_type("application/json")
+                    .bytes(big.into())
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+
+                // A set without accounts has no default.
+                let empty = req(&s, Method::POST, "/v1/social-sets", &owner)
+                    .json(&json!({"name": "Empty"}))
+                    .await
+                    .json::<Value>()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let res = group(json!({"social_set_id": empty, "body": "hi"})).await;
+                res.assert_json(&json!({"error": "no_accounts"}));
+
+                let doc = s.get("/openapi.json").await.json::<Value>();
+                assert!(doc["paths"]["/post-groups"]["post"].is_object());
+            }
+
+            #[tokio::test]
+            #[serial]
             async fn publish_now_posts_with_link_facets_and_takedown_deletes() {
                 let (s, db, _) = on_mock().await;
                 let (cookie, team_id, _) = owner_with_account(&s, &db).await;
@@ -5499,6 +5660,78 @@ mod teams {
             }
 
             /// `/mcp`: the same tokens, scope and code as `/v1`.
+            #[tokio::test]
+            #[serial]
+            async fn post_groups_take_tokens_keys_and_mcp() {
+                let (s, db) = on_mock(120).await;
+                let (owner, team_id, _) = owner_with_account(&s, &db).await;
+                let default = default_set(&db, &team_id).await.to_string();
+                let clients = req(&s, Method::POST, "/v1/social-sets", &owner)
+                    .json(&json!({"name": "Clients"}))
+                    .await
+                    .json::<Value>()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let set = make_token(&s, &owner, json!({"name": "cm", "social_set_id": clients}))
+                    .await["secret"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let team = make_token(&s, &owner, json!({"name": "team"})).await["secret"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+
+                // A set token writes only to its set, which has no accounts here.
+                let res = bearer(&s, Method::POST, "/v1/post-groups", &set)
+                    .json(&json!({"social_set_id": default, "body": "hi"}))
+                    .await;
+                res.assert_json(&json!({"error": "invalid_set"}));
+                let res = bearer(&s, Method::POST, "/v1/post-groups", &set)
+                    .json(&json!({"platforms": ["bluesky"], "body": "mine"}))
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                assert_eq!(
+                    res.json::<Value>()["posts"][0]["social_set_id"],
+                    clients.as_str()
+                );
+
+                // An Idempotency-Key replays the same group.
+                let body = json!({"social_set_id": default, "body": "once"});
+                let send = || {
+                    bearer(&s, Method::POST, "/v1/post-groups", &team)
+                        .add_header("idempotency-key", "group-1")
+                        .json(&body)
+                };
+                let first = send().await;
+                assert_eq!(first.status_code(), 201, "{}", first.text());
+                let again = send().await;
+                assert_eq!(again.header("idempotent-replayed"), "true");
+                assert_eq!(again.text(), first.text());
+                let gid = first.json::<Value>()["group_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let path = format!("/v1/posts?group_id={gid}");
+                let rest = bearer(&s, Method::GET, &path, &team).await.json::<Value>();
+                assert_eq!(rest.as_array().unwrap().len(), 1);
+
+                // MCP: the same service, and list-posts takes the group filter.
+                let args = json!({"social_set_id": default, "body": "via mcp"});
+                let (err, g) = mcp::call(&s, &team, "create-post-group", args).await;
+                assert!(!err, "{g}");
+                assert_eq!(g["posts"][0]["platform"], "bluesky");
+                let gid = g["group_id"].as_str().unwrap();
+                let (_, list) = mcp::call(&s, &team, "list-posts", json!({"group_id": gid})).await;
+                assert_eq!(list, g["posts"]);
+                let args = json!({"social_set_id": default, "body": "x",
+                    "overrides": {"x": {}}});
+                let (err, e) = mcp::call(&s, &team, "create-post-group", args).await;
+                assert!(err);
+                assert_eq!(e, json!({"error": "invalid_override"}));
+            }
+
             mod mcp {
                 use super::*;
                 use axum_test::TestResponse;
@@ -5598,6 +5831,7 @@ mod teams {
                             "add-post-to-list",
                             "create-list",
                             "create-post",
+                            "create-post-group",
                             "delete-post",
                             "get-list",
                             "get-post",
@@ -5744,17 +5978,33 @@ mod teams {
                     assert_eq!(e, json!({"error": "not_found"}));
                 }
 
-                /// Over `MAX_BODY_BYTES` is 413, with a length header or chunked without one.
+                /// Over 64 KiB is 413, with a length header or chunked without one; a post group
+                /// well past 4 KiB goes through.
                 #[tokio::test]
                 #[serial]
-                async fn mcp_bodies_over_4_kib_are_refused() {
+                async fn mcp_bodies_over_64_kib_are_refused() {
                     use std::io::{Read, Write};
                     let (s, db) = on_mock(120).await;
                     let (_, owner, _) = user(&s, &db).await;
                     let made = make_token(&s, &owner, json!({"name": "m"})).await;
                     let secret = made["secret"].as_str().unwrap().to_owned();
-                    let big =
-                        json!({"name": "create-post", "arguments": {"body": "a".repeat(5000)}});
+                    let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let media = |n: usize| -> Vec<String> {
+                        (0..4)
+                            .map(|i| format!("https://a.example/{n}{i}/{}", "p".repeat(2000)))
+                            .collect()
+                    };
+                    let args = json!({"social_set_id": set, "platforms": ["bluesky"],
+                        "body": "\u{1F600}".repeat(300), "media": media(0),
+                        "overrides": {"bluesky": {"media": media(1)}}});
+                    assert!(args.to_string().len() > 10 * 1024);
+                    let (err, g) = call(&s, &secret, "create-post-group", args).await;
+                    assert!(!err, "{g}");
+                    assert_eq!(g["posts"][0]["media"], json!(media(1)));
+
+                    let big = json!({"name": "create-post",
+                        "arguments": {"body": "a".repeat(70 * 1024)}});
                     let res = rpc(&s, Some(&secret), "tools/call", big.clone()).await;
                     assert_eq!(res.status_code(), 413, "{}", res.text());
 
@@ -6730,6 +6980,41 @@ mod teams {
                 assert_eq!(res.status_code(), 404);
                 let res = req(&s, Method::POST, "/v1/team/webhook/test", &owner).await;
                 assert_eq!(res.status_code(), 404);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn target_events_carry_the_group_id() {
+                let (s, db, _) = on_mock().await;
+                let hook = receiver().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                assert_eq!(
+                    put(&s, &cookie, &format!("{hook}/hook"))
+                        .await
+                        .status_code(),
+                    201
+                );
+                let made = req(&s, Method::POST, "/v1/post-groups", &cookie)
+                    .json(&json!({"social_set_id": set, "body": "grouped"}))
+                    .await
+                    .json::<Value>();
+                let id = made["posts"][0]["id"].as_str().unwrap().to_owned();
+                let path = format!("/v1/posts/{id}/publish");
+                assert_eq!(
+                    req(&s, Method::POST, &path, &cookie).await.status_code(),
+                    202
+                );
+                for _ in 0..100 {
+                    if !deliveries(&db, &team_id).await.is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                let got = deliveries(&db, &team_id).await;
+                assert_eq!(got.len(), 1);
+                assert_eq!(got[0].1["data"]["post_id"], id.as_str());
+                assert_eq!(got[0].1["data"]["group_id"], made["group_id"]);
             }
 
             #[tokio::test]

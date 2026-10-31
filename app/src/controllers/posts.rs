@@ -3,10 +3,12 @@
 //! `scheduled` posts change; saving with `scheduled_at` makes one `scheduled`, else `draft`.
 //! Posts of a deleted set are hidden (and held back) until the set is restored. Every route
 //! takes an API token too (`Actor`); a set token only sees and writes its set's posts. Token
-//! writes take an optional `Idempotency-Key` header (see `idempotency`).
-use std::collections::HashMap;
+//! writes take an optional `Idempotency-Key` header (see `idempotency`). `POST /post-groups`
+//! creates one post per platform in one go, tied by a `group_id`.
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use axum::{
+    body::to_bytes,
     extract::{rejection::QueryRejection, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -15,8 +17,9 @@ use axum::{
 use chrono::{DateTime, FixedOffset, Utc};
 use schemars::JsonSchema;
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait, DbBackend, DbErr, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
+    sea_query::Query as Select, ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait,
+    DatabaseTransaction, DbBackend, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use socialreins_core::post;
@@ -32,7 +35,10 @@ use super::{
     waitlist::{error, Error},
 };
 use crate::{
-    models::{post_targets, posts, social_sets, teams},
+    models::{
+        post_targets, posts, social_account_social_set as membership, social_accounts, social_sets,
+        teams,
+    },
     publish,
     state::AppState,
 };
@@ -64,6 +70,8 @@ pub struct Post {
     /// Why it failed, naming each account that failed.
     pub error: Option<String>,
     pub created_by: Option<Uuid>,
+    /// Ties the posts of one `POST /post-groups` call; `null` for a single post.
+    pub group_id: Option<Uuid>,
     pub created_at: DateTime<FixedOffset>,
     pub updated_at: DateTime<FixedOffset>,
     pub targets: Vec<Target>,
@@ -117,6 +125,47 @@ pub struct PostQuery {
     pub from: Option<DateTime<FixedOffset>>,
     /// `scheduled_at` before this time.
     pub to: Option<DateTime<FixedOffset>>,
+    /// The posts of one post group.
+    pub group_id: Option<Uuid>,
+}
+
+#[derive(Deserialize, ToSchema, JsonSchema)]
+pub struct PostGroupInput {
+    /// As in `POST /posts`.
+    pub social_set_id: Option<Uuid>,
+    /// The platforms to post to, one post each. Absent: every platform brain publishes to
+    /// with a connected account in the set (`422 no_accounts` when there is none).
+    pub platforms: Option<Vec<String>>,
+    /// Each post's body, unless its override has one.
+    #[serde(default)]
+    pub body: String,
+    /// Each post's media, unless its override has some.
+    #[serde(default)]
+    pub media: Vec<String>,
+    /// As in `POST /posts`, for every post.
+    pub scheduled_at: Option<DateTime<FixedOffset>>,
+    /// A list to put every post in, in platform order.
+    pub list_id: Option<Uuid>,
+    /// With `list_id`: the first post's 1-based position, the others right after; absent
+    /// appends.
+    pub position: Option<i32>,
+    /// Per-platform body or media; a platform outside the group is `422 invalid_override`.
+    #[serde(default)]
+    pub overrides: BTreeMap<String, Override>,
+}
+
+/// One platform's own body or media in a post group.
+#[derive(Deserialize, ToSchema, JsonSchema)]
+pub struct Override {
+    pub body: Option<String>,
+    pub media: Option<Vec<String>>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct PostGroup {
+    pub group_id: Uuid,
+    /// One post per platform, in platform order.
+    pub posts: Vec<Post>,
 }
 
 fn reply(status: StatusCode, code: &str) -> Response {
@@ -168,6 +217,7 @@ fn post_json(p: posts::Model, targets: Vec<Target>, lists: Vec<ListRef>) -> Post
         published_at: p.published_at,
         error: p.error,
         created_by: p.created_by,
+        group_id: p.group_id,
         created_at: p.created_at,
         updated_at: p.updated_at,
         targets,
@@ -227,12 +277,22 @@ async fn checked(
     a: &Actor,
     input: &PostInput,
 ) -> Result<Result<Uuid, Response>, DbErr> {
-    let invalid_set = || reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_set");
     if let Err(e) = post::validate(&input.platform, &input.body, &input.media) {
         return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, e.code())));
     }
+    set_for(db, a, input.social_set_id).await
+}
+
+/// The live set of the team a write names (a set token's own when absent), if the caller may
+/// write to it.
+async fn set_for(
+    db: &impl ConnectionTrait,
+    a: &Actor,
+    social_set_id: Option<Uuid>,
+) -> Result<Result<Uuid, Response>, DbErr> {
+    let invalid_set = || reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_set");
     // Another set than a set token's own answers like a missing one.
-    let id = match (a.set_id(), input.social_set_id) {
+    let id = match (a.set_id(), social_set_id) {
         (Some(own), None) => own,
         (Some(own), Some(id)) if id == own => own,
         (None, Some(id)) => id,
@@ -302,6 +362,9 @@ pub async fn list_posts(app: &AppState, a: &Actor, q: PostQuery) -> Response {
         if let Some(to) = q.to {
             sel = sel.filter(posts::Column::ScheduledAt.lt(to));
         }
+        if let Some(group) = q.group_id {
+            sel = sel.filter(posts::Column::GroupId.eq(group));
+        }
         let rows = sel
             .order_by_asc(posts::Column::ScheduledAt)
             .order_by_asc(posts::Column::CreatedAt)
@@ -355,42 +418,11 @@ async fn create(State(app): State<AppState>, a: Actor, Body(input): Body<PostInp
 /// The body of `POST /posts`, shared with the MCP `create-post` tool.
 pub async fn create_post(app: &AppState, a: &Actor, input: PostInput) -> Response {
     let made = async {
-        let set = match checked(&app.db, a, &input).await? {
-            Ok(set) => set,
+        let txn = app.db.begin().await?;
+        let p = match insert(&txn, a, &input, None).await? {
+            Ok(p) => p,
             Err(res) => return Ok(Err(res)),
         };
-        let txn = app.db.begin().await?;
-        // The team row lock keeps concurrent creates under the cap.
-        teams::Entity::find_by_id(a.team.id)
-            .lock_exclusive()
-            .one(&txn)
-            .await?;
-        let live = posts::Entity::find()
-            .filter(posts::Column::TeamId.eq(a.team.id))
-            .filter(posts::Column::Status.ne("deleted"))
-            .count(&txn)
-            .await?;
-        if live >= MAX_POSTS {
-            return Ok(Err(reply(StatusCode::CONFLICT, "too_many_posts")));
-        }
-        let row = posts::ActiveModel {
-            id: Set(Uuid::now_v7()),
-            team_id: Set(a.team.id),
-            social_set_id: Set(set),
-            platform: Set(input.platform.clone()),
-            body: Set(input.body.clone()),
-            media: Set(serde_json::json!(input.media)),
-            status: Set(status_for(&input).into()),
-            scheduled_at: Set(when(&input)),
-            created_by: Set(a.user_id),
-            ..Default::default()
-        };
-        let p = posts::Entity::insert(row).exec_with_returning(&txn).await?;
-        if let Some(list) = input.list_id {
-            if let Err(res) = lists::place(&txn, a, list, &p, input.position).await? {
-                return Ok(Err(res));
-            }
-        }
         txn.commit().await?;
         one_json(&app.db, a, p).await.map(Ok)
     };
@@ -399,6 +431,169 @@ pub async fn create_post(app: &AppState, a: &Actor, input: PostInput) -> Respons
         Ok(Err(res)) => res,
         Err(e) => internal(e, "post insert"),
     }
+}
+
+/// Checks and inserts one new post in `txn`, then puts it in its list. Every create runs this:
+/// `POST /posts` and each post of a group. The caller commits.
+async fn insert(
+    txn: &DatabaseTransaction,
+    a: &Actor,
+    input: &PostInput,
+    group_id: Option<Uuid>,
+) -> Result<Result<posts::Model, Response>, DbErr> {
+    let set = match checked(txn, a, input).await? {
+        Ok(set) => set,
+        Err(res) => return Ok(Err(res)),
+    };
+    // The team row lock keeps concurrent creates under the cap.
+    teams::Entity::find_by_id(a.team.id)
+        .lock_exclusive()
+        .one(txn)
+        .await?;
+    let live = posts::Entity::find()
+        .filter(posts::Column::TeamId.eq(a.team.id))
+        .filter(posts::Column::Status.ne("deleted"))
+        .count(txn)
+        .await?;
+    if live >= MAX_POSTS {
+        return Ok(Err(reply(StatusCode::CONFLICT, "too_many_posts")));
+    }
+    let row = posts::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        team_id: Set(a.team.id),
+        social_set_id: Set(set),
+        platform: Set(input.platform.clone()),
+        body: Set(input.body.clone()),
+        media: Set(serde_json::json!(input.media)),
+        status: Set(status_for(input).into()),
+        scheduled_at: Set(when(input)),
+        created_by: Set(a.user_id),
+        group_id: Set(group_id),
+        ..Default::default()
+    };
+    let p = posts::Entity::insert(row).exec_with_returning(txn).await?;
+    if let Some(list) = input.list_id {
+        if let Err(res) = lists::place(txn, a, list, &p, input.position).await? {
+            return Ok(Err(res));
+        }
+    }
+    Ok(Ok(p))
+}
+
+/// Creates one post per platform of a set in one transaction, tied by a new `group_id`; each is
+/// checked as in `POST /posts`. Any failure creates nothing and answers that post's error with
+/// `"platform"` added, e.g. `422 {"error":"too_long","platform":"bluesky"}`.
+#[utoipa::path(post, path = "/post-groups", tag = "posts",
+    security(("session" = []), ("api_token" = [])), request_body = PostGroupInput,
+    params(("Idempotency-Key" = Option<String>, Header, description = "With an API token: 1 to 255 printable ASCII characters. A retry with the same key, path and body replays the first answer for 30 days")),
+    responses((status = 201, body = PostGroup), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
+        (status = 422, body = Error)))]
+async fn create_group(
+    State(app): State<AppState>,
+    a: Actor,
+    Body(input): Body<PostGroupInput>,
+) -> Response {
+    create_post_group(&app, &a, input).await
+}
+
+/// The body of `POST /post-groups`, shared with the MCP `create-post-group` tool.
+pub async fn create_post_group(app: &AppState, a: &Actor, input: PostGroupInput) -> Response {
+    let made = async {
+        let set = match set_for(&app.db, a, input.social_set_id).await? {
+            Ok(set) => set,
+            Err(res) => return Ok(Err(res)),
+        };
+        let mut platforms = match &input.platforms {
+            Some(p) => p.clone(),
+            // Only platforms brain publishes to, so an account connected early breaks nothing.
+            None => connected_platforms(&app.db, a.team.id, set)
+                .await?
+                .into_iter()
+                .filter(|p| publish::publisher(app, p).is_some())
+                .collect(),
+        };
+        let mut seen = HashSet::new();
+        platforms.retain(|p| seen.insert(p.clone()));
+        if platforms.is_empty() {
+            return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, "no_accounts")));
+        }
+        if input.overrides.keys().any(|p| !platforms.contains(p)) {
+            return Ok(Err(reply(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_override",
+            )));
+        }
+        let group = Uuid::now_v7();
+        let txn = app.db.begin().await?;
+        let mut rows = Vec::with_capacity(platforms.len());
+        for (i, platform) in (0i32..).zip(platforms) {
+            let o = input.overrides.get(&platform);
+            let one = PostInput {
+                social_set_id: Some(set),
+                body: o
+                    .and_then(|o| o.body.clone())
+                    .unwrap_or_else(|| input.body.clone()),
+                media: o
+                    .and_then(|o| o.media.clone())
+                    .unwrap_or_else(|| input.media.clone()),
+                platform,
+                scheduled_at: input.scheduled_at,
+                list_id: input.list_id,
+                position: input.position.map(|p| p.saturating_add(i)),
+            };
+            match insert(&txn, a, &one, Some(group)).await? {
+                Ok(p) => rows.push(p),
+                Err(res) => return Ok(Err(naming(res, &one.platform).await)),
+            }
+        }
+        txn.commit().await?;
+        let posts = posts_json(&app.db, a, rows).await?;
+        Ok::<_, DbErr>(Ok(PostGroup {
+            group_id: group,
+            posts,
+        }))
+    };
+    match made.await {
+        Ok(Ok(g)) => (StatusCode::CREATED, Json(g)).into_response(),
+        Ok(Err(res)) => res,
+        Err(e) => internal(e, "post group insert"),
+    }
+}
+
+/// The platforms of the team's accounts in `set`, by name.
+async fn connected_platforms(
+    db: &impl ConnectionTrait,
+    team: Uuid,
+    set: Uuid,
+) -> Result<Vec<String>, DbErr> {
+    let in_set = Select::select()
+        .column(membership::Column::SocialAccountId)
+        .from(membership::Entity)
+        .and_where(membership::Column::SocialSetId.eq(set))
+        .to_owned();
+    social_accounts::Entity::find()
+        .select_only()
+        .column(social_accounts::Column::Provider)
+        .distinct()
+        .filter(social_accounts::Column::TeamId.eq(team))
+        .filter(social_accounts::Column::Id.in_subquery(in_set))
+        .order_by_asc(social_accounts::Column::Provider)
+        .into_tuple()
+        .all(db)
+        .await
+}
+
+/// An error answer with `"platform"` added to its JSON body.
+async fn naming(res: Response, platform: &str) -> Response {
+    let status = res.status();
+    let body = to_bytes(res.into_body(), usize::MAX).await.ok();
+    let mut v: serde_json::Value = body
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({"error": "internal"}));
+    v["platform"] = platform.into();
+    (status, Json(v)).into_response()
 }
 
 /// Replaces a `draft` or `scheduled` post's set, platform, body, media and time; anything else
@@ -604,4 +799,9 @@ pub fn api() -> OpenApiRouter<AppState> {
         .routes(routes!(list, create))
         .routes(routes!(show, update, destroy))
         .routes(routes!(publish_now))
+}
+
+/// `POST /post-groups`, apart so it can take a larger body than the rest of `/v1`.
+pub fn groups_api() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(create_group))
 }

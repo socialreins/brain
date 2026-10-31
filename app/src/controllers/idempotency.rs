@@ -32,7 +32,7 @@ pub const KEEP_DAYS: i64 = 30;
 /// A first run older than this is taken as lost to a crash.
 const ABANDONED_MINUTES: i32 = 10;
 /// The largest `/v1` body limit; bodies are buffered to fingerprint them.
-const MAX_BODY: usize = super::MAX_AUTOMATION_BODY_BYTES;
+const MAX_BODY: usize = super::MAX_GROUP_BODY_BYTES;
 
 fn reply(status: StatusCode, code: &str) -> Response {
     error(status, code).into_response()
