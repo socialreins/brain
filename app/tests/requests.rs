@@ -4081,9 +4081,27 @@ mod teams {
                     "/slow.png?3",
                     "/slow.png?4",
                 ];
-                set_media(&db, &base, &id, &slow[..4]).await;
+                // One sends a PNG start then stalls, so its upload is underway at the deadline.
+                let stall = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let stall_url = format!("http://{}/stall.png", stall.local_addr().unwrap());
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    while let Ok((mut c, _)) = stall.accept().await {
+                        tokio::spawn(async move {
+                            let head = "HTTP/1.1 200 OK\r\ncontent-type: image/png\r\n\
+                                        content-length: 1000\r\n\r\n";
+                            let _ = c.write_all(head.as_bytes()).await;
+                            let _ = c.write_all(b"\x89PNG\r\n\x1a\n\0\0\0\0\0\0").await;
+                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        });
+                    }
+                });
+                let mut urls: Vec<String> =
+                    slow[..3].iter().map(|p| format!("{base}{p}")).collect();
+                urls.push(stall_url);
                 let row = posts::ActiveModel {
                     id: Set(id.parse().unwrap()),
+                    media: Set(json!(urls)),
                     thread: Set(json!([{"body": "two", "media": [format!("{base}{}", slow[4])]}])),
                     ..Default::default()
                 };
@@ -4099,6 +4117,12 @@ mod teams {
                 let msg = p["targets"][0]["error"].as_str().unwrap();
                 assert!(msg.starts_with("Image 2 did not download in time"), "{msg}");
                 assert!(p["targets"][0]["remote_id"].is_null(), "nothing went out");
+                // The aborted upload left nothing, staged or whole, and the stored image went.
+                let dir = media_dir().join("posts").join(&id);
+                let left: Vec<_> = std::fs::read_dir(&dir)
+                    .map(|d| d.flatten().map(|e| e.file_name()).collect())
+                    .unwrap_or_default();
+                assert!(left.is_empty(), "{left:?}");
             }
 
             async fn media_rows(db: &DatabaseConnection, post: &str) -> i64 {
@@ -4129,27 +4153,55 @@ mod teams {
                     ));
                 }
                 let (done, draft, fresh) = (&ids[0], &ids[1], &ids[2]);
+                let soon = || tokio::time::Instant::now() + media::INGEST_DEADLINE;
+                let ingest = |id: &str| {
+                    let (media, db, url) = (state.media.clone(), db.clone(), url.clone());
+                    let id: uuid::Uuid = id.parse().unwrap();
+                    async move {
+                        media
+                            .ingest(&db, id, &url, 1_000_000, soon())
+                            .await
+                            .unwrap()
+                    }
+                };
                 // A retry reuses the stored copy: one row, one key.
-                let post: uuid::Uuid = done.parse().unwrap();
-                let a = state
-                    .media
-                    .ingest(&db, post, &url, 1_000_000)
-                    .await
-                    .unwrap();
-                let b = state
-                    .media
-                    .ingest(&db, post, &url, 1_000_000)
-                    .await
-                    .unwrap();
-                assert_eq!(a.key, b.key);
+                let a = ingest(done).await;
+                assert_eq!(ingest(done).await.key, a.key);
                 assert_eq!(a.content_type, "image/png");
                 assert_eq!(media_rows(&db, done).await, 1);
                 assert_eq!(state.media.read(&a.key).await.unwrap().len(), 64);
-                for id in [draft, fresh] {
-                    let p = id.parse().unwrap();
-                    state.media.ingest(&db, p, &url, 1_000_000).await.unwrap();
+                // A row whose file is gone is a miss: downloaded again, under a new key.
+                let path = |k: &str| object_store::path::Path::from(k);
+                state.media.store.delete(&path(&a.key)).await.unwrap();
+                let a = ingest(done).await;
+                assert_eq!(state.media.read(&a.key).await.unwrap().len(), 64);
+                assert_eq!(media_rows(&db, done).await, 1);
+                ingest(draft).await;
+                ingest(fresh).await;
+                // Files no row names (a lost insert, a crash) go too.
+                let put = |k: String| {
+                    let store = state.media.store.clone();
+                    async move {
+                        store.put(&path(&k), vec![1u8].into()).await.unwrap();
+                        k
+                    }
+                };
+                let orphan = put(format!("posts/{done}/orphan")).await;
+                let gone_post = put(format!("posts/{}/orphan", uuid::Uuid::now_v7())).await;
+                let draft_orphan = put(format!("posts/{draft}/orphan")).await;
+                // A week old, by the file's own time and the row's.
+                let week_old = |k: &str| {
+                    let f = std::fs::File::options()
+                        .write(true)
+                        .open(media_dir().join(k))
+                        .unwrap();
+                    let at =
+                        std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 86_400);
+                    f.set_modified(at).unwrap();
+                };
+                for k in [&a.key, &orphan, &gone_post, &draft_orphan] {
+                    week_old(k);
                 }
-                // `done` settled and `fresh` too, but only `done`'s copy is a week old.
                 let age = |id: &str, days: i32| {
                     Statement::from_sql_and_values(
                         DbBackend::Postgres,
@@ -4169,17 +4221,29 @@ mod teams {
                     };
                     posts::Entity::update(row).exec(&db).await.unwrap();
                 }
-                assert_eq!(media::sweep(&state).await.unwrap(), 1);
+                // `done` settled and `fresh` too, but only `done`'s files are a week old.
+                assert_eq!(media::sweep(&state).await.unwrap(), 3);
                 assert_eq!(media_rows(&db, done).await, 0);
-                assert!(state.media.read(&a.key).await.is_err(), "the file is gone");
+                for k in [&a.key, &orphan, &gone_post] {
+                    assert!(state.media.read(k).await.is_err(), "{k} is gone");
+                }
+                assert!(
+                    state.media.read(&draft_orphan).await.is_ok(),
+                    "a draft keeps its files"
+                );
                 assert_eq!(media_rows(&db, draft).await, 1, "a draft still needs it");
                 assert_eq!(media_rows(&db, fresh).await, 1, "not a week old yet");
-                // Deleting the draft deletes its copy right away.
+                // Once a post settles, everything under its prefix goes, named by a row or not.
+                let fresh_orphan = put(format!("posts/{fresh}/orphan")).await;
+                state.media.release_post(&db, fresh.parse().unwrap()).await;
+                assert_eq!(media_rows(&db, fresh).await, 0);
+                assert!(state.media.read(&fresh_orphan).await.is_err());
+                assert!(!media_dir().join("posts").join(fresh).exists());
+                // Deleting the draft deletes its files right away.
                 let res = req(&s, Method::DELETE, &format!("/v1/posts/{draft}"), &cookie).await;
                 assert_eq!(res.status_code(), 204);
                 assert_eq!(media_rows(&db, draft).await, 0);
-                state.media.release(&db, None, 0).await.unwrap();
-                assert_eq!(media_rows(&db, fresh).await, 0);
+                assert!(state.media.read(&draft_orphan).await.is_err());
             }
 
             #[tokio::test]

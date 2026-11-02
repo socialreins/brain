@@ -34,7 +34,9 @@ cargo run -p socialreins-brain
   once into local disk (`MEDIA_DIR`) or an S3-compatible bucket (`S3_*`, `config.rs`), saved in
   `post_media`, and the publisher reads the stored bytes. Every download goes through
   `PublicOnly`. Files go once the post settles or is deleted, and the hourly sweep deletes the
-  rest after 7 days; a storage error is only logged.
+  rest after 7 days; a storage error is only logged. Cleanup lists `posts/<post id>/` in the
+  store, so it also catches files no row names. Local disk assumes one brain instance: run
+  more than one replica only with the `S3_*` bucket.
 - `app/src/webhooks.rs`: outbound webhooks. Every `post_targets` status change goes through
   `webhooks::with_event`, so its event is queued in the same statement; README documents the
   payload and signature.

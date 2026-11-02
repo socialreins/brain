@@ -6,6 +6,8 @@
 //! `PublicOnly` and follow at most 3 redirects, each to a public https URL.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use tokio::time::Instant;
+
 use object_store::{path::Path, ObjectStore, WriteMultipart};
 use reqwest::{header::CONTENT_TYPE, StatusCode, Url};
 use sea_orm::{
@@ -92,7 +94,7 @@ impl Media {
     }
 
     /// `ingest` of every URL, `PARALLEL` at a time, all within `deadline`; a URL not stored by
-    /// then is `TimedOut`.
+    /// then is `TimedOut`, its upload aborted.
     pub async fn ingest_all(
         &self,
         db: &DatabaseConnection,
@@ -100,7 +102,6 @@ impl Media {
         urls: &[String],
         cap: usize,
     ) -> HashMap<String, Result<Stored, Fail>> {
-        let mut found = HashMap::new();
         let mut left: Vec<String> = Vec::new();
         for url in urls {
             if !left.contains(url) {
@@ -108,46 +109,43 @@ impl Media {
             }
         }
         left.reverse();
+        let until = Instant::now() + self.deadline;
+        let mut found = HashMap::new();
         let mut running = tokio::task::JoinSet::new();
-        let until = tokio::time::Instant::now() + self.deadline;
         loop {
             while running.len() < PARALLEL {
                 let Some(url) = left.pop() else { break };
                 let (media, db) = (self.clone(), db.clone());
                 running.spawn(async move {
-                    let got = media.ingest(&db, post, &url, cap).await;
+                    let got = media.ingest(&db, post, &url, cap, until).await;
                     (url, got)
                 });
             }
-            match tokio::time::timeout_at(until, running.join_next()).await {
-                Ok(Some(Ok((url, got)))) => {
+            // Each download stops itself at `until`, so this ends then too.
+            match running.join_next().await {
+                Some(Ok((url, got))) => {
                     found.insert(url, got);
                 }
-                Ok(Some(Err(e))) => tracing::error!(error = %e, post = %post, "media task failed"),
-                Ok(None) => break,
-                Err(_) => {
-                    tracing::warn!(post = %post, "media downloads ran out of time");
-                    // shortcut: an aborted download may leave a partial upload behind (R2 and
-                    // S3 lifecycle rules expire those); abort them explicitly if that grows.
-                    running.abort_all();
-                    break;
-                }
+                Some(Err(e)) => tracing::error!(error = %e, post = %post, "media task failed"),
+                None => break,
             }
         }
         for url in urls {
-            found.entry(url.clone()).or_insert(Err(Fail::TimedOut));
+            found.entry(url.clone()).or_insert(Err(Fail::Storage));
         }
         found
     }
 
     /// The stored copy of `url` for `post`: the one an earlier try saved, else downloaded now,
-    /// at most `cap` bytes (and never over `MAX_BYTES`).
+    /// at most `cap` bytes (and never over `MAX_BYTES`), by `until`. A row whose file is gone is
+    /// a miss: it is deleted and the URL downloaded again.
     pub async fn ingest(
         &self,
         db: &DatabaseConnection,
         post: Uuid,
         url: &str,
         cap: usize,
+        until: Instant,
     ) -> Result<Stored, Fail> {
         let db_err = |e: DbErr| {
             tracing::warn!(error = %e, post = %post, "post media row failed");
@@ -162,9 +160,20 @@ impl Media {
             .await
             .map_err(db_err)?;
         if let Some(row) = found {
-            return stored(&row).map_err(db_err);
+            let s = stored(&row).map_err(db_err)?;
+            match self.store.head(&Path::from(s.key.as_str())).await {
+                Err(object_store::Error::NotFound { .. }) => {
+                    let stmt = sql(
+                        "DELETE FROM post_media WHERE post_id = $1 AND source_url = $2",
+                        vec![post.into(), url.into()],
+                    );
+                    db.execute_raw(stmt).await.map_err(db_err)?;
+                }
+                _ => return Ok(s),
+            }
         }
-        let (key, content_type, size) = self.download(post, url, cap.min(MAX_BYTES)).await?;
+        let got = self.download(post, url, cap.min(MAX_BYTES), until).await;
+        let (key, content_type, size) = got?;
         // A run that stored the same URL first wins; this copy is then deleted.
         let saved = db
             .query_one_raw(sql(
@@ -200,13 +209,15 @@ impl Media {
         post: Uuid,
         url: &str,
         cap: usize,
+        until: Instant,
     ) -> Result<(String, &'static str, usize), Fail> {
         let drive = drive_url(url);
         let from = Url::parse(drive.as_deref().unwrap_or(url)).map_err(|_| Fail::Blocked)?;
         if !public_url(&from, self.allow_private) {
             return Err(Fail::Blocked);
         }
-        let mut res = self.client.get(from).send().await.map_err(|e| {
+        let sent = tokio::time::timeout_at(until, self.client.get(from).send());
+        let mut res = sent.await.map_err(|_| Fail::TimedOut)?.map_err(|e| {
             let fail = if e.is_redirect() || blocked(&e) {
                 Fail::Blocked
             } else {
@@ -232,7 +243,8 @@ impl Media {
         };
         let mut head = Vec::new();
         while head.len() < SNIFF_LEN {
-            match res.chunk().await.map_err(read)? {
+            let chunk = tokio::time::timeout_at(until, res.chunk()).await;
+            match chunk.map_err(|_| Fail::TimedOut)?.map_err(read)? {
                 Some(chunk) => head.extend_from_slice(&chunk),
                 None => break,
             }
@@ -267,8 +279,11 @@ impl Media {
                 file.write(&chunk);
             }
             Ok(())
-        }
-        .await;
+        };
+        // Past the deadline the upload is aborted, so no partial file stays behind.
+        let streamed = tokio::time::timeout_at(until, streamed)
+            .await
+            .unwrap_or(Err(Fail::TimedOut));
         match streamed {
             Ok(()) => file.finish().await.map_err(storage)?,
             Err(e) => {
@@ -296,35 +311,68 @@ impl Media {
         }
     }
 
-    /// Deletes the files, older than `days`, of posts that no longer wait to publish (settled,
-    /// deleted or gone); only `post`'s when given. A file that fails to delete keeps its row,
-    /// so the sweep tries again. Returns how many went.
+    /// Deletes every stored file under `posts/<post>/` older than `days` of posts that no longer
+    /// wait to publish (settled, deleted or gone), whether or not a row names it, then their
+    /// rows; only `post`'s when given. Storage errors are logged and left for the next sweep.
+    /// Returns how many files went.
     pub async fn release(
         &self,
         db: &DatabaseConnection,
         post: Option<Uuid>,
         days: i32,
     ) -> Result<u64, DbErr> {
-        let rows = db
-            .query_all_raw(sql(
-                "SELECT m.id, m.storage_key FROM post_media m \
-                 LEFT JOIN posts p ON p.id = m.post_id \
-                 WHERE (p.id IS NULL OR p.status NOT IN ('draft', 'scheduled', 'queued')) \
-                 AND ($1::uuid IS NULL OR m.post_id = $1) \
-                 AND m.created_at <= now() - make_interval(days => $2) \
-                 ORDER BY m.created_at LIMIT 1000",
-                vec![post.into(), days.into()],
-            ))
-            .await?;
+        let posts: Vec<Path> = match post {
+            Some(id) => vec![Path::from(format!("posts/{id}"))],
+            None => match self
+                .store
+                .list_with_delimiter(Some(&Path::from("posts")))
+                .await
+            {
+                Ok(list) => list.common_prefixes,
+                Err(e) => {
+                    tracing::warn!(error = %e, "stored media list failed");
+                    Vec::new()
+                }
+            },
+        };
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(days.into());
         let mut gone = 0;
-        for row in rows {
-            let (id, key): (Uuid, String) =
-                (row.try_get("", "id")?, row.try_get("", "storage_key")?);
-            if self.delete(&key).await {
-                let stmt = sql("DELETE FROM post_media WHERE id = $1", vec![id.into()]);
-                gone += db.execute_raw(stmt).await?.rows_affected();
+        for prefix in posts {
+            let Some(id) = prefix.filename().and_then(|f| f.parse::<Uuid>().ok()) else {
+                continue;
+            };
+            let waiting = db
+                .query_one_raw(sql(
+                    "SELECT 1 AS ok FROM posts WHERE id = $1 \
+                     AND status IN ('draft', 'scheduled', 'queued')",
+                    vec![id.into()],
+                ))
+                .await?;
+            if waiting.is_some() {
+                continue;
+            }
+            let files = match self.store.list_with_delimiter(Some(&prefix)).await {
+                Ok(list) => list.objects,
+                Err(e) => {
+                    tracing::warn!(error = %e, post = %id, "stored media list failed");
+                    continue;
+                }
+            };
+            for file in files.into_iter().filter(|f| f.last_modified <= cutoff) {
+                if self.delete(file.location.as_ref()).await {
+                    gone += 1;
+                }
             }
         }
+        // Rows only point at files; one whose file is still up is gone from the store next time.
+        let stmt = sql(
+            "DELETE FROM post_media m WHERE ($1::uuid IS NULL OR m.post_id = $1) \
+             AND m.created_at <= now() - make_interval(days => $2) \
+             AND NOT EXISTS (SELECT 1 FROM posts p WHERE p.id = m.post_id \
+                             AND p.status IN ('draft', 'scheduled', 'queued'))",
+            vec![post.into(), days.into()],
+        );
+        db.execute_raw(stmt).await?;
         Ok(gone)
     }
 
@@ -480,6 +528,10 @@ mod tests {
         }
     }
 
+    fn soon() -> Instant {
+        Instant::now() + INGEST_DEADLINE
+    }
+
     fn png(len: usize) -> Vec<u8> {
         let mut b = b"\x89PNG\r\n\x1a\n".to_vec();
         b.resize(len, 7);
@@ -512,7 +564,7 @@ mod tests {
         let post = Uuid::now_v7();
         for path in ["/ok.png", "/hop"] {
             let (key, ty, size) = media
-                .download(post, &format!("{base}{path}"), MAX_BYTES)
+                .download(post, &format!("{base}{path}"), MAX_BYTES, soon())
                 .await
                 .unwrap();
             assert_eq!((ty, size), ("image/png", 100_000));
@@ -520,11 +572,11 @@ mod tests {
             assert_eq!(media.read(&key).await.unwrap(), png(100_000));
         }
         let got = media
-            .download(post, &format!("{base}/ok.png"), 99_999)
+            .download(post, &format!("{base}/ok.png"), 99_999, soon())
             .await;
         assert_eq!(got.unwrap_err(), Fail::TooLarge);
         let got = media
-            .download(post, &format!("{base}/page"), MAX_BYTES)
+            .download(post, &format!("{base}/page"), MAX_BYTES, soon())
             .await;
         assert_eq!(got.unwrap_err(), Fail::Unsupported);
     }
@@ -543,7 +595,10 @@ mod tests {
             "https://user@example.com/ok.png".to_owned(),
         ] {
             assert_eq!(
-                media.download(post, &url, MAX_BYTES).await.unwrap_err(),
+                media
+                    .download(post, &url, MAX_BYTES, soon())
+                    .await
+                    .unwrap_err(),
                 Fail::Blocked,
                 "{url}"
             );
