@@ -1,5 +1,5 @@
-//! The socialreins.com waitlist: `POST /v1/waitlist` joins and emails a confirmation link,
-//! `GET /v1/waitlist/verify` is that link, `GET /v1/waitlist/count` counts every signup, and
+//! The socialreins.com waitlist: `POST /v1/waitlist` joins and emails a confirmation link to the
+//! web app, which posts its token to `POST /v1/waitlist/verify`, `GET /v1/waitlist/count` counts every signup, and
 //! `GET /v1/admin/waitlist` lists them for `ADMIN_EMAILS`.
 use std::time::{Duration as StdDuration, Instant};
 
@@ -9,7 +9,7 @@ use axum::{
         FromRequest, Query, Request, State,
     },
     http::StatusCode,
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
     Json,
 };
 use chrono::{DateTime, Duration, FixedOffset, Utc};
@@ -24,11 +24,18 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use super::auth::{internal, CurrentUser};
-use crate::{models::waitlist_signups, rate_limit::ClientIp, state::AppState};
+use crate::{
+    models::waitlist_signups,
+    rate_limit::{daily_refund, daily_reserve, ClientIp},
+    state::AppState,
+};
 
 const MAX_SOURCE_LEN: usize = 100;
 /// An unverified email gets at most one confirmation email per hour, however often it signs up.
 const RESEND_AFTER_HOURS: i64 = 1;
+/// Confirmation emails across all signups per rolling 24 hours, since the form has no captcha.
+const CONFIRMATIONS_PER_DAY: i64 = 500;
+const CONFIRMATIONS_BUCKET: &str = "waitlist:confirm";
 /// How long `GET /v1/waitlist/count` serves its cached number.
 const COUNT_TTL: StdDuration = StdDuration::from_secs(30);
 /// shortcut: the admin list stops at the newest 1000 signups, add paging once the list is longer.
@@ -76,8 +83,9 @@ pub(crate) fn rejected(r: &JsonRejection) -> Reply {
 }
 
 /// `200 {"status":"ok"}` for a new email and a known one alike. A new or unverified email gets a
-/// confirmation link by email, at most once an hour; the mail goes out after the reply, so
-/// neither the body nor the timing says whether the email was already on the list.
+/// confirmation link by email, at most once an hour and within a global 500 a day; the mail goes
+/// out after the reply, so neither the body nor the timing says whether the email was already on
+/// the list.
 #[utoipa::path(post, path = "/waitlist", tag = "waitlist", request_body = NewSignup,
     responses((status = 200, body = Status), (status = 400, body = Error),
         (status = 413, body = Error), (status = 415, body = Error), (status = 422, body = Error),
@@ -128,11 +136,7 @@ async fn join(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Requ
     };
     if let Some(secret) = secret {
         // A failed mail keeps the row and the ok reply; the error carries no email or token.
-        tokio::spawn(async move {
-            if let Err(e) = send_confirmation(&app, &email, &secret).await {
-                tracing::error!(error = %e, "waitlist confirmation not sent");
-            }
-        });
+        tokio::spawn(async move { send_confirmation(&app, &email, &secret).await });
     }
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
@@ -159,40 +163,80 @@ async fn claim_confirmation(app: &AppState, email: &str) -> Result<Option<String
     Ok((claimed.rows_affected == 1).then_some(secret))
 }
 
-async fn send_confirmation(app: &AppState, email: &str, secret: &str) -> Result<(), String> {
-    let url = format!("{}/v1/waitlist/verify?token={secret}", app.brain_url);
+/// Mails the link within the global daily cap. Unsent (cap reached or mail failed), the claim
+/// is undone so the next signup of this email may try again; logs carry no email or token.
+async fn send_confirmation(app: &AppState, email: &str, secret: &str) {
+    let caps = [(CONFIRMATIONS_BUCKET.to_owned(), CONFIRMATIONS_PER_DAY)];
+    let reserved = match daily_reserve(&app.db, &caps).await {
+        Ok(Some(ids)) => ids,
+        Ok(None) => {
+            tracing::warn!("waitlist confirmation not sent: daily cap reached");
+            return unclaim(app, secret).await;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "waitlist confirmation cap check failed");
+            return unclaim(app, secret).await;
+        }
+    };
+    let url = format!("{}/waitlist/verify?token={secret}", app.web_url);
     let text = format!(
         "Thanks for joining the SocialReins waitlist.\n\nConfirm my email:\n{url}\n\nIf you \
          did not sign up, ignore this email.\n"
     );
-    app.mailer
-        .send(email, "Confirm your spot on the SocialReins waitlist", text)
-        .await
-        .map_err(|e| format!("mail: {e}"))
+    let subject = "Confirm your spot on the SocialReins waitlist";
+    if let Err(e) = app.mailer.send(email, subject, text).await {
+        tracing::error!(error = %e, "waitlist confirmation not sent");
+        daily_refund(&app.db, &reserved).await;
+        unclaim(app, secret).await;
+    }
 }
 
-#[derive(Deserialize, IntoParams)]
-pub struct VerifyQuery {
-    /// The token from the confirmation email.
-    pub token: String,
-}
-
-/// The link in the confirmation email: marks the signup verified (the first click sets
-/// `verified_at`, later ones keep it) and redirects (303) to `{WEB_URL}/waitlist/verified`, or
-/// to `{WEB_URL}/waitlist/verified?error=invalid_link` for an unknown or malformed token.
-#[utoipa::path(get, path = "/waitlist/verify", tag = "waitlist", params(VerifyQuery),
-    responses((status = 303, description = "Redirect to the web app"),
-        (status = 500, body = Error)))]
-async fn verify(
-    State(app): State<AppState>,
-    q: Result<Query<VerifyQuery>, QueryRejection>,
-) -> Response {
+/// Clears `verify_sent_at` of the claim holding `secret`, so it does not hold back a resend.
+async fn unclaim(app: &AppState, secret: &str) {
     use waitlist_signups::Column;
-    let done = format!("{}/waitlist/verified", app.web_url);
-    let invalid = || Redirect::to(&format!("{done}?error=invalid_link")).into_response();
-    let Ok(Query(VerifyQuery { token: secret })) = q else {
-        return invalid();
+    let cleared = waitlist_signups::Entity::update_many()
+        .col_expr(
+            Column::VerifySentAt,
+            Expr::value(None::<DateTime<FixedOffset>>),
+        )
+        .filter(Column::VerifyTokenHash.eq(token::hash(secret)))
+        .exec(&app.db)
+        .await;
+    if let Err(e) = cleared {
+        tracing::warn!(error = %e, "waitlist confirmation unclaim failed");
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct VerifyBody {
+    /// The `token` query parameter of the emailed link.
+    pub token: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct Verified {
+    /// Always `verified`, also when the email already was.
+    pub status: String,
+}
+
+/// Confirms an email with the token from its confirmation link, which opens
+/// `{WEB_URL}/waitlist/verify?token=...`; the web page posts it here, so a mail scanner that
+/// opens the link changes nothing. The first call sets `verified_at`, later ones keep it.
+/// `422 invalid_link` for a missing, malformed or unknown token. Shares the waitlist IP limit.
+#[utoipa::path(post, path = "/waitlist/verify", tag = "waitlist", request_body = VerifyBody,
+    responses((status = 200, body = Verified), (status = 400, body = Error),
+        (status = 413, body = Error), (status = 415, body = Error), (status = 422, body = Error),
+        (status = 429, body = Error), (status = 500, body = Error)))]
+async fn verify(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Request) -> Reply {
+    use waitlist_signups::Column;
+    if !app.waitlist_limiter.allow(ip) {
+        return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    }
+    let secret = match Json::<VerifyBody>::from_request(request, &()).await {
+        Ok(Json(body)) => body.token.unwrap_or_default(),
+        Err(r) => return rejected(&r),
     };
+    let invalid = || error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_link");
     if secret.len() != 64 || !secret.bytes().all(|b| b.is_ascii_hexdigit()) {
         return invalid();
     }
@@ -205,9 +249,15 @@ async fn verify(
         .exec(&app.db)
         .await;
     match marked {
-        Ok(r) if r.rows_affected == 1 => Redirect::to(&done).into_response(),
+        Ok(r) if r.rows_affected == 1 => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "verified"})),
+        ),
         Ok(_) => invalid(),
-        Err(e) => internal(e, "waitlist verify"),
+        Err(e) => {
+            tracing::error!(error = %e, "waitlist verify failed");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        }
     }
 }
 

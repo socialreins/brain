@@ -29,7 +29,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/openapi.json` | OpenAPI document for `/v1` |
 | POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, accounts, posts and lists. Bearer API token only, same scope and per-token limit as `/v1`, bodies up to 64 KiB; `Idempotency-Key` does not apply |
 | POST | `/v1/waitlist` | `{"email":"...","source":"..."}` joins the waitlist and emails a confirmation link |
-| GET | `/v1/waitlist/verify?token=` | The emailed link: marks the signup verified, redirects to `WEB_URL/waitlist/verified` (or `?error=invalid_link`) |
+| POST | `/v1/waitlist/verify` | `{"token"}` from the emailed link: marks the signup verified, `200 {"status":"verified"}`, else `422 {"error":"invalid_link"}` |
 | GET | `/v1/waitlist/count` | `{"count":n}`: every signup, verified or not, cached for 30 seconds |
 | GET | `/v1/admin/waitlist` | `ADMIN_EMAILS` only, session cookie: `{"total","verified","signups":[{"id","email","source","created_at","verified_at"}]}`, newest first, at most 1000 (`?verified=true\|false` filters the list) |
 | POST | `/v1/contact` | `{"name","email","message"}` mails `CONTACT_TO`, `202 {}` |
@@ -88,11 +88,14 @@ crates/core/     framework-free domain rules (email checks, tokens)
 list, so it never reveals who signed up. A bad email gets `422 {"error":"invalid_email"}`. Each
 client IP (IPv6 by /64) gets 10 requests a minute, then `429`. A new or still unverified email
 gets a confirmation email ("Confirm your spot on the SocialReins waitlist") after the reply, at
-most once an hour however often it signs up; a verified one gets none, and a failed mail is
-logged while the signup stays. Its link, `GET /v1/waitlist/verify?token=...`, sets `verified_at`
-once and redirects to `WEB_URL/waitlist/verified`; a resend replaces the token, and an unknown
-token lands on `WEB_URL/waitlist/verified?error=invalid_link`. Only the token's SHA-256 hash is
-stored. `GET /v1/waitlist/count` is public. `GET /v1/admin/waitlist` needs a session cookie
+most once an hour however often it signs up; a verified one gets none. At most 500 confirmation
+emails go out per rolling 24 hours across all signups; past that, and when a mail fails, the
+signup is still saved and answered ok, nothing is sent, and the next signup of that email may
+try again. The link opens the web app at `WEB_URL/waitlist/verify?token=...`, which posts the
+token to `POST /v1/waitlist/verify` (so a mail scanner opening the link changes nothing): the
+first post sets `verified_at`, later ones answer the same `200`, and a missing, malformed or
+unknown token gets `422 invalid_link`. A resend replaces the token. It shares the waitlist's
+10 requests a minute per IP. Only the token's SHA-256 hash is stored. `GET /v1/waitlist/count` is public. `GET /v1/admin/waitlist` needs a session cookie
 (not an API token) of a user in `ADMIN_EMAILS`: `401 unauthorized` signed out, `403 forbidden`
 otherwise.
 

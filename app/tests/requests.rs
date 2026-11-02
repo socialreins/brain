@@ -7824,10 +7824,16 @@ mod waitlist_confirm {
     use super::captcha_and_contact::{resend, Seen};
     use super::*;
     use chrono::{Duration, Utc};
-    use sea_orm::{sea_query::Expr, DatabaseConnection};
+    use sea_orm::{sea_query::Expr, ConnectionTrait, DatabaseConnection};
     use socialreins_brain::mail::Mailer;
 
     const ADMIN: &str = "boss@example.com";
+
+    /// Empties the global daily cap on confirmation emails, which other tests also use up.
+    async fn reset_cap(db: &DatabaseConnection) {
+        let sql = "DELETE FROM rate_limit_hits WHERE bucket = 'waitlist:confirm'";
+        db.execute_unprepared(sql).await.unwrap();
+    }
 
     async fn app() -> (TestServer, DatabaseConnection, Seen, String) {
         let mut config = Config::from_env().expect("DATABASE_URL must point at a test Postgres");
@@ -7836,6 +7842,7 @@ mod waitlist_confirm {
         config.mailer = Mailer::resend_at(&url, "re_test", "brain@example.com").unwrap();
         let web = config.web_url.clone();
         let db = connect(&config).await.expect("database reachable");
+        reset_cap(&db).await;
         let app = controllers::router(AppState::new(db.clone(), &config), &config);
         (TestServer::new(app).unwrap(), db, seen, web)
     }
@@ -7851,7 +7858,7 @@ mod waitlist_confirm {
 
     fn token_of(mail: &Value) -> String {
         let text = mail["text"].as_str().unwrap();
-        let (_, rest) = text.split_once("/v1/waitlist/verify?token=").unwrap();
+        let (_, rest) = text.split_once("/waitlist/verify?token=").unwrap();
         rest.split_whitespace().next().unwrap().to_owned()
     }
 
@@ -7883,16 +7890,25 @@ mod waitlist_confirm {
         res.assert_json(&json!({"status": "ok"}));
     }
 
-    async fn verify(s: &TestServer, token: &str) -> String {
-        let res = s.get(&format!("/v1/waitlist/verify?token={token}")).await;
-        assert_eq!(res.status_code(), 303, "{token}");
-        res.header("location").to_str().unwrap().to_owned()
+    /// Posts `token` the way the web page does: `true` when verified, `false` for `invalid_link`.
+    async fn verify(s: &TestServer, token: &str) -> bool {
+        let res = s
+            .post("/v1/waitlist/verify")
+            .json(&json!({"token": token}))
+            .await;
+        if res.status_code() == 200 {
+            res.assert_json(&json!({"status": "verified"}));
+            return true;
+        }
+        assert_eq!(res.status_code(), 422, "{token}");
+        res.assert_json(&json!({"error": "invalid_link"}));
+        false
     }
 
     #[tokio::test]
     #[serial]
     async fn join_mails_a_confirmation_link() {
-        let (s, db, seen, _) = app().await;
+        let (s, db, seen, web) = app().await;
         let email = unique_email();
         join(&s, &email).await;
         let sent = mails(&seen, &email).await;
@@ -7903,7 +7919,10 @@ mod waitlist_confirm {
         );
         let text = sent[0]["text"].as_str().unwrap();
         assert!(text.contains("Confirm my email"), "{text}");
-        assert!(text.contains("http://localhost:8080/v1/waitlist/verify?token="));
+        assert!(
+            text.contains(&format!("{web}/waitlist/verify?token=")),
+            "{text}"
+        );
         let token = token_of(&sent[0]);
         let r = row(&db, &email).await;
         assert_eq!(
@@ -7927,8 +7946,8 @@ mod waitlist_confirm {
         assert_eq!(sent.len(), 2, "resent after an hour");
         let (old, new) = (token_of(&sent[0]), token_of(&sent[1]));
         assert_ne!(old, new);
-        assert!(verify(&s, &old).await.ends_with("?error=invalid_link"));
-        assert!(!verify(&s, &new).await.contains("error"));
+        assert!(!verify(&s, &old).await, "replaced token");
+        assert!(verify(&s, &new).await);
         backdate_sent(&db, &email, Duration::hours(2)).await;
         join(&s, &email).await;
         assert_eq!(mails(&seen, &email).await.len(), 2, "verified gets nothing");
@@ -7936,11 +7955,12 @@ mod waitlist_confirm {
 
     #[tokio::test]
     #[serial]
-    async fn mail_failure_still_answers_ok() {
+    async fn mail_failure_still_answers_ok_and_allows_a_retry() {
         let mut config = Config::from_env().unwrap();
         config.mailer =
             Mailer::resend_at("http://127.0.0.1:9/emails", "k", "a@example.com").unwrap();
         let db = connect(&config).await.unwrap();
+        reset_cap(&db).await;
         let s = TestServer::new(controllers::router(
             AppState::new(db.clone(), &config),
             &config,
@@ -7949,27 +7969,68 @@ mod waitlist_confirm {
         let email = unique_email();
         join(&s, &email).await;
         assert_eq!(rows(&db, &email).await, 1);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let r = row(&db, &email).await;
+        assert!(
+            r.verify_sent_at.is_none(),
+            "a failed send does not throttle"
+        );
     }
 
     #[tokio::test]
     #[serial]
-    async fn verify_marks_once_and_redirects() {
-        let (s, db, seen, web) = app().await;
+    async fn over_the_daily_cap_saves_but_does_not_mail() {
+        let (s, db, seen, _) = app().await;
+        let fill = "INSERT INTO rate_limit_hits (bucket) \
+                    SELECT 'waitlist:confirm' FROM generate_series(1, 500)";
+        db.execute_unprepared(fill).await.unwrap();
+        let email = unique_email();
+        join(&s, &email).await;
+        assert!(mails(&seen, &email).await.is_empty());
+        assert_eq!(rows(&db, &email).await, 1);
+        assert!(row(&db, &email).await.verify_sent_at.is_none());
+        reset_cap(&db).await;
+        join(&s, &email).await;
+        assert_eq!(
+            mails(&seen, &email).await.len(),
+            1,
+            "sent once the cap frees up"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn verify_marks_once() {
+        let (s, db, seen, _) = app().await;
         let email = unique_email();
         join(&s, &email).await;
         let token = token_of(&mails(&seen, &email).await[0]);
-        let done = format!("{web}/waitlist/verified");
-        assert_eq!(verify(&s, &token).await, done);
+        assert!(verify(&s, &token).await);
         let first = row(&db, &email).await.verified_at.expect("verified");
-        assert_eq!(verify(&s, &token).await, done, "a second click is fine");
+        assert!(verify(&s, &token).await, "a second click is fine");
         assert_eq!(row(&db, &email).await.verified_at, Some(first));
-        let bad = format!("{done}?error=invalid_link");
         for token in ["", "abc", &"0".repeat(64), &format!("{token}0")] {
-            assert_eq!(verify(&s, token).await, bad, "{token}");
+            assert!(!verify(&s, token).await, "{token}");
         }
-        let res = s.get("/v1/waitlist/verify").await;
-        assert_eq!(res.status_code(), 303);
-        assert_eq!(res.header("location"), bad.as_str());
+        let res = s.post("/v1/waitlist/verify").json(&json!({})).await;
+        assert_eq!(res.status_code(), 422);
+        res.assert_json(&json!({"error": "invalid_link"}));
+        let get = s.get(&format!("/v1/waitlist/verify?token={token}")).await;
+        assert_eq!(get.status_code(), 405, "a GET changes nothing");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn verify_shares_the_waitlist_rate_limit() {
+        let (s, _, _, _) = app().await;
+        for _ in 0..10 {
+            verify(&s, &"0".repeat(64)).await;
+        }
+        let res = s
+            .post("/v1/waitlist/verify")
+            .json(&json!({"token": "x"}))
+            .await;
+        assert_eq!(res.status_code(), 429);
     }
 
     #[tokio::test]
@@ -8065,7 +8126,7 @@ mod waitlist_confirm {
         let (s, _, _, _) = app().await;
         let doc = s.get("/openapi.json").await.json::<Value>();
         for (path, method) in [
-            ("/waitlist/verify", "get"),
+            ("/waitlist/verify", "post"),
             ("/waitlist/count", "get"),
             ("/admin/waitlist", "get"),
         ] {
