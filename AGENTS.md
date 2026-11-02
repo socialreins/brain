@@ -27,7 +27,7 @@ cargo run -p socialreins-brain
 - `app/src/controllers/waitlist.rs`: the public waitlist. No captcha: each new or unverified
   email gets a confirmation link to the web app, which posts the token to
   `POST /v1/waitlist/verify` (never a state-changing GET: mail scanners open links). Mail goes
-  out after the reply, at most hourly per email and 500 a day overall
+  out after the reply, at most hourly per email, 20 a day per IP and 500 a day overall
   (`rate_limit::daily_reserve`). `GET /v1/waitlist/count` is cached 30 seconds, and `GET /v1/admin/waitlist` is for `ADMIN_EMAILS` (`config.rs`) with a
   session cookie only.
 - `app/src/webhooks.rs`: outbound webhooks. Every `post_targets` status change goes through

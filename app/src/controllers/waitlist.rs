@@ -26,7 +26,7 @@ use uuid::Uuid;
 use super::auth::{internal, CurrentUser};
 use crate::{
     models::waitlist_signups,
-    rate_limit::{daily_refund, daily_reserve, ClientIp},
+    rate_limit::{self, daily_refund, daily_reserve, ClientIp},
     state::AppState,
 };
 
@@ -35,6 +35,9 @@ const MAX_SOURCE_LEN: usize = 100;
 const RESEND_AFTER_HOURS: i64 = 1;
 /// Confirmation emails across all signups per rolling 24 hours, since the form has no captcha.
 const CONFIRMATIONS_PER_DAY: i64 = 500;
+/// Confirmation emails one client IP (IPv6 by /64) may trigger per rolling 24 hours, so one
+/// source cannot use up the global allowance.
+const CONFIRMATIONS_PER_IP_PER_DAY: i64 = 20;
 const CONFIRMATIONS_BUCKET: &str = "waitlist:confirm";
 /// How long `GET /v1/waitlist/count` serves its cached number.
 const COUNT_TTL: StdDuration = StdDuration::from_secs(30);
@@ -83,7 +86,7 @@ pub(crate) fn rejected(r: &JsonRejection) -> Reply {
 }
 
 /// `200 {"status":"ok"}` for a new email and a known one alike. A new or unverified email gets a
-/// confirmation link by email, at most once an hour and within a global 500 a day; the mail goes
+/// confirmation link by email, at most once an hour, 20 a day per IP and 500 a day overall; the mail goes
 /// out after the reply, so neither the body nor the timing says whether the email was already on
 /// the list.
 #[utoipa::path(post, path = "/waitlist", tag = "waitlist", request_body = NewSignup,
@@ -136,7 +139,7 @@ async fn join(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Requ
     };
     if let Some(secret) = secret {
         // A failed mail keeps the row and the ok reply; the error carries no email or token.
-        tokio::spawn(async move { send_confirmation(&app, &email, &secret).await });
+        tokio::spawn(async move { send_confirmation(&app, ip, &email, &secret).await });
     }
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
@@ -163,10 +166,24 @@ async fn claim_confirmation(app: &AppState, email: &str) -> Result<Option<String
     Ok((claimed.rows_affected == 1).then_some(secret))
 }
 
-/// Mails the link within the global daily cap. Unsent (cap reached or mail failed), the claim
-/// is undone so the next signup of this email may try again; logs carry no email or token.
-async fn send_confirmation(app: &AppState, email: &str, secret: &str) {
-    let caps = [(CONFIRMATIONS_BUCKET.to_owned(), CONFIRMATIONS_PER_DAY)];
+/// Mails the link within the daily caps, per IP and global; both are checked before either is
+/// counted, so a refused IP uses up none of the global allowance. Unsent (a cap reached or mail
+/// failed), the claim is undone so the next signup of this email may try again; logs carry no
+/// email or token.
+async fn send_confirmation(
+    app: &AppState,
+    ip: Option<std::net::IpAddr>,
+    email: &str,
+    secret: &str,
+) {
+    let ip = ip.map_or_else(|| "unknown".into(), |ip| rate_limit::bucket(ip).to_string());
+    let caps = [
+        (
+            format!("{CONFIRMATIONS_BUCKET}:ip:{ip}"),
+            CONFIRMATIONS_PER_IP_PER_DAY,
+        ),
+        (CONFIRMATIONS_BUCKET.to_owned(), CONFIRMATIONS_PER_DAY),
+    ];
     let reserved = match daily_reserve(&app.db, &caps).await {
         Ok(Some(ids)) => ids,
         Ok(None) => {

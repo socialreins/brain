@@ -88,8 +88,9 @@ crates/core/     framework-free domain rules (email checks, tokens)
 list, so it never reveals who signed up. A bad email gets `422 {"error":"invalid_email"}`. Each
 client IP (IPv6 by /64) gets 10 requests a minute, then `429`. A new or still unverified email
 gets a confirmation email ("Confirm your spot on the SocialReins waitlist") after the reply, at
-most once an hour however often it signs up; a verified one gets none. At most 500 confirmation
-emails go out per rolling 24 hours across all signups; past that, and when a mail fails, the
+most once an hour however often it signs up; a verified one gets none. At most 20 confirmation
+emails go out per client IP (IPv6 by /64) and 500 across all signups per rolling 24 hours; past
+either, and when a mail fails, the
 signup is still saved and answered ok, nothing is sent, and the next signup of that email may
 try again. The link opens the web app at `WEB_URL/waitlist/verify?token=...`, which posts the
 token to `POST /v1/waitlist/verify` (so a mail scanner opening the link changes nothing): the

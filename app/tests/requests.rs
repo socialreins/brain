@@ -7831,7 +7831,7 @@ mod waitlist_confirm {
 
     /// Empties the global daily cap on confirmation emails, which other tests also use up.
     async fn reset_cap(db: &DatabaseConnection) {
-        let sql = "DELETE FROM rate_limit_hits WHERE bucket = 'waitlist:confirm'";
+        let sql = "DELETE FROM rate_limit_hits WHERE bucket LIKE 'waitlist:confirm%'";
         db.execute_unprepared(sql).await.unwrap();
     }
 
@@ -7975,6 +7975,52 @@ mod waitlist_confirm {
             r.verify_sent_at.is_none(),
             "a failed send does not throttle"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn one_ip_gets_20_confirmations_a_day() {
+        let mut config = Config::from_env().unwrap();
+        config.trust_proxy = true;
+        let (url, seen) = resend().await;
+        config.mailer = Mailer::resend_at(&url, "re_test", "brain@example.com").unwrap();
+        let db = connect(&config).await.unwrap();
+        reset_cap(&db).await;
+        let s = TestServer::new(controllers::router(
+            AppState::new(db.clone(), &config),
+            &config,
+        ))
+        .unwrap();
+        let fill = "INSERT INTO rate_limit_hits (bucket) \
+                    SELECT 'waitlist:confirm:ip:203.0.113.50' FROM generate_series(1, 20)";
+        db.execute_unprepared(fill).await.unwrap();
+        let join_from = |ip: &'static str, email: String| {
+            s.post("/v1/waitlist")
+                .add_header("x-forwarded-for", ip)
+                .json(&json!({"email": email}))
+        };
+        let (capped, other) = (unique_email(), unique_email());
+        join_from("203.0.113.50", capped.clone())
+            .await
+            .assert_status_ok();
+        join_from("203.0.113.51", other.clone())
+            .await
+            .assert_status_ok();
+        assert!(mails(&seen, &capped).await.is_empty(), "IP over its cap");
+        assert_eq!(rows(&db, &capped).await, 1, "signup still saved");
+        assert_eq!(mails(&seen, &other).await.len(), 1, "other IPs unaffected");
+        let global = "SELECT count(*) AS n FROM rate_limit_hits WHERE bucket = 'waitlist:confirm'";
+        let n: i64 = db
+            .query_one_raw(sea_orm::Statement::from_string(
+                db.get_database_backend(),
+                global,
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "n")
+            .unwrap();
+        assert_eq!(n, 1, "the refused IP used none of the global allowance");
     }
 
     #[tokio::test]

@@ -36,7 +36,7 @@ pub struct RateLimiter<K = Option<IpAddr>> {
 
 /// The bucket key: an IPv4 address as is, an IPv6 address by its /64 (one subscriber's
 /// allocation, so rotating addresses inside it does not escape the limit).
-fn bucket(ip: IpAddr) -> IpAddr {
+pub(crate) fn bucket(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => IpAddr::V4(v4),
