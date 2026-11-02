@@ -278,7 +278,23 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | no | Both or neither. Turn on Google sign-in (OAuth client of type Web application, redirect URI `{BRAIN_URL}/auth/google/callback`); YouTube will use them too |
 | `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | no | Both or neither. Turn on a Cloudflare Turnstile captcha: `POST /auth/link` and `/v1/contact` then need a `turnstile_token`. Off when unset |
 | `ADMIN_EMAILS` | no | Comma-separated emails, any case, whose signed-in users may read `GET /v1/admin/waitlist` (and get `is_admin: true` from `/auth/me`). None when unset |
+| `MEDIA_DIR` | no | `./media` (`/var/lib/brain/media` in the image). Where post media is kept while a post publishes, when no bucket is set. Files go once the post settles, so an ephemeral disk is fine |
+| `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | no | All or none. Keep post media in an S3-compatible bucket instead of `MEDIA_DIR`, path-style. Cloudflare R2: `S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com`; AWS S3: `https://s3.<region>.amazonaws.com` with `S3_REGION` |
+| `S3_REGION` | no | `auto` (what R2 wants) |
 | `CONTACT_TO` | no | Turn on `POST /v1/contact`, which mails each message to this address (Reply-To: the sender). Off when unset |
+
+## Media
+
+A post's `media` are URLs: public `https://` links or Google Drive share links
+(`/file/d/<id>/view`, `open?id=`, `uc?id=`; the file must be shared with anyone with the link).
+Nothing is fetched when a post is saved. When it publishes, brain downloads each URL once into
+its storage (`MEDIA_DIR` or the `S3_*` bucket): names must resolve to public addresses, at most 3
+redirects, each to a public https URL, streamed with a cap of 100 MB a file (1 MB for Bluesky)
+and typed by its first bytes (JPEG, PNG, WebP, GIF; MP4, MOV and PDF are kept for later
+platforms). Platforms are then served from the stored copy, and a URL that fails fails its
+target naming the image, before anything goes out. A post's files are deleted once it settles
+(published, failed or deleted); an hourly sweep deletes any left a week later whose post no
+longer waits to publish.
 
 ## Deploy
 

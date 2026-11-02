@@ -2671,9 +2671,14 @@ mod teams {
         /// The record key of every `deleteRecord` the mock took, newest last.
         static DELETED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+        /// `len` bytes, a real PNG signature first when the type says PNG.
         fn image(content_type: &'static str, len: usize) -> axum::response::Response {
             use axum::response::IntoResponse;
-            ([("content-type", content_type)], vec![7u8; len]).into_response()
+            let mut bytes = vec![7u8; len];
+            if content_type == "image/png" {
+                bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+            }
+            ([("content-type", content_type)], bytes).into_response()
         }
 
         fn authorized(headers: &axum::http::HeaderMap) -> bool {
@@ -3585,9 +3590,17 @@ mod teams {
         mod posts_api {
             use super::*;
             use socialreins_brain::{
+                media::{self, Media},
                 models::{post_targets, posts},
                 publish,
             };
+
+            /// Where the tests' brain stores media: local disk, as by default.
+            fn media_dir() -> std::path::PathBuf {
+                let dir = std::env::temp_dir().join("socialreins-brain-test-media");
+                std::fs::create_dir_all(&dir).unwrap();
+                dir
+            }
 
             /// A brain on the mock, with its state for driving the publish pipeline directly.
             async fn on_mock() -> (TestServer, DatabaseConnection, AppState) {
@@ -3597,6 +3610,10 @@ mod teams {
                 config.bluesky.appview = base.clone();
                 config.bluesky.plc = base;
                 config.bluesky.allow_insecure_pds = true;
+                let disk = object_store::local::LocalFileSystem::new_with_prefix(media_dir())
+                    .unwrap()
+                    .with_automatic_cleanup(true);
+                config.media = Media::new(std::sync::Arc::new(disk), true);
                 let db = socialreins_brain::connect(&config)
                     .await
                     .expect("database reachable");
@@ -4033,7 +4050,92 @@ mod teams {
                 assert_eq!(images.as_array().unwrap().len(), 2);
                 assert_eq!(images[0]["alt"], "");
                 assert_eq!(images[0]["image"]["mimeType"], "image/png");
+                assert_eq!(images[0]["image"]["size"], 64, "the stored bytes went up");
                 assert_eq!(get_post(&s, &cookie, &not_due).await["status"], "scheduled");
+                // The post settled, so its stored copy is gone, row and file.
+                assert_eq!(media_rows(&db, &id).await, 0);
+                assert!(!media_dir().join("posts").join(&id).exists());
+            }
+
+            async fn media_rows(db: &DatabaseConnection, post: &str) -> i64 {
+                use sea_orm::{ConnectionTrait, DbBackend, Statement};
+                let stmt = Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT count(*) AS n FROM post_media WHERE post_id = $1",
+                    vec![post.parse::<uuid::Uuid>().unwrap().into()],
+                );
+                let row = db.query_one_raw(stmt).await.unwrap().unwrap();
+                row.try_get("", "n").unwrap()
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn media_is_stored_once_and_swept_when_no_post_needs_it() {
+                use sea_orm::{ConnectionTrait, DbBackend, Statement};
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let base = pds_of(&db, &team_id).await;
+                let url = format!("{base}/img.png");
+                let mut ids = Vec::new();
+                for at in [Some(past()), None, Some(past())] {
+                    let later = at.map(|_| (Utc::now() + Duration::hours(1)).to_rfc3339());
+                    ids.push(id_of(
+                        &create(&s, &cookie, input(&set, "kept", later.as_deref())).await,
+                    ));
+                }
+                let (done, draft, fresh) = (&ids[0], &ids[1], &ids[2]);
+                // A retry reuses the stored copy: one row, one key.
+                let post: uuid::Uuid = done.parse().unwrap();
+                let a = state
+                    .media
+                    .ingest(&db, post, &url, 1_000_000)
+                    .await
+                    .unwrap();
+                let b = state
+                    .media
+                    .ingest(&db, post, &url, 1_000_000)
+                    .await
+                    .unwrap();
+                assert_eq!(a.key, b.key);
+                assert_eq!(a.content_type, "image/png");
+                assert_eq!(media_rows(&db, done).await, 1);
+                assert_eq!(state.media.read(&a.key).await.unwrap().len(), 64);
+                for id in [draft, fresh] {
+                    let p = id.parse().unwrap();
+                    state.media.ingest(&db, p, &url, 1_000_000).await.unwrap();
+                }
+                // `done` settled and `fresh` too, but only `done`'s copy is a week old.
+                let age = |id: &str, days: i32| {
+                    Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "UPDATE post_media SET created_at = now() - make_interval(days => $2) \
+                         WHERE post_id = $1",
+                        vec![id.parse::<uuid::Uuid>().unwrap().into(), days.into()],
+                    )
+                };
+                for (id, days) in [(done, 8), (draft, 8), (fresh, 1)] {
+                    db.execute_raw(age(id, days)).await.unwrap();
+                }
+                for id in [done, fresh] {
+                    let row = posts::ActiveModel {
+                        id: Set(id.parse().unwrap()),
+                        status: Set("published".into()),
+                        ..Default::default()
+                    };
+                    posts::Entity::update(row).exec(&db).await.unwrap();
+                }
+                assert_eq!(media::sweep(&state).await.unwrap(), 1);
+                assert_eq!(media_rows(&db, done).await, 0);
+                assert!(state.media.read(&a.key).await.is_err(), "the file is gone");
+                assert_eq!(media_rows(&db, draft).await, 1, "a draft still needs it");
+                assert_eq!(media_rows(&db, fresh).await, 1, "not a week old yet");
+                // Deleting the draft deletes its copy right away.
+                let res = req(&s, Method::DELETE, &format!("/v1/posts/{draft}"), &cookie).await;
+                assert_eq!(res.status_code(), 204);
+                assert_eq!(media_rows(&db, draft).await, 0);
+                state.media.release(&db, None, 0).await.unwrap();
+                assert_eq!(media_rows(&db, fresh).await, 0);
             }
 
             #[tokio::test]
@@ -4058,6 +4160,11 @@ mod teams {
                         "html",
                         vec!["/page.html"],
                         "Image 1 is not a JPEG, PNG, WebP or GIF.",
+                    ),
+                    (
+                        "missing",
+                        vec!["/img.png", "/no/such.png"],
+                        "Image 2 could not be downloaded (HTTP 404).",
                     ),
                 ];
                 for (text, media, msg) in cases {

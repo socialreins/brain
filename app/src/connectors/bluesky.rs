@@ -463,54 +463,6 @@ impl Bluesky {
             .await
     }
 
-    /// Downloads image `n` (1-based, for messages) of a post: https only, a public address,
-    /// an image type Bluesky takes, at most 1 MB.
-    async fn image(&self, n: usize, url: &str) -> Result<(Vec<u8>, String), PostError> {
-        let bad = || failed(format!("Image {n} is not a public https URL."));
-        let parsed = Url::parse(url).map_err(|_| bad())?;
-        let host = parsed.host_str().unwrap_or_default();
-        let named = !host.is_empty() && host.trim_matches(['[', ']']).parse::<IpAddr>().is_err();
-        let secure = parsed.scheme() == "https" && named;
-        if !parsed.username().is_empty() || !(secure || self.allow_insecure_pds) {
-            return Err(bad());
-        }
-        let res = self.client.get(parsed).send().await.map_err(|e| {
-            tracing::warn!(error = %e.without_url(), n, "image download failed");
-            failed(format!("Image {n} could not be downloaded."))
-        })?;
-        if res.status() != StatusCode::OK {
-            return Err(failed(format!(
-                "Image {n} could not be downloaded (HTTP {}).",
-                res.status().as_u16()
-            )));
-        }
-        let mime = res
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| {
-                v.split(';')
-                    .next()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_ascii_lowercase()
-            })
-            .unwrap_or_default();
-        if !IMAGE_TYPES.contains(&mime.as_str()) {
-            return Err(failed(format!(
-                "Image {n} is not a JPEG, PNG, WebP or GIF."
-            )));
-        }
-        match read_capped(res, MAX_IMAGE_BYTES).await {
-            Ok(bytes) => Ok((bytes, mime)),
-            Err(Read::TooLarge) => Err(failed(format!("Image {n} is over 1 MB, Bluesky's limit."))),
-            Err(Read::Failed(e)) => {
-                tracing::warn!(error = %e.without_url(), n, "image download failed");
-                Err(failed(format!("Image {n} could not be downloaded.")))
-            }
-        }
-    }
-
     /// Runs `call` with the account's session (cached, see `live`, so a thread logs in once).
     /// A cached session the PDS refuses (`401`, or `400 ExpiredToken`/`InvalidToken`) is opened
     /// again once: a refused session made nothing, so this cannot post twice.
@@ -534,13 +486,13 @@ impl Bluesky {
         Err(PostError::Reconnect)
     }
 
-    /// Publishes a post with up to 4 images, a reply when `reply` holds `(parent, root)`;
+    /// Publishes a post with up to 4 images `(bytes, type)`, a reply when `reply` holds `(parent, root)`;
     /// returns its `(at:// uri, cid)`.
     pub async fn publish_post(
         &self,
         c: &Creds<'_>,
         text: &str,
-        media: &[String],
+        media: &[(Vec<u8>, String)],
         reply: Option<(Ref<'_>, Ref<'_>)>,
     ) -> Result<(String, String), PostError> {
         self.with_session(c, |s| self.create_post(s, c.did, text, media, reply))
@@ -552,15 +504,26 @@ impl Bluesky {
         s: Live,
         did: &str,
         text: &str,
-        media: &[String],
+        media: &[(Vec<u8>, String)],
         reply: Option<(Ref<'_>, Ref<'_>)>,
     ) -> Result<(String, String), PostError> {
         let (pds, jwt) = (&s.pds, &s.jwt);
         let mut images = Vec::new();
-        for (i, url) in media.iter().enumerate() {
-            let (bytes, mime) = self.image(i + 1, url).await?;
+        for (i, (bytes, mime)) in media.iter().enumerate() {
+            if !IMAGE_TYPES.contains(&mime.as_str()) {
+                let n = i + 1;
+                return Err(failed(format!(
+                    "Image {n} is not a JPEG, PNG, WebP or GIF."
+                )));
+            }
             let up = self
-                .call(pds, jwt, "com.atproto.repo.uploadBlob", bytes.into(), &mime)
+                .call(
+                    pds,
+                    jwt,
+                    "com.atproto.repo.uploadBlob",
+                    bytes.clone().into(),
+                    mime,
+                )
                 .await?;
             if !up["blob"].is_object() {
                 return Err(failed("Bluesky did not take an image."));

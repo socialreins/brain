@@ -17,11 +17,13 @@ RUN find app crates -name '*.rs' -exec touch {} + \
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --no-create-home brain
+    && useradd --system --uid 10001 --no-create-home brain \
+    && mkdir -p /var/lib/brain/media && chown brain /var/lib/brain/media
 COPY --from=builder /src/target/release/socialreins-brain /usr/local/bin/socialreins-brain
 USER brain
 # The commit /version reports in published images (Railway sets RAILWAY_GIT_COMMIT_SHA instead).
 ARG GIT_COMMIT
-ENV PORT=8080 GIT_COMMIT=$GIT_COMMIT
+# Post media lives here only while a post publishes; mount a volume to keep it across restarts.
+ENV PORT=8080 GIT_COMMIT=$GIT_COMMIT MEDIA_DIR=/var/lib/brain/media
 EXPOSE 8080
 CMD ["socialreins-brain"]

@@ -153,6 +153,8 @@ mod tests {
         };
         assert_eq!(ok("hello", &[]), Ok(()));
         assert_eq!(ok("", &["https://a.example/i.png"]), Ok(()));
+        let drive = "https://drive.google.com/file/d/1AbC-d_9/view?usp=sharing";
+        assert_eq!(ok("", &[drive]), Ok(()), "Drive share links are media");
         assert_eq!(ok("  ", &[]), Err(Invalid::Empty));
         // Graphemes, not chars: 300 "e" plus a combining accent are 600 chars but 300 graphemes.
         assert_eq!(ok(&"e\u{301}".repeat(300), &[]), Ok(()));

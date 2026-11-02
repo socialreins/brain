@@ -61,7 +61,9 @@ pub struct Post {
     /// `bluesky`.
     pub platform: String,
     pub body: String,
-    /// Public `https://` image URLs.
+    /// Public `https://` image URLs; Google Drive share links work when the file is shared
+    /// with anyone with the link. Downloaded when the post publishes (JPEG, PNG, WebP or GIF, at
+    /// most 1 MB each on Bluesky) and deleted once it settles.
     pub media: Vec<String>,
     /// Follow-up posts, each a reply to the one before.
     pub thread: Vec<ThreadPart>,
@@ -815,7 +817,10 @@ pub async fn delete_post(app: &AppState, a: &Actor, id: Uuid) -> Response {
                 .exec(&app.db)
                 .await;
             match gone {
-                Ok(r) if r.rows_affected == 1 => StatusCode::NO_CONTENT.into_response(),
+                Ok(r) if r.rows_affected == 1 => {
+                    app.media.release_post(&app.db, id).await;
+                    StatusCode::NO_CONTENT.into_response()
+                }
                 Ok(_) => reply(StatusCode::CONFLICT, "not_deletable"),
                 Err(e) => internal(e, "post delete"),
             }
@@ -826,7 +831,9 @@ pub async fn delete_post(app: &AppState, a: &Actor, id: Uuid) -> Response {
                     return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
                 }
                 match publish::takedown(app, &found).await {
-                    Ok(problems) if problems.is_empty() => {}
+                    Ok(problems) if problems.is_empty() => {
+                        app.media.release_post(&app.db, id).await;
+                    }
                     // 422, never 502: a proxy may swap a 502 body for its own page.
                     Ok(problems) => {
                         let body = serde_json::json!({

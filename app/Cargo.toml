@@ -12,6 +12,8 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "pool", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
 migration = { path = "migration" }
+# Local disk, S3 and R2 behind one trait; its S3 client takes a custom endpoint, path-style.
+object_store = { version = "0.12", features = ["aws"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 rmcp = { version = "3.7", default-features = false, features = ["server", "transport-streamable-http-server"] }
 sea-orm = { version = "2.0", default-features = false, features = ["macros", "with-uuid", "with-chrono", "with-json", "runtime-tokio-rustls", "sqlx-postgres"] }
