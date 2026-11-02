@@ -46,10 +46,13 @@ impl Role {
 /// A trimmed team or set name of 1 to `MAX_NAME_CHARS` characters, without control characters
 /// (it goes into email subjects).
 pub fn name(raw: &str) -> Option<String> {
+    name_up_to(raw, MAX_NAME_CHARS)
+}
+
+/// `name` with a limit of `max` characters, for other names such as a user's display name.
+pub fn name_up_to(raw: &str, max: usize) -> Option<String> {
     let name = raw.trim();
-    let ok = !name.is_empty()
-        && name.chars().count() <= MAX_NAME_CHARS
-        && !name.chars().any(char::is_control);
+    let ok = !name.is_empty() && name.chars().count() <= max && !name.chars().any(char::is_control);
     ok.then(|| name.to_owned())
 }
 
@@ -70,7 +73,7 @@ pub fn inert(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{inert, name, Role::*};
+    use super::{inert, name, name_up_to, Role::*};
 
     #[test]
     fn inert_names_cannot_pass_as_links() {
@@ -122,5 +125,7 @@ mod tests {
         assert!(name(&"a".repeat(60)).is_some());
         assert_eq!(name(&"a".repeat(61)), None);
         assert_eq!(name("a\r\nBcc: x"), None);
+        assert!(name_up_to(&"a".repeat(80), 80).is_some());
+        assert_eq!(name_up_to(&"a".repeat(81), 80), None);
     }
 }

@@ -30,7 +30,10 @@ use tower_http::{
     trace::TraceLayer,
 };
 use utoipa::{
-    openapi::security::{ApiKey, ApiKeyValue, Http, HttpAuthScheme, SecurityScheme},
+    openapi::{
+        security::{ApiKey, ApiKeyValue, Http, HttpAuthScheme, SecurityScheme},
+        Server,
+    },
     OpenApi,
 };
 use utoipa_axum::router::OpenApiRouter;
@@ -94,6 +97,11 @@ fn span(req: &axum::http::Request<axum::body::Body>) -> tracing::Span {
 
 pub fn router(state: AppState, config: &Config) -> Router {
     let (v1, mut doc) = api().split_for_parts();
+    let (auth_api, mut auth_doc) = auth::api().split_for_parts();
+    for item in auth_doc.paths.paths.values_mut() {
+        item.servers = Some(vec![Server::new("/")]);
+    }
+    doc.merge(auth_doc);
     let components = doc.components.get_or_insert_default();
     components.add_security_scheme(
         "session",
@@ -119,6 +127,7 @@ pub fn router(state: AppState, config: &Config) -> Router {
         .merge(health::routes())
         .merge(
             auth::routes()
+                .merge(auth_api)
                 .merge(google::routes())
                 .layer(DefaultBodyLimit::max(MAX_BODY_BYTES)),
         )

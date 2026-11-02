@@ -23,6 +23,7 @@ cargo run -p socialreins-brain
 - `app/migration/`: one file per migration, raw SQL, registered in `lib.rs`. Applied on boot.
 - `crates/*`: framework-free domain code. Never depend on `axum` or `sea-orm` there.
 - `/v1` routes carry `utoipa::path` annotations; `/openapi.json` is generated from them.
+  `PATCH /auth/me` is documented there too, under its own `/` server (`auth::api`).
 - `app/src/mcp/`: `/mcp`, whose tools call the same service fns as their `/v1` routes.
 - `app/src/controllers/waitlist.rs`: the public waitlist. No captcha: each new or unverified
   email gets a confirmation link to the web app, which posts the token to
