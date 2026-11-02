@@ -2381,6 +2381,48 @@ mod teams {
 
     #[tokio::test]
     #[serial]
+    async fn patch_me_renames_the_user() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, cookie, _) = user(&s, &db).await;
+        let rename = |name: Value| {
+            req(&s, Method::PATCH, "/auth/me", &cookie).json(&json!({ "name": name }))
+        };
+
+        let res = rename(json!("  Ada Lovelace  ")).await;
+        res.assert_status_ok();
+        let body = res.json::<Value>();
+        assert_eq!(body["name"], "Ada Lovelace");
+        let me = s.get("/auth/me").add_header("cookie", &cookie).await;
+        assert_eq!(me.json::<Value>(), body);
+
+        for bad in [json!("   "), json!("a".repeat(81))] {
+            let res = rename(bad).await;
+            assert_eq!(res.status_code(), 422);
+            assert_eq!(res.json::<Value>(), json!({"error": "invalid_name"}));
+        }
+        rename(json!("é".repeat(80))).await.assert_status_ok();
+
+        let res = s
+            .patch("/auth/me")
+            .add_header("origin", WEB)
+            .json(&json!({"name": "x"}))
+            .await;
+        assert_eq!(res.status_code(), 401);
+        assert_eq!(res.json::<Value>(), json!({"error": "unauthorized"}));
+        let res = s
+            .patch("/auth/me")
+            .add_header("cookie", &cookie)
+            .json(&json!({"name": "x"}))
+            .await;
+        assert_eq!(res.json::<Value>(), json!({"error": "forbidden_origin"}));
+
+        let doc = s.get("/openapi.json").await.json::<Value>();
+        assert!(doc["paths"]["/auth/me"]["patch"].is_object());
+        assert_eq!(doc["paths"]["/auth/me"]["servers"][0]["url"], "/");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn openapi_documents_the_team_routes() {
         let (s, _) = server_where(|_| {}).await;
         let doc = s.get("/openapi.json").await.json::<Value>();

@@ -1,7 +1,8 @@
 //! Sign-in by magic link and server-side sessions.
 //!
 //! `POST /auth/link` emails a link, `GET /auth/magic/{token}` shows a sign-in button that posts
-//! it to `POST /auth/magic`, which uses it once and sets the session cookie, `GET /auth/me` returns the signed-in user, `POST /auth/logout` ends it.
+//! it to `POST /auth/magic`, which uses it once and sets the session cookie, `GET /auth/me` returns the signed-in user, `PATCH /auth/me` renames them, `POST /auth/logout`
+//! ends it.
 //! Every sign-in gives a user without a team a personal one (see `teams::ensure_team`).
 use axum::{
     extract::{Form, FromRequest, FromRequestParts, Path, Request, State},
@@ -17,11 +18,13 @@ use sea_orm::{
 };
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::json;
-use socialreins_core::{email, token};
+use socialreins_core::{email, team, token};
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::{
     teams,
-    waitlist::{error, rejected, Reply},
+    waitlist::{error, rejected, Error, Reply},
 };
 use crate::{
     config::origin,
@@ -36,6 +39,8 @@ const LINK_MINUTES: i64 = 15;
 const SESSION_DAYS: i64 = 30;
 /// Unexpired links one email can hold; past it, `POST /auth/link` sends nothing.
 const MAX_LIVE_LINKS: u64 = 3;
+/// Longest display name, in characters after trimming.
+const MAX_USER_NAME_CHARS: usize = 80;
 
 #[derive(Deserialize)]
 struct LinkRequest {
@@ -520,6 +525,43 @@ async fn me(State(app): State<AppState>, CurrentUser(user, _): CurrentUser) -> R
     body["current_team"] = json!({"id": team.id, "name": team.name, "role": role.as_str()});
     body["is_admin"] = super::waitlist::is_admin(&app, &user.email).into();
     Json(body).into_response()
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct NewName {
+    /// 1 to 80 characters after trimming, no control characters.
+    pub name: String,
+}
+
+/// Changes the signed-in user's display name. Replies with the same body as `GET /auth/me`.
+#[utoipa::path(patch, path = "/auth/me", tag = "auth", request_body = NewName,
+    security(("session" = [])),
+    responses((status = 200, body = serde_json::Value, description = "As `GET /auth/me`"),
+        (status = 401, body = Error), (status = 403, body = Error), (status = 422, body = Error)))]
+async fn rename(
+    _: FromWeb,
+    State(app): State<AppState>,
+    CurrentUser(user, session): CurrentUser,
+    Body(body): Body<NewName>,
+) -> Response {
+    let Some(name) = team::name_up_to(&body.name, MAX_USER_NAME_CHARS) else {
+        return error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name").into_response();
+    };
+    let row = users::ActiveModel {
+        id: Set(user.id),
+        name: Set(name),
+        updated_at: Set(Utc::now().fixed_offset()),
+        ..Default::default()
+    };
+    match users::Entity::update(row).exec(&app.db).await {
+        Ok(user) => me(State(app), CurrentUser(user, session)).await,
+        Err(e) => internal(e, "user rename"),
+    }
+}
+
+/// `PATCH /auth/me`, documented in `/openapi.json` under its own `/` server (it is not in `/v1`).
+pub fn api() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(rename))
 }
 
 /// `POST /auth/logout`: only the web app's origins, so another site cannot sign a user out.
