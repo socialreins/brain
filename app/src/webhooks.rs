@@ -66,18 +66,7 @@ impl Webhooks {
             return None;
         }
         let url = Url::parse(raw).ok()?;
-        let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
-        if !url.username().is_empty() || url.password().is_some() || host.is_empty() {
-            return None;
-        }
-        if self.allow_private {
-            return matches!(url.scheme(), "https" | "http").then_some(url);
-        }
-        let ok_host = match host.trim_matches(['[', ']']).parse::<IpAddr>() {
-            Ok(ip) => public(ip),
-            Err(_) => host != "localhost" && !host.ends_with(".localhost"),
-        };
-        (url.scheme() == "https" && ok_host).then_some(url)
+        public_url(&url, self.allow_private).then_some(url)
     }
 
     /// POSTs `body`, signed; the receiver's status code, or an error code: `blocked_address`,
@@ -107,6 +96,27 @@ impl Webhooks {
             Err(e) => Err(error_code(&e)),
         }
     }
+}
+
+/// `https://`, no credentials, and a host that is a name other than `localhost` or a public
+/// address. `allow_private` (tests only) also takes plain http and private address literals.
+pub fn public_url(url: &Url, allow_private: bool) -> bool {
+    let host = url
+        .host_str()
+        .unwrap_or_default()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if !url.username().is_empty() || url.password().is_some() || host.is_empty() {
+        return false;
+    }
+    if allow_private {
+        return matches!(url.scheme(), "https" | "http");
+    }
+    let ok_host = match host.trim_matches(['[', ']']).parse::<IpAddr>() {
+        Ok(ip) => public(ip),
+        Err(_) => host != "localhost" && !host.ends_with(".localhost"),
+    };
+    url.scheme() == "https" && ok_host
 }
 
 fn error_code(e: &reqwest::Error) -> &'static str {

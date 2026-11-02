@@ -51,6 +51,8 @@ pub struct AppState {
     pub admin_emails: Vec<String>,
     /// `GET /v1/waitlist/count`'s last answer and when it was read from the database.
     pub waitlist_count: Arc<std::sync::Mutex<Option<(std::time::Instant, u64)>>>,
+    /// Post media while a post publishes (`media.rs`).
+    pub media: crate::media::Media,
 }
 
 impl AppState {
@@ -87,6 +89,7 @@ impl AppState {
             )),
             admin_emails: config.admin_emails.clone(),
             waitlist_count: Arc::default(),
+            media: config.media.clone(),
         }
     }
 }

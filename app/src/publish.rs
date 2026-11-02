@@ -3,8 +3,13 @@
 //! part as a reply to the one before, each saved on its target the moment the platform takes
 //! it. Every step is a conditional update, so two instances (or a tick and "publish now") never
 //! send a post twice. A publish is never retried: a retry could post twice. Each target status change queues its webhook event in the same
-//! statement (`webhooks::with_event`).
-use std::{sync::LazyLock, time::Duration};
+//! statement (`webhooks::with_event`). Media is downloaded into brain's storage before any
+//! target is claimed (`media.rs`) and deleted once the post settles.
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use tokio::sync::Semaphore;
 
@@ -19,6 +24,7 @@ pub use crate::connectors::bluesky::PostError as PublishError;
 use crate::{
     connectors::bluesky::{self, Bluesky},
     controllers::posts::ThreadPart,
+    media::{Fail, Stored},
     models::{
         post_targets, posts, social_account_social_set as membership, social_accounts, social_sets,
     },
@@ -43,7 +49,7 @@ pub trait Publisher: Send + Sync {
         account: &social_accounts::Model,
         secret: &str,
         body: &str,
-        media: &[String],
+        media: &[(Vec<u8>, String)],
         reply: Option<(&Remote, &Remote)>,
     ) -> Result<Remote, PublishError>;
 
@@ -73,7 +79,7 @@ impl Publisher for Bluesky {
         account: &social_accounts::Model,
         secret: &str,
         body: &str,
-        media: &[String],
+        media: &[(Vec<u8>, String)],
         reply: Option<(&Remote, &Remote)>,
     ) -> Result<Remote, PublishError> {
         let reply = reply.map(|(p, r)| {
@@ -409,12 +415,21 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         let msg = format!("No {} account is in this post's set.", post.platform);
         return fail_post(db, id, &msg).await;
     }
-    let runs: Vec<_> = targets
+    let pending: Vec<Uuid> = targets
         .into_iter()
         .filter(|t| t.status == "pending")
+        .map(|t| t.id)
+        .collect();
+    let stored = if pending.is_empty() {
+        Arc::default()
+    } else {
+        Arc::new(ingest(app, &post).await)
+    };
+    let runs: Vec<_> = pending
+        .into_iter()
         .map(|t| {
-            let (app, post) = (app.clone(), post.clone());
-            tokio::spawn(async move { publish_target(&app, &post, t.id).await })
+            let (app, post, stored) = (app.clone(), post.clone(), stored.clone());
+            tokio::spawn(async move { publish_target(&app, &post, t, &stored).await })
         })
         .collect();
     for run in runs {
@@ -424,7 +439,85 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
             Ok(Ok(())) => {}
         }
     }
-    settle(db, id).await
+    let settled = settle(db, id).await;
+    app.media.release_post(db, id).await;
+    settled
+}
+
+/// Each media URL of a post and its thread, downloaded once into storage, or why not.
+type Media = HashMap<String, Result<Stored, Fail>>;
+
+async fn ingest(app: &AppState, post: &posts::Model) -> Media {
+    // shortcut: Bluesky is the only publisher, so its 1 MB image cap; cap per platform with more.
+    let cap = bluesky::MAX_IMAGE_BYTES;
+    let thread: Vec<ThreadPart> = serde_json::from_value(post.thread.clone()).unwrap_or_default();
+    let root: Vec<String> = serde_json::from_value(post.media.clone()).unwrap_or_default();
+    let urls: Vec<String> = root
+        .into_iter()
+        .chain(thread.into_iter().flat_map(|p| p.media))
+        .collect();
+    app.media.ingest_all(&app.db, post.id, &urls, cap).await
+}
+
+/// What to tell the user about image `n` that could not be stored.
+fn media_error(fail: Fail, n: usize) -> String {
+    match fail {
+        Fail::Blocked => format!("Image {n} is not a public https URL."),
+        Fail::NotShared => format!(
+            "Image {n} is a Google Drive file that is not shared publicly. Share it with \
+             anyone with the link."
+        ),
+        Fail::Http(code) => format!("Image {n} could not be downloaded (HTTP {code})."),
+        Fail::Unreachable => format!("Image {n} could not be downloaded."),
+        Fail::TooLarge => format!("Image {n} is over 1 MB, Bluesky's limit."),
+        Fail::Unsupported => format!("Image {n} is not a JPEG, PNG, WebP or GIF."),
+        Fail::Storage => format!("Image {n} could not be stored. Try again."),
+        Fail::TimedOut => format!(
+            "Image {n} did not download in time: the post's media took over a minute. Use \
+             faster or smaller links."
+        ),
+    }
+}
+
+/// The first media problem of the post or its thread, so nothing goes out with one.
+fn media_problem(media: &Media, root: &[String], thread: &[ThreadPart]) -> Option<String> {
+    let first = |urls: &[String]| {
+        urls.iter()
+            .enumerate()
+            .find_map(|(i, u)| match media.get(u) {
+                Some(Err(f)) => Some(media_error(*f, i + 1)),
+                _ => None,
+            })
+    };
+    first(root).or_else(|| {
+        thread.iter().enumerate().find_map(|(i, p)| {
+            let msg = first(&p.media)?;
+            Some(format!("Thread post {} of {}: {msg}", i + 1, thread.len()))
+        })
+    })
+}
+
+/// The stored bytes and type of each URL.
+async fn load(
+    app: &AppState,
+    media: &Media,
+    urls: &[String],
+) -> Result<Vec<(Vec<u8>, String)>, String> {
+    let mut files = Vec::new();
+    for (i, url) in urls.iter().enumerate() {
+        let n = i + 1;
+        let Some(Ok(s)) = media.get(url) else {
+            return Err(media_error(Fail::Storage, n));
+        };
+        match app.media.read(&s.key).await {
+            Ok(bytes) => files.push((bytes, s.content_type.clone())),
+            Err(e) => {
+                tracing::warn!(error = %e, "stored media read failed");
+                return Err(media_error(Fail::Storage, n));
+            }
+        }
+    }
+    Ok(files)
 }
 
 async fn fail_target(db: &DatabaseConnection, id: Uuid, msg: &str) -> Result<(), DbErr> {
@@ -448,15 +541,18 @@ pub async fn claim_target(db: &DatabaseConnection, id: Uuid) -> Result<bool, DbE
     Ok(db.execute_raw(stmt).await?.rows_affected() == 1)
 }
 
-/// One post (or thread part) with its time limit; `Err` holds what to tell the user.
+/// One post (or thread part), its media read from storage, with its time limit; `Err` holds what
+/// to tell the user.
 async fn send(
+    (app, stored): (&AppState, &Media),
     publisher: &dyn Publisher,
     account: &social_accounts::Model,
     secret: &str,
     (body, media): (&str, &[String]),
     reply: Option<(&Remote, &Remote)>,
 ) -> Result<Remote, String> {
-    let sent = publisher.publish(account, secret, body, media, reply);
+    let media = load(app, stored, media).await?;
+    let sent = publisher.publish(account, secret, body, &media, reply);
     match tokio::time::timeout(TARGET_TIMEOUT, sent).await {
         Ok(Ok(remote)) => Ok(remote),
         Ok(Err(PublishError::Reconnect)) => Err(RECONNECT.to_owned()),
@@ -465,7 +561,12 @@ async fn send(
     }
 }
 
-async fn publish_target(app: &AppState, post: &posts::Model, id: Uuid) -> Result<(), DbErr> {
+async fn publish_target(
+    app: &AppState,
+    post: &posts::Model,
+    id: Uuid,
+    stored: &Media,
+) -> Result<(), DbErr> {
     let Ok(_slot) = TARGET_SLOTS.acquire().await else {
         return Ok(());
     };
@@ -492,7 +593,21 @@ async fn publish_target(app: &AppState, post: &posts::Model, id: Uuid) -> Result
         return fail_target(db, id, RECONNECT).await;
     };
     let media: Vec<String> = serde_json::from_value(post.media.clone()).unwrap_or_default();
-    let root = match send(publisher, &account, &secret, (&post.body, &media), None).await {
+    let thread: Vec<ThreadPart> = serde_json::from_value(post.thread.clone()).unwrap_or_default();
+    if let Some(msg) = media_problem(stored, &media, &thread) {
+        return fail_target(db, id, &msg).await;
+    }
+    let with = (app, stored);
+    let root = match send(
+        with,
+        publisher,
+        &account,
+        &secret,
+        (&post.body, &media),
+        None,
+    )
+    .await
+    {
         Ok(remote) => remote,
         Err(msg) => return fail_target(db, id, &msg).await,
     };
@@ -509,11 +624,11 @@ async fn publish_target(app: &AppState, post: &posts::Model, id: Uuid) -> Result
     );
     db.execute_raw(stmt).await?;
     // Each part right after the platform takes it, so its parent is always saved before it.
-    let thread: Vec<ThreadPart> = serde_json::from_value(post.thread.clone()).unwrap_or_default();
     let mut parent = root.clone();
     for (i, part) in thread.iter().enumerate() {
         let content = (part.body.as_str(), part.media.as_slice());
         let made = match send(
+            with,
             publisher,
             &account,
             &secret,

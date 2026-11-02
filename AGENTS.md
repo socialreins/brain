@@ -30,6 +30,13 @@ cargo run -p socialreins-brain
   out after the reply, at most hourly per email, 20 a day per IP and 500 a day overall
   (`rate_limit::daily_reserve`). `GET /v1/waitlist/count` is cached 30 seconds, and `GET /v1/admin/waitlist` is for `ADMIN_EMAILS` (`config.rs`) with a
   session cookie only.
+- `app/src/media.rs`: post media. Publishing downloads each URL (Drive share links rewritten)
+  once into local disk (`MEDIA_DIR`) or an S3-compatible bucket (`S3_*`, `config.rs`), saved in
+  `post_media`, and the publisher reads the stored bytes. Every download goes through
+  `PublicOnly`. Files go once the post settles or is deleted, and the hourly sweep deletes the
+  rest after 7 days; a storage error is only logged. Cleanup lists `posts/<post id>/` in the
+  store, so it also catches files no row names. Local disk assumes one brain instance: run
+  more than one replica only with the `S3_*` bucket.
 - `app/src/webhooks.rs`: outbound webhooks. Every `post_targets` status change goes through
   `webhooks::with_event`, so its event is queued in the same statement; README documents the
   payload and signature.

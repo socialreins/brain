@@ -2,6 +2,7 @@
 use std::sync::Arc;
 
 use axum::http::HeaderValue;
+use object_store::{aws::AmazonS3Builder, local::LocalFileSystem, ObjectStore};
 use webauthn_rs::{prelude::Url, Webauthn, WebauthnBuilder};
 
 use socialreins_core::crypto::Cipher;
@@ -9,6 +10,7 @@ use socialreins_core::crypto::Cipher;
 use crate::{
     connectors::{bluesky::Bluesky, google::Google},
     mail::Mailer,
+    media::Media,
     turnstile::Turnstile,
 };
 
@@ -71,6 +73,11 @@ pub struct Config {
     /// `ADMIN_EMAILS`, comma-separated and normalized: users who may read `/v1/admin/*`.
     /// Empty when unset.
     pub admin_emails: Vec<String>,
+    /// Where post media is stored while a post publishes. `S3_BUCKET`, `S3_ENDPOINT`,
+    /// `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` (all or none; `S3_REGION`, default `auto`):
+    /// an S3-compatible bucket, path-style (Cloudflare R2, AWS S3, MinIO). Else local disk at
+    /// `MEDIA_DIR` (default `./media`, created when missing).
+    pub media: Media,
 }
 
 impl Config {
@@ -152,6 +159,7 @@ impl Config {
             turnstile,
             contact_to,
             admin_emails: admin_emails(var("ADMIN_EMAILS"))?,
+            media: Media::new(media_store(var)?, false),
         })
     }
 }
@@ -173,6 +181,42 @@ fn admin_emails(raw: Option<String>) -> Result<Vec<String>, String> {
                 .ok_or_else(|| format!("ADMIN_EMAILS: not an email address: {e}"))
         })
         .collect()
+}
+
+/// The media store `Config::media` describes.
+fn media_store(var: impl Fn(&str) -> Option<String>) -> Result<Arc<dyn ObjectStore>, String> {
+    let s3 = [
+        "S3_BUCKET",
+        "S3_ENDPOINT",
+        "S3_ACCESS_KEY_ID",
+        "S3_SECRET_ACCESS_KEY",
+    ]
+    .map(&var);
+    match s3 {
+        [Some(bucket), Some(endpoint), Some(key_id), Some(secret)] => {
+            let s3 = AmazonS3Builder::new()
+                .with_bucket_name(bucket)
+                .with_endpoint(endpoint)
+                .with_region(var("S3_REGION").unwrap_or_else(|| "auto".into()))
+                .with_access_key_id(key_id)
+                .with_secret_access_key(secret)
+                .build()
+                .map_err(|e| format!("S3_BUCKET: {e}"))?;
+            Ok(Arc::new(s3))
+        }
+        [None, None, None, None] => {
+            let dir = var("MEDIA_DIR").unwrap_or_else(|| "./media".into());
+            std::fs::create_dir_all(&dir).map_err(|e| format!("MEDIA_DIR: {e}"))?;
+            let local =
+                LocalFileSystem::new_with_prefix(&dir).map_err(|e| format!("MEDIA_DIR: {e}"))?;
+            Ok(Arc::new(local.with_automatic_cleanup(true)))
+        }
+        _ => Err(
+            "S3_BUCKET, S3_ENDPOINT, S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY: set all \
+                  or none"
+                .into(),
+        ),
+    }
 }
 
 /// `ENCRYPTION_KEY`: brain does not start without a valid one.
@@ -281,6 +325,39 @@ mod tests {
         assert!(super::cipher(Some("c2hvcnQ=".into())).is_err());
         let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
         assert!(super::cipher(Some(key.into())).is_ok());
+    }
+
+    #[test]
+    fn media_is_on_disk_unless_the_whole_bucket_is_set() {
+        let dir = std::env::temp_dir().join(format!("media-{}", uuid::Uuid::now_v7()));
+        let dir = dir.to_str().unwrap().to_owned();
+        let with = |pairs: &[(&str, &str)], dir: &str| {
+            let mut vars: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            vars.push(("MEDIA_DIR".into(), dir.to_owned()));
+            super::media_store(move |n: &str| {
+                vars.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone())
+            })
+        };
+        let local = with(&[], &dir).ok().unwrap();
+        assert!(local.to_string().contains("LocalFileSystem"), "{local}");
+        assert!(std::path::Path::new(&dir).is_dir());
+        let full = [
+            ("S3_BUCKET", "media"),
+            ("S3_ENDPOINT", "https://acct.r2.cloudflarestorage.com"),
+            ("S3_ACCESS_KEY_ID", "id"),
+            ("S3_SECRET_ACCESS_KEY", "secret"),
+        ];
+        let s3 = with(&full, &dir).ok().unwrap();
+        assert!(s3.to_string().contains("media"), "{s3}");
+        for n in 0..full.len() {
+            let mut partial = full.to_vec();
+            partial.remove(n);
+            assert!(with(&partial, &dir).is_err(), "without {}", full[n].0);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
