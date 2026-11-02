@@ -510,7 +510,7 @@ pub(crate) fn user_json(user: &users::Model) -> Json<serde_json::Value> {
     }))
 }
 
-/// The user, plus `current_team` `{id, name, role}`.
+/// The user, plus `current_team` `{id, name, role}` and `is_admin` (in `ADMIN_EMAILS`).
 async fn me(State(app): State<AppState>, CurrentUser(user, _): CurrentUser) -> Response {
     let (team, role) = match teams::current_team(&app.db, &user).await {
         Ok(found) => found,
@@ -518,6 +518,7 @@ async fn me(State(app): State<AppState>, CurrentUser(user, _): CurrentUser) -> R
     };
     let Json(mut body) = user_json(&user);
     body["current_team"] = json!({"id": team.id, "name": team.name, "role": role.as_str()});
+    body["is_admin"] = super::waitlist::is_admin(&app, &user.email).into();
     Json(body).into_response()
 }
 

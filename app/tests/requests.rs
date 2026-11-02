@@ -239,7 +239,7 @@ mod auth {
     }
 
     /// Stores a link for `email` the way `POST /auth/link` does and returns its token.
-    async fn link(db: &DatabaseConnection, email: &str, valid_for: Duration) -> String {
+    pub(super) async fn link(db: &DatabaseConnection, email: &str, valid_for: Duration) -> String {
         let secret = token::new();
         let row = magic_links::ActiveModel {
             token_hash: Set(token::hash(&secret)),
@@ -272,7 +272,7 @@ mod auth {
 
     /// Redeems `secret` the way the button on the link page does, returning the redirect target
     /// and the session cookie it set, if any.
-    async fn open(s: &TestServer, secret: &str) -> (String, Option<String>) {
+    pub(super) async fn open(s: &TestServer, secret: &str) -> (String, Option<String>) {
         open_from(s, secret, "http://localhost:8080").await
     }
 
@@ -301,7 +301,7 @@ mod auth {
         links(db, email).await
     }
 
-    fn session(set_cookie: &str) -> String {
+    pub(super) fn session(set_cookie: &str) -> String {
         set_cookie.split(';').next().unwrap().to_owned()
     }
 
@@ -7565,10 +7565,10 @@ mod captcha_and_contact {
         sync::{Arc, Mutex},
     };
 
-    type Seen = Arc<Mutex<Vec<Value>>>;
+    pub(super) type Seen = Arc<Mutex<Vec<Value>>>;
     const TO: &str = "inbox@example.com";
 
-    async fn serve(app: Router) -> String {
+    pub(super) async fn serve(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await });
@@ -7593,7 +7593,7 @@ mod captcha_and_contact {
         url
     }
 
-    async fn resend() -> (String, Seen) {
+    pub(super) async fn resend() -> (String, Seen) {
         let seen = Seen::default();
         let log = seen.clone();
         let app = Router::new().route(
@@ -7628,14 +7628,25 @@ mod captcha_and_contact {
         json!({"name": "Jane", "email": unique_email(), "message": "Hi", "turnstile_token": token})
     }
 
-    /// Each form with `token`: its path, body and success status.
-    fn forms(token: Option<&str>) -> [(&'static str, Value, u16); 3] {
+    /// Each form with `token`: its path, body and success status. The waitlist has no captcha.
+    fn forms(token: Option<&str>) -> [(&'static str, Value, u16); 2] {
         let email = json!({"email": unique_email(), "turnstile_token": token});
         [
-            ("/auth/link", email.clone(), 202),
-            ("/v1/waitlist", email, 200),
+            ("/auth/link", email, 202),
             ("/v1/contact", contact_body(token), 202),
         ]
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn waitlist_ignores_turnstile() {
+        let (s, db, _) = app(Some(siteverify().await)).await;
+        for token in [None, Some("bad")] {
+            let email = unique_email();
+            let body = json!({"email": email, "turnstile_token": token});
+            s.post("/v1/waitlist").json(&body).await.assert_status_ok();
+            assert_eq!(rows(&db, &email).await, 1);
+        }
     }
 
     #[tokio::test]
@@ -7652,15 +7663,12 @@ mod captcha_and_contact {
     #[tokio::test]
     #[serial]
     async fn forms_need_a_good_token_when_turnstile_is_on() {
-        let (s, db, seen) = app(Some(siteverify().await)).await;
+        let (s, _, seen) = app(Some(siteverify().await)).await;
         for token in [None, Some(""), Some("bad")] {
             for (path, body, _) in forms(token) {
                 let res = s.post(path).json(&body).await;
                 assert_eq!(res.status_code(), 422, "{path} {token:?}");
                 res.assert_json(&json!({"error": "captcha_failed"}));
-                if path == "/v1/waitlist" {
-                    assert_eq!(rows(&db, body["email"].as_str().unwrap()).await, 0);
-                }
             }
         }
         assert!(
@@ -7807,5 +7815,261 @@ mod captcha_and_contact {
         let (s, _, _) = app(None).await;
         let doc = s.get("/openapi.json").await.json::<Value>();
         assert!(doc["paths"]["/contact"]["post"].is_object());
+    }
+}
+
+/// Waitlist confirmation mail, the verify link, the public count and the admin list, with mail
+/// going to a fake Resend.
+mod waitlist_confirm {
+    use super::captcha_and_contact::{resend, Seen};
+    use super::*;
+    use chrono::{Duration, Utc};
+    use sea_orm::{sea_query::Expr, DatabaseConnection};
+    use socialreins_brain::mail::Mailer;
+
+    const ADMIN: &str = "boss@example.com";
+
+    async fn app() -> (TestServer, DatabaseConnection, Seen, String) {
+        let mut config = Config::from_env().expect("DATABASE_URL must point at a test Postgres");
+        config.admin_emails = vec![ADMIN.into()];
+        let (url, seen) = resend().await;
+        config.mailer = Mailer::resend_at(&url, "re_test", "brain@example.com").unwrap();
+        let web = config.web_url.clone();
+        let db = connect(&config).await.expect("database reachable");
+        let app = controllers::router(AppState::new(db.clone(), &config), &config);
+        (TestServer::new(app).unwrap(), db, seen, web)
+    }
+
+    /// The mails sent to `email` so far, after giving the background send a moment.
+    async fn mails(seen: &Seen, email: &str) -> Vec<Value> {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let all = seen.lock().unwrap().clone();
+        all.into_iter()
+            .filter(|m| m["to"] == json!([email]))
+            .collect()
+    }
+
+    fn token_of(mail: &Value) -> String {
+        let text = mail["text"].as_str().unwrap();
+        let (_, rest) = text.split_once("/v1/waitlist/verify?token=").unwrap();
+        rest.split_whitespace().next().unwrap().to_owned()
+    }
+
+    async fn row(db: &DatabaseConnection, email: &str) -> waitlist_signups::Model {
+        waitlist_signups::Entity::find()
+            .filter(waitlist_signups::Column::Email.eq(email))
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Moves the last confirmation email of `email` back by `by`.
+    async fn backdate_sent(db: &DatabaseConnection, email: &str, by: Duration) {
+        waitlist_signups::Entity::update_many()
+            .col_expr(
+                waitlist_signups::Column::VerifySentAt,
+                Expr::value((Utc::now() - by).fixed_offset()),
+            )
+            .filter(waitlist_signups::Column::Email.eq(email))
+            .exec(db)
+            .await
+            .unwrap();
+    }
+
+    async fn join(s: &TestServer, email: &str) {
+        let res = s.post("/v1/waitlist").json(&json!({"email": email})).await;
+        res.assert_status_ok();
+        res.assert_json(&json!({"status": "ok"}));
+    }
+
+    async fn verify(s: &TestServer, token: &str) -> String {
+        let res = s.get(&format!("/v1/waitlist/verify?token={token}")).await;
+        assert_eq!(res.status_code(), 303, "{token}");
+        res.header("location").to_str().unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn join_mails_a_confirmation_link() {
+        let (s, db, seen, _) = app().await;
+        let email = unique_email();
+        join(&s, &email).await;
+        let sent = mails(&seen, &email).await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0]["subject"],
+            "Confirm your spot on the SocialReins waitlist"
+        );
+        let text = sent[0]["text"].as_str().unwrap();
+        assert!(text.contains("Confirm my email"), "{text}");
+        assert!(text.contains("http://localhost:8080/v1/waitlist/verify?token="));
+        let token = token_of(&sent[0]);
+        let r = row(&db, &email).await;
+        assert_eq!(
+            r.verify_token_hash,
+            Some(socialreins_core::token::hash(&token))
+        );
+        assert!(r.verify_sent_at.is_some() && r.verified_at.is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resends_at_most_hourly_and_never_after_verifying() {
+        let (s, db, seen, _) = app().await;
+        let email = unique_email();
+        join(&s, &email).await;
+        join(&s, &email).await;
+        assert_eq!(mails(&seen, &email).await.len(), 1, "throttled");
+        backdate_sent(&db, &email, Duration::minutes(61)).await;
+        join(&s, &email).await;
+        let sent = mails(&seen, &email).await;
+        assert_eq!(sent.len(), 2, "resent after an hour");
+        let (old, new) = (token_of(&sent[0]), token_of(&sent[1]));
+        assert_ne!(old, new);
+        assert!(verify(&s, &old).await.ends_with("?error=invalid_link"));
+        assert!(!verify(&s, &new).await.contains("error"));
+        backdate_sent(&db, &email, Duration::hours(2)).await;
+        join(&s, &email).await;
+        assert_eq!(mails(&seen, &email).await.len(), 2, "verified gets nothing");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn mail_failure_still_answers_ok() {
+        let mut config = Config::from_env().unwrap();
+        config.mailer =
+            Mailer::resend_at("http://127.0.0.1:9/emails", "k", "a@example.com").unwrap();
+        let db = connect(&config).await.unwrap();
+        let s = TestServer::new(controllers::router(
+            AppState::new(db.clone(), &config),
+            &config,
+        ))
+        .unwrap();
+        let email = unique_email();
+        join(&s, &email).await;
+        assert_eq!(rows(&db, &email).await, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn verify_marks_once_and_redirects() {
+        let (s, db, seen, web) = app().await;
+        let email = unique_email();
+        join(&s, &email).await;
+        let token = token_of(&mails(&seen, &email).await[0]);
+        let done = format!("{web}/waitlist/verified");
+        assert_eq!(verify(&s, &token).await, done);
+        let first = row(&db, &email).await.verified_at.expect("verified");
+        assert_eq!(verify(&s, &token).await, done, "a second click is fine");
+        assert_eq!(row(&db, &email).await.verified_at, Some(first));
+        let bad = format!("{done}?error=invalid_link");
+        for token in ["", "abc", &"0".repeat(64), &format!("{token}0")] {
+            assert_eq!(verify(&s, token).await, bad, "{token}");
+        }
+        let res = s.get("/v1/waitlist/verify").await;
+        assert_eq!(res.status_code(), 303);
+        assert_eq!(res.header("location"), bad.as_str());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn count_is_every_signup_cached() {
+        let (s, db, _, _) = app().await;
+        let res = s.get("/v1/waitlist/count").await;
+        res.assert_status_ok();
+        let all = waitlist_signups::Entity::find().count(&db).await.unwrap();
+        res.assert_json(&json!({"count": all}));
+        join(&s, &unique_email()).await;
+        let again = s.get("/v1/waitlist/count").await.json::<Value>();
+        assert_eq!(again["count"], all, "served from the 30 second cache");
+        let (fresh, _, _, _) = app().await;
+        let now = fresh.get("/v1/waitlist/count").await.json::<Value>();
+        assert_eq!(now["count"], all + 1);
+    }
+
+    /// A session cookie for `email`, signed in by magic link.
+    async fn signed_in(s: &TestServer, db: &DatabaseConnection, email: &str) -> String {
+        let secret = auth::link(db, email, Duration::minutes(15)).await;
+        let (_, cookie) = auth::open(s, &secret).await;
+        auth::session(&cookie.unwrap())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn admin_list_needs_an_admin_session() {
+        let (s, db, seen, _) = app().await;
+        let res = s.get("/v1/admin/waitlist").await;
+        assert_eq!(res.status_code(), 401);
+        res.assert_json(&json!({"error": "unauthorized"}));
+        let user = signed_in(&s, &db, &unique_email()).await;
+        let res = s
+            .get("/v1/admin/waitlist")
+            .add_header("cookie", &user)
+            .await;
+        assert_eq!(res.status_code(), 403);
+        res.assert_json(&json!({"error": "forbidden"}));
+        let me = s.get("/auth/me").add_header("cookie", &user).await;
+        assert_eq!(me.json::<Value>()["is_admin"], false);
+
+        let (yes, no) = (unique_email(), unique_email());
+        join(&s, &yes).await;
+        join(&s, &no).await;
+        verify(&s, &token_of(&mails(&seen, &yes).await[0])).await;
+        let admin = signed_in(&s, &db, ADMIN).await;
+        let me = s.get("/auth/me").add_header("cookie", &admin).await;
+        assert_eq!(me.json::<Value>()["is_admin"], true);
+        let list = |q: &'static str| {
+            s.get(&format!("/v1/admin/waitlist{q}"))
+                .add_header("cookie", &admin)
+        };
+        let emails = |body: &Value| -> Vec<String> {
+            let rows = body["signups"].as_array().unwrap();
+            rows.iter()
+                .map(|r| r["email"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let all = list("").await;
+        all.assert_status_ok();
+        let all = all.json::<Value>();
+        let total = waitlist_signups::Entity::find().count(&db).await.unwrap();
+        let verified = waitlist_signups::Entity::find()
+            .filter(waitlist_signups::Column::VerifiedAt.is_not_null())
+            .count(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            (all["total"].as_u64(), all["verified"].as_u64()),
+            (Some(total), Some(verified))
+        );
+        assert_eq!(emails(&all)[..2], [no.clone(), yes.clone()], "newest first");
+        let first = &all["signups"][0];
+        for key in ["id", "email", "source", "created_at", "verified_at"] {
+            assert!(first.get(key).is_some(), "{key}");
+        }
+        let only_yes = list("?verified=true").await.json::<Value>();
+        assert!(emails(&only_yes).contains(&yes) && !emails(&only_yes).contains(&no));
+        assert_eq!(
+            only_yes["total"].as_u64(),
+            Some(total),
+            "totals stay overall"
+        );
+        let only_no = list("?verified=false").await.json::<Value>();
+        assert!(emails(&only_no).contains(&no) && !emails(&only_no).contains(&yes));
+        assert_eq!(list("?verified=maybe").await.status_code(), 422);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn openapi_documents_the_new_routes() {
+        let (s, _, _, _) = app().await;
+        let doc = s.get("/openapi.json").await.json::<Value>();
+        for (path, method) in [
+            ("/waitlist/verify", "get"),
+            ("/waitlist/count", "get"),
+            ("/admin/waitlist", "get"),
+        ] {
+            assert!(doc["paths"][path][method].is_object(), "{path}");
+        }
     }
 }
