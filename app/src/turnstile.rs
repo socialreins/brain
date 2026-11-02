@@ -1,5 +1,5 @@
-//! Cloudflare Turnstile: the captcha on the public forms (`POST /auth/link`, `/v1/waitlist`,
-//! `/v1/contact`). Off unless `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY` are set.
+//! Cloudflare Turnstile: the captcha on the public forms (`POST /auth/link`, `/v1/contact`;
+//! not `/v1/waitlist`, which confirms by email instead). Off unless `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY` are set.
 use std::{net::IpAddr, time::Duration};
 
 use axum::http::StatusCode;

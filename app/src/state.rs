@@ -47,6 +47,10 @@ pub struct AppState {
     pub contact_to: Option<String>,
     /// Per-IP limit on `POST /v1/contact`, each of which sends an email.
     pub contact_limiter: Arc<RateLimiter>,
+    /// `ADMIN_EMAILS`: users who may read `/v1/admin/*`.
+    pub admin_emails: Vec<String>,
+    /// `GET /v1/waitlist/count`'s last answer and when it was read from the database.
+    pub waitlist_count: Arc<std::sync::Mutex<Option<(std::time::Instant, u64)>>>,
 }
 
 impl AppState {
@@ -81,6 +85,8 @@ impl AppState {
                 std::time::Duration::from_secs(3600),
                 crate::rate_limit::MAX_KEYS,
             )),
+            admin_emails: config.admin_emails.clone(),
+            waitlist_count: Arc::default(),
         }
     }
 }

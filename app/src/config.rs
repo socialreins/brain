@@ -64,10 +64,13 @@ pub struct Config {
     /// the redirect URI `{BRAIN_URL}/auth/google/callback`.
     pub google: Option<Google>,
     /// `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY` (both or neither): a Cloudflare
-    /// Turnstile captcha on sign-in links, the waitlist and the contact form. Off when unset.
+    /// Turnstile captcha on sign-in links and the contact form. Off when unset.
     pub turnstile: Option<Turnstile>,
     /// `CONTACT_TO`, normalized: where `POST /v1/contact` mails messages. Off when unset.
     pub contact_to: Option<String>,
+    /// `ADMIN_EMAILS`, comma-separated and normalized: users who may read `/v1/admin/*`.
+    /// Empty when unset.
+    pub admin_emails: Vec<String>,
 }
 
 impl Config {
@@ -148,6 +151,7 @@ impl Config {
             google,
             turnstile,
             contact_to,
+            admin_emails: admin_emails(var("ADMIN_EMAILS"))?,
         })
     }
 }
@@ -156,6 +160,19 @@ impl Config {
 fn owner_email(raw: Option<String>) -> Result<Option<String>, &'static str> {
     raw.map(|e| socialreins_core::email::normalize(&e).ok_or("OWNER_EMAIL: not an email address"))
         .transpose()
+}
+
+/// `ADMIN_EMAILS`: each address normalized like `OWNER_EMAIL`; blank entries are skipped.
+fn admin_emails(raw: Option<String>) -> Result<Vec<String>, String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(|e| {
+            socialreins_core::email::normalize(e)
+                .ok_or_else(|| format!("ADMIN_EMAILS: not an email address: {e}"))
+        })
+        .collect()
 }
 
 /// `ENCRYPTION_KEY`: brain does not start without a valid one.
@@ -245,6 +262,17 @@ mod tests {
         );
         assert!(owner("not-an-email").is_err());
         assert_eq!(super::owner_email(None).unwrap(), None);
+    }
+
+    #[test]
+    fn admin_emails_split_and_normalize() {
+        let admins = |v: &str| super::admin_emails(Some(v.into()));
+        assert_eq!(
+            admins(" A@Example.com, ,b@example.com,").unwrap(),
+            ["a@example.com", "b@example.com"]
+        );
+        assert!(admins("a@example.com,nope").is_err());
+        assert!(super::admin_emails(None).unwrap().is_empty());
     }
 
     #[test]

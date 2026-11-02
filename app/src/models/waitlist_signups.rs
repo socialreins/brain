@@ -11,6 +11,13 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub source: Option<String>,
     pub created_at: DateTimeWithTimeZone,
+    /// When the emailed link was first opened; `None` until then.
+    pub verified_at: Option<DateTimeWithTimeZone>,
+    /// SHA-256 hex of the token in the latest confirmation email.
+    #[sea_orm(column_type = "Text", nullable, unique)]
+    pub verify_token_hash: Option<String>,
+    /// When the latest confirmation email was sent, for the resend throttle.
+    pub verify_sent_at: Option<DateTimeWithTimeZone>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -24,6 +24,12 @@ cargo run -p socialreins-brain
 - `crates/*`: framework-free domain code. Never depend on `axum` or `sea-orm` there.
 - `/v1` routes carry `utoipa::path` annotations; `/openapi.json` is generated from them.
 - `app/src/mcp/`: `/mcp`, whose tools call the same service fns as their `/v1` routes.
+- `app/src/controllers/waitlist.rs`: the public waitlist. No captcha: each new or unverified
+  email gets a confirmation link to the web app, which posts the token to
+  `POST /v1/waitlist/verify` (never a state-changing GET: mail scanners open links). Mail goes
+  out after the reply, at most hourly per email, 20 a day per IP and 500 a day overall
+  (`rate_limit::daily_reserve`). `GET /v1/waitlist/count` is cached 30 seconds, and `GET /v1/admin/waitlist` is for `ADMIN_EMAILS` (`config.rs`) with a
+  session cookie only.
 - `app/src/webhooks.rs`: outbound webhooks. Every `post_targets` status change goes through
   `webhooks::with_event`, so its event is queued in the same statement; README documents the
   payload and signature.

@@ -28,12 +28,15 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/version` | `{"commit":"<sha>"}`, from `RAILWAY_GIT_COMMIT_SHA`, `dev` locally |
 | GET | `/openapi.json` | OpenAPI document for `/v1` |
 | POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, accounts, posts and lists. Bearer API token only, same scope and per-token limit as `/v1`, bodies up to 64 KiB; `Idempotency-Key` does not apply |
-| POST | `/v1/waitlist` | `{"email":"...","source":"..."}` joins the waitlist |
+| POST | `/v1/waitlist` | `{"email":"...","source":"..."}` joins the waitlist and emails a confirmation link |
+| POST | `/v1/waitlist/verify` | `{"token"}` from the emailed link: marks the signup verified, `200 {"status":"verified"}`, else `422 {"error":"invalid_link"}` |
+| GET | `/v1/waitlist/count` | `{"count":n}`: every signup, verified or not, cached for 30 seconds |
+| GET | `/v1/admin/waitlist` | `ADMIN_EMAILS` only, session cookie: `{"total","verified","signups":[{"id","email","source","created_at","verified_at"}]}`, newest first, at most 1000 (`?verified=true\|false` filters the list) |
 | POST | `/v1/contact` | `{"name","email","message"}` mails `CONTACT_TO`, `202 {}` |
 | POST | `/auth/link` | `{"email":"..."}` emails a sign-in link, `202 {"status":"sent"}` |
 | GET | `/auth/magic/{token}` | The emailed link: a page with a sign-in button, does not use the link |
 | POST | `/auth/magic` | Form field `token`: uses the link, sets the session cookie, redirects to `WEB_URL` |
-| GET | `/auth/me` | The signed-in user, or `401 {"error":"unauthorized"}` |
+| GET | `/auth/me` | The signed-in user with `is_admin` (in `ADMIN_EMAILS`), or `401 {"error":"unauthorized"}` |
 | POST | `/auth/logout` | Deletes the session, `204`. Origin must be in `CORS_ORIGINS` |
 | GET | `/auth/providers` | `{"google":bool,"turnstile_site_key":"..."\|null}`: the optional sign-in methods this install offers, and the Turnstile key when the captcha is on |
 | GET | `/auth/google/start?next=/path` | Redirects to Google (`404` when Google is not configured). `next` must be a path on the web app, else `/app` |
@@ -83,18 +86,31 @@ crates/core/     framework-free domain rules (email checks, tokens)
 
 `POST /v1/waitlist` answers `200 {"status":"ok"}` for a new email and for one already on the
 list, so it never reveals who signed up. A bad email gets `422 {"error":"invalid_email"}`. Each
-client IP (IPv6 by /64) gets 10 requests a minute, then `429`.
+client IP (IPv6 by /64) gets 10 requests a minute, then `429`. A new or still unverified email
+gets a confirmation email ("Confirm your spot on the SocialReins waitlist") after the reply, at
+most once an hour however often it signs up; a verified one gets none. At most 20 confirmation
+emails go out per client IP (IPv6 by /64) and 500 across all signups per rolling 24 hours; past
+either, and when a mail fails, the
+signup is still saved and answered ok, nothing is sent, and the next signup of that email may
+try again. The link opens the web app at `WEB_URL/waitlist/verify?token=...`, which posts the
+token to `POST /v1/waitlist/verify` (so a mail scanner opening the link changes nothing): the
+first post sets `verified_at`, later ones answer the same `200`, and a missing, malformed or
+unknown token gets `422 invalid_link`. A resend replaces the token. It shares the waitlist's
+10 requests a minute per IP. Only the token's SHA-256 hash is stored. `GET /v1/waitlist/count` is public. `GET /v1/admin/waitlist` needs a session cookie
+(not an API token) of a user in `ADMIN_EMAILS`: `401 unauthorized` signed out, `403 forbidden`
+otherwise.
 
 `POST /v1/contact` (on when `CONTACT_TO` is set, else `503 {"error":"contact_unavailable"}`)
 takes a name of 1 to 100 characters on one line, an email and a message of 1 to 5000
 characters (`422` `invalid_name`, `invalid_email` or `invalid_message`), and mails them to
 `CONTACT_TO` with the sender as Reply-To. Each client IP gets 5 an hour, then `429`.
 
-With `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY` set, `POST /auth/link`, `/v1/waitlist`
-and `/v1/contact` need a `turnstile_token` from the widget, checked with Cloudflare after the
+With `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY` set, `POST /auth/link` and `/v1/contact`
+need a `turnstile_token` from the widget, checked with Cloudflare after the
 rate limit and before anything is stored or sent: a missing or rejected token gets
 `422 {"error":"captcha_failed"}`, and Cloudflare unreachable for 5 seconds gets
-`503 {"error":"captcha_unavailable"}`. With Turnstile off the field is ignored.
+`503 {"error":"captcha_unavailable"}`. With Turnstile off the field is ignored, and
+`/v1/waitlist` always ignores it.
 
 Sign-in is by magic link, Google or passkey; there are no passwords. `POST /auth/link` answers the same `202`, at the same speed,
 whether or not the email has an account (or is refused by `REGISTRATION_DISABLED`): the lookup
@@ -260,7 +276,8 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `X_CLIENT_ID`, `X_CLIENT_SECRET` | no | Offer X (connector not built yet) |
 | `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET` | no | Offer TikTok (connector not built yet) |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | no | Both or neither. Turn on Google sign-in (OAuth client of type Web application, redirect URI `{BRAIN_URL}/auth/google/callback`); YouTube will use them too |
-| `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | no | Both or neither. Turn on a Cloudflare Turnstile captcha: `POST /auth/link`, `/v1/waitlist` and `/v1/contact` then need a `turnstile_token`. Off when unset |
+| `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | no | Both or neither. Turn on a Cloudflare Turnstile captcha: `POST /auth/link` and `/v1/contact` then need a `turnstile_token`. Off when unset |
+| `ADMIN_EMAILS` | no | Comma-separated emails, any case, whose signed-in users may read `GET /v1/admin/waitlist` (and get `is_admin: true` from `/auth/me`). None when unset |
 | `CONTACT_TO` | no | Turn on `POST /v1/contact`, which mails each message to this address (Reply-To: the sender). Off when unset |
 
 ## Deploy
