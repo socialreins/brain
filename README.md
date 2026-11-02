@@ -289,7 +289,7 @@ A post's `media` are URLs: public `https://` links or Google Drive share links
 (`/file/d/<id>/view`, `open?id=`, `uc?id=`; the file must be shared with anyone with the link).
 Nothing is fetched when a post is saved. When it publishes, brain downloads each URL once into
 its storage (`MEDIA_DIR` or the `S3_*` bucket): names must resolve to public addresses, at most 3
-redirects, each to a public https URL, streamed with a cap of 100 MB a file (1 MB for Bluesky)
+redirects, each to a public https URL, 4 at a time and all within a minute, streamed with a cap of 100 MB a file (1 MB for Bluesky)
 and typed by its first bytes (JPEG, PNG, WebP, GIF; MP4, MOV and PDF are kept for later
 platforms). Platforms are then served from the stored copy, and a URL that fails fails its
 target naming the image, before anything goes out. A post's files are deleted once it settles

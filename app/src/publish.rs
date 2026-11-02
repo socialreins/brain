@@ -452,14 +452,11 @@ async fn ingest(app: &AppState, post: &posts::Model) -> Media {
     let cap = bluesky::MAX_IMAGE_BYTES;
     let thread: Vec<ThreadPart> = serde_json::from_value(post.thread.clone()).unwrap_or_default();
     let root: Vec<String> = serde_json::from_value(post.media.clone()).unwrap_or_default();
-    let mut found = Media::new();
-    for url in root.iter().chain(thread.iter().flat_map(|p| &p.media)) {
-        if !found.contains_key(url) {
-            let got = app.media.ingest(&app.db, post.id, url, cap).await;
-            found.insert(url.clone(), got);
-        }
-    }
-    found
+    let urls: Vec<String> = root
+        .into_iter()
+        .chain(thread.into_iter().flat_map(|p| p.media))
+        .collect();
+    app.media.ingest_all(&app.db, post.id, &urls, cap).await
 }
 
 /// What to tell the user about image `n` that could not be stored.
@@ -475,6 +472,10 @@ fn media_error(fail: Fail, n: usize) -> String {
         Fail::TooLarge => format!("Image {n} is over 1 MB, Bluesky's limit."),
         Fail::Unsupported => format!("Image {n} is not a JPEG, PNG, WebP or GIF."),
         Fail::Storage => format!("Image {n} could not be stored. Try again."),
+        Fail::TimedOut => format!(
+            "Image {n} did not download in time: the post's media took over a minute. Use \
+             faster or smaller links."
+        ),
     }
 }
 

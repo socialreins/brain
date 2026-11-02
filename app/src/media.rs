@@ -4,7 +4,7 @@
 //! publisher reads it from there. Storage is temporary: a post's files are deleted once it
 //! settles, and an hourly sweep deletes what is left. Downloads resolve names through
 //! `PublicOnly` and follow at most 3 redirects, each to a public https URL.
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use object_store::{path::Path, ObjectStore, WriteMultipart};
 use reqwest::{header::CONTENT_TYPE, StatusCode, Url};
@@ -20,6 +20,10 @@ pub const MAX_BYTES: usize = 100_000_000;
 /// Files older than this whose post no longer waits to publish are deleted by the sweep.
 pub const SWEEP_DAYS: i32 = 7;
 const MAX_REDIRECTS: usize = 3;
+/// Longest all of a post's downloads may take together, so a slow server cannot hold a tick.
+pub const INGEST_DEADLINE: Duration = Duration::from_secs(60);
+/// Downloads of one post running at once.
+const PARALLEL: usize = 4;
 /// Bytes needed to tell every stored type apart.
 const SNIFF_LEN: usize = 12;
 const SWEEP_LOCK: i64 = 0x004d_4544_4941_5357;
@@ -30,6 +34,8 @@ pub struct Media {
     pub store: Arc<dyn ObjectStore>,
     client: reqwest::Client,
     allow_private: bool,
+    /// `INGEST_DEADLINE`; tests shorten it.
+    pub deadline: Duration,
 }
 
 /// Why a file was not stored.
@@ -45,6 +51,8 @@ pub enum Fail {
     /// Not a JPEG, PNG, WebP, GIF, MP4, MOV or PDF.
     Unsupported,
     Storage,
+    /// The post's downloads ran past `INGEST_DEADLINE` before this one was stored.
+    TimedOut,
 }
 
 /// A stored file.
@@ -79,7 +87,57 @@ impl Media {
             store,
             client,
             allow_private,
+            deadline: INGEST_DEADLINE,
         }
+    }
+
+    /// `ingest` of every URL, `PARALLEL` at a time, all within `deadline`; a URL not stored by
+    /// then is `TimedOut`.
+    pub async fn ingest_all(
+        &self,
+        db: &DatabaseConnection,
+        post: Uuid,
+        urls: &[String],
+        cap: usize,
+    ) -> HashMap<String, Result<Stored, Fail>> {
+        let mut found = HashMap::new();
+        let mut left: Vec<String> = Vec::new();
+        for url in urls {
+            if !left.contains(url) {
+                left.push(url.clone());
+            }
+        }
+        left.reverse();
+        let mut running = tokio::task::JoinSet::new();
+        let until = tokio::time::Instant::now() + self.deadline;
+        loop {
+            while running.len() < PARALLEL {
+                let Some(url) = left.pop() else { break };
+                let (media, db) = (self.clone(), db.clone());
+                running.spawn(async move {
+                    let got = media.ingest(&db, post, &url, cap).await;
+                    (url, got)
+                });
+            }
+            match tokio::time::timeout_at(until, running.join_next()).await {
+                Ok(Some(Ok((url, got)))) => {
+                    found.insert(url, got);
+                }
+                Ok(Some(Err(e))) => tracing::error!(error = %e, post = %post, "media task failed"),
+                Ok(None) => break,
+                Err(_) => {
+                    tracing::warn!(post = %post, "media downloads ran out of time");
+                    // shortcut: an aborted download may leave a partial upload behind (R2 and
+                    // S3 lifecycle rules expire those); abort them explicitly if that grows.
+                    running.abort_all();
+                    break;
+                }
+            }
+        }
+        for url in urls {
+            found.entry(url.clone()).or_insert(Err(Fail::TimedOut));
+        }
+        found
     }
 
     /// The stored copy of `url` for `post`: the one an earlier try saved, else downloaded now,

@@ -2521,6 +2521,13 @@ mod teams {
                 )
                 .route("/xrpc/chat.bsky.convo.sendMessage", post(send_message))
                 .route("/img.png", get(|| async { image("image/png", 64) }))
+                .route(
+                    "/slow.png",
+                    get(|| async {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        image("image/png", 64)
+                    }),
+                )
                 .route("/big.png", get(|| async { image("image/png", 1_000_001) }))
                 .route("/page.html", get(|| async { image("text/html", 64) }))
                 .route("/{did}", get(doc))
@@ -4055,6 +4062,43 @@ mod teams {
                 // The post settled, so its stored copy is gone, row and file.
                 assert_eq!(media_rows(&db, &id).await, 0);
                 assert!(!media_dir().join("posts").join(&id).exists());
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn slow_media_fails_the_target_once_the_deadline_passes() {
+                let (s, db, mut state) = on_mock().await;
+                state.media.deadline = std::time::Duration::from_secs(1);
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let base = pds_of(&db, &team_id).await;
+                let id = id_of(&create(&s, &cookie, input(&set, "slow", Some(&past()))).await);
+                // Five slow files: past the 4 at a time, and each within its own timeout.
+                let slow = [
+                    "/img.png",
+                    "/slow.png",
+                    "/slow.png?2",
+                    "/slow.png?3",
+                    "/slow.png?4",
+                ];
+                set_media(&db, &base, &id, &slow[..4]).await;
+                let row = posts::ActiveModel {
+                    id: Set(id.parse().unwrap()),
+                    thread: Set(json!([{"body": "two", "media": [format!("{base}{}", slow[4])]}])),
+                    ..Default::default()
+                };
+                posts::Entity::update(row).exec(&db).await.unwrap();
+                let started = std::time::Instant::now();
+                publish::tick(&state).await.unwrap();
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(4),
+                    "the deadline held"
+                );
+                let p = get_post(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "failed", "{p}");
+                let msg = p["targets"][0]["error"].as_str().unwrap();
+                assert!(msg.starts_with("Image 2 did not download in time"), "{msg}");
+                assert!(p["targets"][0]["remote_id"].is_null(), "nothing went out");
             }
 
             async fn media_rows(db: &DatabaseConnection, post: &str) -> i64 {
