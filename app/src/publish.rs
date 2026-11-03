@@ -24,6 +24,7 @@ pub use crate::connectors::bluesky::PostError as PublishError;
 use crate::{
     connectors::{
         bluesky::{self, Bluesky},
+        meta::{self, Facebook, Instagram},
         threads::{self, Threads},
     },
     controllers::posts::ThreadPart,
@@ -159,17 +160,8 @@ impl Publisher for Threads {
         media: &[Attachment],
         reply: Option<(&Remote, &Remote)>,
     ) -> Result<Remote, PublishError> {
-        let mut items = Vec::new();
-        for (i, a) in media.iter().enumerate() {
-            if !threads::MEDIA_TYPES.contains(&a.content_type.as_str()) {
-                return Err(PublishError::Failed(format!(
-                    "Image {} is not a JPEG or PNG image or an MP4 or MOV video.",
-                    i + 1
-                )));
-            }
-            let video = a.content_type.starts_with("video/");
-            items.push(threads::Item { url: &a.url, video });
-        }
+        let what = "a JPEG or PNG image or an MP4 or MOV video";
+        let items = by_type(media, &threads::MEDIA_TYPES, what)?;
         let parent = reply.map(|(p, _)| p.id.as_str());
         let (id, url) = self
             .publish_post(&account.external_id, secret, body, &items, parent)
@@ -212,11 +204,140 @@ impl Publisher for Threads {
     }
 }
 
+/// Each file as an item by URL, when its type is one of `types`; else which one is `what` not.
+fn by_type<'a>(
+    media: &'a [Attachment],
+    types: &[&str],
+    what: &str,
+) -> Result<Vec<threads::Item<'a>>, PublishError> {
+    media
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if !types.contains(&a.content_type.as_str()) {
+                let n = i + 1;
+                return Err(PublishError::Failed(format!("Image {n} is not {what}.")));
+            }
+            let video = a.content_type.starts_with("video/");
+            Ok(threads::Item { url: &a.url, video })
+        })
+        .collect()
+}
+
+#[async_trait]
+impl Publisher for Facebook {
+    async fn publish(
+        &self,
+        account: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        _: Option<(&Remote, &Remote)>,
+    ) -> Result<Remote, PublishError> {
+        let what = "a JPEG, PNG or GIF image or an MP4 or MOV video";
+        let items = by_type(media, &meta::FACEBOOK_TYPES, what)?;
+        let id = self
+            .0
+            .publish_facebook(&account.external_id, secret, body, &items)
+            .await?;
+        Ok(Remote {
+            id,
+            cid: String::new(),
+            url: None,
+        })
+    }
+
+    async fn delete(
+        &self,
+        _: &social_accounts::Model,
+        secret: &str,
+        remote_id: &str,
+    ) -> Result<(), PublishError> {
+        self.0.delete(secret, remote_id).await
+    }
+
+    fn url(&self, _: &social_accounts::Model, remote_id: &str) -> Option<String> {
+        Some(format!("https://www.facebook.com/{remote_id}"))
+    }
+
+    fn name(&self) -> &'static str {
+        "Facebook"
+    }
+
+    fn reconnect(&self) -> &'static str {
+        META_RECONNECT
+    }
+
+    fn by_url(&self) -> bool {
+        true
+    }
+
+    fn timeout(&self) -> Duration {
+        meta::PUBLISH_TIMEOUT
+    }
+}
+
+#[async_trait]
+impl Publisher for Instagram {
+    async fn publish(
+        &self,
+        account: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        _: Option<(&Remote, &Remote)>,
+    ) -> Result<Remote, PublishError> {
+        let what = "a JPEG image or an MP4 or MOV video";
+        let items = by_type(media, &meta::INSTAGRAM_TYPES, what)?;
+        let (id, url) = self
+            .0
+            .publish_instagram(&account.external_id, secret, body, &items)
+            .await?;
+        Ok(Remote {
+            id,
+            cid: String::new(),
+            url,
+        })
+    }
+
+    async fn delete(
+        &self,
+        _: &social_accounts::Model,
+        secret: &str,
+        remote_id: &str,
+    ) -> Result<(), PublishError> {
+        self.0.delete(secret, remote_id).await
+    }
+
+    /// An Instagram permalink needs a lookup, done at publish (`Remote::url`).
+    fn url(&self, _: &social_accounts::Model, _: &str) -> Option<String> {
+        None
+    }
+
+    fn name(&self) -> &'static str {
+        "Instagram"
+    }
+
+    fn reconnect(&self) -> &'static str {
+        META_RECONNECT
+    }
+
+    fn by_url(&self) -> bool {
+        true
+    }
+
+    fn timeout(&self) -> Duration {
+        meta::PUBLISH_TIMEOUT
+    }
+}
+
 /// The publisher for `platform`; `None` until its connector exists.
 pub fn publisher<'a>(app: &'a AppState, platform: &str) -> Option<&'a dyn Publisher> {
     match platform {
         "bluesky" => Some(&app.bluesky),
         "threads" => Some(&app.threads),
+        "facebook" => Some(&app.facebook),
+        "instagram" => Some(&app.instagram),
         _ => None,
     }
 }
@@ -247,6 +368,8 @@ pub const RECONNECT: &str =
     "Bluesky refused the app password. Reconnect the account under Connections.";
 pub const THREADS_RECONNECT: &str =
     "Threads refused the account's token. Reconnect the account under Connections.";
+pub const META_RECONNECT: &str = "Meta refused the Page's token or a permission is missing. \
+                                  Reconnect Facebook and Instagram under Connections.";
 const STUCK: &str = "Unknown, check the account: publishing stopped midway and it may have posted.";
 
 fn sql(sql: &str, values: Vec<Value>) -> Statement {
@@ -821,6 +944,15 @@ async fn publish_target(
     db.execute_raw(stmt).await.map(|_| ())
 }
 
+/// An account in messages: `@handle`, else its name (a Facebook Page has no handle).
+fn named(a: &social_accounts::Model) -> String {
+    match (&a.handle, &a.display_name) {
+        (Some(h), _) => format!("@{h}"),
+        (None, Some(n)) => n.clone(),
+        (None, None) => "@account".into(),
+    }
+}
+
 /// Settles a `queued` post once no target is `pending` or `publishing`: `failed` when every
 /// target failed with nothing up, else `published`, with each failed account named in `error`. The post row
 /// is locked, so concurrent settles agree.
@@ -851,9 +983,7 @@ pub async fn settle(db: &DatabaseConnection, id: Uuid) -> Result<(), DbErr> {
             Some(a) => social_accounts::Entity::find_by_id(a).one(&txn).await?,
             None => None,
         };
-        let name = account
-            .and_then(|a| a.handle)
-            .map_or_else(|| "A disconnected account".to_owned(), |h| format!("@{h}"));
+        let name = account.map_or_else(|| "A disconnected account".to_owned(), |a| named(&a));
         errors.push(format!(
             "{name}: {}",
             t.error.as_deref().unwrap_or("failed")
@@ -901,7 +1031,7 @@ pub async fn takedown(app: &AppState, post: &posts::Model) -> Result<Vec<String>
             );
             continue;
         };
-        let name = format!("@{}", account.handle.as_deref().unwrap_or("account"));
+        let name = named(&account);
         let secret = app
             .cipher
             .decrypt(&account.access_token)

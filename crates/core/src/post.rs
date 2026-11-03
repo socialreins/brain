@@ -9,6 +9,13 @@ pub const BLUESKY_MAX_IMAGES: usize = 4;
 /// Threads: 500 characters, 20 images or videos (a carousel).
 pub const THREADS_MAX_CHARS: usize = 500;
 pub const THREADS_MAX_MEDIA: usize = 20;
+/// Facebook: 63206 characters; 10 images or one video, kept to Instagram's carousel size so one
+/// post group fits both.
+pub const FACEBOOK_MAX_CHARS: usize = 63_206;
+pub const FACEBOOK_MAX_MEDIA: usize = 10;
+/// Instagram: a 2200-character caption on 1 to 10 images or videos (a carousel).
+pub const INSTAGRAM_MAX_CHARS: usize = 2200;
+pub const INSTAGRAM_MAX_MEDIA: usize = 10;
 /// Follow-up parts a thread may have after its first post.
 pub const MAX_THREAD_PARTS: usize = 25;
 const MAX_URL_LEN: usize = 2048;
@@ -24,6 +31,8 @@ pub enum Invalid {
     TooManyParts,
     /// The platform's publisher cannot post threads yet.
     ThreadUnsupported,
+    /// Instagram posts need an image or a video.
+    MediaRequired,
 }
 
 impl Invalid {
@@ -36,6 +45,7 @@ impl Invalid {
             Self::InvalidMedia => "invalid_media",
             Self::TooManyParts => "too_many_parts",
             Self::ThreadUnsupported => "thread_not_supported",
+            Self::MediaRequired => "media_required",
         }
     }
 }
@@ -52,8 +62,10 @@ pub fn https_url(url: &str) -> bool {
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-/// Checks a post for `platform` (`bluesky` or `threads`, the ones that publish today).
+/// Checks a post for `platform` (`bluesky`, `threads`, `facebook` or `instagram`, the ones that
+/// publish today).
 pub fn validate(platform: &str, body: &str, media: &[String]) -> Result<(), Invalid> {
+    let chars = || body.chars().count();
     let (too_long, max_media) = match platform {
         "bluesky" => (
             body.len() > BLUESKY_MAX_BYTES || body.graphemes(true).count() > BLUESKY_MAX_GRAPHEMES,
@@ -61,11 +73,16 @@ pub fn validate(platform: &str, body: &str, media: &[String]) -> Result<(), Inva
         ),
         // shortcut: counts characters, while Threads counts an emoji by its UTF-8 bytes, so an
         // emoji-heavy post near 500 may still be refused at publish; count like Threads if it bites.
-        "threads" => (body.chars().count() > THREADS_MAX_CHARS, THREADS_MAX_MEDIA),
+        "threads" => (chars() > THREADS_MAX_CHARS, THREADS_MAX_MEDIA),
+        "facebook" => (chars() > FACEBOOK_MAX_CHARS, FACEBOOK_MAX_MEDIA),
+        "instagram" => (chars() > INSTAGRAM_MAX_CHARS, INSTAGRAM_MAX_MEDIA),
         _ => return Err(Invalid::UnsupportedPlatform),
     };
     if body.trim().is_empty() && media.is_empty() {
         return Err(Invalid::Empty);
+    }
+    if platform == "instagram" && media.is_empty() {
+        return Err(Invalid::MediaRequired);
     }
     if too_long {
         return Err(Invalid::TooLong);
@@ -214,6 +231,45 @@ mod tests {
             validate_thread("threads", &[("two", &media(0)[..])]),
             Ok(())
         );
+    }
+
+    #[test]
+    fn facebook_and_instagram_limits() {
+        let media = |n: usize| vec!["https://a.example/1.jpg".to_owned(); n];
+        assert_eq!(validate("facebook", "text only", &[]), Ok(()));
+        assert_eq!(
+            validate("facebook", &"a".repeat(63_206), &media(10)),
+            Ok(())
+        );
+        assert_eq!(
+            validate("facebook", &"a".repeat(63_207), &[]),
+            Err(Invalid::TooLong)
+        );
+        assert_eq!(
+            validate("facebook", "x", &media(11)),
+            Err(Invalid::TooManyImages)
+        );
+        assert_eq!(
+            validate("instagram", "no picture", &[]),
+            Err(Invalid::MediaRequired)
+        );
+        assert_eq!(validate("instagram", "", &media(1)), Ok(()));
+        assert_eq!(validate("instagram", &"a".repeat(2200), &media(10)), Ok(()));
+        assert_eq!(
+            validate("instagram", &"a".repeat(2201), &media(1)),
+            Err(Invalid::TooLong)
+        );
+        assert_eq!(
+            validate("instagram", "x", &media(11)),
+            Err(Invalid::TooManyImages)
+        );
+        assert_eq!(validate("instagram", " ", &[]), Err(Invalid::Empty));
+        for p in ["facebook", "instagram"] {
+            assert_eq!(
+                validate_thread(p, &[("two", &media(1)[..])]),
+                Err((Invalid::ThreadUnsupported, None))
+            );
+        }
     }
 
     #[test]

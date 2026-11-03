@@ -5290,7 +5290,9 @@ mod teams {
                 }
 
                 /// The query of a redirect's `Location`.
-                fn location(res: &axum_test::TestResponse) -> (String, HashMap<String, String>) {
+                pub(super) fn location(
+                    res: &axum_test::TestResponse,
+                ) -> (String, HashMap<String, String>) {
                     assert_eq!(res.status_code(), 303, "{}", res.text());
                     let to = res.header("location").to_str().unwrap().to_owned();
                     let url = reqwest::Url::parse(&to).unwrap();
@@ -5356,7 +5358,11 @@ mod teams {
                     assert_eq!(got, (Some("threads".into()), None));
                 }
 
-                async fn set_role(db: &DatabaseConnection, user: uuid::Uuid, role: &str) {
+                pub(super) async fn set_role(
+                    db: &DatabaseConnection,
+                    user: uuid::Uuid,
+                    role: &str,
+                ) {
                     use sea_orm::{ConnectionTrait, DbBackend, Statement};
                     db.execute_raw(Statement::from_sql_and_values(
                         DbBackend::Postgres,
@@ -5695,6 +5701,632 @@ mod teams {
                     assert_eq!(s.get(&format!("/media/{other}")).await.status_code(), 404);
                     state.media.release_post(&db, post).await;
                     assert_eq!(s.get(&path).await.status_code(), 404);
+                }
+            }
+
+            /// Meta: the connect flow with its Page picker, publishing to Facebook and
+            /// Instagram through the Graph API mock, and take down.
+            mod meta_api {
+                use super::threads_api::{location, set_role};
+                use super::*;
+                use axum::{
+                    extract::{Form, Path, Query},
+                    routing::{get, post},
+                    Json, Router,
+                };
+                use socialreins_brain::connectors::meta::Meta;
+                use std::sync::atomic::{AtomicU64, Ordering};
+
+                /// Every POST the mock took: (path, form), oldest first.
+                static CALLS: std::sync::Mutex<Vec<(String, HashMap<String, String>)>> =
+                    std::sync::Mutex::new(Vec::new());
+                /// Every rupload `file_url`, and every deleted id.
+                static UPLOADS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                static REMOVED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+
+                type Answer = (axum::http::StatusCode, Json<Value>);
+
+                fn ok(v: Value) -> Answer {
+                    (axum::http::StatusCode::OK, Json(v))
+                }
+
+                fn refused(code: i64, message: &str) -> Answer {
+                    let body = json!({"error": {"message": message, "code": code}});
+                    (axum::http::StatusCode::BAD_REQUEST, Json(body))
+                }
+
+                fn bearer(h: &axum::http::HeaderMap) -> String {
+                    let t = h.get("authorization").and_then(|v| v.to_str().ok());
+                    t.unwrap_or_default().to_owned()
+                }
+
+                /// A Page token the mock handed out.
+                fn page_token(h: &axum::http::HeaderMap) -> bool {
+                    matches!(bearer(h).as_str(), "Bearer pt101" | "Bearer pt102")
+                }
+
+                fn next() -> u64 {
+                    NEXT.fetch_add(1, Ordering::SeqCst)
+                }
+
+                /// The Graph API (v26.0), rupload, and a JPEG, a PNG and a video to point at.
+                /// Code `good` grants Page 101 (with Instagram 1784) and, on the next cursor,
+                /// Page 102; code `none` grants no Page.
+                async fn mock_meta() -> String {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let base = format!("http://{}", listener.local_addr().unwrap());
+                    let token = |Form(f): Form<HashMap<String, String>>| async move {
+                        let get = |k: &str| f.get(k).map(String::as_str).unwrap_or_default();
+                        if get("client_id") != "mapp" || get("client_secret") != "msecret" {
+                            return refused(101, "bad app");
+                        }
+                        match (get("code"), get("grant_type"), get("fb_exchange_token")) {
+                            ("good", "", _) => ok(json!({"access_token": "short"})),
+                            ("none", "", _) => ok(json!({"access_token": "short-none"})),
+                            ("", "fb_exchange_token", "short") => {
+                                ok(json!({"access_token": "long"}))
+                            }
+                            ("", "fb_exchange_token", "short-none") => {
+                                ok(json!({"access_token": "long-none"}))
+                            }
+                            _ => refused(100, "Invalid verification code"),
+                        }
+                    };
+                    let accounts =
+                        |h: axum::http::HeaderMap, Query(q): Query<HashMap<String, String>>| async move {
+                            let fields = q.get("fields").map(String::as_str).unwrap_or_default();
+                            assert!(fields.contains("instagram_business_account{"), "{fields}");
+                            match (bearer(&h).as_str(), q.get("after").map(String::as_str)) {
+                                ("Bearer long-none", _) => ok(json!({"data": []})),
+                                ("Bearer long", None) => ok(json!({
+                                    "data": [{"id": "101", "name": "Cafe", "access_token": "pt101",
+                                        "picture": {"data": {"url": "https://scontent.example/101.jpg"}},
+                                        "instagram_business_account": {"id": "1784",
+                                            "username": "cafe",
+                                            "profile_picture_url": "https://scontent.example/ig.jpg"}}],
+                                    "paging": {"cursors": {"after": "A"},
+                                        "next": "https://graph.facebook.com/next"}})),
+                                ("Bearer long", Some("A")) => ok(json!({
+                                    "data": [{"id": "102", "name": "Shop", "access_token": "pt102"}],
+                                    "paging": {"cursors": {"after": "B"}}})),
+                                _ => refused(190, "expired"),
+                            }
+                        };
+                    let edge =
+                        |h: axum::http::HeaderMap,
+                         Path((node, edge)): Path<(String, String)>,
+                         Form(f): Form<HashMap<String, String>>| async move {
+                            if !page_token(&h) {
+                                return refused(190, "Error validating access token");
+                            }
+                            let n = next();
+                            let answer = match edge.as_str() {
+                                "photos" if f.contains_key("published") => {
+                                    json!({"id": n.to_string()})
+                                }
+                                "photos" => {
+                                    json!({"id": n.to_string(), "post_id": format!("{node}_{n}")})
+                                }
+                                "feed" => json!({"id": format!("{node}_{n}")}),
+                                "video_reels"
+                                    if f.get("upload_phase").map(String::as_str)
+                                        == Some("start") =>
+                                {
+                                    json!({"video_id": n.to_string()})
+                                }
+                                "video_reels" => json!({"success": true}),
+                                "media" => json!({"id": n.to_string()}),
+                                "media_publish" => json!({"id": n.to_string()}),
+                                _ => return refused(100, "unknown edge"),
+                            };
+                            CALLS.lock().unwrap().push((format!("{node}/{edge}"), f));
+                            ok(answer)
+                        };
+                    let node =
+                        |h: axum::http::HeaderMap,
+                         Path(id): Path<String>,
+                         Query(q): Query<HashMap<String, String>>| async move {
+                            if !page_token(&h) {
+                                return refused(190, "expired");
+                            }
+                            match q.get("fields").map(String::as_str) {
+                                Some("status") => {
+                                    ok(json!({"status": {"video_status": "processing",
+                                    "uploading_phase": {"status": "complete"}}}))
+                                }
+                                Some("status_code,status") => {
+                                    ok(json!({"status_code": "FINISHED"}))
+                                }
+                                Some("permalink") => ok(json!({
+                                    "permalink": format!("https://www.instagram.com/p/X{id}/")})),
+                                _ => refused(100, "unknown fields"),
+                            }
+                        };
+                    let remove = |h: axum::http::HeaderMap, Path(id): Path<String>| async move {
+                        if !page_token(&h) {
+                            return refused(190, "expired");
+                        }
+                        REMOVED.lock().unwrap().push(id);
+                        ok(json!({"success": true}))
+                    };
+                    let upload = |h: axum::http::HeaderMap| async move {
+                        let auth = h.get("authorization").and_then(|v| v.to_str().ok());
+                        if auth != Some("OAuth pt101") {
+                            return refused(190, "expired");
+                        }
+                        let file = h.get("file_url").and_then(|v| v.to_str().ok());
+                        UPLOADS
+                            .lock()
+                            .unwrap()
+                            .push(file.unwrap_or_default().to_owned());
+                        ok(json!({"success": true}))
+                    };
+                    let mut jpeg = vec![7u8; 64];
+                    jpeg[..4].copy_from_slice(b"\xFF\xD8\xFF\xE0");
+                    let mut mp4 = vec![0u8; 64];
+                    mp4[..12].copy_from_slice(b"\0\0\0\x18ftypisom");
+                    let app = Router::new()
+                        .route("/v26.0/oauth/access_token", post(token))
+                        .route("/v26.0/me/accounts", get(accounts))
+                        .route("/v26.0/{node}/{edge}", post(edge))
+                        .route("/v26.0/{id}", get(node).delete(remove))
+                        .route("/video-upload/v26.0/{id}", post(upload))
+                        .route(
+                            "/img.jpg",
+                            get(move || async move { ([("content-type", "image/jpeg")], jpeg) }),
+                        )
+                        .route("/img.png", get(|| async { image("image/png", 64) }))
+                        .route(
+                            "/clip.mp4",
+                            get(move || async move { ([("content-type", "video/mp4")], mp4) }),
+                        );
+                    tokio::spawn(async move { axum::serve(listener, app).await });
+                    base
+                }
+
+                /// A brain with Meta set up on the mock (no waits), its state, and the mock.
+                async fn on_meta(
+                    configured: bool,
+                ) -> (TestServer, DatabaseConnection, AppState, String) {
+                    let base = mock_meta().await;
+                    let mut config = Config::from_env().expect("test config");
+                    config.trust_proxy = true;
+                    let app = configured.then(|| ("mapp".to_owned(), "msecret".to_owned()));
+                    let mut m = Meta::new(app, "v26.0").unwrap();
+                    m.graph_url = base.clone();
+                    m.rupload_url = base.clone();
+                    m.poll_every = std::time::Duration::ZERO;
+                    config.meta = m;
+                    let disk = object_store::local::LocalFileSystem::new_with_prefix(media_dir())
+                        .unwrap()
+                        .with_automatic_cleanup(true);
+                    config.media = Media::new(std::sync::Arc::new(disk), true);
+                    let db = socialreins_brain::connect(&config)
+                        .await
+                        .expect("database reachable");
+                    let state = AppState::new(db.clone(), &config);
+                    let app = controllers::router(state.clone(), &config);
+                    (TestServer::new(app).unwrap(), db, state, base)
+                }
+
+                /// Starts a connect: (state, `sr_meta=...`).
+                async fn begin(s: &TestServer, cookie: &str) -> (String, String) {
+                    let res = s
+                        .get("/connections/meta/redirect")
+                        .add_header("cookie", cookie)
+                        .await;
+                    let (to, q) = location(&res);
+                    assert!(
+                        to.starts_with("https://www.facebook.com/v26.0/dialog/oauth?"),
+                        "{to}"
+                    );
+                    assert_eq!(q["client_id"], "mapp");
+                    assert_eq!(
+                        q["redirect_uri"],
+                        "http://localhost:8080/connect/meta/callback"
+                    );
+                    assert!(q["scope"].contains("pages_manage_posts"));
+                    assert!(q["scope"].contains("instagram_content_publish"));
+                    let set = res
+                        .iter_headers_by_name("set-cookie")
+                        .map(|v| v.to_str().unwrap().to_owned())
+                        .find(|c| c.starts_with("sr_meta="))
+                        .unwrap();
+                    assert!(set.contains("HttpOnly") && set.contains("Path=/connect/meta"));
+                    (
+                        q["state"].clone(),
+                        set.split(';').next().unwrap().to_owned(),
+                    )
+                }
+
+                /// A whole connect with `code`: the query web lands on.
+                async fn connect_meta(
+                    s: &TestServer,
+                    cookie: &str,
+                    code: &str,
+                ) -> HashMap<String, String> {
+                    let (state, flow) = begin(s, cookie).await;
+                    let res = s
+                        .get(&format!("/connect/meta/callback?code={code}&state={state}"))
+                        .add_header("cookie", format!("{cookie}; {flow}"))
+                        .await;
+                    let (to, q) = location(&res);
+                    assert!(
+                        to.starts_with("http://localhost:3000/app/connections?"),
+                        "{to}"
+                    );
+                    q
+                }
+
+                async fn choices(s: &TestServer, cookie: &str) -> axum_test::TestResponse {
+                    s.get("/v1/connections/meta/pick")
+                        .add_header("cookie", cookie)
+                        .await
+                }
+
+                async fn pick(
+                    s: &TestServer,
+                    cookie: &str,
+                    body: Value,
+                ) -> axum_test::TestResponse {
+                    req(s, Method::POST, "/v1/connections/meta/pick", cookie)
+                        .json(&body)
+                        .await
+                }
+
+                async fn account(
+                    db: &DatabaseConnection,
+                    team_id: &str,
+                    provider: &str,
+                    external_id: &str,
+                ) -> social_accounts::Model {
+                    social_accounts::Entity::find()
+                        .filter(
+                            social_accounts::Column::TeamId
+                                .eq(team_id.parse::<uuid::Uuid>().unwrap()),
+                        )
+                        .filter(social_accounts::Column::Provider.eq(provider))
+                        .filter(social_accounts::Column::ExternalId.eq(external_id))
+                        .one(db)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                }
+
+                /// An owner with Page 101 and Instagram 1784 connected: (cookie, team id).
+                async fn owner_connected(
+                    s: &TestServer,
+                    db: &DatabaseConnection,
+                ) -> (String, String) {
+                    let (_, cookie, _) = user(s, db).await;
+                    let team_id = current(s, &cookie).await["id"].as_str().unwrap().to_owned();
+                    assert_eq!(connect_meta(s, &cookie, "good").await["pick"], "meta");
+                    let picked = json!({"facebook": ["101"], "instagram": ["1784"]});
+                    assert_eq!(pick(s, &cookie, picked).await.status_code(), 201);
+                    (cookie, team_id)
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connect_offers_pages_and_instagram_accounts_to_pick() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    let (_, cookie, user_id) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    assert_eq!(choices(&s, &cookie).await.status_code(), 404);
+                    let q = connect_meta(&s, &cookie, "good").await;
+                    assert_eq!(q.get("pick").map(String::as_str), Some("meta"));
+                    assert!(!q.contains_key("connected") && !q.contains_key("connect_error"));
+
+                    // Every Page across the paging cursor, and the linked Instagram account;
+                    // never a token.
+                    let res = choices(&s, &cookie).await;
+                    res.assert_status_ok();
+                    assert!(!res.text().contains("pt10"), "{}", res.text());
+                    res.assert_json(&json!({
+                        "facebook": [
+                            {"id": "101", "name": "Cafe",
+                             "picture_url": "https://scontent.example/101.jpg"},
+                            {"id": "102", "name": "Shop", "picture_url": null}],
+                        "instagram": [{"id": "1784", "name": "cafe",
+                            "picture_url": "https://scontent.example/ig.jpg"}]}));
+
+                    for (body, code) in [
+                        (json!({}), "nothing_picked"),
+                        (json!({"facebook": ["999"]}), "invalid_pick"),
+                        (
+                            json!({"facebook": ["101"], "instagram": ["101"]}),
+                            "invalid_pick",
+                        ),
+                    ] {
+                        let res = pick(&s, &cookie, body).await;
+                        assert_eq!(res.status_code(), 422);
+                        res.assert_json(&json!({"error": code}));
+                    }
+                    let picked = json!({"facebook": ["101"], "instagram": ["1784"]});
+                    let res = pick(&s, &cookie, picked.clone()).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let saved: Vec<Value> = res.json();
+                    assert_eq!(saved.len(), 2);
+                    assert_eq!(saved[0]["provider"], "facebook");
+                    assert_eq!(saved[0]["display_name"], "Cafe");
+                    assert_eq!(saved[1]["provider"], "instagram");
+                    assert_eq!(saved[1]["handle"], "cafe");
+                    let set = default_set(&db, &team_id).await.to_string();
+                    assert_eq!(saved[1]["set_ids"], json!([set]));
+                    // The pick is used up.
+                    assert_eq!(choices(&s, &cookie).await.status_code(), 404);
+                    assert_eq!(pick(&s, &cookie, picked).await.status_code(), 404);
+
+                    let fb = account(&db, &team_id, "facebook", "101").await;
+                    assert_eq!(cipher().decrypt(&fb.access_token).unwrap(), b"pt101");
+                    assert!(fb.token_expires_at.is_none());
+                    let ig = account(&db, &team_id, "instagram", "1784").await;
+                    assert_eq!(cipher().decrypt(&ig.access_token).unwrap(), b"pt101");
+                    assert_eq!(ig.meta["page_id"], "101");
+                    assert!(ig.token_expires_at.is_none());
+
+                    // A reconnect refreshes what is connected at once and offers only the rest.
+                    let row = social_accounts::ActiveModel {
+                        id: Set(ig.id),
+                        access_token: Set(cipher().encrypt(b"old")),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(row)
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                    assert_eq!(connect_meta(&s, &cookie, "good").await["pick"], "meta");
+                    let ig = account(&db, &team_id, "instagram", "1784").await;
+                    assert_eq!(cipher().decrypt(&ig.access_token).unwrap(), b"pt101");
+                    choices(&s, &cookie).await.assert_json(&json!({
+                        "facebook": [{"id": "102", "name": "Shop", "picture_url": null}],
+                        "instagram": []}));
+                    // Cancel drops it.
+                    let res = req(&s, Method::DELETE, "/v1/connections/meta/pick", &cookie).await;
+                    assert_eq!(res.status_code(), 204);
+                    assert_eq!(choices(&s, &cookie).await.status_code(), 404);
+                    // With everything connected there is nothing to pick.
+                    connect_meta(&s, &cookie, "good").await;
+                    let res = pick(&s, &cookie, json!({"facebook": ["102"]})).await;
+                    assert_eq!(res.status_code(), 201);
+                    let q = connect_meta(&s, &cookie, "good").await;
+                    assert_eq!(q.get("connected").map(String::as_str), Some("meta"));
+                    assert_eq!(list(&s, &cookie).await.len(), 3);
+
+                    // Members cannot see or make a pick.
+                    set_role(&db, user_id, "member").await;
+                    assert_eq!(choices(&s, &cookie).await.status_code(), 403);
+                    let res = pick(&s, &cookie, json!({"facebook": ["101"]})).await;
+                    assert_eq!(res.status_code(), 403);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connect_errors_land_on_web_with_a_code() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let res = s.get("/connections/meta/redirect").await;
+                    let q = location(&res).1;
+                    assert_eq!(q["connect_error"], "unauthorized");
+                    assert_eq!(q["provider"], "meta");
+                    let err = |q: HashMap<String, String>| {
+                        assert_eq!(q["provider"], "meta");
+                        q["connect_error"].clone()
+                    };
+                    assert_eq!(err(connect_meta(&s, &cookie, "bad").await), "meta_failed");
+                    assert_eq!(err(connect_meta(&s, &cookie, "none").await), "no_pages");
+                    assert_eq!(err(connect_meta(&s, &cookie, "").await), "cancelled");
+                    assert!(list(&s, &cookie).await.is_empty());
+
+                    let (s, db, _, _) = on_meta(false).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let res = s
+                        .get("/connections/meta/redirect")
+                        .add_header("cookie", &cookie)
+                        .await;
+                    assert_eq!(location(&res).1["connect_error"], "not_configured");
+                }
+
+                fn meta_post(set: &str, platform: &str, body: &str) -> Value {
+                    let mut v = input(set, body, Some(&past()));
+                    v["platform"] = json!(platform);
+                    v
+                }
+
+                /// Creates a due post with `media` on the mock, runs a tick, and returns the
+                /// post and the POSTs it made.
+                async fn publish_one(
+                    (s, db, state, base): (&TestServer, &DatabaseConnection, &AppState, &str),
+                    cookie: &str,
+                    mut post: Value,
+                    media: &[&str],
+                ) -> (Value, Vec<(String, HashMap<String, String>)>) {
+                    if !media.is_empty() {
+                        // Valid placeholders; the mock's loopback URLs are set past validation.
+                        post["media"] = json!(vec!["https://a.example/x.jpg"; media.len()]);
+                    }
+                    let res = create(s, cookie, post).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let id = id_of(&res);
+                    set_media(db, base, &id, media).await;
+                    let before = CALLS.lock().unwrap().len();
+                    publish::tick(state).await.unwrap();
+                    let calls = CALLS.lock().unwrap()[before..].to_vec();
+                    (get_post(s, cookie, &id).await, calls)
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn facebook_posts_text_photos_and_reels_and_takes_them_down() {
+                    let (s, db, state, base) = on_meta(true).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let ctx = (&s, &db, &state, base.as_str());
+
+                    let (p, calls) =
+                        publish_one(ctx, &cookie, meta_post(&set, "facebook", "hello"), &[]).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(calls.len(), 1);
+                    assert_eq!(calls[0].0, "101/feed");
+                    assert_eq!(calls[0].1["message"], "hello");
+                    let t = &p["targets"][0];
+                    let id = t["remote_id"].as_str().unwrap().to_owned();
+                    assert!(id.starts_with("101_"));
+                    assert_eq!(t["remote_url"], format!("https://www.facebook.com/{id}"));
+                    let res = req(
+                        &s,
+                        Method::DELETE,
+                        &format!("/v1/posts/{}", p["id"].as_str().unwrap()),
+                        &cookie,
+                    )
+                    .await;
+                    res.assert_status_ok();
+                    assert_eq!(res.json::<Value>()["status"], "deleted");
+                    assert_eq!(REMOVED.lock().unwrap().last(), Some(&id));
+
+                    let post = meta_post(&set, "facebook", "one");
+                    let (p, calls) = publish_one(ctx, &cookie, post, &["/img.jpg"]).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(calls.len(), 1);
+                    assert_eq!(calls[0].0, "101/photos");
+                    assert_eq!(calls[0].1["caption"], "one");
+                    let link = &calls[0].1["url"];
+                    assert!(link.starts_with("http://localhost:8080/media/"), "{link}");
+                    let id = p["targets"][0]["remote_id"].as_str().unwrap();
+                    assert!(id.starts_with("101_"), "the post id, not the photo id");
+
+                    let post = meta_post(&set, "facebook", "two");
+                    let (p, calls) =
+                        publish_one(ctx, &cookie, post, &["/img.jpg", "/img.png"]).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(calls.len(), 3);
+                    for c in &calls[..2] {
+                        assert_eq!(c.0, "101/photos");
+                        assert_eq!(c.1["published"], "false");
+                    }
+                    assert_eq!(calls[2].0, "101/feed");
+                    assert_eq!(calls[2].1["message"], "two");
+                    let first: Value =
+                        serde_json::from_str(&calls[2].1["attached_media[0]"]).unwrap();
+                    assert!(first["media_fbid"].is_string());
+                    assert!(calls[2].1.contains_key("attached_media[1]"));
+
+                    let post = meta_post(&set, "facebook", "reel");
+                    let (p, calls) = publish_one(ctx, &cookie, post, &["/clip.mp4"]).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(calls.len(), 2);
+                    assert_eq!(calls[0].0, "101/video_reels");
+                    assert_eq!(calls[0].1["upload_phase"], "start");
+                    assert_eq!(calls[1].1["upload_phase"], "finish");
+                    assert_eq!(calls[1].1["video_state"], "PUBLISHED");
+                    assert_eq!(calls[1].1["description"], "reel");
+                    let video = calls[1].1["video_id"].clone();
+                    assert_eq!(p["targets"][0]["remote_id"], video);
+                    let uploaded = UPLOADS.lock().unwrap().last().cloned().unwrap();
+                    assert!(uploaded.ends_with(".mp4"), "{uploaded}");
+
+                    // A video cannot ride with other media; nothing goes out.
+                    let post = meta_post(&set, "facebook", "mixed");
+                    let (p, calls) =
+                        publish_one(ctx, &cookie, post, &["/img.jpg", "/clip.mp4"]).await;
+                    assert_eq!(p["status"], "failed");
+                    assert!(calls.is_empty());
+                    let error = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(error.contains("cannot mix a video"), "{error}");
+
+                    // Thread parts are refused at save.
+                    let mut post = meta_post(&set, "facebook", "x");
+                    post["thread"] = json!([{"body": "two"}]);
+                    let res = create(&s, &cookie, post).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "thread_not_supported"}));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn instagram_posts_reels_and_carousels_and_takes_them_down() {
+                    let (s, db, state, base) = on_meta(true).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let ctx = (&s, &db, &state, base.as_str());
+
+                    let res = create(&s, &cookie, meta_post(&set, "instagram", "words")).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "media_required"}));
+
+                    let post = meta_post(&set, "instagram", "pic");
+                    let (p, calls) = publish_one(ctx, &cookie, post, &["/img.jpg"]).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(calls.len(), 2);
+                    assert_eq!(calls[0].0, "1784/media");
+                    assert_eq!(calls[0].1["caption"], "pic");
+                    assert!(calls[0].1["image_url"].starts_with("http://localhost:8080/media/"));
+                    assert_eq!(calls[1].0, "1784/media_publish");
+                    let t = &p["targets"][0];
+                    let id = t["remote_id"].as_str().unwrap().to_owned();
+                    assert_eq!(
+                        t["remote_url"],
+                        format!("https://www.instagram.com/p/X{id}/")
+                    );
+                    let res = req(
+                        &s,
+                        Method::DELETE,
+                        &format!("/v1/posts/{}", p["id"].as_str().unwrap()),
+                        &cookie,
+                    )
+                    .await;
+                    res.assert_status_ok();
+                    assert_eq!(REMOVED.lock().unwrap().last(), Some(&id));
+
+                    let post = meta_post(&set, "instagram", "reel");
+                    let (p, calls) = publish_one(ctx, &cookie, post, &["/clip.mp4"]).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(calls[0].1["media_type"], "REELS");
+                    assert!(calls[0].1["video_url"].ends_with(".mp4"));
+
+                    let post = meta_post(&set, "instagram", "both");
+                    let (p, calls) =
+                        publish_one(ctx, &cookie, post, &["/img.jpg", "/clip.mp4"]).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(calls.len(), 4);
+                    assert_eq!(calls[0].1["media_type"], "IMAGE");
+                    assert_eq!(calls[0].1["is_carousel_item"], "true");
+                    assert_eq!(calls[1].1["media_type"], "VIDEO");
+                    assert_eq!(calls[2].1["media_type"], "CAROUSEL");
+                    assert_eq!(calls[2].1["caption"], "both");
+                    assert_eq!(calls[2].1["children"].split(',').count(), 2);
+                    assert!(!calls[2].1.contains_key("image_url"));
+                    assert_eq!(calls[3].0, "1784/media_publish");
+
+                    // Instagram takes JPEG images only; nothing goes out.
+                    let post = meta_post(&set, "instagram", "png");
+                    let (p, calls) = publish_one(ctx, &cookie, post, &["/img.png"]).await;
+                    assert_eq!(p["status"], "failed");
+                    assert!(calls.is_empty());
+                    assert_eq!(
+                        p["targets"][0]["error"],
+                        "Image 1 is not a JPEG image or an MP4 or MOV video."
+                    );
+
+                    // A token Meta refuses fails the target with what to do.
+                    let ig = account(&db, &team_id, "instagram", "1784").await;
+                    let row = social_accounts::ActiveModel {
+                        id: Set(ig.id),
+                        access_token: Set(cipher().encrypt(b"dead")),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(row)
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                    let post = meta_post(&set, "instagram", "x");
+                    let (p, _) = publish_one(ctx, &cookie, post, &["/img.jpg"]).await;
+                    assert_eq!(p["status"], "failed");
+                    assert_eq!(p["targets"][0]["error"], publish::META_RECONNECT);
                 }
             }
         }

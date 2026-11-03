@@ -69,8 +69,9 @@ fn failed(msg: impl Into<String>) -> PostError {
     PostError::Failed(msg.into())
 }
 
-/// Threads' own words for a refused call, without links (they may carry a token), cut short.
-fn reason(body: &Value, status: reqwest::StatusCode) -> String {
+/// The Graph API's own words for a refused call (Threads and Meta), without links (they may carry
+/// a token), cut short.
+pub(super) fn reason(body: &Value, status: reqwest::StatusCode) -> String {
     let msg = body["error"]["message"]
         .as_str()
         .or(body["error_message"].as_str())
@@ -88,7 +89,7 @@ fn reason(body: &Value, status: reqwest::StatusCode) -> String {
 }
 
 /// The token is expired, revoked or missing a permission: only a new sign-in helps.
-fn needs_reconnect(body: &Value) -> bool {
+pub(super) fn needs_reconnect(body: &Value) -> bool {
     body["error"]["code"]
         .as_i64()
         .is_some_and(|c| c == 190 || c == 10 || (200..300).contains(&c))
@@ -404,7 +405,7 @@ fn item(m: &Item<'_>) -> Vec<(&'static str, String)> {
 }
 
 /// Graph ids come as strings; a number is taken too.
-fn id_of(v: &Value) -> Option<String> {
+pub(super) fn id_of(v: &Value) -> Option<String> {
     match &v["id"] {
         Value::String(s) if !s.is_empty() => Some(s.clone()),
         Value::Number(n) => Some(n.to_string()),

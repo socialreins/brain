@@ -63,7 +63,10 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | POST | `/v1/connections/bluesky` | `{"handle","app_password"}` (owner, admin): checks it on the account's PDS, stores it encrypted, joins the Default set; `201`, or `200` when it replaces the password of an account the team already has |
 | GET | `/connections/threads/redirect` | A page navigation from web (session cookie; owner, admin of the current team): sends the browser to Threads to connect a profile. Lands back on `{WEB_URL}/app/connections` |
 | GET | `/connect/threads/callback` | Where Threads sends the browser back (register `{BRAIN_URL}/connect/threads/callback` in the Threads app); lands on `{WEB_URL}/app/connections?connected=threads` or `?connect_error=<code>&provider=threads` |
-| GET | `/media/{name}` | A stored post file at an unguessable link, for platforms that download media themselves (Threads); `404` once the post settles |
+| GET | `/connections/meta/redirect` | Like the Threads one: sends the browser to Facebook Login for Pages and their linked Instagram accounts |
+| GET | `/connect/meta/callback` | Where Meta sends the browser back (register `{BRAIN_URL}/connect/meta/callback` in the Meta app); lands on `{WEB_URL}/app/connections?pick=meta` when there is something to pick, `?connected=meta` when not, or `?connect_error=<code>&provider=meta` |
+| GET, POST, DELETE | `/v1/connections/meta/pick` | The caller's pending Meta pick (owner, admin): the Pages and Instagram accounts not connected yet (`{"facebook":[{"id","name","picture_url"}],"instagram":[...]}`, never tokens, `404` when none or over 15 minutes old); `{"facebook":[ids],"instagram":[ids]}` connects them (`201` with the accounts; `422 nothing_picked`, `invalid_pick`); drop it, `204` |
+| GET | `/media/{name}` | A stored post file at an unguessable link, for platforms that download media themselves (Threads, Facebook, Instagram); `404` once the post settles |
 | PUT | `/v1/connections/{id}/sets` | `{"set_ids"}` (owner, admin): the sets of the current team holding the account; must include the Default set |
 | DELETE | `/v1/connections/{id}` | Disconnect an account (owner, admin), `204` |
 | GET, POST | `/v1/social-sets` | The current team's live sets with `account_ids`, Default first (`?deleted=true`: deleted ones still restorable); create one (`{"name"}`, owner, admin) |
@@ -174,7 +177,10 @@ job in brain hard-deletes sets deleted over 30 days ago, one instance at a time 
 
 Posts go to every account of their platform in their social set; Bluesky (300 graphemes, 4
 images of at most 1 MB from public https URLs, links become facets) and Threads (500
-characters, up to 20 JPEG or PNG images or MP4 or MOV videos as a carousel) publish today.
+characters, up to 20 JPEG or PNG images or MP4 or MOV videos as a carousel), Facebook (63206
+characters, up to 10 JPEG, PNG or GIF images or one MP4 or MOV video) and Instagram (2200
+characters, 1 to 10 JPEG images or MP4 or MOV videos, `media_required` without one) publish
+today.
 Saving with `scheduled_at` makes a post `scheduled`, else `draft`; only those two can change.
 A tick every minute claims due posts (one instance at a time, advisory lock), creates one
 target per account and claims each target once, so nothing posts twice; a publish is never
@@ -231,6 +237,32 @@ the root (`DELETE /v1.0/{id}`, 100 a day per profile). One post may take up to 6
 Threads downloads media itself, so brain hands it `{BRAIN_URL}/media/<sealed key>.<ext>`: the
 stored file's key sealed with `ENCRYPTION_KEY`, served only while the file is stored (until the
 post settles). `BRAIN_URL` must be reachable from the internet for Threads posts with media.
+
+Meta (when `META_APP_ID` and `META_APP_SECRET` are set) connects Facebook Pages and the
+Instagram professional accounts linked to them with one Facebook Login, through the same OAuth
+checks as Threads (state cookie `sr_meta` scoped to `/connect/meta`). The dialog is
+`www.facebook.com/{META_GRAPH_VERSION}/dialog/oauth` (default `v26.0`) with the publishing scopes
+(`pages_show_list`, `pages_read_engagement`, `pages_manage_posts`, `business_management`,
+`instagram_basic`, `instagram_content_publish`, `instagram_manage_contents`) and those comment
+automations will need. The callback swaps the code for a short-lived user token, then a
+long-lived one (`fb_exchange_token`), and reads `me/accounts` (up to 1000 Pages, following the
+cursor). Accounts the team already has get the new Page token at once. When anything is left,
+the Pages with their tokens are sealed with `ENCRYPTION_KEY` for 15 minutes (one pick per user
+and team) and the browser lands on `?pick=meta`, where web lists them from
+`GET /v1/connections/meta/pick` and connects the chosen ones with `POST`. A Page becomes a
+`facebook` account holding the Page token; an Instagram account becomes an `instagram` account
+holding its Page's token with `meta.page_id`. Both have no expiry: Page tokens from a long-lived
+user token do not expire, so there is no refresh job, and reconnecting renews them. Errors:
+`meta_failed` and `no_pages` besides the Threads codes.
+
+Facebook posts go to the Page: text to `{page}/feed`, one image to `{page}/photos`, several as
+unpublished photos attached to one feed post, one video as a Reel (`video_reels` start, upload
+from its URL to `rupload.facebook.com`, poll, finish); a video cannot be mixed with other media.
+Instagram posts are a container (`image_url`, `REELS` for one video, a `CAROUSEL` of `IMAGE`
+and `VIDEO` items for several), polled until `FINISHED`, then `media_publish`; the permalink is
+looked up after. Both fetch media from brain's `/media/` link, take no thread parts
+(`thread_not_supported`), and come down with `DELETE /{id}` on the Page token. One post may take
+up to 7 minutes.
 
 Webhooks: a team may set one public `https://` URL (at most 2000 characters, no credentials,
 not `localhost` or a private address). Each post target fires `post.target.published`,
@@ -299,7 +331,8 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `RAILWAY_GIT_COMMIT_SHA` | no | Commit `/version` reports (Railway sets it) |
 | `GIT_COMMIT` | no | Used when `RAILWAY_GIT_COMMIT_SHA` is unset; baked into published images. Else `dev` |
 | `RUST_LOG` | no | `info` |
-| `META_APP_ID`, `META_APP_SECRET` | no | Offer Facebook and Instagram (connector not built yet) |
+| `META_APP_ID`, `META_APP_SECRET` | no | Both to connect Facebook Pages and Instagram accounts (redirect URI `{BRAIN_URL}/connect/meta/callback`). Publishing with connected accounts needs neither |
+| `META_GRAPH_VERSION` | no | `v26.0`. The Graph API version for Meta calls |
 | `THREADS_APP_ID`, `THREADS_APP_SECRET` | no | Both to connect Threads accounts (redirect URI `{BRAIN_URL}/connect/threads/callback`). Publishing with connected accounts needs neither |
 | `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET` | no | Offer LinkedIn (connector not built yet) |
 | `X_CLIENT_ID`, `X_CLIENT_SECRET` | no | Offer X (connector not built yet) |
@@ -320,8 +353,8 @@ Nothing is fetched when a post is saved. When it publishes, brain downloads each
 its storage (`MEDIA_DIR` or the `S3_*` bucket): names must resolve to public addresses, at most 3
 redirects, each to a public https URL, 4 at a time and all within a minute, streamed with a cap of 100 MB a file (1 MB for Bluesky)
 and typed by its first bytes (JPEG, PNG, WebP, GIF, MP4, MOV; PDF is kept for later
-platforms). Platforms are then served from the stored copy (Threads fetches it from its
-`/media/` link), and a URL that fails fails its
+platforms). Platforms are then served from the stored copy (Threads, Facebook and Instagram fetch
+it from its `/media/` link), and a URL that fails fails its
 target naming the image, before anything goes out. A post's files are deleted once it settles
 (published, failed or deleted); an hourly sweep deletes any left a week later whose post no
 longer waits to publish, whether or not a row still names it. Local-disk storage assumes one
