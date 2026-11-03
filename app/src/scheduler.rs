@@ -1,11 +1,18 @@
 //! Background jobs, in process: publishing due posts and reading inboxes (then running
 //! automations) and sending webhooks every minute (the old app ran every 5), and purging deleted
-//! sets, old idempotency keys, old webhook deliveries and leftover stored media every hour, each run by one instance at a time through an advisory lock. shortcut: no job queue; move to one if jobs need retries or exact times.
+//! sets, old idempotency keys, old webhook deliveries and leftover stored media every hour, and
+//! extending Threads tokens daily, each run by one instance at a time through an advisory lock.
+//! shortcut: no job queue; move to one if jobs need retries or exact times.
 use std::time::Duration;
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait};
 
-use crate::{controllers::idempotency, inbox, media, publish, state::AppState, webhooks};
+use crate::{
+    controllers::{idempotency, threads},
+    inbox, media, publish,
+    state::AppState,
+    webhooks,
+};
 
 /// How long a deleted social set can be restored before the purge removes it.
 pub const RESTORE_DAYS: i64 = 30;
@@ -20,6 +27,18 @@ pub fn spawn(app: AppState) {
     let inbox_app = app.clone();
     let hook_app = app.clone();
     let sweep_app = app.clone();
+    let threads_app = app.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(24 * 3600));
+        loop {
+            tick.tick().await;
+            match threads::refresh_tokens(&threads_app).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(accounts = n, "extended threads tokens"),
+                Err(e) => tracing::warn!(error = %e, "threads token refresh failed"),
+            }
+        }
+    });
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

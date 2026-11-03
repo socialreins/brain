@@ -5122,6 +5122,581 @@ mod teams {
                 assert_eq!(res.status_code(), 200, "{}", res.text());
                 assert_eq!(res.json::<Value>()["status"], "deleted");
             }
+
+            /// Threads: the connect flow, publishing through the Graph API mock, take down and
+            /// the daily token refresh, plus the brain links Threads fetches media from.
+            mod threads_api {
+                use super::*;
+                use axum::{
+                    extract::{Form, Path, Query},
+                    routing::{delete, get, post},
+                    Json, Router,
+                };
+                use socialreins_brain::{connectors::threads::Threads, controllers::threads};
+                use std::sync::atomic::{AtomicU64, Ordering};
+
+                /// Every container the mock made: (user, params), oldest first.
+                static CONTAINERS: std::sync::Mutex<Vec<(String, HashMap<String, String>)>> =
+                    std::sync::Mutex::new(Vec::new());
+                /// Every `threads_publish` creation id, and every deleted post id.
+                static PUBLISHED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                static REMOVED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+
+                type Answer = (axum::http::StatusCode, Json<Value>);
+
+                fn ok(v: Value) -> Answer {
+                    (axum::http::StatusCode::OK, Json(v))
+                }
+
+                fn refused(code: i64, message: &str) -> Answer {
+                    let body = json!({"error": {"message": message, "code": code}});
+                    (axum::http::StatusCode::BAD_REQUEST, Json(body))
+                }
+
+                /// The bearer token, when it is one the mock handed out.
+                fn token_ok(h: &axum::http::HeaderMap) -> bool {
+                    let t = h.get("authorization").and_then(|v| v.to_str().ok());
+                    matches!(t, Some("Bearer long" | "Bearer refreshed"))
+                }
+
+                /// The Graph API, plus an image and a video for posts to point at.
+                async fn mock_threads() -> String {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let base = format!("http://{}", listener.local_addr().unwrap());
+                    let code = |Form(f): Form<HashMap<String, String>>| async move {
+                        let good = f.get("client_secret").map(String::as_str) == Some("tsecret")
+                            && f.get("client_id").map(String::as_str) == Some("tapp")
+                            && f.get("grant_type").map(String::as_str)
+                                == Some("authorization_code")
+                            && f.get("code").map(String::as_str) == Some("good");
+                        if good {
+                            ok(json!({"access_token": "short", "user_id": 1789}))
+                        } else {
+                            refused(100, "Invalid code")
+                        }
+                    };
+                    let exchange = |Query(q): Query<HashMap<String, String>>| async move {
+                        let good = q.get("grant_type").map(String::as_str)
+                            == Some("th_exchange_token")
+                            && q.get("client_secret").map(String::as_str) == Some("tsecret")
+                            && q.get("access_token").map(String::as_str) == Some("short");
+                        if good {
+                            ok(json!({"access_token": "long", "token_type": "bearer",
+                                "expires_in": 5_184_000}))
+                        } else {
+                            refused(190, "bad token")
+                        }
+                    };
+                    let refresh = |Query(q): Query<HashMap<String, String>>| async move {
+                        let good = q.get("grant_type").map(String::as_str)
+                            == Some("th_refresh_token")
+                            && q.get("access_token").map(String::as_str) == Some("long");
+                        if good {
+                            ok(json!({"access_token": "refreshed", "expires_in": 5_184_000}))
+                        } else {
+                            refused(190, "expired")
+                        }
+                    };
+                    let me = |h: axum::http::HeaderMap| async move {
+                        if !token_ok(&h) {
+                            return refused(190, "expired");
+                        }
+                        ok(json!({"id": "1789", "username": "ann", "name": "Ann Lee",
+                            "threads_profile_picture_url": "https://scontent.example/p.jpg"}))
+                    };
+                    let container =
+                        |h: axum::http::HeaderMap,
+                         Path(user): Path<String>,
+                         Form(f): Form<HashMap<String, String>>| async move {
+                            if !token_ok(&h) {
+                                return refused(190, "Error validating access token");
+                            }
+                            CONTAINERS.lock().unwrap().push((user, f));
+                            ok(json!({"id": format!("c{}", NEXT.fetch_add(1, Ordering::SeqCst))}))
+                        };
+                    let publish =
+                        |h: axum::http::HeaderMap, Form(f): Form<HashMap<String, String>>| async move {
+                            if !token_ok(&h) {
+                                return refused(190, "expired");
+                            }
+                            let creation = f.get("creation_id").cloned().unwrap_or_default();
+                            PUBLISHED.lock().unwrap().push(creation);
+                            ok(json!({"id": NEXT.fetch_add(1, Ordering::SeqCst).to_string()}))
+                        };
+                    let node =
+                        |h: axum::http::HeaderMap,
+                         Path(id): Path<String>,
+                         Query(q): Query<HashMap<String, String>>| async move {
+                            if !token_ok(&h) {
+                                return refused(190, "expired");
+                            }
+                            match q.get("fields").map(String::as_str) {
+                                Some("status,error_message") => ok(json!({"status": "FINISHED"})),
+                                Some("permalink") => ok(json!({
+                                "permalink": format!("https://www.threads.com/@ann/post/P{id}")})),
+                                _ => refused(100, "unknown fields"),
+                            }
+                        };
+                    let remove = |h: axum::http::HeaderMap, Path(id): Path<String>| async move {
+                        if !token_ok(&h) {
+                            return refused(190, "expired");
+                        }
+                        REMOVED.lock().unwrap().push(id);
+                        ok(json!({"success": true}))
+                    };
+                    let mut mp4 = vec![0u8; 64];
+                    mp4[..12].copy_from_slice(b"\0\0\0\x18ftypisom");
+                    let app = Router::new()
+                        .route("/oauth/access_token", post(code))
+                        .route("/access_token", get(exchange))
+                        .route("/refresh_access_token", get(refresh))
+                        .route("/v1.0/me", get(me))
+                        .route("/v1.0/{user}/threads", post(container))
+                        .route("/v1.0/{user}/threads_publish", post(publish))
+                        .route("/v1.0/{id}", get(node).merge(delete(remove)))
+                        .route("/img.png", get(|| async { image("image/png", 64) }))
+                        .route(
+                            "/clip.mp4",
+                            get(move || async move { ([("content-type", "video/mp4")], mp4) }),
+                        );
+                    tokio::spawn(async move { axum::serve(listener, app).await });
+                    base
+                }
+
+                /// A brain with Threads set up on the mock (no waits), its state, and the mock.
+                async fn on_threads(
+                    configured: bool,
+                ) -> (TestServer, DatabaseConnection, AppState, String) {
+                    let base = mock_threads().await;
+                    let mut config = Config::from_env().expect("test config");
+                    config.trust_proxy = true;
+                    let app = configured.then(|| ("tapp".to_owned(), "tsecret".to_owned()));
+                    let mut t = Threads::new(app).unwrap();
+                    t.graph_url = base.clone();
+                    t.publish_wait = std::time::Duration::ZERO;
+                    t.poll_every = std::time::Duration::ZERO;
+                    config.threads = t;
+                    let disk = object_store::local::LocalFileSystem::new_with_prefix(media_dir())
+                        .unwrap()
+                        .with_automatic_cleanup(true);
+                    config.media = Media::new(std::sync::Arc::new(disk), true);
+                    let db = socialreins_brain::connect(&config)
+                        .await
+                        .expect("database reachable");
+                    let state = AppState::new(db.clone(), &config);
+                    let app = controllers::router(state.clone(), &config);
+                    (TestServer::new(app).unwrap(), db, state, base)
+                }
+
+                /// The query of a redirect's `Location`.
+                fn location(res: &axum_test::TestResponse) -> (String, HashMap<String, String>) {
+                    assert_eq!(res.status_code(), 303, "{}", res.text());
+                    let to = res.header("location").to_str().unwrap().to_owned();
+                    let url = reqwest::Url::parse(&to).unwrap();
+                    let q = url.query_pairs().into_owned().collect();
+                    (to, q)
+                }
+
+                /// Starts a connect: (state, `sr_threads=...`).
+                async fn begin(s: &TestServer, cookie: &str) -> (String, String) {
+                    let res = s
+                        .get("/connections/threads/redirect")
+                        .add_header("cookie", cookie)
+                        .await;
+                    let (to, q) = location(&res);
+                    assert!(
+                        to.starts_with("https://threads.com/oauth/authorize?"),
+                        "{to}"
+                    );
+                    assert_eq!(q["client_id"], "tapp");
+                    assert_eq!(
+                        q["redirect_uri"],
+                        "http://localhost:8080/connect/threads/callback"
+                    );
+                    assert_eq!(
+                        q["scope"],
+                        "threads_basic,threads_content_publish,threads_delete"
+                    );
+                    let set = res
+                        .iter_headers_by_name("set-cookie")
+                        .map(|v| v.to_str().unwrap().to_owned())
+                        .find(|c| c.starts_with("sr_threads="))
+                        .unwrap();
+                    assert!(set.contains("HttpOnly") && set.contains("Path=/connect/threads"));
+                    (
+                        q["state"].clone(),
+                        set.split(';').next().unwrap().to_owned(),
+                    )
+                }
+
+                /// Threads' redirect back: where it lands, as `(connected, connect_error)`.
+                async fn finish(
+                    s: &TestServer,
+                    cookies: &str,
+                    query: &str,
+                ) -> (Option<String>, Option<String>) {
+                    let res = s
+                        .get(&format!("/connect/threads/callback?{query}"))
+                        .add_header("cookie", cookies)
+                        .await;
+                    let (to, q) = location(&res);
+                    assert!(
+                        to.starts_with("http://localhost:3000/app/connections?"),
+                        "{to}"
+                    );
+                    (q.get("connected").cloned(), q.get("connect_error").cloned())
+                }
+
+                /// Connects the mock's profile to the caller's current team.
+                async fn connect_threads(s: &TestServer, cookie: &str) {
+                    let (state, flow) = begin(s, cookie).await;
+                    let both = format!("{cookie}; {flow}");
+                    let got = finish(s, &both, &format!("code=good&state={state}")).await;
+                    assert_eq!(got, (Some("threads".into()), None));
+                }
+
+                async fn set_role(db: &DatabaseConnection, user: uuid::Uuid, role: &str) {
+                    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+                    db.execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "UPDATE team_user SET role = $2 WHERE user_id = $1",
+                        [user.into(), role.into()],
+                    ))
+                    .await
+                    .unwrap();
+                }
+
+                async fn threads_account(
+                    db: &DatabaseConnection,
+                    team_id: &str,
+                ) -> social_accounts::Model {
+                    social_accounts::Entity::find()
+                        .filter(
+                            social_accounts::Column::TeamId
+                                .eq(team_id.parse::<uuid::Uuid>().unwrap()),
+                        )
+                        .filter(social_accounts::Column::Provider.eq("threads"))
+                        .one(db)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connect_saves_the_profile_once_in_the_default_set() {
+                    let (s, db, _, _) = on_threads(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let (state, flow) = begin(&s, &cookie).await;
+                    let both = format!("{cookie}; {flow}");
+                    let query = format!("code=good&state={state}");
+                    assert_eq!(
+                        finish(&s, &both, &query).await,
+                        (Some("threads".into()), None)
+                    );
+                    let listed = list(&s, &cookie).await;
+                    assert_eq!(listed.len(), 1);
+                    let a = &listed[0];
+                    assert_eq!(a["provider"], "threads");
+                    assert_eq!(a["external_id"], "1789");
+                    assert_eq!(a["handle"], "ann");
+                    assert_eq!(a["display_name"], "Ann Lee");
+                    let set = default_set(&db, &team_id).await.to_string();
+                    assert_eq!(a["set_ids"], json!([set]));
+                    let row = threads_account(&db, &team_id).await;
+                    assert_eq!(cipher().decrypt(&row.access_token).unwrap(), b"long");
+                    let left = row.token_expires_at.unwrap().timestamp() - Utc::now().timestamp();
+                    assert!((5_183_000..=5_184_000).contains(&left), "{left}");
+                    // The state works once.
+                    assert_eq!(
+                        finish(&s, &both, &query).await,
+                        (None, Some("expired".into()))
+                    );
+                    // A reconnect keeps the one row.
+                    connect_threads(&s, &cookie).await;
+                    let again = list(&s, &cookie).await;
+                    assert_eq!(again.len(), 1);
+                    assert_eq!(again[0]["id"], a["id"]);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connect_refuses_strangers_members_and_other_browsers() {
+                    let (s, db, _, _) = on_threads(true).await;
+                    let (_, cookie, user_id) = user(&s, &db).await;
+                    let back = |res: axum_test::TestResponse| location(&res).1;
+                    let res = s.get("/connections/threads/redirect").await;
+                    assert_eq!(back(res)["connect_error"], "unauthorized");
+
+                    // The state must come back to the browser that started it.
+                    let (state, flow) = begin(&s, &cookie).await;
+                    let query = format!("code=good&state={state}");
+                    assert_eq!(
+                        finish(&s, &cookie, &query).await,
+                        (None, Some("expired".into()))
+                    );
+                    let other = "sr_threads=0000";
+                    let wrong = format!("{cookie}; {other}");
+                    assert_eq!(
+                        finish(&s, &wrong, &query).await,
+                        (None, Some("expired".into()))
+                    );
+                    // Those did not use it up; another signed-in user cannot finish it.
+                    let (_, stranger, _) = user(&s, &db).await;
+                    let theirs = format!("{stranger}; {flow}");
+                    assert_eq!(
+                        finish(&s, &theirs, &query).await,
+                        (None, Some("expired".into()))
+                    );
+
+                    // Cancelled on Threads, a bad code, and a demotion meanwhile.
+                    let (state, flow) = begin(&s, &cookie).await;
+                    let both = format!("{cookie}; {flow}");
+                    let q = format!("error=access_denied&state={state}");
+                    assert_eq!(
+                        finish(&s, &both, &q).await,
+                        (None, Some("cancelled".into()))
+                    );
+                    let (state, flow) = begin(&s, &cookie).await;
+                    let both = format!("{cookie}; {flow}");
+                    let q = format!("code=bad&state={state}");
+                    assert_eq!(
+                        finish(&s, &both, &q).await,
+                        (None, Some("threads_failed".into()))
+                    );
+                    let (state, flow) = begin(&s, &cookie).await;
+                    set_role(&db, user_id, "member").await;
+                    let both = format!("{cookie}; {flow}");
+                    let q = format!("code=good&state={state}");
+                    assert_eq!(finish(&s, &both, &q).await, (None, Some("expired".into())));
+                    let res = s
+                        .get("/connections/threads/redirect")
+                        .add_header("cookie", &cookie)
+                        .await;
+                    assert_eq!(back(res)["connect_error"], "forbidden");
+                    assert!(list(&s, &cookie).await.is_empty());
+
+                    let (s, db, _, _) = on_threads(false).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let res = s
+                        .get("/connections/threads/redirect")
+                        .add_header("cookie", &cookie)
+                        .await;
+                    assert_eq!(back(res)["connect_error"], "not_configured");
+                }
+
+                fn threads_post(
+                    set: &str,
+                    body: &str,
+                    media: Vec<String>,
+                    parts: &[&str],
+                ) -> Value {
+                    let mut v = input(set, body, Some(&past()));
+                    v["platform"] = json!("threads");
+                    v["media"] = json!(media);
+                    v["thread"] = parts.iter().map(|p| json!({"body": p})).collect();
+                    v
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn posts_publish_as_containers_and_come_down() {
+                    let (s, db, state, base) = on_threads(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    connect_threads(&s, &cookie).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let body = threads_post(&set, "one", vec![], &["two"]);
+                    let id = id_of(&create(&s, &cookie, body).await);
+                    // Plain http on loopback, which only tests allow, so set past validation.
+                    set_media(&db, &base, &id, &["/img.png"]).await;
+                    let before = CONTAINERS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let made: Vec<HashMap<String, String>> = CONTAINERS.lock().unwrap()[before..]
+                        .iter()
+                        .map(|(user, f)| {
+                            assert_eq!(user, "1789");
+                            f.clone()
+                        })
+                        .collect();
+                    assert_eq!(made.len(), 2);
+                    assert_eq!(made[0]["media_type"], "IMAGE");
+                    assert_eq!(made[0]["text"], "one");
+                    assert!(!made[0].contains_key("reply_to_id"));
+                    let link = made[0]["image_url"].clone();
+                    assert!(link.starts_with("http://localhost:8080/media/"), "{link}");
+                    assert!(link.ends_with(".png"));
+                    let t = &p["targets"][0];
+                    let root = t["remote_id"].as_str().unwrap().to_owned();
+                    assert_eq!(
+                        t["remote_url"],
+                        format!("https://www.threads.com/@ann/post/P{root}")
+                    );
+                    assert_eq!(made[1]["media_type"], "TEXT");
+                    assert_eq!(made[1]["text"], "two");
+                    assert_eq!(made[1]["reply_to_id"], root);
+                    let part = t["parts"][0]["remote_id"].as_str().unwrap().to_owned();
+                    assert!(t["parts"][0]["remote_url"]
+                        .as_str()
+                        .unwrap()
+                        .ends_with(&format!("/P{part}")));
+                    // The post settled, so its media link is dead.
+                    let path = link.trim_start_matches("http://localhost:8080");
+                    assert_eq!(s.get(path).await.status_code(), 404);
+
+                    let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                    res.assert_status_ok();
+                    assert_eq!(res.json::<Value>()["status"], "deleted");
+                    let removed = REMOVED.lock().unwrap().clone();
+                    assert_eq!(removed[removed.len() - 2..], [part, root]);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn carousels_videos_and_a_refused_token() {
+                    let (s, db, state, base) = on_threads(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    connect_threads(&s, &cookie).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let id =
+                        id_of(&create(&s, &cookie, threads_post(&set, "c", vec![], &[])).await);
+                    set_media(&db, &base, &id, &["/img.png", "/clip.mp4"]).await;
+                    let before = CONTAINERS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                    let made: Vec<HashMap<String, String>> = CONTAINERS.lock().unwrap()[before..]
+                        .iter()
+                        .map(|(_, f)| f.clone())
+                        .collect();
+                    assert_eq!(made.len(), 3);
+                    assert_eq!(made[0]["media_type"], "IMAGE");
+                    assert_eq!(made[0]["is_carousel_item"], "true");
+                    assert_eq!(made[1]["media_type"], "VIDEO");
+                    assert!(made[1]["video_url"].ends_with(".mp4"));
+                    assert_eq!(made[2]["media_type"], "CAROUSEL");
+                    assert_eq!(made[2]["text"], "c");
+                    assert_eq!(made[2]["children"].split(',').count(), 2);
+                    assert!(!PUBLISHED.lock().unwrap().is_empty());
+
+                    // Too many items never reach Threads.
+                    let many = vec!["https://a.example/i.png".to_owned(); 21];
+                    let res = create(&s, &cookie, threads_post(&set, "x", many, &[])).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "too_many_images"}));
+
+                    // A token Threads refuses fails the target with what to do.
+                    let account = threads_account(&db, &team_id).await;
+                    let row = social_accounts::ActiveModel {
+                        id: Set(account.id),
+                        access_token: Set(cipher().encrypt(b"dead")),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(row)
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                    let id =
+                        id_of(&create(&s, &cookie, threads_post(&set, "x", vec![], &[])).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed");
+                    assert_eq!(p["targets"][0]["error"], publish::THREADS_RECONNECT);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn the_daily_refresh_extends_tokens_near_expiry() {
+                    let (s, db, state, _) = on_threads(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    connect_threads(&s, &cookie).await;
+                    let account = threads_account(&db, &team_id).await;
+                    let expire_in = |days: i64| {
+                        let row = social_accounts::ActiveModel {
+                            id: Set(account.id),
+                            token_expires_at: Set(Some(
+                                (Utc::now() + Duration::days(days)).fixed_offset(),
+                            )),
+                            ..Default::default()
+                        };
+                        social_accounts::Entity::update(row).exec(&db)
+                    };
+                    // Over 30 days left, or already expired: left alone.
+                    for days in [40, -1] {
+                        expire_in(days).await.unwrap();
+                        threads::refresh_tokens(&state).await.unwrap();
+                        let row = threads_account(&db, &team_id).await;
+                        assert_eq!(cipher().decrypt(&row.access_token).unwrap(), b"long");
+                    }
+                    expire_in(10).await.unwrap();
+                    assert!(threads::refresh_tokens(&state).await.unwrap() >= 1);
+                    let row = threads_account(&db, &team_id).await;
+                    assert_eq!(cipher().decrypt(&row.access_token).unwrap(), b"refreshed");
+                    let left = row.token_expires_at.unwrap() - Utc::now().fixed_offset();
+                    assert!(left > Duration::days(59), "{left}");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn stored_media_is_served_at_its_link_until_released() {
+                    let (s, db, state, base) = on_threads(true).await;
+                    let post = uuid::Uuid::now_v7();
+                    let until = tokio::time::Instant::now() + media::INGEST_DEADLINE;
+                    let url = format!("{base}/img.png");
+                    let stored = state
+                        .media
+                        .ingest(&db, post, &url, 1_000_000, until)
+                        .await
+                        .unwrap();
+                    let link = media::link(&state, &stored);
+                    let path = link.trim_start_matches("http://localhost:8080").to_owned();
+                    let res = s.get(&path).await;
+                    res.assert_status_ok();
+                    assert_eq!(res.header("content-type"), "image/png");
+                    assert_eq!(res.header("cache-control"), "no-store");
+                    assert_eq!(res.as_bytes().len(), 64);
+                    // Only brain's own sealed post keys open anything.
+                    assert_eq!(s.get("/media/nonsense.png").await.status_code(), 404);
+                    let token = path.trim_start_matches("/media/");
+                    let flipped: String = token
+                        .chars()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            if i == 5 {
+                                if c == 'A' {
+                                    'B'
+                                } else {
+                                    'A'
+                                }
+                            } else {
+                                c
+                            }
+                        })
+                        .collect();
+                    assert_eq!(s.get(&format!("/media/{flipped}")).await.status_code(), 404);
+                    let other = URL_SAFE_NO_PAD.encode(cipher().encrypt(b"users/secret"));
+                    assert_eq!(s.get(&format!("/media/{other}")).await.status_code(), 404);
+                    state.media.release_post(&db, post).await;
+                    assert_eq!(s.get(&path).await.status_code(), 404);
+                }
+            }
         }
 
         /// `/v1/inboxes`, `/v1/inbox-items` and `/v1/automations`, with ingest driven directly

@@ -1,7 +1,8 @@
 //! Connected social accounts of the current team. Members list them; owners and admins connect,
 //! regroup and disconnect them. Tokens never leave brain: they are sealed at rest and absent from
-//! every response. Every account stays in the team's Default set. The list takes an API token
-//! too; a set token sees only its set's accounts, each showing that set alone.
+//! every response. Every account stays in the team's Default set. OAuth providers connect in
+//! their own controllers (`threads.rs`) and save through `save_account`. The list takes an API
+//! token too; a set token sees only its set's accounts, each showing that set alone.
 use std::collections::{HashMap, HashSet};
 
 use axum::{
@@ -14,8 +15,8 @@ use chrono::{DateTime, FixedOffset, Utc};
 use sea_orm::{
     sea_query::{OnConflict, Query, SelectStatement},
     ActiveValue::Set,
-    ColumnTrait, ConnectionTrait, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -362,47 +363,57 @@ async fn connect_bluesky(
         updated_at: Set(now),
         ..Default::default()
     };
-    let saved = async {
-        let txn = app.db.begin().await?;
-        let set = default_set(&txn, t.team.id).await?;
-        // A reconnect keeps the row (id, sets, creator) and takes the new password and profile.
-        let upsert = OnConflict::columns([
-            social_accounts::Column::TeamId,
-            social_accounts::Column::Provider,
-            social_accounts::Column::ExternalId,
-        ])
-        .update_columns([
-            social_accounts::Column::Handle,
-            social_accounts::Column::DisplayName,
-            social_accounts::Column::AvatarUrl,
-            social_accounts::Column::AccessToken,
-            social_accounts::Column::Meta,
-            social_accounts::Column::DmAccess,
-            social_accounts::Column::InboxErrorAt,
-            social_accounts::Column::UpdatedAt,
-        ])
-        .to_owned();
-        let account = social_accounts::Entity::insert(row)
-            .on_conflict(upsert)
-            .exec_with_returning(&txn)
-            .await?;
-        let link = membership::ActiveModel {
-            social_account_id: Set(account.id),
-            social_set_id: Set(set),
-        };
-        membership::Entity::insert(link)
-            .on_conflict_do_nothing()
-            .exec_without_returning(&txn)
-            .await?;
-        let created = account.id == new_id;
-        let json = one_json(&txn, account).await?;
-        txn.commit().await.map(|_| (created, json))
-    };
-    match saved.await {
+    // A reconnect takes the new password and profile.
+    let refresh = [
+        social_accounts::Column::Handle,
+        social_accounts::Column::DisplayName,
+        social_accounts::Column::AvatarUrl,
+        social_accounts::Column::AccessToken,
+        social_accounts::Column::Meta,
+        social_accounts::Column::DmAccess,
+        social_accounts::Column::InboxErrorAt,
+        social_accounts::Column::UpdatedAt,
+    ];
+    match save_account(&app.db, (t.team.id, new_id), row, refresh).await {
         Ok((true, json)) => (StatusCode::CREATED, Json(json)).into_response(),
         Ok((false, json)) => Json(json).into_response(),
         Err(e) => internal(e, "bluesky account save"),
     }
+}
+
+/// Saves a newly connected account (`row`, with id `new_id`), or, when the team already holds it,
+/// updates that row's `refresh` columns and keeps its id, sets and creator. Either way the
+/// account is in the team's Default set. Returns whether it is new, and its JSON.
+pub(crate) async fn save_account(
+    db: &DatabaseConnection,
+    (team_id, new_id): (Uuid, Uuid),
+    row: social_accounts::ActiveModel,
+    refresh: impl IntoIterator<Item = social_accounts::Column>,
+) -> Result<(bool, Connection), DbErr> {
+    let txn = db.begin().await?;
+    let set = default_set(&txn, team_id).await?;
+    let upsert = OnConflict::columns([
+        social_accounts::Column::TeamId,
+        social_accounts::Column::Provider,
+        social_accounts::Column::ExternalId,
+    ])
+    .update_columns(refresh)
+    .to_owned();
+    let account = social_accounts::Entity::insert(row)
+        .on_conflict(upsert)
+        .exec_with_returning(&txn)
+        .await?;
+    let link = membership::ActiveModel {
+        social_account_id: Set(account.id),
+        social_set_id: Set(set),
+    };
+    membership::Entity::insert(link)
+        .on_conflict_do_nothing()
+        .exec_without_returning(&txn)
+        .await?;
+    let created = account.id == new_id;
+    let json = one_json(&txn, account).await?;
+    txn.commit().await.map(|_| (created, json))
 }
 
 /// Replaces the sets an account belongs to. Owners and admins. Every id must be a live set of

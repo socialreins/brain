@@ -492,7 +492,7 @@ impl Bluesky {
         &self,
         c: &Creds<'_>,
         text: &str,
-        media: &[(Vec<u8>, String)],
+        media: &[(&[u8], &str)],
         reply: Option<(Ref<'_>, Ref<'_>)>,
     ) -> Result<(String, String), PostError> {
         self.with_session(c, |s| self.create_post(s, c.did, text, media, reply))
@@ -504,13 +504,13 @@ impl Bluesky {
         s: Live,
         did: &str,
         text: &str,
-        media: &[(Vec<u8>, String)],
+        media: &[(&[u8], &str)],
         reply: Option<(Ref<'_>, Ref<'_>)>,
     ) -> Result<(String, String), PostError> {
         let (pds, jwt) = (&s.pds, &s.jwt);
         let mut images = Vec::new();
         for (i, (bytes, mime)) in media.iter().enumerate() {
-            if !IMAGE_TYPES.contains(&mime.as_str()) {
+            if !IMAGE_TYPES.contains(mime) {
                 let n = i + 1;
                 return Err(failed(format!(
                     "Image {n} is not a JPEG, PNG, WebP or GIF."
@@ -521,7 +521,7 @@ impl Bluesky {
                     pds,
                     jwt,
                     "com.atproto.repo.uploadBlob",
-                    bytes.clone().into(),
+                    bytes.to_vec().into(),
                     mime,
                 )
                 .await?;
