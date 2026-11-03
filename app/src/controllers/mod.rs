@@ -1,7 +1,7 @@
 //! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, the documented `/v1` API
 //! (waitlist, contact, teams, API tokens, webhooks, connections, social sets, posts, lists, inboxes,
-//! automations), `/mcp` (see `crate::mcp`), the Threads connect pages and `/media/{name}` (stored
-//! post files for platforms that download them).
+//! automations), `/mcp` (see `crate::mcp`), the Threads and Meta connect pages and
+//! `/media/{name}` (stored post files for platforms that download them).
 pub mod api_tokens;
 pub mod auth;
 pub mod automations;
@@ -13,6 +13,8 @@ pub mod idempotency;
 pub mod inbox;
 pub mod lists;
 pub mod media;
+pub mod meta;
+pub mod oauth;
 pub mod passkeys;
 pub mod posts;
 pub mod social_sets;
@@ -74,6 +76,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(api_tokens::api())
         .merge(webhooks::api())
         .merge(connections::api())
+        .merge(meta::api())
         .merge(social_sets::api())
         .merge(posts::api().layer(DefaultBodyLimit::max(MAX_GROUP_BODY_BYTES)))
         .merge(posts::groups_api().layer(DefaultBodyLimit::max(MAX_GROUP_BODY_BYTES)))
@@ -139,6 +142,7 @@ pub fn router(state: AppState, config: &Config) -> Router {
         )
         .merge(passkeys::routes().layer(DefaultBodyLimit::max(MAX_PASSKEY_BODY_BYTES)))
         .merge(threads::routes())
+        .merge(meta::routes())
         .merge(media::routes())
         .nest(
             "/v1",

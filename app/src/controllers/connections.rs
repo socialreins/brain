@@ -1,7 +1,7 @@
 //! Connected social accounts of the current team. Members list them; owners and admins connect,
 //! regroup and disconnect them. Tokens never leave brain: they are sealed at rest and absent from
 //! every response. Every account stays in the team's Default set. OAuth providers connect in
-//! their own controllers (`threads.rs`) and save through `save_account`. The list takes an API
+//! their own controllers (`threads.rs`, `meta.rs`) and save through `save_account`. The list takes an API
 //! token too; a set token sees only its set's accounts, each showing that set alone.
 use std::collections::{HashMap, HashSet};
 

@@ -8,7 +8,7 @@ use webauthn_rs::{prelude::Url, Webauthn, WebauthnBuilder};
 use socialreins_core::crypto::Cipher;
 
 use crate::{
-    connectors::{bluesky::Bluesky, google::Google, threads::Threads},
+    connectors::{bluesky::Bluesky, google::Google, meta, threads::Threads},
     mail::Mailer,
     media::Media,
     turnstile::Turnstile,
@@ -82,6 +82,10 @@ pub struct Config {
     /// redirect URI `{BRAIN_URL}/connect/threads/callback`. Publishing with a connected
     /// account's token needs neither.
     pub threads: Threads,
+    /// `META_APP_ID` and `META_APP_SECRET`: connecting Facebook Pages and Instagram accounts,
+    /// with the redirect URI `{BRAIN_URL}/connect/meta/callback`, on Graph API
+    /// `META_GRAPH_VERSION` (default `v26.0`). Publishing with a stored Page token needs neither.
+    pub meta: meta::Meta,
 }
 
 impl Config {
@@ -165,6 +169,10 @@ impl Config {
             admin_emails: admin_emails(var("ADMIN_EMAILS"))?,
             media: Media::new(media_store(var)?, false),
             threads: Threads::new(var("THREADS_APP_ID").zip(var("THREADS_APP_SECRET")))?,
+            meta: meta::Meta::new(
+                var("META_APP_ID").zip(var("META_APP_SECRET")),
+                &var("META_GRAPH_VERSION").unwrap_or_else(|| meta::DEFAULT_VERSION.into()),
+            )?,
         })
     }
 }
