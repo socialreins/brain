@@ -30,8 +30,12 @@ const PAGE_LIMIT: &str = "100";
 const PAGE_CALLS: usize = 10;
 /// Status checks: now, then after 1, 2, ... `POLLS - 1` times `poll_every` (about 4 minutes).
 const POLLS: u32 = 10;
+/// A carousel container's own wait, after its items finished (about 50 seconds).
+const CAROUSEL_POLLS: u32 = 5;
 /// Longest one post may take: an Instagram video is processed for minutes.
 pub const PUBLISH_TIMEOUT: Duration = Duration::from_secs(420);
+/// Longest the permalink lookup after an Instagram publish may take.
+const LINK_TIMEOUT: Duration = Duration::from_secs(5);
 /// What each platform takes. Instagram publishes JPEG images only.
 pub const FACEBOOK_TYPES: [&str; 5] = [
     "image/jpeg",
@@ -436,7 +440,9 @@ impl Meta {
         if !caption.is_empty() {
             top.push(("caption", caption));
         }
-        let container = match media {
+        // A carousel waits for its items first, so its own wait is shorter: both stay well
+        // inside PUBLISH_TIMEOUT, never cutting off `media_publish`.
+        let (container, polls) = match media {
             [] => return Err(failed("Instagram needs at least one image or video.")),
             [one] => {
                 if one.video {
@@ -444,7 +450,7 @@ impl Meta {
                 } else {
                     top.push(("image_url", one.url));
                 }
-                self.container(&path, token, &top).await?
+                (self.container(&path, token, &top).await?, POLLS)
             }
             many => {
                 let mut children = Vec::new();
@@ -458,24 +464,26 @@ impl Meta {
                     form.push(("is_carousel_item", "true"));
                     children.push(self.container(&path, token, &form).await?);
                 }
-                self.finished(token, &children).await?;
+                self.finished(token, &children, POLLS).await?;
                 let children = children.join(",");
                 top.extend([("media_type", "CAROUSEL"), ("children", children.as_str())]);
-                self.container(&path, token, &top).await?
+                (self.container(&path, token, &top).await?, CAROUSEL_POLLS)
             }
         };
-        self.finished(token, std::slice::from_ref(&container))
+        self.finished(token, std::slice::from_ref(&container), polls)
             .await?;
         let form = [("creation_id", container.as_str())];
         let made = self
             .post(&format!("{ig}/media_publish"), token, &form, "Publish")
             .await?;
         let id = id_of(&made).ok_or_else(|| failed("Publish: Meta sent no id."))?;
-        // Best effort: the post is up, so a failed lookup only leaves the link out.
-        let link = self
-            .get(&id, token, &[("fields", "permalink")], "Link")
+        // Best effort: the post is up, so a failed lookup only leaves the link out. Bounded, so
+        // a slow lookup cannot run past the publish timeout and lose the live post's id.
+        let lookup = self.get(&id, token, &[("fields", "permalink")], "Link");
+        let link = tokio::time::timeout(LINK_TIMEOUT, lookup)
             .await
             .ok()
+            .and_then(Result::ok)
             .and_then(|v| text(&v["permalink"]))
             .filter(|l| l.starts_with("https://"));
         Ok((id, link))
@@ -492,9 +500,14 @@ impl Meta {
     }
 
     /// Polls Instagram containers until all are `FINISHED`, within one shared bound.
-    async fn finished(&self, token: &str, containers: &[String]) -> Result<(), PostError> {
+    async fn finished(
+        &self,
+        token: &str,
+        containers: &[String],
+        polls: u32,
+    ) -> Result<(), PostError> {
         let mut left: Vec<&String> = containers.iter().collect();
-        for i in 1..=POLLS {
+        for i in 1..=polls {
             let mut still = Vec::new();
             for c in left {
                 let fields = [("fields", "status_code,status")];
@@ -515,7 +528,7 @@ impl Meta {
             if left.is_empty() {
                 return Ok(());
             }
-            if i < POLLS {
+            if i < polls {
                 tokio::time::sleep(self.poll_every * i).await;
             }
         }
