@@ -8,7 +8,7 @@ use webauthn_rs::{prelude::Url, Webauthn, WebauthnBuilder};
 use socialreins_core::crypto::Cipher;
 
 use crate::{
-    connectors::{bluesky::Bluesky, google::Google},
+    connectors::{bluesky::Bluesky, google::Google, threads::Threads},
     mail::Mailer,
     media::Media,
     turnstile::Turnstile,
@@ -78,6 +78,10 @@ pub struct Config {
     /// an S3-compatible bucket, path-style (Cloudflare R2, AWS S3, MinIO). Else local disk at
     /// `MEDIA_DIR` (default `./media`, created when missing).
     pub media: Media,
+    /// `THREADS_APP_ID` and `THREADS_APP_SECRET`: connecting Threads accounts, with the
+    /// redirect URI `{BRAIN_URL}/connect/threads/callback`. Publishing with a connected
+    /// account's token needs neither.
+    pub threads: Threads,
 }
 
 impl Config {
@@ -160,6 +164,7 @@ impl Config {
             contact_to,
             admin_emails: admin_emails(var("ADMIN_EMAILS"))?,
             media: Media::new(media_store(var)?, false),
+            threads: Threads::new(var("THREADS_APP_ID").zip(var("THREADS_APP_SECRET")))?,
         })
     }
 }

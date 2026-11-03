@@ -53,6 +53,7 @@ pub struct AppState {
     pub waitlist_count: Arc<std::sync::Mutex<Option<(std::time::Instant, u64)>>>,
     /// Post media while a post publishes (`media.rs`).
     pub media: crate::media::Media,
+    pub threads: crate::connectors::threads::Threads,
 }
 
 impl AppState {
@@ -90,6 +91,7 @@ impl AppState {
             admin_emails: config.admin_emails.clone(),
             waitlist_count: Arc::default(),
             media: config.media.clone(),
+            threads: config.threads.clone(),
         }
     }
 }

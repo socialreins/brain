@@ -1,6 +1,7 @@
 //! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, the documented `/v1` API
 //! (waitlist, contact, teams, API tokens, webhooks, connections, social sets, posts, lists, inboxes,
-//! automations), and `/mcp` (see `crate::mcp`).
+//! automations), `/mcp` (see `crate::mcp`), the Threads connect pages and `/media/{name}` (stored
+//! post files for platforms that download them).
 pub mod api_tokens;
 pub mod auth;
 pub mod automations;
@@ -11,10 +12,12 @@ pub mod health;
 pub mod idempotency;
 pub mod inbox;
 pub mod lists;
+pub mod media;
 pub mod passkeys;
 pub mod posts;
 pub mod social_sets;
 pub mod teams;
+pub mod threads;
 pub mod waitlist;
 pub mod webhooks;
 
@@ -80,8 +83,9 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(automations::api().layer(DefaultBodyLimit::max(MAX_AUTOMATION_BODY_BYTES)))
 }
 
-/// The request span. Logs the path only (no query), with the token in `/auth/magic/{token}` and
-/// `/v1/invitations/{token}` replaced, so a sign-in or invitation link never reaches the log.
+/// The request span. Logs the path only (no query), with the token in `/auth/magic/{token}`,
+/// `/v1/invitations/{token}` and `/media/{name}` replaced, so a sign-in, invitation or media
+/// link never reaches the log.
 /// Headers are not logged, so neither is an API token's `Authorization` header.
 fn span(req: &axum::http::Request<axum::body::Body>) -> tracing::Span {
     let path = req.uri().path();
@@ -89,6 +93,8 @@ fn span(req: &axum::http::Request<axum::body::Body>) -> tracing::Span {
         "/auth/magic/{token}"
     } else if path.starts_with("/v1/invitations/") {
         "/v1/invitations/{token}"
+    } else if path.starts_with("/media/") {
+        "/media/{name}"
     } else {
         path
     };
@@ -132,6 +138,8 @@ pub fn router(state: AppState, config: &Config) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_BODY_BYTES)),
         )
         .merge(passkeys::routes().layer(DefaultBodyLimit::max(MAX_PASSKEY_BODY_BYTES)))
+        .merge(threads::routes())
+        .merge(media::routes())
         .nest(
             "/v1",
             v1.layer(from_fn_with_state(state.clone(), idempotency::layer))

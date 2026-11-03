@@ -6,6 +6,7 @@
 //! `PublicOnly` and follow at most 3 redirects, each to a public https URL.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use tokio::time::Instant;
 
 use object_store::{path::Path, ObjectStore, WriteMultipart};
@@ -403,6 +404,31 @@ pub async fn sweep(app: &AppState) -> Result<u64, DbErr> {
     let gone = app.media.release(&app.db, None, SWEEP_DAYS).await?;
     lock.commit().await?;
     Ok(gone)
+}
+
+/// The unguessable brain URL of a stored file, for platforms that download media themselves
+/// (Threads): its storage key sealed with `ENCRYPTION_KEY`, plus an extension for its type. It
+/// serves the file only while the file is stored, which ends once its post settles.
+pub fn link(app: &AppState, file: &Stored) -> String {
+    let sealed = URL_SAFE_NO_PAD.encode(app.cipher.encrypt(file.key.as_bytes()));
+    let ext = match file.content_type.as_str() {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
+        _ => "bin",
+    };
+    format!("{}/media/{sealed}.{ext}", app.brain_url)
+}
+
+/// The storage key a `link` names, when brain sealed it and it is a post file.
+pub fn unseal(app: &AppState, name: &str) -> Option<String> {
+    let token = name.split('.').next()?;
+    let sealed = URL_SAFE_NO_PAD.decode(token).ok()?;
+    let key = String::from_utf8(app.cipher.decrypt(&sealed)?).ok()?;
+    key.starts_with("posts/").then_some(key)
 }
 
 fn sql(sql: &str, values: Vec<Value>) -> Statement {

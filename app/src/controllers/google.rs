@@ -112,7 +112,8 @@ async fn take_state(
 ) -> Result<Option<(String, String, String)>, DbErr> {
     let stmt = Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "DELETE FROM oauth_states WHERE state_hash = $1 RETURNING nonce, verifier, next, \
+        "DELETE FROM oauth_states WHERE state_hash = $1 AND provider IS NULL \
+         RETURNING nonce, verifier, next, \
          expires_at > now() AS live",
         [token::hash(state).into()],
     );

@@ -6,6 +6,9 @@ pub const BLUESKY_MAX_GRAPHEMES: usize = 300;
 /// Bluesky also caps the text at 3000 UTF-8 bytes.
 pub const BLUESKY_MAX_BYTES: usize = 3000;
 pub const BLUESKY_MAX_IMAGES: usize = 4;
+/// Threads: 500 characters, 20 images or videos (a carousel).
+pub const THREADS_MAX_CHARS: usize = 500;
+pub const THREADS_MAX_MEDIA: usize = 20;
 /// Follow-up parts a thread may have after its first post.
 pub const MAX_THREAD_PARTS: usize = 25;
 const MAX_URL_LEN: usize = 2048;
@@ -49,18 +52,25 @@ pub fn https_url(url: &str) -> bool {
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-/// Checks a post for `platform` (only `bluesky` publishes today).
+/// Checks a post for `platform` (`bluesky` or `threads`, the ones that publish today).
 pub fn validate(platform: &str, body: &str, media: &[String]) -> Result<(), Invalid> {
-    if platform != "bluesky" {
-        return Err(Invalid::UnsupportedPlatform);
-    }
+    let (too_long, max_media) = match platform {
+        "bluesky" => (
+            body.len() > BLUESKY_MAX_BYTES || body.graphemes(true).count() > BLUESKY_MAX_GRAPHEMES,
+            BLUESKY_MAX_IMAGES,
+        ),
+        // shortcut: counts characters, while Threads counts an emoji by its UTF-8 bytes, so an
+        // emoji-heavy post near 500 may still be refused at publish; count like Threads if it bites.
+        "threads" => (body.chars().count() > THREADS_MAX_CHARS, THREADS_MAX_MEDIA),
+        _ => return Err(Invalid::UnsupportedPlatform),
+    };
     if body.trim().is_empty() && media.is_empty() {
         return Err(Invalid::Empty);
     }
-    if body.len() > BLUESKY_MAX_BYTES || body.graphemes(true).count() > BLUESKY_MAX_GRAPHEMES {
+    if too_long {
         return Err(Invalid::TooLong);
     }
-    if media.len() > BLUESKY_MAX_IMAGES {
+    if media.len() > max_media {
         return Err(Invalid::TooManyImages);
     }
     if !media.iter().all(|m| https_url(m)) {
@@ -78,7 +88,7 @@ pub fn validate_thread(
     if parts.is_empty() {
         return Ok(());
     }
-    if platform != "bluesky" {
+    if !matches!(platform, "bluesky" | "threads") {
         return Err((Invalid::ThreadUnsupported, None));
     }
     if parts.len() > MAX_THREAD_PARTS {
@@ -183,6 +193,27 @@ mod tests {
             assert_eq!(ok("x", &[bad]), Err(Invalid::InvalidMedia), "{bad}");
         }
         assert_eq!(validate("x", "hi", &[]), Err(Invalid::UnsupportedPlatform));
+    }
+
+    #[test]
+    fn threads_limits() {
+        let media = |n: usize| vec!["https://a.example/1.png".to_owned(); n];
+        assert_eq!(validate("threads", &"a".repeat(500), &[]), Ok(()));
+        assert_eq!(validate("threads", &"é".repeat(500), &[]), Ok(()));
+        assert_eq!(
+            validate("threads", &"a".repeat(501), &[]),
+            Err(Invalid::TooLong)
+        );
+        assert_eq!(validate("threads", "x", &media(20)), Ok(()));
+        assert_eq!(
+            validate("threads", "x", &media(21)),
+            Err(Invalid::TooManyImages)
+        );
+        assert_eq!(validate("threads", " ", &[]), Err(Invalid::Empty));
+        assert_eq!(
+            validate_thread("threads", &[("two", &media(0)[..])]),
+            Ok(())
+        );
     }
 
     #[test]

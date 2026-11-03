@@ -22,7 +22,10 @@ use uuid::Uuid;
 
 pub use crate::connectors::bluesky::PostError as PublishError;
 use crate::{
-    connectors::bluesky::{self, Bluesky},
+    connectors::{
+        bluesky::{self, Bluesky},
+        threads::{self, Threads},
+    },
     controllers::posts::ThreadPart,
     media::{Fail, Stored},
     models::{
@@ -33,11 +36,21 @@ use crate::{
     webhooks::with_event,
 };
 
-/// A published post: the platform's id and, where a reply must name it (Bluesky), its cid.
+/// A published post: the platform's id, where a reply must name it (Bluesky) its cid, and its
+/// link when the platform gave one (Threads); else `Publisher::url` makes it.
 #[derive(Clone)]
 pub struct Remote {
     pub id: String,
     pub cid: String,
+    pub url: Option<String>,
+}
+
+/// One stored image or video: its bytes (empty for a publisher that fetches by URL), type, and
+/// the unguessable brain URL that serves it while the post publishes (`media::link`).
+pub struct Attachment {
+    pub bytes: Vec<u8>,
+    pub content_type: String,
+    pub url: String,
 }
 
 /// One publisher per platform.
@@ -49,9 +62,25 @@ pub trait Publisher: Send + Sync {
         account: &social_accounts::Model,
         secret: &str,
         body: &str,
-        media: &[(Vec<u8>, String)],
+        media: &[Attachment],
         reply: Option<(&Remote, &Remote)>,
     ) -> Result<Remote, PublishError>;
+
+    /// The platform's name in messages, e.g. "Delete the post in the Bluesky app".
+    fn name(&self) -> &'static str;
+
+    /// What a target says when the platform refused the stored credentials.
+    fn reconnect(&self) -> &'static str;
+
+    /// The platform downloads media from `Attachment::url` itself, so no bytes are read.
+    fn by_url(&self) -> bool {
+        false
+    }
+
+    /// Longest one post (or thread part) may take to publish.
+    fn timeout(&self) -> Duration {
+        TARGET_TIMEOUT
+    }
 
     async fn delete(
         &self,
@@ -79,9 +108,13 @@ impl Publisher for Bluesky {
         account: &social_accounts::Model,
         secret: &str,
         body: &str,
-        media: &[(Vec<u8>, String)],
+        media: &[Attachment],
         reply: Option<(&Remote, &Remote)>,
     ) -> Result<Remote, PublishError> {
+        let media: Vec<(&[u8], &str)> = media
+            .iter()
+            .map(|a| (a.bytes.as_slice(), a.content_type.as_str()))
+            .collect();
         let reply = reply.map(|(p, r)| {
             (
                 (p.id.as_str(), p.cid.as_str()),
@@ -89,9 +122,17 @@ impl Publisher for Bluesky {
             )
         });
         let (id, cid) = self
-            .publish_post(&creds(account, secret), body, media, reply)
+            .publish_post(&creds(account, secret), body, &media, reply)
             .await?;
-        Ok(Remote { id, cid })
+        Ok(Remote { id, cid, url: None })
+    }
+
+    fn name(&self) -> &'static str {
+        "Bluesky"
+    }
+
+    fn reconnect(&self) -> &'static str {
+        RECONNECT
     }
 
     async fn delete(
@@ -108,10 +149,74 @@ impl Publisher for Bluesky {
     }
 }
 
+#[async_trait]
+impl Publisher for Threads {
+    async fn publish(
+        &self,
+        account: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        reply: Option<(&Remote, &Remote)>,
+    ) -> Result<Remote, PublishError> {
+        let mut items = Vec::new();
+        for (i, a) in media.iter().enumerate() {
+            if !threads::MEDIA_TYPES.contains(&a.content_type.as_str()) {
+                return Err(PublishError::Failed(format!(
+                    "Image {} is not a JPEG or PNG image or an MP4 or MOV video.",
+                    i + 1
+                )));
+            }
+            let video = a.content_type.starts_with("video/");
+            items.push(threads::Item { url: &a.url, video });
+        }
+        let parent = reply.map(|(p, _)| p.id.as_str());
+        let (id, url) = self
+            .publish_post(&account.external_id, secret, body, &items, parent)
+            .await?;
+        Ok(Remote {
+            id,
+            cid: String::new(),
+            url,
+        })
+    }
+
+    async fn delete(
+        &self,
+        _: &social_accounts::Model,
+        secret: &str,
+        remote_id: &str,
+    ) -> Result<(), PublishError> {
+        self.delete_post(secret, remote_id).await
+    }
+
+    /// A Threads permalink needs a lookup, done at publish (`Remote::url`).
+    fn url(&self, _: &social_accounts::Model, _: &str) -> Option<String> {
+        None
+    }
+
+    fn name(&self) -> &'static str {
+        "Threads"
+    }
+
+    fn reconnect(&self) -> &'static str {
+        THREADS_RECONNECT
+    }
+
+    fn by_url(&self) -> bool {
+        true
+    }
+
+    fn timeout(&self) -> Duration {
+        threads::PUBLISH_TIMEOUT
+    }
+}
+
 /// The publisher for `platform`; `None` until its connector exists.
 pub fn publisher<'a>(app: &'a AppState, platform: &str) -> Option<&'a dyn Publisher> {
     match platform {
         "bluesky" => Some(&app.bluesky),
+        "threads" => Some(&app.threads),
         _ => None,
     }
 }
@@ -131,7 +236,8 @@ pub fn quota_bucket(team_id: Uuid) -> String {
     format!("publish:team:{team_id}")
 }
 
-/// Longest one post (or thread part) may take to publish or delete.
+/// Longest one post (or thread part) may take to publish or delete, unless its publisher says
+/// otherwise (`Publisher::timeout`).
 const TARGET_TIMEOUT: Duration = Duration::from_secs(120);
 /// A target `publishing` this long was cut off (crash, restart) and may have posted.
 const STUCK_MINUTES: i64 = 15;
@@ -139,6 +245,8 @@ const PUBLISH_LOCK: i64 = 0x0050_5542_4c49_5348;
 
 pub const RECONNECT: &str =
     "Bluesky refused the app password. Reconnect the account under Connections.";
+pub const THREADS_RECONNECT: &str =
+    "Threads refused the account's token. Reconnect the account under Connections.";
 const STUCK: &str = "Unknown, check the account: publishing stopped midway and it may have posted.";
 
 fn sql(sql: &str, values: Vec<Value>) -> Statement {
@@ -298,7 +406,8 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
         } else {
             ("published", None)
         };
-        // shortcut: Bluesky is the only publisher; use the platform's `url` once there are more.
+        // shortcut: only Bluesky links are made from the id; a Threads link (looked up at
+        // publish) is left out here. Look it up if recovered Threads posts need one.
         let url = bluesky::post_url(&remote);
         let stmt = sql(
             &with_event(
@@ -448,8 +557,7 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
 type Media = HashMap<String, Result<Stored, Fail>>;
 
 async fn ingest(app: &AppState, post: &posts::Model) -> Media {
-    // shortcut: Bluesky is the only publisher, so its 1 MB image cap; cap per platform with more.
-    let cap = bluesky::MAX_IMAGE_BYTES;
+    let cap = max_bytes(&post.platform);
     let thread: Vec<ThreadPart> = serde_json::from_value(post.thread.clone()).unwrap_or_default();
     let root: Vec<String> = serde_json::from_value(post.media.clone()).unwrap_or_default();
     let urls: Vec<String> = root
@@ -459,8 +567,17 @@ async fn ingest(app: &AppState, post: &posts::Model) -> Media {
     app.media.ingest_all(&app.db, post.id, &urls, cap).await
 }
 
+/// The largest file stored for `platform`: Bluesky takes 1 MB images; Threads fetches up to 8 MB
+/// images and 1 GB videos itself, so brain's own cap holds there.
+fn max_bytes(platform: &str) -> usize {
+    match platform {
+        "bluesky" => bluesky::MAX_IMAGE_BYTES,
+        _ => crate::media::MAX_BYTES,
+    }
+}
+
 /// What to tell the user about image `n` that could not be stored.
-fn media_error(fail: Fail, n: usize) -> String {
+fn media_error(fail: Fail, n: usize, platform: &str) -> String {
     match fail {
         Fail::Blocked => format!("Image {n} is not a public https URL."),
         Fail::NotShared => format!(
@@ -469,7 +586,13 @@ fn media_error(fail: Fail, n: usize) -> String {
         ),
         Fail::Http(code) => format!("Image {n} could not be downloaded (HTTP {code})."),
         Fail::Unreachable => format!("Image {n} could not be downloaded."),
-        Fail::TooLarge => format!("Image {n} is over 1 MB, Bluesky's limit."),
+        Fail::TooLarge if platform == "bluesky" => {
+            format!("Image {n} is over 1 MB, Bluesky's limit.")
+        }
+        Fail::TooLarge => format!(
+            "Image {n} is over {} MB, the largest file SocialReins takes.",
+            max_bytes(platform) / 1_000_000
+        ),
         Fail::Unsupported => format!("Image {n} is not a JPEG, PNG, WebP or GIF."),
         Fail::Storage => format!("Image {n} could not be stored. Try again."),
         Fail::TimedOut => format!(
@@ -480,12 +603,17 @@ fn media_error(fail: Fail, n: usize) -> String {
 }
 
 /// The first media problem of the post or its thread, so nothing goes out with one.
-fn media_problem(media: &Media, root: &[String], thread: &[ThreadPart]) -> Option<String> {
+fn media_problem(
+    media: &Media,
+    root: &[String],
+    thread: &[ThreadPart],
+    platform: &str,
+) -> Option<String> {
     let first = |urls: &[String]| {
         urls.iter()
             .enumerate()
             .find_map(|(i, u)| match media.get(u) {
-                Some(Err(f)) => Some(media_error(*f, i + 1)),
+                Some(Err(f)) => Some(media_error(*f, i + 1, platform)),
                 _ => None,
             })
     };
@@ -497,25 +625,35 @@ fn media_problem(media: &Media, root: &[String], thread: &[ThreadPart]) -> Optio
     })
 }
 
-/// The stored bytes and type of each URL.
+/// Each URL's stored file: its type and brain link, and its bytes unless `by_url`.
 async fn load(
     app: &AppState,
     media: &Media,
     urls: &[String],
-) -> Result<Vec<(Vec<u8>, String)>, String> {
+    (by_url, platform): (bool, &str),
+) -> Result<Vec<Attachment>, String> {
     let mut files = Vec::new();
     for (i, url) in urls.iter().enumerate() {
         let n = i + 1;
         let Some(Ok(s)) = media.get(url) else {
-            return Err(media_error(Fail::Storage, n));
+            return Err(media_error(Fail::Storage, n, platform));
         };
-        match app.media.read(&s.key).await {
-            Ok(bytes) => files.push((bytes, s.content_type.clone())),
-            Err(e) => {
-                tracing::warn!(error = %e, "stored media read failed");
-                return Err(media_error(Fail::Storage, n));
+        let bytes = if by_url {
+            Vec::new()
+        } else {
+            match app.media.read(&s.key).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(error = %e, "stored media read failed");
+                    return Err(media_error(Fail::Storage, n, platform));
+                }
             }
-        }
+        };
+        files.push(Attachment {
+            bytes,
+            content_type: s.content_type.clone(),
+            url: crate::media::link(app, s),
+        });
     }
     Ok(files)
 }
@@ -551,11 +689,12 @@ async fn send(
     (body, media): (&str, &[String]),
     reply: Option<(&Remote, &Remote)>,
 ) -> Result<Remote, String> {
-    let media = load(app, stored, media).await?;
+    let how = (publisher.by_url(), account.provider.as_str());
+    let media = load(app, stored, media, how).await?;
     let sent = publisher.publish(account, secret, body, &media, reply);
-    match tokio::time::timeout(TARGET_TIMEOUT, sent).await {
+    match tokio::time::timeout(publisher.timeout(), sent).await {
         Ok(Ok(remote)) => Ok(remote),
-        Ok(Err(PublishError::Reconnect)) => Err(RECONNECT.to_owned()),
+        Ok(Err(PublishError::Reconnect)) => Err(publisher.reconnect().to_owned()),
         Ok(Err(PublishError::Failed(msg))) => Err(msg),
         Err(_) => Err("Timed out; it may have posted, check the account.".to_owned()),
     }
@@ -590,11 +729,11 @@ async fn publish_target(
         .decrypt(&account.access_token)
         .and_then(|b| String::from_utf8(b).ok())
     else {
-        return fail_target(db, id, RECONNECT).await;
+        return fail_target(db, id, publisher.reconnect()).await;
     };
     let media: Vec<String> = serde_json::from_value(post.media.clone()).unwrap_or_default();
     let thread: Vec<ThreadPart> = serde_json::from_value(post.thread.clone()).unwrap_or_default();
-    if let Some(msg) = media_problem(stored, &media, &thread) {
+    if let Some(msg) = media_problem(stored, &media, &thread, &post.platform) {
         return fail_target(db, id, &msg).await;
     }
     let with = (app, stored);
@@ -619,7 +758,10 @@ async fn publish_target(
             id.into(),
             root.id.clone().into(),
             root.cid.clone().into(),
-            publisher.url(&account, &root.id).into(),
+            root.url
+                .clone()
+                .or_else(|| publisher.url(&account, &root.id))
+                .into(),
         ],
     );
     db.execute_raw(stmt).await?;
@@ -649,7 +791,7 @@ async fn publish_target(
         };
         let saved = serde_json::json!([{
             "remote_id": made.id, "cid": made.cid,
-            "remote_url": publisher.url(&account, &made.id),
+            "remote_url": made.url.clone().or_else(|| publisher.url(&account, &made.id)),
             "published_at": chrono::Utc::now().fixed_offset(),
         }]);
         let stmt = sql(
@@ -828,18 +970,20 @@ async fn delete_one(
     remote_id: &str,
     name: &str,
 ) -> Option<String> {
+    let app = publisher.name();
     let done =
         tokio::time::timeout(TARGET_TIMEOUT, publisher.delete(account, secret, remote_id)).await;
     match done {
         Ok(Ok(())) => None,
         Ok(Err(PublishError::Reconnect)) => Some(format!(
-            "{name}: {RECONNECT} Or delete the post in the Bluesky app."
+            "{name}: {} Or delete the post in the {app} app.",
+            publisher.reconnect()
         )),
         Ok(Err(PublishError::Failed(msg))) => Some(format!(
-            "{name}: {msg} Delete the post in the Bluesky app if it is still up."
+            "{name}: {msg} Delete the post in the {app} app if it is still up."
         )),
         Err(_) => Some(format!(
-            "{name}: Bluesky did not answer in time. Try again, or delete it in the app."
+            "{name}: {app} did not answer in time. Try again, or delete it in the app."
         )),
     }
 }

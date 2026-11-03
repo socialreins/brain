@@ -61,6 +61,9 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/v1/connections` | The current team's connected accounts with their `set_ids`; never tokens |
 | GET | `/v1/connections/providers` | Each provider with `configured`: Bluesky always, the others once their app id and secret are set |
 | POST | `/v1/connections/bluesky` | `{"handle","app_password"}` (owner, admin): checks it on the account's PDS, stores it encrypted, joins the Default set; `201`, or `200` when it replaces the password of an account the team already has |
+| GET | `/connections/threads/redirect` | A page navigation from web (session cookie; owner, admin of the current team): sends the browser to Threads to connect a profile. Lands back on `{WEB_URL}/app/connections` |
+| GET | `/connect/threads/callback` | Where Threads sends the browser back (register `{BRAIN_URL}/connect/threads/callback` in the Threads app); lands on `{WEB_URL}/app/connections?connected=threads` or `?connect_error=<code>&provider=threads` |
+| GET | `/media/{name}` | A stored post file at an unguessable link, for platforms that download media themselves (Threads); `404` once the post settles |
 | PUT | `/v1/connections/{id}/sets` | `{"set_ids"}` (owner, admin): the sets of the current team holding the account; must include the Default set |
 | DELETE | `/v1/connections/{id}` | Disconnect an account (owner, admin), `204` |
 | GET, POST | `/v1/social-sets` | The current team's live sets with `account_ids`, Default first (`?deleted=true`: deleted ones still restorable); create one (`{"name"}`, owner, admin) |
@@ -169,8 +172,9 @@ team's live sets in any case (`409 name_taken`); a team holds at most 50 live se
 it keeps its account links, hidden, so a restore within 30 days brings them back. An hourly
 job in brain hard-deletes sets deleted over 30 days ago, one instance at a time (advisory lock).
 
-Posts go to every account of their platform in their social set; only Bluesky publishes
-today (300 graphemes, 4 images of at most 1 MB from public https URLs, links become facets).
+Posts go to every account of their platform in their social set; Bluesky (300 graphemes, 4
+images of at most 1 MB from public https URLs, links become facets) and Threads (500
+characters, up to 20 JPEG or PNG images or MP4 or MOV videos as a carousel) publish today.
 Saving with `scheduled_at` makes a post `scheduled`, else `draft`; only those two can change.
 A tick every minute claims due posts (one instance at a time, advisory lock), creates one
 target per account and claims each target once, so nothing posts twice; a publish is never
@@ -203,6 +207,30 @@ a day per user (handles that do not resolve included), 10 a day per account (DID
 account across all teams, which a team already holding the account is exempt from. The DID
 document must list the handle (`alsoKnownAs`), or the answer is `invalid_handle`. Bluesky hosts must resolve to public addresses (`unsupported_pds`), and
 responses over 64 KiB are dropped.
+
+Threads (when `THREADS_APP_ID` and `THREADS_APP_SECRET` are set) connects by OAuth. The web app
+navigates to `GET /connections/threads/redirect`, which needs an owner or admin of the current
+team (5 a minute per user) and sends the browser to `threads.com/oauth/authorize` with the
+scopes `threads_basic`, `threads_content_publish` and `threads_delete`. The attempt (the state's
+SHA-256, the team and the user) is kept in Postgres for 10 minutes and used once; the browser
+holds the state in an HttpOnly cookie scoped to `/connect/threads`, compared in constant time.
+The callback needs the same signed-in user, still an owner or admin of that team, swaps the code
+at `graph.threads.com/oauth/access_token` for a 60-day token (`th_exchange_token`), reads `me`
+(id, username, name, picture) and saves a `threads` account in that team's Default set; a
+reconnect updates the same row. It lands on `{WEB_URL}/app/connections?connected=threads`, or
+`?connect_error=` `not_configured`, `unauthorized`, `forbidden`, `rate_limited`, `expired`,
+`cancelled`, `threads_failed` or `internal` with `&provider=threads`, never with details. A daily
+job extends tokens with 30 days or less left and not yet expired (`th_refresh_token`).
+
+A Threads post is a container (`TEXT`, `IMAGE`, `VIDEO`, or `CAROUSEL` of item containers)
+made with `POST {user}/threads`, polled until `FINISHED`, then published with
+`threads_publish` after a 30-second wait (a finished text container still failed when published
+sooner). Each thread part replies to the one before (`reply_to_id`). The permalink is looked up
+after publishing; a failed lookup only leaves the link out. A takedown deletes each part, then
+the root (`DELETE /v1.0/{id}`, 100 a day per profile). One post may take up to 6 minutes.
+Threads downloads media itself, so brain hands it `{BRAIN_URL}/media/<sealed key>.<ext>`: the
+stored file's key sealed with `ENCRYPTION_KEY`, served only while the file is stored (until the
+post settles). `BRAIN_URL` must be reachable from the internet for Threads posts with media.
 
 Webhooks: a team may set one public `https://` URL (at most 2000 characters, no credentials,
 not `localhost` or a private address). Each post target fires `post.target.published`,
@@ -272,7 +300,7 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `GIT_COMMIT` | no | Used when `RAILWAY_GIT_COMMIT_SHA` is unset; baked into published images. Else `dev` |
 | `RUST_LOG` | no | `info` |
 | `META_APP_ID`, `META_APP_SECRET` | no | Offer Facebook and Instagram (connector not built yet) |
-| `THREADS_APP_ID`, `THREADS_APP_SECRET` | no | Offer Threads (connector not built yet) |
+| `THREADS_APP_ID`, `THREADS_APP_SECRET` | no | Both to connect Threads accounts (redirect URI `{BRAIN_URL}/connect/threads/callback`). Publishing with connected accounts needs neither |
 | `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET` | no | Offer LinkedIn (connector not built yet) |
 | `X_CLIENT_ID`, `X_CLIENT_SECRET` | no | Offer X (connector not built yet) |
 | `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET` | no | Offer TikTok (connector not built yet) |
@@ -291,8 +319,9 @@ A post's `media` are URLs: public `https://` links or Google Drive share links
 Nothing is fetched when a post is saved. When it publishes, brain downloads each URL once into
 its storage (`MEDIA_DIR` or the `S3_*` bucket): names must resolve to public addresses, at most 3
 redirects, each to a public https URL, 4 at a time and all within a minute, streamed with a cap of 100 MB a file (1 MB for Bluesky)
-and typed by its first bytes (JPEG, PNG, WebP, GIF; MP4, MOV and PDF are kept for later
-platforms). Platforms are then served from the stored copy, and a URL that fails fails its
+and typed by its first bytes (JPEG, PNG, WebP, GIF, MP4, MOV; PDF is kept for later
+platforms). Platforms are then served from the stored copy (Threads fetches it from its
+`/media/` link), and a URL that fails fails its
 target naming the image, before anything goes out. A post's files are deleted once it settles
 (published, failed or deleted); an hourly sweep deletes any left a week later whose post no
 longer waits to publish, whether or not a row still names it. Local-disk storage assumes one

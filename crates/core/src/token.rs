@@ -18,8 +18,25 @@ pub fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// Whether `a` equals `b`, in a time that depends only on their lengths.
+pub fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0, |acc, (x, y)| acc | (x ^ y))
+            == 0
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn same_compares_whole_strings() {
+        assert!(super::same("abc", "abc"));
+        assert!(!super::same("abc", "abd"));
+        assert!(!super::same("abc", "ab"));
+        assert!(super::same("", ""));
+    }
+
     #[test]
     fn tokens_are_random_and_hashes_stable() {
         let (a, b) = (super::new(), super::new());
