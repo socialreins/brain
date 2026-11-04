@@ -5704,6 +5704,676 @@ mod teams {
                 }
             }
 
+            /// LinkedIn: the connect flow, publishing through the Posts, Images and Videos APIs
+            /// mock, take down, expired tokens and the daily token renewal.
+            mod linkedin_api {
+                use super::threads_api::{location, set_role};
+                use super::*;
+                use axum::{
+                    extract::{Form, Path, Query},
+                    http::{HeaderMap, StatusCode, Uri},
+                    response::IntoResponse,
+                    routing::{get, post, put},
+                    Json, Router,
+                };
+                use socialreins_brain::{
+                    connectors::linkedin::{LinkedIn, API_VERSION},
+                    controllers::linkedin,
+                };
+                use std::sync::atomic::{AtomicU64, Ordering};
+
+                /// Every `/rest/posts` body the mock took, oldest first.
+                static POSTS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+                /// Every upload: (path, byte count), and every finalize body.
+                static UPLOADS: std::sync::Mutex<Vec<(String, usize)>> =
+                    std::sync::Mutex::new(Vec::new());
+                static FINALIZED: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+                /// The raw path of every delete.
+                static REMOVED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+
+                type Answer = (StatusCode, Json<Value>);
+
+                fn ok(v: Value) -> Answer {
+                    (StatusCode::OK, Json(v))
+                }
+
+                fn expired() -> Answer {
+                    let msg = "The token used in the request has been revoked or is expired.";
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({"message": msg, "status": 401})),
+                    )
+                }
+
+                /// A token the mock handed out, with the version headers `/rest` needs.
+                fn rest_ok(h: &HeaderMap) -> bool {
+                    let bearer = h.get("authorization").and_then(|v| v.to_str().ok());
+                    let version = h.get("linkedin-version").and_then(|v| v.to_str().ok());
+                    let proto = h
+                        .get("x-restli-protocol-version")
+                        .and_then(|v| v.to_str().ok());
+                    matches!(bearer, Some("Bearer lin" | "Bearer lrefreshed"))
+                        && version == Some(API_VERSION)
+                        && proto == Some("2.0.0")
+                }
+
+                fn next() -> u64 {
+                    NEXT.fetch_add(1, Ordering::SeqCst)
+                }
+
+                /// LinkedIn (OAuth, userinfo, `/rest`, upload hosts), plus a PNG and an MP4.
+                /// Code `good` gives a 60-day token, `partner` also a refresh token.
+                async fn mock_linkedin() -> String {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let base = format!("http://{}", listener.local_addr().unwrap());
+                    let token = |Form(f): Form<HashMap<String, String>>| async move {
+                        let get = |k: &str| f.get(k).map(String::as_str).unwrap_or_default();
+                        let app = get("client_id") == "lapp" && get("client_secret") == "lsecret";
+                        let code = (get("grant_type"), get("code"), get("refresh_token"));
+                        match (app, code) {
+                            (true, ("authorization_code", "good", _)) => {
+                                ok(json!({"access_token": "lin", "expires_in": 5_184_000}))
+                            }
+                            (true, ("authorization_code", "partner", _)) => ok(json!({
+                                "access_token": "lin", "expires_in": 5_184_000,
+                                "refresh_token": "lrefresh", "refresh_token_expires_in": 31_536_000})),
+                            (true, ("refresh_token", _, "lrefresh")) => ok(json!({
+                                "access_token": "lrefreshed", "expires_in": 5_184_000,
+                                "refresh_token": "lrefresh2"})),
+                            _ => (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({"error": "invalid_request",
+                                    "error_description": "The provided authorization code is invalid"})),
+                            ),
+                        }
+                    };
+                    let userinfo = |h: HeaderMap| async move {
+                        let bearer = h.get("authorization").and_then(|v| v.to_str().ok());
+                        if !matches!(bearer, Some("Bearer lin" | "Bearer lrefreshed")) {
+                            return expired();
+                        }
+                        ok(json!({"sub": "abc123", "name": "Ann Lee",
+                            "picture": "https://media.example/p.jpg"}))
+                    };
+                    let b = base.clone();
+                    let images = move |h: HeaderMap, Json(body): Json<Value>| async move {
+                        if !rest_ok(&h) {
+                            return expired();
+                        }
+                        assert_eq!(
+                            body["initializeUploadRequest"]["owner"],
+                            "urn:li:person:abc123"
+                        );
+                        let n = next();
+                        ok(json!({"value": {"uploadUrl": format!("{b}/upload/img/{n}"),
+                            "image": format!("urn:li:image:{n}")}}))
+                    };
+                    let b = base.clone();
+                    let videos = move |h: HeaderMap,
+                                       Query(q): Query<HashMap<String, String>>,
+                                       Json(body): Json<Value>| async move {
+                        if !rest_ok(&h) {
+                            return expired();
+                        }
+                        match q.get("action").map(String::as_str) {
+                            Some("initializeUpload") => {
+                                let size = body["initializeUploadRequest"]["fileSizeBytes"]
+                                    .as_u64()
+                                    .unwrap();
+                                let n = next();
+                                let half = size / 2;
+                                ok(json!({"value": {
+                                    "video": format!("urn:li:video:{n}"), "uploadToken": "tok",
+                                    "uploadInstructions": [
+                                        {"firstByte": 0, "lastByte": half - 1,
+                                         "uploadUrl": format!("{b}/upload/vid/{n}a")},
+                                        {"firstByte": half, "lastByte": size - 1,
+                                         "uploadUrl": format!("{b}/upload/vid/{n}b")}]}}))
+                            }
+                            Some("finalizeUpload") => {
+                                FINALIZED.lock().unwrap().push(body);
+                                ok(json!({}))
+                            }
+                            _ => (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({"message": "bad action"})),
+                            ),
+                        }
+                    };
+                    let video = |h: HeaderMap, Path(_urn): Path<String>| async move {
+                        if !rest_ok(&h) {
+                            return expired();
+                        }
+                        ok(json!({"status": "AVAILABLE"}))
+                    };
+                    let upload_img = |h: HeaderMap, uri: Uri, body: axum::body::Bytes| async move {
+                        // Images go with the token, video parts without (as the docs show).
+                        let bearer = h.get("authorization").is_some();
+                        let is_img = uri.path().starts_with("/upload/img/");
+                        assert_eq!(bearer, is_img, "{}", uri.path());
+                        UPLOADS
+                            .lock()
+                            .unwrap()
+                            .push((uri.path().to_owned(), body.len()));
+                        let tag = format!("\"etag-{}\"", uri.path().rsplit('/').next().unwrap());
+                        (StatusCode::CREATED, [("etag", tag)])
+                    };
+                    let create = |h: HeaderMap, Json(body): Json<Value>| async move {
+                        if !rest_ok(&h) {
+                            return expired().into_response();
+                        }
+                        POSTS.lock().unwrap().push(body);
+                        let id = format!("urn:li:share:{}", next());
+                        (StatusCode::CREATED, [("x-restli-id", id)], "").into_response()
+                    };
+                    let remove = |h: HeaderMap, uri: Uri| async move {
+                        let method = h.get("x-restli-method").and_then(|v| v.to_str().ok());
+                        assert_eq!(method, Some("DELETE"));
+                        if !rest_ok(&h) {
+                            return expired().into_response();
+                        }
+                        REMOVED.lock().unwrap().push(uri.path().to_owned());
+                        StatusCode::NO_CONTENT.into_response()
+                    };
+                    let mut mp4 = vec![0u8; 64];
+                    mp4[..12].copy_from_slice(b"\0\0\0\x18ftypisom");
+                    let app = Router::new()
+                        .route("/oauth/v2/accessToken", post(token))
+                        .route("/v2/userinfo", get(userinfo))
+                        .route("/rest/images", post(images))
+                        .route("/rest/videos", post(videos))
+                        .route("/rest/videos/{urn}", get(video))
+                        .route("/upload/img/{n}", put(upload_img))
+                        .route("/upload/vid/{n}", put(upload_img))
+                        .route("/rest/posts", post(create))
+                        .route("/rest/posts/{urn}", axum::routing::delete(remove))
+                        .route("/img.png", get(|| async { image("image/png", 64) }))
+                        .route("/img2.png", get(|| async { image("image/png", 48) }))
+                        .route(
+                            "/clip.mp4",
+                            get(move || async move { ([("content-type", "video/mp4")], mp4) }),
+                        );
+                    tokio::spawn(async move { axum::serve(listener, app).await });
+                    base
+                }
+
+                /// A brain with LinkedIn set up on the mock (no waits), its state, and the mock.
+                async fn on_linkedin(
+                    configured: bool,
+                ) -> (TestServer, DatabaseConnection, AppState, String) {
+                    let base = mock_linkedin().await;
+                    let mut config = Config::from_env().expect("test config");
+                    config.trust_proxy = true;
+                    let app = configured.then(|| ("lapp".to_owned(), "lsecret".to_owned()));
+                    let mut l = LinkedIn::new(app).unwrap();
+                    l.oauth_url = format!("{base}/oauth/v2/accessToken");
+                    l.api_url = base.clone();
+                    l.poll_every = std::time::Duration::ZERO;
+                    config.linkedin = l;
+                    let disk = object_store::local::LocalFileSystem::new_with_prefix(media_dir())
+                        .unwrap()
+                        .with_automatic_cleanup(true);
+                    config.media = Media::new(std::sync::Arc::new(disk), true);
+                    let db = socialreins_brain::connect(&config)
+                        .await
+                        .expect("database reachable");
+                    let state = AppState::new(db.clone(), &config);
+                    let app = controllers::router(state.clone(), &config);
+                    (TestServer::new(app).unwrap(), db, state, base)
+                }
+
+                /// Starts a connect: (state, `sr_linkedin=...`).
+                async fn begin(s: &TestServer, cookie: &str) -> (String, String) {
+                    let res = s
+                        .get("/connections/linkedin/redirect")
+                        .add_header("cookie", cookie)
+                        .await;
+                    let (to, q) = location(&res);
+                    assert!(
+                        to.starts_with("https://www.linkedin.com/oauth/v2/authorization?"),
+                        "{to}"
+                    );
+                    assert_eq!(q["client_id"], "lapp");
+                    assert_eq!(q["response_type"], "code");
+                    assert_eq!(
+                        q["redirect_uri"],
+                        "http://localhost:8080/connect/linkedin/callback"
+                    );
+                    assert_eq!(q["scope"], "openid profile email w_member_social");
+                    let set = res
+                        .iter_headers_by_name("set-cookie")
+                        .map(|v| v.to_str().unwrap().to_owned())
+                        .find(|c| c.starts_with("sr_linkedin="))
+                        .unwrap();
+                    assert!(set.contains("HttpOnly") && set.contains("Path=/connect/linkedin"));
+                    (
+                        q["state"].clone(),
+                        set.split(';').next().unwrap().to_owned(),
+                    )
+                }
+
+                /// LinkedIn's redirect back: where it lands, as `(connected, connect_error)`.
+                async fn finish(
+                    s: &TestServer,
+                    cookies: &str,
+                    query: &str,
+                ) -> (Option<String>, Option<String>) {
+                    let res = s
+                        .get(&format!("/connect/linkedin/callback?{query}"))
+                        .add_header("cookie", cookies)
+                        .await;
+                    let (to, q) = location(&res);
+                    assert!(
+                        to.starts_with("http://localhost:3000/app/connections?"),
+                        "{to}"
+                    );
+                    if q.contains_key("connect_error") {
+                        assert_eq!(q["provider"], "linkedin");
+                    }
+                    (q.get("connected").cloned(), q.get("connect_error").cloned())
+                }
+
+                /// Connects the mock's profile with `code` to the caller's current team.
+                async fn connect_with(s: &TestServer, cookie: &str, code: &str) {
+                    let (state, flow) = begin(s, cookie).await;
+                    let both = format!("{cookie}; {flow}");
+                    let got = finish(s, &both, &format!("code={code}&state={state}")).await;
+                    assert_eq!(got, (Some("linkedin".into()), None));
+                }
+
+                async fn linkedin_account(
+                    db: &DatabaseConnection,
+                    team_id: &str,
+                ) -> social_accounts::Model {
+                    social_accounts::Entity::find()
+                        .filter(
+                            social_accounts::Column::TeamId
+                                .eq(team_id.parse::<uuid::Uuid>().unwrap()),
+                        )
+                        .filter(social_accounts::Column::Provider.eq("linkedin"))
+                        .one(db)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                }
+
+                /// Sets the account's token and expiry.
+                async fn set_token(
+                    db: &DatabaseConnection,
+                    account: uuid::Uuid,
+                    token: &str,
+                    days: i64,
+                ) {
+                    let row = social_accounts::ActiveModel {
+                        id: Set(account),
+                        access_token: Set(cipher().encrypt(token.as_bytes())),
+                        token_expires_at: Set(Some(
+                            (Utc::now() + Duration::days(days)).fixed_offset(),
+                        )),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(row).exec(db).await.unwrap();
+                }
+
+                fn linkedin_post(set: &str, body: &str) -> Value {
+                    let mut v = input(set, body, Some(&past()));
+                    v["platform"] = json!("linkedin");
+                    v
+                }
+
+                /// A connected team: (server, db, state, mock base, cookie, team id, set id).
+                async fn team() -> (
+                    TestServer,
+                    DatabaseConnection,
+                    AppState,
+                    String,
+                    String,
+                    String,
+                    String,
+                ) {
+                    let (s, db, state, base) = on_linkedin(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    connect_with(&s, &cookie, "good").await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    (s, db, state, base, cookie, team_id, set)
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connect_saves_the_profile_once_in_the_default_set() {
+                    let (s, db, _, _) = on_linkedin(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let (state, flow) = begin(&s, &cookie).await;
+                    let both = format!("{cookie}; {flow}");
+                    let query = format!("code=good&state={state}");
+                    assert_eq!(
+                        finish(&s, &both, &query).await,
+                        (Some("linkedin".into()), None)
+                    );
+                    let listed = list(&s, &cookie).await;
+                    assert_eq!(listed.len(), 1);
+                    let a = &listed[0];
+                    assert_eq!(a["provider"], "linkedin");
+                    assert_eq!(a["external_id"], "abc123");
+                    assert_eq!(a["display_name"], "Ann Lee");
+                    assert_eq!(a["avatar_url"], "https://media.example/p.jpg");
+                    let set = default_set(&db, &team_id).await.to_string();
+                    assert_eq!(a["set_ids"], json!([set]));
+                    let row = linkedin_account(&db, &team_id).await;
+                    assert_eq!(cipher().decrypt(&row.access_token).unwrap(), b"lin");
+                    assert_eq!(row.meta, json!({}));
+                    let left = row.token_expires_at.unwrap().timestamp() - Utc::now().timestamp();
+                    assert!((5_183_000..=5_184_000).contains(&left), "{left}");
+                    // The state works once.
+                    assert_eq!(
+                        finish(&s, &both, &query).await,
+                        (None, Some("expired".into()))
+                    );
+                    // A reconnect keeps the one row.
+                    connect_with(&s, &cookie, "good").await;
+                    let again = list(&s, &cookie).await;
+                    assert_eq!(again.len(), 1);
+                    assert_eq!(again[0]["id"], a["id"]);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_partner_apps_refresh_token_is_kept_sealed() {
+                    let (s, db, _, _) = on_linkedin(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    connect_with(&s, &cookie, "partner").await;
+                    let row = linkedin_account(&db, &team_id).await;
+                    let sealed = row.meta["refresh_token"].as_str().unwrap();
+                    assert!(!sealed.contains("lrefresh"));
+                    let bytes = URL_SAFE_NO_PAD.decode(sealed).unwrap();
+                    assert_eq!(cipher().decrypt(&bytes).unwrap(), b"lrefresh");
+                    // A later connect without one drops it.
+                    connect_with(&s, &cookie, "good").await;
+                    assert_eq!(linkedin_account(&db, &team_id).await.meta, json!({}));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connect_refuses_strangers_members_and_other_browsers() {
+                    let (s, db, _, _) = on_linkedin(true).await;
+                    let (_, cookie, user_id) = user(&s, &db).await;
+                    let back = |res: axum_test::TestResponse| location(&res).1;
+                    let res = s.get("/connections/linkedin/redirect").await;
+                    assert_eq!(back(res)["connect_error"], "unauthorized");
+
+                    // The state must come back to the browser that started it.
+                    let (state, flow) = begin(&s, &cookie).await;
+                    let query = format!("code=good&state={state}");
+                    assert_eq!(
+                        finish(&s, &cookie, &query).await,
+                        (None, Some("expired".into()))
+                    );
+                    let wrong = format!("{cookie}; sr_linkedin=0000");
+                    assert_eq!(
+                        finish(&s, &wrong, &query).await,
+                        (None, Some("expired".into()))
+                    );
+                    // Those did not use it up; another signed-in user cannot finish it.
+                    let (_, stranger, _) = user(&s, &db).await;
+                    let theirs = format!("{stranger}; {flow}");
+                    assert_eq!(
+                        finish(&s, &theirs, &query).await,
+                        (None, Some("expired".into()))
+                    );
+
+                    // Cancelled on LinkedIn, a bad code, and a demotion meanwhile.
+                    let (state, flow) = begin(&s, &cookie).await;
+                    let both = format!("{cookie}; {flow}");
+                    let q = format!("error=user_cancelled_login&state={state}");
+                    assert_eq!(
+                        finish(&s, &both, &q).await,
+                        (None, Some("cancelled".into()))
+                    );
+                    let (state, flow) = begin(&s, &cookie).await;
+                    let both = format!("{cookie}; {flow}");
+                    let q = format!("code=bad&state={state}");
+                    assert_eq!(
+                        finish(&s, &both, &q).await,
+                        (None, Some("linkedin_failed".into()))
+                    );
+                    let (state, flow) = begin(&s, &cookie).await;
+                    set_role(&db, user_id, "member").await;
+                    let both = format!("{cookie}; {flow}");
+                    let q = format!("code=good&state={state}");
+                    assert_eq!(finish(&s, &both, &q).await, (None, Some("expired".into())));
+                    let res = s
+                        .get("/connections/linkedin/redirect")
+                        .add_header("cookie", &cookie)
+                        .await;
+                    assert_eq!(back(res)["connect_error"], "forbidden");
+                    assert!(list(&s, &cookie).await.is_empty());
+
+                    let (s, db, _, _) = on_linkedin(false).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let res = s
+                        .get("/connections/linkedin/redirect")
+                        .add_header("cookie", &cookie)
+                        .await;
+                    assert_eq!(back(res)["connect_error"], "not_configured");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_text_post_publishes_and_comes_down() {
+                    let (s, db, state, _, cookie, _, set) = team().await;
+                    let body = linkedin_post(&set, "Hello (world) #rust *bold*");
+                    let id = id_of(&create(&s, &cookie, body).await);
+                    let before = POSTS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let sent = POSTS.lock().unwrap()[before].clone();
+                    assert_eq!(sent["author"], "urn:li:person:abc123");
+                    assert_eq!(sent["commentary"], r"Hello \(world\) #rust \*bold\*");
+                    assert_eq!(sent["visibility"], "PUBLIC");
+                    assert_eq!(sent["lifecycleState"], "PUBLISHED");
+                    assert_eq!(sent["distribution"]["feedDistribution"], "MAIN_FEED");
+                    assert!(sent.get("content").is_none());
+                    let t = &p["targets"][0];
+                    let urn = t["remote_id"].as_str().unwrap().to_owned();
+                    assert!(urn.starts_with("urn:li:share:"), "{urn}");
+                    assert_eq!(
+                        t["remote_url"],
+                        format!("https://www.linkedin.com/feed/update/{urn}")
+                    );
+
+                    let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                    res.assert_status_ok();
+                    assert_eq!(res.json::<Value>()["status"], "deleted");
+                    let removed = REMOVED.lock().unwrap().clone();
+                    let want = format!("/rest/posts/{}", urn.replace(':', "%3A"));
+                    assert_eq!(removed.last(), Some(&want));
+                    drop(db);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn images_upload_first_and_the_post_names_them() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    // One image is `content.media`.
+                    let id = id_of(&create(&s, &cookie, linkedin_post(&set, "one")).await);
+                    set_media(&db, &base, &id, &["/img.png"]).await;
+                    let (posts, ups) = (POSTS.lock().unwrap().len(), UPLOADS.lock().unwrap().len());
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                    let sent = POSTS.lock().unwrap()[posts].clone();
+                    let image = sent["content"]["media"]["id"].as_str().unwrap().to_owned();
+                    assert!(image.starts_with("urn:li:image:"), "{image}");
+                    let uploads = UPLOADS.lock().unwrap()[ups..].to_vec();
+                    assert_eq!(uploads.len(), 1);
+                    assert_eq!(uploads[0].1, 64);
+                    assert!(uploads[0].0.starts_with("/upload/img/"));
+
+                    // Several are `content.multiImage`, in order.
+                    let id = id_of(&create(&s, &cookie, linkedin_post(&set, "two")).await);
+                    set_media(&db, &base, &id, &["/img.png", "/img2.png"]).await;
+                    let (posts, ups) = (POSTS.lock().unwrap().len(), UPLOADS.lock().unwrap().len());
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                    let sent = POSTS.lock().unwrap()[posts].clone();
+                    let images = sent["content"]["multiImage"]["images"].as_array().unwrap();
+                    assert_eq!(images.len(), 2);
+                    assert_ne!(images[0]["id"], images[1]["id"]);
+                    let sizes: Vec<usize> =
+                        UPLOADS.lock().unwrap()[ups..].iter().map(|u| u.1).collect();
+                    assert_eq!(sizes, [64, 48]);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_video_uploads_in_parts_and_is_finalized() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let id = id_of(&create(&s, &cookie, linkedin_post(&set, "clip")).await);
+                    set_media(&db, &base, &id, &["/clip.mp4"]).await;
+                    let (posts, ups, fin) = (
+                        POSTS.lock().unwrap().len(),
+                        UPLOADS.lock().unwrap().len(),
+                        FINALIZED.lock().unwrap().len(),
+                    );
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let sent = POSTS.lock().unwrap()[posts].clone();
+                    let video = sent["content"]["media"]["id"].as_str().unwrap().to_owned();
+                    assert!(video.starts_with("urn:li:video:"), "{video}");
+                    let sizes: Vec<usize> =
+                        UPLOADS.lock().unwrap()[ups..].iter().map(|u| u.1).collect();
+                    assert_eq!(sizes, [32, 32]);
+                    let done = FINALIZED.lock().unwrap()[fin].clone();
+                    let f = &done["finalizeUploadRequest"];
+                    assert_eq!(f["video"], video);
+                    assert_eq!(f["uploadToken"], "tok");
+                    let ids = f["uploadedPartIds"].as_array().unwrap();
+                    assert_eq!(ids.len(), 2);
+                    assert!(ids[0].as_str().unwrap().starts_with("etag-"));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn limits_and_unsupported_shapes_are_refused() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let res = create(&s, &cookie, linkedin_post(&set, &"a".repeat(3001))).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "too_long"}));
+                    let mut exact = linkedin_post(&set, &"a".repeat(3000));
+                    exact["scheduled_at"] = Value::Null;
+                    assert_eq!(create(&s, &cookie, exact).await.status_code(), 201);
+                    let mut many = linkedin_post(&set, "x");
+                    many["media"] = json!(vec!["https://a.example/i.png"; 21]);
+                    let res = create(&s, &cookie, many).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "too_many_images"}));
+                    let mut threaded = linkedin_post(&set, "x");
+                    threaded["thread"] = json!([{"body": "two"}]);
+                    let res = create(&s, &cookie, threaded).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "thread_not_supported"}));
+
+                    // A video next to an image never reaches LinkedIn.
+                    let id = id_of(&create(&s, &cookie, linkedin_post(&set, "mix")).await);
+                    set_media(&db, &base, &id, &["/img.png", "/clip.mp4"]).await;
+                    let posts = POSTS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed");
+                    assert!(p["targets"][0]["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("one video, or images"));
+                    assert_eq!(POSTS.lock().unwrap().len(), posts);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn an_expired_or_refused_token_asks_for_a_reconnect() {
+                    let (s, db, state, _, cookie, team_id, set) = team().await;
+                    let account = linkedin_account(&db, &team_id).await.id;
+                    // Past its 60 days: failed without a call.
+                    set_token(&db, account, "lin", -1).await;
+                    let id = id_of(&create(&s, &cookie, linkedin_post(&set, "a")).await);
+                    let posts = POSTS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed");
+                    assert_eq!(p["targets"][0]["error"], publish::LINKEDIN_RECONNECT);
+                    assert_eq!(POSTS.lock().unwrap().len(), posts);
+                    // Not yet expired but revoked: LinkedIn answers 401.
+                    set_token(&db, account, "dead", 30).await;
+                    let id = id_of(&create(&s, &cookie, linkedin_post(&set, "b")).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed");
+                    assert_eq!(p["targets"][0]["error"], publish::LINKEDIN_RECONNECT);
+                    // The list still shows when it ends, for the reconnect prompt.
+                    assert!(list(&s, &cookie).await[0]["token_expires_at"].is_string());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn the_daily_renewal_covers_accounts_with_a_refresh_token_near_expiry() {
+                    let (s, db, state, _) = on_linkedin(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    connect_with(&s, &cookie, "partner").await;
+                    let account = linkedin_account(&db, &team_id).await.id;
+                    // 40 days left: left alone.
+                    set_token(&db, account, "lin", 40).await;
+                    linkedin::refresh_tokens(&state).await.unwrap();
+                    let row = linkedin_account(&db, &team_id).await;
+                    assert_eq!(cipher().decrypt(&row.access_token).unwrap(), b"lin");
+                    // 10 days left, or already expired: renewed, with the new refresh token.
+                    for days in [10, -2] {
+                        set_token(&db, account, "lin", days).await;
+                        assert!(linkedin::refresh_tokens(&state).await.unwrap() >= 1);
+                        let row = linkedin_account(&db, &team_id).await;
+                        assert_eq!(cipher().decrypt(&row.access_token).unwrap(), b"lrefreshed");
+                        let left = row.token_expires_at.unwrap() - Utc::now().fixed_offset();
+                        assert!(left > Duration::days(59), "{left}");
+                        let sealed = row.meta["refresh_token"].as_str().unwrap();
+                        let bytes = URL_SAFE_NO_PAD.decode(sealed).unwrap();
+                        assert_eq!(cipher().decrypt(&bytes).unwrap(), b"lrefresh2");
+                        // The mock only renews "lrefresh": put it back for the next round.
+                        let sealed = URL_SAFE_NO_PAD.encode(cipher().encrypt(b"lrefresh"));
+                        let back = social_accounts::ActiveModel {
+                            id: Set(account),
+                            meta: Set(json!({ "refresh_token": sealed })),
+                            ..Default::default()
+                        };
+                        social_accounts::Entity::update(back)
+                            .exec(&db)
+                            .await
+                            .unwrap();
+                    }
+                    // Without a refresh token nothing is tried.
+                    connect_with(&s, &cookie, "good").await;
+                    set_token(&db, account, "lin", 5).await;
+                    linkedin::refresh_tokens(&state).await.unwrap();
+                    let row = linkedin_account(&db, &team_id).await;
+                    assert_eq!(cipher().decrypt(&row.access_token).unwrap(), b"lin");
+                }
+            }
+
             /// Meta: the connect flow with its Page picker, publishing to Facebook and
             /// Instagram through the Graph API mock, and take down.
             mod meta_api {

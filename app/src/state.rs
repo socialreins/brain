@@ -56,6 +56,7 @@ pub struct AppState {
     /// Post media while a post publishes (`media.rs`).
     pub media: crate::media::Media,
     pub threads: crate::connectors::threads::Threads,
+    pub linkedin: crate::connectors::linkedin::LinkedIn,
     /// The Meta app for connecting, and its two publishers.
     pub meta: crate::connectors::meta::Meta,
     pub facebook: crate::connectors::meta::Facebook,
@@ -99,6 +100,7 @@ impl AppState {
             waitlist_count: Arc::default(),
             media: config.media.clone(),
             threads: config.threads.clone(),
+            linkedin: config.linkedin.clone(),
             meta: config.meta.clone(),
             facebook: crate::connectors::meta::Facebook(config.meta.clone()),
             instagram: crate::connectors::meta::Instagram(config.meta.clone()),

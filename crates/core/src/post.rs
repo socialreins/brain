@@ -9,6 +9,9 @@ pub const BLUESKY_MAX_IMAGES: usize = 4;
 /// Threads: 500 characters, 20 images or videos (a carousel).
 pub const THREADS_MAX_CHARS: usize = 500;
 pub const THREADS_MAX_MEDIA: usize = 20;
+/// LinkedIn: 3000 characters, 20 images (or one video).
+pub const LINKEDIN_MAX_CHARS: usize = 3000;
+pub const LINKEDIN_MAX_MEDIA: usize = 20;
 /// Facebook: 63206 characters; 10 images or one video, kept to Instagram's carousel size so one
 /// post group fits both.
 pub const FACEBOOK_MAX_CHARS: usize = 63_206;
@@ -62,8 +65,8 @@ pub fn https_url(url: &str) -> bool {
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-/// Checks a post for `platform` (`bluesky`, `threads`, `facebook` or `instagram`, the ones that
-/// publish today).
+/// Checks a post for `platform` (`bluesky`, `threads`, `linkedin`, `facebook` or `instagram`, the ones
+/// that publish today).
 pub fn validate(platform: &str, body: &str, media: &[String]) -> Result<(), Invalid> {
     let chars = || body.chars().count();
     let (too_long, max_media) = match platform {
@@ -74,6 +77,7 @@ pub fn validate(platform: &str, body: &str, media: &[String]) -> Result<(), Inva
         // shortcut: counts characters, while Threads counts an emoji by its UTF-8 bytes, so an
         // emoji-heavy post near 500 may still be refused at publish; count like Threads if it bites.
         "threads" => (chars() > THREADS_MAX_CHARS, THREADS_MAX_MEDIA),
+        "linkedin" => (chars() > LINKEDIN_MAX_CHARS, LINKEDIN_MAX_MEDIA),
         "facebook" => (chars() > FACEBOOK_MAX_CHARS, FACEBOOK_MAX_MEDIA),
         "instagram" => (chars() > INSTAGRAM_MAX_CHARS, INSTAGRAM_MAX_MEDIA),
         _ => return Err(Invalid::UnsupportedPlatform),
@@ -230,6 +234,25 @@ mod tests {
         assert_eq!(
             validate_thread("threads", &[("two", &media(0)[..])]),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn linkedin_limits() {
+        let media = |n: usize| vec!["https://a.example/1.png".to_owned(); n];
+        assert_eq!(validate("linkedin", &"a".repeat(3000), &[]), Ok(()));
+        assert_eq!(
+            validate("linkedin", &"a".repeat(3001), &[]),
+            Err(Invalid::TooLong)
+        );
+        assert_eq!(validate("linkedin", "x", &media(20)), Ok(()));
+        assert_eq!(
+            validate("linkedin", "x", &media(21)),
+            Err(Invalid::TooManyImages)
+        );
+        assert_eq!(
+            validate_thread("linkedin", &[("two", &media(0)[..])]),
+            Err((Invalid::ThreadUnsupported, None))
         );
     }
 

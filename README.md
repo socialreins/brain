@@ -64,6 +64,8 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | POST | `/v1/connections/bluesky` | `{"handle","app_password"}` (owner, admin): checks it on the account's PDS, stores it encrypted, joins the Default set; `201`, or `200` when it replaces the password of an account the team already has |
 | GET | `/connections/threads/redirect` | A page navigation from web (session cookie; owner, admin of the current team): sends the browser to Threads to connect a profile. Lands back on `{WEB_URL}/app/connections` |
 | GET | `/connect/threads/callback` | Where Threads sends the browser back (register `{BRAIN_URL}/connect/threads/callback` in the Threads app); lands on `{WEB_URL}/app/connections?connected=threads` or `?connect_error=<code>&provider=threads` |
+| GET | `/connections/linkedin/redirect` | Like the Threads one: sends the browser to LinkedIn (scopes `openid profile email w_member_social`) to connect a member's profile |
+| GET | `/connect/linkedin/callback` | Where LinkedIn sends the browser back (register `{BRAIN_URL}/connect/linkedin/callback` in the LinkedIn app); lands on `{WEB_URL}/app/connections?connected=linkedin` or `?connect_error=<code>&provider=linkedin` |
 | GET | `/connections/meta/redirect` | Like the Threads one: sends the browser to Facebook Login for Pages and their linked Instagram accounts |
 | GET, POST | `/webhooks/meta` | Meta's webhook (register `{BRAIN_URL}/webhooks/meta` in the Meta app). `GET` is the subscribe handshake: `hub.mode=subscribe` and a `hub.verify_token` equal to `META_WEBHOOK_VERIFY_TOKEN` get `hub.challenge` back as plain text, else `403`; `404` while the variable is unset. `POST` needs `X-Hub-Signature-256` (HMAC-SHA256 of the raw body under `META_APP_SECRET`, `403` otherwise, `404` without the secret), takes at most 256 KiB, and answers `200` once the items are stored |
 | GET | `/connect/meta/callback` | Where Meta sends the browser back (register `{BRAIN_URL}/connect/meta/callback` in the Meta app); lands on `{WEB_URL}/app/connections?pick=meta` when there is something to pick, `?connected=meta` when not, or `?connect_error=<code>&provider=meta` |
@@ -179,7 +181,8 @@ job in brain hard-deletes sets deleted over 30 days ago, one instance at a time 
 
 Posts go to every account of their platform in their social set; Bluesky (300 graphemes, 4
 images of at most 1 MB from public https URLs, links become facets) and Threads (500
-characters, up to 20 JPEG or PNG images or MP4 or MOV videos as a carousel), Facebook (63206
+characters, up to 20 JPEG or PNG images or MP4 or MOV videos as a carousel), LinkedIn (3000
+characters, up to 20 JPEG, PNG or GIF images or one MP4 video, no threads), Facebook (63206
 characters, up to 10 JPEG, PNG or GIF images or one MP4 or MOV video) and Instagram (2200
 characters, 1 to 10 JPEG images or MP4 or MOV videos, `media_required` without one) publish
 today.
@@ -239,6 +242,29 @@ the root (`DELETE /v1.0/{id}`, 100 a day per profile). One post may take up to 6
 Threads downloads media itself, so brain hands it `{BRAIN_URL}/media/<sealed key>.<ext>`: the
 stored file's key sealed with `ENCRYPTION_KEY`, served only while the file is stored (until the
 post settles). `BRAIN_URL` must be reachable from the internet for Threads posts with media.
+
+LinkedIn (when `LINKEDIN_CLIENT_ID` and `LINKEDIN_CLIENT_SECRET` are set) connects a member's
+own profile through the same OAuth checks as Threads (state cookie `sr_linkedin`, scoped to
+`/connect/linkedin`). The app needs the products Sign In with LinkedIn using OpenID Connect and
+Share on LinkedIn. The callback swaps the code at `www.linkedin.com/oauth/v2/accessToken` for a
+token (about 60 days), reads `GET /v2/userinfo` (`sub`, name, picture) and saves a `linkedin`
+account (`external_id` is the `sub`, the author is `urn:li:person:{sub}`) in the team's Default
+set. Only partner apps get a refresh token; when there is one it is sealed in the account's
+`meta` and a daily job renews tokens with 14 days or less left. Without one the token simply
+runs out: the account shows its `token_expires_at`, publishing fails with "Reconnect the account
+under Connections" and the member signs in again. Error code `linkedin_failed` besides the
+Threads ones.
+
+A LinkedIn post (3000 characters, up to 20 JPEG, PNG or GIF images, or one MP4 video; no
+threads) goes out with the Posts API (`POST /rest/posts`, `LinkedIn-Version` `202610`, see
+`connectors/linkedin.rs`): text only, one image as `content.media`, several as
+`content.multiImage`, a video as `content.media`. Images go through `POST /rest/images?action=
+initializeUpload` and a `PUT` of the bytes; a video through the Videos API (initialize, a `PUT`
+per part, finalize, poll until `AVAILABLE`). The text is escaped for LinkedIn's "little" format
+(hashtags stay links). The post URN comes from the `x-restli-id` header and is saved first; the
+permalink is `https://www.linkedin.com/feed/update/{urn}`. A takedown is `DELETE
+/rest/posts/{encoded urn}`. brain uploads the stored bytes itself, so LinkedIn needs no public
+media link. Documents (PDF) and a first comment are not built yet.
 
 Meta (when `META_APP_ID` and `META_APP_SECRET` are set) connects Facebook Pages and the
 Instagram professional accounts linked to them with one Facebook Login, through the same OAuth
@@ -363,7 +389,7 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `META_GRAPH_VERSION` | no | `v26.0`. The Graph API version for Meta calls |
 | `META_WEBHOOK_VERIFY_TOKEN` | no | Any secret string, typed into the Meta app's webhook setup too. Turns on `GET /webhooks/meta`; `POST /webhooks/meta` is signed with `META_APP_SECRET` |
 | `THREADS_APP_ID`, `THREADS_APP_SECRET` | no | Both to connect Threads accounts (redirect URI `{BRAIN_URL}/connect/threads/callback`). Publishing with connected accounts needs neither |
-| `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET` | no | Offer LinkedIn (connector not built yet) |
+| `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET` | no | Both to connect LinkedIn profiles (redirect URI `{BRAIN_URL}/connect/linkedin/callback`). Publishing with connected accounts needs neither |
 | `X_CLIENT_ID`, `X_CLIENT_SECRET` | no | Offer X (connector not built yet) |
 | `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET` | no | Offer TikTok (connector not built yet) |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | no | Both or neither. Turn on Google sign-in (OAuth client of type Web application, redirect URI `{BRAIN_URL}/auth/google/callback`); YouTube will use them too |

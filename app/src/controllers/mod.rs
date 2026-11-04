@@ -11,6 +11,7 @@ pub mod google;
 pub mod health;
 pub mod idempotency;
 pub mod inbox;
+pub mod linkedin;
 pub mod lists;
 pub mod media;
 pub mod meta;
@@ -151,6 +152,7 @@ pub fn router(state: AppState, config: &Config) -> Router {
         )
         .merge(passkeys::routes().layer(DefaultBodyLimit::max(MAX_PASSKEY_BODY_BYTES)))
         .merge(threads::routes())
+        .merge(linkedin::routes())
         .merge(meta::routes())
         .merge(meta_webhook::routes())
         .merge(media::routes())
