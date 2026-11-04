@@ -51,7 +51,7 @@ pub struct Remote {
 /// One stored image or video: its bytes (empty for a publisher that fetches by URL), type, and
 /// the unguessable brain URL that serves it while the post publishes (`media::link`).
 pub struct Attachment {
-    pub bytes: Vec<u8>,
+    pub bytes: bytes::Bytes,
     pub content_type: String,
     pub url: String,
 }
@@ -116,7 +116,7 @@ impl Publisher for Bluesky {
     ) -> Result<Remote, PublishError> {
         let media: Vec<(&[u8], &str)> = media
             .iter()
-            .map(|a| (a.bytes.as_slice(), a.content_type.as_str()))
+            .map(|a| (&a.bytes[..], a.content_type.as_str()))
             .collect();
         let reply = reply.map(|(p, r)| {
             (
@@ -317,7 +317,7 @@ impl Publisher for YouTube {
             ));
         }
         let file = youtube::File {
-            bytes: &video.bytes,
+            bytes: video.bytes.clone(),
             content_type: &video.content_type,
         };
         let id = self
@@ -934,7 +934,7 @@ async fn load(
             }
         };
         files.push(Attachment {
-            bytes,
+            bytes: bytes.into(),
             content_type: s.content_type.clone(),
             url: crate::media::link(app, s),
         });

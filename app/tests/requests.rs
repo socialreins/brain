@@ -6511,20 +6511,42 @@ mod teams {
                             Json(json!({"error": "invalid_grant",
                                 "error_description": "Token has been expired or revoked."})),
                         );
+                        let upload = "https://www.googleapis.com/auth/youtube.upload";
+                        let read = "https://www.googleapis.com/auth/youtube.readonly";
+                        let ssl = "https://www.googleapis.com/auth/youtube.force-ssl";
+                        let scopes = format!("{upload} {read} {ssl}");
                         match (app, code) {
                             (true, ("authorization_code", "good", _)) => (
                                 StatusCode::OK,
                                 Json(json!({"access_token": "yt", "expires_in": 3599,
-                                    "refresh_token": "yrefresh", "token_type": "Bearer"})),
+                                    "refresh_token": "yrefresh", "token_type": "Bearer",
+                                    "scope": scopes})),
+                            ),
+                            // The user unticked a permission on Google's consent screen.
+                            (true, ("authorization_code", "noforcessl", _)) => (
+                                StatusCode::OK,
+                                Json(json!({"access_token": "yt", "expires_in": 3599,
+                                    "refresh_token": "yrefresh", "scope": format!("{upload} {read}")})),
+                            ),
+                            (true, ("authorization_code", "noupload", _)) => (
+                                StatusCode::OK,
+                                Json(json!({"access_token": "yt", "expires_in": 3599,
+                                    "refresh_token": "yrefresh", "scope": format!("{read} {ssl}")})),
+                            ),
+                            (true, ("authorization_code", "noscope", _)) => (
+                                StatusCode::OK,
+                                Json(json!({"access_token": "yt", "expires_in": 3599,
+                                    "refresh_token": "yrefresh"})),
                             ),
                             (true, ("authorization_code", "norefresh", _)) => (
                                 StatusCode::OK,
-                                Json(json!({"access_token": "yt", "expires_in": 3599})),
+                                Json(json!({"access_token": "yt", "expires_in": 3599,
+                                    "scope": scopes})),
                             ),
                             (true, ("authorization_code", "nochannel", _)) => (
                                 StatusCode::OK,
                                 Json(json!({"access_token": "ynochannel", "expires_in": 3599,
-                                    "refresh_token": "yrefresh"})),
+                                    "refresh_token": "yrefresh", "scope": scopes})),
                             ),
                             (true, ("refresh_token", _, "yrefresh")) => {
                                 REFRESHES.fetch_add(1, Ordering::SeqCst);
@@ -6961,6 +6983,27 @@ mod teams {
                         assert_eq!(got, (None, Some(want.into())), "{q}");
                     }
                     assert!(list(&s, &cookie).await.is_empty());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_consent_missing_a_permission_saves_nothing() {
+                    let (s, db, _, _) = on_youtube(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    // Granular consent: a permission left unticked, or none named at all.
+                    let bearers = BEARERS.lock().unwrap().len();
+                    for code in ["noforcessl", "noupload", "noscope"] {
+                        let (state, flow) = begin(&s, &cookie).await;
+                        let both = format!("{cookie}; {flow}");
+                        let got = finish(&s, &both, &format!("code={code}&state={state}")).await;
+                        assert_eq!(got, (None, Some("missing_scopes".into())), "{code}");
+                    }
+                    assert!(list(&s, &cookie).await.is_empty());
+                    // Not even the channel was looked up.
+                    assert_eq!(BEARERS.lock().unwrap().len(), bearers);
+                    // All three ticked connects.
+                    connect_with(&s, &cookie, "good").await;
+                    assert_eq!(list(&s, &cookie).await.len(), 1);
                 }
 
                 #[tokio::test]

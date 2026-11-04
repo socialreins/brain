@@ -277,8 +277,9 @@ the code at `oauth2.googleapis.com/token`, needs the refresh token `prompt=conse
 `GET /youtube/v3/channels?part=snippet&mine=true` (id, title, `@handle`, thumbnail) and saves a
 `youtube` account (`external_id` is the channel id) in the team's Default set. A Google account
 with several channels or brand accounts connects the one the consent picked; connect again for
-another. Error codes `youtube_failed` and `no_channel` (the Google account has no channel)
-besides the Threads ones. The access token lasts an hour and is stored with its expiry; the
+another. Error codes `youtube_failed`, `no_channel` (the Google account has no channel) and
+`missing_scopes` (granular consent: the token Google returned lacks one of the three scopes, so
+nothing is saved) besides the Threads ones. The access token lasts an hour and is stored with its expiry; the
 refresh token is sealed in the account's `meta`. Before each publish or take down, a token with
 under two minutes left is renewed and saved first (there is no daily job). A refused refresh
 token (revoked access) or a refused call (`401`, `insufficientPermissions`) fails the target with

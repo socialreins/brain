@@ -110,6 +110,12 @@ async fn fetch(
             return Err("youtube_failed");
         }
     };
+    // Granular consent lets the user untick scopes; without all three, publishing or taking
+    // down would fail later, so nothing is saved.
+    if !token.has_all_scopes() {
+        tracing::warn!("youtube consent lacked a needed scope");
+        return Err("missing_scopes");
+    }
     // `prompt=consent` always brings one; without it the account could not be renewed.
     let Some(refresh) = token.refresh_token.clone() else {
         tracing::warn!("youtube sent no refresh token");

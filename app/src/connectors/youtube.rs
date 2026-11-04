@@ -52,6 +52,22 @@ pub struct Token {
     pub expires_in: i64,
     /// Only the code swap returns one; a refresh keeps the old.
     pub refresh_token: Option<String>,
+    /// The scopes Google granted, space-separated. With granular consent the user can untick some.
+    pub scope: Option<String>,
+}
+
+impl Token {
+    /// Whether every scope this connector asks for was granted. A token that names none counts
+    /// as missing them, so the connect fails rather than breaking at the first publish.
+    pub fn has_all_scopes(&self) -> bool {
+        let granted: Vec<&str> = self
+            .scope
+            .as_deref()
+            .unwrap_or_default()
+            .split(' ')
+            .collect();
+        SCOPES.split(' ').all(|s| granted.contains(&s))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -68,11 +84,12 @@ struct TokenAnswer {
     access_token: String,
     expires_in: Option<i64>,
     refresh_token: Option<String>,
+    scope: Option<String>,
 }
 
-/// The video to post: its bytes and type.
+/// The video to post: its bytes (shared, not copied, when sent) and type.
 pub struct File<'a> {
-    pub bytes: &'a [u8],
+    pub bytes: bytes::Bytes,
     pub content_type: &'a str,
 }
 
@@ -225,6 +242,7 @@ impl YouTube {
                 .filter(|s| *s > 0)
                 .unwrap_or(DEFAULT_EXPIRES_IN),
             refresh_token: t.refresh_token.filter(|r| !r.is_empty()),
+            scope: t.scope,
         })
     }
 
@@ -332,7 +350,7 @@ impl YouTube {
             .bearer_auth(token)
             .header("Content-Type", video.content_type)
             .timeout(UPLOAD_TIMEOUT)
-            .body(video.bytes.to_vec());
+            .body(video.bytes.clone());
         let (_, body) = self.send(req, "Upload").await?;
         body["id"]
             .as_str()
@@ -457,6 +475,28 @@ mod tests {
             PostError::Failed(m) => assert_eq!(m, "Upload: HTTP 502"),
             PostError::Reconnect => panic!(),
         }
+    }
+
+    #[test]
+    fn a_token_needs_every_scope_asked_for() {
+        let token = |scope: Option<&str>| Token {
+            access_token: "t".into(),
+            expires_in: 3600,
+            refresh_token: None,
+            scope: scope.map(str::to_owned),
+        };
+        assert!(token(Some(SCOPES)).has_all_scopes());
+        // Order and extra scopes do not matter.
+        let shuffled = "openid https://www.googleapis.com/auth/youtube.force-ssl \
+                        https://www.googleapis.com/auth/youtube.upload \
+                        https://www.googleapis.com/auth/youtube.readonly";
+        assert!(token(Some(shuffled)).has_all_scopes());
+        for missing in SCOPES.split(' ') {
+            let rest: Vec<&str> = SCOPES.split(' ').filter(|s| *s != missing).collect();
+            assert!(!token(Some(&rest.join(" "))).has_all_scopes(), "{missing}");
+        }
+        assert!(!token(Some("")).has_all_scopes());
+        assert!(!token(None).has_all_scopes());
     }
 
     #[test]
