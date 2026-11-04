@@ -1,4 +1,4 @@
-//! What every OAuth connect (Threads, Meta) shares. `start` sends an owner or admin of the
+//! What every OAuth connect (Threads, Meta, LinkedIn, YouTube, X) shares. `start` sends an owner or admin of the
 //! current team to the platform with a fresh state, stored server-side with that team and user
 //! for 10 minutes, its hash only, while the browser holds the state in a cookie scoped to
 //! `/connect/<provider>`. `finish` checks the cookie against the state in constant time, uses the
@@ -54,7 +54,19 @@ pub(crate) fn back_failed(app: &AppState, provider: &str, code: &str) -> Respons
 pub(crate) async fn start(
     app: &AppState,
     t: Result<InTeam, Reply>,
+    how: (&str, bool),
+    authorize: impl FnOnce(&str, &str) -> Option<String>,
+) -> Response {
+    start_with(app, t, how, "", authorize).await
+}
+
+/// `start` for a provider that uses PKCE: `verifier` (sealed by the caller, never the plain
+/// verifier) is kept with the state and comes back from `finish_with`.
+pub(crate) async fn start_with(
+    app: &AppState,
+    t: Result<InTeam, Reply>,
     (provider, configured): (&str, bool),
+    verifier: &str,
     authorize: impl FnOnce(&str, &str) -> Option<String>,
 ) -> Response {
     let fail = |code| back_failed(app, provider, code);
@@ -79,7 +91,7 @@ pub(crate) async fn start(
             DbBackend::Postgres,
             "INSERT INTO oauth_states \
              (state_hash, nonce, verifier, next, expires_at, provider, team_id, user_id) \
-             VALUES ($1, '', '', '', $2, $3, $4, $5)",
+             VALUES ($1, '', $6, '', $2, $3, $4, $5)",
             [
                 token::hash(&state).into(),
                 (Utc::now() + Duration::minutes(STATE_MINUTES))
@@ -88,6 +100,7 @@ pub(crate) async fn start(
                 provider.into(),
                 t.team.id.into(),
                 t.current.0.id.into(),
+                verifier.into(),
             ],
         );
         app.db.execute_raw(stmt).await.map(|_| ())
@@ -116,17 +129,17 @@ pub(crate) struct Callback {
     state: Option<String>,
 }
 
-/// The attempt stored for `state`, deleted as it is read so it works once: `(team, user)` when
-/// it is live and the user still manages the team.
+/// The attempt stored for `state`, deleted as it is read so it works once: `(team, user,
+/// verifier)` when it is live and the user still manages the team.
 async fn take_state(
     app: &AppState,
     provider: &str,
     state: &str,
-) -> Result<Option<(Uuid, Uuid)>, DbErr> {
+) -> Result<Option<(Uuid, Uuid, String)>, DbErr> {
     let stmt = Statement::from_sql_and_values(
         DbBackend::Postgres,
         "DELETE FROM oauth_states s WHERE state_hash = $1 AND provider = $2 \
-         RETURNING team_id, user_id, expires_at > now() AND EXISTS ( \
+         RETURNING team_id, user_id, verifier, expires_at > now() AND EXISTS ( \
            SELECT 1 FROM team_user m WHERE m.team_id = s.team_id AND m.user_id = s.user_id \
            AND m.role IN ('owner', 'admin')) AS ok",
         [token::hash(state).into(), provider.into()],
@@ -141,6 +154,7 @@ async fn take_state(
     Ok(Some((
         row.try_get("", "team_id")?,
         row.try_get("", "user_id")?,
+        row.try_get("", "verifier")?,
     )))
 }
 
@@ -156,8 +170,19 @@ pub(crate) async fn finish(
     app: &AppState,
     headers: &HeaderMap,
     q: Callback,
-    (provider, configured): (&str, bool),
+    how: (&str, bool),
 ) -> Result<(Uuid, Uuid, String), Box<Response>> {
+    let (team, user, code, _) = finish_with(app, headers, q, how).await?;
+    Ok((team, user, code))
+}
+
+/// `finish` for a PKCE provider: also the sealed verifier `start_with` stored.
+pub(crate) async fn finish_with(
+    app: &AppState,
+    headers: &HeaderMap,
+    q: Callback,
+    (provider, configured): (&str, bool),
+) -> Result<(Uuid, Uuid, String, String), Box<Response>> {
     let fail = |code| {
         Box::new(landed(
             app,
@@ -177,7 +202,7 @@ pub(crate) async fn finish(
     if !from_this_browser {
         return Err(fail("expired"));
     }
-    let (team_id, user_id) = match take_state(app, provider, &state).await {
+    let (team_id, user_id, verifier) = match take_state(app, provider, &state).await {
         Ok(Some(found)) => found,
         Ok(None) => return Err(fail("expired")),
         Err(e) => {
@@ -189,7 +214,7 @@ pub(crate) async fn finish(
         return Err(fail("cancelled"));
     };
     match signed_in(app, headers).await {
-        Ok(Some(current)) if current.0.id == user_id => Ok((team_id, user_id, code)),
+        Ok(Some(current)) if current.0.id == user_id => Ok((team_id, user_id, code, verifier)),
         Ok(_) => Err(fail("expired")),
         Err(e) => {
             tracing::error!(error = %e, "session lookup failed");

@@ -23,6 +23,9 @@ pub const INSTAGRAM_MAX_MEDIA: usize = 10;
 /// rest (5000 bytes). YouTube refuses `<` and `>` in either.
 pub const YOUTUBE_MAX_TITLE: usize = 100;
 pub const YOUTUBE_MAX_DESCRIPTION: usize = 5000;
+/// X: 280 weighted characters (`x_weight`), 4 images or one video or GIF.
+pub const X_MAX_WEIGHT: usize = 280;
+pub const X_MAX_MEDIA: usize = 4;
 /// Follow-up parts a thread may have after its first post.
 pub const MAX_THREAD_PARTS: usize = 25;
 const MAX_URL_LEN: usize = 2048;
@@ -79,8 +82,60 @@ pub fn youtube_text(body: &str) -> (&str, &str) {
     (title.trim(), rest.trim())
 }
 
-/// Checks a post for `platform` (`bluesky`, `threads`, `linkedin`, `facebook`, `instagram` or
-/// `youtube`, the ones that publish today).
+/// What a link counts for on X, however long it is (X wraps every link in a t.co link).
+const X_LINK_WEIGHT: usize = 23;
+
+/// Whether `word` looks like a link X would wrap: `http(s)://...`, or a bare domain such as
+/// `example.com/path` (letters, digits and hyphens in each label, a final label of two or more
+/// letters).
+fn x_link(word: &str) -> bool {
+    if word.starts_with("https://") || word.starts_with("http://") {
+        return true;
+    }
+    let host = word.split(['/', '?', '#']).next().unwrap_or_default();
+    let labels: Vec<&str> = host.split('.').collect();
+    let tld = labels.last().copied().unwrap_or_default();
+    labels.len() >= 2
+        && labels
+            .iter()
+            .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        && tld.len() >= 2
+        && tld.chars().all(|c| c.is_ascii_alphabetic())
+}
+
+/// The length of `text` as X counts it, against `X_MAX_WEIGHT`: most Latin, Greek, Cyrillic and
+/// punctuation characters count 1, everything else (CJK, emoji) 2, and every link 23.
+/// shortcut: conservative. A bare domain is counted as a link even where X would not (a file
+/// name such as `notes.txt`, for X's list of top-level domains), and text is not normalized to
+/// NFC, so a post may be refused here that X would take, never the other way round. Mirror
+/// twitter-text exactly if that bites.
+pub fn x_weight(text: &str) -> usize {
+    let weight = |c: char| match c as u32 {
+        0..=0x10FF | 0x2000..=0x200D | 0x2010..=0x201F | 0x2032..=0x2037 => 1,
+        _ => 2,
+    };
+    let mut total = 0;
+    let mut rest = text;
+    while !rest.is_empty() {
+        let white = rest.len() - rest.trim_start().len();
+        total += rest[..white].chars().map(weight).sum::<usize>();
+        rest = &rest[white..];
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let word = &rest[..end];
+        // Trailing punctuation stays out of the link, as X does.
+        let bare = word.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', '"', '\'']);
+        if x_link(bare) {
+            total += X_LINK_WEIGHT + word[bare.len()..].chars().map(weight).sum::<usize>();
+        } else {
+            total += word.chars().map(weight).sum::<usize>();
+        }
+        rest = &rest[end..];
+    }
+    total
+}
+
+/// Checks a post for `platform` (`bluesky`, `threads`, `linkedin`, `facebook`, `instagram`,
+/// `youtube` or `x`, the ones that publish today).
 pub fn validate(platform: &str, body: &str, media: &[String]) -> Result<(), Invalid> {
     let chars = || body.chars().count();
     let (too_long, max_media) = match platform {
@@ -94,6 +149,7 @@ pub fn validate(platform: &str, body: &str, media: &[String]) -> Result<(), Inva
         "linkedin" => (chars() > LINKEDIN_MAX_CHARS, LINKEDIN_MAX_MEDIA),
         "facebook" => (chars() > FACEBOOK_MAX_CHARS, FACEBOOK_MAX_MEDIA),
         "instagram" => (chars() > INSTAGRAM_MAX_CHARS, INSTAGRAM_MAX_MEDIA),
+        "x" => (x_weight(body) > X_MAX_WEIGHT, X_MAX_MEDIA),
         "youtube" => {
             let (title, description) = youtube_text(body);
             let too_long = title.chars().count() > YOUTUBE_MAX_TITLE
@@ -133,7 +189,7 @@ pub fn validate_thread(
     if parts.is_empty() {
         return Ok(());
     }
-    if !matches!(platform, "bluesky" | "threads") {
+    if !matches!(platform, "bluesky" | "threads" | "x") {
         return Err((Invalid::ThreadUnsupported, None));
     }
     if parts.len() > MAX_THREAD_PARTS {
@@ -237,7 +293,10 @@ mod tests {
         ] {
             assert_eq!(ok("x", &[bad]), Err(Invalid::InvalidMedia), "{bad}");
         }
-        assert_eq!(validate("x", "hi", &[]), Err(Invalid::UnsupportedPlatform));
+        assert_eq!(
+            validate("tiktok", "hi", &[]),
+            Err(Invalid::UnsupportedPlatform)
+        );
     }
 
     #[test]
@@ -258,6 +317,47 @@ mod tests {
         assert_eq!(
             validate_thread("threads", &[("two", &media(0)[..])]),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn x_counts_weight_with_links_at_23() {
+        assert_eq!(x_weight("hello"), 5);
+        assert_eq!(x_weight("é ü"), 3);
+        // CJK and emoji count 2.
+        assert_eq!(x_weight("日本"), 4);
+        assert_eq!(x_weight("🙂"), 2);
+        // Every link is 23, however long or short, and trailing punctuation stays outside it.
+        assert_eq!(x_weight("https://example.com/a/very/long/path?x=1"), 23);
+        assert_eq!(x_weight("http://a.co"), 23);
+        assert_eq!(x_weight("see https://example.com."), 4 + 23 + 1);
+        assert_eq!(x_weight("example.com/x"), 23);
+        assert_eq!(x_weight("e.g. this"), 9);
+        assert_eq!(x_weight("a\nb  c"), 6);
+    }
+
+    #[test]
+    fn x_limits() {
+        let media = |n: usize| vec!["https://a.example/1.png".to_owned(); n];
+        assert_eq!(validate("x", &"a".repeat(280), &[]), Ok(()));
+        assert_eq!(validate("x", &"a".repeat(281), &[]), Err(Invalid::TooLong));
+        // 140 CJK characters weigh 280.
+        assert_eq!(validate("x", &"日".repeat(140), &[]), Ok(()));
+        assert_eq!(validate("x", &"日".repeat(141), &[]), Err(Invalid::TooLong));
+        let link = |n| format!("{} https://example.com/{}", "a".repeat(n), "b".repeat(80));
+        assert_eq!(validate("x", &link(256), &[]), Ok(()));
+        assert_eq!(validate("x", &link(257), &[]), Err(Invalid::TooLong));
+        assert_eq!(validate("x", "x", &media(4)), Ok(()));
+        assert_eq!(validate("x", "x", &media(5)), Err(Invalid::TooManyImages));
+        assert_eq!(validate("x", "", &media(1)), Ok(()));
+        assert_eq!(validate("x", " ", &[]), Err(Invalid::Empty));
+        assert_eq!(
+            validate_thread("x", &[("two", &media(0)[..]), ("three", &media(4)[..])]),
+            Ok(())
+        );
+        assert_eq!(
+            validate_thread("x", &[("two", &media(0)[..]), (&"a".repeat(281), &[])]),
+            Err((Invalid::TooLong, Some(2)))
         );
     }
 
@@ -376,9 +476,9 @@ mod tests {
         let img = vec!["https://a.example/1.png".to_owned(); 5];
         let part = |body: &'static str, n: usize| (body, &img[..n]);
         assert_eq!(validate_thread("bluesky", &[]), Ok(()));
-        assert_eq!(validate_thread("x", &[]), Ok(()));
+        assert_eq!(validate_thread("linkedin", &[]), Ok(()));
         assert_eq!(
-            validate_thread("x", &[part("hi", 0)]),
+            validate_thread("linkedin", &[part("hi", 0)]),
             Err((Invalid::ThreadUnsupported, None))
         );
         let full = vec![part("hi", 4); MAX_THREAD_PARTS];

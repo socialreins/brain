@@ -9,7 +9,7 @@ use socialreins_core::crypto::Cipher;
 
 use crate::{
     connectors::{
-        bluesky::Bluesky, google::Google, linkedin::LinkedIn, meta, threads::Threads,
+        bluesky::Bluesky, google::Google, linkedin::LinkedIn, meta, threads::Threads, x::X,
         youtube::YouTube,
     },
     mail::Mailer,
@@ -96,6 +96,10 @@ pub struct Config {
     /// redirect URI `{BRAIN_URL}/connect/youtube/callback` (not the sign-in one). Publishing
     /// with a connected channel's token needs neither, but renewing it does.
     pub youtube: YouTube,
+    /// `X_CLIENT_ID` and `X_CLIENT_SECRET`: connecting X accounts (OAuth 2.0 with PKCE), with the
+    /// redirect URI `{BRAIN_URL}/connect/x/callback`. Renewing a token needs them too; posting
+    /// with a live one does not.
+    pub x: X,
     /// `META_APP_ID` and `META_APP_SECRET`: connecting Facebook Pages and Instagram accounts,
     /// with the redirect URI `{BRAIN_URL}/connect/meta/callback`, on Graph API
     /// `META_GRAPH_VERSION` (default `v26.0`). Publishing with a stored Page token needs neither.
@@ -188,6 +192,7 @@ impl Config {
             threads: Threads::new(var("THREADS_APP_ID").zip(var("THREADS_APP_SECRET")))?,
             linkedin: LinkedIn::new(var("LINKEDIN_CLIENT_ID").zip(var("LINKEDIN_CLIENT_SECRET")))?,
             youtube: YouTube::new(var("GOOGLE_CLIENT_ID").zip(var("GOOGLE_CLIENT_SECRET")))?,
+            x: X::new(var("X_CLIENT_ID").zip(var("X_CLIENT_SECRET")))?,
             meta: {
                 let mut meta = meta::Meta::new(
                     var("META_APP_ID").zip(var("META_APP_SECRET")),

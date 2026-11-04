@@ -1,7 +1,7 @@
 //! Connected social accounts of the current team. Members list them; owners and admins connect,
 //! regroup and disconnect them. Tokens never leave brain: they are sealed at rest and absent from
 //! every response. Every account stays in the team's Default set. OAuth providers connect in
-//! their own controllers (`threads.rs`, `meta.rs`, `linkedin.rs`, `youtube.rs`) and save through `save_account`. The list takes an API
+//! their own controllers (`threads.rs`, `meta.rs`, `linkedin.rs`, `youtube.rs`, `x.rs`) and save through `save_account`. The list takes an API
 //! token too; a set token sees only its set's accounts, each showing that set alone.
 use std::collections::{HashMap, HashSet};
 
@@ -63,6 +63,10 @@ pub struct Connection {
     /// when the subscription worked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub webhook_error: Option<String>,
+    /// X: the platform refused to renew the account's token, so it must be connected again.
+    /// Absent otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub reconnect: bool,
     /// The social sets holding the account; the team's Default set is always one of them.
     pub set_ids: Vec<Uuid>,
     pub created_at: DateTime<FixedOffset>,
@@ -154,6 +158,7 @@ fn connection_json(a: social_accounts::Model, set_ids: Vec<Uuid>) -> Connection 
         token_expires_at: a.token_expires_at,
         dm_access: a.dm_access,
         webhook_error: a.meta["webhook_error"].as_str().map(str::to_owned),
+        reconnect: a.meta["reconnect"].as_bool() == Some(true),
         set_ids,
         created_at: a.created_at,
     }

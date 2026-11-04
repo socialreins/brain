@@ -68,6 +68,8 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/connect/linkedin/callback` | Where LinkedIn sends the browser back (register `{BRAIN_URL}/connect/linkedin/callback` in the LinkedIn app); lands on `{WEB_URL}/app/connections?connected=linkedin` or `?connect_error=<code>&provider=linkedin` |
 | GET | `/connections/youtube/redirect` | Like the Threads one: sends the browser to Google (scopes `youtube.upload`, `youtube.readonly`, `youtube.force-ssl`; `access_type=offline`, `prompt=consent`, `include_granted_scopes=false`) to connect a YouTube channel |
 | GET | `/connect/youtube/callback` | Where Google sends the browser back (register `{BRAIN_URL}/connect/youtube/callback` in the Google OAuth client, besides the sign-in one); lands on `{WEB_URL}/app/connections?connected=youtube` or `?connect_error=<code>&provider=youtube` |
+| GET | `/connections/x/redirect` | Like the Threads one, with PKCE: sends the browser to `x.com/i/oauth2/authorize` (scopes `tweet.read tweet.write users.read offline.access media.write`, `code_challenge_method=S256`) to connect an X account |
+| GET | `/connect/x/callback` | Where X sends the browser back (register `{BRAIN_URL}/connect/x/callback` in the X app); lands on `{WEB_URL}/app/connections?connected=x` or `?connect_error=<code>&provider=x` |
 | GET | `/connections/meta/redirect` | Like the Threads one: sends the browser to Facebook Login for Pages and their linked Instagram accounts |
 | GET, POST | `/webhooks/meta` | Meta's webhook (register `{BRAIN_URL}/webhooks/meta` in the Meta app). `GET` is the subscribe handshake: `hub.mode=subscribe` and a `hub.verify_token` equal to `META_WEBHOOK_VERIFY_TOKEN` get `hub.challenge` back as plain text, else `403`; `404` while the variable is unset. `POST` needs `X-Hub-Signature-256` (HMAC-SHA256 of the raw body under `META_APP_SECRET`, `403` otherwise, `404` without the secret), takes at most 256 KiB, and answers `200` once the items are stored |
 | GET | `/connect/meta/callback` | Where Meta sends the browser back (register `{BRAIN_URL}/connect/meta/callback` in the Meta app); lands on `{WEB_URL}/app/connections?pick=meta` when there is something to pick, `?connected=meta` when not, or `?connect_error=<code>&provider=meta` |
@@ -186,8 +188,9 @@ images of at most 1 MB from public https URLs, links become facets) and Threads 
 characters, up to 20 JPEG or PNG images or MP4 or MOV videos as a carousel), LinkedIn (3000
 characters, up to 20 JPEG, PNG or GIF images or one MP4 video, no threads), Facebook (63206
 characters, up to 10 JPEG, PNG or GIF images or one MP4 or MOV video) and Instagram (2200
-characters, 1 to 10 JPEG images or MP4 or MOV videos, `media_required` without one) and YouTube
-(one MP4 or MOV video, a title and a description, no threads) publish today.
+characters, 1 to 10 JPEG images or MP4 or MOV videos, `media_required` without one), YouTube
+(one MP4 or MOV video, a title and a description, no threads) and X (280 characters as X counts
+them, up to 4 images or one GIF or one video, threads) publish today.
 Saving with `scheduled_at` makes a post `scheduled`, else `draft`; only those two can change.
 A tick every minute claims due posts (one instance at a time, advisory lock), creates one
 target per account and claims each target once, so nothing posts twice; a publish is never
@@ -303,6 +306,50 @@ shows up private in YouTube Studio; apply for the audit before relying on it. A 
 a day; when Google answers `quotaExceeded` the target fails with a message saying so. A takedown
 is `DELETE /youtube/v3/videos?id={id}` (a video already gone counts as down; a channel connected
 before `youtube.force-ssl` was requested must reconnect).
+
+X (when `X_CLIENT_ID` and `X_CLIENT_SECRET` are set) connects an account through the same OAuth
+checks as Threads (state cookie `sr_x`, scoped to `/connect/x`), as a confidential Web App client
+with PKCE. The app needs User authentication settings with read and write permission and the
+redirect URI above. `GET /connections/x/redirect` makes a fresh code verifier and keeps it with
+the state, sealed with `ENCRYPTION_KEY` like the tokens (the URL carries only its S256
+challenge). The callback swaps the code and the verifier at `POST api.x.com/2/oauth2/token` with
+the client id and secret in HTTP Basic auth, reads `GET /2/users/me` (id, username, name,
+picture) and saves an `x` account (`external_id` is the user id, `handle` the username) in the
+team's Default set. Error codes `x_failed` and `missing_scopes` (the consent screen let the user
+untick a scope, so nothing is saved) besides the Threads ones.
+
+An access token lasts two hours and is stored with its expiry; the refresh token is sealed in the
+account's `meta`. X refresh tokens are single use, so renewing locks the account row
+(`SELECT ... FOR UPDATE`) and saves the new access and refresh token in the same transaction: two
+publishes renewing at once call X once and both use the result. A response without a new refresh
+token keeps the current one. Before each publish or take down a token with under two minutes left
+is renewed, and a job every 15 minutes (one instance at a time, advisory lock) renews tokens with
+30 minutes or less left. A refresh X refuses (revoked access, a spent token) sets `meta.reconnect`;
+the account then fails every publish with "Reconnect the account under Connections" without
+calling X, `GET /v1/connections` shows `reconnect: true`, and connecting it again clears the flag.
+A network or server error while renewing changes nothing. If the process dies between X's answer
+and the commit, the new refresh token is lost and the account asks for a reconnect.
+
+An X post (280 weighted characters, up to 4 JPEG, PNG or WebP images, or one GIF, or one MP4 or
+MOV video, not a mix; threads of up to 25 follow-up posts) goes out with API v2
+(`connectors/x.rs`). Length is counted the X way (`socialreins_core::post::x_weight`): most
+Latin, Greek and Cyrillic characters count 1, CJK and emoji 2, every link 23. The count is
+conservative: a bare domain counts as a link even where X would not, so a post may be refused
+(`too_long`) that X would take, never the reverse. Media is uploaded first with
+`POST /2/media/upload/initialize` (`media_type`, `total_bytes`, `media_category` `tweet_image`,
+`tweet_gif` or `tweet_video`), one `POST .../{id}/append` per 4 MB chunk (multipart, `segment_index`
+and `media`), `POST .../{id}/finalize`, and `GET /2/media/upload?command=STATUS` until a video is
+processed; images are at most 5 MB, a GIF 15 MB, a video 100 MB (brain's own cap). Then
+`POST /2/tweets` with `text`, `media.media_ids` and, for a thread part, `reply.in_reply_to_tweet_id`
+set to the part before it. Each tweet id is saved the moment X answers, before the next part is
+sent; a part that fails keeps the ones before it up, and nothing is retried. The permalink is
+`https://x.com/{username}/status/{id}`. A takedown is `DELETE /2/tweets/{id}` per part, last
+first, then the root (a tweet already gone counts as down). X bills API use by credits: when X
+answers `402`, or an error whose type, title or detail speaks of credits, the target fails with
+"X says this app is out of API credits ... Add credits in the X developer console". A `429`
+fails it with the reset time from `x-rate-limit-reset` ("resets at 2026-11-04 12:30 UTC. It was
+not retried."), and a `429` of type `usage-capped` says the usage cap is reached. A `403` shows X's
+own reason (for example duplicate content). A `401` is a dead token and asks for a reconnect.
 
 Meta (when `META_APP_ID` and `META_APP_SECRET` are set) connects Facebook Pages and the
 Instagram professional accounts linked to them with one Facebook Login, through the same OAuth
@@ -428,7 +475,7 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `META_WEBHOOK_VERIFY_TOKEN` | no | Any secret string, typed into the Meta app's webhook setup too. Turns on `GET /webhooks/meta`; `POST /webhooks/meta` is signed with `META_APP_SECRET` |
 | `THREADS_APP_ID`, `THREADS_APP_SECRET` | no | Both to connect Threads accounts (redirect URI `{BRAIN_URL}/connect/threads/callback`). Publishing with connected accounts needs neither |
 | `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET` | no | Both to connect LinkedIn profiles (redirect URI `{BRAIN_URL}/connect/linkedin/callback`). Publishing with connected accounts needs neither |
-| `X_CLIENT_ID`, `X_CLIENT_SECRET` | no | Offer X (connector not built yet) |
+| `X_CLIENT_ID`, `X_CLIENT_SECRET` | no | Both to connect X accounts (a Web App client, redirect URI `{BRAIN_URL}/connect/x/callback`). Publishing with a live token needs neither, renewing one does |
 | `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET` | no | Offer TikTok (connector not built yet) |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | no | Both or neither. Turn on Google sign-in (OAuth client of type Web application, redirect URI `{BRAIN_URL}/auth/google/callback`). They also turn on connecting YouTube channels (add the redirect URI `{BRAIN_URL}/connect/youtube/callback` to the same client) |
 | `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | no | Both or neither. Turn on a Cloudflare Turnstile captcha: `POST /auth/link` and `/v1/contact` then need a `turnstile_token`. Off when unset |

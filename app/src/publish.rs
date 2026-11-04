@@ -27,6 +27,7 @@ use crate::{
         linkedin::{self, LinkedIn},
         meta::{self, Facebook, Instagram},
         threads::{self, Threads},
+        x::{self, X},
         youtube::{self, YouTube},
     },
     controllers::posts::ThreadPart,
@@ -294,6 +295,70 @@ impl Publisher for LinkedIn {
 }
 
 #[async_trait]
+impl Publisher for X {
+    /// Text with up to four images, or one GIF, or one video; a thread part is a reply to the
+    /// part before it (`reply`'s parent). `secret` is already renewed (`credential`). The
+    /// tweet id is returned the moment X has it, and the caller saves it first.
+    async fn publish(
+        &self,
+        _: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        reply: Option<(&Remote, &Remote)>,
+    ) -> Result<Remote, PublishError> {
+        let mut files = Vec::new();
+        for (i, a) in media.iter().enumerate() {
+            let t = a.content_type.as_str();
+            let known =
+                x::IMAGE_TYPES.contains(&t) || t == x::GIF_TYPE || x::VIDEO_TYPES.contains(&t);
+            if !known {
+                let n = i + 1;
+                return Err(PublishError::Failed(format!(
+                    "Image {n} is not a JPEG, PNG, WebP or GIF image or an MP4 or MOV video."
+                )));
+            }
+            files.push(x::File {
+                bytes: &a.bytes,
+                content_type: t,
+            });
+        }
+        let parent = reply.map(|(p, _)| p.id.as_str());
+        let id = self.publish_post(secret, body, &files, parent).await?;
+        Ok(Remote {
+            id,
+            cid: String::new(),
+            url: None,
+        })
+    }
+
+    async fn delete(
+        &self,
+        _: &social_accounts::Model,
+        secret: &str,
+        remote_id: &str,
+    ) -> Result<(), PublishError> {
+        self.delete_post(secret, remote_id).await
+    }
+
+    fn url(&self, account: &social_accounts::Model, remote_id: &str) -> Option<String> {
+        Some(x::status_url(account.handle.as_deref(), remote_id))
+    }
+
+    fn name(&self) -> &'static str {
+        "X"
+    }
+
+    fn reconnect(&self) -> &'static str {
+        X_RECONNECT
+    }
+
+    fn timeout(&self) -> Duration {
+        x::PUBLISH_TIMEOUT
+    }
+}
+
+#[async_trait]
 impl Publisher for YouTube {
     /// One MP4 or MOV video, titled by the first line of the body. `secret` is already renewed
     /// (`credential`). The video id is returned the moment YouTube has the bytes, and the caller
@@ -470,6 +535,7 @@ pub fn publisher<'a>(app: &'a AppState, platform: &str) -> Option<&'a dyn Publis
         "threads" => Some(&app.threads),
         "linkedin" => Some(&app.linkedin),
         "youtube" => Some(&app.youtube),
+        "x" => Some(&app.x),
         "facebook" => Some(&app.facebook),
         "instagram" => Some(&app.instagram),
         _ => None,
@@ -506,19 +572,25 @@ pub const LINKEDIN_RECONNECT: &str =
     "LinkedIn refused the account's token, or it expired. Reconnect the account under Connections.";
 pub const YOUTUBE_RECONNECT: &str = "Google refused the channel's token, or access was removed. \
                                       Reconnect the channel under Connections.";
+pub const X_RECONNECT: &str = "X refused the account's token, or access was removed. \
+                               Reconnect the account under Connections.";
 pub const META_RECONNECT: &str = "Meta refused the Page's token or a permission is missing. \
                                   Reconnect Facebook and Instagram under Connections.";
 const STUCK: &str = "Unknown, check the account: publishing stopped midway and it may have posted.";
 
-/// The token to call the platform with. YouTube's lasts an hour, so it is renewed first when
-/// near its end (`controllers::youtube::fresh_token`); the others use the stored secret as it
-/// is, and an unreadable one is a reconnect.
+/// The token to call the platform with. YouTube's lasts an hour and X's two, so they are
+/// renewed first when near their end (`controllers::youtube::fresh_token`, `controllers::x::
+/// fresh_token`); the others use the stored secret as it is, and an unreadable one is a
+/// reconnect.
 async fn credential(
     app: &AppState,
     account: &social_accounts::Model,
 ) -> Result<String, PublishError> {
     if account.provider == "youtube" {
         return crate::controllers::youtube::fresh_token(app, account).await;
+    }
+    if account.provider == "x" {
+        return crate::controllers::x::fresh_token(app, account).await;
     }
     app.cipher
         .decrypt(&account.access_token)
@@ -684,15 +756,17 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
         } else {
             ("published", None)
         };
-        // shortcut: only Bluesky, LinkedIn and YouTube links are made from the id; a Threads link
-        // (looked up at publish) is left out here. Look it up if recovered Threads posts need one.
+        // shortcut: only Bluesky, LinkedIn, YouTube and X links are made from the id (X's without
+        // the username, which `/i/status` does not need); a Threads link (looked up at publish)
+        // is left out here. Look it up if recovered Threads posts need one.
         let url = bluesky::post_url(&remote)
             .or_else(|| {
                 remote
                     .starts_with("urn:li:")
                     .then(|| linkedin::post_url(&remote))
             })
-            .or_else(|| (platform == "youtube").then(|| youtube::watch_url(&remote)));
+            .or_else(|| (platform == "youtube").then(|| youtube::watch_url(&remote)))
+            .or_else(|| (platform == "x").then(|| x::status_url(None, &remote)));
         let stmt = sql(
             &with_event(
                 "UPDATE post_targets SET status = $3, remote_url = $2, error = $4, \
