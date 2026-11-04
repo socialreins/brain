@@ -27,6 +27,7 @@ use crate::{
         linkedin::{self, LinkedIn},
         meta::{self, Facebook, Instagram},
         threads::{self, Threads},
+        youtube::{self, YouTube},
     },
     controllers::posts::ThreadPart,
     media::{Fail, Stored},
@@ -293,6 +294,69 @@ impl Publisher for LinkedIn {
 }
 
 #[async_trait]
+impl Publisher for YouTube {
+    /// One MP4 or MOV video, titled by the first line of the body. `secret` is already renewed
+    /// (`credential`). The video id is returned the moment YouTube has the bytes, and the caller
+    /// saves it first.
+    async fn publish(
+        &self,
+        _: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        _: Option<(&Remote, &Remote)>,
+    ) -> Result<Remote, PublishError> {
+        let [video] = media else {
+            return Err(PublishError::Failed(
+                "A YouTube post needs exactly one MP4 or MOV video.".into(),
+            ));
+        };
+        if !youtube::VIDEO_TYPES.contains(&video.content_type.as_str()) {
+            return Err(PublishError::Failed(
+                "The file is not an MP4 or MOV video.".into(),
+            ));
+        }
+        let file = youtube::File {
+            bytes: &video.bytes,
+            content_type: &video.content_type,
+        };
+        let id = self
+            .upload(secret, socialreins_core::post::youtube_text(body), &file)
+            .await?;
+        Ok(Remote {
+            id,
+            cid: String::new(),
+            url: None,
+        })
+    }
+
+    async fn delete(
+        &self,
+        _: &social_accounts::Model,
+        secret: &str,
+        remote_id: &str,
+    ) -> Result<(), PublishError> {
+        self.delete_video(secret, remote_id).await
+    }
+
+    fn url(&self, _: &social_accounts::Model, remote_id: &str) -> Option<String> {
+        Some(youtube::watch_url(remote_id))
+    }
+
+    fn name(&self) -> &'static str {
+        "YouTube"
+    }
+
+    fn reconnect(&self) -> &'static str {
+        YOUTUBE_RECONNECT
+    }
+
+    fn timeout(&self) -> Duration {
+        youtube::PUBLISH_TIMEOUT
+    }
+}
+
+#[async_trait]
 impl Publisher for Facebook {
     async fn publish(
         &self,
@@ -405,6 +469,7 @@ pub fn publisher<'a>(app: &'a AppState, platform: &str) -> Option<&'a dyn Publis
         "bluesky" => Some(&app.bluesky),
         "threads" => Some(&app.threads),
         "linkedin" => Some(&app.linkedin),
+        "youtube" => Some(&app.youtube),
         "facebook" => Some(&app.facebook),
         "instagram" => Some(&app.instagram),
         _ => None,
@@ -439,9 +504,27 @@ pub const THREADS_RECONNECT: &str =
     "Threads refused the account's token. Reconnect the account under Connections.";
 pub const LINKEDIN_RECONNECT: &str =
     "LinkedIn refused the account's token, or it expired. Reconnect the account under Connections.";
+pub const YOUTUBE_RECONNECT: &str = "Google refused the channel's token, or access was removed. \
+                                      Reconnect the channel under Connections.";
 pub const META_RECONNECT: &str = "Meta refused the Page's token or a permission is missing. \
                                   Reconnect Facebook and Instagram under Connections.";
 const STUCK: &str = "Unknown, check the account: publishing stopped midway and it may have posted.";
+
+/// The token to call the platform with. YouTube's lasts an hour, so it is renewed first when
+/// near its end (`controllers::youtube::fresh_token`); the others use the stored secret as it
+/// is, and an unreadable one is a reconnect.
+async fn credential(
+    app: &AppState,
+    account: &social_accounts::Model,
+) -> Result<String, PublishError> {
+    if account.provider == "youtube" {
+        return crate::controllers::youtube::fresh_token(app, account).await;
+    }
+    app.cipher
+        .decrypt(&account.access_token)
+        .and_then(|b| String::from_utf8(b).ok())
+        .ok_or(PublishError::Reconnect)
+}
 
 fn sql(sql: &str, values: Vec<Value>) -> Statement {
     Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
@@ -576,7 +659,7 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
     // part that may or may not have gone out; the saved parts stay takeable down.
     let stmt = sql(
         "SELECT t.id, t.post_id, t.remote_id, jsonb_array_length(t.parts) AS done, \
-         jsonb_array_length(p.thread) AS total FROM post_targets t \
+         jsonb_array_length(p.thread) AS total, p.platform FROM post_targets t \
          JOIN posts p ON p.id = t.post_id \
          WHERE t.status = 'publishing' AND t.remote_id IS NOT NULL \
          AND t.updated_at < now() - make_interval(mins => $1)",
@@ -590,6 +673,7 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
             row.try_get("", "remote_id")?,
         );
         let (done, total): (i32, i32) = (row.try_get("", "done")?, row.try_get("", "total")?);
+        let platform: String = row.try_get("", "platform")?;
         let (status, error) = if done < total {
             let msg = format!(
                 "Unknown, check the account: publishing stopped midway and thread post {} of \
@@ -600,13 +684,15 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
         } else {
             ("published", None)
         };
-        // shortcut: only Bluesky and LinkedIn links are made from the id; a Threads link (looked
-        // up at publish) is left out here. Look it up if recovered Threads posts need one.
-        let url = bluesky::post_url(&remote).or_else(|| {
-            remote
-                .starts_with("urn:li:")
-                .then(|| linkedin::post_url(&remote))
-        });
+        // shortcut: only Bluesky, LinkedIn and YouTube links are made from the id; a Threads link
+        // (looked up at publish) is left out here. Look it up if recovered Threads posts need one.
+        let url = bluesky::post_url(&remote)
+            .or_else(|| {
+                remote
+                    .starts_with("urn:li:")
+                    .then(|| linkedin::post_url(&remote))
+            })
+            .or_else(|| (platform == "youtube").then(|| youtube::watch_url(&remote)));
         let stmt = sql(
             &with_event(
                 "UPDATE post_targets SET status = $3, remote_url = $2, error = $4, \
@@ -922,12 +1008,10 @@ async fn publish_target(
     let Some(publisher) = publisher(app, &post.platform) else {
         return fail_target(db, id, "This platform cannot publish yet.").await;
     };
-    let Some(secret) = app
-        .cipher
-        .decrypt(&account.access_token)
-        .and_then(|b| String::from_utf8(b).ok())
-    else {
-        return fail_target(db, id, publisher.reconnect()).await;
+    let secret = match credential(app, &account).await {
+        Ok(secret) => secret,
+        Err(PublishError::Reconnect) => return fail_target(db, id, publisher.reconnect()).await,
+        Err(PublishError::Failed(msg)) => return fail_target(db, id, &msg).await,
     };
     let media: Vec<String> = serde_json::from_value(post.media.clone()).unwrap_or_default();
     let thread: Vec<ThreadPart> = serde_json::from_value(post.thread.clone()).unwrap_or_default();
@@ -1107,10 +1191,16 @@ pub async fn takedown(app: &AppState, post: &posts::Model) -> Result<Vec<String>
             continue;
         };
         let name = named(&account);
-        let secret = app
-            .cipher
-            .decrypt(&account.access_token)
-            .and_then(|b| String::from_utf8(b).ok());
+        let secret = match credential(app, &account).await {
+            Ok(secret) => Some(secret),
+            Err(PublishError::Reconnect) => None,
+            Err(PublishError::Failed(msg)) => {
+                problems.push(format!(
+                    "{name}: {msg} Delete the post in the app if it is still up."
+                ));
+                continue;
+            }
+        };
         let (Some(publisher), Some(secret), Some(root)) = (
             publisher(app, &post.platform),
             secret,

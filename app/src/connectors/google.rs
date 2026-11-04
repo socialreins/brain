@@ -9,8 +9,9 @@ use reqwest::Url;
 use serde::Deserialize;
 use serde_json::Value;
 
-const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
-const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+/// Shared with the YouTube connector, which uses the same Google client.
+pub(crate) const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+pub(crate) const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const ISSUERS: [&str; 2] = ["https://accounts.google.com", "accounts.google.com"];
 
 /// `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`. No `Debug`: it holds the secret.

@@ -25,6 +25,7 @@ pub mod teams;
 pub mod threads;
 pub mod waitlist;
 pub mod webhooks;
+pub mod youtube;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -153,6 +154,7 @@ pub fn router(state: AppState, config: &Config) -> Router {
         .merge(passkeys::routes().layer(DefaultBodyLimit::max(MAX_PASSKEY_BODY_BYTES)))
         .merge(threads::routes())
         .merge(linkedin::routes())
+        .merge(youtube::routes())
         .merge(meta::routes())
         .merge(meta_webhook::routes())
         .merge(media::routes())

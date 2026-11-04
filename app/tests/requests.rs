@@ -6430,6 +6430,797 @@ mod teams {
                 }
             }
 
+            /// YouTube: the connect flow on the Google client, resumable video uploads against a
+            /// mock of the Data API, take down, token renewal and the session URL guard.
+            mod youtube_api {
+                use super::threads_api::{location, set_role};
+                use super::*;
+                use axum::{
+                    extract::{Form, Query},
+                    http::{HeaderMap, StatusCode},
+                    response::IntoResponse,
+                    routing::{delete, get, post},
+                    Json, Router,
+                };
+                use socialreins_brain::connectors::youtube::YouTube;
+                use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+                /// Every session start: (metadata, `X-Upload-Content-Length`, `X-Upload-Content-Type`).
+                static STARTS: std::sync::Mutex<Vec<(Value, String, String)>> =
+                    std::sync::Mutex::new(Vec::new());
+                /// Every upload of bytes: (byte count, bearer token sent).
+                static PUTS: std::sync::Mutex<Vec<(usize, String)>> =
+                    std::sync::Mutex::new(Vec::new());
+                /// The bearer token of every call that needs one, newest last.
+                static BEARERS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                /// Every video id the mock was asked to delete.
+                static REMOVED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                static REFRESHES: AtomicU64 = AtomicU64::new(0);
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                /// When set, the mock hands out this session URL instead of its own.
+                static FORCED_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+                /// Requests the "foreign host" took.
+                static FOREIGN_HITS: AtomicU64 = AtomicU64::new(0);
+                /// The mock's quota is used up.
+                static QUOTA: AtomicBool = AtomicBool::new(false);
+                /// How the mock answers a delete: 0 as asked, 1 video gone, 2 scope missing.
+                static DELETE_MODE: AtomicU64 = AtomicU64::new(0);
+
+                type Answer = (StatusCode, Json<Value>);
+
+                fn google_error(status: StatusCode, reason: &str, message: &str) -> Answer {
+                    let error = json!({"code": status.as_u16(), "message": message,
+                        "errors": [{"message": message, "reason": reason}]});
+                    (status, Json(json!({ "error": error })))
+                }
+
+                fn expired() -> Answer {
+                    let msg = "Invalid Credentials";
+                    google_error(StatusCode::UNAUTHORIZED, "authError", msg)
+                }
+
+                /// A token the mock handed out; every call is logged.
+                fn bearer_ok(h: &HeaderMap) -> bool {
+                    let bearer = h.get("authorization").and_then(|v| v.to_str().ok());
+                    BEARERS
+                        .lock()
+                        .unwrap()
+                        .push(bearer.unwrap_or_default().to_owned());
+                    matches!(bearer, Some("Bearer yt" | "Bearer yrefreshed"))
+                }
+
+                fn forced_url() -> Option<String> {
+                    FORCED_URL.lock().unwrap().clone()
+                }
+
+                /// Google (token endpoint, channels, upload, delete), plus a PNG and an MP4.
+                /// Code `good` gives a token with a refresh token, `norefresh` none,
+                /// `nochannel` a token whose account has no channel.
+                async fn mock_youtube() -> String {
+                    *FORCED_URL.lock().unwrap() = None;
+                    QUOTA.store(false, Ordering::SeqCst);
+                    DELETE_MODE.store(0, Ordering::SeqCst);
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let base = format!("http://{}", listener.local_addr().unwrap());
+                    let token = |Form(f): Form<HashMap<String, String>>| async move {
+                        let get = |k: &str| f.get(k).map(String::as_str).unwrap_or_default();
+                        let app = get("client_id") == "yapp" && get("client_secret") == "ysecret";
+                        let code = (get("grant_type"), get("code"), get("refresh_token"));
+                        let bad = (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": "invalid_grant",
+                                "error_description": "Token has been expired or revoked."})),
+                        );
+                        match (app, code) {
+                            (true, ("authorization_code", "good", _)) => (
+                                StatusCode::OK,
+                                Json(json!({"access_token": "yt", "expires_in": 3599,
+                                    "refresh_token": "yrefresh", "token_type": "Bearer"})),
+                            ),
+                            (true, ("authorization_code", "norefresh", _)) => (
+                                StatusCode::OK,
+                                Json(json!({"access_token": "yt", "expires_in": 3599})),
+                            ),
+                            (true, ("authorization_code", "nochannel", _)) => (
+                                StatusCode::OK,
+                                Json(json!({"access_token": "ynochannel", "expires_in": 3599,
+                                    "refresh_token": "yrefresh"})),
+                            ),
+                            (true, ("refresh_token", _, "yrefresh")) => {
+                                REFRESHES.fetch_add(1, Ordering::SeqCst);
+                                (
+                                    StatusCode::OK,
+                                    Json(json!({"access_token": "yrefreshed", "expires_in": 3599})),
+                                )
+                            }
+                            _ => bad,
+                        }
+                    };
+                    let channels = |h: HeaderMap, Query(q): Query<HashMap<String, String>>| async move {
+                        assert_eq!(q["part"], "snippet");
+                        assert_eq!(q["mine"], "true");
+                        if h.get("authorization").and_then(|v| v.to_str().ok())
+                            == Some("Bearer ynochannel")
+                        {
+                            return (
+                                StatusCode::OK,
+                                Json(json!({"kind": "youtube#channelListResponse",
+                                    "pageInfo": {"totalResults": 0}})),
+                            );
+                        }
+                        if !bearer_ok(&h) {
+                            return expired();
+                        }
+                        (
+                            StatusCode::OK,
+                            Json(json!({"items": [{"id": "UCabc123", "snippet": {
+                                "title": "Ann Lee Makes",
+                                "customUrl": "@annleemakes",
+                                "thumbnails": {
+                                    "default": {"url": "https://yt3.ggpht.com/d=s88"},
+                                    "medium": {"url": "https://yt3.ggpht.com/m=s240"}}}}]})),
+                        )
+                    };
+                    let b = base.clone();
+                    let start = move |h: HeaderMap,
+                                      Query(q): Query<HashMap<String, String>>,
+                                      Json(meta): Json<Value>| async move {
+                        assert_eq!(q["uploadType"], "resumable");
+                        assert_eq!(q["part"], "snippet,status");
+                        if !bearer_ok(&h) {
+                            return expired().into_response();
+                        }
+                        if QUOTA.load(Ordering::SeqCst) {
+                            let msg = "The request cannot be completed because you have exceeded your quota.";
+                            return google_error(StatusCode::FORBIDDEN, "quotaExceeded", msg)
+                                .into_response();
+                        }
+                        let header = |k: &str| {
+                            h.get(k)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or_default()
+                                .to_owned()
+                        };
+                        STARTS.lock().unwrap().push((
+                            meta,
+                            header("x-upload-content-length"),
+                            header("x-upload-content-type"),
+                        ));
+                        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+                        let session = forced_url().unwrap_or(format!(
+                            "{b}/upload/youtube/v3/videos?uploadType=resumable&upload_id=s{n}"
+                        ));
+                        (StatusCode::OK, [("location", session)], "").into_response()
+                    };
+                    let upload = |h: HeaderMap, body: axum::body::Bytes| async move {
+                        let sent = h
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned();
+                        PUTS.lock().unwrap().push((body.len(), sent));
+                        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            Json(json!({"kind": "youtube#video", "id": format!("vid{n}"),
+                                "status": {"privacyStatus": "public"}})),
+                        )
+                    };
+                    let remove = |h: HeaderMap, Query(q): Query<HashMap<String, String>>| async move {
+                        if !bearer_ok(&h) {
+                            return expired().into_response();
+                        }
+                        match DELETE_MODE.load(Ordering::SeqCst) {
+                            1 => {
+                                return google_error(
+                                    StatusCode::NOT_FOUND,
+                                    "videoNotFound",
+                                    "The video could not be found.",
+                                )
+                                .into_response()
+                            }
+                            2 => {
+                                return google_error(
+                                    StatusCode::FORBIDDEN,
+                                    "insufficientPermissions",
+                                    "Insufficient Permission",
+                                )
+                                .into_response()
+                            }
+                            _ => {}
+                        }
+                        REMOVED.lock().unwrap().push(q["id"].clone());
+                        StatusCode::NO_CONTENT.into_response()
+                    };
+                    let mut mp4 = vec![0u8; 64];
+                    mp4[..12].copy_from_slice(b"\0\0\0\x18ftypisom");
+                    let app = Router::new()
+                        .route("/token", post(token))
+                        .route("/youtube/v3/channels", get(channels))
+                        .route("/upload/youtube/v3/videos", post(start).put(upload))
+                        .route("/youtube/v3/videos", delete(remove))
+                        .route("/img.png", get(|| async { image("image/png", 64) }))
+                        .route(
+                            "/clip.mp4",
+                            get(move || async move { ([("content-type", "video/mp4")], mp4) }),
+                        );
+                    tokio::spawn(async move { axum::serve(listener, app).await });
+                    base
+                }
+
+                /// A brain with YouTube set up on the mock, its state, and the mock.
+                async fn on_youtube(
+                    configured: bool,
+                ) -> (TestServer, DatabaseConnection, AppState, String) {
+                    let base = mock_youtube().await;
+                    let mut config = Config::from_env().expect("test config");
+                    config.trust_proxy = true;
+                    let app = configured.then(|| ("yapp".to_owned(), "ysecret".to_owned()));
+                    let mut y = YouTube::new(app).unwrap();
+                    y.token_url = format!("{base}/token");
+                    y.api_url = base.clone();
+                    config.youtube = y;
+                    let disk = object_store::local::LocalFileSystem::new_with_prefix(media_dir())
+                        .unwrap()
+                        .with_automatic_cleanup(true);
+                    config.media = Media::new(std::sync::Arc::new(disk), true);
+                    let db = socialreins_brain::connect(&config)
+                        .await
+                        .expect("database reachable");
+                    let state = AppState::new(db.clone(), &config);
+                    let app = controllers::router(state.clone(), &config);
+                    (TestServer::new(app).unwrap(), db, state, base)
+                }
+
+                /// Starts a connect: (state, `sr_youtube=...`).
+                async fn begin(s: &TestServer, cookie: &str) -> (String, String) {
+                    let res = s
+                        .get("/connections/youtube/redirect")
+                        .add_header("cookie", cookie)
+                        .await;
+                    let (to, q) = location(&res);
+                    assert!(
+                        to.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"),
+                        "{to}"
+                    );
+                    assert_eq!(q["client_id"], "yapp");
+                    assert_eq!(q["response_type"], "code");
+                    assert_eq!(
+                        q["redirect_uri"],
+                        "http://localhost:8080/connect/youtube/callback"
+                    );
+                    assert_eq!(q["access_type"], "offline");
+                    assert_eq!(q["prompt"], "consent");
+                    assert_eq!(q["include_granted_scopes"], "false");
+                    assert_eq!(
+                        q["scope"],
+                        "https://www.googleapis.com/auth/youtube.upload \
+                         https://www.googleapis.com/auth/youtube.readonly \
+                         https://www.googleapis.com/auth/youtube.force-ssl"
+                    );
+                    let set = res
+                        .iter_headers_by_name("set-cookie")
+                        .map(|v| v.to_str().unwrap().to_owned())
+                        .find(|c| c.starts_with("sr_youtube="))
+                        .unwrap();
+                    assert!(set.contains("HttpOnly") && set.contains("Path=/connect/youtube"));
+                    (
+                        q["state"].clone(),
+                        set.split(';').next().unwrap().to_owned(),
+                    )
+                }
+
+                /// Google's redirect back: where it lands, as `(connected, connect_error)`.
+                async fn finish(
+                    s: &TestServer,
+                    cookies: &str,
+                    query: &str,
+                ) -> (Option<String>, Option<String>) {
+                    let res = s
+                        .get(&format!("/connect/youtube/callback?{query}"))
+                        .add_header("cookie", cookies)
+                        .await;
+                    let (to, q) = location(&res);
+                    assert!(
+                        to.starts_with("http://localhost:3000/app/connections?"),
+                        "{to}"
+                    );
+                    if q.contains_key("connect_error") {
+                        assert_eq!(q["provider"], "youtube");
+                    }
+                    (q.get("connected").cloned(), q.get("connect_error").cloned())
+                }
+
+                /// Connects the mock's channel with `code` to the caller's current team.
+                async fn connect_with(s: &TestServer, cookie: &str, code: &str) {
+                    let (state, flow) = begin(s, cookie).await;
+                    let both = format!("{cookie}; {flow}");
+                    let got = finish(s, &both, &format!("code={code}&state={state}")).await;
+                    assert_eq!(got, (Some("youtube".into()), None));
+                }
+
+                async fn youtube_account(
+                    db: &DatabaseConnection,
+                    team_id: &str,
+                ) -> social_accounts::Model {
+                    social_accounts::Entity::find()
+                        .filter(
+                            social_accounts::Column::TeamId
+                                .eq(team_id.parse::<uuid::Uuid>().unwrap()),
+                        )
+                        .filter(social_accounts::Column::Provider.eq("youtube"))
+                        .one(db)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                }
+
+                /// Sets the account's access token and the seconds it has left.
+                async fn set_token(
+                    db: &DatabaseConnection,
+                    account: uuid::Uuid,
+                    token: &str,
+                    secs: i64,
+                ) {
+                    let row = social_accounts::ActiveModel {
+                        id: Set(account),
+                        access_token: Set(cipher().encrypt(token.as_bytes())),
+                        token_expires_at: Set(Some(
+                            (Utc::now() + Duration::seconds(secs)).fixed_offset(),
+                        )),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(row).exec(db).await.unwrap();
+                }
+
+                /// Sets the account's sealed refresh token, or removes it.
+                async fn set_refresh(
+                    db: &DatabaseConnection,
+                    account: uuid::Uuid,
+                    token: Option<&str>,
+                ) {
+                    let meta = match token {
+                        Some(t) => {
+                            json!({"refresh_token": URL_SAFE_NO_PAD.encode(cipher().encrypt(t.as_bytes()))})
+                        }
+                        None => json!({}),
+                    };
+                    let row = social_accounts::ActiveModel {
+                        id: Set(account),
+                        meta: Set(meta),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(row).exec(db).await.unwrap();
+                }
+
+                fn youtube_post(set: &str, body: &str) -> Value {
+                    let mut v = input(set, body, Some(&past()));
+                    v["platform"] = json!("youtube");
+                    v["media"] = json!(["https://a.example/clip.mp4"]);
+                    v
+                }
+
+                /// A connected team: (server, db, state, mock base, cookie, team id, set id).
+                async fn team() -> (
+                    TestServer,
+                    DatabaseConnection,
+                    AppState,
+                    String,
+                    String,
+                    String,
+                    String,
+                ) {
+                    let (s, db, state, base) = on_youtube(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    connect_with(&s, &cookie, "good").await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    (s, db, state, base, cookie, team_id, set)
+                }
+
+                /// Saves a video post of the mock's clip and publishes it: the post.
+                async fn publish_clip(
+                    s: &TestServer,
+                    (db, state, base): (&DatabaseConnection, &AppState, &str),
+                    (cookie, set): (&str, &str),
+                    body: &str,
+                ) -> Value {
+                    let id = id_of(&create(s, cookie, youtube_post(set, body)).await);
+                    set_media(db, base, &id, &["/clip.mp4"]).await;
+                    publish::tick(state).await.unwrap();
+                    get_post(s, cookie, &id).await
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connect_saves_the_channel_and_a_sealed_refresh_token() {
+                    let (s, db, _, _) = on_youtube(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let (state, flow) = begin(&s, &cookie).await;
+                    let both = format!("{cookie}; {flow}");
+                    let query = format!("code=good&state={state}");
+                    let res = s
+                        .get(&format!("/connect/youtube/callback?{query}"))
+                        .add_header("cookie", &both)
+                        .await;
+                    let (_, q) = location(&res);
+                    assert_eq!(q["connected"], "youtube");
+                    // Only the connect cookie is cleared: nobody is signed in by this.
+                    let cookies: Vec<String> = res
+                        .iter_headers_by_name("set-cookie")
+                        .map(|v| v.to_str().unwrap().to_owned())
+                        .collect();
+                    assert_eq!(cookies.len(), 1, "{cookies:?}");
+                    assert!(cookies[0].starts_with("sr_youtube=;"), "{cookies:?}");
+
+                    let listed = list(&s, &cookie).await;
+                    assert_eq!(listed.len(), 1);
+                    let a = &listed[0];
+                    assert_eq!(a["provider"], "youtube");
+                    assert_eq!(a["external_id"], "UCabc123");
+                    assert_eq!(a["display_name"], "Ann Lee Makes");
+                    assert_eq!(a["handle"], "annleemakes");
+                    assert_eq!(a["avatar_url"], "https://yt3.ggpht.com/m=s240");
+                    let set = default_set(&db, &team_id).await.to_string();
+                    assert_eq!(a["set_ids"], json!([set]));
+                    assert!(a.get("access_token").is_none() && !a.to_string().contains("yrefresh"));
+                    let row = youtube_account(&db, &team_id).await;
+                    assert_eq!(cipher().decrypt(&row.access_token).unwrap(), b"yt");
+                    let sealed = row.meta["refresh_token"].as_str().unwrap();
+                    assert!(!sealed.contains("yrefresh"));
+                    let bytes = URL_SAFE_NO_PAD.decode(sealed).unwrap();
+                    assert_eq!(cipher().decrypt(&bytes).unwrap(), b"yrefresh");
+                    let left = row.token_expires_at.unwrap().timestamp() - Utc::now().timestamp();
+                    assert!((3590..=3599).contains(&left), "{left}");
+                    // The state works once.
+                    assert_eq!(
+                        finish(&s, &both, &query).await,
+                        (None, Some("expired".into()))
+                    );
+                    // A reconnect keeps the one row.
+                    connect_with(&s, &cookie, "good").await;
+                    let again = list(&s, &cookie).await;
+                    assert_eq!(again.len(), 1);
+                    assert_eq!(again[0]["id"], a["id"]);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connect_refuses_strangers_members_and_other_browsers() {
+                    let (s, db, _, _) = on_youtube(true).await;
+                    let (_, cookie, user_id) = user(&s, &db).await;
+                    let back = |res: axum_test::TestResponse| location(&res).1;
+                    let res = s.get("/connections/youtube/redirect").await;
+                    assert_eq!(back(res)["connect_error"], "unauthorized");
+
+                    // The state must come back to the browser that started it.
+                    let (state, flow) = begin(&s, &cookie).await;
+                    let query = format!("code=good&state={state}");
+                    assert_eq!(
+                        finish(&s, &cookie, &query).await,
+                        (None, Some("expired".into()))
+                    );
+                    let wrong = format!("{cookie}; sr_youtube=0000");
+                    assert_eq!(
+                        finish(&s, &wrong, &query).await,
+                        (None, Some("expired".into()))
+                    );
+                    // Those did not use it up; another signed-in user cannot finish it.
+                    let (_, stranger, _) = user(&s, &db).await;
+                    let theirs = format!("{stranger}; {flow}");
+                    assert_eq!(
+                        finish(&s, &theirs, &query).await,
+                        (None, Some("expired".into()))
+                    );
+
+                    // A demotion meanwhile.
+                    let (state, flow) = begin(&s, &cookie).await;
+                    set_role(&db, user_id, "member").await;
+                    let both = format!("{cookie}; {flow}");
+                    let q = format!("code=good&state={state}");
+                    assert_eq!(finish(&s, &both, &q).await, (None, Some("expired".into())));
+                    let res = s
+                        .get("/connections/youtube/redirect")
+                        .add_header("cookie", &cookie)
+                        .await;
+                    assert_eq!(back(res)["connect_error"], "forbidden");
+                    assert!(list(&s, &cookie).await.is_empty());
+
+                    let (s, db, _, _) = on_youtube(false).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let res = s
+                        .get("/connections/youtube/redirect")
+                        .add_header("cookie", &cookie)
+                        .await;
+                    assert_eq!(back(res)["connect_error"], "not_configured");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connects_that_go_wrong_land_with_a_code_and_save_nothing() {
+                    let (s, db, _, _) = on_youtube(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    // Cancelled on Google, a bad code, no refresh token (the account could not be
+                    // renewed), and a Google account without a YouTube channel.
+                    for (q, want) in [
+                        ("error=access_denied", "cancelled"),
+                        ("code=bad", "youtube_failed"),
+                        ("code=norefresh", "youtube_failed"),
+                        ("code=nochannel", "no_channel"),
+                    ] {
+                        let (state, flow) = begin(&s, &cookie).await;
+                        let both = format!("{cookie}; {flow}");
+                        let got = finish(&s, &both, &format!("{q}&state={state}")).await;
+                        assert_eq!(got, (None, Some(want.into())), "{q}");
+                    }
+                    assert!(list(&s, &cookie).await.is_empty());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_video_uploads_in_a_resumable_session_and_comes_down() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let (starts, puts) = (STARTS.lock().unwrap().len(), PUTS.lock().unwrap().len());
+                    let body = "My first short\n\nSecond line of the description\nand a third";
+                    let p = publish_clip(&s, (&db, &state, &base), (&cookie, &set), body).await;
+                    assert_eq!(p["status"], "published", "{p}");
+
+                    let (meta, length, kind) = STARTS.lock().unwrap()[starts].clone();
+                    assert_eq!(meta["snippet"]["title"], "My first short");
+                    assert_eq!(
+                        meta["snippet"]["description"],
+                        "Second line of the description\nand a third"
+                    );
+                    assert_eq!(meta["status"]["privacyStatus"], "public");
+                    assert_eq!(meta["status"]["selfDeclaredMadeForKids"], false);
+                    assert_eq!((length.as_str(), kind.as_str()), ("64", "video/mp4"));
+                    let (size, sent) = PUTS.lock().unwrap()[puts].clone();
+                    assert_eq!((size, sent.as_str()), (64, "Bearer yt"));
+
+                    let t = &p["targets"][0];
+                    let video = t["remote_id"].as_str().unwrap().to_owned();
+                    assert!(video.starts_with("vid"), "{video}");
+                    assert_eq!(
+                        t["remote_url"],
+                        format!("https://www.youtube.com/watch?v={video}")
+                    );
+
+                    let res = req(
+                        &s,
+                        Method::DELETE,
+                        &format!("/v1/posts/{}", p["id"].as_str().unwrap()),
+                        &cookie,
+                    )
+                    .await;
+                    res.assert_status_ok();
+                    assert_eq!(res.json::<Value>()["status"], "deleted");
+                    assert_eq!(REMOVED.lock().unwrap().last(), Some(&video));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_title_alone_is_enough_and_blank_lines_before_it_are_skipped() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let starts = STARTS.lock().unwrap().len();
+                    let p = publish_clip(
+                        &s,
+                        (&db, &state, &base),
+                        (&cookie, &set),
+                        "\n  Just a title ",
+                    )
+                    .await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let (meta, _, _) = STARTS.lock().unwrap()[starts].clone();
+                    assert_eq!(meta["snippet"]["title"], "Just a title");
+                    assert_eq!(meta["snippet"]["description"], "");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn posts_without_exactly_one_valid_video_are_refused() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let refused = |res: axum_test::TestResponse, code: &str| {
+                        assert_eq!(res.status_code(), 422, "{}", res.text());
+                        res.assert_json(&json!({"error": code}));
+                    };
+                    let mut none = youtube_post(&set, "Title");
+                    none["media"] = json!([]);
+                    refused(create(&s, &cookie, none).await, "media_required");
+                    let mut two = youtube_post(&set, "Title");
+                    two["media"] = json!(["https://a.example/1.mp4", "https://a.example/2.mp4"]);
+                    refused(create(&s, &cookie, two).await, "too_many_images");
+                    refused(
+                        create(&s, &cookie, youtube_post(&set, &"a".repeat(101))).await,
+                        "too_long",
+                    );
+                    let long = format!("Title\n{}", "a".repeat(5001));
+                    refused(
+                        create(&s, &cookie, youtube_post(&set, &long)).await,
+                        "too_long",
+                    );
+                    refused(
+                        create(&s, &cookie, youtube_post(&set, "")).await,
+                        "empty_post",
+                    );
+                    refused(
+                        create(&s, &cookie, youtube_post(&set, "a <b> c")).await,
+                        "invalid_text",
+                    );
+                    let mut threaded = youtube_post(&set, "Title");
+                    threaded["thread"] = json!([{"body": "two"}]);
+                    refused(create(&s, &cookie, threaded).await, "thread_not_supported");
+                    // The limits themselves pass.
+                    let mut exact =
+                        youtube_post(&set, &format!("{}\n{}", "a".repeat(100), "b".repeat(5000)));
+                    exact["scheduled_at"] = Value::Null;
+                    assert_eq!(create(&s, &cookie, exact).await.status_code(), 201);
+
+                    // A file that is not an MP4 or MOV video never reaches YouTube.
+                    let id = id_of(&create(&s, &cookie, youtube_post(&set, "Image")).await);
+                    set_media(&db, &base, &id, &["/img.png"]).await;
+                    let starts = STARTS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed");
+                    let error = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(error.contains("not an MP4 or MOV video"), "{error}");
+                    assert_eq!(STARTS.lock().unwrap().len(), starts);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn foreign_session_urls_never_get_the_bytes_or_the_token() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    // A host that is not Google's: any request to it is counted.
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let port = listener.local_addr().unwrap().port();
+                    let evil = format!("http://127.0.0.1:{port}");
+                    let spy = Router::new().fallback(|| async {
+                        FOREIGN_HITS.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    });
+                    tokio::spawn(async move { axum::serve(listener, spy).await });
+                    let urls = [
+                        format!("{evil}/x"),
+                        format!("{base}@127.0.0.1:{port}/x"),
+                        "https://www.googleapis.com.evil.net/x".to_owned(),
+                        "https://www.googleapis.com@evil.net/x".to_owned(),
+                        "https://evil.net/www.googleapis.com".to_owned(),
+                        "http://www.googleapis.com/x".to_owned(),
+                    ];
+                    for url in &urls {
+                        *FORCED_URL.lock().unwrap() = Some(url.clone());
+                        let puts = PUTS.lock().unwrap().len();
+                        let p = publish_clip(&s, (&db, &state, &base), (&cookie, &set), "x").await;
+                        assert_eq!(p["status"], "failed", "{url}");
+                        let error = p["targets"][0]["error"].as_str().unwrap();
+                        assert!(error.contains("unexpected upload URL"), "{url}: {error}");
+                        assert_eq!(PUTS.lock().unwrap().len(), puts, "{url}");
+                    }
+                    *FORCED_URL.lock().unwrap() = None;
+                    assert_eq!(FOREIGN_HITS.load(Ordering::SeqCst), 0);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn an_access_token_near_its_end_is_renewed_before_the_call() {
+                    let (s, db, state, base, cookie, team_id, set) = team().await;
+                    let account = youtube_account(&db, &team_id).await.id;
+                    let ctx = (&db, &state, base.as_str());
+                    // Half an hour left: used as it is.
+                    set_token(&db, account, "yt", 1800).await;
+                    let refreshes = REFRESHES.load(Ordering::SeqCst);
+                    let p = publish_clip(&s, ctx, (&cookie, &set), "a").await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(REFRESHES.load(Ordering::SeqCst), refreshes);
+
+                    // Within two minutes: renewed first, saved, and the new token is the one sent.
+                    set_token(&db, account, "dead", 90).await;
+                    let puts = PUTS.lock().unwrap().len();
+                    let p = publish_clip(&s, ctx, (&cookie, &set), "b").await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(REFRESHES.load(Ordering::SeqCst), refreshes + 1);
+                    assert_eq!(PUTS.lock().unwrap()[puts].1, "Bearer yrefreshed");
+                    let row = youtube_account(&db, &team_id).await;
+                    assert_eq!(cipher().decrypt(&row.access_token).unwrap(), b"yrefreshed");
+                    let left = row.token_expires_at.unwrap().timestamp() - Utc::now().timestamp();
+                    assert!((3590..=3599).contains(&left), "{left}");
+                    // The refresh token stays.
+                    let sealed = row.meta["refresh_token"].as_str().unwrap();
+                    let bytes = URL_SAFE_NO_PAD.decode(sealed).unwrap();
+                    assert_eq!(cipher().decrypt(&bytes).unwrap(), b"yrefresh");
+
+                    // An expired one is renewed too, and a take down renews as well.
+                    set_token(&db, account, "dead", -60).await;
+                    let id = p["id"].as_str().unwrap().to_owned();
+                    let video = p["targets"][0]["remote_id"].as_str().unwrap().to_owned();
+                    let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                    res.assert_status_ok();
+                    assert_eq!(REMOVED.lock().unwrap().last(), Some(&video));
+                    assert_eq!(REFRESHES.load(Ordering::SeqCst), refreshes + 2);
+                    assert_eq!(BEARERS.lock().unwrap().last().unwrap(), "Bearer yrefreshed");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_refused_token_or_refresh_asks_for_a_reconnect() {
+                    let (s, db, state, base, cookie, team_id, set) = team().await;
+                    let account = youtube_account(&db, &team_id).await.id;
+                    let ctx = (&db, &state, base.as_str());
+                    let starts = STARTS.lock().unwrap().len();
+                    // Revoked but not yet expired: Google answers 401.
+                    set_token(&db, account, "dead", 1800).await;
+                    let p = publish_clip(&s, ctx, (&cookie, &set), "a").await;
+                    assert_eq!(p["status"], "failed");
+                    assert_eq!(p["targets"][0]["error"], publish::YOUTUBE_RECONNECT);
+                    // Expired, and Google refuses the refresh token.
+                    set_token(&db, account, "dead", -60).await;
+                    set_refresh(&db, account, Some("revoked")).await;
+                    let p = publish_clip(&s, ctx, (&cookie, &set), "b").await;
+                    assert_eq!(p["status"], "failed");
+                    assert_eq!(p["targets"][0]["error"], publish::YOUTUBE_RECONNECT);
+                    // Expired, with no refresh token at all: no call is made.
+                    set_refresh(&db, account, None).await;
+                    let refreshes = REFRESHES.load(Ordering::SeqCst);
+                    let p = publish_clip(&s, ctx, (&cookie, &set), "c").await;
+                    assert_eq!(p["status"], "failed");
+                    assert_eq!(p["targets"][0]["error"], publish::YOUTUBE_RECONNECT);
+                    assert_eq!(REFRESHES.load(Ordering::SeqCst), refreshes);
+                    assert_eq!(STARTS.lock().unwrap().len(), starts);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn an_exhausted_quota_is_named() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    QUOTA.store(true, Ordering::SeqCst);
+                    let p = publish_clip(&s, (&db, &state, &base), (&cookie, &set), "a").await;
+                    QUOTA.store(false, Ordering::SeqCst);
+                    assert_eq!(p["status"], "failed", "{p}");
+                    let error = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(error.contains("daily quota"), "{error}");
+                    assert!(error.contains("1,600"), "{error}");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn take_down_treats_a_gone_video_as_down_and_a_missing_scope_as_reconnect() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let ctx = (&db, &state, base.as_str());
+                    let p = publish_clip(&s, ctx, (&cookie, &set), "a").await;
+                    let path = format!("/v1/posts/{}", p["id"].as_str().unwrap());
+                    // Connected before the delete scope existed: Google says the scope is missing.
+                    DELETE_MODE.store(2, Ordering::SeqCst);
+                    let res = req(&s, Method::DELETE, &path, &cookie).await;
+                    DELETE_MODE.store(0, Ordering::SeqCst);
+                    assert_eq!(res.status_code(), 422, "{}", res.text());
+                    let body = res.json::<Value>();
+                    assert_eq!(body["error"], "takedown_failed");
+                    let msg = body["message"].as_str().unwrap();
+                    assert!(
+                        msg.contains("Reconnect the channel under Connections"),
+                        "{msg}"
+                    );
+                    assert_eq!(
+                        get_post(&s, &cookie, p["id"].as_str().unwrap()).await["status"],
+                        "published"
+                    );
+                    // Deleted in YouTube Studio meanwhile: nothing left to take down.
+                    DELETE_MODE.store(1, Ordering::SeqCst);
+                    let res = req(&s, Method::DELETE, &path, &cookie).await;
+                    DELETE_MODE.store(0, Ordering::SeqCst);
+                    res.assert_status_ok();
+                    assert_eq!(res.json::<Value>()["status"], "deleted");
+                }
+            }
+
             /// Meta: the connect flow with its Page picker, publishing to Facebook and
             /// Instagram through the Graph API mock, and take down.
             mod meta_api {
