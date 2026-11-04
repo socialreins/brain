@@ -73,6 +73,9 @@ pub struct Config {
     /// `ADMIN_EMAILS`, comma-separated and normalized: users who may read `/v1/admin/*`.
     /// Empty when unset.
     pub admin_emails: Vec<String>,
+    /// `REVIEW_LOGIN_TOKEN`: turns on `GET /review-login/{token}`, a sign-in to a fixed demo
+    /// account for app-store reviewers (Meta App Review). Unset, the route is a 404.
+    pub review_login_token: Option<String>,
     /// Where post media is stored while a post publishes. `S3_BUCKET`, `S3_ENDPOINT`,
     /// `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` (all or none; `S3_REGION`, default `auto`):
     /// an S3-compatible bucket, path-style (Cloudflare R2, AWS S3, MinIO). Else local disk at
@@ -169,6 +172,7 @@ impl Config {
             turnstile,
             contact_to,
             admin_emails: admin_emails(var("ADMIN_EMAILS"))?,
+            review_login_token: var("REVIEW_LOGIN_TOKEN"),
             media: Media::new(media_store(var)?, false),
             threads: Threads::new(var("THREADS_APP_ID").zip(var("THREADS_APP_SECRET")))?,
             meta: {

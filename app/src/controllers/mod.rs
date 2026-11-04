@@ -18,6 +18,7 @@ pub mod meta_webhook;
 pub mod oauth;
 pub mod passkeys;
 pub mod posts;
+pub mod review_login;
 pub mod social_sets;
 pub mod teams;
 pub mod threads;
@@ -139,6 +140,7 @@ pub fn router(state: AppState, config: &Config) -> Router {
             auth::routes()
                 .merge(auth_api)
                 .merge(google::routes())
+                .merge(review_login::routes())
                 .layer(DefaultBodyLimit::max(MAX_BODY_BYTES)),
         )
         .merge(passkeys::routes().layer(DefaultBodyLimit::max(MAX_PASSKEY_BODY_BYTES)))
