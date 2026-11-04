@@ -6,7 +6,10 @@
 //! sealed for 15 minutes and the browser lands on `?pick=meta`; `/v1/connections/meta/pick`
 //! then lists the choices (ids, names and pictures, never tokens), saves the picked ones, or
 //! drops the pick. Else it lands on `?connected=meta`.
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use axum::{
     extract::{Query, State},
@@ -21,6 +24,7 @@ use sea_orm::{
     QuerySelect, Statement,
 };
 use serde::{Deserialize, Serialize};
+use tokio::{sync::Semaphore, task::JoinSet};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
@@ -35,7 +39,7 @@ use super::{
 use crate::{
     connectors::{
         bluesky::PostError,
-        meta::{IgAccount, Page},
+        meta::{IgAccount, Meta, Page},
     },
     models::social_accounts,
     state::AppState,
@@ -109,8 +113,8 @@ const SUBSCRIBE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Subscribes the Page to the app's webhooks, so its comments and messages (and its Instagram
 /// account's) arrive. Never fails the connect: the reason, when it did not work, is logged and
 /// kept as `meta.webhook_error` on the account.
-async fn subscribe(app: &AppState, page: &Page) -> Option<String> {
-    let call = app.meta.subscribe_page(&page.id, &page.access_token);
+async fn subscribe(meta: &Meta, page: &Page) -> Option<String> {
+    let call = meta.subscribe_page(&page.id, &page.access_token);
     let why = match tokio::time::timeout(SUBSCRIBE_WAIT, call).await {
         Ok(Ok(())) => return None,
         Ok(Err(PostError::Reconnect)) => "Webhook: Meta refused the Page's token, or the \
@@ -158,17 +162,46 @@ pub async fn unsubscribe(app: &AppState, gone: &social_accounts::Model) {
     }
 }
 
+/// Pages subscribed at once, so a login with many Pages does not wait on them one by one.
+const SUBSCRIBE_PARALLEL: usize = 8;
+
+/// Subscribes each distinct Page of `pages` once, in parallel; why not, per Page id, for those
+/// that failed.
+async fn subscribe_pages<'a>(
+    app: &AppState,
+    pages: impl IntoIterator<Item = &'a Page>,
+) -> HashMap<String, String> {
+    let slots = Arc::new(Semaphore::new(SUBSCRIBE_PARALLEL));
+    let mut seen = HashSet::new();
+    let mut calls = JoinSet::new();
+    for page in pages.into_iter().filter(|p| seen.insert(p.id.clone())) {
+        let (meta, page, slots) = (app.meta.clone(), page.clone(), slots.clone());
+        calls.spawn(async move {
+            let _slot = slots.acquire().await;
+            (page.id.clone(), subscribe(&meta, &page).await)
+        });
+    }
+    let mut failed = HashMap::new();
+    while let Some(done) = calls.join_next().await {
+        if let Ok((id, Some(why))) = done {
+            failed.insert(id, why);
+        }
+    }
+    failed
+}
+
 /// Saves `page` as a Facebook account, or with `ig` its Instagram account (on the Page's token,
 /// `meta.page_id` naming the Page); a reconnect takes the new token and profile.
+/// `webhook_error`: why the Page could not be subscribed (`subscribe_pages`), kept in `meta`.
 async fn save(
     app: &AppState,
     (team_id, user_id): (Uuid, Uuid),
     page: &Page,
     ig: Option<&IgAccount>,
+    webhook_error: Option<&String>,
 ) -> Result<Connection, DbErr> {
     let now = Utc::now().fixed_offset();
     let new_id = Uuid::now_v7();
-    let webhook_error = subscribe(app, page).await;
     let (provider, external_id, handle, name, picture, mut meta) = match ig {
         None => (
             "facebook",
@@ -188,7 +221,7 @@ async fn save(
         ),
     };
     if let Some(why) = webhook_error {
-        meta["webhook_error"] = why.into();
+        meta["webhook_error"] = why.as_str().into();
     }
     let row = social_accounts::ActiveModel {
         id: Set(new_id),
@@ -231,15 +264,23 @@ async fn refresh_and_hold(
 ) -> Result<bool, DbErr> {
     let held = held(&app.db, team_id).await?;
     let mut open = false;
+    let connected = pages.iter().filter(|p| {
+        has(&held, "facebook", &p.id)
+            || p.instagram
+                .as_ref()
+                .is_some_and(|ig| has(&held, "instagram", &ig.id))
+    });
+    let unsubscribed = subscribe_pages(app, connected).await;
     for p in pages {
+        let why = unsubscribed.get(&p.id);
         if has(&held, "facebook", &p.id) {
-            save(app, (team_id, user_id), p, None).await?;
+            save(app, (team_id, user_id), p, None, why).await?;
         } else {
             open = true;
         }
         if let Some(ig) = &p.instagram {
             if has(&held, "instagram", &ig.id) {
-                save(app, (team_id, user_id), p, Some(ig)).await?;
+                save(app, (team_id, user_id), p, Some(ig), why).await?;
             } else {
                 open = true;
             }
@@ -420,11 +461,17 @@ async fn pick(
         }
         let who = (t.team.id, t.current.0.id);
         let mut saved = Vec::new();
+        let chosen = body
+            .facebook
+            .iter()
+            .filter_map(page_of)
+            .chain(body.instagram.iter().filter_map(ig_of).map(|(p, _)| p));
+        let unsubscribed = subscribe_pages(&app, chosen).await;
         for p in body.facebook.iter().filter_map(page_of) {
-            saved.push(save(&app, who, p, None).await?);
+            saved.push(save(&app, who, p, None, unsubscribed.get(&p.id)).await?);
         }
         for (p, ig) in body.instagram.iter().filter_map(ig_of) {
-            saved.push(save(&app, who, p, Some(ig)).await?);
+            saved.push(save(&app, who, p, Some(ig), unsubscribed.get(&p.id)).await?);
         }
         drop_pick(&app, &t).await?;
         Ok::<_, DbErr>(Ok(saved))

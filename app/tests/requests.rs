@@ -6440,9 +6440,13 @@ mod teams {
                 }
 
                 fn ig_comment(entry: &str, id: &str, from: &str) -> Value {
+                    ig_comment_as(entry, id, from, "jane")
+                }
+
+                fn ig_comment_as(entry: &str, id: &str, from: &str, username: &str) -> Value {
                     json!({"object": "instagram", "entry": [{"id": entry, "time": now(), "changes": [
                         {"field": "comments", "value": {"id": id, "text": "so nice",
-                            "from": {"id": from, "username": "jane"},
+                            "from": {"id": from, "username": username},
                             "media": {"id": "17900000", "media_product_type": "FEED"}}}]}]})
                 }
 
@@ -6802,12 +6806,12 @@ mod teams {
                     let (s, db, _, _) = on_meta(true).await;
                     clean(&db).await;
                     let (cookie, team_id) = owner_connected(&s, &db).await;
-                    // Page 101 once for its Facebook account and once for Instagram.
+                    // Page 101 once, though its Facebook and Instagram accounts were both saved.
                     let subscribed = calls_since(0)
                         .into_iter()
                         .filter(|(path, _)| path == "101/subscribed_apps")
                         .collect::<Vec<_>>();
-                    assert_eq!(subscribed.len(), 2);
+                    assert_eq!(subscribed.len(), 1);
                     assert_eq!(subscribed[0].1["subscribed_fields"], "feed,messages");
                     let accounts = list(&s, &cookie).await;
                     assert!(accounts.iter().all(|a| a.get("webhook_error").is_none()));
@@ -6822,10 +6826,10 @@ mod teams {
                     assert!(!why.contains("pt102"));
                     let shop = account(&db, &team_id, "facebook", "102").await;
                     assert_eq!(shop.meta["webhook_error"], why);
-                    // A reconnect subscribes every connected Page again (101 twice, 102 refuses).
+                    // A reconnect subscribes every connected Page again (101 once, 102 refuses).
                     let before = calls_since(0).len();
                     connect_meta(&s, &cookie, "good").await;
-                    assert_eq!(calls_since(before).len(), 2);
+                    assert_eq!(calls_since(before).len(), 1);
                     assert!(list(&s, &cookie)
                         .await
                         .iter()
@@ -7060,6 +7064,112 @@ mod teams {
                         .find(|(path, _)| path == "101_9_666/comments")
                         .unwrap();
                     assert_eq!(fallback.1["message"], "Please check your DMs");
+                }
+
+                async fn guide_automation(s: &TestServer, cookie: &str) -> String {
+                    let res = req(s, Method::POST, "/v1/automations", cookie)
+                        .json(&json!({
+                            "name": "Guide by DM", "trigger": "comment_received",
+                            "conditions": {},
+                            "actions": [{"type": "send_dm", "text": "Here is the guide"}],
+                        }))
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    res.json::<Value>()["id"].as_str().unwrap().to_owned()
+                }
+
+                async fn runs_of(s: &TestServer, cookie: &str, auto: &str) -> Vec<Value> {
+                    let res = s
+                        .get(&format!("/v1/automations/{auto}/runs"))
+                        .add_header("cookie", cookie)
+                        .await;
+                    res.assert_status_ok();
+                    res.json::<Value>()["runs"].as_array().unwrap().clone()
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn items_stored_before_a_database_error_still_run_their_automations() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    let auto = guide_automation(&s, &cookie).await;
+                    let when = now() + 5;
+                    // Postgres refuses a NUL in text: the second entry fails once the first
+                    // is stored.
+                    let good = page_comment("101_9_801", "guide please", "777", when);
+                    let bad = page_comment("101_9_802", "guide\u{0}", "888", when);
+                    let both = json!({"object": "page",
+                        "entry": [good["entry"][0].clone(), bad["entry"][0].clone()]});
+                    assert_eq!(deliver(&s, &both).await.status_code(), 500);
+                    let items = stored(&db, &team_id).await;
+                    assert_eq!(items.len(), 1);
+                    assert_eq!(items[0].remote_id, "101_9_801");
+                    // Its automation ran although the delivery failed...
+                    let runs = until(|| async {
+                        let r = runs_of(&s, &cookie, &auto).await;
+                        Some(r).filter(|r| r.len() == 1 && r[0]["status"] != "running")
+                    })
+                    .await;
+                    assert_eq!(runs[0]["status"], "sent", "{}", runs[0]);
+                    // ...and Meta's redelivery, which finds it stored, does not run it again.
+                    assert_eq!(deliver(&s, &both).await.status_code(), 500);
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    assert_eq!(runs_of(&s, &cookie, &auto).await.len(), 1);
+                    let sent = calls_since(0)
+                        .into_iter()
+                        .filter(|(path, _)| path == "101/messages")
+                        .count();
+                    assert_eq!(sent, 1);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn the_accounts_own_instagram_comments_are_skipped_whatever_id_they_carry() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    let auto = guide_automation(&s, &cookie).await;
+                    // Instagram names the commenter by an id that is not the entry's, but
+                    // the username is the account's (case aside).
+                    for (id, username) in [("2001", "cafe"), ("2002", "Cafe")] {
+                        let own = ig_comment_as("1784", id, "17841400000000", username);
+                        assert_eq!(deliver(&s, &own).await.status_code(), 200);
+                    }
+                    assert!(stored(&db, &team_id).await.is_empty());
+
+                    // A reply we sent comes back as a comment of someone unrecognisable; its
+                    // id gives it away.
+                    assert_eq!(
+                        deliver(&s, &ig_comment("1784", "1790", "555"))
+                            .await
+                            .status_code(),
+                        200
+                    );
+                    let first = stored(&db, &team_id).await.remove(0);
+                    let res = req(
+                        &s,
+                        Method::POST,
+                        &format!("/v1/inbox-items/{}/reply", first.id),
+                        &cookie,
+                    )
+                    .json(&json!({"text": "Thanks!"}))
+                    .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let sent = res.json::<Value>()["replies"][0]["remote_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let echo = ig_comment_as("1784", &sent, "17841400000001", "someone_else");
+                    assert_eq!(deliver(&s, &echo).await.status_code(), 200);
+                    assert_eq!(stored(&db, &team_id).await.len(), 1);
+                    // Only the real comment ever ran the automation.
+                    let runs = until(|| async {
+                        let r = runs_of(&s, &cookie, &auto).await;
+                        Some(r).filter(|r| r.iter().all(|run| run["status"] != "running"))
+                    })
+                    .await;
+                    assert!(runs.len() <= 1);
                 }
             }
         }

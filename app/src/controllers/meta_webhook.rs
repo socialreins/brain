@@ -65,14 +65,17 @@ async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -
         tracing::warn!("meta webhook: signed body is not JSON");
         return StatusCode::OK.into_response();
     };
-    match meta_inbox::ingest(&app, &payload).await {
-        Ok(fresh) if fresh.is_empty() => {}
-        Ok(fresh) => {
-            tokio::spawn(async move { meta_inbox::follow_up(&app, fresh).await });
-        }
-        Err(e) => return internal(e, "meta webhook"),
+    let mut fresh = Vec::new();
+    let stored = meta_inbox::ingest(&app, &payload, &mut fresh).await;
+    // Even after an error: a redelivery finds these items stored and would not run them again.
+    if !fresh.is_empty() {
+        let later = app.clone();
+        tokio::spawn(async move { meta_inbox::follow_up(&later, fresh).await });
     }
-    StatusCode::OK.into_response()
+    match stored {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => internal(e, "meta webhook"),
+    }
 }
 
 pub fn routes() -> Router<AppState> {

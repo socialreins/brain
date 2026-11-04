@@ -114,7 +114,10 @@ fn inbox_error(refused: Refused) -> InboxError {
         (Some(4 | 17 | 32 | 613), _) => InboxError::RateLimited,
         // "No matching user", "This person isn't available right now".
         (Some(551), _) | (_, Some(2_018_001)) => InboxError::Invalid("dm_unavailable"),
-        _ if needs_reconnect(&body) => InboxError::MetaReconnect,
+        // Only a bad token asks for a reconnect here: codes 10 and 200 to 299 are also how Meta
+        // words messaging-policy refusals (a second private reply, a blocked recipient), which
+        // a new login would not fix.
+        (Some(190), _) => InboxError::MetaReconnect,
         _ => InboxError::Meta(reason(&body, status)),
     }
 }
@@ -777,7 +780,13 @@ mod tests {
             InboxError::Invalid("dm_unavailable")
         );
         assert_eq!(refused(190, None), InboxError::MetaReconnect);
-        assert_eq!(refused(10, None), InboxError::MetaReconnect);
+        for policy in [10, 200, 230, 299] {
+            assert_eq!(
+                refused(policy, None),
+                InboxError::Meta("nope".into()),
+                "{policy}"
+            );
+        }
         assert_eq!(refused(100, None), InboxError::Meta("nope".into()));
         assert_eq!(
             inbox_error(Refused::Unreachable),

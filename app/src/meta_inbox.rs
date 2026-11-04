@@ -148,20 +148,21 @@ pub fn events(object: &str, entry: &Value) -> Vec<Fresh> {
     out
 }
 
-/// Stores what a signed delivery holds for every connected account it names, in any team; the
-/// accounts and new items, for `follow_up`. Unknown accounts and items already stored are left
-/// out.
-pub async fn ingest(
-    app: &AppState,
-    payload: &Value,
-) -> Result<Vec<(social_accounts::Model, inbox_items::Model)>, DbErr> {
+/// What `ingest` stored, for `follow_up`.
+pub type Stored = Vec<(social_accounts::Model, inbox_items::Model)>;
+
+/// Stores what a signed delivery holds for every connected account it names, in any team, and
+/// pushes the accounts and new items to `fresh` for `follow_up`. Unknown accounts, items already
+/// stored and the account's own comments are left out. On an error `fresh` still holds what was
+/// stored before it: a redelivery finds those items already there, so their follow-up (and
+/// automations) must run now.
+pub async fn ingest(app: &AppState, payload: &Value, fresh: &mut Stored) -> Result<(), DbErr> {
     let object = payload["object"].as_str().unwrap_or_default();
     let provider = match object {
         "page" => "facebook",
         "instagram" => "instagram",
-        _ => return Ok(Vec::new()),
+        _ => return Ok(()),
     };
-    let mut fresh = Vec::new();
     for entry in payload["entry"].as_array().into_iter().flatten() {
         let Some(id) = sid(&entry["id"]) else {
             continue;
@@ -177,13 +178,45 @@ pub async fn ingest(
             .await?;
         for account in accounts {
             for event in &found {
+                if is_ours(app, &account, event).await? {
+                    continue;
+                }
                 if let Some(item) = inbox::store(&app.db, &account, event.clone()).await? {
                     fresh.push((account.clone(), item));
                 }
             }
         }
     }
-    Ok(fresh)
+    Ok(())
+}
+
+/// Whether a comment is one the account itself wrote. Instagram may name the commenter by an
+/// id other than the entry's, so the username is compared with the account's handle too, and
+/// the ids of replies we sent are remembered.
+async fn is_ours(
+    app: &AppState,
+    account: &social_accounts::Model,
+    event: &Fresh,
+) -> Result<bool, DbErr> {
+    if event.kind != "comment" {
+        return Ok(false);
+    }
+    let named = account
+        .handle
+        .as_deref()
+        .zip(event.author.handle.as_deref());
+    if named.is_some_and(|(mine, theirs)| mine.eq_ignore_ascii_case(theirs)) {
+        return Ok(true);
+    }
+    let stmt = sql(
+        "SELECT EXISTS (SELECT 1 FROM inbox_replies r JOIN inbox_items i ON i.id = r.inbox_item_id \
+         WHERE i.social_account_id = $1 AND r.remote_id = $2) AS ok",
+        vec![account.id.into(), event.remote_id.clone().into()],
+    );
+    match app.db.query_one_raw(stmt).await? {
+        Some(r) => r.try_get("", "ok"),
+        None => Ok(false),
+    }
 }
 
 fn sql(sql: &str, values: Vec<sea_orm::Value>) -> Statement {
