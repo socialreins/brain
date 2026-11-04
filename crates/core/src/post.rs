@@ -19,6 +19,10 @@ pub const FACEBOOK_MAX_MEDIA: usize = 10;
 /// Instagram: a 2200-character caption on 1 to 10 images or videos (a carousel).
 pub const INSTAGRAM_MAX_CHARS: usize = 2200;
 pub const INSTAGRAM_MAX_MEDIA: usize = 10;
+/// YouTube: one video; its title is the body's first line (100 characters), its description the
+/// rest (5000 bytes). YouTube refuses `<` and `>` in either.
+pub const YOUTUBE_MAX_TITLE: usize = 100;
+pub const YOUTUBE_MAX_DESCRIPTION: usize = 5000;
 /// Follow-up parts a thread may have after its first post.
 pub const MAX_THREAD_PARTS: usize = 25;
 const MAX_URL_LEN: usize = 2048;
@@ -34,8 +38,10 @@ pub enum Invalid {
     TooManyParts,
     /// The platform's publisher cannot post threads yet.
     ThreadUnsupported,
-    /// Instagram posts need an image or a video.
+    /// Instagram posts need an image or a video; YouTube posts need a video.
     MediaRequired,
+    /// YouTube refuses `<` and `>` in a title or description.
+    InvalidText,
 }
 
 impl Invalid {
@@ -49,6 +55,7 @@ impl Invalid {
             Self::TooManyParts => "too_many_parts",
             Self::ThreadUnsupported => "thread_not_supported",
             Self::MediaRequired => "media_required",
+            Self::InvalidText => "invalid_text",
         }
     }
 }
@@ -65,8 +72,15 @@ pub fn https_url(url: &str) -> bool {
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-/// Checks a post for `platform` (`bluesky`, `threads`, `linkedin`, `facebook` or `instagram`, the ones
-/// that publish today).
+/// A YouTube post's `(title, description)`: the body's first line, and the rest, both trimmed.
+pub fn youtube_text(body: &str) -> (&str, &str) {
+    let body = body.trim();
+    let (title, rest) = body.split_once('\n').unwrap_or((body, ""));
+    (title.trim(), rest.trim())
+}
+
+/// Checks a post for `platform` (`bluesky`, `threads`, `linkedin`, `facebook`, `instagram` or
+/// `youtube`, the ones that publish today).
 pub fn validate(platform: &str, body: &str, media: &[String]) -> Result<(), Invalid> {
     let chars = || body.chars().count();
     let (too_long, max_media) = match platform {
@@ -80,13 +94,23 @@ pub fn validate(platform: &str, body: &str, media: &[String]) -> Result<(), Inva
         "linkedin" => (chars() > LINKEDIN_MAX_CHARS, LINKEDIN_MAX_MEDIA),
         "facebook" => (chars() > FACEBOOK_MAX_CHARS, FACEBOOK_MAX_MEDIA),
         "instagram" => (chars() > INSTAGRAM_MAX_CHARS, INSTAGRAM_MAX_MEDIA),
+        "youtube" => {
+            let (title, description) = youtube_text(body);
+            let too_long = title.chars().count() > YOUTUBE_MAX_TITLE
+                || description.len() > YOUTUBE_MAX_DESCRIPTION;
+            (too_long, 1)
+        }
         _ => return Err(Invalid::UnsupportedPlatform),
     };
-    if body.trim().is_empty() && media.is_empty() {
+    // A video needs a title, so a YouTube post needs a body even with its video.
+    if body.trim().is_empty() && (media.is_empty() || platform == "youtube") {
         return Err(Invalid::Empty);
     }
-    if platform == "instagram" && media.is_empty() {
+    if matches!(platform, "instagram" | "youtube") && media.is_empty() {
         return Err(Invalid::MediaRequired);
+    }
+    if platform == "youtube" && body.contains(['<', '>']) {
+        return Err(Invalid::InvalidText);
     }
     if too_long {
         return Err(Invalid::TooLong);
@@ -252,6 +276,58 @@ mod tests {
         );
         assert_eq!(
             validate_thread("linkedin", &[("two", &media(0)[..])]),
+            Err((Invalid::ThreadUnsupported, None))
+        );
+    }
+
+    #[test]
+    fn youtube_takes_one_video_titled_by_the_first_line() {
+        let video = |n: usize| vec!["https://a.example/1.mp4".to_owned(); n];
+        assert_eq!(
+            youtube_text("  Title \n\n rest\nmore \n"),
+            ("Title", "rest\nmore")
+        );
+        assert_eq!(youtube_text("Only a title"), ("Only a title", ""));
+        assert_eq!(validate("youtube", "Title\nabout it", &video(1)), Ok(()));
+        // One video, and a body to title it.
+        assert_eq!(
+            validate("youtube", "Title", &[]),
+            Err(Invalid::MediaRequired)
+        );
+        assert_eq!(
+            validate("youtube", "Title", &video(2)),
+            Err(Invalid::TooManyImages)
+        );
+        assert_eq!(validate("youtube", "  \n ", &video(1)), Err(Invalid::Empty));
+        assert_eq!(validate("youtube", "", &[]), Err(Invalid::Empty));
+        // 100 characters of title, 5000 bytes of description.
+        let title = |n: usize| "é".repeat(n);
+        assert_eq!(validate("youtube", &title(100), &video(1)), Ok(()));
+        assert_eq!(
+            validate("youtube", &title(101), &video(1)),
+            Err(Invalid::TooLong)
+        );
+        let body = |n: usize| format!("T\n{}", "a".repeat(n));
+        assert_eq!(validate("youtube", &body(5000), &video(1)), Ok(()));
+        assert_eq!(
+            validate("youtube", &body(5001), &video(1)),
+            Err(Invalid::TooLong)
+        );
+        let bytes = format!("T\n{}", "é".repeat(2501));
+        assert_eq!(
+            validate("youtube", &bytes, &video(1)),
+            Err(Invalid::TooLong)
+        );
+        assert_eq!(
+            validate("youtube", "a <b>", &video(1)),
+            Err(Invalid::InvalidText)
+        );
+        assert_eq!(
+            validate("youtube", "T\n1 > 0", &video(1)),
+            Err(Invalid::InvalidText)
+        );
+        assert_eq!(
+            validate_thread("youtube", &[("two", &video(0)[..])]),
             Err((Invalid::ThreadUnsupported, None))
         );
     }

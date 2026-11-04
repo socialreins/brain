@@ -66,6 +66,8 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/connect/threads/callback` | Where Threads sends the browser back (register `{BRAIN_URL}/connect/threads/callback` in the Threads app); lands on `{WEB_URL}/app/connections?connected=threads` or `?connect_error=<code>&provider=threads` |
 | GET | `/connections/linkedin/redirect` | Like the Threads one: sends the browser to LinkedIn (scopes `openid profile email w_member_social`) to connect a member's profile |
 | GET | `/connect/linkedin/callback` | Where LinkedIn sends the browser back (register `{BRAIN_URL}/connect/linkedin/callback` in the LinkedIn app); lands on `{WEB_URL}/app/connections?connected=linkedin` or `?connect_error=<code>&provider=linkedin` |
+| GET | `/connections/youtube/redirect` | Like the Threads one: sends the browser to Google (scopes `youtube.upload`, `youtube.readonly`, `youtube.force-ssl`; `access_type=offline`, `prompt=consent`, `include_granted_scopes=false`) to connect a YouTube channel |
+| GET | `/connect/youtube/callback` | Where Google sends the browser back (register `{BRAIN_URL}/connect/youtube/callback` in the Google OAuth client, besides the sign-in one); lands on `{WEB_URL}/app/connections?connected=youtube` or `?connect_error=<code>&provider=youtube` |
 | GET | `/connections/meta/redirect` | Like the Threads one: sends the browser to Facebook Login for Pages and their linked Instagram accounts |
 | GET, POST | `/webhooks/meta` | Meta's webhook (register `{BRAIN_URL}/webhooks/meta` in the Meta app). `GET` is the subscribe handshake: `hub.mode=subscribe` and a `hub.verify_token` equal to `META_WEBHOOK_VERIFY_TOKEN` get `hub.challenge` back as plain text, else `403`; `404` while the variable is unset. `POST` needs `X-Hub-Signature-256` (HMAC-SHA256 of the raw body under `META_APP_SECRET`, `403` otherwise, `404` without the secret), takes at most 256 KiB, and answers `200` once the items are stored |
 | GET | `/connect/meta/callback` | Where Meta sends the browser back (register `{BRAIN_URL}/connect/meta/callback` in the Meta app); lands on `{WEB_URL}/app/connections?pick=meta` when there is something to pick, `?connected=meta` when not, or `?connect_error=<code>&provider=meta` |
@@ -184,8 +186,8 @@ images of at most 1 MB from public https URLs, links become facets) and Threads 
 characters, up to 20 JPEG or PNG images or MP4 or MOV videos as a carousel), LinkedIn (3000
 characters, up to 20 JPEG, PNG or GIF images or one MP4 video, no threads), Facebook (63206
 characters, up to 10 JPEG, PNG or GIF images or one MP4 or MOV video) and Instagram (2200
-characters, 1 to 10 JPEG images or MP4 or MOV videos, `media_required` without one) publish
-today.
+characters, 1 to 10 JPEG images or MP4 or MOV videos, `media_required` without one) and YouTube
+(one MP4 or MOV video, a title and a description, no threads) publish today.
 Saving with `scheduled_at` makes a post `scheduled`, else `draft`; only those two can change.
 A tick every minute claims due posts (one instance at a time, advisory lock), creates one
 target per account and claims each target once, so nothing posts twice; a publish is never
@@ -265,6 +267,42 @@ per part, finalize, poll until `AVAILABLE`). The text is escaped for LinkedIn's 
 permalink is `https://www.linkedin.com/feed/update/{urn}`. A takedown is `DELETE
 /rest/posts/{encoded urn}`. brain uploads the stored bytes itself, so LinkedIn needs no public
 media link. Documents (PDF) and a first comment are not built yet.
+
+YouTube (when `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are set, the same Google client as
+sign-in) connects one channel per consent through the same OAuth checks as Threads, with its own
+redirect URI `{BRAIN_URL}/connect/youtube/callback`, state and cookie (`sr_youtube`, scoped to
+`/connect/youtube`), so it never signs anyone in. Add the three YouTube scopes to the OAuth
+consent screen and enable the YouTube Data API v3 in the Google Cloud project. The callback swaps
+the code at `oauth2.googleapis.com/token`, needs the refresh token `prompt=consent` brings, reads
+`GET /youtube/v3/channels?part=snippet&mine=true` (id, title, `@handle`, thumbnail) and saves a
+`youtube` account (`external_id` is the channel id) in the team's Default set. A Google account
+with several channels or brand accounts connects the one the consent picked; connect again for
+another. Error codes `youtube_failed`, `no_channel` (the Google account has no channel) and
+`missing_scopes` (granular consent: the token Google returned lacks one of the three scopes, so
+nothing is saved) besides the Threads ones. The access token lasts an hour and is stored with its expiry; the
+refresh token is sealed in the account's `meta`. Before each publish or take down, a token with
+under two minutes left is renewed and saved first (there is no daily job). A refused refresh
+token (revoked access) or a refused call (`401`, `insufficientPermissions`) fails the target with
+"Reconnect the channel under Connections".
+
+A YouTube post is one MP4 or MOV video (no threads; `media_required` without one,
+`too_many_images` with several). The first line of the body is the title (at most 100
+characters, required: `empty_post` without one) and the rest the description (at most 5000
+bytes); `too_long` over either, and `invalid_text` for a `<` or `>`, which YouTube refuses. Shorts
+are just vertical videos up to three minutes, so there is no separate call. brain downloads the
+video into its storage (100 MB at most) and uploads the bytes itself: `POST
+/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status` with the metadata
+(`privacyStatus` `public`, `selfDeclaredMadeForKids` `false`), then one `PUT` of the bytes to the
+session URL from the `Location` header. brain sends the token only to a session URL that is https
+on `googleapis.com`. The video id is saved the moment YouTube answers, before anything else; the
+permalink is `https://www.youtube.com/watch?v={id}`; nothing is retried or resumed. Privacy is
+always `public`: the post model has no place for per-post platform options. Until Google audits
+the API project, YouTube locks every upload from it to private whatever is asked, so the video
+shows up private in YouTube Studio; apply for the audit before relying on it. A video upload costs
+1,600 of the project's 10,000 daily quota units, shared by every team on the install, so about six
+a day; when Google answers `quotaExceeded` the target fails with a message saying so. A takedown
+is `DELETE /youtube/v3/videos?id={id}` (a video already gone counts as down; a channel connected
+before `youtube.force-ssl` was requested must reconnect).
 
 Meta (when `META_APP_ID` and `META_APP_SECRET` are set) connects Facebook Pages and the
 Instagram professional accounts linked to them with one Facebook Login, through the same OAuth
@@ -392,7 +430,7 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET` | no | Both to connect LinkedIn profiles (redirect URI `{BRAIN_URL}/connect/linkedin/callback`). Publishing with connected accounts needs neither |
 | `X_CLIENT_ID`, `X_CLIENT_SECRET` | no | Offer X (connector not built yet) |
 | `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET` | no | Offer TikTok (connector not built yet) |
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | no | Both or neither. Turn on Google sign-in (OAuth client of type Web application, redirect URI `{BRAIN_URL}/auth/google/callback`); YouTube will use them too |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | no | Both or neither. Turn on Google sign-in (OAuth client of type Web application, redirect URI `{BRAIN_URL}/auth/google/callback`). They also turn on connecting YouTube channels (add the redirect URI `{BRAIN_URL}/connect/youtube/callback` to the same client) |
 | `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | no | Both or neither. Turn on a Cloudflare Turnstile captcha: `POST /auth/link` and `/v1/contact` then need a `turnstile_token`. Off when unset |
 | `ADMIN_EMAILS` | no | Comma-separated emails, any case, whose signed-in users may read `GET /v1/admin/waitlist` (and get `is_admin: true` from `/auth/me`). None when unset |
 | `REVIEW_LOGIN_TOKEN` | no | Turns on `GET /review-login/{token}`, a sign-in to a demo account for Meta App Review. Unset (the default) the route is a `404`. Remove it after the review: see [App Review login](#app-review-login) |
