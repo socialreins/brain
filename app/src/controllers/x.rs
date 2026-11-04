@@ -38,8 +38,9 @@ use crate::{
 };
 
 const PROVIDER: &str = "x";
-/// An access token with less than this left is renewed before a call.
-const RENEW_WITHIN: Duration = Duration::minutes(2);
+/// An access token with less than this left is renewed before a call. One post can take up to
+/// 7 minutes (`PUBLISH_TIMEOUT`), so this leaves room for it.
+const RENEW_WITHIN: Duration = Duration::minutes(15);
 /// The job renews tokens with less than this left, so a publish finds a fresh one.
 const JOB_RENEW_WITHIN: Duration = Duration::minutes(30);
 /// Advisory lock key held by the instance running the renewal job.
@@ -184,26 +185,15 @@ fn db_failed(e: DbErr) -> PostError {
     PostError::Failed("The X token could not be renewed. Try again.".into())
 }
 
-/// The access token to call X with: the stored one, or, when it ends within two minutes (or has
+/// The access token to call X with: the stored one, or, when it ends within 15 minutes (or has
 /// no end recorded), a new one (see `renew`). An account flagged `reconnect`, or one X refuses
-/// to renew, is `Reconnect`.
+/// to renew, is `Reconnect`. It always reads the row under its lock rather than trusting
+/// `account`, which may be older than a renewal: a thread or a take down calls this again
+/// before each part, so a long run never reuses a token that ran out.
 pub async fn fresh_token(
     app: &AppState,
     account: &social_accounts::Model,
 ) -> Result<String, PostError> {
-    if account.meta["reconnect"].as_bool() == Some(true) {
-        return Err(PostError::Reconnect);
-    }
-    let live = account
-        .token_expires_at
-        .is_some_and(|t| t > Utc::now() + RENEW_WITHIN);
-    let stored = app
-        .cipher
-        .decrypt(&account.access_token)
-        .and_then(|b| String::from_utf8(b).ok());
-    if let (true, Some(token)) = (live, stored) {
-        return Ok(token);
-    }
     renew(app, account.id, RENEW_WITHIN).await.map(|r| r.0)
 }
 

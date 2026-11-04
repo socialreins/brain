@@ -7314,9 +7314,44 @@ mod teams {
                     /// 0 deletes, 1 answers 404, 2 answers 429.
                     delete_mode: AtomicU64,
                     next: AtomicU64,
+                    /// Access tokens X no longer accepts.
+                    revoked: Mutex<Vec<String>>,
+                    /// Simulated time passing: after this many more successful tweets or
+                    /// deletes, the account's token has a minute left and the bearer that just
+                    /// succeeded is no longer accepted.
+                    clock: Mutex<Option<(DatabaseConnection, uuid::Uuid, usize)>>,
                 }
 
                 type Shared = State<Arc<Mock>>;
+
+                /// Whether `who` may still call: not revoked.
+                fn accepted(m: &Mock, who: &str) -> bool {
+                    !m.revoked.lock().unwrap().iter().any(|t| t == who)
+                }
+
+                /// Counts one success against the clock; when it runs out, time "passes".
+                async fn tick(m: &Mock, who: &str) {
+                    let due = {
+                        let mut clock = m.clock.lock().unwrap();
+                        match clock.as_mut() {
+                            Some((_, _, left)) if *left > 1 => {
+                                *left -= 1;
+                                None
+                            }
+                            Some(_) => clock.take(),
+                            None => None,
+                        }
+                    };
+                    if let Some((db, account, _)) = due {
+                        m.revoked.lock().unwrap().push(who.to_owned());
+                        db.execute_unprepared(&format!(
+                            "UPDATE social_accounts SET token_expires_at = now() + \
+                             interval '1 minute' WHERE id = '{account}'"
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                }
 
                 fn bearer(h: &HeaderMap) -> Option<String> {
                     let v = h.get("authorization")?.to_str().ok()?;
@@ -7473,7 +7508,7 @@ mod teams {
                 }
 
                 async fn tweet(State(m): Shared, h: HeaderMap, Json(b): Json<Value>) -> Response {
-                    let Some(who) = bearer(&h) else {
+                    let Some(who) = bearer(&h).filter(|w| accepted(&m, w)) else {
                         return dead();
                     };
                     m.attempts.fetch_add(1, Ordering::SeqCst);
@@ -7506,7 +7541,8 @@ mod teams {
                     }
                     let id = (1_800_000_000_000_000_000u64 + m.next.fetch_add(1, Ordering::SeqCst))
                         .to_string();
-                    m.tweets.lock().unwrap().push((who, b));
+                    m.tweets.lock().unwrap().push((who.clone(), b));
+                    tick(&m, &who).await;
                     let body = json!({"data": {"id": id, "text": text}});
                     (StatusCode::CREATED, Json(body)).into_response()
                 }
@@ -7516,9 +7552,9 @@ mod teams {
                     Path(id): Path<String>,
                     h: HeaderMap,
                 ) -> Response {
-                    if bearer(&h).is_none() {
+                    let Some(who) = bearer(&h).filter(|w| accepted(&m, w)) else {
                         return dead();
-                    }
+                    };
                     match m.delete_mode.load(Ordering::SeqCst) {
                         1 => (StatusCode::NOT_FOUND, Json(json!({"title": "Not Found"})))
                             .into_response(),
@@ -7529,6 +7565,7 @@ mod teams {
                         }
                         _ => {
                             m.removed.lock().unwrap().push(id);
+                            tick(&m, &who).await;
                             Json(json!({"data": {"deleted": true}})).into_response()
                         }
                     }
@@ -8065,6 +8102,57 @@ mod teams {
                     assert_eq!(body["targets"][0]["parts"], json!([]));
                     let removed = mock.removed.lock().unwrap().clone();
                     assert_eq!(removed[removed.len() - 3..], [second, first, root]);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_token_that_runs_out_during_a_thread_is_renewed_before_the_next_part() {
+                    let (s, db, state, _, mock, cookie, team_id, set) = team().await;
+                    let account = x_account(&db, &team_id).await;
+                    // 20 minutes left: no renewal at the start. After the first tweet time
+                    // "passes": the token has a minute left and X no longer takes it.
+                    set_token(&db, account.id, "xtok", 20 * 60).await;
+                    *mock.clock.lock().unwrap() = Some((db.clone(), account.id, 1));
+                    let body = thread(&set, "one", &["two", "three"]);
+                    let id = id_of(&create(&s, &cookie, body).await);
+                    let before = mock.tweets.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let t = &p["targets"][0];
+                    assert_eq!(t["status"], "published", "{t}");
+                    assert_eq!(t["parts"].as_array().unwrap().len(), 2);
+                    assert_eq!(mock.refreshes.load(Ordering::SeqCst), 1, "renewed once");
+                    let sent: Vec<String> = mock.tweets.lock().unwrap()[before..]
+                        .iter()
+                        .map(|t| t.0.clone())
+                        .collect();
+                    assert_eq!(sent.len(), 3);
+                    assert_eq!(sent[0], "xtok");
+                    let row = x_account(&db, &team_id).await;
+                    assert_eq!(sent[1], access_of(&row), "part two used the renewed token");
+                    assert_eq!(sent[2], sent[1]);
+                    assert!(row.meta.get("reconnect").is_none());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_take_down_renews_the_token_between_deletes() {
+                    let (s, db, state, _, mock, cookie, team_id, set) = team().await;
+                    let id =
+                        id_of(&create(&s, &cookie, thread(&set, "one", &["two", "three"])).await);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                    // Time passes after the first delete.
+                    let account = x_account(&db, &team_id).await;
+                    set_token(&db, account.id, "xtok", 20 * 60).await;
+                    *mock.clock.lock().unwrap() = Some((db.clone(), account.id, 1));
+                    let removed = mock.removed.lock().unwrap().len();
+                    let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                    res.assert_status_ok();
+                    assert_eq!(res.json::<Value>()["status"], "deleted");
+                    assert_eq!(mock.removed.lock().unwrap().len(), removed + 3);
+                    assert_eq!(mock.refreshes.load(Ordering::SeqCst), 1);
                 }
 
                 #[tokio::test]

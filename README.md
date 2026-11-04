@@ -322,8 +322,9 @@ An access token lasts two hours and is stored with its expiry; the refresh token
 account's `meta`. X refresh tokens are single use, so renewing locks the account row
 (`SELECT ... FOR UPDATE`) and saves the new access and refresh token in the same transaction: two
 publishes renewing at once call X once and both use the result. A response without a new refresh
-token keeps the current one. Before each publish or take down a token with under two minutes left
-is renewed, and a job every 15 minutes (one instance at a time, advisory lock) renews tokens with
+token keeps the current one. A token with under 15 minutes left is renewed before a publish, before
+each part of a thread and before each delete of a take down (a post can take minutes, so a long
+run never reuses a token that ran out), and a job every 15 minutes (one instance at a time, advisory lock) renews tokens with
 30 minutes or less left. A refresh X refuses (revoked access, a spent token) sets `meta.reconnect`;
 the account then fails every publish with "Reconnect the account under Connections" without
 calling X, `GET /v1/connections` shows `reconnect: true`, and connecting it again clears the flag.

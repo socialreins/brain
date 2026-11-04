@@ -1124,6 +1124,23 @@ async fn publish_target(
     // Each part right after the platform takes it, so its parent is always saved before it.
     let mut parent = root.clone();
     for (i, part) in thread.iter().enumerate() {
+        // A thread can outlast the token it started with: fetch the credential again before
+        // each part (renewed when near its end, through the locked path).
+        let secret = match credential(app, &account).await {
+            Ok(secret) => secret,
+            Err(e) => {
+                let why = match e {
+                    PublishError::Reconnect => publisher.reconnect().to_owned(),
+                    PublishError::Failed(msg) => msg,
+                };
+                let msg = format!(
+                    "Thread post {} of {}: {why} The posts before it are up.",
+                    i + 1,
+                    thread.len()
+                );
+                return fail_target(db, id, &msg).await;
+            }
+        };
         let content = (part.body.as_str(), part.media.as_slice());
         let made = match send(
             with,
@@ -1275,7 +1292,9 @@ pub async fn takedown(app: &AppState, post: &posts::Model) -> Result<Vec<String>
                 continue;
             }
         };
-        let (Some(publisher), Some(secret), Some(root)) = (
+        // The credential above only tells early that the account needs a reconnect; each
+        // delete fetches its own (`delete_one`).
+        let (Some(publisher), Some(_), Some(root)) = (
             publisher(app, &post.platform),
             secret,
             t.remote_id.as_deref(),
@@ -1290,7 +1309,7 @@ pub async fn takedown(app: &AppState, post: &posts::Model) -> Result<Vec<String>
         let mut problem = None;
         for (i, part) in parts.iter().enumerate().rev() {
             let remote_id = part["remote_id"].as_str().unwrap_or_default();
-            problem = delete_one(publisher, &account, &secret, remote_id, &name).await;
+            problem = delete_one(app, publisher, &account, remote_id, &name).await;
             if problem.is_some() {
                 break;
             }
@@ -1302,7 +1321,7 @@ pub async fn takedown(app: &AppState, post: &posts::Model) -> Result<Vec<String>
             db.execute_raw(stmt).await?;
         }
         if problem.is_none() {
-            problem = delete_one(publisher, &account, &secret, root, &name).await;
+            problem = delete_one(app, publisher, &account, root, &name).await;
         }
         match problem {
             Some(p) => problems.push(p),
@@ -1331,17 +1350,45 @@ pub async fn takedown(app: &AppState, post: &posts::Model) -> Result<Vec<String>
     Ok(problems)
 }
 
-/// Deletes one post on the platform; `Some` says what to tell the user when it stayed up.
+/// Deletes one post on the platform; `Some` says what to tell the user when it stayed up. The
+/// credential is fetched again for each call (renewed when near its end, through the locked
+/// path), since a thread's take down can outlast the token it started with.
 async fn delete_one(
+    app_state: &AppState,
     publisher: &dyn Publisher,
     account: &social_accounts::Model,
-    secret: &str,
     remote_id: &str,
     name: &str,
 ) -> Option<String> {
     let app = publisher.name();
-    let done =
-        tokio::time::timeout(TARGET_TIMEOUT, publisher.delete(account, secret, remote_id)).await;
+    // The row as it is now: an earlier call of this take down may have renewed the token.
+    let account = match social_accounts::Entity::find_by_id(account.id)
+        .one(&app_state.db)
+        .await
+    {
+        Ok(Some(fresh)) => fresh,
+        _ => account.clone(),
+    };
+    let account = &account;
+    let secret = match credential(app_state, account).await {
+        Ok(secret) => secret,
+        Err(PublishError::Reconnect) => {
+            return Some(format!(
+                "{name}: {} Or delete the post in the {app} app.",
+                publisher.reconnect()
+            ))
+        }
+        Err(PublishError::Failed(msg)) => {
+            return Some(format!(
+                "{name}: {msg} Delete the post in the {app} app if it is still up."
+            ))
+        }
+    };
+    let done = tokio::time::timeout(
+        TARGET_TIMEOUT,
+        publisher.delete(account, &secret, remote_id),
+    )
+    .await;
     match done {
         Ok(Ok(())) => None,
         Ok(Err(PublishError::Reconnect)) => Some(format!(
