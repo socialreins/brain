@@ -18,6 +18,7 @@ pub mod meta_webhook;
 pub mod oauth;
 pub mod passkeys;
 pub mod posts;
+pub mod review_login;
 pub mod social_sets;
 pub mod teams;
 pub mod threads;
@@ -88,21 +89,27 @@ fn api() -> OpenApiRouter<AppState> {
 }
 
 /// The request span. Logs the path only (no query), with the token in `/auth/magic/{token}`,
-/// `/v1/invitations/{token}` and `/media/{name}` replaced, so a sign-in, invitation or media
-/// link never reaches the log.
+/// `/v1/invitations/{token}`, `/review-login/{token}` and `/media/{name}` replaced, so a
+/// sign-in, invitation, review login or media link never reaches the log.
 /// Headers are not logged, so neither is an API token's `Authorization` header.
 fn span(req: &axum::http::Request<axum::body::Body>) -> tracing::Span {
-    let path = req.uri().path();
-    let path = if path.starts_with("/auth/magic/") {
+    let path = logged_path(req.uri().path());
+    tracing::debug_span!("request", method = %req.method(), path)
+}
+
+/// `path` with the secret segment of token-bearing routes replaced.
+fn logged_path(path: &str) -> &str {
+    if path.starts_with("/auth/magic/") {
         "/auth/magic/{token}"
     } else if path.starts_with("/v1/invitations/") {
         "/v1/invitations/{token}"
+    } else if path.starts_with("/review-login/") {
+        "/review-login/{token}"
     } else if path.starts_with("/media/") {
         "/media/{name}"
     } else {
         path
-    };
-    tracing::debug_span!("request", method = %req.method(), path)
+    }
 }
 
 pub fn router(state: AppState, config: &Config) -> Router {
@@ -139,6 +146,7 @@ pub fn router(state: AppState, config: &Config) -> Router {
             auth::routes()
                 .merge(auth_api)
                 .merge(google::routes())
+                .merge(review_login::routes())
                 .layer(DefaultBodyLimit::max(MAX_BODY_BYTES)),
         )
         .merge(passkeys::routes().layer(DefaultBodyLimit::max(MAX_PASSKEY_BODY_BYTES)))
@@ -160,4 +168,22 @@ pub fn router(state: AppState, config: &Config) -> Router {
         .layer(cors)
         .layer(TraceLayer::new_for_http().make_span_with(span))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::logged_path;
+
+    #[test]
+    fn secret_path_segments_never_reach_the_log() {
+        for (path, logged) in [
+            ("/auth/magic/abc123", "/auth/magic/{token}"),
+            ("/v1/invitations/abc123", "/v1/invitations/{token}"),
+            ("/review-login/abc123", "/review-login/{token}"),
+            ("/media/abc123.png", "/media/{name}"),
+            ("/auth/me", "/auth/me"),
+        ] {
+            assert_eq!(logged_path(path), logged);
+        }
+    }
 }
