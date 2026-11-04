@@ -33,7 +33,7 @@ cargo run -p socialreins-brain
   session cookie only.
 - `app/src/media.rs`: post media. Publishing downloads each URL (Drive share links rewritten)
   once into local disk (`MEDIA_DIR`) or an S3-compatible bucket (`S3_*`, `config.rs`), saved in
-  `post_media`, and the publisher reads the stored bytes (LinkedIn and YouTube upload them themselves), or (Threads, Facebook and Instagram,
+  `post_media`, and the publisher reads the stored bytes (LinkedIn, YouTube and X upload them themselves), or (Threads, Facebook and Instagram,
   which download media themselves) gets an unguessable `/media/` link to them (`media::link`, `controllers/media.rs`). Every download goes through
   `PublicOnly`. Files go once the post settles or is deleted, and the hourly sweep deletes the
   rest after 7 days; a storage error is only logged. Cleanup lists `posts/<post id>/` in the

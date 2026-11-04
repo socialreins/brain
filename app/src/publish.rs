@@ -27,6 +27,7 @@ use crate::{
         linkedin::{self, LinkedIn},
         meta::{self, Facebook, Instagram},
         threads::{self, Threads},
+        x::{self, X},
         youtube::{self, YouTube},
     },
     controllers::posts::ThreadPart,
@@ -294,6 +295,70 @@ impl Publisher for LinkedIn {
 }
 
 #[async_trait]
+impl Publisher for X {
+    /// Text with up to four images, or one GIF, or one video; a thread part is a reply to the
+    /// part before it (`reply`'s parent). `secret` is already renewed (`credential`). The
+    /// tweet id is returned the moment X has it, and the caller saves it first.
+    async fn publish(
+        &self,
+        _: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        reply: Option<(&Remote, &Remote)>,
+    ) -> Result<Remote, PublishError> {
+        let mut files = Vec::new();
+        for (i, a) in media.iter().enumerate() {
+            let t = a.content_type.as_str();
+            let known =
+                x::IMAGE_TYPES.contains(&t) || t == x::GIF_TYPE || x::VIDEO_TYPES.contains(&t);
+            if !known {
+                let n = i + 1;
+                return Err(PublishError::Failed(format!(
+                    "Image {n} is not a JPEG, PNG, WebP or GIF image or an MP4 or MOV video."
+                )));
+            }
+            files.push(x::File {
+                bytes: &a.bytes,
+                content_type: t,
+            });
+        }
+        let parent = reply.map(|(p, _)| p.id.as_str());
+        let id = self.publish_post(secret, body, &files, parent).await?;
+        Ok(Remote {
+            id,
+            cid: String::new(),
+            url: None,
+        })
+    }
+
+    async fn delete(
+        &self,
+        _: &social_accounts::Model,
+        secret: &str,
+        remote_id: &str,
+    ) -> Result<(), PublishError> {
+        self.delete_post(secret, remote_id).await
+    }
+
+    fn url(&self, account: &social_accounts::Model, remote_id: &str) -> Option<String> {
+        Some(x::status_url(account.handle.as_deref(), remote_id))
+    }
+
+    fn name(&self) -> &'static str {
+        "X"
+    }
+
+    fn reconnect(&self) -> &'static str {
+        X_RECONNECT
+    }
+
+    fn timeout(&self) -> Duration {
+        x::PUBLISH_TIMEOUT
+    }
+}
+
+#[async_trait]
 impl Publisher for YouTube {
     /// One MP4 or MOV video, titled by the first line of the body. `secret` is already renewed
     /// (`credential`). The video id is returned the moment YouTube has the bytes, and the caller
@@ -470,6 +535,7 @@ pub fn publisher<'a>(app: &'a AppState, platform: &str) -> Option<&'a dyn Publis
         "threads" => Some(&app.threads),
         "linkedin" => Some(&app.linkedin),
         "youtube" => Some(&app.youtube),
+        "x" => Some(&app.x),
         "facebook" => Some(&app.facebook),
         "instagram" => Some(&app.instagram),
         _ => None,
@@ -506,19 +572,25 @@ pub const LINKEDIN_RECONNECT: &str =
     "LinkedIn refused the account's token, or it expired. Reconnect the account under Connections.";
 pub const YOUTUBE_RECONNECT: &str = "Google refused the channel's token, or access was removed. \
                                       Reconnect the channel under Connections.";
+pub const X_RECONNECT: &str = "X refused the account's token, or access was removed. \
+                               Reconnect the account under Connections.";
 pub const META_RECONNECT: &str = "Meta refused the Page's token or a permission is missing. \
                                   Reconnect Facebook and Instagram under Connections.";
 const STUCK: &str = "Unknown, check the account: publishing stopped midway and it may have posted.";
 
-/// The token to call the platform with. YouTube's lasts an hour, so it is renewed first when
-/// near its end (`controllers::youtube::fresh_token`); the others use the stored secret as it
-/// is, and an unreadable one is a reconnect.
+/// The token to call the platform with. YouTube's lasts an hour and X's two, so they are
+/// renewed first when near their end (`controllers::youtube::fresh_token`, `controllers::x::
+/// fresh_token`); the others use the stored secret as it is, and an unreadable one is a
+/// reconnect.
 async fn credential(
     app: &AppState,
     account: &social_accounts::Model,
 ) -> Result<String, PublishError> {
     if account.provider == "youtube" {
         return crate::controllers::youtube::fresh_token(app, account).await;
+    }
+    if account.provider == "x" {
+        return crate::controllers::x::fresh_token(app, account).await;
     }
     app.cipher
         .decrypt(&account.access_token)
@@ -684,15 +756,17 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
         } else {
             ("published", None)
         };
-        // shortcut: only Bluesky, LinkedIn and YouTube links are made from the id; a Threads link
-        // (looked up at publish) is left out here. Look it up if recovered Threads posts need one.
+        // shortcut: only Bluesky, LinkedIn, YouTube and X links are made from the id (X's without
+        // the username, which `/i/status` does not need); a Threads link (looked up at publish)
+        // is left out here. Look it up if recovered Threads posts need one.
         let url = bluesky::post_url(&remote)
             .or_else(|| {
                 remote
                     .starts_with("urn:li:")
                     .then(|| linkedin::post_url(&remote))
             })
-            .or_else(|| (platform == "youtube").then(|| youtube::watch_url(&remote)));
+            .or_else(|| (platform == "youtube").then(|| youtube::watch_url(&remote)))
+            .or_else(|| (platform == "x").then(|| x::status_url(None, &remote)));
         let stmt = sql(
             &with_event(
                 "UPDATE post_targets SET status = $3, remote_url = $2, error = $4, \
@@ -1050,6 +1124,23 @@ async fn publish_target(
     // Each part right after the platform takes it, so its parent is always saved before it.
     let mut parent = root.clone();
     for (i, part) in thread.iter().enumerate() {
+        // A thread can outlast the token it started with: fetch the credential again before
+        // each part (renewed when near its end, through the locked path).
+        let secret = match credential(app, &account).await {
+            Ok(secret) => secret,
+            Err(e) => {
+                let why = match e {
+                    PublishError::Reconnect => publisher.reconnect().to_owned(),
+                    PublishError::Failed(msg) => msg,
+                };
+                let msg = format!(
+                    "Thread post {} of {}: {why} The posts before it are up.",
+                    i + 1,
+                    thread.len()
+                );
+                return fail_target(db, id, &msg).await;
+            }
+        };
         let content = (part.body.as_str(), part.media.as_slice());
         let made = match send(
             with,
@@ -1201,7 +1292,9 @@ pub async fn takedown(app: &AppState, post: &posts::Model) -> Result<Vec<String>
                 continue;
             }
         };
-        let (Some(publisher), Some(secret), Some(root)) = (
+        // The credential above only tells early that the account needs a reconnect; each
+        // delete fetches its own (`delete_one`).
+        let (Some(publisher), Some(_), Some(root)) = (
             publisher(app, &post.platform),
             secret,
             t.remote_id.as_deref(),
@@ -1216,7 +1309,7 @@ pub async fn takedown(app: &AppState, post: &posts::Model) -> Result<Vec<String>
         let mut problem = None;
         for (i, part) in parts.iter().enumerate().rev() {
             let remote_id = part["remote_id"].as_str().unwrap_or_default();
-            problem = delete_one(publisher, &account, &secret, remote_id, &name).await;
+            problem = delete_one(app, publisher, &account, remote_id, &name).await;
             if problem.is_some() {
                 break;
             }
@@ -1228,7 +1321,7 @@ pub async fn takedown(app: &AppState, post: &posts::Model) -> Result<Vec<String>
             db.execute_raw(stmt).await?;
         }
         if problem.is_none() {
-            problem = delete_one(publisher, &account, &secret, root, &name).await;
+            problem = delete_one(app, publisher, &account, root, &name).await;
         }
         match problem {
             Some(p) => problems.push(p),
@@ -1257,17 +1350,45 @@ pub async fn takedown(app: &AppState, post: &posts::Model) -> Result<Vec<String>
     Ok(problems)
 }
 
-/// Deletes one post on the platform; `Some` says what to tell the user when it stayed up.
+/// Deletes one post on the platform; `Some` says what to tell the user when it stayed up. The
+/// credential is fetched again for each call (renewed when near its end, through the locked
+/// path), since a thread's take down can outlast the token it started with.
 async fn delete_one(
+    app_state: &AppState,
     publisher: &dyn Publisher,
     account: &social_accounts::Model,
-    secret: &str,
     remote_id: &str,
     name: &str,
 ) -> Option<String> {
     let app = publisher.name();
-    let done =
-        tokio::time::timeout(TARGET_TIMEOUT, publisher.delete(account, secret, remote_id)).await;
+    // The row as it is now: an earlier call of this take down may have renewed the token.
+    let account = match social_accounts::Entity::find_by_id(account.id)
+        .one(&app_state.db)
+        .await
+    {
+        Ok(Some(fresh)) => fresh,
+        _ => account.clone(),
+    };
+    let account = &account;
+    let secret = match credential(app_state, account).await {
+        Ok(secret) => secret,
+        Err(PublishError::Reconnect) => {
+            return Some(format!(
+                "{name}: {} Or delete the post in the {app} app.",
+                publisher.reconnect()
+            ))
+        }
+        Err(PublishError::Failed(msg)) => {
+            return Some(format!(
+                "{name}: {msg} Delete the post in the {app} app if it is still up."
+            ))
+        }
+    };
+    let done = tokio::time::timeout(
+        TARGET_TIMEOUT,
+        publisher.delete(account, &secret, remote_id),
+    )
+    .await;
     match done {
         Ok(Ok(())) => None,
         Ok(Err(PublishError::Reconnect)) => Some(format!(

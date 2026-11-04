@@ -58,6 +58,7 @@ pub struct AppState {
     pub threads: crate::connectors::threads::Threads,
     pub linkedin: crate::connectors::linkedin::LinkedIn,
     pub youtube: crate::connectors::youtube::YouTube,
+    pub x: crate::connectors::x::X,
     /// The Meta app for connecting, and its two publishers.
     pub meta: crate::connectors::meta::Meta,
     pub facebook: crate::connectors::meta::Facebook,
@@ -103,6 +104,7 @@ impl AppState {
             threads: config.threads.clone(),
             linkedin: config.linkedin.clone(),
             youtube: config.youtube.clone(),
+            x: config.x.clone(),
             meta: config.meta.clone(),
             facebook: crate::connectors::meta::Facebook(config.meta.clone()),
             instagram: crate::connectors::meta::Instagram(config.meta.clone()),

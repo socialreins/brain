@@ -1,5 +1,5 @@
 //! Posts of the current team: every member writes them. One post per platform (Bluesky,
-//! Threads, LinkedIn, Facebook, Instagram and YouTube today); a post goes to every account of its platform in its social set. Only `draft` and
+//! Threads, LinkedIn, Facebook, Instagram, YouTube and X today); a post goes to every account of its platform in its social set. Only `draft` and
 //! `scheduled` posts change; saving with `scheduled_at` makes one `scheduled`, else `draft`.
 //! Posts of a deleted set are hidden (and held back) until the set is restored. Every route
 //! takes an API token too (`Actor`); a set token only sees and writes its set's posts. Token
@@ -126,10 +126,10 @@ pub struct PostInput {
     /// A live set of the current team. Required, except with a set token, where absent means
     /// the token's set and any other set is `invalid_set`.
     pub social_set_id: Option<Uuid>,
-    /// `bluesky`, `threads`, `linkedin`, `facebook`, `instagram` or `youtube` (the platforms that publish today).
+    /// `bluesky`, `threads`, `linkedin`, `facebook`, `instagram`, `youtube` or `x` (the platforms that publish today).
     pub platform: String,
     /// At most 300 graphemes on Bluesky, 500 characters on Threads, 3000 on LinkedIn, 63206 on Facebook, 2200 on
-    /// Instagram. On YouTube the first line is the video's title (required, at most 100 characters)
+    /// Instagram, 280 on X as X counts them (a link is 23, a CJK character or emoji 2). On YouTube the first line is the video's title (required, at most 100 characters)
     /// and the rest its description (at most 5000 bytes); neither may hold `<` or `>`
     /// (`invalid_text`).
     #[serde(default)]
@@ -138,7 +138,8 @@ pub struct PostInput {
     /// each), on Threads at most 20 JPEG or PNG images or MP4 or MOV videos, on LinkedIn at most 20 JPEG, PNG or GIF images or one MP4 video, on Facebook at most
     /// 10 JPEG, PNG or GIF images or one MP4 or MOV video (a Reel), on Instagram 1 to 10 JPEG
     /// images or MP4 or MOV videos (`media_required` without one), on YouTube exactly one MP4 or
-    /// MOV video (`media_required` without one).
+    /// MOV video (`media_required` without one), on X at most 4 JPEG, PNG or WebP images, or one
+    /// GIF, or one MP4 or MOV video.
     #[serde(default)]
     pub media: Vec<String>,
     /// Follow-up posts of a thread (at most 25), each a reply to the one before and checked

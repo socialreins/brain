@@ -3753,7 +3753,7 @@ mod teams {
                 let mut too_many = input(&set, "x", None);
                 too_many["media"] = json!(five);
                 let mut other_platform = input(&set, "x", None);
-                other_platform["platform"] = json!("x");
+                other_platform["platform"] = json!("tiktok");
                 for (body, code) in [
                     (input(&set, &"a".repeat(301), None), "too_long"),
                     (input(&set, "  ", None), "empty_post"),
@@ -3935,10 +3935,10 @@ mod teams {
                 let before = count().await;
                 for (body, code, platform) in [
                     (
-                        json!({"social_set_id": set, "platforms": ["bluesky", "x"],
+                        json!({"social_set_id": set, "platforms": ["bluesky", "tiktok"],
                             "body": "hi"}),
                         "unsupported_platform",
-                        "x",
+                        "tiktok",
                     ),
                     (
                         json!({"social_set_id": set, "body": "hi",
@@ -3972,7 +3972,7 @@ mod teams {
                 let copy = sea_orm::Statement::from_sql_and_values(
                     sea_orm::DbBackend::Postgres,
                     "INSERT INTO social_accounts (id, team_id, provider, external_id, \
-                     access_token) SELECT $1, team_id, 'x', external_id, access_token \
+                     access_token) SELECT $1, team_id, 'tiktok', external_id, access_token \
                      FROM social_accounts WHERE id = $2",
                     [x.into(), account.parse::<uuid::Uuid>().unwrap().into()],
                 );
@@ -3996,8 +3996,9 @@ mod teams {
                     .collect();
                 assert_eq!(platforms, [json!("bluesky")]);
                 let res =
-                    group(json!({"social_set_id": set, "platforms": ["x"], "body": "hi"})).await;
-                res.assert_json(&json!({"error": "unsupported_platform", "platform": "x"}));
+                    group(json!({"social_set_id": set, "platforms": ["tiktok"], "body": "hi"}))
+                        .await;
+                res.assert_json(&json!({"error": "unsupported_platform", "platform": "tiktok"}));
                 assert_eq!(count().await, before + 1);
 
                 // A group body may run well past the 4 KiB `/v1` limit.
@@ -7261,6 +7262,1176 @@ mod teams {
                     DELETE_MODE.store(0, Ordering::SeqCst);
                     res.assert_status_ok();
                     assert_eq!(res.json::<Value>()["status"], "deleted");
+                }
+            }
+
+            /// X: the connect flow with PKCE, single-use refresh tokens, publishing text, media
+            /// and threads against a mock of API v2, take down, and the failures X bills for.
+            mod x_api {
+                use super::threads_api::{location, set_role};
+                use super::*;
+                use axum::{
+                    extract::{Form, Path, Query, State},
+                    http::{HeaderMap, StatusCode},
+                    response::{IntoResponse, Response},
+                    routing::{delete, get, post},
+                    Json, Router,
+                };
+                use base64::engine::general_purpose::STANDARD;
+                use sea_orm::ConnectionTrait;
+                use socialreins_brain::{connectors::x::X, controllers::x};
+                use std::sync::{
+                    atomic::{AtomicU64, Ordering},
+                    Arc, Mutex,
+                };
+
+                const ALL_SCOPES: &str =
+                    "tweet.read tweet.write users.read offline.access media.write";
+                /// 2026-11-04 12:30:00 UTC, as `x-rate-limit-reset`.
+                const RESET: &str = "1793795400";
+
+                /// What the mock X saw and how it behaves.
+                #[derive(Default)]
+                struct Mock {
+                    /// Refresh tokens that work once.
+                    live: Mutex<Vec<String>>,
+                    /// 0 as X does, 1 no new refresh token, 2 server error.
+                    refresh_mode: AtomicU64,
+                    refreshes: AtomicU64,
+                    /// Each `code_verifier` and the grant it came with.
+                    verifiers: Mutex<Vec<String>>,
+                    /// Each initialize body.
+                    inits: Mutex<Vec<Value>>,
+                    /// Each append: (media id, segment index, body length).
+                    appends: Mutex<Vec<(String, String, usize)>>,
+                    categories: Mutex<HashMap<String, String>>,
+                    polls: AtomicU64,
+                    /// Every POST /2/tweets that reached the mock, and the bearer of each success.
+                    attempts: AtomicU64,
+                    tweets: Mutex<Vec<(String, Value)>>,
+                    /// Every deleted tweet id.
+                    removed: Mutex<Vec<String>>,
+                    /// 0 deletes, 1 answers 404, 2 answers 429.
+                    delete_mode: AtomicU64,
+                    next: AtomicU64,
+                    /// Access tokens X no longer accepts.
+                    revoked: Mutex<Vec<String>>,
+                    /// Simulated time passing: after this many more successful tweets or
+                    /// deletes, the account's token has a minute left and the bearer that just
+                    /// succeeded is no longer accepted.
+                    clock: Mutex<Option<(DatabaseConnection, uuid::Uuid, usize)>>,
+                }
+
+                type Shared = State<Arc<Mock>>;
+
+                /// Whether `who` may still call: not revoked.
+                fn accepted(m: &Mock, who: &str) -> bool {
+                    !m.revoked.lock().unwrap().iter().any(|t| t == who)
+                }
+
+                /// Counts one success against the clock; when it runs out, time "passes".
+                async fn tick(m: &Mock, who: &str) {
+                    let due = {
+                        let mut clock = m.clock.lock().unwrap();
+                        match clock.as_mut() {
+                            Some((_, _, left)) if *left > 1 => {
+                                *left -= 1;
+                                None
+                            }
+                            Some(_) => clock.take(),
+                            None => None,
+                        }
+                    };
+                    if let Some((db, account, _)) = due {
+                        m.revoked.lock().unwrap().push(who.to_owned());
+                        db.execute_unprepared(&format!(
+                            "UPDATE social_accounts SET token_expires_at = now() + \
+                             interval '1 minute' WHERE id = '{account}'"
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                }
+
+                fn bearer(h: &HeaderMap) -> Option<String> {
+                    let v = h.get("authorization")?.to_str().ok()?;
+                    let t = v.strip_prefix("Bearer ")?;
+                    t.starts_with("xtok").then(|| t.to_owned())
+                }
+
+                fn dead() -> Response {
+                    let body = json!({"title": "Unauthorized", "status": 401});
+                    (StatusCode::UNAUTHORIZED, Json(body)).into_response()
+                }
+
+                async fn token(
+                    State(m): Shared,
+                    h: HeaderMap,
+                    Form(f): Form<HashMap<String, String>>,
+                ) -> Response {
+                    let want = format!("Basic {}", STANDARD.encode("xapp:xsecret"));
+                    let basic = h.get("authorization").and_then(|v| v.to_str().ok());
+                    if basic != Some(want.as_str()) || f.contains_key("client_secret") {
+                        return dead();
+                    }
+                    let refused = |why: &str| {
+                        let body = json!({"error": "invalid_request", "error_description": why});
+                        (StatusCode::BAD_REQUEST, Json(body)).into_response()
+                    };
+                    let get = |k: &str| f.get(k).map(String::as_str).unwrap_or_default();
+                    match (get("grant_type"), get("code")) {
+                        ("authorization_code", code @ ("good" | "narrow")) => {
+                            m.verifiers
+                                .lock()
+                                .unwrap()
+                                .push(get("code_verifier").to_owned());
+                            let refresh = format!("xr-{}", uuid::Uuid::now_v7());
+                            m.live.lock().unwrap().push(refresh.clone());
+                            let scope = if code == "narrow" {
+                                "tweet.read tweet.write users.read offline.access"
+                            } else {
+                                ALL_SCOPES
+                            };
+                            Json(json!({"token_type": "bearer", "access_token": "xtok",
+                                "expires_in": 7200, "refresh_token": refresh, "scope": scope}))
+                            .into_response()
+                        }
+                        ("refresh_token", _) => {
+                            m.refreshes.fetch_add(1, Ordering::SeqCst);
+                            if m.refresh_mode.load(Ordering::SeqCst) == 2 {
+                                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                            }
+                            // Single use: the token is spent whatever happens next.
+                            let spent = {
+                                let mut live = m.live.lock().unwrap();
+                                let at = live.iter().position(|t| t == get("refresh_token"));
+                                at.map(|i| live.remove(i)).is_some()
+                            };
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                            if !spent {
+                                return refused("Value passed for the token was invalid.");
+                            }
+                            let n = m.next.fetch_add(1, Ordering::SeqCst);
+                            let mut answer = json!({"token_type": "bearer",
+                                "access_token": format!("xtok{n}"), "expires_in": 7200,
+                                "scope": ALL_SCOPES});
+                            if m.refresh_mode.load(Ordering::SeqCst) == 0 {
+                                let refresh = format!("xr-{}", uuid::Uuid::now_v7());
+                                m.live.lock().unwrap().push(refresh.clone());
+                                answer["refresh_token"] = json!(refresh);
+                            } else {
+                                m.live.lock().unwrap().push(get("refresh_token").to_owned());
+                            }
+                            Json(answer).into_response()
+                        }
+                        _ => refused("The provided authorization code is invalid"),
+                    }
+                }
+
+                async fn me(h: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
+                    assert_eq!(q["user.fields"], "profile_image_url,username,name");
+                    if bearer(&h).is_none() {
+                        return dead();
+                    }
+                    Json(json!({"data": {"id": "2244994945", "username": "ann_lee",
+                        "name": "Ann Lee", "profile_image_url": "https://pbs.example/p.jpg"}}))
+                    .into_response()
+                }
+
+                async fn init(State(m): Shared, h: HeaderMap, Json(b): Json<Value>) -> Response {
+                    if bearer(&h).is_none() {
+                        return dead();
+                    }
+                    let id = (9000 + m.next.fetch_add(1, Ordering::SeqCst)).to_string();
+                    let category = b["media_category"].as_str().unwrap().to_owned();
+                    m.categories.lock().unwrap().insert(id.clone(), category);
+                    m.inits.lock().unwrap().push(b);
+                    Json(json!({"data": {"id": id, "media_key": format!("7_{id}"),
+                        "expires_after_secs": 86400}}))
+                    .into_response()
+                }
+
+                async fn append(
+                    State(m): Shared,
+                    Path(id): Path<String>,
+                    h: HeaderMap,
+                    body: axum::body::Bytes,
+                ) -> Response {
+                    if bearer(&h).is_none() {
+                        return dead();
+                    }
+                    let kind = h.get("content-type").and_then(|v| v.to_str().ok());
+                    assert!(kind.unwrap().starts_with("multipart/form-data; boundary="));
+                    let text = String::from_utf8_lossy(&body);
+                    let tag = "name=\"segment_index\"\r\n\r\n";
+                    let at = text.find(tag).unwrap() + tag.len();
+                    let index = text[at..].split("\r\n").next().unwrap().to_owned();
+                    assert!(text.contains("name=\"media\""));
+                    m.appends.lock().unwrap().push((id, index, body.len()));
+                    StatusCode::NO_CONTENT.into_response()
+                }
+
+                async fn finalize(
+                    State(m): Shared,
+                    Path(id): Path<String>,
+                    h: HeaderMap,
+                ) -> Response {
+                    if bearer(&h).is_none() {
+                        return dead();
+                    }
+                    let video = m.categories.lock().unwrap().get(&id).map(String::as_str)
+                        == Some("tweet_video");
+                    let mut data = json!({"id": id, "media_key": format!("7_{id}"), "size": 1});
+                    if video {
+                        data["processing_info"] =
+                            json!({"state": "pending", "check_after_secs": 0});
+                    }
+                    Json(json!({ "data": data })).into_response()
+                }
+
+                async fn status(
+                    State(m): Shared,
+                    h: HeaderMap,
+                    Query(q): Query<HashMap<String, String>>,
+                ) -> Response {
+                    if bearer(&h).is_none() {
+                        return dead();
+                    }
+                    assert_eq!(q["command"], "STATUS");
+                    let state = match m.polls.fetch_add(1, Ordering::SeqCst) {
+                        0 => "in_progress",
+                        _ => "succeeded",
+                    };
+                    let info = json!({"state": state, "check_after_secs": 0});
+                    Json(json!({"data": {"id": q["media_id"], "processing_info": info}}))
+                        .into_response()
+                }
+
+                async fn tweet(State(m): Shared, h: HeaderMap, Json(b): Json<Value>) -> Response {
+                    let Some(who) = bearer(&h).filter(|w| accepted(&m, w)) else {
+                        return dead();
+                    };
+                    m.attempts.fetch_add(1, Ordering::SeqCst);
+                    let text = b["text"].as_str().unwrap_or_default().to_owned();
+                    if text.starts_with("CREDITS") {
+                        let detail = "Your enrolled account [1] does not have any credits to \
+                                      fulfill this request.";
+                        let body = json!({"title": "CreditsDepleted", "detail": detail,
+                            "type": "https://api.x.com/2/problems/credits"});
+                        return (StatusCode::PAYMENT_REQUIRED, Json(body)).into_response();
+                    }
+                    if text.starts_with("LIMIT") {
+                        let body = json!({"title": "Too Many Requests", "status": 429});
+                        let headers = [("x-rate-limit-reset", RESET)];
+                        return (StatusCode::TOO_MANY_REQUESTS, headers, Json(body))
+                            .into_response();
+                    }
+                    if text.starts_with("REJECT") {
+                        let detail = "You are not allowed to create a Tweet with duplicate \
+                                      content. https://x.example/?access_token=abc";
+                        let body = json!({"title": "Forbidden", "detail": detail});
+                        return (StatusCode::FORBIDDEN, Json(body)).into_response();
+                    }
+                    for id in b["media"]["media_ids"].as_array().into_iter().flatten() {
+                        assert!(m
+                            .categories
+                            .lock()
+                            .unwrap()
+                            .contains_key(id.as_str().unwrap()));
+                    }
+                    let id = (1_800_000_000_000_000_000u64 + m.next.fetch_add(1, Ordering::SeqCst))
+                        .to_string();
+                    m.tweets.lock().unwrap().push((who.clone(), b));
+                    tick(&m, &who).await;
+                    let body = json!({"data": {"id": id, "text": text}});
+                    (StatusCode::CREATED, Json(body)).into_response()
+                }
+
+                async fn remove(
+                    State(m): Shared,
+                    Path(id): Path<String>,
+                    h: HeaderMap,
+                ) -> Response {
+                    let Some(who) = bearer(&h).filter(|w| accepted(&m, w)) else {
+                        return dead();
+                    };
+                    match m.delete_mode.load(Ordering::SeqCst) {
+                        1 => (StatusCode::NOT_FOUND, Json(json!({"title": "Not Found"})))
+                            .into_response(),
+                        2 => {
+                            let headers = [("x-rate-limit-reset", RESET)];
+                            let body = json!({"title": "Too Many Requests"});
+                            (StatusCode::TOO_MANY_REQUESTS, headers, Json(body)).into_response()
+                        }
+                        _ => {
+                            m.removed.lock().unwrap().push(id);
+                            tick(&m, &who).await;
+                            Json(json!({"data": {"deleted": true}})).into_response()
+                        }
+                    }
+                }
+
+                /// X (OAuth, API v2, upload), plus images, a GIF and videos to post.
+                async fn mock_x() -> (String, Arc<Mock>) {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let base = format!("http://{}", listener.local_addr().unwrap());
+                    let mock = Arc::new(Mock::default());
+                    let video = |len: usize| async move {
+                        let mut v = vec![0u8; len];
+                        v[..14].copy_from_slice(b"\0\0\0\x18ftypmp42\0\0");
+                        ([("content-type", "video/mp4")], v)
+                    };
+                    let gif = || async {
+                        let mut v = vec![0u8; 40];
+                        v[..12].copy_from_slice(b"GIF89a\x01\0\x01\0\0\0");
+                        ([("content-type", "image/gif")], v)
+                    };
+                    let app = Router::new()
+                        .route("/2/oauth2/token", post(token))
+                        .route("/2/users/me", get(me))
+                        .route("/2/media/upload/initialize", post(init))
+                        .route("/2/media/upload/{id}/append", post(append))
+                        .route("/2/media/upload/{id}/finalize", post(finalize))
+                        .route("/2/media/upload", get(status))
+                        .route("/2/tweets", post(tweet))
+                        .route("/2/tweets/{id}", delete(remove))
+                        .layer(axum::extract::DefaultBodyLimit::max(8_000_000))
+                        .with_state(mock.clone())
+                        .route("/img.png", get(|| async { image("image/png", 64) }))
+                        .route("/img2.png", get(|| async { image("image/png", 48) }))
+                        .route("/pic.gif", get(gif))
+                        .route("/clip.mp4", get(move || video(64)))
+                        .route("/big.mp4", get(move || video(4_000_001)));
+                    tokio::spawn(async move { axum::serve(listener, app).await });
+                    (base, mock)
+                }
+
+                /// A brain with X set up on the mock (no waits), its state, and the mock.
+                async fn on_x(
+                    configured: bool,
+                ) -> (TestServer, DatabaseConnection, AppState, String, Arc<Mock>) {
+                    let (base, mock) = mock_x().await;
+                    let mut config = Config::from_env().expect("test config");
+                    config.trust_proxy = true;
+                    let app = configured.then(|| ("xapp".to_owned(), "xsecret".to_owned()));
+                    let mut x = X::new(app).unwrap();
+                    x.api_url = base.clone();
+                    x.poll_every = std::time::Duration::ZERO;
+                    config.x = x;
+                    let disk = object_store::local::LocalFileSystem::new_with_prefix(media_dir())
+                        .unwrap()
+                        .with_automatic_cleanup(true);
+                    config.media = Media::new(std::sync::Arc::new(disk), true);
+                    let db = socialreins_brain::connect(&config)
+                        .await
+                        .expect("database reachable");
+                    let state = AppState::new(db.clone(), &config);
+                    let app = controllers::router(state.clone(), &config);
+                    (TestServer::new(app).unwrap(), db, state, base, mock)
+                }
+
+                /// Starts a connect: (state, `sr_x=...`, the PKCE challenge sent to X).
+                async fn begin(s: &TestServer, cookie: &str) -> (String, String, String) {
+                    let res = s
+                        .get("/connections/x/redirect")
+                        .add_header("cookie", cookie)
+                        .await;
+                    let (to, q) = location(&res);
+                    assert!(to.starts_with("https://x.com/i/oauth2/authorize?"), "{to}");
+                    assert_eq!(q["client_id"], "xapp");
+                    assert_eq!(q["response_type"], "code");
+                    assert_eq!(
+                        q["redirect_uri"],
+                        "http://localhost:8080/connect/x/callback"
+                    );
+                    assert_eq!(q["scope"], ALL_SCOPES);
+                    assert_eq!(q["code_challenge_method"], "S256");
+                    assert!(!to.contains("xsecret") && !to.contains("verifier"));
+                    let set = res
+                        .iter_headers_by_name("set-cookie")
+                        .map(|v| v.to_str().unwrap().to_owned())
+                        .find(|c| c.starts_with("sr_x="))
+                        .unwrap();
+                    assert!(set.contains("HttpOnly") && set.contains("Path=/connect/x"));
+                    (
+                        q["state"].clone(),
+                        set.split(';').next().unwrap().to_owned(),
+                        q["code_challenge"].clone(),
+                    )
+                }
+
+                /// X's redirect back: where it lands, as `(connected, connect_error)`.
+                async fn finish(
+                    s: &TestServer,
+                    cookies: &str,
+                    query: &str,
+                ) -> (Option<String>, Option<String>) {
+                    let res = s
+                        .get(&format!("/connect/x/callback?{query}"))
+                        .add_header("cookie", cookies)
+                        .await;
+                    let (to, q) = location(&res);
+                    assert!(
+                        to.starts_with("http://localhost:3000/app/connections?"),
+                        "{to}"
+                    );
+                    if q.contains_key("connect_error") {
+                        assert_eq!(q["provider"], "x");
+                    }
+                    (q.get("connected").cloned(), q.get("connect_error").cloned())
+                }
+
+                async fn connect_with(s: &TestServer, cookie: &str, code: &str) {
+                    let (state, flow, _) = begin(s, cookie).await;
+                    let both = format!("{cookie}; {flow}");
+                    let got = finish(s, &both, &format!("code={code}&state={state}")).await;
+                    assert_eq!(got, (Some("x".into()), None));
+                }
+
+                async fn x_account(
+                    db: &DatabaseConnection,
+                    team_id: &str,
+                ) -> social_accounts::Model {
+                    social_accounts::Entity::find()
+                        .filter(
+                            social_accounts::Column::TeamId
+                                .eq(team_id.parse::<uuid::Uuid>().unwrap()),
+                        )
+                        .filter(social_accounts::Column::Provider.eq("x"))
+                        .one(db)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                }
+
+                fn unseal(sealed: &str) -> String {
+                    let bytes = URL_SAFE_NO_PAD.decode(sealed).unwrap();
+                    String::from_utf8(cipher().decrypt(&bytes).unwrap()).unwrap()
+                }
+
+                fn seal(s: &str) -> String {
+                    URL_SAFE_NO_PAD.encode(cipher().encrypt(s.as_bytes()))
+                }
+
+                /// The refresh token stored in the account's `meta`.
+                fn refresh_of(a: &social_accounts::Model) -> String {
+                    unseal(a.meta["refresh_token"].as_str().unwrap())
+                }
+
+                fn access_of(a: &social_accounts::Model) -> String {
+                    String::from_utf8(cipher().decrypt(&a.access_token).unwrap()).unwrap()
+                }
+
+                /// Sets the account's access token and how many seconds it has left.
+                async fn set_token(
+                    db: &DatabaseConnection,
+                    account: uuid::Uuid,
+                    token: &str,
+                    secs: i64,
+                ) {
+                    let row = social_accounts::ActiveModel {
+                        id: Set(account),
+                        access_token: Set(cipher().encrypt(token.as_bytes())),
+                        token_expires_at: Set(Some(
+                            (Utc::now() + Duration::seconds(secs)).fixed_offset(),
+                        )),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(row).exec(db).await.unwrap();
+                }
+
+                async fn set_meta(db: &DatabaseConnection, account: uuid::Uuid, meta: Value) {
+                    let row = social_accounts::ActiveModel {
+                        id: Set(account),
+                        meta: Set(meta),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(row).exec(db).await.unwrap();
+                }
+
+                /// Other tests left X accounts behind; the renewal job would renew those too.
+                async fn forget_others(db: &DatabaseConnection, team_id: &str) {
+                    db.execute_unprepared(&format!(
+                        "DELETE FROM social_accounts WHERE provider = 'x' AND team_id <> '{team_id}'"
+                    ))
+                    .await
+                    .unwrap();
+                }
+
+                fn x_post(set: &str, body: &str) -> Value {
+                    let mut v = input(set, body, Some(&past()));
+                    v["platform"] = json!("x");
+                    v
+                }
+
+                fn thread(set: &str, body: &str, parts: &[&str]) -> Value {
+                    let mut v = x_post(set, body);
+                    v["thread"] = parts.iter().map(|p| json!({"body": p})).collect();
+                    v
+                }
+
+                /// A connected team: (server, db, state, mock base, mock, cookie, team id, set id).
+                async fn team() -> (
+                    TestServer,
+                    DatabaseConnection,
+                    AppState,
+                    String,
+                    Arc<Mock>,
+                    String,
+                    String,
+                    String,
+                ) {
+                    let (s, db, state, base, mock) = on_x(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    connect_with(&s, &cookie, "good").await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    (s, db, state, base, mock, cookie, team_id, set)
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connect_uses_pkce_and_saves_the_profile_once_in_the_default_set() {
+                    let (s, db, _, _, mock) = on_x(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let (state, flow, challenge) = begin(&s, &cookie).await;
+
+                    // The verifier waits in the database, sealed, and matches the challenge.
+                    let row = db
+                        .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                            sea_orm::DbBackend::Postgres,
+                            "SELECT verifier FROM oauth_states WHERE state_hash = $1",
+                            [socialreins_core::token::hash(&state).into()],
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let stored: String = row.try_get("", "verifier").unwrap();
+                    let verifier = unseal(&stored);
+                    assert_ne!(stored, verifier);
+                    assert_eq!(
+                        socialreins_core::oauth::pkce_challenge(&verifier),
+                        challenge
+                    );
+
+                    let both = format!("{cookie}; {flow}");
+                    let query = format!("code=good&state={state}");
+                    assert_eq!(finish(&s, &both, &query).await, (Some("x".into()), None));
+                    // X was given the verifier, with the client secret in Basic auth only.
+                    assert_eq!(mock.verifiers.lock().unwrap().clone(), [verifier]);
+
+                    let listed = list(&s, &cookie).await;
+                    assert_eq!(listed.len(), 1);
+                    let a = &listed[0];
+                    assert_eq!(a["provider"], "x");
+                    assert_eq!(a["external_id"], "2244994945");
+                    assert_eq!(a["handle"], "ann_lee");
+                    assert_eq!(a["display_name"], "Ann Lee");
+                    assert_eq!(a["avatar_url"], "https://pbs.example/p.jpg");
+                    let set = default_set(&db, &team_id).await.to_string();
+                    assert_eq!(a["set_ids"], json!([set]));
+                    let row = x_account(&db, &team_id).await;
+                    assert_eq!(access_of(&row), "xtok");
+                    assert!(refresh_of(&row).starts_with("xr-"));
+                    assert!(!row.meta.to_string().contains("xr-"), "sealed at rest");
+                    let left = row.token_expires_at.unwrap().timestamp() - Utc::now().timestamp();
+                    assert!((7100..=7200).contains(&left), "{left}");
+
+                    // The state works once.
+                    assert_eq!(
+                        finish(&s, &both, &query).await,
+                        (None, Some("expired".into()))
+                    );
+                    // A reconnect keeps the one row and clears the reconnect flag.
+                    set_meta(&db, row.id, json!({"reconnect": true})).await;
+                    connect_with(&s, &cookie, "good").await;
+                    let again = list(&s, &cookie).await;
+                    assert_eq!(again.len(), 1);
+                    assert_eq!(again[0]["id"], a["id"]);
+                    let row = x_account(&db, &team_id).await;
+                    assert!(row.meta.get("reconnect").is_none());
+                    assert!(refresh_of(&row).starts_with("xr-"));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connect_refuses_strangers_members_other_browsers_and_missing_scopes() {
+                    let (s, db, _, _, _) = on_x(true).await;
+                    let (_, cookie, user_id) = user(&s, &db).await;
+                    let back = |res: axum_test::TestResponse| location(&res).1;
+                    let res = s.get("/connections/x/redirect").await;
+                    assert_eq!(back(res)["connect_error"], "unauthorized");
+
+                    // The state must come back to the browser that started it.
+                    let (state, flow, _) = begin(&s, &cookie).await;
+                    let query = format!("code=good&state={state}");
+                    assert_eq!(
+                        finish(&s, &cookie, &query).await,
+                        (None, Some("expired".into()))
+                    );
+                    let wrong = format!("{cookie}; sr_x=0000");
+                    assert_eq!(
+                        finish(&s, &wrong, &query).await,
+                        (None, Some("expired".into()))
+                    );
+                    // Those did not use it up; another signed-in user cannot finish it.
+                    let (_, stranger, _) = user(&s, &db).await;
+                    let theirs = format!("{stranger}; {flow}");
+                    assert_eq!(
+                        finish(&s, &theirs, &query).await,
+                        (None, Some("expired".into()))
+                    );
+
+                    // Cancelled on X, a bad code, a narrowed consent, and a demotion meanwhile.
+                    let (state, flow, _) = begin(&s, &cookie).await;
+                    let both = format!("{cookie}; {flow}");
+                    let q = format!("error=access_denied&state={state}");
+                    assert_eq!(
+                        finish(&s, &both, &q).await,
+                        (None, Some("cancelled".into()))
+                    );
+                    let (state, flow, _) = begin(&s, &cookie).await;
+                    let both = format!("{cookie}; {flow}");
+                    let q = format!("code=bad&state={state}");
+                    assert_eq!(finish(&s, &both, &q).await, (None, Some("x_failed".into())));
+                    let (state, flow, _) = begin(&s, &cookie).await;
+                    let both = format!("{cookie}; {flow}");
+                    let q = format!("code=narrow&state={state}");
+                    assert_eq!(
+                        finish(&s, &both, &q).await,
+                        (None, Some("missing_scopes".into()))
+                    );
+                    let (state, flow, _) = begin(&s, &cookie).await;
+                    set_role(&db, user_id, "member").await;
+                    let both = format!("{cookie}; {flow}");
+                    let q = format!("code=good&state={state}");
+                    assert_eq!(finish(&s, &both, &q).await, (None, Some("expired".into())));
+                    let res = s
+                        .get("/connections/x/redirect")
+                        .add_header("cookie", &cookie)
+                        .await;
+                    assert_eq!(back(res)["connect_error"], "forbidden");
+                    assert!(list(&s, &cookie).await.is_empty());
+
+                    let (s, db, _, _, _) = on_x(false).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let res = s
+                        .get("/connections/x/redirect")
+                        .add_header("cookie", &cookie)
+                        .await;
+                    assert_eq!(back(res)["connect_error"], "not_configured");
+                    let res = s.get("/connect/x/callback?code=good&state=s").await;
+                    assert_eq!(location(&res).1["connect_error"], "not_configured");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_text_post_publishes_with_its_permalink_and_comes_down() {
+                    let (s, _, state, _, mock, cookie, _, set) = team().await;
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "Hello X")).await);
+                    let before = mock.tweets.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let (who, sent) = mock.tweets.lock().unwrap()[before].clone();
+                    assert_eq!(who, "xtok");
+                    assert_eq!(sent, json!({"text": "Hello X"}));
+                    let t = &p["targets"][0];
+                    let tweet = t["remote_id"].as_str().unwrap().to_owned();
+                    assert_eq!(
+                        t["remote_url"],
+                        format!("https://x.com/ann_lee/status/{tweet}")
+                    );
+
+                    let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                    res.assert_status_ok();
+                    assert_eq!(res.json::<Value>()["status"], "deleted");
+                    assert_eq!(mock.removed.lock().unwrap().last(), Some(&tweet));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn images_a_gif_and_a_video_upload_first_and_the_post_names_them() {
+                    let (s, db, state, base, mock, cookie, _, set) = team().await;
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "two")).await);
+                    set_media(&db, &base, &id, &["/img.png", "/img2.png"]).await;
+                    let (tweets, inits) = (
+                        mock.tweets.lock().unwrap().len(),
+                        mock.inits.lock().unwrap().len(),
+                    );
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let started = mock.inits.lock().unwrap()[inits..].to_vec();
+                    assert_eq!(started.len(), 2);
+                    assert_eq!(
+                        started[0],
+                        json!({"media_type": "image/png", "total_bytes": 64,
+                            "media_category": "tweet_image"})
+                    );
+                    assert_eq!(started[1]["total_bytes"], 48);
+                    let sent = mock.tweets.lock().unwrap()[tweets].1.clone();
+                    let ids = sent["media"]["media_ids"].as_array().unwrap();
+                    assert_eq!(ids.len(), 2);
+                    assert_ne!(ids[0], ids[1]);
+                    let appends = mock.appends.lock().unwrap().clone();
+                    let mine: Vec<_> = appends
+                        .iter()
+                        .filter(|a| ids.contains(&json!(a.0)))
+                        .collect();
+                    assert_eq!(mine.len(), 2);
+                    assert!(mine.iter().all(|a| a.1 == "0"));
+
+                    // A GIF is its own category.
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "gif")).await);
+                    set_media(&db, &base, &id, &["/pic.gif"]).await;
+                    let inits = mock.inits.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                    let started = mock.inits.lock().unwrap()[inits..].to_vec();
+                    assert_eq!(started[0]["media_category"], "tweet_gif");
+                    assert_eq!(started[0]["media_type"], "image/gif");
+
+                    // A video over one chunk goes in segments 0 and 1, and is polled until X is done.
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "clip")).await);
+                    set_media(&db, &base, &id, &["/big.mp4"]).await;
+                    let (inits, appends, polls) = (
+                        mock.inits.lock().unwrap().len(),
+                        mock.appends.lock().unwrap().len(),
+                        mock.polls.load(Ordering::SeqCst),
+                    );
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let started = mock.inits.lock().unwrap()[inits..].to_vec();
+                    assert_eq!(started[0]["media_category"], "tweet_video");
+                    assert_eq!(started[0]["total_bytes"], 4_000_001);
+                    let parts = mock.appends.lock().unwrap()[appends..].to_vec();
+                    let indexes: Vec<&str> = parts.iter().map(|a| a.1.as_str()).collect();
+                    assert_eq!(indexes, ["0", "1"]);
+                    assert!(parts[0].2 > 4_000_000 && parts[1].2 < 1_000);
+                    assert_eq!(mock.polls.load(Ordering::SeqCst), polls + 2);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn limits_and_unsupported_shapes_are_refused() {
+                    let (s, db, state, base, mock, cookie, _, set) = team().await;
+                    // 280 weighted characters, links counted as 23.
+                    let res = create(&s, &cookie, x_post(&set, &"a".repeat(281))).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "too_long"}));
+                    let link =
+                        format!("{} https://example.com/{}", "a".repeat(256), "b".repeat(90));
+                    let mut ok = x_post(&set, &link);
+                    ok["scheduled_at"] = Value::Null;
+                    assert_eq!(create(&s, &cookie, ok).await.status_code(), 201);
+                    let mut many = x_post(&set, "x");
+                    many["media"] = json!(vec!["https://a.example/i.png"; 5]);
+                    let res = create(&s, &cookie, many).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "too_many_images"}));
+                    let res =
+                        create(&s, &cookie, thread(&set, "x", &["a".repeat(281).as_str()])).await;
+                    assert_eq!(res.status_code(), 422);
+                    assert_eq!(res.json::<Value>()["part"], 1);
+
+                    // A video next to an image, or a GIF next to an image, never reaches X.
+                    for second in ["/clip.mp4", "/pic.gif"] {
+                        let id = id_of(&create(&s, &cookie, x_post(&set, "mix")).await);
+                        set_media(&db, &base, &id, &["/img.png", second]).await;
+                        let inits = mock.inits.lock().unwrap().len();
+                        publish::tick(&state).await.unwrap();
+                        let p = get_post(&s, &cookie, &id).await;
+                        assert_eq!(p["status"], "failed", "{second}");
+                        assert!(p["targets"][0]["error"]
+                            .as_str()
+                            .unwrap()
+                            .contains("not a mix"));
+                        assert_eq!(mock.inits.lock().unwrap().len(), inits);
+                    }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_thread_goes_out_as_replies_and_comes_down_children_first() {
+                    let (s, _, state, _, mock, cookie, _, set) = team().await;
+                    let body = thread(&set, "one", &["two", "three"]);
+                    let id = id_of(&create(&s, &cookie, body).await);
+                    let before = mock.tweets.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let t = &p["targets"][0];
+                    let root = t["remote_id"].as_str().unwrap().to_owned();
+                    let parts = t["parts"].as_array().unwrap();
+                    assert_eq!(parts.len(), 2);
+                    let (first, second) = (
+                        parts[0]["remote_id"].as_str().unwrap().to_owned(),
+                        parts[1]["remote_id"].as_str().unwrap().to_owned(),
+                    );
+                    assert_eq!(
+                        parts[1]["remote_url"],
+                        format!("https://x.com/ann_lee/status/{second}")
+                    );
+                    let sent: Vec<Value> = mock.tweets.lock().unwrap()[before..]
+                        .iter()
+                        .map(|t| t.1.clone())
+                        .collect();
+                    assert_eq!(sent[0], json!({"text": "one"}));
+                    assert_eq!(
+                        sent[1],
+                        json!({"text": "two", "reply": {"in_reply_to_tweet_id": root}})
+                    );
+                    assert_eq!(
+                        sent[2],
+                        json!({"text": "three", "reply": {"in_reply_to_tweet_id": first}})
+                    );
+
+                    let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                    res.assert_status_ok();
+                    let body = res.json::<Value>();
+                    assert_eq!(body["status"], "deleted");
+                    assert_eq!(body["targets"][0]["parts"], json!([]));
+                    let removed = mock.removed.lock().unwrap().clone();
+                    assert_eq!(removed[removed.len() - 3..], [second, first, root]);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_token_that_runs_out_during_a_thread_is_renewed_before_the_next_part() {
+                    let (s, db, state, _, mock, cookie, team_id, set) = team().await;
+                    let account = x_account(&db, &team_id).await;
+                    // 20 minutes left: no renewal at the start. After the first tweet time
+                    // "passes": the token has a minute left and X no longer takes it.
+                    set_token(&db, account.id, "xtok", 20 * 60).await;
+                    *mock.clock.lock().unwrap() = Some((db.clone(), account.id, 1));
+                    let body = thread(&set, "one", &["two", "three"]);
+                    let id = id_of(&create(&s, &cookie, body).await);
+                    let before = mock.tweets.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let t = &p["targets"][0];
+                    assert_eq!(t["status"], "published", "{t}");
+                    assert_eq!(t["parts"].as_array().unwrap().len(), 2);
+                    assert_eq!(mock.refreshes.load(Ordering::SeqCst), 1, "renewed once");
+                    let sent: Vec<String> = mock.tweets.lock().unwrap()[before..]
+                        .iter()
+                        .map(|t| t.0.clone())
+                        .collect();
+                    assert_eq!(sent.len(), 3);
+                    assert_eq!(sent[0], "xtok");
+                    let row = x_account(&db, &team_id).await;
+                    assert_eq!(sent[1], access_of(&row), "part two used the renewed token");
+                    assert_eq!(sent[2], sent[1]);
+                    assert!(row.meta.get("reconnect").is_none());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_take_down_renews_the_token_between_deletes() {
+                    let (s, db, state, _, mock, cookie, team_id, set) = team().await;
+                    let id =
+                        id_of(&create(&s, &cookie, thread(&set, "one", &["two", "three"])).await);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                    // Time passes after the first delete.
+                    let account = x_account(&db, &team_id).await;
+                    set_token(&db, account.id, "xtok", 20 * 60).await;
+                    *mock.clock.lock().unwrap() = Some((db.clone(), account.id, 1));
+                    let removed = mock.removed.lock().unwrap().len();
+                    let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                    res.assert_status_ok();
+                    assert_eq!(res.json::<Value>()["status"], "deleted");
+                    assert_eq!(mock.removed.lock().unwrap().len(), removed + 3);
+                    assert_eq!(mock.refreshes.load(Ordering::SeqCst), 1);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_failed_part_keeps_the_parts_before_it_and_is_never_retried() {
+                    let (s, db, state, _, mock, cookie, _, set) = team().await;
+                    let body = thread(&set, "one", &["two", "REJECT three", "four"]);
+                    let id = id_of(&create(&s, &cookie, body).await);
+                    let (tweets, attempts) = (
+                        mock.tweets.lock().unwrap().len(),
+                        mock.attempts.load(Ordering::SeqCst),
+                    );
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(mock.tweets.lock().unwrap().len(), tweets + 2);
+                    assert_eq!(
+                        mock.attempts.load(Ordering::SeqCst),
+                        attempts + 3,
+                        "four never went"
+                    );
+                    let p = get_post(&s, &cookie, &id).await;
+                    // The root is up, so the post is published and can come down.
+                    assert_eq!(p["status"], "published", "{p}");
+                    let t = &p["targets"][0];
+                    assert_eq!(t["status"], "failed");
+                    assert_eq!(
+                        t["error"],
+                        "Thread post 2 of 3: Publish: You are not allowed to create a Tweet \
+                         with duplicate content. The posts before it are up."
+                    );
+                    assert_eq!(t["parts"].as_array().unwrap().len(), 1);
+                    assert!(t["remote_url"].is_string());
+
+                    // Never sent again.
+                    publish::publish_post(&state, id.parse().unwrap())
+                        .await
+                        .unwrap();
+                    publish::recover_stuck(&db).await.unwrap();
+                    assert_eq!(mock.attempts.load(Ordering::SeqCst), attempts + 3);
+
+                    let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                    res.assert_status_ok();
+                    let body = res.json::<Value>();
+                    assert_eq!(body["status"], "deleted");
+                    assert_eq!(body["targets"][0]["status"], "deleted");
+                    let removed = mock.removed.lock().unwrap().clone();
+                    assert_eq!(removed.len(), 2, "the saved part and the root");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn out_of_credits_and_rate_limits_say_so_and_are_not_retried() {
+                    let (s, _, state, _, mock, cookie, _, set) = team().await;
+                    let attempts = mock.attempts.load(Ordering::SeqCst);
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "CREDITS please")).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed");
+                    let why = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(why.contains("out of API credits"), "{why}");
+                    assert!(why.contains("Add credits"), "{why}");
+                    assert_eq!(mock.attempts.load(Ordering::SeqCst), attempts + 1);
+
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "LIMIT me")).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed");
+                    assert_eq!(
+                        p["targets"][0]["error"],
+                        "Publish: X rate limit reached; it resets at 2026-11-04 12:30 UTC. It \
+                         was not retried."
+                    );
+                    assert_eq!(mock.attempts.load(Ordering::SeqCst), attempts + 2);
+
+                    // Credits run out midway through a thread: the posts before it stay up.
+                    let body = thread(&set, "one", &["CREDITS two"]);
+                    let id = id_of(&create(&s, &cookie, body).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let why = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(why.starts_with("Thread post 1 of 1: "), "{why}");
+                    assert!(why.contains("out of API credits"), "{why}");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_post_that_will_not_come_down_says_why_and_stays_up() {
+                    let (s, _, state, _, mock, cookie, _, set) = team().await;
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "stays")).await);
+                    publish::tick(&state).await.unwrap();
+                    mock.delete_mode.store(2, Ordering::SeqCst);
+                    let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                    assert_eq!(res.status_code(), 422);
+                    let msg = res.json::<Value>()["message"].as_str().unwrap().to_owned();
+                    assert!(msg.contains("resets at 2026-11-04 12:30 UTC"), "{msg}");
+                    assert!(msg.contains("Delete the post in the X app"), "{msg}");
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+
+                    // Already deleted on X meanwhile: nothing left to take down.
+                    mock.delete_mode.store(1, Ordering::SeqCst);
+                    let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                    res.assert_status_ok();
+                    assert_eq!(res.json::<Value>()["status"], "deleted");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn an_expiring_token_is_renewed_first_and_the_new_refresh_token_saved() {
+                    let (s, db, state, _, mock, cookie, team_id, set) = team().await;
+                    let account = x_account(&db, &team_id).await;
+                    let old = refresh_of(&account);
+                    // Under two minutes left.
+                    set_token(&db, account.id, "xtok", 60).await;
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "renewed")).await);
+                    let tweets = mock.tweets.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                    assert_eq!(mock.refreshes.load(Ordering::SeqCst), 1);
+                    let row = x_account(&db, &team_id).await;
+                    assert!(access_of(&row).starts_with("xtok") && access_of(&row) != "xtok");
+                    assert_ne!(refresh_of(&row), old);
+                    assert!(row.meta.get("reconnect").is_none());
+                    let left = row.token_expires_at.unwrap().timestamp() - Utc::now().timestamp();
+                    assert!(left > 7000, "{left}");
+                    // The tweet went out with the new access token.
+                    assert_eq!(mock.tweets.lock().unwrap()[tweets].0, access_of(&row));
+
+                    // Plenty left: no refresh.
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "again")).await);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                    assert_eq!(mock.refreshes.load(Ordering::SeqCst), 1);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_refresh_without_a_new_refresh_token_keeps_the_current_one() {
+                    let (_, db, state, _, mock, _, team_id, _) = team().await;
+                    let account = x_account(&db, &team_id).await;
+                    let old = refresh_of(&account);
+                    mock.refresh_mode.store(1, Ordering::SeqCst);
+                    set_token(&db, account.id, "xtok", -5).await;
+                    let account = x_account(&db, &team_id).await;
+                    let token = x::fresh_token(&state, &account).await.unwrap();
+                    assert!(token.starts_with("xtok") && token != "xtok");
+                    let row = x_account(&db, &team_id).await;
+                    assert_eq!(refresh_of(&row), old);
+                    assert_eq!(access_of(&row), token);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn two_concurrent_refreshes_spend_the_refresh_token_once() {
+                    let (_, db, state, _, mock, _, team_id, _) = team().await;
+                    let account = x_account(&db, &team_id).await;
+                    let old = refresh_of(&account);
+                    set_token(&db, account.id, "xtok", -5).await;
+                    let account = x_account(&db, &team_id).await;
+                    let (a, b, c) = tokio::join!(
+                        x::fresh_token(&state, &account),
+                        x::fresh_token(&state, &account),
+                        x::fresh_token(&state, &account),
+                    );
+                    let (a, b, c) = (a.unwrap(), b.unwrap(), c.unwrap());
+                    assert!(a != "xtok" && a.starts_with("xtok"));
+                    assert_eq!(a, b, "all three got the one new token");
+                    assert_eq!(b, c);
+                    assert_eq!(mock.refreshes.load(Ordering::SeqCst), 1, "X was asked once");
+                    let row = x_account(&db, &team_id).await;
+                    assert_ne!(refresh_of(&row), old);
+                    assert!(row.meta.get("reconnect").is_none());
+                    assert_eq!(access_of(&row), a);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_refused_refresh_flags_the_account_until_it_is_connected_again() {
+                    let (s, db, state, _, mock, cookie, team_id, set) = team().await;
+                    let account = x_account(&db, &team_id).await;
+                    // A refresh token X has never heard of (or already spent).
+                    set_meta(&db, account.id, json!({"refresh_token": seal("spent")})).await;
+                    set_token(&db, account.id, "xtok", -5).await;
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "a")).await);
+                    let attempts = mock.attempts.load(Ordering::SeqCst);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed");
+                    assert_eq!(p["targets"][0]["error"], publish::X_RECONNECT);
+                    assert_eq!(
+                        mock.attempts.load(Ordering::SeqCst),
+                        attempts,
+                        "no tweet sent"
+                    );
+                    let row = x_account(&db, &team_id).await;
+                    assert_eq!(row.meta["reconnect"], true);
+                    assert_eq!(mock.refreshes.load(Ordering::SeqCst), 1);
+                    // The connections list says so, for the reconnect prompt.
+                    assert_eq!(list(&s, &cookie).await[0]["reconnect"], true);
+
+                    // Flagged: X is not asked again, even by the job, and a live token is not used.
+                    set_token(&db, account.id, "xtok", 3600).await;
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "b")).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["targets"][0]["error"], publish::X_RECONNECT);
+                    forget_others(&db, &team_id).await;
+                    x::refresh_tokens(&state).await.unwrap();
+                    assert_eq!(mock.refreshes.load(Ordering::SeqCst), 1);
+
+                    // Signing in again clears it.
+                    connect_with(&s, &cookie, "good").await;
+                    let row = x_account(&db, &team_id).await;
+                    assert!(row.meta.get("reconnect").is_none());
+                    assert!(list(&s, &cookie).await[0].get("reconnect").is_none());
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "c")).await);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn an_unreachable_refresh_does_not_flag_the_account() {
+                    let (s, db, state, _, mock, cookie, team_id, set) = team().await;
+                    let account = x_account(&db, &team_id).await;
+                    let old = refresh_of(&account);
+                    set_token(&db, account.id, "xtok", -5).await;
+                    mock.refresh_mode.store(2, Ordering::SeqCst);
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "a")).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed");
+                    assert!(p["targets"][0]["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Refresh"));
+                    let row = x_account(&db, &team_id).await;
+                    assert!(row.meta.get("reconnect").is_none());
+                    assert_eq!(refresh_of(&row), old, "the row is as it was");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_token_revoked_on_x_asks_for_a_reconnect() {
+                    let (s, db, state, _, mock, cookie, team_id, set) = team().await;
+                    let account = x_account(&db, &team_id).await;
+                    // Not expired, but X no longer knows it.
+                    set_token(&db, account.id, "revoked", 3600).await;
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "a")).await);
+                    let attempts = mock.attempts.load(Ordering::SeqCst);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed");
+                    assert_eq!(p["targets"][0]["error"], publish::X_RECONNECT);
+                    assert_eq!(mock.attempts.load(Ordering::SeqCst), attempts);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn the_job_renews_tokens_near_their_end_and_skips_flagged_accounts() {
+                    let (_, db, state, _, mock, _, team_id, _) = team().await;
+                    forget_others(&db, &team_id).await;
+                    let account = x_account(&db, &team_id).await;
+                    // 40 minutes left: left alone.
+                    set_token(&db, account.id, "xtok", 40 * 60).await;
+                    assert_eq!(x::refresh_tokens(&state).await.unwrap(), 0);
+                    assert_eq!(mock.refreshes.load(Ordering::SeqCst), 0);
+                    // 20 minutes left: renewed.
+                    set_token(&db, account.id, "xtok", 20 * 60).await;
+                    assert_eq!(x::refresh_tokens(&state).await.unwrap(), 1);
+                    let row = x_account(&db, &team_id).await;
+                    assert!(access_of(&row).starts_with("xtok") && access_of(&row) != "xtok");
+                    let left = row.token_expires_at.unwrap().timestamp() - Utc::now().timestamp();
+                    assert!(left > 7000, "{left}");
+                    assert_eq!(x::refresh_tokens(&state).await.unwrap(), 0, "fresh now");
+                    // Flagged: skipped.
+                    set_meta(&db, account.id, json!({"reconnect": true})).await;
+                    set_token(&db, account.id, "xtok", -5).await;
+                    assert_eq!(x::refresh_tokens(&state).await.unwrap(), 0);
+                    assert_eq!(mock.refreshes.load(Ordering::SeqCst), 1);
                 }
             }
 
