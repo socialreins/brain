@@ -58,6 +58,11 @@ pub struct Connection {
     /// "Allow access to your direct messages"; without it comments and mentions still arrive.
     /// Checked on connect and again on every inbox poll.
     pub dm_access: bool,
+    /// Facebook and Instagram: why Meta did not subscribe the Page to webhooks when it was
+    /// connected, so its comments and messages do not arrive until it is connected again. Absent
+    /// when the subscription worked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook_error: Option<String>,
     /// The social sets holding the account; the team's Default set is always one of them.
     pub set_ids: Vec<Uuid>,
     pub created_at: DateTime<FixedOffset>,
@@ -148,6 +153,7 @@ fn connection_json(a: social_accounts::Model, set_ids: Vec<Uuid>) -> Connection 
         avatar_url: a.avatar_url,
         token_expires_at: a.token_expires_at,
         dm_access: a.dm_access,
+        webhook_error: a.meta["webhook_error"].as_str().map(str::to_owned),
         set_ids,
         created_at: a.created_at,
     }
@@ -499,13 +505,26 @@ async fn disconnect(
     if !t.current.recent() {
         return reply(StatusCode::FORBIDDEN, "reauth_required");
     }
+    let gone = social_accounts::Entity::find_by_id(id)
+        .filter(social_accounts::Column::TeamId.eq(t.team.id))
+        .one(&app.db)
+        .await;
+    let gone = match gone {
+        Ok(found) => found,
+        Err(e) => return internal(e, "connection read"),
+    };
     let deleted = social_accounts::Entity::delete_many()
         .filter(social_accounts::Column::Id.eq(id))
         .filter(social_accounts::Column::TeamId.eq(t.team.id))
         .exec(&app.db)
         .await;
     match deleted {
-        Ok(r) if r.rows_affected == 1 => StatusCode::NO_CONTENT.into_response(),
+        Ok(r) if r.rows_affected == 1 => {
+            if let Some(gone) = gone {
+                super::meta::unsubscribe(&app, &gone).await;
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(_) => not_found(),
         Err(e) => internal(e, "connection delete"),
     }

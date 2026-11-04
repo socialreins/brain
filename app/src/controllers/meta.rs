@@ -103,6 +103,61 @@ fn has(held: &HashSet<(String, String)>, provider: &str, id: &str) -> bool {
     held.contains(&(provider.to_owned(), id.to_owned()))
 }
 
+/// How long a webhook subscription may take before the connect goes on without it.
+const SUBSCRIBE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Subscribes the Page to the app's webhooks, so its comments and messages (and its Instagram
+/// account's) arrive. Never fails the connect: the reason, when it did not work, is logged and
+/// kept as `meta.webhook_error` on the account.
+async fn subscribe(app: &AppState, page: &Page) -> Option<String> {
+    let call = app.meta.subscribe_page(&page.id, &page.access_token);
+    let why = match tokio::time::timeout(SUBSCRIBE_WAIT, call).await {
+        Ok(Ok(())) => return None,
+        Ok(Err(PostError::Reconnect)) => "Webhook: Meta refused the Page's token, or the \
+            pages_manage_metadata permission is missing."
+            .to_owned(),
+        Ok(Err(PostError::Failed(why))) => why,
+        Err(_) => "Webhook: Meta took too long.".to_owned(),
+    };
+    tracing::warn!(page = %page.id, why, "meta webhook subscription failed");
+    Some(why)
+}
+
+/// After a Facebook or Instagram account is disconnected: takes the app's webhook subscription
+/// off its Page, unless another account (in any team) still uses that Page. Best effort: a
+/// failure is only logged.
+pub async fn unsubscribe(app: &AppState, gone: &social_accounts::Model) {
+    let page = match gone.provider.as_str() {
+        "facebook" => gone.external_id.as_str(),
+        "instagram" => gone.meta["page_id"].as_str().unwrap_or_default(),
+        _ => return,
+    };
+    let Some(token) = app
+        .cipher
+        .decrypt(&gone.access_token)
+        .and_then(|b| String::from_utf8(b).ok())
+    else {
+        return;
+    };
+    let used = Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT EXISTS (SELECT 1 FROM social_accounts WHERE (provider = 'facebook' \
+         AND external_id = $1) OR (provider = 'instagram' AND meta->>'page_id' = $1)) AS used",
+        [page.into()],
+    );
+    match app.db.query_one_raw(used).await {
+        Ok(Some(r)) if r.try_get("", "used") == Ok(false) => {}
+        Ok(_) => return,
+        Err(e) => return tracing::warn!(error = %e, "meta page use check failed"),
+    }
+    let call = app.meta.unsubscribe_page(page, &token);
+    match tokio::time::timeout(SUBSCRIBE_WAIT, call).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(page, error = ?e, "meta webhook unsubscribe failed"),
+        Err(_) => tracing::warn!(page, "meta webhook unsubscribe timed out"),
+    }
+}
+
 /// Saves `page` as a Facebook account, or with `ig` its Instagram account (on the Page's token,
 /// `meta.page_id` naming the Page); a reconnect takes the new token and profile.
 async fn save(
@@ -113,7 +168,8 @@ async fn save(
 ) -> Result<Connection, DbErr> {
     let now = Utc::now().fixed_offset();
     let new_id = Uuid::now_v7();
-    let (provider, external_id, handle, name, picture, meta) = match ig {
+    let webhook_error = subscribe(app, page).await;
+    let (provider, external_id, handle, name, picture, mut meta) = match ig {
         None => (
             "facebook",
             &page.id,
@@ -131,6 +187,9 @@ async fn save(
             serde_json::json!({ "page_id": page.id }),
         ),
     };
+    if let Some(why) = webhook_error {
+        meta["webhook_error"] = why.into();
+    }
     let row = social_accounts::ActiveModel {
         id: Set(new_id),
         team_id: Set(team_id),

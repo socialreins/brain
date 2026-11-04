@@ -5736,6 +5736,14 @@ mod teams {
                     (axum::http::StatusCode::BAD_REQUEST, Json(body))
                 }
 
+                fn refused_sub(code: i64, subcode: i64, message: &str) -> Answer {
+                    let error = json!({"message": message, "code": code, "error_subcode": subcode});
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": error })),
+                    )
+                }
+
                 fn bearer(h: &axum::http::HeaderMap) -> String {
                     let t = h.get("authorization").and_then(|v| v.to_str().ok());
                     t.unwrap_or_default().to_owned()
@@ -5818,6 +5826,34 @@ mod teams {
                                 "video_reels" => json!({"success": true}),
                                 "media" => json!({"id": n.to_string()}),
                                 "media_publish" => json!({"id": n.to_string()}),
+                                // Page 102 may not subscribe (permission missing).
+                                "subscribed_apps" if node == "102" => {
+                                    return refused(200, "(#200) pages_manage_metadata is missing")
+                                }
+                                "subscribed_apps" => json!({"success": true}),
+                                "comments" | "replies" => json!({"id": format!("{node}_r{n}")}),
+                                "messages" => {
+                                    let to = f.get("recipient").map(String::as_str);
+                                    let to = to.unwrap_or_default();
+                                    // Comment 666 cannot be messaged, the text "LIMIT" is
+                                    // rate limited, and "WINDOW" is outside the 24 hours.
+                                    let said = f.get("message").map(String::as_str);
+                                    let said = said.unwrap_or_default();
+                                    if to.contains("666") {
+                                        return refused_sub(100, 2_018_001, "No matching user");
+                                    }
+                                    if said.contains("LIMIT") {
+                                        return refused(613, "Calls to this api have exceeded");
+                                    }
+                                    if said.contains("WINDOW") {
+                                        return refused_sub(
+                                            10,
+                                            2_018_278,
+                                            "Outside allowed window",
+                                        );
+                                    }
+                                    json!({"recipient_id": "9", "message_id": format!("mid.{n}")})
+                                }
                                 _ => return refused(100, "unknown edge"),
                             };
                             CALLS.lock().unwrap().push((format!("{node}/{edge}"), f));
@@ -5840,8 +5876,21 @@ mod teams {
                                 }
                                 Some("permalink") => ok(json!({
                                     "permalink": format!("https://www.instagram.com/p/X{id}/")})),
+                                Some("name,profile_pic") => ok(json!({
+                                    "name": "Dana Doe", "profile_pic": "https://scontent.example/d.jpg"})),
+                                Some("name,username,profile_pic") => ok(json!({
+                                    "name": "Ivy", "username": "ivy_ig",
+                                    "profile_pic": "https://scontent.example/i.jpg"})),
                                 _ => refused(100, "unknown fields"),
                             }
+                        };
+                    let unsubscribe =
+                        |h: axum::http::HeaderMap, Path((node, edge)): Path<(String, String)>| async move {
+                            if !page_token(&h) || edge != "subscribed_apps" {
+                                return refused(190, "expired");
+                            }
+                            REMOVED.lock().unwrap().push(format!("{node}/{edge}"));
+                            ok(json!({"success": true}))
                         };
                     let remove = |h: axum::http::HeaderMap, Path(id): Path<String>| async move {
                         if !page_token(&h) {
@@ -5869,7 +5918,7 @@ mod teams {
                     let app = Router::new()
                         .route("/v26.0/oauth/access_token", post(token))
                         .route("/v26.0/me/accounts", get(accounts))
-                        .route("/v26.0/{node}/{edge}", post(edge))
+                        .route("/v26.0/{node}/{edge}", post(edge).delete(unsubscribe))
                         .route("/v26.0/{id}", get(node).delete(remove))
                         .route("/video-upload/v26.0/{id}", post(upload))
                         .route(
@@ -5889,6 +5938,14 @@ mod teams {
                 async fn on_meta(
                     configured: bool,
                 ) -> (TestServer, DatabaseConnection, AppState, String) {
+                    on_meta_with(configured, Some("vtoken")).await
+                }
+
+                /// `on_meta` with `META_WEBHOOK_VERIFY_TOKEN` set to `hook`.
+                async fn on_meta_with(
+                    configured: bool,
+                    hook: Option<&str>,
+                ) -> (TestServer, DatabaseConnection, AppState, String) {
                     let base = mock_meta().await;
                     let mut config = Config::from_env().expect("test config");
                     config.trust_proxy = true;
@@ -5897,6 +5954,7 @@ mod teams {
                     m.graph_url = base.clone();
                     m.rupload_url = base.clone();
                     m.poll_every = std::time::Duration::ZERO;
+                    m.webhook_token = hook.map(str::to_owned);
                     config.meta = m;
                     let disk = object_store::local::LocalFileSystem::new_with_prefix(media_dir())
                         .unwrap()
@@ -6327,6 +6385,681 @@ mod teams {
                     let (p, _) = publish_one(ctx, &cookie, post, &["/img.jpg"]).await;
                     assert_eq!(p["status"], "failed");
                     assert_eq!(p["targets"][0]["error"], publish::META_RECONNECT);
+                }
+
+                // The Meta webhook: handshake, signatures, ingest, replies, subscriptions.
+
+                use sea_orm::QueryOrder;
+                use socialreins_brain::{
+                    inbox::{self, Via},
+                    models::{inbox_items, inbox_replies},
+                };
+
+                /// Meta accounts left by earlier tests would take part in these deliveries.
+                async fn clean(db: &DatabaseConnection) {
+                    social_accounts::Entity::delete_many()
+                        .filter(social_accounts::Column::Provider.is_in(["facebook", "instagram"]))
+                        .exec(db)
+                        .await
+                        .unwrap();
+                    CALLS.lock().unwrap().clear();
+                    REMOVED.lock().unwrap().clear();
+                }
+
+                /// A delivery as Meta signs it with the app secret.
+                async fn deliver(s: &TestServer, payload: &Value) -> axum_test::TestResponse {
+                    let body = serde_json::to_vec(payload).unwrap();
+                    let sig = socialreins_core::webhook::sign_sha256("msecret", &body);
+                    s.post("/webhooks/meta")
+                        .add_header("x-hub-signature-256", sig)
+                        .content_type("application/json")
+                        .bytes(body.into())
+                        .await
+                }
+
+                fn now() -> i64 {
+                    chrono::Utc::now().timestamp()
+                }
+
+                fn page_comment(comment: &str, text: &str, from: &str, when: i64) -> Value {
+                    json!({"object": "page", "entry": [{"id": "101", "time": when, "changes": [
+                        {"field": "feed", "value": {"item": "comment", "verb": "add",
+                            "comment_id": comment, "post_id": "101_9", "parent_id": "101_9",
+                            "from": {"id": from, "name": "Ada Fan"}, "message": text,
+                            "created_time": when}}]}]})
+                }
+
+                fn page_message(entry: &str, mid: &str, from: &str, text: &str) -> Value {
+                    let mut message = json!({"mid": mid, "text": text});
+                    if from == entry {
+                        message["is_echo"] = json!(true);
+                    }
+                    json!({"object": "page", "entry": [{"id": entry, "time": now(), "messaging": [
+                        {"sender": {"id": from}, "recipient": {"id": "101"},
+                         "timestamp": now() * 1000, "message": message}]}]})
+                }
+
+                fn ig_comment(entry: &str, id: &str, from: &str) -> Value {
+                    json!({"object": "instagram", "entry": [{"id": entry, "time": now(), "changes": [
+                        {"field": "comments", "value": {"id": id, "text": "so nice",
+                            "from": {"id": from, "username": "jane"},
+                            "media": {"id": "17900000", "media_product_type": "FEED"}}}]}]})
+                }
+
+                fn ig_message(entry: &str, mid: &str, from: &str) -> Value {
+                    let mut message = json!({"mid": mid, "text": "hi from ig"});
+                    if from == entry {
+                        message["is_echo"] = json!(true);
+                    }
+                    json!({"object": "instagram", "entry": [{"id": entry, "time": now(), "messaging": [
+                        {"sender": {"id": from}, "recipient": {"id": "1784"},
+                         "timestamp": now() * 1000, "message": message}]}]})
+                }
+
+                async fn stored(db: &DatabaseConnection, team_id: &str) -> Vec<inbox_items::Model> {
+                    inbox_items::Entity::find()
+                        .filter(
+                            inbox_items::Column::TeamId.eq(team_id.parse::<uuid::Uuid>().unwrap()),
+                        )
+                        .order_by_asc(inbox_items::Column::RemoteId)
+                        .all(db)
+                        .await
+                        .unwrap()
+                }
+
+                /// Polls `f` until it gives something: the work after the `200` takes a moment.
+                async fn until<T, F: std::future::Future<Output = Option<T>>>(
+                    mut f: impl FnMut() -> F,
+                ) -> T {
+                    for _ in 0..100 {
+                        if let Some(found) = f().await {
+                            return found;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    panic!("nothing happened in 5 seconds");
+                }
+
+                fn calls_since(before: usize) -> Vec<(String, HashMap<String, String>)> {
+                    CALLS.lock().unwrap()[before..].to_vec()
+                }
+
+                async fn inbox_items_of(s: &TestServer, cookie: &str, inbox: &str) -> Vec<Value> {
+                    let res = s
+                        .get(&format!("/v1/inboxes/{inbox}/items"))
+                        .add_header("cookie", cookie)
+                        .await;
+                    res.assert_status_ok();
+                    res.json::<Value>()["items"].as_array().unwrap().clone()
+                }
+
+                async fn all_inbox_id(s: &TestServer, cookie: &str) -> String {
+                    let res = s.get("/v1/inboxes").add_header("cookie", cookie).await;
+                    res.assert_status_ok();
+                    res.json::<Value>()[0]["id"].as_str().unwrap().to_owned()
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn the_handshake_echoes_the_challenge_for_the_right_token_only() {
+                    let (s, _, _, _) = on_meta(true).await;
+                    let base = "/webhooks/meta?hub.mode=subscribe&hub.challenge=1158201444";
+                    let res = s.get(&format!("{base}&hub.verify_token=vtoken")).await;
+                    res.assert_status_ok();
+                    assert_eq!(res.text(), "1158201444");
+                    let kind = res.header("content-type");
+                    assert!(kind.to_str().unwrap().starts_with("text/plain"));
+                    for query in [
+                        format!("{base}&hub.verify_token=vtokeo"),
+                        format!("{base}&hub.verify_token=vtoken2"),
+                        format!("{base}&hub.verify_token="),
+                        base.to_owned(),
+                        "/webhooks/meta?hub.mode=unsubscribe&hub.verify_token=vtoken&hub.challenge=1"
+                            .to_owned(),
+                        "/webhooks/meta?hub.mode=subscribe&hub.verify_token=vtoken".to_owned(),
+                        "/webhooks/meta".to_owned(),
+                    ] {
+                        let res = s.get(&query).await;
+                        assert_eq!(res.status_code(), 403, "{query}");
+                        res.assert_json(&json!({"error": "forbidden"}));
+                    }
+                    // Without META_WEBHOOK_VERIFY_TOKEN the webhook is off.
+                    let (s, _, _, _) = on_meta_with(true, None).await;
+                    let res = s.get(&format!("{base}&hub.verify_token=")).await;
+                    assert_eq!(res.status_code(), 404);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn deliveries_need_a_valid_signature_before_anything_is_read() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (_, team_id) = owner_connected(&s, &db).await;
+                    let payload = page_comment("101_9_1", "hi", "777", now());
+                    let body = serde_json::to_vec(&payload).unwrap();
+                    let good = socialreins_core::webhook::sign_sha256("msecret", &body);
+                    let tampered = {
+                        let mut other = payload.clone();
+                        other["entry"][0]["changes"][0]["value"]["message"] = json!("bye");
+                        serde_json::to_vec(&other).unwrap()
+                    };
+                    let post = |body: Vec<u8>, sig: Option<&str>| {
+                        let mut r = s.post("/webhooks/meta").content_type("application/json");
+                        if let Some(sig) = sig {
+                            r = r.add_header("x-hub-signature-256", sig.to_owned());
+                        }
+                        r.bytes(body.into())
+                    };
+                    let zeros = format!("sha256={}", "0".repeat(64));
+                    let wrong_key = socialreins_core::webhook::sign_sha256("other", &body);
+                    let sha1 = good.replace("sha256=", "sha1=");
+                    let uppercase = good.to_uppercase();
+                    let cases = [
+                        (body.clone(), None),
+                        (body.clone(), Some(zeros.as_str())),
+                        (body.clone(), Some("")),
+                        (body.clone(), Some(wrong_key.as_str())),
+                        (body.clone(), Some(sha1.as_str())),
+                        (body.clone(), Some(uppercase.as_str())),
+                        (body.clone(), Some(&good[7..])),
+                        (tampered, Some(good.as_str())),
+                    ];
+                    for (i, (body, sig)) in cases.into_iter().enumerate() {
+                        let res = post(body, sig).await;
+                        assert_eq!(res.status_code(), 403, "case {i}");
+                        res.assert_json(&json!({"error": "forbidden"}));
+                    }
+                    assert!(
+                        stored(&db, &team_id).await.is_empty(),
+                        "no work for a bad one"
+                    );
+
+                    assert_eq!(post(body.clone(), Some(&good)).await.status_code(), 200);
+                    assert_eq!(stored(&db, &team_id).await.len(), 1);
+                    // A signed body that is not JSON, or says nothing we use, is still a 200.
+                    let junk = b"not json".to_vec();
+                    let sig = socialreins_core::webhook::sign_sha256("msecret", &junk);
+                    assert_eq!(post(junk, Some(&sig)).await.status_code(), 200);
+                    let other =
+                        json!({"object": "whatsapp_business_account", "entry": [{"id": "1"}]});
+                    assert_eq!(deliver(&s, &other).await.status_code(), 200);
+                    // A body over the cap is refused outright.
+                    let big = vec![b' '; 300 * 1024];
+                    let sig = socialreins_core::webhook::sign_sha256("msecret", &big);
+                    assert_eq!(post(big, Some(&sig)).await.status_code(), 413);
+                    assert_eq!(stored(&db, &team_id).await.len(), 1);
+
+                    // No app secret, no webhook.
+                    let (s, _, _, _) = on_meta(false).await;
+                    let res = s
+                        .post("/webhooks/meta")
+                        .add_header("x-hub-signature-256", good.clone())
+                        .bytes(body.into())
+                        .await;
+                    assert_eq!(res.status_code(), 404);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn facebook_comments_and_messages_land_in_the_inbox() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    let when = now();
+                    let res = deliver(&s, &page_comment("101_9_5", "Love it", "777", when)).await;
+                    assert_eq!(res.status_code(), 200);
+                    let res = deliver(&s, &page_message("101", "m_1", "777", "hello")).await;
+                    assert_eq!(res.status_code(), 200);
+                    let items = stored(&db, &team_id).await;
+                    assert_eq!(items.len(), 2);
+                    let fb = account(&db, &team_id, "facebook", "101").await;
+                    let comment = items.iter().find(|i| i.kind == "comment").unwrap();
+                    assert_eq!(comment.social_account_id, fb.id);
+                    assert_eq!(comment.platform, "facebook");
+                    assert_eq!(comment.remote_id, "101_9_5");
+                    assert_eq!(comment.parent_remote_id.as_deref(), Some("101_9"));
+                    assert_eq!(comment.root_remote_id.as_deref(), Some("101_9"));
+                    assert_eq!(comment.author_id, "777");
+                    assert_eq!(comment.author_name.as_deref(), Some("Ada Fan"));
+                    assert_eq!(comment.text, "Love it");
+                    assert_eq!(comment.received_at.timestamp(), when);
+                    assert_eq!(comment.state, "open");
+                    let dm = items.iter().find(|i| i.kind == "dm").unwrap();
+                    assert_eq!(dm.remote_id, "m_1");
+                    assert_eq!(dm.convo_id.as_deref(), Some("777"));
+                    assert_eq!(dm.text, "hello");
+
+                    // The sender's name comes from a lookup after the 200.
+                    let id = dm.id;
+                    let named = until(|| async {
+                        let row = inbox_items::Entity::find_by_id(id).one(&db).await.unwrap();
+                        row.filter(|r| r.author_name.is_some())
+                    })
+                    .await;
+                    assert_eq!(named.author_name.as_deref(), Some("Dana Doe"));
+                    assert_eq!(
+                        named.author_avatar.as_deref(),
+                        Some("https://scontent.example/d.jpg")
+                    );
+
+                    // The team's inbox shows them, with the post they hang off and a link.
+                    let all = all_inbox_id(&s, &cookie).await;
+                    let page = inbox_items_of(&s, &cookie, &all).await;
+                    assert_eq!(page.len(), 2);
+                    let c = page.iter().find(|i| i["kind"] == "comment").unwrap();
+                    assert_eq!(c["platform"], "facebook");
+                    assert_eq!(c["parent_remote_id"], "101_9");
+                    assert_eq!(c["remote_url"], "https://www.facebook.com/101_9");
+                    assert_eq!(c["author"]["name"], "Ada Fan");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn instagram_comments_and_messages_land_in_the_inbox() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    assert_eq!(
+                        deliver(&s, &ig_comment("1784", "1790", "555"))
+                            .await
+                            .status_code(),
+                        200
+                    );
+                    assert_eq!(
+                        deliver(&s, &ig_message("1784", "ig_m1", "555"))
+                            .await
+                            .status_code(),
+                        200
+                    );
+                    let items = stored(&db, &team_id).await;
+                    assert_eq!(items.len(), 2);
+                    let comment = items.iter().find(|i| i.kind == "comment").unwrap();
+                    assert_eq!(comment.platform, "instagram");
+                    assert_eq!(comment.author_handle.as_deref(), Some("jane"));
+                    assert_eq!(comment.parent_remote_id.as_deref(), Some("17900000"));
+                    assert_eq!(comment.root_remote_id.as_deref(), Some("17900000"));
+                    let ig = account(&db, &team_id, "instagram", "1784").await;
+                    assert_eq!(comment.social_account_id, ig.id);
+                    // Its link and the sender's profile are looked up after the 200.
+                    let (cid, mid) = (
+                        comment.id,
+                        items.iter().find(|i| i.kind == "dm").unwrap().id,
+                    );
+                    let linked = until(|| async {
+                        let row = inbox_items::Entity::find_by_id(cid).one(&db).await.unwrap();
+                        row.filter(|r| r.permalink.is_some())
+                    })
+                    .await;
+                    assert_eq!(
+                        linked.permalink.as_deref(),
+                        Some("https://www.instagram.com/p/X17900000/")
+                    );
+                    let named = until(|| async {
+                        let row = inbox_items::Entity::find_by_id(mid).one(&db).await.unwrap();
+                        row.filter(|r| r.author_name.is_some())
+                    })
+                    .await;
+                    assert_eq!(named.author_handle.as_deref(), Some("ivy_ig"));
+                    assert_eq!(named.author_name.as_deref(), Some("Ivy"));
+                    assert_eq!(named.convo_id.as_deref(), Some("555"));
+
+                    // An inbox for Instagram only shows these; one for Facebook, nothing.
+                    for (platform, want) in [("instagram", 2), ("facebook", 0)] {
+                        let res = req(&s, Method::POST, "/v1/inboxes", &cookie)
+                            .json(&json!({"name": platform, "filters": {"platforms": [platform]}}))
+                            .await;
+                        assert_eq!(res.status_code(), 201, "{}", res.text());
+                        let id = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                        assert_eq!(
+                            inbox_items_of(&s, &cookie, &id).await.len(),
+                            want,
+                            "{platform}"
+                        );
+                    }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn echoes_own_comments_unknown_accounts_and_repeats_are_ignored() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (_, team_id) = owner_connected(&s, &db).await;
+                    for payload in [
+                        // Our own comment, and a reply from our own Page.
+                        page_comment("101_9_1", "thanks!", "101", now()),
+                        // What the Page itself sent (an echo).
+                        page_message("101", "m_echo", "101", "sent by us"),
+                        ig_comment("1784", "1791", "1784"),
+                        ig_message("1784", "ig_echo", "1784"),
+                        // A Page and an Instagram account nobody connected.
+                        page_message("999", "m_2", "777", "who am i"),
+                        ig_comment("555000", "1792", "555"),
+                        json!({"object": "page", "entry": [{"id": "101", "changes": [
+                            {"field": "feed", "value": {"item": "reaction", "verb": "add"}},
+                            {"field": "feed", "value": {"item": "comment", "verb": "remove",
+                                "comment_id": "101_9_2", "post_id": "101_9",
+                                "from": {"id": "777"}}},
+                            {"field": "feed", "value": {"item": "status", "verb": "add"}}]}]}),
+                    ] {
+                        assert_eq!(deliver(&s, &payload).await.status_code(), 200);
+                    }
+                    assert!(stored(&db, &team_id).await.is_empty());
+
+                    // The same delivery twice, even in one body, adds one item.
+                    let once = page_comment("101_9_3", "again", "777", now());
+                    let twice = json!({"object": "page", "entry": [
+                        once["entry"][0].clone(), once["entry"][0].clone()]});
+                    for payload in [&once, &once, &twice] {
+                        assert_eq!(deliver(&s, payload).await.status_code(), 200);
+                    }
+                    let dm = page_message("101", "m_3", "777", "dup");
+                    assert_eq!(deliver(&s, &dm).await.status_code(), 200);
+                    assert_eq!(deliver(&s, &dm).await.status_code(), 200);
+                    let items = stored(&db, &team_id).await;
+                    assert_eq!(
+                        items.len(),
+                        2,
+                        "{:?}",
+                        items.iter().map(|i| &i.remote_id).collect::<Vec<_>>()
+                    );
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn each_team_with_the_account_gets_its_own_items() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (cookie_a, team_a) = owner_connected(&s, &db).await;
+                    let (cookie_b, team_b) = owner_connected(&s, &db).await;
+                    let (_, cookie_c, _) = user(&s, &db).await;
+                    let res = deliver(&s, &page_comment("101_9_7", "to both", "777", now())).await;
+                    assert_eq!(res.status_code(), 200);
+                    let (a, b) = (stored(&db, &team_a).await, stored(&db, &team_b).await);
+                    assert_eq!((a.len(), b.len()), (1, 1));
+                    assert_ne!(a[0].id, b[0].id);
+                    assert_ne!(a[0].social_account_id, b[0].social_account_id);
+                    assert_eq!(a[0].team_id.to_string(), team_a);
+                    assert_eq!(b[0].team_id.to_string(), team_b);
+                    for (cookie, want) in [(&cookie_a, a[0].id), (&cookie_b, b[0].id)] {
+                        let all = all_inbox_id(&s, cookie).await;
+                        let page = inbox_items_of(&s, cookie, &all).await;
+                        assert_eq!(page.len(), 1);
+                        assert_eq!(page[0]["id"], want.to_string());
+                    }
+                    // A team without the account sees nothing, and cannot open another's item.
+                    let all = all_inbox_id(&s, &cookie_c).await;
+                    assert!(inbox_items_of(&s, &cookie_c, &all).await.is_empty());
+                    let res = s
+                        .get(&format!("/v1/inbox-items/{}", a[0].id))
+                        .add_header("cookie", &cookie_c)
+                        .await;
+                    assert_eq!(res.status_code(), 404);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connecting_subscribes_the_page_and_disconnecting_unsubscribes() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    // Page 101 once for its Facebook account and once for Instagram.
+                    let subscribed = calls_since(0)
+                        .into_iter()
+                        .filter(|(path, _)| path == "101/subscribed_apps")
+                        .collect::<Vec<_>>();
+                    assert_eq!(subscribed.len(), 2);
+                    assert_eq!(subscribed[0].1["subscribed_fields"], "feed,messages");
+                    let accounts = list(&s, &cookie).await;
+                    assert!(accounts.iter().all(|a| a.get("webhook_error").is_none()));
+
+                    // A refusal never fails the connect, but shows on the account.
+                    connect_meta(&s, &cookie, "good").await;
+                    let res = pick(&s, &cookie, json!({"facebook": ["102"]})).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let saved: Vec<Value> = res.json();
+                    let why = saved[0]["webhook_error"].as_str().unwrap();
+                    assert!(why.contains("pages_manage_metadata"), "{why}");
+                    assert!(!why.contains("pt102"));
+                    let shop = account(&db, &team_id, "facebook", "102").await;
+                    assert_eq!(shop.meta["webhook_error"], why);
+                    // A reconnect subscribes every connected Page again (101 twice, 102 refuses).
+                    let before = calls_since(0).len();
+                    connect_meta(&s, &cookie, "good").await;
+                    assert_eq!(calls_since(before).len(), 2);
+                    assert!(list(&s, &cookie)
+                        .await
+                        .iter()
+                        .any(|a| a["webhook_error"] == why));
+
+                    // The Page stays subscribed while one of its accounts is connected.
+                    let fb = account(&db, &team_id, "facebook", "101").await;
+                    let ig = account(&db, &team_id, "instagram", "1784").await;
+                    let res = req(
+                        &s,
+                        Method::DELETE,
+                        &format!("/v1/connections/{}", fb.id),
+                        &cookie,
+                    )
+                    .await;
+                    assert_eq!(res.status_code(), 204);
+                    assert!(REMOVED.lock().unwrap().is_empty());
+                    let res = req(
+                        &s,
+                        Method::DELETE,
+                        &format!("/v1/connections/{}", ig.id),
+                        &cookie,
+                    )
+                    .await;
+                    assert_eq!(res.status_code(), 204);
+                    assert_eq!(*REMOVED.lock().unwrap(), ["101/subscribed_apps"]);
+
+                    // Nor does it come off while another team has the Page.
+                    let (other, _) = owner_connected(&s, &db).await;
+                    let (mine, _) = owner_connected(&s, &db).await;
+                    REMOVED.lock().unwrap().clear();
+                    for a in list(&s, &mine).await {
+                        let id = a["id"].as_str().unwrap();
+                        let path = format!("/v1/connections/{id}");
+                        let res = req(&s, Method::DELETE, &path, &mine).await;
+                        assert_eq!(res.status_code(), 204);
+                    }
+                    assert!(REMOVED.lock().unwrap().is_empty());
+                    assert_eq!(list(&s, &other).await.len(), 2);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn replies_and_dms_go_out_through_the_graph_api_once() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    deliver(&s, &page_comment("101_9_5", "Love it", "777", now())).await;
+                    deliver(&s, &ig_comment("1784", "1790", "555")).await;
+                    deliver(&s, &page_message("101", "m_1", "777", "hello")).await;
+                    deliver(&s, &ig_message("1784", "ig_m1", "555")).await;
+                    let items = stored(&db, &team_id).await;
+                    let item =
+                        |remote: &str| items.iter().find(|i| i.remote_id == remote).unwrap().id;
+                    let reply = |id: uuid::Uuid, text: &str| {
+                        req(
+                            &s,
+                            Method::POST,
+                            &format!("/v1/inbox-items/{id}/reply"),
+                            &cookie,
+                        )
+                        .json(&json!({ "text": text }))
+                    };
+
+                    // A public reply: /comments on Facebook, /replies on Instagram.
+                    let before = calls_since(0).len();
+                    let res = reply(item("101_9_5"), "Thank you!").await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let body = res.json::<Value>();
+                    assert_eq!(body["replies"][0]["kind"], "public");
+                    assert!(body["replied_at"].is_string());
+                    let res = reply(item("1790"), "Glad you like it").await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let calls = calls_since(before);
+                    assert_eq!(calls[0].0, "101_9_5/comments");
+                    assert_eq!(calls[0].1["message"], "Thank you!");
+                    assert_eq!(calls[1].0, "1790/replies");
+                    assert_eq!(calls[1].1["message"], "Glad you like it");
+
+                    // A DM goes from the Page (Instagram through its linked Page) to the person.
+                    let before = calls_since(0).len();
+                    let res = reply(item("m_1"), "Hi Dana").await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    assert_eq!(res.json::<Value>()["replies"][0]["kind"], "dm");
+                    assert_eq!(reply(item("ig_m1"), "Hi Ivy").await.status_code(), 201);
+                    let calls = calls_since(before);
+                    assert_eq!(calls[0].0, "101/messages");
+                    assert_eq!(calls[0].1["recipient"], r#"{"id":"777"}"#);
+                    assert_eq!(calls[0].1["message"], r#"{"text":"Hi Dana"}"#);
+                    assert_eq!(calls[0].1["messaging_type"], "RESPONSE");
+                    assert_eq!(calls[1].0, "101/messages");
+                    assert_eq!(calls[1].1["recipient"], r#"{"id":"555"}"#);
+
+                    // What Meta refuses comes back as a reason, never retried.
+                    let before = calls_since(0).len();
+                    let res = reply(item("m_1"), "LIMIT").await;
+                    assert_eq!(res.status_code(), 429);
+                    let res = reply(item("m_1"), "WINDOW").await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json_contains(&json!({"error": "outside_window"}));
+                    assert_eq!(
+                        calls_since(before).len(),
+                        0,
+                        "the mock refused before recording"
+                    );
+                    let res = reply(item("m_1"), &"a".repeat(2001)).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "invalid_text"}));
+                    let res = reply(item("1790"), &"a".repeat(2201)).await;
+                    assert_eq!(res.status_code(), 422);
+
+                    // A DM more than 24 hours after the person's last message is not sent.
+                    let old = (chrono::Utc::now() - chrono::Duration::hours(25)).fixed_offset();
+                    for remote in ["m_1", "ig_m1"] {
+                        let row = inbox_items::ActiveModel {
+                            id: Set(item(remote)),
+                            received_at: Set(old),
+                            ..Default::default()
+                        };
+                        inbox_items::Entity::update(row).exec(&db).await.unwrap();
+                    }
+                    let before = calls_since(0).len();
+                    let res = reply(item("m_1"), "Late hello").await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json_contains(&json!({"error": "outside_window"}));
+                    assert_eq!(calls_since(before).len(), 0);
+
+                    // A token Meta refuses asks for a new connect, in Meta's words.
+                    let fb = account(&db, &team_id, "facebook", "101").await;
+                    let row = social_accounts::ActiveModel {
+                        id: Set(fb.id),
+                        access_token: Set(cipher().encrypt(b"dead")),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(row)
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                    let res = reply(item("101_9_5"), "Second thanks").await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json_contains(&json!({"error": "meta_reconnect_required"}));
+                    let sent = inbox_replies::Entity::find()
+                        .filter(inbox_replies::Column::InboxItemId.eq(item("101_9_5")))
+                        .all(&db)
+                        .await
+                        .unwrap();
+                    assert_eq!(sent.len(), 1, "only the first reply went out");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn comment_automations_reply_privately_once_with_a_public_fallback() {
+                    let (s, db, state, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                        .json(&json!({
+                            "name": "Guide by DM", "trigger": "comment_received",
+                            "conditions": {},
+                            "actions": [{"type": "send_dm", "text": "Here is the guide: https://x.io"}],
+                            "fallback_public_reply": "Please check your DMs",
+                        }))
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let auto = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                    let runs = || async {
+                        let res = s
+                            .get(&format!("/v1/automations/{auto}/runs"))
+                            .add_header("cookie", &cookie)
+                            .await;
+                        res.assert_status_ok();
+                        res.json::<Value>()["runs"].as_array().unwrap().clone()
+                    };
+                    // Runs are stored `running` until every action was tried.
+                    let settled = |r: &Vec<Value>, n: usize| {
+                        r.len() == n && r.iter().all(|run| run["status"] != "running")
+                    };
+                    // A moment ahead, so the comment is after the automation was turned on.
+                    let when = now() + 5;
+
+                    // The private reply goes to the comment, not to a user id.
+                    deliver(&s, &page_comment("101_9_501", "guide please", "777", when)).await;
+                    let first =
+                        until(|| async { Some(runs().await).filter(|r| settled(r, 1)) }).await;
+                    assert_eq!(first[0]["status"], "sent", "{}", first[0]);
+                    let calls = calls_since(0)
+                        .into_iter()
+                        .filter(|(path, _)| path == "101/messages")
+                        .collect::<Vec<_>>();
+                    assert_eq!(calls.len(), 1);
+                    assert_eq!(calls[0].1["recipient"], r#"{"comment_id":"101_9_501"}"#);
+                    assert_eq!(
+                        calls[0].1["message"],
+                        r#"{"text":"Here is the guide: https://x.io"}"#
+                    );
+                    assert!(!calls[0].1.contains_key("messaging_type"));
+
+                    // Meta takes one private reply per comment: a second never goes out.
+                    let fb = account(&db, &team_id, "facebook", "101").await;
+                    let item = stored(&db, &team_id).await.remove(0);
+                    let again = inbox::send(&state, &fb, &item, Via::Dm, "again", &[], None, None)
+                        .await
+                        .unwrap();
+                    assert_eq!(again.unwrap_err().code(), "already_replied");
+
+                    // A repeated delivery runs nothing.
+                    deliver(&s, &page_comment("101_9_501", "guide please", "777", when)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    assert_eq!(runs().await.len(), 1);
+
+                    // Our own comment is not answered.
+                    deliver(&s, &page_comment("101_9_502", "see the guide", "101", when)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    assert_eq!(runs().await.len(), 1);
+
+                    // A commenter Meta cannot message: the run is skipped and the public
+                    // fallback goes under the comment.
+                    deliver(&s, &page_comment("101_9_666", "guide me", "888", when)).await;
+                    let both =
+                        until(|| async { Some(runs().await).filter(|r| settled(r, 2)) }).await;
+                    let skipped = both
+                        .iter()
+                        .find(|r| r["reason"] == "dm_unavailable")
+                        .unwrap();
+                    assert_eq!(skipped["status"], "sent", "the fallback went: {skipped}");
+                    let results = skipped["results"].as_array().unwrap();
+                    assert_eq!(results[0]["status"], "skipped");
+                    assert_eq!(results[1]["type"], "fallback_public_reply");
+                    assert_eq!(results[1]["status"], "sent");
+                    let fallback = calls_since(0)
+                        .into_iter()
+                        .find(|(path, _)| path == "101_9_666/comments")
+                        .unwrap();
+                    assert_eq!(fallback.1["message"], "Please check your DMs");
                 }
             }
         }

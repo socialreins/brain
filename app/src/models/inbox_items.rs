@@ -45,6 +45,10 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub state: String,
     pub replied_at: Option<DateTimeWithTimeZone>,
+    /// Where the item lives, when the platform gave a link (Meta); Bluesky's is built from
+    /// `remote_id`.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub permalink: Option<String>,
     pub created_at: DateTimeWithTimeZone,
 }
 

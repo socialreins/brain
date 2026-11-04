@@ -1,6 +1,6 @@
 //! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, the documented `/v1` API
 //! (waitlist, contact, teams, API tokens, webhooks, connections, social sets, posts, lists, inboxes,
-//! automations), `/mcp` (see `crate::mcp`), the Threads and Meta connect pages and
+//! automations), `/webhooks/meta` (Facebook and Instagram deliveries), `/mcp` (see `crate::mcp`), the Threads and Meta connect pages and
 //! `/media/{name}` (stored post files for platforms that download them).
 pub mod api_tokens;
 pub mod auth;
@@ -14,6 +14,7 @@ pub mod inbox;
 pub mod lists;
 pub mod media;
 pub mod meta;
+pub mod meta_webhook;
 pub mod oauth;
 pub mod passkeys;
 pub mod posts;
@@ -143,6 +144,7 @@ pub fn router(state: AppState, config: &Config) -> Router {
         .merge(passkeys::routes().layer(DefaultBodyLimit::max(MAX_PASSKEY_BODY_BYTES)))
         .merge(threads::routes())
         .merge(meta::routes())
+        .merge(meta_webhook::routes())
         .merge(media::routes())
         .nest(
             "/v1",

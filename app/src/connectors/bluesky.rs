@@ -589,6 +589,10 @@ pub enum InboxError {
     Unreachable,
     /// Not sent, for a reason found before calling (e.g. `unsupported_pds`, `too_long`).
     Invalid(&'static str),
+    /// Meta refused the Page token, or a permission was not granted: connect the account again.
+    MetaReconnect,
+    /// Meta refused the call, or could not be reached; the scrubbed reason.
+    Meta(String),
 }
 
 impl InboxError {
@@ -601,6 +605,9 @@ impl InboxError {
             Self::Refused { .. } => "bluesky_refused",
             Self::Unreachable => "bluesky_unreachable",
             Self::Invalid(code) => code,
+            // Not `reconnect_required`: the web app words that one for Bluesky.
+            Self::MetaReconnect => "meta_reconnect_required",
+            Self::Meta(_) => "meta_failed",
         }
     }
 
@@ -616,10 +623,24 @@ impl InboxError {
             Self::DmNotAllowed => "Bluesky did not take the DM: the recipient's settings do not \
                                    allow messages from this account."
                 .into(),
-            Self::RateLimited => "Bluesky is rate limiting this account.".into(),
+            Self::RateLimited => "The platform is rate limiting this account.".into(),
             Self::Refused { code, .. } => format!("Bluesky refused it ({code})."),
             Self::Unreachable => "Bluesky could not be reached.".into(),
+            Self::Invalid("outside_window") => "Meta only takes this message within 24 hours of \
+                                                the person's last message, or 7 days of their \
+                                                comment."
+                .into(),
+            Self::Invalid("already_replied") => "Meta takes one private reply per comment, and \
+                                                 this one has it."
+                .into(),
+            Self::Invalid("dm_unavailable") => {
+                "Meta cannot deliver a message to this person.".into()
+            }
             Self::Invalid(code) => format!("Not sent ({code})."),
+            Self::MetaReconnect => "Meta refused the Page's token or a permission is missing. \
+                                    Connect the account again under Connections."
+                .into(),
+            Self::Meta(why) => format!("Meta did not take it: {why}"),
         }
     }
 }
@@ -641,8 +662,9 @@ pub struct Creds<'a> {
     pub password: &'a str,
 }
 
-/// Someone on Bluesky.
-#[derive(Debug, Default, PartialEq, Eq)]
+/// Someone on Bluesky, or (as an inbox item's author) on Facebook or Instagram: `did` is then
+/// their id there.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Author {
     pub did: String,
     pub handle: Option<String>,

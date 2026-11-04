@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    bluesky::PostError,
+    bluesky::{InboxError, PostError},
     threads::{id_of, needs_reconnect, reason, Item},
 };
 
@@ -23,6 +23,9 @@ const SCOPES: &str = "pages_show_list,pages_read_engagement,pages_manage_posts,\
 business_management,instagram_basic,instagram_content_publish,instagram_manage_contents,\
 pages_manage_metadata,pages_messaging,pages_manage_engagement,pages_read_user_content,\
 instagram_manage_comments,instagram_manage_messages";
+/// What a Page subscribes to. Instagram messages and comments come through the same Page
+/// subscription (the app's Instagram webhooks need no field of their own here).
+const WEBHOOK_FIELDS: &str = "feed,messages";
 const PAGE_FIELDS: &str =
     "id,name,access_token,picture,instagram_business_account{id,username,profile_picture_url}";
 /// Pages read per call, and calls at most: 1000 Pages.
@@ -59,6 +62,9 @@ pub struct Meta {
     pub graph_url: String,
     pub rupload_url: String,
     pub poll_every: Duration,
+    /// `META_WEBHOOK_VERIFY_TOKEN`: the subscribe handshake of `GET /webhooks/meta`; the
+    /// webhook is off without it.
+    pub webhook_token: Option<String>,
     client: reqwest::Client,
 }
 
@@ -88,6 +94,47 @@ pub struct IgAccount {
 
 /// A query or form: name and value pairs.
 type Params<'a> = &'a [(&'a str, &'a str)];
+
+/// A call that did not succeed: not reached, or Graph's status and error body.
+enum Refused {
+    Unreachable,
+    Graph(reqwest::StatusCode, Value),
+}
+
+/// A reply or message that Meta did not take, as the inbox words it.
+fn inbox_error(refused: Refused) -> InboxError {
+    let Refused::Graph(status, body) = refused else {
+        return InboxError::Meta("Meta could not be reached.".into());
+    };
+    let code = body["error"]["code"].as_i64();
+    let sub = body["error"]["error_subcode"].as_i64();
+    match (code, sub) {
+        // Outside the 24 hour messaging window.
+        (_, Some(2_018_278 | 2_534_022)) => InboxError::Invalid("outside_window"),
+        (Some(4 | 17 | 32 | 613), _) => InboxError::RateLimited,
+        // "No matching user", "This person isn't available right now".
+        (Some(551), _) | (_, Some(2_018_001)) => InboxError::Invalid("dm_unavailable"),
+        _ if needs_reconnect(&body) => InboxError::MetaReconnect,
+        _ => InboxError::Meta(reason(&body, status)),
+    }
+}
+
+/// A person's name, handle and picture as Meta shows them.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Profile {
+    pub name: Option<String>,
+    pub handle: Option<String>,
+    pub avatar: Option<String>,
+}
+
+/// Who a message goes to.
+#[derive(Clone, Copy)]
+pub enum To<'a> {
+    /// The author of this comment: a private reply.
+    Comment(&'a str),
+    /// This person, who wrote to the Page within 24 hours.
+    Person(&'a str),
+}
 
 fn failed(msg: impl Into<String>) -> PostError {
     PostError::Failed(msg.into())
@@ -144,7 +191,16 @@ impl Meta {
             graph_url: GRAPH_URL.into(),
             rupload_url: RUPLOAD_URL.into(),
             poll_every: Duration::from_secs(5),
+            webhook_token: None,
             client,
+        })
+    }
+
+    /// Whether `header` (`X-Hub-Signature-256`) signs `body` with the app secret. Never true
+    /// without one.
+    pub fn signed(&self, body: &[u8], header: &str) -> bool {
+        self.app.as_ref().is_some_and(|(_, secret)| {
+            socialreins_core::webhook::verify_sha256(secret, body, header)
         })
     }
 
@@ -169,15 +225,14 @@ impl Meta {
             .map(String::from)
     }
 
-    /// Sends one request: the JSON answer, `Reconnect` when the token is refused, else `Failed`
-    /// with `step` and Meta's reason.
-    async fn send(
+    /// Sends one request: the JSON answer, or why not. Never logs the URL or token.
+    async fn raw(
         &self,
         mut req: RequestBuilder,
         token: Option<&str>,
         form: Option<&[(&str, &str)]>,
         step: &str,
-    ) -> Result<Value, PostError> {
+    ) -> Result<Value, Refused> {
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
@@ -186,17 +241,34 @@ impl Meta {
         }
         let res = req.send().await.map_err(|e| {
             tracing::warn!(error = %e.without_url(), step, "meta call failed");
-            failed(format!("{step}: Meta could not be reached."))
+            Refused::Unreachable
         })?;
         let status = res.status();
         let body: Value = res.json().await.unwrap_or(Value::Null);
         if status.is_success() {
             return Ok(body);
         }
-        if needs_reconnect(&body) {
-            return Err(PostError::Reconnect);
-        }
-        Err(failed(format!("{step}: {}", reason(&body, status))))
+        Err(Refused::Graph(status, body))
+    }
+
+    /// Sends one request: the JSON answer, `Reconnect` when the token is refused, else `Failed`
+    /// with `step` and Meta's reason.
+    async fn send(
+        &self,
+        req: RequestBuilder,
+        token: Option<&str>,
+        form: Option<&[(&str, &str)]>,
+        step: &str,
+    ) -> Result<Value, PostError> {
+        self.raw(req, token, form, step)
+            .await
+            .map_err(|refused| match refused {
+                Refused::Unreachable => failed(format!("{step}: Meta could not be reached.")),
+                Refused::Graph(_, body) if needs_reconnect(&body) => PostError::Reconnect,
+                Refused::Graph(status, body) => {
+                    failed(format!("{step}: {}", reason(&body, status)))
+                }
+            })
     }
 
     /// One Graph API call on `path` under the version.
@@ -537,6 +609,137 @@ impl Meta {
         ))
     }
 
+    /// Subscribes Page `page` to the app's webhooks (`feed` and `messages`), so its comments and
+    /// messages, and its linked Instagram account's, reach `POST /webhooks/meta`. Needs
+    /// `pages_manage_metadata`.
+    pub async fn subscribe_page(&self, page: &str, token: &str) -> Result<(), PostError> {
+        if !graph_id(page) {
+            return Err(failed("This is not a Facebook Page id."));
+        }
+        let form = [("subscribed_fields", WEBHOOK_FIELDS)];
+        let path = format!("{page}/subscribed_apps");
+        let done = self.post(&path, token, &form, "Webhook").await?;
+        match done["success"] {
+            Value::Bool(false) => Err(failed("Webhook: Meta did not subscribe the Page.")),
+            _ => Ok(()),
+        }
+    }
+
+    /// Takes the app's webhook subscription off Page `page`.
+    pub async fn unsubscribe_page(&self, page: &str, token: &str) -> Result<(), PostError> {
+        if !graph_id(page) {
+            return Err(failed("This is not a Facebook Page id."));
+        }
+        let path = format!("{page}/subscribed_apps");
+        self.call(Method::DELETE, &path, Some(token), (&[], None), "Webhook")
+            .await
+            .map(|_| ())
+    }
+
+    /// One call of the inbox: Meta's answer, or why it did not take it. Never retried.
+    async fn inbox_call(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        form: Option<Params<'_>>,
+    ) -> Result<Value, InboxError> {
+        let url = format!("{}/{}/{path}", self.graph_url, self.version);
+        let req = self.client.request(method, url);
+        self.raw(req, Some(token), form, "Inbox")
+            .await
+            .map_err(inbox_error)
+    }
+
+    /// A public reply under `comment`: `{comment}/comments` on Facebook (`pages_manage_engagement`),
+    /// `{comment}/replies` on Instagram (`instagram_manage_comments`). Returns the reply's id.
+    pub async fn reply_to_comment(
+        &self,
+        instagram: bool,
+        token: &str,
+        comment: &str,
+        message: &str,
+    ) -> Result<String, InboxError> {
+        if !graph_id(comment) {
+            return Err(InboxError::Invalid("not_repliable"));
+        }
+        let edge = if instagram { "replies" } else { "comments" };
+        let form = [("message", message)];
+        let path = format!("{comment}/{edge}");
+        let made = self
+            .inbox_call(Method::POST, &path, token, Some(&form))
+            .await?;
+        id_of(&made).ok_or_else(|| InboxError::Meta("Meta sent no id.".into()))
+    }
+
+    /// A message from Page `page` (`pages_messaging`, `instagram_manage_messages`): the private
+    /// reply to a comment (once per comment, within 7 days), or a DM to a person who wrote
+    /// within 24 hours. Returns the message id.
+    pub async fn message(
+        &self,
+        page: &str,
+        token: &str,
+        to: To<'_>,
+        body: &str,
+    ) -> Result<String, InboxError> {
+        let (To::Comment(id) | To::Person(id)) = to;
+        if !graph_id(page) || !graph_id(id) {
+            return Err(InboxError::Invalid("not_repliable"));
+        }
+        let recipient = match to {
+            To::Comment(id) => serde_json::json!({ "comment_id": id }),
+            To::Person(id) => serde_json::json!({ "id": id }),
+        }
+        .to_string();
+        let message = serde_json::json!({ "text": body }).to_string();
+        let mut form = vec![
+            ("recipient", recipient.as_str()),
+            ("message", message.as_str()),
+        ];
+        if matches!(to, To::Person(_)) {
+            form.push(("messaging_type", "RESPONSE"));
+        }
+        let path = format!("{page}/messages");
+        let made = self
+            .inbox_call(Method::POST, &path, token, Some(&form))
+            .await?;
+        text(&made["message_id"]).ok_or_else(|| InboxError::Meta("Meta sent no id.".into()))
+    }
+
+    /// The name, handle and picture of a person who messaged: a Messenger page-scoped id, or an
+    /// Instagram-scoped id. `None` when Meta will not say.
+    pub async fn profile(&self, instagram: bool, token: &str, id: &str) -> Option<Profile> {
+        if !graph_id(id) {
+            return None;
+        }
+        let fields = if instagram {
+            "name,username,profile_pic"
+        } else {
+            "name,profile_pic"
+        };
+        let got = self
+            .get(id, token, &[("fields", fields)], "Profile")
+            .await
+            .ok()?;
+        Some(Profile {
+            name: text(&got["name"]),
+            handle: text(&got["username"]),
+            avatar: text(&got["profile_pic"]),
+        })
+    }
+
+    /// The public link of an Instagram media.
+    pub async fn permalink(&self, token: &str, media: &str) -> Option<String> {
+        if !graph_id(media) {
+            return None;
+        }
+        let got = self
+            .get(media, token, &[("fields", "permalink")], "Permalink")
+            .await
+            .ok()?;
+        text(&got["permalink"])
+    }
+
     /// Deletes a Facebook post, photo or Reel, or an Instagram media, with the Page token.
     pub async fn delete(&self, token: &str, id: &str) -> Result<(), PostError> {
         if !graph_id(id) {
@@ -552,6 +755,35 @@ impl Meta {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn refused_messages_are_worded_for_the_inbox() {
+        let refused = |code: i64, sub: Option<i64>| {
+            let body = json!({"error": {"message": "nope", "code": code, "error_subcode": sub}});
+            inbox_error(Refused::Graph(reqwest::StatusCode::BAD_REQUEST, body))
+        };
+        assert_eq!(
+            refused(10, Some(2_018_278)),
+            InboxError::Invalid("outside_window")
+        );
+        assert_eq!(
+            refused(10, Some(2_534_022)),
+            InboxError::Invalid("outside_window")
+        );
+        assert_eq!(refused(613, None), InboxError::RateLimited);
+        assert_eq!(refused(551, None), InboxError::Invalid("dm_unavailable"));
+        assert_eq!(
+            refused(100, Some(2_018_001)),
+            InboxError::Invalid("dm_unavailable")
+        );
+        assert_eq!(refused(190, None), InboxError::MetaReconnect);
+        assert_eq!(refused(10, None), InboxError::MetaReconnect);
+        assert_eq!(refused(100, None), InboxError::Meta("nope".into()));
+        assert_eq!(
+            inbox_error(Refused::Unreachable),
+            InboxError::Meta("Meta could not be reached.".into())
+        );
+    }
 
     #[test]
     fn the_dialog_url_carries_the_version_scopes_and_state() {

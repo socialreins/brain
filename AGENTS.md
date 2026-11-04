@@ -39,6 +39,11 @@ cargo run -p socialreins-brain
   rest after 7 days; a storage error is only logged. Cleanup lists `posts/<post id>/` in the
   store, so it also catches files no row names. Local disk assumes one brain instance: run
   more than one replica only with the `S3_*` bucket.
+- `app/src/meta_inbox.rs` and `controllers/meta_webhook.rs`: `/webhooks/meta`. The signature of
+  the raw body is checked before anything is parsed; items are stored before the `200` (unique
+  on account and remote id, so redeliveries are harmless), names, links and automations run
+  after it. Meta replies and DMs go out through `inbox::send` like Bluesky ones, once, never
+  retried.
 - `app/src/webhooks.rs`: outbound webhooks. Every `post_targets` status change goes through
   `webhooks::with_event`, so its event is queued in the same statement; README documents the
   payload and signature.

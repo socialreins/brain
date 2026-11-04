@@ -64,6 +64,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/connections/threads/redirect` | A page navigation from web (session cookie; owner, admin of the current team): sends the browser to Threads to connect a profile. Lands back on `{WEB_URL}/app/connections` |
 | GET | `/connect/threads/callback` | Where Threads sends the browser back (register `{BRAIN_URL}/connect/threads/callback` in the Threads app); lands on `{WEB_URL}/app/connections?connected=threads` or `?connect_error=<code>&provider=threads` |
 | GET | `/connections/meta/redirect` | Like the Threads one: sends the browser to Facebook Login for Pages and their linked Instagram accounts |
+| GET, POST | `/webhooks/meta` | Meta's webhook (register `{BRAIN_URL}/webhooks/meta` in the Meta app). `GET` is the subscribe handshake: `hub.mode=subscribe` and a `hub.verify_token` equal to `META_WEBHOOK_VERIFY_TOKEN` get `hub.challenge` back as plain text, else `403`; `404` while the variable is unset. `POST` needs `X-Hub-Signature-256` (HMAC-SHA256 of the raw body under `META_APP_SECRET`, `403` otherwise, `404` without the secret), takes at most 256 KiB, and answers `200` once the items are stored |
 | GET | `/connect/meta/callback` | Where Meta sends the browser back (register `{BRAIN_URL}/connect/meta/callback` in the Meta app); lands on `{WEB_URL}/app/connections?pick=meta` when there is something to pick, `?connected=meta` when not, or `?connect_error=<code>&provider=meta` |
 | GET, POST, DELETE | `/v1/connections/meta/pick` | The caller's pending Meta pick (owner, admin): the Pages and Instagram accounts not connected yet (`{"facebook":[{"id","name","picture_url"}],"instagram":[...]}`, never tokens, `404` when none or over 15 minutes old); `{"facebook":[ids],"instagram":[ids]}` connects them (`201` with the accounts; `422 nothing_picked`, `invalid_pick`); drop it, `204` |
 | GET | `/media/{name}` | A stored post file at an unguessable link, for platforms that download media themselves (Threads, Facebook, Instagram); `404` once the post settles |
@@ -85,7 +86,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | PUT, DELETE | `/v1/inboxes/{id}` | Replace name and filters; delete (owner, admin; not "All") |
 | GET | `/v1/inboxes/{id}/items` | `?state=open\|done&cursor=&limit=`: items newest first with their `replies`, and `next_cursor` |
 | GET, PATCH | `/v1/inbox-items/{id}` | One item; `{"state":"open"\|"done"}` (any member) |
-| POST | `/v1/inbox-items/{id}/reply` | `{"text"}` (any member): a public reply to a comment or mention, a DM for a DM; `422 {"error","message"}` when it cannot go |
+| POST | `/v1/inbox-items/{id}/reply` | `{"text"}` (any member): a public reply to a comment or mention, a DM for a DM; `422 {"error","message"}` when it cannot go (on Facebook and Instagram `meta_reconnect_required`, `meta_failed`, `outside_window`, `dm_unavailable`) |
 | GET, POST | `/v1/automations` | The team's automations; create one (`{"name","trigger":"comment_received","conditions","actions":[{"type":"send_dm"\|"reply_publicly","text"}],"active","fallback_public_reply"}`, owner, admin) |
 | GET, PUT, DELETE | `/v1/automations/{id}` | One automation; replace it; delete it (owner, admin) |
 | POST | `/v1/automations/{id}/enable`, `/disable` | Switch it on (acts on comments from then on) or off (owner, admin) |
@@ -264,6 +265,32 @@ looked up after. Both fetch media from brain's `/media/` link, take no thread pa
 (`thread_not_supported`), and come down with `DELETE /{id}` on the Page token. One post may take
 up to 7 minutes.
 
+Meta's inbox (`POST /webhooks/meta`, `app/src/meta_inbox.rs`): Facebook Page comments (`feed`,
+`item=comment`, `verb=add`, replies to comments included) and Messenger messages
+(`entry.messaging`), and Instagram `comments` and `messages`, are stored in `inbox_items` for
+every connected account named by the entry (a Page id for `facebook`, the Instagram account id
+for `instagram`), in every team that connected it. The unique key is the account and the
+comment or message id, so a repeated delivery adds nothing. Skipped: unknown accounts, what the
+account wrote itself (its id is the entry's, or `is_echo`), and events that are not comments or
+messages. A comment's `parent_remote_id` is the post (or the comment it answers) and
+`root_remote_id` the post, so conditions and web can tell which post; a DM's `convo_id` is the
+sender's id. Names, the Instagram link and automations come after the `200`: a DM sender's
+profile is read once, an Instagram comment's link is the media permalink, and new comments run
+the team's automations. Connecting (and reconnecting) a Page calls `POST {page}/subscribed_apps`
+with `subscribed_fields=feed,messages` (`pages_manage_metadata`); a refusal never fails the
+connect, it is logged and kept as `webhook_error` on the connection. Disconnecting the last
+account of a Page (in any team) unsubscribes it, best effort. Replies: a comment gets a public
+reply (`{comment}/comments` on Facebook, `{comment}/replies` on Instagram), a DM item a message
+from the Page (`{page}/messages`, `recipient.id`, `messaging_type=RESPONSE`, within 24 hours of
+the person's last message; Instagram goes through its linked Page). An automation's `send_dm`
+on a comment is Meta's private reply (`recipient.comment_id`): within 7 days of the comment and
+once per comment. Neither is ever retried. Reasons not sent: `outside_window`, `already_replied`,
+`dm_unavailable` (these skip the DM and let the fallback public reply go), `rate_limited`.
+Permissions: `pages_manage_metadata` (subscribe), `pages_read_user_content` and
+`pages_read_engagement` (comments), `pages_manage_engagement` (Facebook public reply),
+`pages_messaging` (Messenger messages and private replies), `instagram_manage_comments`
+(Instagram comments and replies), `instagram_manage_messages` (Instagram messages).
+
 Webhooks: a team may set one public `https://` URL (at most 2000 characters, no credentials,
 not `localhost` or a private address). Each post target fires `post.target.published`,
 `post.target.failed` and `post.target.deleted` at most once each, so a post that went out to
@@ -333,6 +360,7 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `RUST_LOG` | no | `info` |
 | `META_APP_ID`, `META_APP_SECRET` | no | Both to connect Facebook Pages and Instagram accounts (redirect URI `{BRAIN_URL}/connect/meta/callback`). Publishing with connected accounts needs neither |
 | `META_GRAPH_VERSION` | no | `v26.0`. The Graph API version for Meta calls |
+| `META_WEBHOOK_VERIFY_TOKEN` | no | Any secret string, typed into the Meta app's webhook setup too. Turns on `GET /webhooks/meta`; `POST /webhooks/meta` is signed with `META_APP_SECRET` |
 | `THREADS_APP_ID`, `THREADS_APP_SECRET` | no | Both to connect Threads accounts (redirect URI `{BRAIN_URL}/connect/threads/callback`). Publishing with connected accounts needs neither |
 | `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET` | no | Offer LinkedIn (connector not built yet) |
 | `X_CLIENT_ID`, `X_CLIENT_SECRET` | no | Offer X (connector not built yet) |
