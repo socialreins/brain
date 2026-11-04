@@ -5731,6 +5731,14 @@ mod teams {
                 /// The raw path of every delete.
                 static REMOVED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
                 static NEXT: AtomicU64 = AtomicU64::new(1);
+                /// When set, the mock hands out this upload URL instead of its own.
+                static FORCED_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+                /// Requests the "foreign host" took.
+                static FOREIGN_HITS: AtomicU64 = AtomicU64::new(0);
+
+                fn forced_url() -> Option<String> {
+                    FORCED_URL.lock().unwrap().clone()
+                }
 
                 type Answer = (StatusCode, Json<Value>);
 
@@ -5765,6 +5773,7 @@ mod teams {
                 /// LinkedIn (OAuth, userinfo, `/rest`, upload hosts), plus a PNG and an MP4.
                 /// Code `good` gives a 60-day token, `partner` also a refresh token.
                 async fn mock_linkedin() -> String {
+                    *FORCED_URL.lock().unwrap() = None;
                     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let base = format!("http://{}", listener.local_addr().unwrap());
                     let token = |Form(f): Form<HashMap<String, String>>| async move {
@@ -5806,8 +5815,10 @@ mod teams {
                             "urn:li:person:abc123"
                         );
                         let n = next();
-                        ok(json!({"value": {"uploadUrl": format!("{b}/upload/img/{n}"),
-                            "image": format!("urn:li:image:{n}")}}))
+                        ok(
+                            json!({"value": {"uploadUrl": forced_url().unwrap_or(format!("{b}/upload/img/{n}")),
+                            "image": format!("urn:li:image:{n}")}}),
+                        )
                     };
                     let b = base.clone();
                     let videos = move |h: HeaderMap,
@@ -5827,7 +5838,7 @@ mod teams {
                                     "video": format!("urn:li:video:{n}"), "uploadToken": "tok",
                                     "uploadInstructions": [
                                         {"firstByte": 0, "lastByte": half - 1,
-                                         "uploadUrl": format!("{b}/upload/vid/{n}a")},
+                                         "uploadUrl": forced_url().unwrap_or(format!("{b}/upload/vid/{n}a"))},
                                         {"firstByte": half, "lastByte": size - 1,
                                          "uploadUrl": format!("{b}/upload/vid/{n}b")}]}}))
                             }
@@ -6299,6 +6310,51 @@ mod teams {
                         .unwrap()
                         .contains("one video, or images"));
                     assert_eq!(POSTS.lock().unwrap().len(), posts);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn foreign_upload_urls_never_get_the_bytes_or_the_token() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    // A host that is not LinkedIn's: any request to it is counted.
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let port = listener.local_addr().unwrap().port();
+                    let evil = format!("http://127.0.0.1:{port}");
+                    let spy = Router::new().fallback(|| async {
+                        FOREIGN_HITS.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    });
+                    tokio::spawn(async move { axum::serve(listener, spy).await });
+                    let userinfo = format!("{base}@127.0.0.1:{port}/x");
+                    let urls = [
+                        format!("{evil}/x"),
+                        userinfo,
+                        "https://api.linkedin.com.evil.net/x".to_owned(),
+                        "https://api.linkedin.com@evil.net/x".to_owned(),
+                        "https://evil.net/www.linkedin.com".to_owned(),
+                    ];
+                    for (media, url) in [("/img.png", &urls[0]), ("/clip.mp4", &urls[0])]
+                        .into_iter()
+                        .chain(urls[1..].iter().map(|u| ("/img.png", u)))
+                    {
+                        *FORCED_URL.lock().unwrap() = Some(url.clone());
+                        let id = id_of(&create(&s, &cookie, linkedin_post(&set, "x")).await);
+                        set_media(&db, &base, &id, &[media]).await;
+                        let posts = POSTS.lock().unwrap().len();
+                        publish::tick(&state).await.unwrap();
+                        let p = get_post(&s, &cookie, &id).await;
+                        assert_eq!(p["status"], "failed", "{url}");
+                        assert!(
+                            p["targets"][0]["error"]
+                                .as_str()
+                                .unwrap()
+                                .contains("unexpected upload URL"),
+                            "{url}: {p}"
+                        );
+                        assert_eq!(POSTS.lock().unwrap().len(), posts, "{url}");
+                    }
+                    *FORCED_URL.lock().unwrap() = None;
+                    assert_eq!(FOREIGN_HITS.load(Ordering::SeqCst), 0);
                 }
 
                 #[tokio::test]

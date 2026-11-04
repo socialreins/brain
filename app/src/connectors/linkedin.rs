@@ -326,8 +326,26 @@ impl LinkedIn {
         Ok(body["value"].clone())
     }
 
-    /// PUTs `bytes` to a URL LinkedIn handed out; returns the answer's `ETag`. The token goes
-    /// along only to LinkedIn itself.
+    /// Whether an upload URL LinkedIn handed out is LinkedIn's own: https on `linkedin.com` or a
+    /// subdomain, or exactly the API's origin (scheme, host and port; a mock in tests). The URL is
+    /// parsed, so lookalikes (`api.linkedin.com.evil.net`) and userinfo tricks
+    /// (`https://api.linkedin.com@evil.net`) fail.
+    fn upload_allowed(&self, url: &str) -> bool {
+        let Ok(u) = Url::parse(url) else {
+            return false;
+        };
+        if !u.username().is_empty() || u.password().is_some() {
+            return false;
+        }
+        let host = u.host_str().unwrap_or_default();
+        let linkedin =
+            u.scheme() == "https" && (host == "linkedin.com" || host.ends_with(".linkedin.com"));
+        let api = Url::parse(&self.api_url).is_ok_and(|a| a.origin() == u.origin());
+        linkedin || api
+    }
+
+    /// PUTs `bytes` to a URL LinkedIn handed out (see `upload_allowed`); returns the answer's
+    /// `ETag`. The token goes along only to such a URL.
     async fn put(
         &self,
         url: &str,
@@ -335,13 +353,7 @@ impl LinkedIn {
         bytes: &[u8],
         content_type: &str,
     ) -> Result<String, PostError> {
-        let host = Url::parse(url)
-            .ok()
-            .filter(|u| u.scheme() == "https")
-            .and_then(|u| u.host_str().map(str::to_owned))
-            .unwrap_or_default();
-        let linkedin = host == "linkedin.com" || host.ends_with(".linkedin.com");
-        if !linkedin && !url.starts_with(&self.api_url) {
+        if !self.upload_allowed(url) {
             return Err(failed("Upload: LinkedIn sent an unexpected upload URL."));
         }
         let mut req = self
@@ -496,6 +508,31 @@ mod tests {
         assert_eq!(commentary("end #"), r"end \#");
         assert_eq!(commentary(r"a\b|c"), r"a\\b\|c");
         assert_eq!(commentary("plain, text."), "plain, text.");
+    }
+
+    #[test]
+    fn only_linkedins_own_upload_urls_are_accepted() {
+        let l = LinkedIn::new(None).unwrap();
+        for ok in [
+            "https://www.linkedin.com/dms-uploads/C5/uploadedVideo?sau=x",
+            "https://api.linkedin.com/up/1",
+            "https://linkedin.com/up",
+        ] {
+            assert!(l.upload_allowed(ok), "{ok}");
+        }
+        for bad in [
+            "https://api.linkedin.com.evil.net/x",
+            "https://api.linkedin.com@evil.net/x",
+            "https://user:pw@www.linkedin.com/x",
+            "https://evil.net/api.linkedin.com",
+            "https://notlinkedin.com/x",
+            "http://www.linkedin.com/x",
+            "http://api.linkedin.com/x",
+            "//evil.net/x",
+            "not a url",
+        ] {
+            assert!(!l.upload_allowed(bad), "{bad}");
+        }
     }
 
     #[test]
