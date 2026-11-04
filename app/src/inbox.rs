@@ -1,11 +1,11 @@
 //! The inbox: comments, mentions and DMs of every connected account. Bluesky has no webhooks,
 //! so a per-minute tick reads each account's notifications and DMs from its saved cursors and
-//! stores new items (Meta will post into the same table from a webhook). New comments then run
+//! stores new items (Meta posts into the same table from its webhook, `meta_inbox`). New comments then run
 //! the team's automations. Replies, by people or automations, go out through `send`, at most
 //! once: nothing here retries a send.
 use std::sync::LazyLock;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, FixedOffset, Utc};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, DbErr, EntityTrait, QueryFilter,
     Statement, TransactionTrait, Value,
@@ -18,7 +18,8 @@ use uuid::Uuid;
 
 use crate::{
     automations,
-    connectors::bluesky::{Creds, InboxError, Message, Notification},
+    connectors::bluesky::{Author, Creds, InboxError, Message, Notification},
+    meta_inbox,
     models::{inbox_items, inbox_replies, social_accounts},
     state::AppState,
 };
@@ -205,7 +206,7 @@ fn pds(account: &social_accounts::Model) -> &str {
     account.meta["pds"].as_str().unwrap_or_default()
 }
 
-fn secret(app: &AppState, account: &social_accounts::Model) -> Option<String> {
+pub(crate) fn secret(app: &AppState, account: &social_accounts::Model) -> Option<String> {
     app.cipher
         .decrypt(&account.access_token)
         .and_then(|b| String::from_utf8(b).ok())
@@ -361,36 +362,55 @@ fn clip(text: &str) -> String {
 
 const INSERT: &str = "INSERT INTO inbox_items (id, team_id, social_account_id, platform, kind, \
     remote_id, remote_cid, parent_remote_id, root_remote_id, root_remote_cid, convo_id, \
-    author_id, author_handle, author_name, author_avatar, text, received_at, post_id) \
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
+    author_id, author_handle, author_name, author_avatar, text, received_at, permalink, post_id) \
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
     (SELECT t.post_id FROM post_targets t WHERE t.social_account_id = $3 \
      AND t.remote_id IN ($8, $9) LIMIT 1)) \
     ON CONFLICT (social_account_id, remote_id) DO NOTHING RETURNING *";
 
-/// Stores a notification; the new item, or `None` when it was already there.
-async fn store_notification(
+/// An item to store, from any platform.
+#[derive(Clone)]
+pub struct Fresh {
+    pub kind: &'static str,
+    pub remote_id: String,
+    pub remote_cid: Option<String>,
+    /// The post or comment it answers.
+    pub parent: Option<String>,
+    /// The thread's first post, and its cid.
+    pub root: (Option<String>, Option<String>),
+    pub convo_id: Option<String>,
+    pub author: Author,
+    pub text: String,
+    pub at: DateTime<FixedOffset>,
+    pub permalink: Option<String>,
+}
+
+/// Stores `f` for `account`; the new item, or `None` when it was already there. The unique key
+/// is the account and the platform's id, so a repeated read or webhook delivery adds nothing.
+pub async fn store(
     db: &DatabaseConnection,
     account: &social_accounts::Model,
-    n: &Notification,
+    f: Fresh,
 ) -> Result<Option<inbox_items::Model>, DbErr> {
     let values: Vec<Value> = vec![
         Uuid::now_v7().into(),
         account.team_id.into(),
         account.id.into(),
         account.provider.clone().into(),
-        n.kind.into(),
-        n.uri.clone().into(),
-        n.cid.clone().into(),
-        n.parent_uri.clone().into(),
-        n.root.0.clone().into(),
-        n.root.1.clone().into(),
-        Option::<String>::None.into(),
-        n.author.did.clone().into(),
-        n.author.handle.clone().into(),
-        n.author.display_name.clone().into(),
-        n.author.avatar.clone().into(),
-        clip(&n.text).into(),
-        n.indexed_at.into(),
+        f.kind.into(),
+        f.remote_id.into(),
+        f.remote_cid.into(),
+        f.parent.into(),
+        f.root.0.into(),
+        f.root.1.into(),
+        f.convo_id.into(),
+        f.author.did.into(),
+        f.author.handle.into(),
+        f.author.display_name.into(),
+        f.author.avatar.into(),
+        clip(&f.text).into(),
+        f.at.into(),
+        f.permalink.into(),
     ];
     inbox_items::Entity::find()
         .from_raw_sql(sql(INSERT, values))
@@ -398,35 +418,45 @@ async fn store_notification(
         .await
 }
 
+/// Stores a notification; the new item, or `None` when it was already there.
+async fn store_notification(
+    db: &DatabaseConnection,
+    account: &social_accounts::Model,
+    n: &Notification,
+) -> Result<Option<inbox_items::Model>, DbErr> {
+    let fresh = Fresh {
+        kind: n.kind,
+        remote_id: n.uri.clone(),
+        remote_cid: n.cid.clone(),
+        parent: n.parent_uri.clone(),
+        root: (Some(n.root.0.clone()), n.root.1.clone()),
+        convo_id: None,
+        author: n.author.clone(),
+        text: n.text.clone(),
+        at: n.indexed_at,
+        permalink: None,
+    };
+    store(db, account, fresh).await
+}
+
 async fn store_message(
     db: &DatabaseConnection,
     account: &social_accounts::Model,
     m: &Message,
 ) -> Result<Option<inbox_items::Model>, DbErr> {
-    let none = || Value::from(Option::<String>::None);
-    let values: Vec<Value> = vec![
-        Uuid::now_v7().into(),
-        account.team_id.into(),
-        account.id.into(),
-        account.provider.clone().into(),
-        "dm".into(),
-        m.id.clone().into(),
-        none(),
-        none(),
-        none(),
-        none(),
-        m.convo_id.clone().into(),
-        m.sender.did.clone().into(),
-        m.sender.handle.clone().into(),
-        m.sender.display_name.clone().into(),
-        m.sender.avatar.clone().into(),
-        clip(&m.text).into(),
-        m.sent_at.into(),
-    ];
-    inbox_items::Entity::find()
-        .from_raw_sql(sql(INSERT, values))
-        .one(db)
-        .await
+    let fresh = Fresh {
+        kind: "dm",
+        remote_id: m.id.clone(),
+        remote_cid: None,
+        parent: None,
+        root: (None, None),
+        convo_id: Some(m.convo_id.clone()),
+        author: m.sender.clone(),
+        text: m.text.clone(),
+        at: m.sent_at,
+        permalink: None,
+    };
+    store(db, account, fresh).await
 }
 
 /// How a reply goes out.
@@ -459,6 +489,21 @@ pub fn fits(via: Via, text: &str) -> bool {
     }
 }
 
+/// `text` fits a reply on `platform`: Facebook takes comments of 8000 characters and messages of
+/// 2000; Instagram comments of 2200 characters and messages of 1000 bytes; any other platform is
+/// held to `fits`.
+pub fn fits_on(platform: &str, via: Via, text: &str) -> bool {
+    let chars = text.chars().count();
+    let some = !text.trim().is_empty();
+    match (platform, via) {
+        ("facebook", Via::Public) => some && chars <= 8000,
+        ("facebook", Via::Dm) => some && chars <= 2000,
+        ("instagram", Via::Public) => some && chars <= 2200,
+        ("instagram", Via::Dm) => some && text.len() <= 1000,
+        _ => fits(via, text),
+    }
+}
+
 /// Sends `text` for `item` from `account`, once, and records it on the item (a reply row and
 /// `replied_at`). The inner `Err` says why nothing was sent.
 /// `skip`: byte ranges of `text` filled in from someone else, which never become links.
@@ -473,46 +518,17 @@ pub async fn send(
     sent_by: Option<Uuid>,
     automation_id: Option<Uuid>,
 ) -> Result<Result<inbox_replies::Model, InboxError>, DbErr> {
-    if account.provider != "bluesky" {
+    let meta = matches!(account.provider.as_str(), "facebook" | "instagram");
+    if !meta && account.provider != "bluesky" {
         return Ok(Err(InboxError::Invalid("unsupported_platform")));
     }
-    if !fits(via, text) {
+    if !fits_on(&account.provider, via, text) {
         return Ok(Err(InboxError::Invalid("too_long")));
     }
-    if via == Via::Dm && !account.dm_access {
-        return Ok(Err(InboxError::NoDmAccess));
-    }
-    let Some(secret) = secret(app, account) else {
-        return Ok(Err(InboxError::Reconnect));
-    };
-    let c = Creds {
-        pds: pds(account),
-        did: &account.external_id,
-        password: &secret,
-    };
-    let sent = match via {
-        Via::Public => {
-            let parent = item
-                .remote_cid
-                .as_deref()
-                .map(|cid| (&*item.remote_id, cid));
-            let root = item
-                .root_remote_id
-                .as_deref()
-                .zip(item.root_remote_cid.as_deref());
-            match (item.kind.as_str(), parent, root) {
-                ("comment" | "mention", Some(parent), Some(root)) => {
-                    app.bluesky.reply(&c, text, skip, parent, root).await
-                }
-                _ => Err(InboxError::Invalid("not_repliable")),
-            }
-        }
-        Via::Dm => {
-            let convo = item.convo_id.as_deref();
-            app.bluesky
-                .send_dm(&c, convo, &item.author_id, text, skip)
-                .await
-        }
+    let sent = if meta {
+        meta_inbox::send(app, account, item, via, text).await?
+    } else {
+        send_bluesky(app, account, item, (via, text, skip)).await
     };
     let remote_id = match sent {
         Ok(id) => id,
@@ -537,6 +553,50 @@ pub async fn send(
     );
     app.db.execute_raw(stmt).await?;
     Ok(Ok(reply))
+}
+
+/// The Bluesky half of `send`: the id of what went out.
+async fn send_bluesky(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    (via, text, skip): (Via, &str, &[std::ops::Range<usize>]),
+) -> Result<String, InboxError> {
+    if via == Via::Dm && !account.dm_access {
+        return Err(InboxError::NoDmAccess);
+    }
+    let Some(secret) = secret(app, account) else {
+        return Err(InboxError::Reconnect);
+    };
+    let c = Creds {
+        pds: pds(account),
+        did: &account.external_id,
+        password: &secret,
+    };
+    match via {
+        Via::Public => {
+            let parent = item
+                .remote_cid
+                .as_deref()
+                .map(|cid| (&*item.remote_id, cid));
+            let root = item
+                .root_remote_id
+                .as_deref()
+                .zip(item.root_remote_cid.as_deref());
+            match (item.kind.as_str(), parent, root) {
+                ("comment" | "mention", Some(parent), Some(root)) => {
+                    app.bluesky.reply(&c, text, skip, parent, root).await
+                }
+                _ => Err(InboxError::Invalid("not_repliable")),
+            }
+        }
+        Via::Dm => {
+            let convo = item.convo_id.as_deref();
+            app.bluesky
+                .send_dm(&c, convo, &item.author_id, text, skip)
+                .await
+        }
+    }
 }
 
 #[cfg(test)]
@@ -608,6 +668,20 @@ mod tests {
         }
         let unknown = serde_json::from_value::<Filters>(serde_json::json!({"kind": ["dm"]}));
         assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn meta_replies_have_their_own_limits() {
+        assert!(fits_on("facebook", Via::Public, &"a".repeat(8000)));
+        assert!(!fits_on("facebook", Via::Public, &"a".repeat(8001)));
+        assert!(fits_on("facebook", Via::Dm, &"a".repeat(2000)));
+        assert!(!fits_on("facebook", Via::Dm, &"a".repeat(2001)));
+        assert!(fits_on("instagram", Via::Public, &"a".repeat(2200)));
+        assert!(!fits_on("instagram", Via::Public, &"a".repeat(2201)));
+        assert!(fits_on("instagram", Via::Dm, &"a".repeat(1000)));
+        assert!(!fits_on("instagram", Via::Dm, &"a".repeat(1001)));
+        assert!(!fits_on("instagram", Via::Dm, " "));
+        assert!(!fits_on("bluesky", Via::Public, &"a".repeat(301)));
     }
 
     #[test]

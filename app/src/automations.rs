@@ -45,7 +45,7 @@ pub struct Conditions {
     #[serde(default)]
     pub account_ids: Vec<Uuid>,
     /// Comments under these posts (the post replied to, or the thread's first post), e.g.
-    /// Bluesky `at://` URIs; at most 100.
+    /// Bluesky `at://` URIs or Facebook and Instagram post ids; at most 100.
     #[serde(default)]
     pub post_remote_ids: Vec<String>,
     /// Any of these, case-insensitive, in the comment; at most 20 of 1 to 100 characters.
@@ -60,7 +60,8 @@ pub struct Conditions {
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
-    /// A DM to the comment's author, at most 1000 graphemes.
+    /// A DM to the comment's author, at most 1000 graphemes. On Facebook and Instagram it is the
+    /// private reply to the comment, once per comment and within 7 days.
     SendDm { text: String },
     /// A reply under the comment, at most 300 graphemes.
     ReplyPublicly { text: String },
@@ -339,7 +340,9 @@ pub struct ActionResult {
     pub kind: String,
     /// `sent`, `failed` or `skipped`.
     pub status: String,
-    /// Why it was not sent, e.g. `dm_not_allowed`, `no_dm_access`, `rate_limited`.
+    /// Why it was not sent, e.g. `dm_not_allowed`, `no_dm_access`, `rate_limited`; on Facebook
+    /// and Instagram `outside_window` (a private reply works within 7 days of the comment),
+    /// `already_replied` (once per comment) and `dm_unavailable`.
     pub reason: Option<String>,
     pub remote_id: Option<String>,
 }
@@ -348,7 +351,10 @@ fn outcome(kind: &str, sent: Result<Result<String, InboxError>, DbErr>) -> Actio
     let (status, reason, remote_id) = match sent {
         Ok(Ok(id)) => ("sent", None, Some(id)),
         Ok(Err(
-            e @ (InboxError::DmNotAllowed | InboxError::NoDmAccess | InboxError::RateLimited),
+            e @ (InboxError::DmNotAllowed
+            | InboxError::NoDmAccess
+            | InboxError::RateLimited
+            | InboxError::Invalid("outside_window" | "already_replied" | "dm_unavailable")),
         )) => ("skipped", Some(e.code().to_owned()), None),
         Ok(Err(e)) => ("failed", Some(e.code().to_owned()), None),
         Err(e) => {
@@ -386,7 +392,16 @@ async fn act(
     }
     let dm_refused = results.iter().any(|r| {
         r.kind == "send_dm"
-            && matches!(r.reason.as_deref(), Some("dm_not_allowed" | "no_dm_access"))
+            && matches!(
+                r.reason.as_deref(),
+                Some(
+                    "dm_not_allowed"
+                        | "no_dm_access"
+                        | "outside_window"
+                        | "already_replied"
+                        | "dm_unavailable"
+                )
+            )
     });
     let replied = results
         .iter()

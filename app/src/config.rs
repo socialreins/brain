@@ -85,6 +85,8 @@ pub struct Config {
     /// `META_APP_ID` and `META_APP_SECRET`: connecting Facebook Pages and Instagram accounts,
     /// with the redirect URI `{BRAIN_URL}/connect/meta/callback`, on Graph API
     /// `META_GRAPH_VERSION` (default `v26.0`). Publishing with a stored Page token needs neither.
+    /// `META_WEBHOOK_VERIFY_TOKEN` turns on `GET /webhooks/meta` (the handshake when the webhook
+    /// is registered in the Meta app); `POST /webhooks/meta` is signed with `META_APP_SECRET`.
     pub meta: meta::Meta,
 }
 
@@ -169,10 +171,14 @@ impl Config {
             admin_emails: admin_emails(var("ADMIN_EMAILS"))?,
             media: Media::new(media_store(var)?, false),
             threads: Threads::new(var("THREADS_APP_ID").zip(var("THREADS_APP_SECRET")))?,
-            meta: meta::Meta::new(
-                var("META_APP_ID").zip(var("META_APP_SECRET")),
-                &var("META_GRAPH_VERSION").unwrap_or_else(|| meta::DEFAULT_VERSION.into()),
-            )?,
+            meta: {
+                let mut meta = meta::Meta::new(
+                    var("META_APP_ID").zip(var("META_APP_SECRET")),
+                    &var("META_GRAPH_VERSION").unwrap_or_else(|| meta::DEFAULT_VERSION.into()),
+                )?;
+                meta.webhook_token = var("META_WEBHOOK_VERIFY_TOKEN");
+                meta
+            },
         })
     }
 }

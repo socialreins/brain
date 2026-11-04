@@ -20,6 +20,7 @@ mod m20261109_000001_waitlist_verify;
 mod m20261110_000001_post_media;
 mod m20261111_000001_threads_connect;
 mod m20261112_000001_meta_picks;
+mod m20261113_000001_inbox_permalink;
 
 pub struct Migrator;
 
@@ -47,6 +48,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261110_000001_post_media::Migration),
             Box::new(m20261111_000001_threads_connect::Migration),
             Box::new(m20261112_000001_meta_picks::Migration),
+            Box::new(m20261113_000001_inbox_permalink::Migration),
             // inject-above (do not remove this comment)
         ]
     }

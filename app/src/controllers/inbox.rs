@@ -203,7 +203,7 @@ async fn items_json(
             replies: by_item.remove(&i.id).unwrap_or_default(),
             id: i.id,
             social_account_id: i.social_account_id,
-            remote_url: url_of(&i.remote_id),
+            remote_url: i.permalink.or_else(|| url_of(&i.remote_id)),
             platform: i.platform,
             kind: i.kind,
             remote_id: i.remote_id,
@@ -590,7 +590,9 @@ fn send_error(e: &InboxError) -> Response {
 /// replies. Every member; at most 10 a minute per user, shared with publishing; `409
 /// reply_in_progress` while another reply to the item is going out. Failures:
 /// `422` with `error` (`reconnect_required`, `no_dm_access`, `dm_not_allowed`, `too_long`,
-/// `not_repliable`, `bluesky_refused`, `bluesky_unreachable`) and a `message`, or `429`.
+/// `not_repliable`, `bluesky_refused`, `bluesky_unreachable`; on Facebook and Instagram
+/// `meta_reconnect_required`, `meta_failed`, `outside_window`, `dm_unavailable`) and a
+/// `message`, or `429`.
 #[utoipa::path(post, path = "/inbox-items/{id}/reply", tag = "inbox", request_body = ReplyInput,
     params(("id" = Uuid, Path)),
     responses((status = 201, body = Item), (status = 401, body = Error),
@@ -614,7 +616,7 @@ async fn send_reply(
         Via::Public
     };
     let text = input.text.trim();
-    if !inbox::fits(via, text) {
+    if !inbox::fits_on(&item.platform, via, text) {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_text");
     }
     if !app.post_limiter.hit(t.current.0.id) {
