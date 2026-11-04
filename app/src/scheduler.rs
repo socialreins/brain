@@ -1,14 +1,14 @@
 //! Background jobs, in process: publishing due posts and reading inboxes (then running
 //! automations) and sending webhooks every minute (the old app ran every 5), and purging deleted
 //! sets, old idempotency keys, old webhook deliveries and leftover stored media every hour, and
-//! extending Threads tokens daily, each run by one instance at a time through an advisory lock.
+//! extending Threads and LinkedIn tokens daily, each run by one instance at a time through an advisory lock.
 //! shortcut: no job queue; move to one if jobs need retries or exact times.
 use std::time::Duration;
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait};
 
 use crate::{
-    controllers::{idempotency, threads},
+    controllers::{idempotency, linkedin, threads},
     inbox, media, publish,
     state::AppState,
     webhooks,
@@ -36,6 +36,11 @@ pub fn spawn(app: AppState) {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(accounts = n, "extended threads tokens"),
                 Err(e) => tracing::warn!(error = %e, "threads token refresh failed"),
+            }
+            match linkedin::refresh_tokens(&threads_app).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(accounts = n, "renewed linkedin tokens"),
+                Err(e) => tracing::warn!(error = %e, "linkedin token refresh failed"),
             }
         }
     });

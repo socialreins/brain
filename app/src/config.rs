@@ -8,7 +8,7 @@ use webauthn_rs::{prelude::Url, Webauthn, WebauthnBuilder};
 use socialreins_core::crypto::Cipher;
 
 use crate::{
-    connectors::{bluesky::Bluesky, google::Google, meta, threads::Threads},
+    connectors::{bluesky::Bluesky, google::Google, linkedin::LinkedIn, meta, threads::Threads},
     mail::Mailer,
     media::Media,
     turnstile::Turnstile,
@@ -85,6 +85,10 @@ pub struct Config {
     /// redirect URI `{BRAIN_URL}/connect/threads/callback`. Publishing with a connected
     /// account's token needs neither.
     pub threads: Threads,
+    /// `LINKEDIN_CLIENT_ID` and `LINKEDIN_CLIENT_SECRET`: connecting LinkedIn profiles, with the
+    /// redirect URI `{BRAIN_URL}/connect/linkedin/callback`. Publishing with a connected
+    /// account's token needs neither.
+    pub linkedin: LinkedIn,
     /// `META_APP_ID` and `META_APP_SECRET`: connecting Facebook Pages and Instagram accounts,
     /// with the redirect URI `{BRAIN_URL}/connect/meta/callback`, on Graph API
     /// `META_GRAPH_VERSION` (default `v26.0`). Publishing with a stored Page token needs neither.
@@ -175,6 +179,7 @@ impl Config {
             review_login_token: var("REVIEW_LOGIN_TOKEN"),
             media: Media::new(media_store(var)?, false),
             threads: Threads::new(var("THREADS_APP_ID").zip(var("THREADS_APP_SECRET")))?,
+            linkedin: LinkedIn::new(var("LINKEDIN_CLIENT_ID").zip(var("LINKEDIN_CLIENT_SECRET")))?,
             meta: {
                 let mut meta = meta::Meta::new(
                     var("META_APP_ID").zip(var("META_APP_SECRET")),

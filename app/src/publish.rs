@@ -24,6 +24,7 @@ pub use crate::connectors::bluesky::PostError as PublishError;
 use crate::{
     connectors::{
         bluesky::{self, Bluesky},
+        linkedin::{self, LinkedIn},
         meta::{self, Facebook, Instagram},
         threads::{self, Threads},
     },
@@ -225,6 +226,73 @@ fn by_type<'a>(
 }
 
 #[async_trait]
+impl Publisher for LinkedIn {
+    async fn publish(
+        &self,
+        account: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        _: Option<(&Remote, &Remote)>,
+    ) -> Result<Remote, PublishError> {
+        // A token past its 60 days is refused anyway: say so without calling.
+        if account
+            .token_expires_at
+            .is_some_and(|t| t <= chrono::Utc::now())
+        {
+            return Err(PublishError::Reconnect);
+        }
+        let mut files = Vec::new();
+        for (i, a) in media.iter().enumerate() {
+            let t = a.content_type.as_str();
+            if !linkedin::IMAGE_TYPES.contains(&t) && t != linkedin::VIDEO_TYPE {
+                let n = i + 1;
+                return Err(PublishError::Failed(format!(
+                    "Image {n} is not a JPEG, PNG or GIF image or an MP4 video."
+                )));
+            }
+            files.push(linkedin::File {
+                bytes: &a.bytes,
+                content_type: t,
+            });
+        }
+        let id = self
+            .publish_post(&account.external_id, secret, body, &files)
+            .await?;
+        Ok(Remote {
+            id,
+            cid: String::new(),
+            url: None,
+        })
+    }
+
+    async fn delete(
+        &self,
+        _: &social_accounts::Model,
+        secret: &str,
+        remote_id: &str,
+    ) -> Result<(), PublishError> {
+        self.delete_post(secret, remote_id).await
+    }
+
+    fn url(&self, _: &social_accounts::Model, remote_id: &str) -> Option<String> {
+        Some(linkedin::post_url(remote_id))
+    }
+
+    fn name(&self) -> &'static str {
+        "LinkedIn"
+    }
+
+    fn reconnect(&self) -> &'static str {
+        LINKEDIN_RECONNECT
+    }
+
+    fn timeout(&self) -> Duration {
+        linkedin::PUBLISH_TIMEOUT
+    }
+}
+
+#[async_trait]
 impl Publisher for Facebook {
     async fn publish(
         &self,
@@ -336,6 +404,7 @@ pub fn publisher<'a>(app: &'a AppState, platform: &str) -> Option<&'a dyn Publis
     match platform {
         "bluesky" => Some(&app.bluesky),
         "threads" => Some(&app.threads),
+        "linkedin" => Some(&app.linkedin),
         "facebook" => Some(&app.facebook),
         "instagram" => Some(&app.instagram),
         _ => None,
@@ -368,6 +437,8 @@ pub const RECONNECT: &str =
     "Bluesky refused the app password. Reconnect the account under Connections.";
 pub const THREADS_RECONNECT: &str =
     "Threads refused the account's token. Reconnect the account under Connections.";
+pub const LINKEDIN_RECONNECT: &str =
+    "LinkedIn refused the account's token, or it expired. Reconnect the account under Connections.";
 pub const META_RECONNECT: &str = "Meta refused the Page's token or a permission is missing. \
                                   Reconnect Facebook and Instagram under Connections.";
 const STUCK: &str = "Unknown, check the account: publishing stopped midway and it may have posted.";
@@ -529,9 +600,13 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
         } else {
             ("published", None)
         };
-        // shortcut: only Bluesky links are made from the id; a Threads link (looked up at
-        // publish) is left out here. Look it up if recovered Threads posts need one.
-        let url = bluesky::post_url(&remote);
+        // shortcut: only Bluesky and LinkedIn links are made from the id; a Threads link (looked
+        // up at publish) is left out here. Look it up if recovered Threads posts need one.
+        let url = bluesky::post_url(&remote).or_else(|| {
+            remote
+                .starts_with("urn:li:")
+                .then(|| linkedin::post_url(&remote))
+        });
         let stmt = sql(
             &with_event(
                 "UPDATE post_targets SET status = $3, remote_url = $2, error = $4, \
