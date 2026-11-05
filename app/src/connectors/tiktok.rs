@@ -231,6 +231,15 @@ impl TikTok {
         if status.is_success() && matches!(code(&body), "ok" | "") {
             Ok(body["data"].clone())
         } else {
+            // TikTok's code and request id help when asking TikTok about a refusal.
+            let log_id = body["error"]["log_id"].as_str().unwrap_or_default();
+            tracing::warn!(
+                step,
+                status = status.as_u16(),
+                code = code(&body),
+                log_id,
+                "tiktok refused a call"
+            );
             Err(refusal(status, &body, step))
         }
     }
@@ -353,6 +362,7 @@ impl TikTok {
         let Some(privacy) = Self::privacy(&creator) else {
             return Err(failed("This TikTok account cannot post right now."));
         };
+        tracing::info!(options = %creator["privacy_level_options"], chosen = %privacy, "tiktok privacy levels");
         let (path, payload) = match media {
             Media::Video(url) => (
                 "video/init",
