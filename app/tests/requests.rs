@@ -3753,7 +3753,7 @@ mod teams {
                 let mut too_many = input(&set, "x", None);
                 too_many["media"] = json!(five);
                 let mut other_platform = input(&set, "x", None);
-                other_platform["platform"] = json!("tiktok");
+                other_platform["platform"] = json!("myspace");
                 for (body, code) in [
                     (input(&set, &"a".repeat(301), None), "too_long"),
                     (input(&set, "  ", None), "empty_post"),
@@ -3935,10 +3935,10 @@ mod teams {
                 let before = count().await;
                 for (body, code, platform) in [
                     (
-                        json!({"social_set_id": set, "platforms": ["bluesky", "tiktok"],
+                        json!({"social_set_id": set, "platforms": ["bluesky", "myspace"],
                             "body": "hi"}),
                         "unsupported_platform",
-                        "tiktok",
+                        "myspace",
                     ),
                     (
                         json!({"social_set_id": set, "body": "hi",
@@ -3972,7 +3972,7 @@ mod teams {
                 let copy = sea_orm::Statement::from_sql_and_values(
                     sea_orm::DbBackend::Postgres,
                     "INSERT INTO social_accounts (id, team_id, provider, external_id, \
-                     access_token) SELECT $1, team_id, 'tiktok', external_id, access_token \
+                     access_token) SELECT $1, team_id, 'myspace', external_id, access_token \
                      FROM social_accounts WHERE id = $2",
                     [x.into(), account.parse::<uuid::Uuid>().unwrap().into()],
                 );
@@ -3996,9 +3996,9 @@ mod teams {
                     .collect();
                 assert_eq!(platforms, [json!("bluesky")]);
                 let res =
-                    group(json!({"social_set_id": set, "platforms": ["tiktok"], "body": "hi"}))
+                    group(json!({"social_set_id": set, "platforms": ["myspace"], "body": "hi"}))
                         .await;
-                res.assert_json(&json!({"error": "unsupported_platform", "platform": "tiktok"}));
+                res.assert_json(&json!({"error": "unsupported_platform", "platform": "myspace"}));
                 assert_eq!(count().await, before + 1);
 
                 // A group body may run well past the 4 KiB `/v1` limit.
@@ -7262,6 +7262,656 @@ mod teams {
                     DELETE_MODE.store(0, Ordering::SeqCst);
                     res.assert_status_ok();
                     assert_eq!(res.json::<Value>()["status"], "deleted");
+                }
+            }
+
+            /// TikTok: the connect flow, direct posts of a video or photos that TikTok pulls from
+            /// brain's links, against a mock of the Content Posting API; a post TikTok refuses,
+            /// token renewal, and the missing delete.
+            mod tiktok_api {
+                use super::threads_api::{location, set_role};
+                use super::*;
+                use axum::{
+                    extract::Form,
+                    http::{HeaderMap, StatusCode},
+                    routing::{get, post},
+                    Json, Router,
+                };
+                use socialreins_brain::connectors::tiktok::TikTok;
+                use std::sync::atomic::{AtomicU64, Ordering};
+
+                /// Every init: (path, body).
+                static INITS: std::sync::Mutex<Vec<(String, Value)>> =
+                    std::sync::Mutex::new(Vec::new());
+                /// The bearer token of every call that needs one, newest last.
+                static BEARERS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                static REFRESHES: AtomicU64 = AtomicU64::new(0);
+                static STATUS_CALLS: AtomicU64 = AtomicU64::new(0);
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                /// 0: a public account, 1: only `SELF_ONLY` (an app TikTok has not reviewed).
+                static PRIVACY: AtomicU64 = AtomicU64::new(0);
+                /// 0: the init works, 1: TikTok refuses it as unaudited, 2: the publish fails.
+                static MODE: AtomicU64 = AtomicU64::new(0);
+
+                type Answer = (StatusCode, Json<Value>);
+
+                fn ok(data: Value) -> Answer {
+                    (
+                        StatusCode::OK,
+                        Json(json!({"data": data, "error": {"code": "ok", "message": ""}})),
+                    )
+                }
+
+                fn refused(status: StatusCode, code: &str, message: &str) -> Answer {
+                    let error = json!({"code": code, "message": message});
+                    (status, Json(json!({"data": {}, "error": error})))
+                }
+
+                fn bearer_ok(h: &HeaderMap) -> bool {
+                    let bearer = h.get("authorization").and_then(|v| v.to_str().ok());
+                    BEARERS
+                        .lock()
+                        .unwrap()
+                        .push(bearer.unwrap_or_default().to_owned());
+                    matches!(bearer, Some("Bearer tt" | "Bearer ttrefreshed"))
+                }
+
+                fn expired() -> Answer {
+                    let msg = "The access token is invalid or not authorized.";
+                    refused(StatusCode::UNAUTHORIZED, "access_token_invalid", msg)
+                }
+
+                fn jpeg() -> ([(&'static str, &'static str); 1], Vec<u8>) {
+                    let mut bytes = vec![7u8; 64];
+                    bytes[..4].copy_from_slice(b"\xFF\xD8\xFF\xE0");
+                    ([("content-type", "image/jpeg")], bytes)
+                }
+
+                /// TikTok (token endpoint, profile, creator info, init, status), plus a JPEG and an
+                /// MP4. Code `good` gives a token with every scope, `noscope` none named,
+                /// `nopublish` one without `video.publish`, `norefresh` no refresh token.
+                async fn mock_tiktok() -> String {
+                    PRIVACY.store(0, Ordering::SeqCst);
+                    MODE.store(0, Ordering::SeqCst);
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let base = format!("http://{}", listener.local_addr().unwrap());
+                    let token = |Form(f): Form<HashMap<String, String>>| async move {
+                        let get = |k: &str| f.get(k).map(String::as_str).unwrap_or_default();
+                        let app = get("client_key") == "kapp" && get("client_secret") == "ksecret";
+                        let code = (get("grant_type"), get("code"), get("refresh_token"));
+                        let all = "user.info.basic,video.upload,video.publish";
+                        let bad = (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error": "invalid_grant",
+                                "error_description": "Authorization code is expired."})),
+                        );
+                        let good = |scope: Option<&str>, refresh: Option<&str>| {
+                            let mut v = json!({"access_token": "tt", "expires_in": 86400,
+                                "open_id": "openid1", "token_type": "Bearer"});
+                            if let Some(s) = scope {
+                                v["scope"] = json!(s);
+                            }
+                            if let Some(r) = refresh {
+                                v["refresh_token"] = json!(r);
+                            }
+                            (StatusCode::OK, Json(v))
+                        };
+                        match (app, code) {
+                            (true, ("authorization_code", "good", _)) => {
+                                good(Some(all), Some("krefresh"))
+                            }
+                            (true, ("authorization_code", "nopublish", _)) => {
+                                good(Some("user.info.basic,video.upload"), Some("krefresh"))
+                            }
+                            (true, ("authorization_code", "noscope", _)) => {
+                                good(None, Some("krefresh"))
+                            }
+                            (true, ("authorization_code", "norefresh", _)) => good(Some(all), None),
+                            (true, ("refresh_token", _, "krefresh")) => {
+                                REFRESHES.fetch_add(1, Ordering::SeqCst);
+                                (
+                                    StatusCode::OK,
+                                    Json(json!({"access_token": "ttrefreshed",
+                                        "expires_in": 86400, "refresh_token": "krefresh2"})),
+                                )
+                            }
+                            _ => bad,
+                        }
+                    };
+                    let user = |h: HeaderMap| async move {
+                        if !bearer_ok(&h) {
+                            return expired();
+                        }
+                        ok(
+                            json!({"user": {"open_id": "openid1", "display_name": "Ann Lee",
+                            "avatar_url": "https://p16.tiktokcdn.com/ann.jpeg"}}),
+                        )
+                    };
+                    let creator = |h: HeaderMap| async move {
+                        if !bearer_ok(&h) {
+                            return expired();
+                        }
+                        let options = if PRIVACY.load(Ordering::SeqCst) == 1 {
+                            json!(["SELF_ONLY"])
+                        } else {
+                            json!(["FOLLOWER_OF_CREATOR", "PUBLIC_TO_EVERYONE", "SELF_ONLY"])
+                        };
+                        ok(json!({"creator_username": "annlee", "privacy_level_options": options}))
+                    };
+                    let init = |path: &'static str| {
+                        move |h: HeaderMap, Json(body): Json<Value>| async move {
+                            if !bearer_ok(&h) {
+                                return expired();
+                            }
+                            INITS.lock().unwrap().push((path.to_owned(), body));
+                            if MODE.load(Ordering::SeqCst) == 1 {
+                                let code = "unaudited_client_can_only_post_to_private_accounts";
+                                return refused(StatusCode::FORBIDDEN, code, "private only");
+                            }
+                            let n = NEXT.fetch_add(1, Ordering::SeqCst);
+                            ok(json!({ "publish_id": format!("v_pub_url~v2.{n}") }))
+                        }
+                    };
+                    let status = |h: HeaderMap, Json(body): Json<Value>| async move {
+                        if !bearer_ok(&h) {
+                            return expired();
+                        }
+                        assert!(body["publish_id"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("v_pub_url~"));
+                        // The first answer says TikTok is still downloading.
+                        if STATUS_CALLS
+                            .fetch_add(1, Ordering::SeqCst)
+                            .is_multiple_of(2)
+                        {
+                            return ok(json!({"status": "PROCESSING_DOWNLOAD"}));
+                        }
+                        if MODE.load(Ordering::SeqCst) == 2 {
+                            return ok(json!({"status": "FAILED",
+                                "fail_reason": "file_format_check_failed"}));
+                        }
+                        if PRIVACY.load(Ordering::SeqCst) == 1 {
+                            return ok(json!({"status": "PUBLISH_COMPLETE"}));
+                        }
+                        ok(json!({"status": "PUBLISH_COMPLETE",
+                            "publicaly_available_post_id": [7311234567890123456_i64]}))
+                    };
+                    let mut mp4 = vec![0u8; 64];
+                    mp4[..12].copy_from_slice(b"\0\0\0\x18ftypisom");
+                    let app = Router::new()
+                        .route("/v2/oauth/token/", post(token))
+                        .route("/v2/user/info/", get(user))
+                        .route("/v2/post/publish/creator_info/query/", post(creator))
+                        .route("/v2/post/publish/video/init/", post(init("video")))
+                        .route("/v2/post/publish/content/init/", post(init("content")))
+                        .route("/v2/post/publish/status/fetch/", post(status))
+                        .route("/a.jpg", get(|| async { jpeg() }))
+                        .route("/b.jpg", get(|| async { jpeg() }))
+                        .route("/img.png", get(|| async { image("image/png", 64) }))
+                        .route(
+                            "/clip.mp4",
+                            get(move || async move { ([("content-type", "video/mp4")], mp4) }),
+                        );
+                    tokio::spawn(async move { axum::serve(listener, app).await });
+                    base
+                }
+
+                /// A brain with TikTok set up on the mock, its state, and the mock.
+                async fn on_tiktok(
+                    configured: bool,
+                ) -> (TestServer, DatabaseConnection, AppState, String) {
+                    let base = mock_tiktok().await;
+                    let mut config = Config::from_env().expect("test config");
+                    config.trust_proxy = true;
+                    let app = configured.then(|| ("kapp".to_owned(), "ksecret".to_owned()));
+                    let mut t = TikTok::new(app).unwrap();
+                    t.api_url = base.clone();
+                    t.poll_every = std::time::Duration::from_millis(5);
+                    config.tiktok = t;
+                    let disk = object_store::local::LocalFileSystem::new_with_prefix(media_dir())
+                        .unwrap()
+                        .with_automatic_cleanup(true);
+                    config.media = Media::new(std::sync::Arc::new(disk), true);
+                    let db = socialreins_brain::connect(&config)
+                        .await
+                        .expect("database reachable");
+                    let state = AppState::new(db.clone(), &config);
+                    let app = controllers::router(state.clone(), &config);
+                    (TestServer::new(app).unwrap(), db, state, base)
+                }
+
+                /// Starts a connect: (state, `sr_tiktok=...`).
+                async fn begin(s: &TestServer, cookie: &str) -> (String, String) {
+                    let res = s
+                        .get("/connections/tiktok/redirect")
+                        .add_header("cookie", cookie)
+                        .await;
+                    let (to, q) = location(&res);
+                    assert!(
+                        to.starts_with("https://www.tiktok.com/v2/auth/authorize/?"),
+                        "{to}"
+                    );
+                    assert_eq!(q["client_key"], "kapp");
+                    assert_eq!(q["response_type"], "code");
+                    assert_eq!(
+                        q["redirect_uri"],
+                        "http://localhost:8080/connect/tiktok/callback"
+                    );
+                    assert_eq!(q["scope"], "user.info.basic,video.upload,video.publish");
+                    let set = res
+                        .iter_headers_by_name("set-cookie")
+                        .map(|v| v.to_str().unwrap().to_owned())
+                        .find(|c| c.starts_with("sr_tiktok="))
+                        .unwrap();
+                    assert!(set.contains("HttpOnly") && set.contains("Path=/connect/tiktok"));
+                    (
+                        q["state"].clone(),
+                        set.split(';').next().unwrap().to_owned(),
+                    )
+                }
+
+                /// TikTok's redirect back: where it lands, as `(connected, connect_error)`.
+                async fn finish(
+                    s: &TestServer,
+                    cookies: &str,
+                    query: &str,
+                ) -> (Option<String>, Option<String>) {
+                    let res = s
+                        .get(&format!("/connect/tiktok/callback?{query}"))
+                        .add_header("cookie", cookies)
+                        .await;
+                    let (to, q) = location(&res);
+                    assert!(
+                        to.starts_with("http://localhost:3000/app/connections?"),
+                        "{to}"
+                    );
+                    if q.contains_key("connect_error") {
+                        assert_eq!(q["provider"], "tiktok");
+                    }
+                    (q.get("connected").cloned(), q.get("connect_error").cloned())
+                }
+
+                async fn connect_with(s: &TestServer, cookie: &str, code: &str) {
+                    let (state, flow) = begin(s, cookie).await;
+                    let both = format!("{cookie}; {flow}");
+                    let got = finish(s, &both, &format!("code={code}&state={state}")).await;
+                    assert_eq!(got, (Some("tiktok".into()), None));
+                }
+
+                async fn tiktok_account(
+                    db: &DatabaseConnection,
+                    team_id: &str,
+                ) -> social_accounts::Model {
+                    social_accounts::Entity::find()
+                        .filter(
+                            social_accounts::Column::TeamId
+                                .eq(team_id.parse::<uuid::Uuid>().unwrap()),
+                        )
+                        .filter(social_accounts::Column::Provider.eq("tiktok"))
+                        .one(db)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                }
+
+                /// Sets the account's access token and the seconds it has left.
+                async fn set_token(db: &DatabaseConnection, account: uuid::Uuid, secs: i64) {
+                    let row = social_accounts::ActiveModel {
+                        id: Set(account),
+                        access_token: Set(cipher().encrypt(b"old")),
+                        token_expires_at: Set(Some(
+                            (Utc::now() + Duration::seconds(secs)).fixed_offset(),
+                        )),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(row).exec(db).await.unwrap();
+                }
+
+                fn tiktok_post(set: &str, body: &str, media: &[&str]) -> Value {
+                    let mut v = input(set, body, Some(&past()));
+                    v["platform"] = json!("tiktok");
+                    v["media"] = json!(media
+                        .iter()
+                        .map(|m| format!("https://a.example{m}"))
+                        .collect::<Vec<_>>());
+                    v
+                }
+
+                /// A connected team: (server, db, state, mock base, cookie, team id, set id).
+                async fn team() -> (
+                    TestServer,
+                    DatabaseConnection,
+                    AppState,
+                    String,
+                    String,
+                    String,
+                    String,
+                ) {
+                    let (s, db, state, base) = on_tiktok(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    connect_with(&s, &cookie, "good").await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    (s, db, state, base, cookie, team_id, set)
+                }
+
+                /// Saves a post of the mock's files and publishes it: the post.
+                async fn publish_files(
+                    s: &TestServer,
+                    (db, state, base): (&DatabaseConnection, &AppState, &str),
+                    (cookie, set): (&str, &str),
+                    (body, paths): (&str, &[&str]),
+                ) -> Value {
+                    let id = id_of(&create(s, cookie, tiktok_post(set, body, paths)).await);
+                    set_media(db, base, &id, paths).await;
+                    publish::tick(state).await.unwrap();
+                    get_post(s, cookie, &id).await
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connect_saves_the_account_and_a_sealed_refresh_token() {
+                    let (s, db, _, _) = on_tiktok(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let (state, flow) = begin(&s, &cookie).await;
+                    let both = format!("{cookie}; {flow}");
+                    let query = format!("code=good&state={state}");
+                    let res = s
+                        .get(&format!("/connect/tiktok/callback?{query}"))
+                        .add_header("cookie", &both)
+                        .await;
+                    let (_, q) = location(&res);
+                    assert_eq!(q["connected"], "tiktok");
+                    // Only the connect cookie is cleared: nobody is signed in by this.
+                    let cookies: Vec<String> = res
+                        .iter_headers_by_name("set-cookie")
+                        .map(|v| v.to_str().unwrap().to_owned())
+                        .collect();
+                    assert_eq!(cookies.len(), 1, "{cookies:?}");
+                    assert!(cookies[0].starts_with("sr_tiktok=;"), "{cookies:?}");
+
+                    let listed = list(&s, &cookie).await;
+                    assert_eq!(listed.len(), 1);
+                    let a = &listed[0];
+                    assert_eq!(a["provider"], "tiktok");
+                    assert_eq!(a["external_id"], "openid1");
+                    assert_eq!(a["display_name"], "Ann Lee");
+                    assert_eq!(a["handle"], "annlee");
+                    assert_eq!(a["avatar_url"], "https://p16.tiktokcdn.com/ann.jpeg");
+                    let set = default_set(&db, &team_id).await.to_string();
+                    assert_eq!(a["set_ids"], json!([set]));
+                    assert!(a.get("access_token").is_none() && !a.to_string().contains("krefresh"));
+                    let row = tiktok_account(&db, &team_id).await;
+                    assert_eq!(cipher().decrypt(&row.access_token).unwrap(), b"tt");
+                    let sealed = row.meta["refresh_token"].as_str().unwrap();
+                    assert!(!sealed.contains("krefresh"));
+                    let plain = cipher()
+                        .decrypt(&URL_SAFE_NO_PAD.decode(sealed).unwrap())
+                        .unwrap();
+                    assert_eq!(plain, b"krefresh");
+                    // The state works once, and a reconnect keeps the one row.
+                    assert_eq!(
+                        finish(&s, &both, &query).await,
+                        (None, Some("expired".into()))
+                    );
+                    connect_with(&s, &cookie, "good").await;
+                    let again = list(&s, &cookie).await;
+                    assert_eq!(again.len(), 1);
+                    assert_eq!(again[0]["id"], a["id"]);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connect_refuses_strangers_members_and_other_browsers() {
+                    let (s, db, _, _) = on_tiktok(true).await;
+                    let (_, cookie, user_id) = user(&s, &db).await;
+                    let back = |res: axum_test::TestResponse| location(&res).1;
+                    let res = s.get("/connections/tiktok/redirect").await;
+                    assert_eq!(back(res)["connect_error"], "unauthorized");
+
+                    // The state must come back to the browser that started it.
+                    let (state, _) = begin(&s, &cookie).await;
+                    let query = format!("code=good&state={state}");
+                    assert_eq!(
+                        finish(&s, &cookie, &query).await,
+                        (None, Some("expired".into()))
+                    );
+                    // A demotion meanwhile.
+                    let (state, flow) = begin(&s, &cookie).await;
+                    set_role(&db, user_id, "member").await;
+                    let both = format!("{cookie}; {flow}");
+                    let q = format!("code=good&state={state}");
+                    assert_eq!(finish(&s, &both, &q).await, (None, Some("expired".into())));
+                    let res = s
+                        .get("/connections/tiktok/redirect")
+                        .add_header("cookie", &cookie)
+                        .await;
+                    assert_eq!(back(res)["connect_error"], "forbidden");
+                    assert!(list(&s, &cookie).await.is_empty());
+
+                    let (s, db, _, _) = on_tiktok(false).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let res = s
+                        .get("/connections/tiktok/redirect")
+                        .add_header("cookie", &cookie)
+                        .await;
+                    assert_eq!(back(res)["connect_error"], "not_configured");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connects_that_go_wrong_land_with_a_code_and_save_nothing() {
+                    let (s, db, _, _) = on_tiktok(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    // Cancelled on TikTok, a bad code, no refresh token (the account could not be
+                    // renewed), and a permission left unticked or none named at all.
+                    for (q, want) in [
+                        ("error=access_denied", "cancelled"),
+                        ("code=bad", "tiktok_failed"),
+                        ("code=norefresh", "tiktok_failed"),
+                        ("code=nopublish", "missing_scopes"),
+                        ("code=noscope", "missing_scopes"),
+                    ] {
+                        let (state, flow) = begin(&s, &cookie).await;
+                        let both = format!("{cookie}; {flow}");
+                        let got = finish(&s, &both, &format!("{q}&state={state}")).await;
+                        assert_eq!(got, (None, Some(want.into())), "{q}");
+                    }
+                    assert!(list(&s, &cookie).await.is_empty());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_video_is_pulled_by_link_and_posted_publicly() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let (inits, polls) = (
+                        INITS.lock().unwrap().len(),
+                        STATUS_CALLS.load(Ordering::SeqCst),
+                    );
+                    let body = "  A caption for the clip \n#fyp";
+                    let ctx = (&db, &state, base.as_str());
+                    let p = publish_files(&s, ctx, (&cookie, &set), (body, &["/clip.mp4"])).await;
+                    assert_eq!(p["status"], "published", "{p}");
+
+                    let (path, sent) = INITS.lock().unwrap()[inits].clone();
+                    assert_eq!(path, "video");
+                    assert_eq!(sent["post_info"]["title"], "A caption for the clip \n#fyp");
+                    assert_eq!(sent["post_info"]["privacy_level"], "PUBLIC_TO_EVERYONE");
+                    for off in ["disable_duet", "disable_comment", "disable_stitch"] {
+                        assert_eq!(sent["post_info"][off], true, "{off}");
+                    }
+                    assert_eq!(sent["source_info"]["source"], "PULL_FROM_URL");
+                    let url = sent["source_info"]["video_url"].as_str().unwrap();
+                    assert!(url.starts_with("http://localhost:8080/media/"), "{url}");
+                    assert!(url.ends_with(".mp4"), "{url}");
+                    // It asked again while TikTok was still downloading.
+                    assert_eq!(STATUS_CALLS.load(Ordering::SeqCst) - polls, 2);
+
+                    let t = &p["targets"][0];
+                    assert!(t["remote_id"].as_str().unwrap().starts_with("v_pub_url~"));
+                    assert_eq!(
+                        t["remote_url"],
+                        "https://www.tiktok.com/@annlee/video/7311234567890123456"
+                    );
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn an_account_that_may_only_post_privately_gets_the_private_level() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    PRIVACY.store(1, Ordering::SeqCst);
+                    let inits = INITS.lock().unwrap().len();
+                    let ctx = (&db, &state, base.as_str());
+                    let p = publish_files(&s, ctx, (&cookie, &set), ("hi", &["/clip.mp4"])).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let (_, sent) = INITS.lock().unwrap()[inits].clone();
+                    assert_eq!(sent["post_info"]["privacy_level"], "SELF_ONLY");
+                    // A private post has no public video id, so no link.
+                    assert_eq!(p["targets"][0]["remote_url"], Value::Null);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn photos_are_posted_as_a_photo_post() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let inits = INITS.lock().unwrap().len();
+                    let ctx = (&db, &state, base.as_str());
+                    let paths = ["/a.jpg", "/b.jpg"];
+                    let p =
+                        publish_files(&s, ctx, (&cookie, &set), ("Trip\nthe long caption", &paths))
+                            .await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let (path, sent) = INITS.lock().unwrap()[inits].clone();
+                    assert_eq!(path, "content");
+                    assert_eq!(sent["media_type"], "PHOTO");
+                    assert_eq!(sent["post_mode"], "DIRECT_POST");
+                    assert_eq!(sent["post_info"]["title"], "Trip");
+                    assert_eq!(sent["post_info"]["description"], "Trip\nthe long caption");
+                    assert_eq!(sent["source_info"]["photo_cover_index"], 0);
+                    let images = sent["source_info"]["photo_images"].as_array().unwrap();
+                    assert_eq!(images.len(), 2);
+                    for i in images {
+                        let url = i.as_str().unwrap();
+                        assert!(url.starts_with("http://localhost:8080/media/"), "{url}");
+                    }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_file_tiktok_cannot_take_fails_the_target_without_calling_tiktok() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let inits = INITS.lock().unwrap().len();
+                    let ctx = (&db, &state, base.as_str());
+                    // A PNG is not a TikTok photo.
+                    let p = publish_files(&s, ctx, (&cookie, &set), ("a", &["/img.png"])).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    let msg = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(
+                        msg.contains("one MP4 or MOV video, or JPEG or WebP photos"),
+                        "{msg}"
+                    );
+                    assert_eq!(INITS.lock().unwrap().len(), inits);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_post_tiktok_refuses_or_fails_says_why() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let ctx = (&db, &state, base.as_str());
+                    // The app is not reviewed and the account is public.
+                    MODE.store(1, Ordering::SeqCst);
+                    let p = publish_files(&s, ctx, (&cookie, &set), ("a", &["/clip.mp4"])).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    let msg = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(msg.contains("private account"), "{msg}");
+                    // TikTok took the post and then could not publish it.
+                    MODE.store(2, Ordering::SeqCst);
+                    let p = publish_files(&s, ctx, (&cookie, &set), ("a", &["/clip.mp4"])).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    let msg = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(msg.contains("file_format_check_failed"), "{msg}");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_token_near_its_end_is_renewed_and_the_new_refresh_token_kept() {
+                    let (s, db, state, base, cookie, team_id, set) = team().await;
+                    let account = tiktok_account(&db, &team_id).await.id;
+                    set_token(&db, account, 30).await;
+                    let renewed = REFRESHES.load(Ordering::SeqCst);
+                    let ctx = (&db, &state, base.as_str());
+                    let p = publish_files(&s, ctx, (&cookie, &set), ("a", &["/clip.mp4"])).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(REFRESHES.load(Ordering::SeqCst), renewed + 1);
+                    assert_eq!(
+                        BEARERS.lock().unwrap().last().map(String::as_str),
+                        Some("Bearer ttrefreshed")
+                    );
+                    let row = tiktok_account(&db, &team_id).await;
+                    assert_eq!(cipher().decrypt(&row.access_token).unwrap(), b"ttrefreshed");
+                    let sealed = row.meta["refresh_token"].as_str().unwrap();
+                    let plain = cipher()
+                        .decrypt(&URL_SAFE_NO_PAD.decode(sealed).unwrap())
+                        .unwrap();
+                    assert_eq!(plain, b"krefresh2");
+                    // A live token is not renewed again.
+                    let p = publish_files(&s, ctx, (&cookie, &set), ("b", &["/clip.mp4"])).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(REFRESHES.load(Ordering::SeqCst), renewed + 1);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_refresh_token_tiktok_refuses_asks_for_a_reconnect() {
+                    let (s, db, state, base, cookie, team_id, set) = team().await;
+                    let account = tiktok_account(&db, &team_id).await.id;
+                    set_token(&db, account, 30).await;
+                    let row = social_accounts::ActiveModel {
+                        id: Set(account),
+                        meta: Set(json!({"refresh_token":
+                            URL_SAFE_NO_PAD.encode(cipher().encrypt(b"revoked"))})),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(row)
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                    let ctx = (&db, &state, base.as_str());
+                    let p = publish_files(&s, ctx, (&cookie, &set), ("a", &["/clip.mp4"])).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    let msg = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(
+                        msg.contains("Reconnect the account under Connections"),
+                        "{msg}"
+                    );
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn take_down_says_tiktok_has_no_delete_and_keeps_the_post() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let ctx = (&db, &state, base.as_str());
+                    let p = publish_files(&s, ctx, (&cookie, &set), ("a", &["/clip.mp4"])).await;
+                    let id = p["id"].as_str().unwrap();
+                    let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                    assert_eq!(res.status_code(), 422, "{}", res.text());
+                    let body = res.json::<Value>();
+                    assert_eq!(body["error"], "takedown_failed");
+                    let msg = body["message"].as_str().unwrap();
+                    assert!(
+                        msg.contains("does not let other apps delete posts"),
+                        "{msg}"
+                    );
+                    assert!(msg.contains("Delete the post in the TikTok app"), "{msg}");
+                    assert_eq!(get_post(&s, &cookie, id).await["status"], "published");
                 }
             }
 

@@ -23,6 +23,10 @@ pub const INSTAGRAM_MAX_MEDIA: usize = 10;
 /// rest (5000 bytes). YouTube refuses `<` and `>` in either.
 pub const YOUTUBE_MAX_TITLE: usize = 100;
 pub const YOUTUBE_MAX_DESCRIPTION: usize = 5000;
+/// TikTok: a caption of 2200 characters on one video or 1 to 35 photos (TikTok has no text-only
+/// posts).
+pub const TIKTOK_MAX_CHARS: usize = 2200;
+pub const TIKTOK_MAX_MEDIA: usize = 35;
 /// X: 280 weighted characters (`x_weight`), 4 images or one video or GIF.
 pub const X_MAX_WEIGHT: usize = 280;
 pub const X_MAX_MEDIA: usize = 4;
@@ -135,7 +139,7 @@ pub fn x_weight(text: &str) -> usize {
 }
 
 /// Checks a post for `platform` (`bluesky`, `threads`, `linkedin`, `facebook`, `instagram`,
-/// `youtube` or `x`, the ones that publish today).
+/// `youtube`, `x` or `tiktok`, the ones that publish today).
 pub fn validate(platform: &str, body: &str, media: &[String]) -> Result<(), Invalid> {
     let chars = || body.chars().count();
     let (too_long, max_media) = match platform {
@@ -150,6 +154,7 @@ pub fn validate(platform: &str, body: &str, media: &[String]) -> Result<(), Inva
         "facebook" => (chars() > FACEBOOK_MAX_CHARS, FACEBOOK_MAX_MEDIA),
         "instagram" => (chars() > INSTAGRAM_MAX_CHARS, INSTAGRAM_MAX_MEDIA),
         "x" => (x_weight(body) > X_MAX_WEIGHT, X_MAX_MEDIA),
+        "tiktok" => (chars() > TIKTOK_MAX_CHARS, TIKTOK_MAX_MEDIA),
         "youtube" => {
             let (title, description) = youtube_text(body);
             let too_long = title.chars().count() > YOUTUBE_MAX_TITLE
@@ -162,7 +167,7 @@ pub fn validate(platform: &str, body: &str, media: &[String]) -> Result<(), Inva
     if body.trim().is_empty() && (media.is_empty() || platform == "youtube") {
         return Err(Invalid::Empty);
     }
-    if matches!(platform, "instagram" | "youtube") && media.is_empty() {
+    if matches!(platform, "instagram" | "youtube" | "tiktok") && media.is_empty() {
         return Err(Invalid::MediaRequired);
     }
     if platform == "youtube" && body.contains(['<', '>']) {
@@ -294,7 +299,7 @@ mod tests {
             assert_eq!(ok("x", &[bad]), Err(Invalid::InvalidMedia), "{bad}");
         }
         assert_eq!(
-            validate("tiktok", "hi", &[]),
+            validate("myspace", "hi", &[]),
             Err(Invalid::UnsupportedPlatform)
         );
     }
@@ -377,6 +382,29 @@ mod tests {
         assert_eq!(
             validate_thread("linkedin", &[("two", &media(0)[..])]),
             Err((Invalid::ThreadUnsupported, None))
+        );
+    }
+
+    #[test]
+    fn tiktok_takes_a_caption_on_one_video_or_up_to_35_photos() {
+        let media = |n: usize| -> Vec<String> {
+            (0..n)
+                .map(|i| format!("https://a.example/{i}.mp4"))
+                .collect()
+        };
+        assert_eq!(validate("tiktok", "hi", &media(1)), Ok(()));
+        assert_eq!(validate("tiktok", "", &media(1)), Ok(()));
+        assert_eq!(validate("tiktok", "hi", &media(35)), Ok(()));
+        assert_eq!(
+            validate("tiktok", "hi", &media(36)),
+            Err(Invalid::TooManyImages)
+        );
+        assert_eq!(validate("tiktok", "hi", &[]), Err(Invalid::MediaRequired));
+        assert_eq!(validate("tiktok", "", &[]), Err(Invalid::Empty));
+        assert_eq!(validate("tiktok", &"a".repeat(2200), &media(1)), Ok(()));
+        assert_eq!(
+            validate("tiktok", &"a".repeat(2201), &media(1)),
+            Err(Invalid::TooLong)
         );
     }
 

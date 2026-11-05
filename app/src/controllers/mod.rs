@@ -23,6 +23,7 @@ pub mod review_login;
 pub mod social_sets;
 pub mod teams;
 pub mod threads;
+pub mod tiktok;
 pub mod waitlist;
 pub mod webhooks;
 pub mod x;
@@ -156,6 +157,7 @@ pub fn router(state: AppState, config: &Config) -> Router {
         .merge(threads::routes())
         .merge(linkedin::routes())
         .merge(youtube::routes())
+        .merge(tiktok::routes())
         .merge(x::routes())
         .merge(meta::routes())
         .merge(meta_webhook::routes())

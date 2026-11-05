@@ -4,5 +4,6 @@ pub mod google;
 pub mod linkedin;
 pub mod meta;
 pub mod threads;
+pub mod tiktok;
 pub mod x;
 pub mod youtube;
