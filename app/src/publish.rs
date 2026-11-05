@@ -27,6 +27,7 @@ use crate::{
         linkedin::{self, LinkedIn},
         meta::{self, Facebook, Instagram},
         threads::{self, Threads},
+        tiktok::{self, TikTok},
         x::{self, X},
         youtube::{self, YouTube},
     },
@@ -422,6 +423,84 @@ impl Publisher for YouTube {
 }
 
 #[async_trait]
+impl Publisher for TikTok {
+    /// One MP4 or MOV video, or JPEG or WebP photos, that TikTok downloads from brain's links.
+    /// `secret` is already renewed (`credential`). The caption is the body.
+    async fn publish(
+        &self,
+        account: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        _: Option<(&Remote, &Remote)>,
+    ) -> Result<Remote, PublishError> {
+        let videos = media
+            .iter()
+            .filter(|a| a.content_type.starts_with("video/"));
+        let items = match (videos.count(), media) {
+            (1, [video]) if tiktok::VIDEO_TYPES.contains(&video.content_type.as_str()) => {
+                tiktok::Media::Video(&video.url)
+            }
+            (0, [_, ..])
+                if media
+                    .iter()
+                    .all(|a| tiktok::PHOTO_TYPES.contains(&a.content_type.as_str())) =>
+            {
+                tiktok::Media::Photos(media.iter().map(|a| a.url.as_str()).collect())
+            }
+            _ => {
+                return Err(PublishError::Failed(
+                    "A TikTok post needs one MP4 or MOV video, or JPEG or WebP photos.".into(),
+                ))
+            }
+        };
+        let posted = self.post(secret, body, &items).await?;
+        let url = posted
+            .video_id
+            .as_deref()
+            .zip(account.handle.as_deref())
+            .and_then(|(id, user)| tiktok::video_url(user, id));
+        Ok(Remote {
+            id: posted.publish_id,
+            cid: String::new(),
+            url,
+        })
+    }
+
+    /// TikTok gives apps no way to delete a post.
+    async fn delete(
+        &self,
+        _: &social_accounts::Model,
+        _: &str,
+        _: &str,
+    ) -> Result<(), PublishError> {
+        Err(PublishError::Failed(
+            "TikTok does not let other apps delete posts.".into(),
+        ))
+    }
+
+    fn url(&self, _: &social_accounts::Model, _: &str) -> Option<String> {
+        None
+    }
+
+    fn name(&self) -> &'static str {
+        "TikTok"
+    }
+
+    fn reconnect(&self) -> &'static str {
+        TIKTOK_RECONNECT
+    }
+
+    fn by_url(&self) -> bool {
+        true
+    }
+
+    fn timeout(&self) -> Duration {
+        tiktok::PUBLISH_TIMEOUT
+    }
+}
+
+#[async_trait]
 impl Publisher for Facebook {
     async fn publish(
         &self,
@@ -536,6 +615,7 @@ pub fn publisher<'a>(app: &'a AppState, platform: &str) -> Option<&'a dyn Publis
         "linkedin" => Some(&app.linkedin),
         "youtube" => Some(&app.youtube),
         "x" => Some(&app.x),
+        "tiktok" => Some(&app.tiktok),
         "facebook" => Some(&app.facebook),
         "instagram" => Some(&app.instagram),
         _ => None,
@@ -572,15 +652,17 @@ pub const LINKEDIN_RECONNECT: &str =
     "LinkedIn refused the account's token, or it expired. Reconnect the account under Connections.";
 pub const YOUTUBE_RECONNECT: &str = "Google refused the channel's token, or access was removed. \
                                       Reconnect the channel under Connections.";
+pub const TIKTOK_RECONNECT: &str = "TikTok refused the account's token, or access was removed. \
+                                     Reconnect the account under Connections.";
 pub const X_RECONNECT: &str = "X refused the account's token, or access was removed. \
                                Reconnect the account under Connections.";
 pub const META_RECONNECT: &str = "Meta refused the Page's token or a permission is missing. \
                                   Reconnect Facebook and Instagram under Connections.";
 const STUCK: &str = "Unknown, check the account: publishing stopped midway and it may have posted.";
 
-/// The token to call the platform with. YouTube's lasts an hour and X's two, so they are
-/// renewed first when near their end (`controllers::youtube::fresh_token`, `controllers::x::
-/// fresh_token`); the others use the stored secret as it is, and an unreadable one is a
+/// The token to call the platform with. YouTube's lasts an hour, X's two and TikTok's a day, so
+/// they are renewed first when near their end (`controllers::youtube::fresh_token`,
+/// `controllers::x::fresh_token`, `controllers::tiktok::fresh_token`); the others use the stored secret as it is, and an unreadable one is a
 /// reconnect.
 async fn credential(
     app: &AppState,
@@ -591,6 +673,9 @@ async fn credential(
     }
     if account.provider == "x" {
         return crate::controllers::x::fresh_token(app, account).await;
+    }
+    if account.provider == "tiktok" {
+        return crate::controllers::tiktok::fresh_token(app, account).await;
     }
     app.cipher
         .decrypt(&account.access_token)

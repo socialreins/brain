@@ -9,8 +9,8 @@ use socialreins_core::crypto::Cipher;
 
 use crate::{
     connectors::{
-        bluesky::Bluesky, google::Google, linkedin::LinkedIn, meta, threads::Threads, x::X,
-        youtube::YouTube,
+        bluesky::Bluesky, google::Google, linkedin::LinkedIn, meta, threads::Threads,
+        tiktok::TikTok, x::X, youtube::YouTube,
     },
     mail::Mailer,
     media::Media,
@@ -100,6 +100,10 @@ pub struct Config {
     /// redirect URI `{BRAIN_URL}/connect/x/callback`. Renewing a token needs them too; posting
     /// with a live one does not.
     pub x: X,
+    /// `TIKTOK_CLIENT_KEY` and `TIKTOK_CLIENT_SECRET`: connecting TikTok accounts, with the
+    /// redirect URI `{BRAIN_URL}/connect/tiktok/callback`. Renewing a token needs them too;
+    /// posting with a live one does not.
+    pub tiktok: TikTok,
     /// `META_APP_ID` and `META_APP_SECRET`: connecting Facebook Pages and Instagram accounts,
     /// with the redirect URI `{BRAIN_URL}/connect/meta/callback`, on Graph API
     /// `META_GRAPH_VERSION` (default `v26.0`). Publishing with a stored Page token needs neither.
@@ -193,6 +197,7 @@ impl Config {
             linkedin: LinkedIn::new(var("LINKEDIN_CLIENT_ID").zip(var("LINKEDIN_CLIENT_SECRET")))?,
             youtube: YouTube::new(var("GOOGLE_CLIENT_ID").zip(var("GOOGLE_CLIENT_SECRET")))?,
             x: X::new(var("X_CLIENT_ID").zip(var("X_CLIENT_SECRET")))?,
+            tiktok: TikTok::new(var("TIKTOK_CLIENT_KEY").zip(var("TIKTOK_CLIENT_SECRET")))?,
             meta: {
                 let mut meta = meta::Meta::new(
                     var("META_APP_ID").zip(var("META_APP_SECRET")),
