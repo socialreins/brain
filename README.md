@@ -188,7 +188,7 @@ job in brain hard-deletes sets deleted over 30 days ago, one instance at a time 
 Posts go to every account of their platform in their social set; Bluesky (300 graphemes, 4
 images of at most 1 MB from public https URLs, links become facets) and Threads (500
 characters, up to 20 JPEG or PNG images or MP4 or MOV videos as a carousel), LinkedIn (3000
-characters, up to 20 JPEG, PNG or GIF images or one MP4 video, no threads), Facebook (63206
+characters, up to 20 JPEG, PNG or GIF images, one MP4 video or one PDF as a document, no threads), Facebook (63206
 characters, up to 10 JPEG, PNG or GIF images or one MP4 or MOV video) and Instagram (2200
 characters, 1 to 10 JPEG images or MP4 or MOV videos, `media_required` without one), YouTube
 (one MP4 or MOV video, a title and a description, no threads), X (280 characters as X counts
@@ -292,16 +292,25 @@ runs out: the account shows its `token_expires_at`, publishing fails with "Recon
 under Connections" and the member signs in again. Error code `linkedin_failed` besides the
 Threads ones.
 
-A LinkedIn post (3000 characters, up to 20 JPEG, PNG or GIF images, or one MP4 video; no
+A LinkedIn post (3000 characters, up to 20 JPEG, PNG or GIF images, one MP4 video, or one PDF; no
 threads) goes out with the Posts API (`POST /rest/posts`, `LinkedIn-Version` `202610`, see
 `connectors/linkedin.rs`): text only, one image as `content.media`, several as
-`content.multiImage`, a video as `content.media`. Images go through `POST /rest/images?action=
+`content.multiImage`, a video or a document as `content.media`. Images go through `POST /rest/images?action=
 initializeUpload` and a `PUT` of the bytes; a video through the Videos API (initialize, a `PUT`
 per part, finalize, poll until `AVAILABLE`). The text is escaped for LinkedIn's "little" format
-(hashtags stay links). The post URN comes from the `x-restli-id` header and is saved first; the
+(hashtags stay links). A PDF is a document (the swipeable carousel): `POST /rest/documents?action=
+initializeUpload`, a `PUT` of the bytes, poll `GET /rest/documents/{urn}` until `AVAILABLE`, then
+`content.media` `{id, title}`. The title is the body's first non-empty line cut to 100 characters,
+else `Document`. LinkedIn takes up to 100 MB and 300 pages; brain does not count pages, so a file
+LinkedIn refuses fails the target with LinkedIn's reason. A document post takes exactly one PDF:
+a PDF with any other file fails the target ("A LinkedIn document post takes exactly one PDF and
+nothing else."), as it is only known once the files are stored (types come from their first
+bytes, not their names). Every other platform fails a PDF's target ("Image N is a PDF. Only
+LinkedIn posts take a PDF, as a document."). Taking the post down deletes the post URN only; the
+document asset stays. The post URN comes from the `x-restli-id` header and is saved first; the
 permalink is `https://www.linkedin.com/feed/update/{urn}`. A takedown is `DELETE
 /rest/posts/{encoded urn}`. brain uploads the stored bytes itself, so LinkedIn needs no public
-media link. Documents (PDF) are not built yet.
+media link.
 
 YouTube (when `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are set, the same Google client as
 sign-in) connects one channel per consent through the same OAuth checks as Threads, with its own
@@ -575,8 +584,8 @@ A post's `media` are URLs: public `https://` links or Google Drive share links
 Nothing is fetched when a post is saved. When it publishes, brain downloads each URL once into
 its storage (`MEDIA_DIR` or the `S3_*` bucket): names must resolve to public addresses, at most 3
 redirects, each to a public https URL, 4 at a time and all within a minute, streamed with a cap of 100 MB a file (1 MB for Bluesky)
-and typed by its first bytes (JPEG, PNG, WebP, GIF, MP4, MOV; PDF is kept for later
-platforms). Platforms are then served from the stored copy (Threads, Facebook and Instagram fetch
+and typed by its first bytes (JPEG, PNG, WebP, GIF, MP4, MOV, PDF; only LinkedIn
+takes a PDF). Platforms are then served from the stored copy (Threads, Facebook and Instagram fetch
 it from its `/media/` link), and a URL that fails fails its
 target naming the image, before anything goes out. A post's files are deleted once it settles
 (published, failed or deleted); an hourly sweep deletes any left a week later whose post no

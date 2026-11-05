@@ -2572,6 +2572,7 @@ mod teams {
                 )
                 .route("/big.png", get(|| async { image("image/png", 1_000_001) }))
                 .route("/page.html", get(|| async { image("text/html", 64) }))
+                .route("/doc.pdf", get(|| async { image("application/pdf", 64) }))
                 .route("/{did}", get(doc))
                 .with_state(base.clone());
             tokio::spawn(async move { axum::serve(listener, app).await });
@@ -2726,6 +2727,8 @@ mod teams {
             let mut bytes = vec![7u8; len];
             if content_type == "image/png" {
                 bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+            } else if content_type == "application/pdf" {
+                bytes[..5].copy_from_slice(b"%PDF-");
             }
             ([("content-type", content_type)], bytes).into_response()
         }
@@ -4341,6 +4344,11 @@ mod teams {
                         "Image 1 is not a JPEG, PNG, WebP or GIF.",
                     ),
                     (
+                        "pdf",
+                        vec!["/doc.pdf"],
+                        "Image 1 is a PDF. Only LinkedIn posts take a PDF, as a document.",
+                    ),
+                    (
                         "missing",
                         vec!["/img.png", "/no/such.png"],
                         "Image 2 could not be downloaded (HTTP 404).",
@@ -5865,6 +5873,12 @@ mod teams {
                 static FORCED_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
                 /// Requests the "foreign host" took.
                 static FOREIGN_HITS: AtomicU64 = AtomicU64::new(0);
+                /// Every document initialize body the mock took.
+                static DOC_INITS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+                /// How the mock answers a document status check: 0 AVAILABLE after one
+                /// PROCESSING answer, 1 PROCESSING_FAILED.
+                static DOC_MODE: AtomicU64 = AtomicU64::new(0);
+                static DOC_POLLS: AtomicU64 = AtomicU64::new(0);
 
                 fn forced_url() -> Option<String> {
                     FORCED_URL.lock().unwrap().clone()
@@ -5905,6 +5919,8 @@ mod teams {
                 async fn mock_linkedin() -> String {
                     *FORCED_URL.lock().unwrap() = None;
                     COMMENT_MODE.store(0, Ordering::SeqCst);
+                    DOC_MODE.store(0, Ordering::SeqCst);
+                    DOC_POLLS.store(0, Ordering::SeqCst);
                     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let base = format!("http://{}", listener.local_addr().unwrap());
                     let token = |Form(f): Form<HashMap<String, String>>| async move {
@@ -5983,6 +5999,34 @@ mod teams {
                             ),
                         }
                     };
+                    let b = base.clone();
+                    let documents =
+                        move |h: HeaderMap,
+                              Query(q): Query<HashMap<String, String>>,
+                              Json(body): Json<Value>| async move {
+                            if !rest_ok(&h)
+                                || q.get("action").map(String::as_str) != Some("initializeUpload")
+                            {
+                                return expired();
+                            }
+                            DOC_INITS.lock().unwrap().push(body);
+                            let n = next();
+                            ok(
+                                json!({"value": {"uploadUrl": forced_url().unwrap_or(format!("{b}/upload/doc/{n}")),
+                            "document": format!("urn:li:document:{n}")}}),
+                            )
+                        };
+                    let document = |h: HeaderMap, Path(_urn): Path<String>| async move {
+                        if !rest_ok(&h) {
+                            return expired();
+                        }
+                        let polls = DOC_POLLS.fetch_add(1, Ordering::SeqCst);
+                        if DOC_MODE.load(Ordering::SeqCst) == 1 {
+                            return ok(json!({"status": "PROCESSING_FAILED",
+                                "processingFailureReason": "The document has more than 300 pages"}));
+                        }
+                        ok(json!({"status": if polls == 0 { "PROCESSING" } else { "AVAILABLE" }}))
+                    };
                     let video = |h: HeaderMap, Path(_urn): Path<String>| async move {
                         if !rest_ok(&h) {
                             return expired();
@@ -5990,9 +6034,10 @@ mod teams {
                         ok(json!({"status": "AVAILABLE"}))
                     };
                     let upload_img = |h: HeaderMap, uri: Uri, body: axum::body::Bytes| async move {
-                        // Images go with the token, video parts without (as the docs show).
+                        // Images and documents go with the token, video parts without.
                         let bearer = h.get("authorization").is_some();
-                        let is_img = uri.path().starts_with("/upload/img/");
+                        let is_img = uri.path().starts_with("/upload/img/")
+                            || uri.path().starts_with("/upload/doc/");
                         assert_eq!(bearer, is_img, "{}", uri.path());
                         UPLOADS
                             .lock()
@@ -6041,14 +6086,19 @@ mod teams {
                         .route("/v2/userinfo", get(userinfo))
                         .route("/rest/images", post(images))
                         .route("/rest/videos", post(videos))
+                        .route("/rest/documents", post(documents))
+                        .route("/rest/documents/{urn}", get(document))
                         .route("/rest/videos/{urn}", get(video))
                         .route("/upload/img/{n}", put(upload_img))
                         .route("/upload/vid/{n}", put(upload_img))
+                        .route("/upload/doc/{n}", put(upload_img))
                         .route("/rest/posts", post(create))
                         .route("/rest/socialActions/{urn}/comments", post(comment))
                         .route("/rest/posts/{urn}", axum::routing::delete(remove))
                         .route("/img.png", get(|| async { image("image/png", 64) }))
                         .route("/img2.png", get(|| async { image("image/png", 48) }))
+                        .route("/doc.pdf", get(|| async { image("application/pdf", 96) }))
+                        .route("/page.html", get(|| async { image("text/html", 64) }))
                         .route(
                             "/clip.mp4",
                             get(move || async move { ([("content-type", "video/mp4")], mp4) }),
@@ -6582,6 +6632,135 @@ mod teams {
                     let ids = f["uploadedPartIds"].as_array().unwrap();
                     assert_eq!(ids.len(), 2);
                     assert!(ids[0].as_str().unwrap().starts_with("etag-"));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_pdf_posts_as_a_document_titled_by_the_first_line_and_comes_down() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let body = "Q3 results (draft)\nSwipe through";
+                    let id = id_of(&create(&s, &cookie, linkedin_post(&set, body)).await);
+                    set_media(&db, &base, &id, &["/doc.pdf"]).await;
+                    let (posts, ups, inits) = (
+                        POSTS.lock().unwrap().len(),
+                        UPLOADS.lock().unwrap().len(),
+                        DOC_INITS.lock().unwrap().len(),
+                    );
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let init = DOC_INITS.lock().unwrap()[inits].clone();
+                    assert_eq!(
+                        init["initializeUploadRequest"]["owner"],
+                        "urn:li:person:abc123"
+                    );
+                    let uploads = UPLOADS.lock().unwrap()[ups..].to_vec();
+                    assert_eq!(uploads.len(), 1);
+                    assert_eq!(uploads[0].1, 96);
+                    assert!(uploads[0].0.starts_with("/upload/doc/"));
+                    // Waited for AVAILABLE: one PROCESSING answer, then the next.
+                    assert!(DOC_POLLS.load(Ordering::SeqCst) >= 2);
+                    let sent = POSTS.lock().unwrap()[posts].clone();
+                    let media = &sent["content"]["media"];
+                    assert!(media["id"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("urn:li:document:"));
+                    assert_eq!(media["title"], "Q3 results (draft)");
+                    assert_eq!(POSTS.lock().unwrap().len(), posts + 1);
+
+                    // No text: the fixed title.
+                    let id2 = id_of(&create(&s, &cookie, linkedin_post(&set, "x")).await);
+                    set_media(&db, &base, &id2, &["/doc.pdf"]).await;
+                    let blank = posts::ActiveModel {
+                        id: Set(id2.parse().unwrap()),
+                        body: Set("  \n ".into()),
+                        ..Default::default()
+                    };
+                    posts::Entity::update(blank).exec(&db).await.unwrap();
+                    let posts = POSTS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id2).await["status"], "published");
+                    let sent = POSTS.lock().unwrap()[posts].clone();
+                    assert_eq!(sent["content"]["media"]["title"], "Document");
+
+                    // Take down is the post's delete, nothing for the document.
+                    let urn = p["targets"][0]["remote_id"].as_str().unwrap().to_owned();
+                    let removed = REMOVED.lock().unwrap().len();
+                    let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                    res.assert_status_ok();
+                    assert_eq!(res.json::<Value>()["status"], "deleted");
+                    let gone = REMOVED.lock().unwrap()[removed..].to_vec();
+                    assert_eq!(gone, [format!("/rest/posts/{}", urn.replace(':', "%3A"))]);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_pdf_next_to_other_media_or_another_pdf_never_reaches_linkedin() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let want = "A LinkedIn document post takes exactly one PDF and nothing else.";
+                    for media in [
+                        ["/doc.pdf", "/img.png"],
+                        ["/img.png", "/doc.pdf"],
+                        ["/doc.pdf", "/clip.mp4"],
+                        ["/doc.pdf", "/doc.pdf?2"],
+                    ] {
+                        let id = id_of(&create(&s, &cookie, linkedin_post(&set, "mix")).await);
+                        set_media(&db, &base, &id, &media).await;
+                        let (posts, inits, ups) = (
+                            POSTS.lock().unwrap().len(),
+                            DOC_INITS.lock().unwrap().len(),
+                            UPLOADS.lock().unwrap().len(),
+                        );
+                        publish::tick(&state).await.unwrap();
+                        let p = get_post(&s, &cookie, &id).await;
+                        assert_eq!(p["status"], "failed", "{media:?}");
+                        assert_eq!(p["targets"][0]["error"], want, "{media:?}");
+                        assert_eq!(POSTS.lock().unwrap().len(), posts);
+                        assert_eq!(DOC_INITS.lock().unwrap().len(), inits);
+                        assert_eq!(UPLOADS.lock().unwrap().len(), ups);
+                    }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_file_that_is_not_a_pdf_image_or_video_is_refused_before_linkedin() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let id = id_of(&create(&s, &cookie, linkedin_post(&set, "page")).await);
+                    set_media(&db, &base, &id, &["/page.html"]).await;
+                    let inits = DOC_INITS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed");
+                    let why = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(why.starts_with("Image 1 is not a JPEG"), "{why}");
+                    assert!(why.contains("PDF"), "{why}");
+                    assert_eq!(DOC_INITS.lock().unwrap().len(), inits);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_document_linkedin_refuses_fails_the_target_and_is_not_repeated() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    DOC_MODE.store(1, Ordering::SeqCst);
+                    let id = id_of(&create(&s, &cookie, linkedin_post(&set, "long one")).await);
+                    set_media(&db, &base, &id, &["/doc.pdf"]).await;
+                    let (posts, inits) =
+                        (POSTS.lock().unwrap().len(), DOC_INITS.lock().unwrap().len());
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    let why = p["targets"][0]["error"].as_str().unwrap();
+                    assert_eq!(
+                        why,
+                        "LinkedIn could not process the document: The document has more than 300 pages"
+                    );
+                    assert_eq!(POSTS.lock().unwrap().len(), posts);
+                    assert_eq!(DOC_INITS.lock().unwrap().len(), inits + 1);
+                    // Later ticks leave a failed post alone: nothing is sent again.
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(DOC_INITS.lock().unwrap().len(), inits + 1);
+                    assert_eq!(POSTS.lock().unwrap().len(), posts);
                 }
 
                 #[tokio::test]

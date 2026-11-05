@@ -268,10 +268,13 @@ impl Publisher for LinkedIn {
         let mut files = Vec::new();
         for (i, a) in media.iter().enumerate() {
             let t = a.content_type.as_str();
-            if !linkedin::IMAGE_TYPES.contains(&t) && t != linkedin::VIDEO_TYPE {
+            let known = linkedin::IMAGE_TYPES.contains(&t)
+                || t == linkedin::VIDEO_TYPE
+                || t == linkedin::PDF_TYPE;
+            if !known {
                 let n = i + 1;
                 return Err(PublishError::Failed(format!(
-                    "Image {n} is not a JPEG, PNG or GIF image or an MP4 video."
+                    "Image {n} is not a JPEG, PNG or GIF image, an MP4 video or a PDF."
                 )));
             }
             files.push(linkedin::File {
@@ -1124,6 +1127,11 @@ fn media_error(fail: Fail, n: usize, platform: &str) -> String {
             "Image {n} is over {} MB, the largest file SocialReins takes.",
             max_bytes(platform) / 1_000_000
         ),
+        Fail::Unsupported if platform == "linkedin" => {
+            format!(
+                "Image {n} is not a JPEG, PNG, WebP or GIF image, an MP4 or MOV video or a PDF."
+            )
+        }
         Fail::Unsupported => format!("Image {n} is not a JPEG, PNG, WebP or GIF."),
         Fail::Storage => format!("Image {n} could not be stored. Try again."),
         Fail::TimedOut => format!(
@@ -1222,6 +1230,18 @@ async fn send(
 ) -> Result<Remote, String> {
     let how = (publisher.by_url(), account.provider.as_str());
     let media = load(app, stored, media, how).await?;
+    // Stored PDFs exist for LinkedIn's document posts; no other platform takes one.
+    if let Some(n) = media
+        .iter()
+        .position(|a| a.content_type == linkedin::PDF_TYPE)
+    {
+        if account.provider != "linkedin" {
+            return Err(format!(
+                "Image {} is a PDF. Only LinkedIn posts take a PDF, as a document.",
+                n + 1
+            ));
+        }
+    }
     let sent = publisher.publish(account, secret, body, &media, reply);
     match tokio::time::timeout(publisher.timeout(), sent).await {
         Ok(Ok(remote)) => Ok(remote),
