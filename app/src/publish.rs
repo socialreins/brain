@@ -141,6 +141,18 @@ pub trait Publisher: Send + Sync {
         self.publish(account, secret, body, media, None).await
     }
 
+    /// `publish` with the settings the user chose for the post. Only TikTok has any.
+    async fn publish_with_tiktok(
+        &self,
+        account: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        _: &tiktok::Options,
+    ) -> Result<Remote, PublishError> {
+        self.publish(account, secret, body, media, None).await
+    }
+
     /// Sets the cover of the live video `remote_id`. Only where a cover is not
     /// `cover_in_publish`: Facebook and YouTube. A failure is a warning, the post stays up.
     async fn set_cover(
@@ -529,17 +541,16 @@ impl Publisher for YouTube {
     }
 }
 
-#[async_trait]
-impl Publisher for TikTok {
+impl TikTok {
     /// One MP4 or MOV video, or JPEG or WebP photos, that TikTok downloads from brain's links.
     /// `secret` is already renewed (`credential`). The caption is the body.
-    async fn publish(
+    async fn publish_media(
         &self,
         account: &social_accounts::Model,
         secret: &str,
         body: &str,
         media: &[Attachment],
-        _: Option<(&Remote, &Remote)>,
+        options: Option<&tiktok::Options>,
     ) -> Result<Remote, PublishError> {
         let videos = media
             .iter()
@@ -561,7 +572,7 @@ impl Publisher for TikTok {
                 ))
             }
         };
-        let posted = self.post(secret, body, &items).await?;
+        let posted = self.post(secret, body, &items, options).await?;
         let url = posted
             .video_id
             .as_deref()
@@ -572,6 +583,32 @@ impl Publisher for TikTok {
             cid: String::new(),
             url,
         })
+    }
+}
+
+#[async_trait]
+impl Publisher for TikTok {
+    async fn publish(
+        &self,
+        account: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        _: Option<(&Remote, &Remote)>,
+    ) -> Result<Remote, PublishError> {
+        self.publish_media(account, secret, body, media, None).await
+    }
+
+    async fn publish_with_tiktok(
+        &self,
+        account: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        options: &tiktok::Options,
+    ) -> Result<Remote, PublishError> {
+        self.publish_media(account, secret, body, media, Some(options))
+            .await
     }
 
     /// TikTok gives apps no way to delete a post.
@@ -1407,7 +1444,12 @@ async fn send(
     publisher: &dyn Publisher,
     account: &social_accounts::Model,
     secret: &str,
-    (body, media, cover): (&str, &[String], Option<&Attachment>),
+    (body, media, cover, tiktok): (
+        &str,
+        &[String],
+        Option<&Attachment>,
+        Option<&tiktok::Options>,
+    ),
     reply: Option<(&Remote, &Remote)>,
 ) -> Result<Remote, String> {
     let how = (publisher.by_url(), account.provider.as_str());
@@ -1425,13 +1467,18 @@ async fn send(
         }
     }
     let sent = async {
-        match cover {
-            Some(c) => {
+        match (cover, tiktok) {
+            (Some(c), _) => {
                 publisher
                     .publish_with_cover(account, secret, body, &media, c)
                     .await
             }
-            None => {
+            (None, Some(t)) => {
+                publisher
+                    .publish_with_tiktok(account, secret, body, &media, t)
+                    .await
+            }
+            (None, None) => {
                 publisher
                     .publish(account, secret, body, &media, reply)
                     .await
@@ -1484,6 +1531,19 @@ async fn publish_target(
         Ok(cover) => cover,
         Err(msg) => return fail_target(db, id, &msg).await,
     };
+    // The user chose these settings, so unreadable ones fail the target rather than post with defaults.
+    let tiktok = match post
+        .tiktok
+        .clone()
+        .map(serde_json::from_value::<tiktok::Options>)
+    {
+        Some(Err(_)) => {
+            let msg = "The TikTok settings of this post could not be read. Open the post, choose them again and save it.";
+            return fail_target(db, id, msg).await;
+        }
+        Some(Ok(options)) => Some(options),
+        None => None,
+    };
     let with = (app, stored);
     let in_call = cover.as_ref().filter(|_| publisher.cover_in_publish());
     let root = match send(
@@ -1491,7 +1551,7 @@ async fn publish_target(
         publisher,
         &account,
         &secret,
-        (&post.body, &media, in_call),
+        (&post.body, &media, in_call, tiktok.as_ref()),
         None,
     )
     .await
@@ -1534,7 +1594,7 @@ async fn publish_target(
                 return fail_target(db, id, &msg).await;
             }
         };
-        let content = (part.body.as_str(), part.media.as_slice(), None);
+        let content = (part.body.as_str(), part.media.as_slice(), None, None);
         let made = match send(
             with,
             publisher,

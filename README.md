@@ -70,6 +70,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/connect/youtube/callback` | Where Google sends the browser back (register `{BRAIN_URL}/connect/youtube/callback` in the Google OAuth client, besides the sign-in one); lands on `{WEB_URL}/app/connections?connected=youtube` or `?connect_error=<code>&provider=youtube` |
 | GET | `/connections/x/redirect` | Like the Threads one, with PKCE: sends the browser to `x.com/i/oauth2/authorize` (scopes `tweet.read tweet.write users.read offline.access media.write`, `code_challenge_method=S256`) to connect an X account |
 | GET | `/connect/x/callback` | Where X sends the browser back (register `{BRAIN_URL}/connect/x/callback` in the X app); lands on `{WEB_URL}/app/connections?connected=x` or `?connect_error=<code>&provider=x` |
+| GET | `/v1/connections/{id}/tiktok` | What a connected TikTok account may post now (any member; a set token only for its set's account): `{"nickname","username","privacy_level_options","comment_disabled","duet_disabled","stitch_disabled","max_video_post_duration_sec","can_post","reason"}`, read live from TikTok's creator info. `can_post` false (a daily limit, a ban, the app's user cap, no level offered) comes with `reason`, still `200`. `409 reconnect_required` for a dead token, `502 tiktok_failed` when TikTok cannot be reached |
 | GET | `/connections/tiktok/redirect` | Like the Threads one: sends the browser to TikTok (scopes `user.info.basic,video.upload,video.publish`) to connect an account |
 | GET | `/connect/tiktok/callback` | Where TikTok sends the browser back (register `{BRAIN_URL}/connect/tiktok/callback` in the TikTok app); lands on `{WEB_URL}/app/connections?connected=tiktok` or `?connect_error=<code>&provider=tiktok` |
 | GET | `/connections/meta/redirect` | Like the Threads one: sends the browser to Facebook Login for Pages and their linked Instagram accounts |
@@ -82,9 +83,9 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET, POST | `/v1/social-sets` | The current team's live sets with `account_ids`, Default first (`?deleted=true`: deleted ones still restorable); create one (`{"name"}`, owner, admin) |
 | PATCH, DELETE | `/v1/social-sets/{id}` | Rename (`{"name"}`, the Default set too); delete (sign-in from the last 10 minutes, not the Default set), restorable for 30 days. Owner, admin |
 | POST | `/v1/social-sets/{id}/restore` | Restore a set deleted in the last 30 days, with its accounts (owner, admin) |
-| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&group_id=&from=&to=` on `scheduled_at`), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"thread":[{"body","media"}],"first_comment","cover","scheduled_at"}`; any member). `first_comment`: see "First comment" below; `cover`: see "Video cover". `thread`: up to 25 follow-up posts, each a reply to the one before and checked like the post (`422 {"error","part"}` names a bad one); each part is saved on its target as it goes out, a target whose part fails is `failed` naming it with the parts before it kept, and a takedown deletes the parts last first, then the root |
+| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&group_id=&from=&to=` on `scheduled_at`), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"thread":[{"body","media"}],"first_comment","cover","tiktok","scheduled_at"}`; any member). `first_comment`: see "First comment" below; `cover`: see "Video cover"; `tiktok`: see "TikTok settings". `thread`: up to 25 follow-up posts, each a reply to the one before and checked like the post (`422 {"error","part"}` names a bad one); each part is saved on its target as it goes out, a target whose part fails is `failed` naming it with the parts before it kept, and a takedown deletes the parts last first, then the root |
 | GET, PUT, DELETE | `/v1/posts/{id}` | One post with its `targets`; replace a `draft` or `scheduled` one; delete (`204` for draft or scheduled, `200` after taking a published one down, `422 takedown_failed` with a `message`, `409` for queued or failed) |
-| POST | `/v1/post-groups` | One post per platform of a set in one call (`{"social_set_id","platforms","body","media","scheduled_at","list_id","position","thread","first_comment","cover","overrides":{"<platform>":{"body","media","thread","first_comment","cover"}}}`; `platforms` defaults to those brain publishes to with a connected account; bodies up to 64 KiB): `201 {"group_id","posts"}`; an invalid post creates nothing and its error names the `platform` |
+| POST | `/v1/post-groups` | One post per platform of a set in one call (`{"social_set_id","platforms","body","media","scheduled_at","list_id","position","thread","first_comment","cover","tiktok","overrides":{"<platform>":{"body","media","thread","first_comment","cover","tiktok"}}}`; `platforms` defaults to those brain publishes to with a connected account; bodies up to 64 KiB): `201 {"group_id","posts"}`; an invalid post creates nothing and its error names the `platform` |
 | POST | `/v1/posts/{id}/publish` | Publish a draft or scheduled post now: `202` with the post `queued`; poll it for the result |
 | GET, POST | `/v1/lists` | Post lists (ordered groups such as a series), or create one (`{"name","social_set_id"}`; no set means team-wide, or the token's own set for a set token) |
 | GET, PATCH, DELETE | `/v1/lists/{id}` | One list with its `items` (`post_id`, 1-based `position`, `post`); rename (`{"name"}`); delete (posts stay) |
@@ -376,6 +377,24 @@ first under a lock on the account row, with the new refresh token saved in the s
 token or a refused call (`401`, `access_token_invalid`, `scope_not_authorized`) fails the target
 with "Reconnect the account under Connections".
 
+**TikTok settings.** TikTok's Content Sharing Guidelines for Direct Post make the user choose
+how a post goes out, so a TikTok post may carry `tiktok`: `{"privacy_level","allow_comment","allow_duet","allow_stitch","commercial_content","your_brand","branded_content","ai_generated"}`
+(saved as `posts.tiktok`, returned on the post; every switch defaults to off). `privacy_level` is
+required, has no default, and must be one of the account's `privacy_level_options`
+(`GET /v1/connections/{id}/tiktok`); brain checks the four known values on save
+(`tiktok_privacy_required`, `invalid_tiktok_privacy`) and that the account is offered the chosen
+one at publish, failing the target before anything is sent otherwise. Comment, duet and stitch map
+to `disable_comment`, `disable_duet` and `disable_stitch`, and stay off when the creator turned
+them off in TikTok; a photo post has no duet or stitch. The disclosure is `commercial_content`
+with `your_brand` ("Promotional content", `brand_organic_toggle`), `branded_content` ("Paid
+partnership", `brand_content_toggle`) or both: the switch needs one of them
+(`tiktok_disclosure_incomplete`), the two need the switch (`invalid_tiktok_disclosure`), and branded
+content cannot be `SELF_ONLY` (`tiktok_branded_content_private`). `ai_generated` sends `is_aigc`
+(in `post_info` for a video, beside it for photos, as TikTok documents it). Other platforms answer
+`tiktok_not_supported`. A group takes `tiktok` for its TikTok post only, with an override
+(`overrides.tiktok.tiktok`). The video length against `max_video_post_duration_sec` is not
+checked by brain (it does not read the video); TikTok refuses a longer one.
+
 A TikTok post is one MP4 or MOV video, or 1 to 35 JPEG or WebP photos (no threads, no text-only
 posts: `media_required` without media; the caption is the body, at most 2200 UTF-16 code units, so an emoji counts two). brain
 does not upload: TikTok downloads the media from brain's unguessable `/media/` links
@@ -384,12 +403,11 @@ The post is `POST /v2/post/publish/video/init/` (or `content/init/` for photos, 
 line of the body as the photo title) as a direct post, then the publish status is asked every
 three seconds for up to 4.5 minutes until TikTok says `PUBLISH_COMPLETE` (or `FAILED`, with its
 reason); a status call that errors is asked again, since the post already exists, and after the
-4.5 minutes the target fails with "check the account before posting again". The privacy level is the most public one the account is offered (creator info), and
-comments, duets and stitches are off: TikTok's rules say a person turns them on, and SocialReins
-has no setting for that yet. Until TikTok audits the app, it only lets it post privately
+4.5 minutes the target fails with "check the account before posting again". A post without `tiktok` settings (made through the API) goes out with the most
+public privacy level the account is offered and comments, duets and stitches off. Until TikTok audits the app, it only lets it post privately
 (`SELF_ONLY`) and from private accounts: when TikTok refuses a level for that reason and offers
 `SELF_ONLY`, the init is asked again with it (the refused one made no post); the video then has
-no public id and no link. The saved
+no public id and no link (a branded content post is never asked again, it cannot be private). The saved
 id is the publish id; the permalink is `https://www.tiktok.com/@{username}/video/{id}` when the
 video is public. TikTok gives apps no way to delete a post, so a take down fails with a message
 that says to delete it in the TikTok app and the post stays `published`.

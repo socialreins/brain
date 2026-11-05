@@ -6,29 +6,35 @@
 //! token under a lock on the account row whenever a call is about to be made with one near its
 //! end, and saves the refresh token TikTok sends back with it in the same transaction.
 use axum::{
-    extract::{Query, State},
-    http::HeaderMap,
-    response::Response,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::get,
-    Router,
+    Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Duration, Utc};
-use sea_orm::{ActiveValue::Set, ConnectionTrait, DbBackend, DbErr, Statement, TransactionTrait};
+use sea_orm::{
+    sea_query, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, DbErr, EntityTrait,
+    QueryFilter, Statement, TransactionTrait,
+};
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use super::{
+    api_tokens::Actor,
+    auth::internal,
     connections::save_account,
     oauth::{self, Callback},
     teams::InTeam,
-    waitlist::Reply,
+    waitlist::{error, Error, Reply},
 };
 use crate::{
     connectors::{
         bluesky::PostError,
-        tiktok::{Profile, Token},
+        tiktok::{Creator, Profile, Token},
     },
-    models::social_accounts,
+    models::{social_account_social_set as membership, social_accounts},
     state::AppState,
 };
 
@@ -219,6 +225,52 @@ async fn callback(
         return fail("internal");
     }
     oauth::landed(&app, PROVIDER, &[("connected", PROVIDER)])
+}
+
+/// What a TikTok account may post right now, for the post editor: the name to show, the
+/// privacy levels it is offered (the only ones to show), which interactions the creator turned
+/// off in TikTok, the longest video, and whether TikTok lets it post (`can_post`, else `reason`).
+/// TikTok asks for this on every render of the posting page, so it is read live, never cached.
+/// Any member; a set token only for an account of its set.
+#[utoipa::path(get, path = "/connections/{id}/tiktok", tag = "connections",
+    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path)),
+    responses((status = 200, body = Creator), (status = 401, body = Error),
+        (status = 404, body = Error), (status = 409, body = Error), (status = 502, body = Error)))]
+async fn creator(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
+    let mut sel = social_accounts::Entity::find_by_id(id)
+        .filter(social_accounts::Column::TeamId.eq(a.team.id))
+        .filter(social_accounts::Column::Provider.eq(PROVIDER));
+    if let Some(own) = a.set_id() {
+        let in_set = sea_query::Query::select()
+            .column(membership::Column::SocialAccountId)
+            .from(membership::Entity)
+            .and_where(membership::Column::SocialSetId.eq(own))
+            .to_owned();
+        sel = sel.filter(social_accounts::Column::Id.in_subquery(in_set));
+    }
+    let account = match sel.one(&app.db).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found").into_response(),
+        Err(e) => return internal(e, "tiktok account read"),
+    };
+    let found = match fresh_token(&app, &account).await {
+        Ok(token) => app.tiktok.creator_info(&token).await,
+        Err(e) => Err(e),
+    };
+    match found {
+        Ok(creator) => Json(creator).into_response(),
+        Err(PostError::Reconnect) => {
+            error(StatusCode::CONFLICT, "reconnect_required").into_response()
+        }
+        Err(PostError::Failed(why)) => {
+            tracing::warn!(why, "tiktok creator info failed");
+            error(StatusCode::BAD_GATEWAY, "tiktok_failed").into_response()
+        }
+    }
+}
+
+pub fn api() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(creator))
 }
 
 pub fn routes() -> Router<AppState> {

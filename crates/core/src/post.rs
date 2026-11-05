@@ -67,6 +67,17 @@ pub enum Invalid {
     InvalidCover,
     /// A cover belongs to a post with exactly one media item, which must be a video.
     CoverNeedsOneVideo,
+    /// TikTok settings on a post for another platform.
+    TikTokUnsupported,
+    /// TikTok needs the user to choose who may see the post.
+    TikTokPrivacyRequired,
+    InvalidTikTokPrivacy,
+    /// Your brand or Branded content ticked without the disclosure turned on.
+    InvalidTikTokDisclosure,
+    /// The disclosure is on but neither Your brand nor Branded content is ticked.
+    TikTokDisclosureIncomplete,
+    /// Branded content cannot be private (`SELF_ONLY`).
+    TikTokBrandedPrivate,
 }
 
 impl Invalid {
@@ -86,6 +97,12 @@ impl Invalid {
             Self::CoverUnsupported => "cover_not_supported",
             Self::InvalidCover => "invalid_cover",
             Self::CoverNeedsOneVideo => "cover_needs_one_video",
+            Self::TikTokUnsupported => "tiktok_not_supported",
+            Self::TikTokPrivacyRequired => "tiktok_privacy_required",
+            Self::InvalidTikTokPrivacy => "invalid_tiktok_privacy",
+            Self::InvalidTikTokDisclosure => "invalid_tiktok_disclosure",
+            Self::TikTokDisclosureIncomplete => "tiktok_disclosure_incomplete",
+            Self::TikTokBrandedPrivate => "tiktok_branded_content_private",
         }
     }
 }
@@ -262,6 +279,49 @@ pub fn validate_cover(
     }
     if media.len() != 1 {
         return Err(Invalid::CoverNeedsOneVideo);
+    }
+    Ok(())
+}
+
+/// The privacy levels TikTok knows; an account is offered some of them.
+pub const TIKTOK_PRIVACY_LEVELS: [&str; 4] = [
+    "PUBLIC_TO_EVERYONE",
+    "MUTUAL_FOLLOW_FRIENDS",
+    "FOLLOWER_OF_CREATOR",
+    "SELF_ONLY",
+];
+
+/// What a user chose for a TikTok post, as far as the rules of TikTok's Content Sharing
+/// Guidelines go.
+pub struct TikTokChoice<'a> {
+    pub privacy_level: Option<&'a str>,
+    pub commercial_content: bool,
+    pub your_brand: bool,
+    pub branded_content: bool,
+}
+
+/// Checks a post's TikTok settings for `platform`: only TikTok takes them. The user must pick
+/// the privacy level (it has no default), the disclosure needs one of its two boxes, and
+/// branded content cannot be private. Whether the account is offered the level is known only
+/// at publish.
+pub fn validate_tiktok(platform: &str, choice: Option<TikTokChoice>) -> Result<(), Invalid> {
+    let Some(c) = choice else {
+        return Ok(());
+    };
+    if platform != "tiktok" {
+        return Err(Invalid::TikTokUnsupported);
+    }
+    let level = c.privacy_level.ok_or(Invalid::TikTokPrivacyRequired)?;
+    if !TIKTOK_PRIVACY_LEVELS.contains(&level) {
+        return Err(Invalid::InvalidTikTokPrivacy);
+    }
+    match (c.commercial_content, c.your_brand || c.branded_content) {
+        (false, true) => return Err(Invalid::InvalidTikTokDisclosure),
+        (true, false) => return Err(Invalid::TikTokDisclosureIncomplete),
+        _ => {}
+    }
+    if c.branded_content && level == "SELF_ONLY" {
+        return Err(Invalid::TikTokBrandedPrivate);
     }
     Ok(())
 }
@@ -637,6 +697,62 @@ mod tests {
         for p in ["tiktok", "x", "linkedin", "threads", "bluesky"] {
             assert_eq!(validate_cover(p, c, &one), Err(Invalid::CoverUnsupported));
         }
+    }
+
+    #[test]
+    fn tiktok_settings_follow_the_content_sharing_guidelines() {
+        let c = |level: Option<&'static str>, on, brand, branded| {
+            Some(TikTokChoice {
+                privacy_level: level,
+                commercial_content: on,
+                your_brand: brand,
+                branded_content: branded,
+            })
+        };
+        let public = Some("PUBLIC_TO_EVERYONE");
+        assert_eq!(validate_tiktok("x", None), Ok(()));
+        assert_eq!(validate_tiktok("tiktok", None), Ok(()));
+        assert_eq!(
+            validate_tiktok("x", c(public, false, false, false)),
+            Err(Invalid::TikTokUnsupported)
+        );
+        assert_eq!(
+            validate_tiktok("tiktok", c(public, false, false, false)),
+            Ok(())
+        );
+        assert_eq!(
+            validate_tiktok("tiktok", c(None, false, false, false)),
+            Err(Invalid::TikTokPrivacyRequired)
+        );
+        assert_eq!(
+            validate_tiktok("tiktok", c(Some("EVERYONE"), false, false, false)),
+            Err(Invalid::InvalidTikTokPrivacy)
+        );
+        assert_eq!(
+            validate_tiktok("tiktok", c(public, false, true, false)),
+            Err(Invalid::InvalidTikTokDisclosure)
+        );
+        assert_eq!(
+            validate_tiktok("tiktok", c(public, true, false, false)),
+            Err(Invalid::TikTokDisclosureIncomplete)
+        );
+        assert_eq!(
+            validate_tiktok("tiktok", c(public, true, true, true)),
+            Ok(())
+        );
+        let private = Some("SELF_ONLY");
+        assert_eq!(
+            validate_tiktok("tiktok", c(private, true, true, false)),
+            Ok(())
+        );
+        assert_eq!(
+            validate_tiktok("tiktok", c(private, true, false, true)),
+            Err(Invalid::TikTokBrandedPrivate)
+        );
+        assert_eq!(
+            validate_tiktok("tiktok", c(private, true, true, true)),
+            Err(Invalid::TikTokBrandedPrivate)
+        );
     }
 
     #[test]

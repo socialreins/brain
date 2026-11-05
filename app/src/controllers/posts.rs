@@ -35,6 +35,7 @@ use super::{
     waitlist::{error, Error},
 };
 use crate::{
+    connectors::tiktok,
     models::{
         post_targets, posts, social_account_social_set as membership, social_accounts, social_sets,
         teams,
@@ -72,6 +73,8 @@ pub struct Post {
     pub first_comment: Option<String>,
     /// Cover image URL for the post's one video.
     pub cover: Option<String>,
+    /// TikTok settings of a TikTok post, when it has any.
+    pub tiktok: Option<tiktok::Options>,
     /// `draft`, `scheduled`, `queued`, `published`, `failed` or `deleted`.
     pub status: String,
     pub scheduled_at: Option<DateTime<FixedOffset>>,
@@ -179,6 +182,15 @@ pub struct PostInput {
     /// Facebook and YouTube the cover is set after the video is live: a refusal (YouTube needs
     /// a verified channel) leaves the post `published` and shows as the target's `cover_error`.
     pub cover: Option<String>,
+    /// TikTok's per-post settings, as its Content Sharing Guidelines ask the user to choose
+    /// them: the visibility (required, one of the account's `privacy_level_options` from
+    /// `GET /connections/{id}/tiktok`), comments, duets and stitches (all off unless turned on),
+    /// the commercial content disclosure and the AI-generated flag. Branded content cannot be
+    /// `SELF_ONLY`. Other platforms answer `tiktok_not_supported`; invalid settings answer
+    /// `tiktok_privacy_required`, `invalid_tiktok_privacy`, `invalid_tiktok_disclosure`,
+    /// `tiktok_disclosure_incomplete` or `tiktok_branded_content_private`. Without them a TikTok
+    /// post goes out with the most public level the account is offered and every interaction off.
+    pub tiktok: Option<tiktok::Options>,
     /// When to publish. Set: `scheduled`; absent or `null`: `draft`.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
     /// A list to put the post in (moving it there when it already is).
@@ -226,6 +238,8 @@ pub struct PostGroupInput {
     /// cover answer `cover_not_supported` unless they override it with `""`, so pass
     /// `platforms` or override.
     pub cover: Option<String>,
+    /// The TikTok post's settings, unless its override has some. Other platforms get none.
+    pub tiktok: Option<tiktok::Options>,
     /// As in `POST /posts`, for every post.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
     /// A list to put every post in, in platform order.
@@ -246,6 +260,7 @@ pub struct Override {
     pub thread: Option<Vec<ThreadPart>>,
     pub first_comment: Option<String>,
     pub cover: Option<String>,
+    pub tiktok: Option<tiktok::Options>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -307,6 +322,7 @@ fn post_json(p: posts::Model, targets: Vec<Target>, lists: Vec<ListRef>) -> Post
         thread: serde_json::from_value(p.thread).unwrap_or_default(),
         first_comment: p.first_comment,
         cover: p.cover,
+        tiktok: p.tiktok.and_then(|v| serde_json::from_value(v).ok()),
         status: p.status,
         scheduled_at: p.scheduled_at,
         published_at: p.published_at,
@@ -397,6 +413,15 @@ async fn checked(
     if let Err(e) = post::validate_cover(&input.platform, cover, &input.media) {
         return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, e.code())));
     }
+    let choice = input.tiktok.as_ref().map(|t| post::TikTokChoice {
+        privacy_level: t.privacy_level.as_deref(),
+        commercial_content: t.commercial_content,
+        your_brand: t.your_brand,
+        branded_content: t.branded_content,
+    });
+    if let Err(e) = post::validate_tiktok(&input.platform, choice) {
+        return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, e.code())));
+    }
     set_for(db, a, input.social_set_id).await
 }
 
@@ -435,6 +460,14 @@ fn when(input: &PostInput) -> Option<DateTime<FixedOffset>> {
 /// The first comment as saved: blank is none.
 fn stored_comment(input: &PostInput) -> Option<String> {
     post::first_comment(input.first_comment.as_deref()).map(str::to_owned)
+}
+
+/// The TikTok settings as saved.
+fn stored_tiktok(input: &PostInput) -> Option<serde_json::Value> {
+    input
+        .tiktok
+        .as_ref()
+        .and_then(|t| serde_json::to_value(t).ok())
 }
 
 /// The cover as saved: blank is none.
@@ -595,6 +628,7 @@ async fn insert(
         thread: Set(serde_json::json!(input.thread)),
         first_comment: Set(stored_comment(input)),
         cover: Set(stored_cover(input)),
+        tiktok: Set(stored_tiktok(input)),
         status: Set(status_for(input).into()),
         scheduled_at: Set(when(input)),
         created_by: Set(a.user_id),
@@ -676,6 +710,9 @@ pub async fn create_post_group(app: &AppState, a: &Actor, input: PostGroupInput)
                 cover: o
                     .and_then(|o| o.cover.clone())
                     .or_else(|| input.cover.clone()),
+                tiktok: o
+                    .and_then(|o| o.tiktok.clone())
+                    .or_else(|| input.tiktok.clone().filter(|_| platform == "tiktok")),
                 platform,
                 scheduled_at: input.scheduled_at,
                 list_id: input.list_id,
@@ -778,6 +815,7 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) 
             )
             .col_expr(posts::Column::FirstComment, stored_comment(&input).into())
             .col_expr(posts::Column::Cover, stored_cover(&input).into())
+            .col_expr(posts::Column::Tiktok, stored_tiktok(&input).into())
             .col_expr(posts::Column::Status, status_for(&input).into())
             .col_expr(posts::Column::ScheduledAt, when(&input).into())
             .col_expr(posts::Column::UpdatedAt, Utc::now().fixed_offset().into())

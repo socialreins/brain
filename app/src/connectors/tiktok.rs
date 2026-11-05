@@ -7,8 +7,10 @@
 use std::time::Duration;
 
 use reqwest::{RequestBuilder, StatusCode, Url};
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use utoipa::ToSchema;
 
 use super::bluesky::PostError;
 
@@ -33,6 +35,113 @@ pub enum Media<'a> {
     Video(&'a str),
     Photos(Vec<&'a str>),
 }
+
+/// What the user chose for one post, as TikTok's Content Sharing Guidelines require: who may see
+/// it (no default: the user picks one the account is offered), which interactions are allowed
+/// (all off unless turned on; duets and stitches only apply to a video), and the commercial
+/// content disclosure. A post without settings (made through the API) posts with the most
+/// public level the account is offered and every interaction off.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Options {
+    /// `PUBLIC_TO_EVERYONE`, `MUTUAL_FOLLOW_FRIENDS`, `FOLLOWER_OF_CREATOR` or `SELF_ONLY`, one
+    /// of the account's `privacy_level_options` (`GET /connections/{id}/tiktok`). Required.
+    pub privacy_level: Option<String>,
+    /// Allow comments.
+    #[serde(default)]
+    pub allow_comment: bool,
+    /// Allow duets (video only).
+    #[serde(default)]
+    pub allow_duet: bool,
+    /// Allow stitches (video only).
+    #[serde(default)]
+    pub allow_stitch: bool,
+    /// The content disclosure switch: the post promotes a brand. Needs `your_brand`,
+    /// `branded_content` or both.
+    #[serde(default)]
+    pub commercial_content: bool,
+    /// The creator promotes their own business; TikTok labels the post "Promotional content".
+    #[serde(default)]
+    pub your_brand: bool,
+    /// A paid partnership with a third party; TikTok labels the post "Paid partnership" and it
+    /// cannot be `SELF_ONLY`.
+    #[serde(default)]
+    pub branded_content: bool,
+    /// The post is AI-generated.
+    #[serde(default)]
+    pub ai_generated: bool,
+}
+
+/// What TikTok says an account may post, from the creator info call.
+#[derive(Debug, Default, PartialEq, Serialize, ToSchema)]
+pub struct Creator {
+    /// The name to show, so the user knows which account receives the post.
+    pub nickname: String,
+    pub username: Option<String>,
+    /// The privacy levels the account is offered; show only these.
+    pub privacy_level_options: Vec<String>,
+    /// The creator turned the interaction off in the TikTok app: show it unavailable.
+    pub comment_disabled: bool,
+    pub duet_disabled: bool,
+    pub stitch_disabled: bool,
+    /// The longest video the account may post, in seconds.
+    pub max_video_post_duration_sec: Option<i64>,
+    /// Whether TikTok lets the account post now.
+    pub can_post: bool,
+    /// Why not, when `can_post` is false.
+    pub reason: Option<String>,
+}
+
+impl Creator {
+    fn blocked(reason: impl Into<String>) -> Self {
+        Self {
+            reason: Some(reason.into()),
+            ..Self::default()
+        }
+    }
+
+    fn from_data(data: &Value) -> Self {
+        let text = |k: &str| {
+            data[k]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        let options: Vec<String> = data["privacy_level_options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+        let username = text("creator_username");
+        let can_post = !options.is_empty();
+        Self {
+            nickname: text("creator_nickname")
+                .or_else(|| username.clone())
+                .unwrap_or_default(),
+            username,
+            can_post,
+            reason: (!can_post).then(|| CANNOT_POST.to_owned()),
+            privacy_level_options: options,
+            comment_disabled: data["comment_disabled"].as_bool().unwrap_or(false),
+            duet_disabled: data["duet_disabled"].as_bool().unwrap_or(false),
+            stitch_disabled: data["stitch_disabled"].as_bool().unwrap_or(false),
+            max_video_post_duration_sec: data["max_video_post_duration_sec"].as_i64(),
+        }
+    }
+
+    /// The most public privacy level offered: `PUBLIC_TO_EVERYONE` when TikTok offers it, else
+    /// the first it does.
+    fn most_public(&self) -> Option<&str> {
+        let o = &self.privacy_level_options;
+        o.iter()
+            .find(|o| *o == "PUBLIC_TO_EVERYONE")
+            .or(o.first())
+            .map(String::as_str)
+    }
+}
+
+const CANNOT_POST: &str = "This TikTok account cannot post right now.";
 
 /// The TikTok app (`TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET`). No `Debug`: it holds the secret.
 #[derive(Clone)]
@@ -228,7 +337,12 @@ impl TikTok {
     /// `raw`, with anything not 2xx or not `ok` turned into its `refusal`; the `data` of the answer.
     async fn send(&self, req: RequestBuilder, step: &str) -> Result<Value, PostError> {
         let (status, body) = self.raw(req, step).await?;
-        if status.is_success() && matches!(code(&body), "ok" | "") {
+        Self::data(status, &body, step)
+    }
+
+    /// The `data` of an answer, or its `refusal`.
+    fn data(status: StatusCode, body: &Value, step: &str) -> Result<Value, PostError> {
+        if status.is_success() && matches!(code(body), "ok" | "") {
             Ok(body["data"].clone())
         } else {
             // TikTok's code and request id help when asking TikTok about a refusal.
@@ -236,11 +350,11 @@ impl TikTok {
             tracing::warn!(
                 step,
                 status = status.as_u16(),
-                code = code(&body),
+                code = code(body),
                 log_id,
                 "tiktok refused a call"
             );
-            Err(refusal(status, &body, step))
+            Err(refusal(status, body, step))
         }
     }
 
@@ -333,66 +447,104 @@ impl TikTok {
         .await
     }
 
-    /// The most public privacy level the account may use: `PUBLIC_TO_EVERYONE` when TikTok
-    /// offers it, else the first it does.
-    fn privacy(creator: &Value) -> Option<String> {
-        let options: Vec<&str> = creator["privacy_level_options"]
-            .as_array()?
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
-        options
-            .iter()
-            .find(|o| **o == "PUBLIC_TO_EVERYONE")
-            .or(options.first())
-            .map(|o| (*o).to_owned())
-    }
-
-    /// Whether the account is offered the privacy `level`.
-    fn offers(creator: &Value, level: &str) -> bool {
-        creator["privacy_level_options"]
-            .as_array()
-            .is_some_and(|o| o.iter().any(|v| v == level))
+    /// What the account may post now. An account TikTok will not let post (a daily limit, a ban,
+    /// the app's user cap) is a `Creator` with `can_post` false and the reason, not an error.
+    pub async fn creator_info(&self, token: &str) -> Result<Creator, PostError> {
+        let url = format!("{}/v2/post/publish/creator_info/query/", self.api_url);
+        let req = self.client.post(url).bearer_auth(token).json(&json!({}));
+        let (status, body) = self.raw(req, "Account").await?;
+        match Self::data(status, &body, "Account") {
+            Ok(data) => Ok(Creator::from_data(&data)),
+            Err(PostError::Failed(why))
+                if matches!(
+                    code(&body),
+                    "spam_risk_too_many_posts"
+                        | "spam_risk_user_banned_from_posting"
+                        | "reached_active_user_cap"
+                ) =>
+            {
+                Ok(Creator::blocked(why))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Posts `media` with `body` as its caption and waits for TikTok to finish. Never retried: a
-    /// retry could post twice. Comments, duets and stitches are off: TikTok's rules say a person
-    /// turns them on, and SocialReins has no setting for it yet.
+    /// retry could post twice. `options` are the user's choices; without them (a post made
+    /// through the API) the most public level the account is offered is used and comments,
+    /// duets and stitches are off.
     pub async fn post(
         &self,
         token: &str,
         body: &str,
         media: &Media<'_>,
+        options: Option<&Options>,
     ) -> Result<Posted, PostError> {
-        let creator = self.creator(token).await?;
-        let Some(privacy) = Self::privacy(&creator) else {
-            return Err(failed("This TikTok account cannot post right now."));
+        let creator = self.creator_info(token).await?;
+        if !creator.can_post {
+            return Err(failed(creator.reason.unwrap_or_else(|| CANNOT_POST.into())));
+        }
+        let privacy = match options {
+            Some(o) => {
+                let level = o.privacy_level.as_deref().unwrap_or_default();
+                if !creator.privacy_level_options.iter().any(|p| p == level) {
+                    return Err(failed(
+                        "TikTok does not offer the chosen visibility to this account. Choose another and save the post again.",
+                    ));
+                }
+                level
+            }
+            None => creator.most_public().unwrap_or_default(),
         };
-        tracing::info!(options = %creator["privacy_level_options"], chosen = %privacy, "tiktok privacy levels");
+        tracing::info!(options = ?creator.privacy_level_options, chosen = %privacy, "tiktok privacy levels");
+        // An interaction is on only when the user turned it on and the creator allows it.
+        let o = options.cloned().unwrap_or_default();
+        let comment = o.allow_comment && !creator.comment_disabled;
+        let duet = o.allow_duet && !creator.duet_disabled;
+        let stitch = o.allow_stitch && !creator.stitch_disabled;
         let (path, payload) = match media {
-            Media::Video(url) => (
-                "video/init",
-                json!({
-                    "post_info": {
-                        "title": body.trim(),
-                        "disable_duet": true, "disable_comment": true, "disable_stitch": true,
-                    },
-                    "source_info": {"source": "PULL_FROM_URL", "video_url": url},
-                }),
-            ),
-            Media::Photos(urls) => (
-                "content/init",
-                json!({
-                    "post_info": {
-                        "title": photo_title(body), "description": body.trim(),
-                        "disable_comment": true,
-                    },
+            Media::Video(url) => {
+                let mut info = json!({
+                    "title": body.trim(),
+                    "disable_duet": !duet, "disable_comment": !comment, "disable_stitch": !stitch,
+                });
+                if options.is_some() {
+                    info["brand_content_toggle"] = json!(o.commercial_content && o.branded_content);
+                    info["brand_organic_toggle"] = json!(o.commercial_content && o.your_brand);
+                    if o.ai_generated {
+                        info["is_aigc"] = json!(true);
+                    }
+                }
+                (
+                    "video/init",
+                    json!({
+                        "post_info": info,
+                        "source_info": {"source": "PULL_FROM_URL", "video_url": url},
+                    }),
+                )
+            }
+            Media::Photos(urls) => {
+                let mut info = json!({
+                    "title": photo_title(body), "description": body.trim(),
+                    "disable_comment": !comment,
+                });
+                if options.is_some() {
+                    info["brand_content_toggle"] = json!(o.commercial_content && o.branded_content);
+                    info["brand_organic_toggle"] = json!(o.commercial_content && o.your_brand);
+                }
+                let mut payload = json!({
+                    "post_info": info,
                     "source_info": {
                         "source": "PULL_FROM_URL", "photo_cover_index": 0, "photo_images": urls,
                     },
                     "post_mode": "DIRECT_POST", "media_type": "PHOTO",
-                }),
-            ),
+                });
+                // For a photo post TikTok documents the flag beside `post_info`, not in it.
+                if o.ai_generated {
+                    payload["is_aigc"] = json!(true);
+                }
+                ("content/init", payload)
+            }
         };
         let url = format!("{}/v2/post/publish/{path}/", self.api_url);
         let init = |level: &str| {
@@ -403,13 +555,18 @@ impl TikTok {
                 "Post",
             )
         };
-        let (mut status, mut answer) = init(&privacy).await?;
+        let (mut status, mut answer) = init(privacy).await?;
         // Until TikTok reviews the app it takes only `SELF_ONLY`. A refused init made no post, so
-        // asking again with it cannot post twice.
-        let offered = Self::offers(&creator, "SELF_ONLY");
+        // asking again with it cannot post twice. Branded content cannot be private, so it is not
+        // asked again.
+        let offered = creator
+            .privacy_level_options
+            .iter()
+            .any(|p| p == "SELF_ONLY");
         if code(&answer) == "unaudited_client_can_only_post_to_private_accounts"
             && privacy != "SELF_ONLY"
             && offered
+            && !(o.commercial_content && o.branded_content)
         {
             (status, answer) = init("SELF_ONLY").await?;
         }
@@ -521,15 +678,27 @@ mod tests {
     }
 
     #[test]
-    fn the_most_public_privacy_level_wins() {
-        let p = |v: Value| TikTok::privacy(&json!({ "privacy_level_options": v }));
-        assert_eq!(
-            p(json!(["SELF_ONLY", "PUBLIC_TO_EVERYONE"])).as_deref(),
-            Some("PUBLIC_TO_EVERYONE")
+    fn the_creator_is_read_from_creator_info() {
+        let c = |v: Value| Creator::from_data(&v);
+        let full = c(
+            json!({"creator_nickname": "Ann", "creator_username": "annlee",
+            "privacy_level_options": ["SELF_ONLY", "PUBLIC_TO_EVERYONE"],
+            "duet_disabled": true, "max_video_post_duration_sec": 600}),
         );
-        assert_eq!(p(json!(["SELF_ONLY"])).as_deref(), Some("SELF_ONLY"));
-        assert_eq!(p(json!([])), None);
-        assert_eq!(TikTok::privacy(&json!({})), None);
+        assert_eq!(full.nickname, "Ann");
+        assert!(full.can_post && full.duet_disabled && !full.comment_disabled);
+        assert_eq!(full.max_video_post_duration_sec, Some(600));
+        assert_eq!(full.most_public(), Some("PUBLIC_TO_EVERYONE"));
+        let private =
+            c(json!({"creator_username": "annlee", "privacy_level_options": ["SELF_ONLY"]}));
+        assert_eq!(private.most_public(), Some("SELF_ONLY"));
+        // No nickname: the username stands in.
+        assert_eq!(private.nickname, "annlee");
+        for none in [json!({"privacy_level_options": []}), json!({})] {
+            let c = c(none);
+            assert!(!c.can_post && c.most_public().is_none());
+            assert_eq!(c.reason.as_deref(), Some(CANNOT_POST));
+        }
     }
 
     #[test]

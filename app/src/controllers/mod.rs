@@ -83,6 +83,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(webhooks::api())
         .merge(connections::api())
         .merge(meta::api())
+        .merge(tiktok::api())
         .merge(social_sets::api())
         .merge(posts::api().layer(DefaultBodyLimit::max(MAX_GROUP_BODY_BYTES)))
         .merge(posts::groups_api().layer(DefaultBodyLimit::max(MAX_GROUP_BODY_BYTES)))
