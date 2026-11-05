@@ -8167,7 +8167,9 @@ mod teams {
                 static REFRESHES: AtomicU64 = AtomicU64::new(0);
                 static STATUS_CALLS: AtomicU64 = AtomicU64::new(0);
                 static NEXT: AtomicU64 = AtomicU64::new(1);
-                /// 0: a public account, 1: only `SELF_ONLY` (an app TikTok has not reviewed).
+                /// 0: a public account, 1: only `SELF_ONLY` (an app TikTok has not reviewed), 2:
+                /// TikTok will not let it post (daily limit), 3: the creator turned comments and
+                /// duets off in TikTok.
                 static PRIVACY: AtomicU64 = AtomicU64::new(0);
                 /// 0: the init works, 1: TikTok refuses any level but `SELF_ONLY` as unaudited, 2: the publish
                 /// fails, 3: TikTok refuses every init as unaudited.
@@ -8274,12 +8276,23 @@ mod teams {
                         if !bearer_ok(&h) {
                             return expired();
                         }
-                        let options = if PRIVACY.load(Ordering::SeqCst) == 1 {
+                        let mode = PRIVACY.load(Ordering::SeqCst);
+                        if mode == 2 {
+                            // TikTok answers 200 with the code for these.
+                            let error = json!({"code": "spam_risk_too_many_posts", "message": ""});
+                            return (StatusCode::OK, Json(json!({"data": {}, "error": error})));
+                        }
+                        let options = if mode == 1 {
                             json!(["SELF_ONLY"])
                         } else {
                             json!(["FOLLOWER_OF_CREATOR", "PUBLIC_TO_EVERYONE", "SELF_ONLY"])
                         };
-                        ok(json!({"creator_username": "annlee", "privacy_level_options": options}))
+                        ok(
+                            json!({"creator_username": "annlee", "creator_nickname": "Ann Lee",
+                            "privacy_level_options": options, "comment_disabled": mode == 3,
+                            "duet_disabled": mode == 3, "stitch_disabled": false,
+                            "max_video_post_duration_sec": 600}),
+                        )
                     };
                     let init = |path: &'static str| {
                         move |h: HeaderMap, Json(body): Json<Value>| async move {
@@ -8497,11 +8510,26 @@ mod teams {
                 /// Saves a post of the mock's files and publishes it: the post.
                 async fn publish_files(
                     s: &TestServer,
+                    ctx: (&DatabaseConnection, &AppState, &str),
+                    who: (&str, &str),
+                    what: (&str, &[&str]),
+                ) -> Value {
+                    publish_with(s, ctx, who, what, Value::Null).await
+                }
+
+                /// `publish_files` with the post's TikTok settings.
+                async fn publish_with(
+                    s: &TestServer,
                     (db, state, base): (&DatabaseConnection, &AppState, &str),
                     (cookie, set): (&str, &str),
                     (body, paths): (&str, &[&str]),
+                    settings: Value,
                 ) -> Value {
-                    let id = id_of(&create(s, cookie, tiktok_post(set, body, paths)).await);
+                    let mut post = tiktok_post(set, body, paths);
+                    post["tiktok"] = settings;
+                    let res = create(s, cookie, post).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let id = id_of(&res);
                     set_media(db, base, &id, paths).await;
                     publish::tick(state).await.unwrap();
                     get_post(s, cookie, &id).await
@@ -8862,6 +8890,321 @@ mod teams {
                     );
                     assert!(msg.contains("Delete the post in the TikTok app"), "{msg}");
                     assert_eq!(get_post(&s, &cookie, id).await["status"], "published");
+                }
+
+                fn settings(level: &str) -> Value {
+                    json!({"privacy_level": level})
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_videos_settings_are_saved_and_sent_to_tiktok() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let inits = INITS.lock().unwrap().len();
+                    let ctx = (&db, &state, base.as_str());
+                    let chosen = json!({"privacy_level": "FOLLOWER_OF_CREATOR",
+                        "allow_comment": true, "allow_duet": true, "commercial_content": true,
+                        "your_brand": true, "branded_content": true, "ai_generated": true});
+                    let p = publish_with(&s, ctx, (&cookie, &set), ("hi", &["/clip.mp4"]), chosen)
+                        .await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(p["tiktok"]["privacy_level"], "FOLLOWER_OF_CREATOR");
+                    assert_eq!(p["tiktok"]["allow_stitch"], false);
+                    let (_, sent) = INITS.lock().unwrap()[inits].clone();
+                    let info = &sent["post_info"];
+                    assert_eq!(info["privacy_level"], "FOLLOWER_OF_CREATOR");
+                    assert_eq!(info["disable_comment"], false);
+                    assert_eq!(info["disable_duet"], false);
+                    assert_eq!(info["disable_stitch"], true);
+                    assert_eq!(info["brand_content_toggle"], true);
+                    assert_eq!(info["brand_organic_toggle"], true);
+                    assert_eq!(info["is_aigc"], true);
+                    // Only the one chosen level is tried, and a post the user did not mark as
+                    // commercial or AI-generated says neither.
+                    let inits = INITS.lock().unwrap().len();
+                    let p = publish_with(
+                        &s,
+                        ctx,
+                        (&cookie, &set),
+                        ("hi", &["/clip.mp4"]),
+                        settings("SELF_ONLY"),
+                    )
+                    .await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let (_, sent) = INITS.lock().unwrap()[inits].clone();
+                    let info = &sent["post_info"];
+                    assert_eq!(info["privacy_level"], "SELF_ONLY");
+                    for off in ["disable_duet", "disable_comment", "disable_stitch"] {
+                        assert_eq!(info[off], true, "{off}");
+                    }
+                    assert_eq!(info["brand_content_toggle"], false);
+                    assert_eq!(info["brand_organic_toggle"], false);
+                    assert!(info.get("is_aigc").is_none());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_photo_post_takes_comments_and_the_flags_but_no_duet_or_stitch() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let inits = INITS.lock().unwrap().len();
+                    let ctx = (&db, &state, base.as_str());
+                    let chosen = json!({"privacy_level": "PUBLIC_TO_EVERYONE",
+                        "allow_comment": true, "allow_duet": true, "allow_stitch": true,
+                        "commercial_content": true, "your_brand": true, "ai_generated": true});
+                    let p =
+                        publish_with(&s, ctx, (&cookie, &set), ("hi", &["/a.jpg"]), chosen).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let (path, sent) = INITS.lock().unwrap()[inits].clone();
+                    assert_eq!(path, "content");
+                    let info = &sent["post_info"];
+                    assert_eq!(info["privacy_level"], "PUBLIC_TO_EVERYONE");
+                    assert_eq!(info["disable_comment"], false);
+                    assert!(
+                        info.get("disable_duet").is_none() && info.get("disable_stitch").is_none()
+                    );
+                    assert_eq!(info["brand_content_toggle"], false);
+                    assert_eq!(info["brand_organic_toggle"], true);
+                    // Beside post_info for photos.
+                    assert_eq!(sent["is_aigc"], true);
+                    assert!(info.get("is_aigc").is_none());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn an_interaction_the_creator_turned_off_stays_off() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    PRIVACY.store(3, Ordering::SeqCst);
+                    let inits = INITS.lock().unwrap().len();
+                    let ctx = (&db, &state, base.as_str());
+                    let chosen = json!({"privacy_level": "PUBLIC_TO_EVERYONE",
+                        "allow_comment": true, "allow_duet": true, "allow_stitch": true});
+                    let p = publish_with(&s, ctx, (&cookie, &set), ("hi", &["/clip.mp4"]), chosen)
+                        .await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let (_, sent) = INITS.lock().unwrap()[inits].clone();
+                    let info = &sent["post_info"];
+                    assert_eq!(info["disable_comment"], true);
+                    assert_eq!(info["disable_duet"], true);
+                    assert_eq!(info["disable_stitch"], false);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_level_the_account_is_not_offered_fails_before_any_init() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    PRIVACY.store(1, Ordering::SeqCst);
+                    let inits = INITS.lock().unwrap().len();
+                    let ctx = (&db, &state, base.as_str());
+                    let chosen = settings("PUBLIC_TO_EVERYONE");
+                    let p = publish_with(&s, ctx, (&cookie, &set), ("hi", &["/clip.mp4"]), chosen)
+                        .await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    let msg = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(
+                        msg.contains("does not offer the chosen visibility"),
+                        "{msg}"
+                    );
+                    assert_eq!(INITS.lock().unwrap().len(), inits);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn an_unreviewed_app_asks_again_privately_except_for_branded_content() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    MODE.store(1, Ordering::SeqCst);
+                    let ctx = (&db, &state, base.as_str());
+                    let inits = INITS.lock().unwrap().len();
+                    let public = settings("PUBLIC_TO_EVERYONE");
+                    let p =
+                        publish_with(&s, ctx, (&cookie, &set), ("a", &["/clip.mp4"]), public).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(INITS.lock().unwrap().len() - inits, 2);
+                    // A paid partnership cannot be private, so it is refused, not downgraded.
+                    let inits = INITS.lock().unwrap().len();
+                    let paid = json!({"privacy_level": "PUBLIC_TO_EVERYONE",
+                        "commercial_content": true, "branded_content": true});
+                    let p =
+                        publish_with(&s, ctx, (&cookie, &set), ("a", &["/clip.mp4"]), paid).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    assert_eq!(INITS.lock().unwrap().len() - inits, 1);
+                    let msg = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(msg.contains("private account"), "{msg}");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn an_account_tiktok_will_not_let_post_fails_with_its_reason() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    PRIVACY.store(2, Ordering::SeqCst);
+                    let inits = INITS.lock().unwrap().len();
+                    let ctx = (&db, &state, base.as_str());
+                    let chosen = settings("SELF_ONLY");
+                    let p =
+                        publish_with(&s, ctx, (&cookie, &set), ("a", &["/clip.mp4"]), chosen).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    let msg = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(msg.contains("limit of posts for the day"), "{msg}");
+                    assert_eq!(INITS.lock().unwrap().len(), inits);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn settings_are_checked_when_a_post_is_saved() {
+                    let (s, _, _, _, cookie, _, set) = team().await;
+                    let with = |t: Value| {
+                        let mut v = tiktok_post(&set, "hi", &["/clip.mp4"]);
+                        v["tiktok"] = t;
+                        v
+                    };
+                    let bad = |t: Value, want: &'static str| {
+                        let (s, cookie, body) = (&s, &cookie, with(t));
+                        async move {
+                            let res = create(s, cookie, body).await;
+                            assert_eq!(res.status_code(), 422, "{want}: {}", res.text());
+                            res.assert_json(&json!({"error": want}));
+                        }
+                    };
+                    bad(json!({}), "tiktok_privacy_required").await;
+                    bad(json!({"allow_comment": true}), "tiktok_privacy_required").await;
+                    bad(settings("EVERYONE"), "invalid_tiktok_privacy").await;
+                    let mut t = settings("SELF_ONLY");
+                    t["your_brand"] = json!(true);
+                    bad(t, "invalid_tiktok_disclosure").await;
+                    let mut t = settings("SELF_ONLY");
+                    t["commercial_content"] = json!(true);
+                    bad(t, "tiktok_disclosure_incomplete").await;
+                    let mut t = settings("SELF_ONLY");
+                    t["commercial_content"] = json!(true);
+                    t["branded_content"] = json!(true);
+                    bad(t, "tiktok_branded_content_private").await;
+
+                    // Not for another platform, and unknown fields are not ignored.
+                    let mut v = input(&set, "hi", None);
+                    v["tiktok"] = settings("SELF_ONLY");
+                    let res = create(&s, &cookie, v).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "tiktok_not_supported"}));
+                    let mut t = settings("SELF_ONLY");
+                    t["duet"] = json!(true);
+                    let res = create(&s, &cookie, with(t)).await;
+                    assert!(res.status_code().is_client_error());
+
+                    // A replace is checked the same way, and replaces the settings.
+                    let ok = create(&s, &cookie, with(settings("SELF_ONLY"))).await;
+                    assert_eq!(ok.status_code(), 201, "{}", ok.text());
+                    let id = id_of(&ok);
+                    let url = format!("/v1/posts/{id}");
+                    let res = req(&s, Method::PUT, &url, &cookie)
+                        .json(&with(json!({})))
+                        .await;
+                    assert_eq!(res.status_code(), 422);
+                    let mut t = settings("MUTUAL_FOLLOW_FRIENDS");
+                    t["allow_comment"] = json!(true);
+                    let res = req(&s, Method::PUT, &url, &cookie).json(&with(t)).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["tiktok"]["privacy_level"], "MUTUAL_FOLLOW_FRIENDS");
+                    assert_eq!(p["tiktok"]["allow_comment"], true);
+                    let res = req(&s, Method::PUT, &url, &cookie)
+                        .json(&tiktok_post(&set, "hi", &["/clip.mp4"]))
+                        .await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    assert_eq!(get_post(&s, &cookie, &id).await["tiktok"], Value::Null);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_post_group_gives_the_settings_to_its_tiktok_post() {
+                    let (s, _, _, _, cookie, _, set) = team().await;
+                    let group = |extra: Value| {
+                        let mut v = json!({"social_set_id": set, "body": "hi",
+                            "media": ["https://a.example/clip.mp4"], "platforms": ["tiktok"]});
+                        v.as_object_mut()
+                            .unwrap()
+                            .extend(extra.as_object().unwrap().clone());
+                        v
+                    };
+                    let make =
+                        |body: Value| req(&s, Method::POST, "/v1/post-groups", &cookie).json(&body);
+                    let res = make(group(json!({"tiktok": settings("SELF_ONLY")}))).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let g = res.json::<Value>();
+                    assert_eq!(g["posts"][0]["tiktok"]["privacy_level"], "SELF_ONLY");
+                    let both = json!({"tiktok": settings("SELF_ONLY"),
+                        "overrides": {"tiktok": {"tiktok": settings("FOLLOWER_OF_CREATOR")}}});
+                    let g = make(group(both)).await.json::<Value>();
+                    let level = &g["posts"][0]["tiktok"]["privacy_level"];
+                    assert_eq!(level, "FOLLOWER_OF_CREATOR");
+                    let res = make(group(json!({"tiktok": {}}))).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "tiktok_privacy_required",
+                        "platform": "tiktok"}));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn the_account_endpoint_tells_the_editor_what_the_creator_may_post() {
+                    let (s, db, _, _, cookie, team_id, _) = team().await;
+                    let id = tiktok_account(&db, &team_id).await.id;
+                    let url = format!("/v1/connections/{id}/tiktok");
+                    let get = || s.get(&url).add_header("cookie", cookie.as_str());
+                    let res = get().await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    res.assert_json(&json!({"nickname": "Ann Lee", "username": "annlee",
+                        "privacy_level_options":
+                            ["FOLLOWER_OF_CREATOR", "PUBLIC_TO_EVERYONE", "SELF_ONLY"],
+                        "comment_disabled": false, "duet_disabled": false,
+                        "stitch_disabled": false, "max_video_post_duration_sec": 600,
+                        "can_post": true, "reason": null}));
+                    PRIVACY.store(3, Ordering::SeqCst);
+                    let body = get().await.json::<Value>();
+                    assert_eq!(
+                        (
+                            body["comment_disabled"].clone(),
+                            body["duet_disabled"].clone()
+                        ),
+                        (json!(true), json!(true))
+                    );
+                    // TikTok will not let it post now: an answer with the reason, not an error.
+                    PRIVACY.store(2, Ordering::SeqCst);
+                    let res = get().await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let body = res.json::<Value>();
+                    assert_eq!(body["can_post"], false);
+                    assert!(body["reason"].as_str().unwrap().contains("limit of posts"));
+                    assert_eq!(body["privacy_level_options"], json!([]));
+                    // Only the team's own TikTok accounts, and only signed in.
+                    let other = format!("/v1/connections/{}/tiktok", uuid::Uuid::now_v7());
+                    let res = s.get(&other).add_header("cookie", cookie.as_str()).await;
+                    assert_eq!(res.status_code(), 404);
+                    assert_eq!(s.get(&url).await.status_code(), 401);
+                    let (_, stranger, _) = user(&s, &db).await;
+                    let res = s.get(&url).add_header("cookie", stranger).await;
+                    assert_eq!(res.status_code(), 404);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn the_account_endpoint_asks_for_a_reconnect_when_the_token_is_dead() {
+                    let (s, db, _, _, cookie, team_id, _) = team().await;
+                    let account = tiktok_account(&db, &team_id).await.id;
+                    set_token(&db, account, 30).await;
+                    let row = social_accounts::ActiveModel {
+                        id: Set(account),
+                        meta: Set(json!({"refresh_token":
+                            URL_SAFE_NO_PAD.encode(cipher().encrypt(b"revoked"))})),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(row)
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                    let res = s
+                        .get(&format!("/v1/connections/{account}/tiktok"))
+                        .add_header("cookie", cookie.as_str())
+                        .await;
+                    assert_eq!(res.status_code(), 409, "{}", res.text());
+                    res.assert_json(&json!({"error": "reconnect_required"}));
                 }
             }
 

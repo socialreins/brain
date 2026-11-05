@@ -36,6 +36,9 @@ pub struct Model {
     /// Cover image URL for a post's one video (Instagram, Facebook, YouTube).
     #[sea_orm(column_type = "Text", nullable)]
     pub cover: Option<String>,
+    /// TikTok settings (`connectors::tiktok::Options`); null for none.
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub tiktok: Option<Json>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }
