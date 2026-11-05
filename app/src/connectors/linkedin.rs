@@ -7,6 +7,7 @@ use std::time::Duration;
 use reqwest::{header::HeaderMap, Method, RequestBuilder, Url};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::bluesky::PostError;
 
@@ -30,7 +31,7 @@ pub const VIDEO_TYPE: &str = "video/mp4";
 pub const PDF_TYPE: &str = "application/pdf";
 /// Title of a document post whose body has no text to take one from.
 const DOCUMENT_TITLE: &str = "Document";
-/// Longest document title brain sends.
+/// Longest document title brain sends, in graphemes so an emoji is never cut apart.
 const TITLE_CHARS: usize = 100;
 
 /// The LinkedIn app (`LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET`). No `Debug`: it holds the
@@ -101,7 +102,7 @@ fn reason(body: &Value, status: reqwest::StatusCode) -> String {
 pub fn document_title(body: &str) -> String {
     let line = body.lines().map(str::trim).find(|l| !l.is_empty());
     match line {
-        Some(l) => l.chars().take(TITLE_CHARS).collect(),
+        Some(l) => l.graphemes(true).take(TITLE_CHARS).collect(),
         None => DOCUMENT_TITLE.to_owned(),
     }
 }
@@ -627,6 +628,10 @@ mod tests {
         assert_eq!(document_title(""), "Document");
         assert_eq!(document_title("   \n "), "Document");
         assert_eq!(document_title(&"a".repeat(150)).chars().count(), 100);
+        // 99 letters, then a family emoji (one grapheme of seven chars): kept whole or not at all.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+        let title = document_title(&format!("{}{family}{family}", "a".repeat(99)));
+        assert_eq!(title, format!("{}{family}", "a".repeat(99)));
     }
 
     #[test]

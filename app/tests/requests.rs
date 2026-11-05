@@ -6100,6 +6100,22 @@ mod teams {
                         .route("/doc.pdf", get(|| async { image("application/pdf", 96) }))
                         .route("/page.html", get(|| async { image("text/html", 64) }))
                         .route(
+                            "/pic.webp",
+                            get(|| async {
+                                let mut b = b"RIFF\x24\0\0\0WEBPVP8 ".to_vec();
+                                b.resize(64, 0);
+                                ([("content-type", "image/webp")], b)
+                            }),
+                        )
+                        .route(
+                            "/movie.mov",
+                            get(|| async {
+                                let mut b = b"\0\0\0\x14ftypqt  ".to_vec();
+                                b.resize(64, 0);
+                                ([("content-type", "video/quicktime")], b)
+                            }),
+                        )
+                        .route(
                             "/clip.mp4",
                             get(move || async move { ([("content-type", "video/mp4")], mp4) }),
                         );
@@ -6726,16 +6742,20 @@ mod teams {
                 #[serial]
                 async fn a_file_that_is_not_a_pdf_image_or_video_is_refused_before_linkedin() {
                     let (s, db, state, base, cookie, _, set) = team().await;
-                    let id = id_of(&create(&s, &cookie, linkedin_post(&set, "page")).await);
-                    set_media(&db, &base, &id, &["/page.html"]).await;
-                    let inits = DOC_INITS.lock().unwrap().len();
-                    publish::tick(&state).await.unwrap();
-                    let p = get_post(&s, &cookie, &id).await;
-                    assert_eq!(p["status"], "failed");
-                    let why = p["targets"][0]["error"].as_str().unwrap();
-                    assert!(why.starts_with("Image 1 is not a JPEG"), "{why}");
-                    assert!(why.contains("PDF"), "{why}");
-                    assert_eq!(DOC_INITS.lock().unwrap().len(), inits);
+                    let want = "Image 1 is not a JPEG, PNG or GIF image, an MP4 video or a PDF.";
+                    // An HTML page fails at storing; a stored WebP or MOV, at the publisher.
+                    for file in ["/page.html", "/pic.webp", "/movie.mov"] {
+                        let id = id_of(&create(&s, &cookie, linkedin_post(&set, "page")).await);
+                        set_media(&db, &base, &id, &[file]).await;
+                        let (inits, posts) =
+                            (DOC_INITS.lock().unwrap().len(), POSTS.lock().unwrap().len());
+                        publish::tick(&state).await.unwrap();
+                        let p = get_post(&s, &cookie, &id).await;
+                        assert_eq!(p["status"], "failed", "{file}");
+                        assert_eq!(p["targets"][0]["error"], want, "{file}");
+                        assert_eq!(DOC_INITS.lock().unwrap().len(), inits);
+                        assert_eq!(POSTS.lock().unwrap().len(), posts);
+                    }
                 }
 
                 #[tokio::test]
@@ -6819,9 +6839,14 @@ mod teams {
                         "https://api.linkedin.com@evil.net/x".to_owned(),
                         "https://evil.net/www.linkedin.com".to_owned(),
                     ];
-                    for (media, url) in [("/img.png", &urls[0]), ("/clip.mp4", &urls[0])]
-                        .into_iter()
-                        .chain(urls[1..].iter().map(|u| ("/img.png", u)))
+                    for (media, url) in [
+                        ("/img.png", &urls[0]),
+                        ("/clip.mp4", &urls[0]),
+                        ("/doc.pdf", &urls[0]),
+                        ("/doc.pdf", &urls[2]),
+                    ]
+                    .into_iter()
+                    .chain(urls[1..].iter().map(|u| ("/img.png", u)))
                     {
                         *FORCED_URL.lock().unwrap() = Some(url.clone());
                         let id = id_of(&create(&s, &cookie, linkedin_post(&set, "x")).await);

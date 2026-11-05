@@ -300,7 +300,7 @@ initializeUpload` and a `PUT` of the bytes; a video through the Videos API (init
 per part, finalize, poll until `AVAILABLE`). The text is escaped for LinkedIn's "little" format
 (hashtags stay links). A PDF is a document (the swipeable carousel): `POST /rest/documents?action=
 initializeUpload`, a `PUT` of the bytes, poll `GET /rest/documents/{urn}` until `AVAILABLE`, then
-`content.media` `{id, title}`. The title is the body's first non-empty line cut to 100 characters,
+`content.media` `{id, title}`. The title is the body's first non-empty line cut to 100 graphemes,
 else `Document`. LinkedIn takes up to 100 MB and 300 pages; brain does not count pages, so a file
 LinkedIn refuses fails the target with LinkedIn's reason. A document post takes exactly one PDF:
 a PDF with any other file fails the target ("A LinkedIn document post takes exactly one PDF and

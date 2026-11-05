@@ -1128,9 +1128,7 @@ fn media_error(fail: Fail, n: usize, platform: &str) -> String {
             max_bytes(platform) / 1_000_000
         ),
         Fail::Unsupported if platform == "linkedin" => {
-            format!(
-                "Image {n} is not a JPEG, PNG, WebP or GIF image, an MP4 or MOV video or a PDF."
-            )
+            format!("Image {n} is not a JPEG, PNG or GIF image, an MP4 video or a PDF.")
         }
         Fail::Unsupported => format!("Image {n} is not a JPEG, PNG, WebP or GIF."),
         Fail::Storage => format!("Image {n} could not be stored. Try again."),
