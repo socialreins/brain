@@ -7290,7 +7290,8 @@ mod teams {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 /// 0: a public account, 1: only `SELF_ONLY` (an app TikTok has not reviewed).
                 static PRIVACY: AtomicU64 = AtomicU64::new(0);
-                /// 0: the init works, 1: TikTok refuses it as unaudited, 2: the publish fails.
+                /// 0: the init works, 1: TikTok refuses any level but `SELF_ONLY` as unaudited, 2: the publish
+                /// fails, 3: TikTok refuses every init as unaudited.
                 static MODE: AtomicU64 = AtomicU64::new(0);
                 /// The next status call fails with a server error, once.
                 static FLAKY: std::sync::atomic::AtomicBool =
@@ -7406,8 +7407,13 @@ mod teams {
                             if !bearer_ok(&h) {
                                 return expired();
                             }
+                            let level = body["post_info"]["privacy_level"]
+                                .as_str()
+                                .map(str::to_owned);
                             INITS.lock().unwrap().push((path.to_owned(), body));
-                            if MODE.load(Ordering::SeqCst) == 1 {
+                            // 1: refuses every level but SELF_ONLY, 3: refuses all.
+                            let mode = MODE.load(Ordering::SeqCst);
+                            if mode == 3 || (mode == 1 && level.as_deref() != Some("SELF_ONLY")) {
                                 let code = "unaudited_client_can_only_post_to_private_accounts";
                                 return refused(StatusCode::FORBIDDEN, code, "private only");
                             }
@@ -7790,6 +7796,23 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
+                async fn an_unreviewed_app_is_asked_again_with_the_private_level() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    MODE.store(1, Ordering::SeqCst);
+                    let inits = INITS.lock().unwrap().len();
+                    let ctx = (&db, &state, base.as_str());
+                    let p = publish_files(&s, ctx, (&cookie, &set), ("hi", &["/clip.mp4"])).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let sent = INITS.lock().unwrap()[inits..].to_vec();
+                    let levels: Vec<&str> = sent
+                        .iter()
+                        .map(|(_, b)| b["post_info"]["privacy_level"].as_str().unwrap())
+                        .collect();
+                    assert_eq!(levels, ["PUBLIC_TO_EVERYONE", "SELF_ONLY"]);
+                }
+
+                #[tokio::test]
+                #[serial]
                 async fn photos_are_posted_as_a_photo_post() {
                     let (s, db, state, base, cookie, _, set) = team().await;
                     let inits = INITS.lock().unwrap().len();
@@ -7836,8 +7859,8 @@ mod teams {
                 async fn a_post_tiktok_refuses_or_fails_says_why() {
                     let (s, db, state, base, cookie, _, set) = team().await;
                     let ctx = (&db, &state, base.as_str());
-                    // The app is not reviewed and the account is public.
-                    MODE.store(1, Ordering::SeqCst);
+                    // The app is not reviewed and no level is taken.
+                    MODE.store(3, Ordering::SeqCst);
                     let p = publish_files(&s, ctx, (&cookie, &set), ("a", &["/clip.mp4"])).await;
                     assert_eq!(p["status"], "failed", "{p}");
                     let msg = p["targets"][0]["error"].as_str().unwrap();
