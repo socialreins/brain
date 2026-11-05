@@ -33,6 +33,9 @@ pub struct Model {
     pub comment_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub comment_error: Option<String>,
+    /// Why the cover image could not be set on the published video (a warning).
+    #[sea_orm(column_type = "Text", nullable)]
+    pub cover_error: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }

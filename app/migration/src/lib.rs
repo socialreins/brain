@@ -22,6 +22,7 @@ mod m20261111_000001_threads_connect;
 mod m20261112_000001_meta_picks;
 mod m20261113_000001_inbox_permalink;
 mod m20261114_000001_first_comment;
+mod m20261115_000001_video_cover;
 
 pub struct Migrator;
 
@@ -51,6 +52,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261112_000001_meta_picks::Migration),
             Box::new(m20261113_000001_inbox_permalink::Migration),
             Box::new(m20261114_000001_first_comment::Migration),
+            Box::new(m20261115_000001_video_cover::Migration),
             // inject-above (do not remove this comment)
         ]
     }

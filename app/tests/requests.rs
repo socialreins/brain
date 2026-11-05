@@ -3719,6 +3719,16 @@ mod teams {
                 posts::Entity::update(row).exec(db).await.unwrap();
             }
 
+            /// Points a post's cover at the mock (http on loopback, which only tests allow).
+            async fn set_cover_url(db: &DatabaseConnection, base: &str, id: &str, path: &str) {
+                let row = posts::ActiveModel {
+                    id: Set(id.parse().unwrap()),
+                    cover: Set(Some(format!("{base}{path}"))),
+                    ..Default::default()
+                };
+                posts::Entity::update(row).exec(db).await.unwrap();
+            }
+
             /// A published post put back as `queued` with its targets `pending` and unsent, as if a
             /// publish started again. Their `comment_status` is left as it is.
             async fn requeue_unsent(db: &DatabaseConnection, id: &str) {
@@ -4951,6 +4961,111 @@ mod teams {
                 assert_eq!(res.status_code(), 422);
                 res.assert_json(&json!({"error": "first_comment_too_long",
                     "platform": "linkedin"}));
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn covers_are_for_one_video_on_three_platforms_and_saved_with_the_post() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let with = |platform: &str, media: Value, cover: Value| {
+                    let mut v = input(&set, "hi", None);
+                    v["platform"] = json!(platform);
+                    v["media"] = media;
+                    v["cover"] = cover;
+                    v
+                };
+                let clip = json!(["https://a.example/clip.mp4"]);
+                let cover = json!("https://a.example/cover.jpg");
+                // TikTok only picks a frame, the rest have no cover at all.
+                for p in ["bluesky", "threads", "x", "tiktok", "linkedin"] {
+                    let res = create(&s, &cookie, with(p, clip.clone(), cover.clone())).await;
+                    assert_eq!(res.status_code(), 422, "{p}");
+                    res.assert_json(&json!({"error": "cover_not_supported"}));
+                }
+                for p in ["facebook", "instagram", "youtube"] {
+                    let res = create(&s, &cookie, with(p, clip.clone(), cover.clone())).await;
+                    assert_eq!(res.status_code(), 201, "{p}: {}", res.text());
+                    assert_eq!(res.json::<Value>()["cover"], cover);
+                    // A public https link.
+                    let http = json!("http://a.example/cover.jpg");
+                    let res = create(&s, &cookie, with(p, clip.clone(), http)).await;
+                    assert_eq!(res.status_code(), 422, "{p}");
+                    res.assert_json(&json!({"error": "invalid_cover"}));
+                }
+                // Exactly one media item (YouTube takes one at most, Instagram needs media).
+                let two = json!(["https://a.example/a.mp4", "https://a.example/b.mp4"]);
+                for (p, media) in [
+                    ("facebook", json!([])),
+                    ("facebook", two.clone()),
+                    ("instagram", two),
+                ] {
+                    let res = create(&s, &cookie, with(p, media, cover.clone())).await;
+                    assert_eq!(res.status_code(), 422, "{p}");
+                    res.assert_json(&json!({"error": "cover_needs_one_video"}));
+                }
+                // Blank is none.
+                let res = create(&s, &cookie, with("facebook", clip.clone(), json!("  "))).await;
+                assert_eq!(res.status_code(), 201);
+                assert_eq!(res.json::<Value>()["cover"], Value::Null);
+
+                // Saved, replaced and cleared with the post.
+                let res = create(&s, &cookie, with("facebook", clip.clone(), cover)).await;
+                let id = id_of(&res);
+                let put = |body: Value| {
+                    req(&s, Method::PUT, &format!("/v1/posts/{id}"), &cookie).json(&body)
+                };
+                let other = json!("https://a.example/other.png");
+                let res = put(with("facebook", clip.clone(), other.clone())).await;
+                assert_eq!(res.json::<Value>()["cover"], other);
+                let res = put(with("bluesky", clip.clone(), other)).await;
+                assert_eq!(res.status_code(), 422);
+                let mut cleared = with("facebook", clip, Value::Null);
+                cleared.as_object_mut().unwrap().remove("cover");
+                let res = put(cleared).await;
+                assert_eq!(res.json::<Value>()["cover"], Value::Null);
+                assert_eq!(get_post(&s, &cookie, &id).await["cover"], Value::Null);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn post_group_covers_take_per_platform_overrides() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let group =
+                    |body: Value| req(&s, Method::POST, "/v1/post-groups", &cookie).json(&body);
+                let clip = json!(["https://a.example/clip.mp4"]);
+                // A platform without a cover refuses the shared one, naming itself.
+                let res = group(json!({"social_set_id": set, "body": "hi", "media": clip,
+                    "platforms": ["tiktok", "youtube"], "cover": "https://a.example/c.jpg"}))
+                .await;
+                assert_eq!(res.status_code(), 422);
+                res.assert_json(&json!({"error": "cover_not_supported", "platform": "tiktok"}));
+                // An empty override leaves it out there; another replaces it.
+                let res = group(json!({"social_set_id": set, "body": "hi", "media": clip,
+                    "platforms": ["tiktok", "youtube", "facebook"],
+                    "cover": "https://a.example/c.jpg",
+                    "overrides": {"tiktok": {"cover": ""},
+                        "facebook": {"cover": "https://a.example/own.png"}}}))
+                .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let g = res.json::<Value>();
+                let covers: Vec<&Value> = g["posts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| &p["cover"])
+                    .collect();
+                assert_eq!(
+                    covers,
+                    [
+                        &Value::Null,
+                        &json!("https://a.example/c.jpg"),
+                        &json!("https://a.example/own.png")
+                    ]
+                );
             }
 
             #[tokio::test]
@@ -6981,6 +7096,11 @@ mod teams {
                 static COMMENTS: std::sync::Mutex<Vec<(String, String, Value)>> =
                     std::sync::Mutex::new(Vec::new());
                 static COMMENT_MODE: AtomicU64 = AtomicU64::new(0);
+                /// Every thumbnail the mock took: (bearer, videoId, content type, byte count).
+                /// `THUMB_MODE` 1: the channel is not verified (403 `forbidden`).
+                static THUMBS: std::sync::Mutex<Vec<(String, String, String, usize)>> =
+                    std::sync::Mutex::new(Vec::new());
+                static THUMB_MODE: AtomicU64 = AtomicU64::new(0);
 
                 type Answer = (StatusCode, Json<Value>);
 
@@ -7017,6 +7137,7 @@ mod teams {
                     QUOTA.store(false, Ordering::SeqCst);
                     DELETE_MODE.store(0, Ordering::SeqCst);
                     COMMENT_MODE.store(0, Ordering::SeqCst);
+                    THUMB_MODE.store(0, Ordering::SeqCst);
                     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let base = format!("http://{}", listener.local_addr().unwrap());
                     let token = |Form(f): Form<HashMap<String, String>>| async move {
@@ -7196,10 +7317,37 @@ mod teams {
                         )
                             .into_response()
                     };
+                    let thumbnail = |h: HeaderMap,
+                                     Query(q): Query<HashMap<String, String>>,
+                                     body: axum::body::Bytes| async move {
+                        if !bearer_ok(&h) {
+                            return expired().into_response();
+                        }
+                        if THUMB_MODE.load(Ordering::SeqCst) == 1 {
+                            let msg = "The user doesn't have permissions to upload and set custom video thumbnails.";
+                            return google_error(StatusCode::FORBIDDEN, "forbidden", msg)
+                                .into_response();
+                        }
+                        let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok());
+                        THUMBS.lock().unwrap().push((
+                            get("authorization").unwrap_or_default().to_owned(),
+                            q["videoId"].clone(),
+                            get("content-type").unwrap_or_default().to_owned(),
+                            body.len(),
+                        ));
+                        Json(json!({"kind": "youtube#thumbnailSetResponse"})).into_response()
+                    };
+                    let mut jpeg = vec![7u8; 64];
+                    jpeg[..4].copy_from_slice(b"\xFF\xD8\xFF\xE0");
                     let mut mp4 = vec![0u8; 64];
                     mp4[..12].copy_from_slice(b"\0\0\0\x18ftypisom");
                     let app = Router::new()
                         .route("/token", post(token))
+                        .route("/upload/youtube/v3/thumbnails/set", post(thumbnail))
+                        .route(
+                            "/cover.jpg",
+                            get(move || async move { ([("content-type", "image/jpeg")], jpeg) }),
+                        )
                         .route("/youtube/v3/channels", get(channels))
                         .route("/upload/youtube/v3/videos", post(start).put(upload))
                         .route("/youtube/v3/videos", delete(remove))
@@ -7660,6 +7808,83 @@ mod teams {
                         get_post(&s, &cookie, &id).await["targets"][0]["comment_status"],
                         "failed"
                     );
+                }
+
+                /// Saves a video post with a cover of the mock and publishes it: the post.
+                async fn publish_covered(
+                    (s, db, state, base): (&TestServer, &DatabaseConnection, &AppState, &str),
+                    (cookie, set): (&str, &str),
+                    cover: &str,
+                ) -> Value {
+                    let mut post = youtube_post(set, "Short");
+                    post["cover"] = json!("https://a.example/cover.jpg");
+                    let id = id_of(&create(s, cookie, post).await);
+                    set_media(db, base, &id, &["/clip.mp4"]).await;
+                    set_cover_url(db, base, &id, cover).await;
+                    publish::tick(state).await.unwrap();
+                    get_post(s, cookie, &id).await
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_cover_is_set_on_the_video_once_it_is_up() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let ctx = (&s, &db, &state, base.as_str());
+                    for (path, kind) in [("/cover.jpg", "image/jpeg"), ("/img.png", "image/png")] {
+                        let before = THUMBS.lock().unwrap().len();
+                        let p = publish_covered(ctx, (&cookie, &set), path).await;
+                        assert_eq!(p["status"], "published", "{p}");
+                        let t = &p["targets"][0];
+                        assert_eq!(t["cover_error"], Value::Null);
+                        let sent = THUMBS.lock().unwrap()[before..].to_vec();
+                        let video = t["remote_id"].as_str().unwrap().to_owned();
+                        assert_eq!(sent, [("Bearer yt".into(), video, kind.into(), 64)]);
+                    }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_channel_that_cannot_set_thumbnails_keeps_its_published_video() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    THUMB_MODE.store(1, Ordering::SeqCst);
+                    let ctx = (&s, &db, &state, base.as_str());
+                    let (starts, thumbs) =
+                        (STARTS.lock().unwrap().len(), THUMBS.lock().unwrap().len());
+                    let p = publish_covered(ctx, (&cookie, &set), "/cover.jpg").await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(p["error"], Value::Null);
+                    assert_eq!(STARTS.lock().unwrap().len(), starts + 1, "uploaded once");
+                    assert_eq!(THUMBS.lock().unwrap().len(), thumbs);
+                    let t = &p["targets"][0];
+                    assert_eq!(t["status"], "published");
+                    assert!(t["remote_id"].is_string());
+                    let why = t["cover_error"].as_str().unwrap();
+                    assert!(why.starts_with("The video is up, but its cover image was not set."));
+                    assert!(why.contains("verified"), "{why}");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_cover_that_is_not_usable_fails_the_target_before_the_upload() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let ctx = (&s, &db, &state, base.as_str());
+                    let (starts, thumbs) =
+                        (STARTS.lock().unwrap().len(), THUMBS.lock().unwrap().len());
+                    // A video where an image belongs, a page that is not there.
+                    for (path, want) in [
+                        ("/clip.mp4", "YouTube takes a JPEG or PNG cover image."),
+                        (
+                            "/nothing.jpg",
+                            "The cover image could not be downloaded (HTTP 404).",
+                        ),
+                    ] {
+                        let p = publish_covered(ctx, (&cookie, &set), path).await;
+                        assert_eq!(p["status"], "failed", "{p}");
+                        assert_eq!(p["targets"][0]["error"], want);
+                        assert_eq!(p["targets"][0]["remote_id"], Value::Null);
+                    }
+                    assert_eq!(STARTS.lock().unwrap().len(), starts);
+                    assert_eq!(THUMBS.lock().unwrap().len(), thumbs);
                 }
 
                 #[tokio::test]
@@ -9790,6 +10015,11 @@ mod teams {
                 static UPLOADS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
                 static REMOVED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
                 static NEXT: AtomicU64 = AtomicU64::new(1);
+                /// Every Reel thumbnail the mock took: (video id, content type, multipart body).
+                /// `THUMB_MODE` 1: Meta refuses it.
+                static THUMBS: std::sync::Mutex<Vec<(String, String, String)>> =
+                    std::sync::Mutex::new(Vec::new());
+                static THUMB_MODE: AtomicU64 = AtomicU64::new(0);
 
                 type Answer = (axum::http::StatusCode, Json<Value>);
 
@@ -9828,6 +10058,7 @@ mod teams {
                 /// Code `good` grants Page 101 (with Instagram 1784) and, on the next cursor,
                 /// Page 102; code `none` grants no Page.
                 async fn mock_meta() -> String {
+                    THUMB_MODE.store(0, Ordering::SeqCst);
                     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let base = format!("http://{}", listener.local_addr().unwrap());
                     let token = |Form(f): Form<HashMap<String, String>>| async move {
@@ -9983,12 +10214,27 @@ mod teams {
                             .push(file.unwrap_or_default().to_owned());
                         ok(json!({"success": true}))
                     };
+                    let thumbnail = |h: axum::http::HeaderMap,
+                                     Path(id): Path<String>,
+                                     body: axum::body::Bytes| async move {
+                        if !page_token(&h) || THUMB_MODE.load(Ordering::SeqCst) == 1 {
+                            return refused(100, "(#100) Invalid thumbnail");
+                        }
+                        let kind = h.get("content-type").and_then(|v| v.to_str().ok());
+                        THUMBS.lock().unwrap().push((
+                            id,
+                            kind.unwrap_or_default().to_owned(),
+                            String::from_utf8_lossy(&body).into_owned(),
+                        ));
+                        ok(json!({"success": true}))
+                    };
                     let mut jpeg = vec![7u8; 64];
                     jpeg[..4].copy_from_slice(b"\xFF\xD8\xFF\xE0");
                     let mut mp4 = vec![0u8; 64];
                     mp4[..12].copy_from_slice(b"\0\0\0\x18ftypisom");
                     let app = Router::new()
                         .route("/v26.0/oauth/access_token", post(token))
+                        .route("/v26.0/{id}/thumbnails", post(thumbnail))
                         .route("/v26.0/me/accounts", get(accounts))
                         .route("/v26.0/{node}/{edge}", post(edge).delete(unsubscribe))
                         .route("/v26.0/{id}", get(node).delete(remove))
@@ -10474,6 +10720,125 @@ mod teams {
                     let again = get_post(&s, &cookie, id).await;
                     assert_eq!(again["targets"][0]["comment_status"], "failed");
                     assert_eq!(again["status"], "published");
+                }
+
+                /// Like `publish_one` for a video post with a cover from the mock's `cover` path.
+                async fn publish_covered(
+                    (s, db, state, base): (&TestServer, &DatabaseConnection, &AppState, &str),
+                    cookie: &str,
+                    mut post: Value,
+                    (media, cover): (&[&str], &str),
+                ) -> (Value, Vec<(String, HashMap<String, String>)>) {
+                    post["media"] = json!(vec!["https://a.example/x.mp4"; media.len()]);
+                    post["cover"] = json!("https://a.example/c.jpg");
+                    let res = create(s, cookie, post).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let id = id_of(&res);
+                    set_media(db, base, &id, media).await;
+                    set_cover_url(db, base, &id, cover).await;
+                    let before = CALLS.lock().unwrap().len();
+                    publish::tick(state).await.unwrap();
+                    let calls = CALLS.lock().unwrap()[before..].to_vec();
+                    (get_post(s, cookie, &id).await, calls)
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn an_instagram_reel_takes_its_cover_by_url_in_the_container() {
+                    let (s, db, state, base) = on_meta(true).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let ctx = (&s, &db, &state, base.as_str());
+
+                    let post = meta_post(&set, "instagram", "reel");
+                    let (p, calls) =
+                        publish_covered(ctx, &cookie, post, (&["/clip.mp4"], "/img.jpg")).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(p["targets"][0]["cover_error"], Value::Null);
+                    assert_eq!(calls[0].1["media_type"], "REELS");
+                    let cover = &calls[0].1["cover_url"];
+                    assert!(cover.starts_with("http://localhost:8080/media/"), "{cover}");
+                    assert!(cover.ends_with(".jpg"), "{cover}");
+                    assert_eq!(calls[1].0, "1784/media_publish");
+
+                    // Instagram takes a JPEG only; the post never starts.
+                    let post = meta_post(&set, "instagram", "reel");
+                    let (p, calls) =
+                        publish_covered(ctx, &cookie, post, (&["/clip.mp4"], "/img.png")).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    assert_eq!(
+                        p["targets"][0]["error"],
+                        "Instagram takes a JPEG cover image."
+                    );
+                    assert!(calls.is_empty());
+
+                    // A cover on an image, or one that cannot be downloaded, is the same.
+                    let post = meta_post(&set, "instagram", "pic");
+                    let (p, calls) =
+                        publish_covered(ctx, &cookie, post, (&["/img.jpg"], "/img.jpg")).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    let error = p["targets"][0]["error"].as_str().unwrap();
+                    assert_eq!(error, "A cover needs a post with exactly one video.");
+                    let post = meta_post(&set, "instagram", "reel");
+                    let (p, calls_missing) =
+                        publish_covered(ctx, &cookie, post, (&["/clip.mp4"], "/nothing.jpg")).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    let error = p["targets"][0]["error"].as_str().unwrap();
+                    assert_eq!(error, "The cover image could not be downloaded (HTTP 404).");
+                    assert!(calls.is_empty() && calls_missing.is_empty());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_facebook_reel_gets_its_cover_as_a_thumbnail_once_it_is_up() {
+                    let (s, db, state, base) = on_meta(true).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let ctx = (&s, &db, &state, base.as_str());
+
+                    for (path, kind, ext) in [
+                        ("/img.jpg", "image/jpeg", "jpg"),
+                        ("/img.png", "image/png", "png"),
+                    ] {
+                        let before = THUMBS.lock().unwrap().len();
+                        let post = meta_post(&set, "facebook", "reel");
+                        let (p, calls) =
+                            publish_covered(ctx, &cookie, post, (&["/clip.mp4"], path)).await;
+                        assert_eq!(p["status"], "published", "{p}");
+                        let t = &p["targets"][0];
+                        assert_eq!(t["cover_error"], Value::Null);
+                        // The Reel's own calls carry no cover; the thumbnail follows the finish.
+                        assert_eq!(calls.len(), 2);
+                        assert!(calls.iter().all(|c| !c.1.contains_key("thumb")));
+                        let sent = THUMBS.lock().unwrap()[before..].to_vec();
+                        assert_eq!(sent.len(), 1);
+                        assert_eq!(sent[0].0, t["remote_id"].as_str().unwrap());
+                        assert!(sent[0].1.starts_with("multipart/form-data; boundary="));
+                        assert!(sent[0].2.contains("name=\"is_preferred\"\r\n\r\ntrue\r\n"));
+                        assert!(sent[0].2.contains(&format!("filename=\"cover.{ext}\"")));
+                        assert!(sent[0].2.contains(&format!("Content-Type: {kind}\r\n\r\n")));
+                    }
+
+                    // Meta refusing the thumbnail leaves the Reel published, with a warning.
+                    THUMB_MODE.store(1, Ordering::SeqCst);
+                    let post = meta_post(&set, "facebook", "reel");
+                    let (p, _) =
+                        publish_covered(ctx, &cookie, post, (&["/clip.mp4"], "/img.jpg")).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(p["error"], Value::Null);
+                    let t = &p["targets"][0];
+                    assert_eq!(t["status"], "published");
+                    let why = t["cover_error"].as_str().unwrap();
+                    assert!(why.starts_with("The video is up, but its cover image was not set."));
+                    assert!(why.contains("Cover:"), "{why}");
+                    THUMB_MODE.store(0, Ordering::SeqCst);
+
+                    // A cover on a photo post fails the target before anything goes out.
+                    let post = meta_post(&set, "facebook", "pic");
+                    let (p, calls) =
+                        publish_covered(ctx, &cookie, post, (&["/img.jpg"], "/img.jpg")).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    assert!(calls.is_empty());
                 }
 
                 #[tokio::test]

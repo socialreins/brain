@@ -70,6 +70,8 @@ pub struct Post {
     /// Text the same account comments on the post right after it is published (Facebook,
     /// Instagram, LinkedIn, YouTube); each target says how it went (`comment_status`).
     pub first_comment: Option<String>,
+    /// Cover image URL for the post's one video.
+    pub cover: Option<String>,
     /// `draft`, `scheduled`, `queued`, `published`, `failed` or `deleted`.
     pub status: String,
     pub scheduled_at: Option<DateTime<FixedOffset>>,
@@ -110,6 +112,8 @@ pub struct Target {
     pub comment_id: Option<String>,
     /// Why the comment failed.
     pub comment_error: Option<String>,
+    /// Why the cover could not be set on the published video; a warning, the post is up.
+    pub cover_error: Option<String>,
 }
 
 /// One follow-up post of a thread.
@@ -165,6 +169,16 @@ pub struct PostInput {
     /// failed comment leaves the post `published` and shows as the target's `comment_error`.
     /// Taking the post down removes it with the comment.
     pub first_comment: Option<String>,
+    /// A cover image for the post's one video (a public https link to a JPEG or PNG, Google
+    /// Drive share links included, fetched at publish time like `media`). Only on Instagram
+    /// (JPEG, at most 8 MB), Facebook (JPEG or PNG, 10 MB) and YouTube (JPEG or PNG, 2 MB);
+    /// other platforms answer `cover_not_supported` (TikTok can only pick a frame), a post
+    /// without exactly one media item `cover_needs_one_video`, and a bad link `invalid_cover`.
+    /// Blank counts as absent. A cover that cannot be downloaded or is not the right type, or
+    /// a media item that is not a video, fails the target before anything is posted. On
+    /// Facebook and YouTube the cover is set after the video is live: a refusal (YouTube needs
+    /// a verified channel) leaves the post `published` and shows as the target's `cover_error`.
+    pub cover: Option<String>,
     /// When to publish. Set: `scheduled`; absent or `null`: `draft`.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
     /// A list to put the post in (moving it there when it already is).
@@ -208,6 +222,10 @@ pub struct PostGroupInput {
     /// `first_comment` fails with `first_comment_not_supported` naming the first platform that
     /// cannot take it (Bluesky, Threads, TikTok, X): pass `platforms`.
     pub first_comment: Option<String>,
+    /// Each post's cover, unless its override has one (`""` for none). Platforms without a
+    /// cover answer `cover_not_supported` unless they override it with `""`, so pass
+    /// `platforms` or override.
+    pub cover: Option<String>,
     /// As in `POST /posts`, for every post.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
     /// A list to put every post in, in platform order.
@@ -227,6 +245,7 @@ pub struct Override {
     pub media: Option<Vec<String>>,
     pub thread: Option<Vec<ThreadPart>>,
     pub first_comment: Option<String>,
+    pub cover: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -272,6 +291,7 @@ async fn targets_of(
             comment_status: t.comment_status,
             comment_id: t.comment_id,
             comment_error: t.comment_error,
+            cover_error: t.cover_error,
         });
     }
     Ok(map)
@@ -286,6 +306,7 @@ fn post_json(p: posts::Model, targets: Vec<Target>, lists: Vec<ListRef>) -> Post
         media: serde_json::from_value(p.media).unwrap_or_default(),
         thread: serde_json::from_value(p.thread).unwrap_or_default(),
         first_comment: p.first_comment,
+        cover: p.cover,
         status: p.status,
         scheduled_at: p.scheduled_at,
         published_at: p.published_at,
@@ -372,6 +393,10 @@ async fn checked(
     if let Err(e) = post::validate_first_comment(&input.platform, comment) {
         return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, e.code())));
     }
+    let cover = post::cover(input.cover.as_deref());
+    if let Err(e) = post::validate_cover(&input.platform, cover, &input.media) {
+        return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, e.code())));
+    }
     set_for(db, a, input.social_set_id).await
 }
 
@@ -410,6 +435,11 @@ fn when(input: &PostInput) -> Option<DateTime<FixedOffset>> {
 /// The first comment as saved: blank is none.
 fn stored_comment(input: &PostInput) -> Option<String> {
     post::first_comment(input.first_comment.as_deref()).map(str::to_owned)
+}
+
+/// The cover as saved: blank is none.
+fn stored_cover(input: &PostInput) -> Option<String> {
+    post::cover(input.cover.as_deref()).map(str::to_owned)
 }
 
 fn status_for(input: &PostInput) -> &'static str {
@@ -564,6 +594,7 @@ async fn insert(
         media: Set(serde_json::json!(input.media)),
         thread: Set(serde_json::json!(input.thread)),
         first_comment: Set(stored_comment(input)),
+        cover: Set(stored_cover(input)),
         status: Set(status_for(input).into()),
         scheduled_at: Set(when(input)),
         created_by: Set(a.user_id),
@@ -642,6 +673,9 @@ pub async fn create_post_group(app: &AppState, a: &Actor, input: PostGroupInput)
                 first_comment: o
                     .and_then(|o| o.first_comment.clone())
                     .or_else(|| input.first_comment.clone()),
+                cover: o
+                    .and_then(|o| o.cover.clone())
+                    .or_else(|| input.cover.clone()),
                 platform,
                 scheduled_at: input.scheduled_at,
                 list_id: input.list_id,
@@ -701,7 +735,7 @@ async fn naming(res: Response, platform: &str) -> Response {
     (status, Json(v)).into_response()
 }
 
-/// Replaces a `draft` or `scheduled` post's set, platform, body, media, thread, first comment and time; anything else
+/// Replaces a `draft` or `scheduled` post's set, platform, body, media, thread, first comment, cover and time; anything else
 /// is `409 not_editable`.
 #[utoipa::path(put, path = "/posts/{id}", tag = "posts",
     security(("session" = []), ("api_token" = [])), request_body = PostInput,
@@ -743,6 +777,7 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) 
                 serde_json::json!(input.thread).into(),
             )
             .col_expr(posts::Column::FirstComment, stored_comment(&input).into())
+            .col_expr(posts::Column::Cover, stored_cover(&input).into())
             .col_expr(posts::Column::Status, status_for(&input).into())
             .col_expr(posts::Column::ScheduledAt, when(&input).into())
             .col_expr(posts::Column::UpdatedAt, Utc::now().fixed_offset().into())

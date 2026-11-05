@@ -61,6 +61,12 @@ pub enum Invalid {
     /// The platform's publisher cannot post a first comment.
     FirstCommentUnsupported,
     FirstCommentTooLong,
+    /// The platform has no way to set a video's cover image by API.
+    CoverUnsupported,
+    /// The cover is not a public https URL.
+    InvalidCover,
+    /// A cover belongs to a post with exactly one media item, which must be a video.
+    CoverNeedsOneVideo,
 }
 
 impl Invalid {
@@ -77,6 +83,9 @@ impl Invalid {
             Self::InvalidText => "invalid_text",
             Self::FirstCommentUnsupported => "first_comment_not_supported",
             Self::FirstCommentTooLong => "first_comment_too_long",
+            Self::CoverUnsupported => "cover_not_supported",
+            Self::InvalidCover => "invalid_cover",
+            Self::CoverNeedsOneVideo => "cover_needs_one_video",
         }
     }
 }
@@ -223,6 +232,36 @@ pub fn validate_first_comment(platform: &str, text: Option<&str>) -> Result<(), 
     };
     if text.chars().count() > max {
         return Err(Invalid::FirstCommentTooLong);
+    }
+    Ok(())
+}
+
+/// The cover image URL as stored: `None` when absent or blank.
+pub fn cover(url: Option<&str>) -> Option<&str> {
+    url.map(str::trim).filter(|u| !u.is_empty())
+}
+
+/// Checks a video cover (already through `cover`) for `platform`. Only Instagram (`cover_url`),
+/// Facebook (a Reel's thumbnail) and YouTube (`thumbnails.set`) have an API for one: TikTok only
+/// picks a frame (`video_cover_timestamp_ms`), and the rest have none. The post must have
+/// exactly one media item; that it is a video is known only once it is downloaded, so publish
+/// checks that, before anything goes out.
+pub fn validate_cover(
+    platform: &str,
+    cover: Option<&str>,
+    media: &[String],
+) -> Result<(), Invalid> {
+    let Some(cover) = cover else {
+        return Ok(());
+    };
+    if !matches!(platform, "instagram" | "facebook" | "youtube") {
+        return Err(Invalid::CoverUnsupported);
+    }
+    if !https_url(cover) {
+        return Err(Invalid::InvalidCover);
+    }
+    if media.len() != 1 {
+        return Err(Invalid::CoverNeedsOneVideo);
     }
     Ok(())
 }
@@ -572,6 +611,31 @@ mod tests {
                 Err(Invalid::FirstCommentTooLong),
                 "{p}"
             );
+        }
+    }
+
+    #[test]
+    fn a_cover_is_for_one_video_on_three_platforms() {
+        let one = vec!["https://a.example/v.mp4".to_owned()];
+        let two = vec![one[0].clone(), one[0].clone()];
+        let c = Some("https://a.example/c.jpg");
+        assert_eq!(cover(None), None);
+        assert_eq!(cover(Some("  ")), None);
+        assert_eq!(cover(Some(" https://a.example/c.jpg ")), c);
+        for p in ["instagram", "facebook", "youtube", "tiktok", "x"] {
+            assert_eq!(validate_cover(p, None, &two), Ok(()), "{p} without");
+        }
+        for p in ["instagram", "facebook", "youtube"] {
+            assert_eq!(validate_cover(p, c, &one), Ok(()), "{p}");
+            assert_eq!(validate_cover(p, c, &[]), Err(Invalid::CoverNeedsOneVideo));
+            assert_eq!(validate_cover(p, c, &two), Err(Invalid::CoverNeedsOneVideo));
+            assert_eq!(
+                validate_cover(p, Some("http://a.example/c.jpg"), &one),
+                Err(Invalid::InvalidCover)
+            );
+        }
+        for p in ["tiktok", "x", "linkedin", "threads", "bluesky"] {
+            assert_eq!(validate_cover(p, c, &one), Err(Invalid::CoverUnsupported));
         }
     }
 

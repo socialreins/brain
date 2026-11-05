@@ -33,6 +33,9 @@ pub struct Model {
     /// Text the account comments on the published post (Facebook, Instagram, LinkedIn, YouTube).
     #[sea_orm(column_type = "Text", nullable)]
     pub first_comment: Option<String>,
+    /// Cover image URL for a post's one video (Instagram, Facebook, YouTube).
+    #[sea_orm(column_type = "Text", nullable)]
+    pub cover: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }
