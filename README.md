@@ -208,7 +208,9 @@ documents a number for comments through its API (Google only names `commentTextT
 are the widely reported figures, and a text over the real limit fails as a comment, never as a
 post. Blank counts as none. A post group takes it at group level with a per-platform override
 (`overrides.<platform>.first_comment`, `""` for none), so a group that includes Bluesky, X, Threads
-or TikTok needs `""` there. The comment is posted at most once per target and never retried, since
+or TikTok needs `""` there. A group without `platforms` covers every connected platform, so with
+a `first_comment` it fails with `first_comment_not_supported` naming the first platform that
+cannot take it: pass `platforms`. The comment is posted at most once per target and never retried, since
 a retry could comment twice: the target claims it (`comment_status` `posting`) before the call,
 then records `posted` with `comment_id` or `failed` with `comment_error`. A refused, timed out or
 cut-off comment leaves the post and its target `published` (a cut-off one is failed by the same

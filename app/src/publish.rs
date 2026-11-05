@@ -1357,10 +1357,16 @@ async fn publish_target(
         }
         parent = made;
     }
+    // A post with a first comment is claimed for it in this same statement (`posting`, only
+    // from null), so a crash after it falls into recovery of a stuck `posting` and never leaves
+    // a published target whose comment is silently forgotten.
     let stmt = sql(
         &with_event(
-            "UPDATE post_targets SET status = 'published', error = NULL, updated_at = now() \
-             WHERE id = $1 AND status = 'publishing'",
+            "UPDATE post_targets SET status = 'published', error = NULL, \
+             comment_status = CASE WHEN comment_status IS NULL AND EXISTS (SELECT 1 FROM posts \
+               WHERE id = post_targets.post_id AND first_comment IS NOT NULL) \
+               THEN 'posting' ELSE comment_status END, \
+             updated_at = now() WHERE id = $1 AND status = 'publishing'",
         ),
         vec![id.into()],
     );
@@ -1375,9 +1381,9 @@ async fn publish_target(
 }
 
 /// Posts the first comment on a published target, at most once: the claim (`comment_status`
-/// null to `posting`) is made before the call and nothing resets it, so a crash, a timeout or a
-/// refusal is never followed by a second try that could post twice. Whatever happens only
-/// sets the comment's own columns: the target stays `published`.
+/// null to `posting`) was made by the statement that published the target and nothing resets
+/// it, so a crash, a timeout or a refusal is never followed by a second try that could post
+/// twice. Whatever happens only sets the comment's own columns: the target stays `published`.
 async fn first_comment(
     app: &AppState,
     publisher: &dyn Publisher,
@@ -1386,12 +1392,13 @@ async fn first_comment(
     text: &str,
 ) -> Result<(), DbErr> {
     let db = &app.db;
-    let claim = sql(
-        "UPDATE post_targets SET comment_status = 'posting', comment_error = NULL, \
-         updated_at = now() WHERE id = $1 AND status = 'published' AND comment_status IS NULL",
+    // Only the claim made by that statement may send: any other state means it is not ours.
+    let held = sql(
+        "UPDATE post_targets SET updated_at = now() \
+         WHERE id = $1 AND status = 'published' AND comment_status = 'posting'",
         vec![target.into()],
     );
-    if db.execute_raw(claim).await?.rows_affected() != 1 {
+    if db.execute_raw(held).await?.rows_affected() != 1 {
         return Ok(());
     }
     tokio::time::sleep(publisher.comment_wait()).await;

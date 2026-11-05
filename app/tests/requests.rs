@@ -3716,6 +3716,34 @@ mod teams {
                 posts::Entity::update(row).exec(db).await.unwrap();
             }
 
+            /// A published post put back as `queued` with its targets `pending` and unsent, as if a
+            /// publish started again. Their `comment_status` is left as it is.
+            async fn requeue_unsent(db: &DatabaseConnection, id: &str) {
+                let id: uuid::Uuid = id.parse().unwrap();
+                let post = posts::ActiveModel {
+                    id: Set(id),
+                    status: Set("queued".into()),
+                    quota_reserved: Set(true),
+                    ..Default::default()
+                };
+                posts::Entity::update(post).exec(db).await.unwrap();
+                let targets = post_targets::Entity::find()
+                    .filter(post_targets::Column::PostId.eq(id))
+                    .all(db)
+                    .await
+                    .unwrap();
+                for t in targets {
+                    let back = post_targets::ActiveModel {
+                        id: Set(t.id),
+                        status: Set("pending".into()),
+                        remote_id: Set(None),
+                        remote_url: Set(None),
+                        ..Default::default()
+                    };
+                    post_targets::Entity::update(back).exec(db).await.unwrap();
+                }
+            }
+
             async fn pds_of(db: &DatabaseConnection, team_id: &str) -> String {
                 let a = social_accounts::Entity::find()
                     .filter(
@@ -6372,7 +6400,7 @@ mod teams {
                 #[tokio::test]
                 #[serial]
                 async fn a_refused_first_comment_is_a_comment_error_not_a_failed_post() {
-                    let (s, _, state, _, cookie, _, set) = team().await;
+                    let (s, db, state, _, cookie, _, set) = team().await;
                     COMMENT_MODE.store(1, Ordering::SeqCst);
                     let mut body = linkedin_post(&set, "Hello");
                     body["first_comment"] = json!("Sources");
@@ -6392,16 +6420,54 @@ mod teams {
                     // Not a reconnect prompt: the 403 is the app's permission, not the token.
                     assert!(!why.contains("Reconnect the account under"), "{why}");
 
-                    // Once the permission is there, nothing retries it by itself.
+                    // Once the permission is there, nothing retries it by itself. The target is
+                    // sent again (queued, pending, unsent): only the `comment_status IS NULL`
+                    // guard of the publishing statement keeps it from claiming the comment.
                     COMMENT_MODE.store(0, Ordering::SeqCst);
-                    let before = COMMENTS.lock().unwrap().len();
-                    publish::tick(&state).await.unwrap();
+                    requeue_unsent(&db, &id).await;
+                    let (posts, comments) =
+                        (POSTS.lock().unwrap().len(), COMMENTS.lock().unwrap().len());
                     publish::publish_post(&state, id.parse().unwrap())
                         .await
                         .unwrap();
-                    assert_eq!(COMMENTS.lock().unwrap().len(), before);
+                    assert_eq!(POSTS.lock().unwrap().len(), posts + 1, "sent again");
+                    assert_eq!(COMMENTS.lock().unwrap().len(), comments);
                     let again = get_post(&s, &cookie, &id).await;
+                    assert_eq!(again["targets"][0]["status"], "published");
                     assert_eq!(again["targets"][0]["comment_status"], "failed");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_target_is_published_and_claimed_for_its_comment_in_one_statement() {
+                    use sea_orm::ConnectionTrait;
+                    let (s, db, state, _, cookie, _, set) = team().await;
+                    // A published target of a post with a first comment must never exist with
+                    // no comment_status: this trigger refuses a statement that leaves one.
+                    let guard = "DROP TRIGGER IF EXISTS fc_atomic ON post_targets;
+                        CREATE OR REPLACE FUNCTION fc_atomic() RETURNS trigger AS $$ BEGIN
+                          IF NEW.status = 'published' AND NEW.comment_status IS NULL
+                             AND EXISTS (SELECT 1 FROM posts WHERE id = NEW.post_id
+                                         AND first_comment IS NOT NULL) THEN
+                            RAISE EXCEPTION 'published without a comment claim';
+                          END IF;
+                          RETURN NEW;
+                        END $$ LANGUAGE plpgsql;
+                        CREATE TRIGGER fc_atomic BEFORE UPDATE ON post_targets
+                          FOR EACH ROW EXECUTE FUNCTION fc_atomic();";
+                    db.execute_unprepared(guard).await.unwrap();
+                    let mut body = linkedin_post(&set, "Hello");
+                    body["first_comment"] = json!("Sources");
+                    let id = id_of(&create(&s, &cookie, body).await);
+                    let before = COMMENTS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    db.execute_unprepared("DROP TRIGGER fc_atomic ON post_targets")
+                        .await
+                        .unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(p["targets"][0]["comment_status"], "posted", "{p}");
+                    assert_eq!(COMMENTS.lock().unwrap().len(), before + 1);
                 }
 
                 #[tokio::test]
@@ -7375,14 +7441,17 @@ mod teams {
                     let why = t["comment_error"].as_str().unwrap();
                     assert!(why.starts_with("Comment:"), "{why}");
 
-                    // Not tried again, even when YouTube would take it now.
+                    // Not tried again, even when YouTube would take it now and the target is
+                    // sent again (see the LinkedIn test of the guard).
                     COMMENT_MODE.store(0, Ordering::SeqCst);
-                    let before = COMMENTS.lock().unwrap().len();
-                    publish::tick(&state).await.unwrap();
+                    requeue_unsent(&db, &id).await;
+                    let (puts, comments) =
+                        (PUTS.lock().unwrap().len(), COMMENTS.lock().unwrap().len());
                     publish::publish_post(&state, id.parse().unwrap())
                         .await
                         .unwrap();
-                    assert_eq!(COMMENTS.lock().unwrap().len(), before);
+                    assert_eq!(PUTS.lock().unwrap().len(), puts + 1, "uploaded again");
+                    assert_eq!(COMMENTS.lock().unwrap().len(), comments);
                     assert_eq!(
                         get_post(&s, &cookie, &id).await["targets"][0]["comment_status"],
                         "failed"
@@ -10180,14 +10249,24 @@ mod teams {
                     let why = t["comment_error"].as_str().unwrap();
                     assert!(why.contains("Invalid comment"), "{why}");
 
-                    // Later rounds, recovery and a second publish call never comment again.
+                    // The target is sent again (queued, pending, unsent): the failed comment is
+                    // not claimed again.
                     let id = p["id"].as_str().unwrap();
+                    // Text the mock would take now, so a second claim would show as a call.
+                    let fine = posts::ActiveModel {
+                        id: Set(id.parse().unwrap()),
+                        first_comment: Set(Some("fine now".into())),
+                        ..Default::default()
+                    };
+                    posts::Entity::update(fine).exec(&db).await.unwrap();
+                    requeue_unsent(&db, id).await;
                     let before = CALLS.lock().unwrap().len();
-                    publish::tick(&state).await.unwrap();
                     publish::publish_post(&state, id.parse().unwrap())
                         .await
                         .unwrap();
-                    assert_eq!(CALLS.lock().unwrap().len(), before);
+                    let calls = CALLS.lock().unwrap()[before..].to_vec();
+                    let paths: Vec<&str> = calls.iter().map(|c| c.0.as_str()).collect();
+                    assert_eq!(paths, ["101/feed"], "sent again, with no comment");
                     let again = get_post(&s, &cookie, id).await;
                     assert_eq!(again["targets"][0]["comment_status"], "failed");
                     assert_eq!(again["status"], "published");

@@ -204,6 +204,9 @@ pub struct PostGroupInput {
     pub thread: Vec<ThreadPart>,
     /// Each post's first comment, unless its override has one (`""` for none). Platforms that
     /// cannot post one answer `first_comment_not_supported` unless they override it with `""`.
+    /// Without `platforms` the group covers every connected platform, so a group with a
+    /// `first_comment` fails with `first_comment_not_supported` naming the first platform that
+    /// cannot take it (Bluesky, Threads, TikTok, X): pass `platforms`.
     pub first_comment: Option<String>,
     /// As in `POST /posts`, for every post.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
