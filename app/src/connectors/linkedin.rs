@@ -463,6 +463,45 @@ impl LinkedIn {
         ))
     }
 
+    /// Comments `text` on the post `urn` as the member `sub` (`POST /rest/socialActions/{urn}/
+    /// comments`), plain text with no escaping. Returns the comment's id. LinkedIn's docs name
+    /// `w_member_social_feed` for this call, not the `w_member_social` this connector asks for, so
+    /// a refusal says so instead of asking for a reconnect that cannot help. Once, never retried.
+    pub async fn comment_post(
+        &self,
+        sub: &str,
+        token: &str,
+        urn: &str,
+        text: &str,
+    ) -> Result<String, PostError> {
+        let Some(path) = encoded(urn).map(|e| format!("socialActions/{e}/comments")) else {
+            return Err(failed("This is not a LinkedIn post id."));
+        };
+        let body = json!({
+            "actor": format!("urn:li:person:{sub}"),
+            "object": urn,
+            "message": {"text": text},
+        });
+        let req = self.rest(Method::POST, &path, token).json(&body);
+        let (headers, body) = match self.send(req, "Comment").await {
+            Ok(done) => done,
+            Err(PostError::Reconnect) => {
+                return Err(failed(
+                    "Comment: LinkedIn refused it. The app may lack the w_member_social_feed \
+                     permission, or the token expired; reconnect the account if it did.",
+                ))
+            }
+            Err(e) => return Err(e),
+        };
+        headers
+            .get("x-restli-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .or_else(|| body["id"].as_str().map(str::to_owned))
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| failed("Comment: LinkedIn sent no comment id."))
+    }
+
     /// Takes a post down (`w_member_social`). LinkedIn answers 204 also for one already gone.
     pub async fn delete_post(&self, token: &str, urn: &str) -> Result<(), PostError> {
         let Some(path) = encoded(urn).map(|e| format!("posts/{e}")) else {

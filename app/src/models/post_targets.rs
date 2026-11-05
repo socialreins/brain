@@ -26,6 +26,13 @@ pub struct Model {
     /// published_at}]`.
     #[sea_orm(column_type = "JsonBinary")]
     pub parts: Json,
+    /// The first comment: `None` not tried, `posting`, `posted` or `failed`.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub comment_status: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub comment_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub comment_error: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }

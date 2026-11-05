@@ -82,9 +82,9 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET, POST | `/v1/social-sets` | The current team's live sets with `account_ids`, Default first (`?deleted=true`: deleted ones still restorable); create one (`{"name"}`, owner, admin) |
 | PATCH, DELETE | `/v1/social-sets/{id}` | Rename (`{"name"}`, the Default set too); delete (sign-in from the last 10 minutes, not the Default set), restorable for 30 days. Owner, admin |
 | POST | `/v1/social-sets/{id}/restore` | Restore a set deleted in the last 30 days, with its accounts (owner, admin) |
-| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&group_id=&from=&to=` on `scheduled_at`), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"thread":[{"body","media"}],"scheduled_at"}`; any member). `thread`: up to 25 follow-up posts, each a reply to the one before and checked like the post (`422 {"error","part"}` names a bad one); each part is saved on its target as it goes out, a target whose part fails is `failed` naming it with the parts before it kept, and a takedown deletes the parts last first, then the root |
+| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&group_id=&from=&to=` on `scheduled_at`), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"thread":[{"body","media"}],"first_comment","scheduled_at"}`; any member). `first_comment`: see "First comment" below. `thread`: up to 25 follow-up posts, each a reply to the one before and checked like the post (`422 {"error","part"}` names a bad one); each part is saved on its target as it goes out, a target whose part fails is `failed` naming it with the parts before it kept, and a takedown deletes the parts last first, then the root |
 | GET, PUT, DELETE | `/v1/posts/{id}` | One post with its `targets`; replace a `draft` or `scheduled` one; delete (`204` for draft or scheduled, `200` after taking a published one down, `422 takedown_failed` with a `message`, `409` for queued or failed) |
-| POST | `/v1/post-groups` | One post per platform of a set in one call (`{"social_set_id","platforms","body","media","scheduled_at","list_id","position","thread","overrides":{"<platform>":{"body","media","thread"}}}`; `platforms` defaults to those brain publishes to with a connected account; bodies up to 64 KiB): `201 {"group_id","posts"}`; an invalid post creates nothing and its error names the `platform` |
+| POST | `/v1/post-groups` | One post per platform of a set in one call (`{"social_set_id","platforms","body","media","scheduled_at","list_id","position","thread","first_comment","overrides":{"<platform>":{"body","media","thread","first_comment"}}}`; `platforms` defaults to those brain publishes to with a connected account; bodies up to 64 KiB): `201 {"group_id","posts"}`; an invalid post creates nothing and its error names the `platform` |
 | POST | `/v1/posts/{id}/publish` | Publish a draft or scheduled post now: `202` with the post `queued`; poll it for the result |
 | GET, POST | `/v1/lists` | Post lists (ordered groups such as a series), or create one (`{"name","social_set_id"}`; no set means team-wide, or the token's own set for a set token) |
 | GET, PATCH, DELETE | `/v1/lists/{id}` | One list with its `items` (`post_id`, 1-based `position`, `post`); rename (`{"name"}`); delete (posts stay) |
@@ -198,6 +198,33 @@ Saving with `scheduled_at` makes a post `scheduled`, else `draft`; only those tw
 A tick every minute claims due posts (one instance at a time, advisory lock), creates one
 target per account and claims each target once, so nothing posts twice; a publish is never
 retried. A target cut off mid-publish for 15 minutes fails as "unknown, check the account".
+
+**First comment.** A post may carry `first_comment`, text its own account comments right after
+the post is saved as published on that target, e.g. for sources and caveats. Only Facebook,
+Instagram, LinkedIn and YouTube do; any other platform answers `422 first_comment_not_supported`
+(like `thread_not_supported`), and a longer text `422 first_comment_too_long`. Limits, in
+characters: Facebook 8000, Instagram 2200, LinkedIn 1250, YouTube 10000. None of the four
+documents a number for comments through its API (Google only names `commentTextTooLong`), so these
+are the widely reported figures, and a text over the real limit fails as a comment, never as a
+post. Blank counts as none. A post group takes it at group level with a per-platform override
+(`overrides.<platform>.first_comment`, `""` for none), so a group that includes Bluesky, X, Threads
+or TikTok needs `""` there. The comment is posted at most once per target and never retried, since
+a retry could comment twice: the target claims it (`comment_status` `posting`) before the call,
+then records `posted` with `comment_id` or `failed` with `comment_error`. A refused, timed out or
+cut-off comment leaves the post and its target `published` (a cut-off one is failed by the same
+sweep that recovers stuck targets, as "unknown, check the account"); the web app shows the error.
+Nothing is posted if the target never reached `published`. A takedown deletes the post only: the
+platform removes its comments with it. Calls (all with the account's own token): Facebook `POST
+/{post-id}/comments` with `message` (the Page token, `pages_manage_engagement`), Instagram `POST
+/{media-id}/comments` with `message` (`instagram_manage_comments`), LinkedIn `POST
+/rest/socialActions/{post urn}/comments` with `actor` (the member), `object` and `message.text`
+(plain text, not escaped; `LinkedIn-Version` `202610`), YouTube `POST
+/youtube/v3/commentThreads?part=snippet` with the channel and video ids (`youtube.force-ssl`;
+brain waits 10 seconds after the upload first, and a refusal such as `processingFailure` is the
+comment's failure). LinkedIn's docs name `w_member_social_feed` for member comments while the
+connector asks for `w_member_social`; if LinkedIn refuses, the comment error says so and the
+scope needs a decision (it is a separate LinkedIn product permission). Webhook payloads are
+unchanged.
 Posts of a deleted set are hidden and held back until it is restored. Errors never carry URLs
 or tokens. A team keeps at most 2000 posts that are not deleted; publish now and take-down are
 10 a minute per user. A team publishes at most 100 posts a day, scheduled or now (`429
@@ -272,7 +299,7 @@ per part, finalize, poll until `AVAILABLE`). The text is escaped for LinkedIn's 
 (hashtags stay links). The post URN comes from the `x-restli-id` header and is saved first; the
 permalink is `https://www.linkedin.com/feed/update/{urn}`. A takedown is `DELETE
 /rest/posts/{encoded urn}`. brain uploads the stored bytes itself, so LinkedIn needs no public
-media link. Documents (PDF) and a first comment are not built yet.
+media link. Documents (PDF) are not built yet.
 
 YouTube (when `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are set, the same Google client as
 sign-in) connects one channel per consent through the same OAuth checks as Threads, with its own
@@ -306,7 +333,7 @@ always `public`: the post model has no place for per-post platform options. Unti
 the API project, YouTube locks every upload from it to private whatever is asked, so the video
 shows up private in YouTube Studio; apply for the audit before relying on it. A video upload costs
 1,600 of the project's 10,000 daily quota units, shared by every team on the install, so about six
-a day; when Google answers `quotaExceeded` the target fails with a message saying so. A takedown
+a day (a first comment costs 50 more, `commentThreads.insert`); when Google answers `quotaExceeded` the target fails with a message saying so. A takedown
 is `DELETE /youtube/v3/videos?id={id}` (a video already gone counts as down; a channel connected
 before `youtube.force-ssl` was requested must reconnect).
 

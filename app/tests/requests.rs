@@ -4823,6 +4823,102 @@ mod teams {
 
             #[tokio::test]
             #[serial]
+            async fn first_comments_are_checked_per_platform_and_saved_with_the_post() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let with = |platform: &str, comment: Value| {
+                    let mut v = input(&set, "hi", None);
+                    v["platform"] = json!(platform);
+                    v["media"] = json!(["https://a.example/clip.mp4"]);
+                    v["first_comment"] = comment;
+                    v
+                };
+                // Only Facebook, Instagram, LinkedIn and YouTube comment.
+                for p in ["bluesky", "threads", "x", "tiktok"] {
+                    let res = create(&s, &cookie, with(p, json!("sources"))).await;
+                    assert_eq!(res.status_code(), 422, "{p}");
+                    res.assert_json(&json!({"error": "first_comment_not_supported"}));
+                }
+                // Their limits, in characters; blank is none.
+                for (p, max) in [("facebook", 8000), ("linkedin", 1250), ("youtube", 10_000)] {
+                    let ok = with(p, json!("é".repeat(max)));
+                    let res = create(&s, &cookie, ok).await;
+                    assert_eq!(res.status_code(), 201, "{p}: {}", res.text());
+                    let long = with(p, json!("é".repeat(max + 1)));
+                    let res = create(&s, &cookie, long).await;
+                    assert_eq!(res.status_code(), 422, "{p}");
+                    res.assert_json(&json!({"error": "first_comment_too_long"}));
+                }
+                let res = create(&s, &cookie, with("linkedin", json!("  \n"))).await;
+                assert_eq!(res.status_code(), 201);
+                assert_eq!(res.json::<Value>()["first_comment"], Value::Null);
+                assert_eq!(res.json::<Value>()["targets"], json!([]));
+
+                // Saved, replaced and cleared with the post.
+                let res = create(&s, &cookie, with("linkedin", json!("first"))).await;
+                assert_eq!(res.json::<Value>()["first_comment"], "first");
+                let id = id_of(&res);
+                let put = |body: Value| {
+                    req(&s, Method::PUT, &format!("/v1/posts/{id}"), &cookie).json(&body)
+                };
+                let res = put(with("linkedin", json!("second"))).await;
+                assert_eq!(res.json::<Value>()["first_comment"], "second");
+                let res = put(with("bluesky", json!("nope"))).await;
+                assert_eq!(res.status_code(), 422);
+                let mut cleared = with("linkedin", Value::Null);
+                cleared.as_object_mut().unwrap().remove("first_comment");
+                let res = put(cleared).await;
+                assert_eq!(res.json::<Value>()["first_comment"], Value::Null);
+                assert_eq!(
+                    get_post(&s, &cookie, &id).await["first_comment"],
+                    Value::Null
+                );
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn post_group_first_comments_take_per_platform_overrides() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let group =
+                    |body: Value| req(&s, Method::POST, "/v1/post-groups", &cookie).json(&body);
+                // A platform that cannot comment refuses the shared text, naming itself.
+                let res = group(json!({"social_set_id": set, "body": "hi",
+                    "platforms": ["bluesky", "linkedin"], "first_comment": "sources"}))
+                .await;
+                assert_eq!(res.status_code(), 422);
+                res.assert_json(&json!({"error": "first_comment_not_supported",
+                    "platform": "bluesky"}));
+                // An empty override leaves it out there; another override replaces it.
+                let res = group(json!({"social_set_id": set, "body": "hi",
+                    "platforms": ["bluesky", "linkedin", "facebook"],
+                    "first_comment": "sources",
+                    "overrides": {"bluesky": {"first_comment": ""},
+                        "facebook": {"first_comment": "own"}}}))
+                .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let g = res.json::<Value>();
+                let comments: Vec<&Value> = g["posts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| &p["first_comment"])
+                    .collect();
+                assert_eq!(comments, [&Value::Null, &json!("sources"), &json!("own")]);
+                // A bad override is that platform's error.
+                let res = group(json!({"social_set_id": set, "body": "hi",
+                    "platforms": ["linkedin"],
+                    "overrides": {"linkedin": {"first_comment": "a".repeat(1251)}}}))
+                .await;
+                assert_eq!(res.status_code(), 422);
+                res.assert_json(&json!({"error": "first_comment_too_long",
+                    "platform": "linkedin"}));
+            }
+
+            #[tokio::test]
+            #[serial]
             async fn recovered_queued_posts_never_skip_the_quota() {
                 use sea_orm::{ConnectionTrait, DbBackend, Statement};
                 let (s, db, state) = on_mock().await;
@@ -5729,6 +5825,11 @@ mod teams {
                 static UPLOADS: std::sync::Mutex<Vec<(String, usize)>> =
                     std::sync::Mutex::new(Vec::new());
                 static FINALIZED: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+                /// Every comment the mock took: (path, body). `COMMENT_MODE` 1: LinkedIn
+                /// refuses it for a missing permission.
+                static COMMENTS: std::sync::Mutex<Vec<(String, Value)>> =
+                    std::sync::Mutex::new(Vec::new());
+                static COMMENT_MODE: AtomicU64 = AtomicU64::new(0);
                 /// The raw path of every delete.
                 static REMOVED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
                 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -5775,6 +5876,7 @@ mod teams {
                 /// Code `good` gives a 60-day token, `partner` also a refresh token.
                 async fn mock_linkedin() -> String {
                     *FORCED_URL.lock().unwrap() = None;
+                    COMMENT_MODE.store(0, Ordering::SeqCst);
                     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let base = format!("http://{}", listener.local_addr().unwrap());
                     let token = |Form(f): Form<HashMap<String, String>>| async move {
@@ -5879,6 +5981,22 @@ mod teams {
                         let id = format!("urn:li:share:{}", next());
                         (StatusCode::CREATED, [("x-restli-id", id)], "").into_response()
                     };
+                    let comment = |h: HeaderMap, uri: Uri, Json(body): Json<Value>| async move {
+                        if !rest_ok(&h) {
+                            return expired().into_response();
+                        }
+                        if COMMENT_MODE.load(Ordering::SeqCst) == 1 {
+                            let msg = "Not enough permissions to access: socialActions.CREATE";
+                            return (
+                                StatusCode::FORBIDDEN,
+                                Json(json!({"message": msg, "status": 403})),
+                            )
+                                .into_response();
+                        }
+                        COMMENTS.lock().unwrap().push((uri.path().to_owned(), body));
+                        let id = format!("cmt{}", next());
+                        (StatusCode::CREATED, [("x-restli-id", id)], "").into_response()
+                    };
                     let remove = |h: HeaderMap, uri: Uri| async move {
                         let method = h.get("x-restli-method").and_then(|v| v.to_str().ok());
                         assert_eq!(method, Some("DELETE"));
@@ -5899,6 +6017,7 @@ mod teams {
                         .route("/upload/img/{n}", put(upload_img))
                         .route("/upload/vid/{n}", put(upload_img))
                         .route("/rest/posts", post(create))
+                        .route("/rest/socialActions/{urn}/comments", post(comment))
                         .route("/rest/posts/{urn}", axum::routing::delete(remove))
                         .route("/img.png", get(|| async { image("image/png", 64) }))
                         .route("/img2.png", get(|| async { image("image/png", 48) }))
@@ -6218,6 +6337,127 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
+                async fn a_first_comment_follows_the_post_as_the_member_and_stays_when_it_comes_down(
+                ) {
+                    let (s, _, state, _, cookie, _, set) = team().await;
+                    let mut body = linkedin_post(&set, "Big claim");
+                    body["first_comment"] = json!("Sources (see #notes) *here*");
+                    let id = id_of(&create(&s, &cookie, body).await);
+                    let before = COMMENTS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let t = &p["targets"][0];
+                    let urn = t["remote_id"].as_str().unwrap().to_owned();
+                    let sent = COMMENTS.lock().unwrap()[before..].to_vec();
+                    assert_eq!(sent.len(), 1);
+                    let path = format!("/rest/socialActions/{}/comments", urn.replace(':', "%3A"));
+                    assert_eq!(sent[0].0, path);
+                    // Plain text, as written: the comment API has no escaping.
+                    assert_eq!(sent[0].1["message"]["text"], "Sources (see #notes) *here*");
+                    assert_eq!(sent[0].1["actor"], "urn:li:person:abc123");
+                    assert_eq!(sent[0].1["object"], urn);
+                    assert_eq!(t["comment_status"], "posted");
+                    assert!(t["comment_id"].as_str().unwrap().starts_with("cmt"));
+
+                    let removed = REMOVED.lock().unwrap().len();
+                    let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                    res.assert_status_ok();
+                    assert_eq!(res.json::<Value>()["status"], "deleted");
+                    // One delete, of the post: nothing for the comment.
+                    let gone = REMOVED.lock().unwrap()[removed..].to_vec();
+                    assert_eq!(gone, [format!("/rest/posts/{}", urn.replace(':', "%3A"))]);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_refused_first_comment_is_a_comment_error_not_a_failed_post() {
+                    let (s, _, state, _, cookie, _, set) = team().await;
+                    COMMENT_MODE.store(1, Ordering::SeqCst);
+                    let mut body = linkedin_post(&set, "Hello");
+                    body["first_comment"] = json!("Sources");
+                    let id = id_of(&create(&s, &cookie, body).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(p["error"], Value::Null);
+                    let t = &p["targets"][0];
+                    assert_eq!(
+                        (t["status"].as_str(), t["error"].clone()),
+                        (Some("published"), Value::Null)
+                    );
+                    assert_eq!(t["comment_status"], "failed");
+                    let why = t["comment_error"].as_str().unwrap();
+                    assert!(why.contains("w_member_social_feed"), "{why}");
+                    // Not a reconnect prompt: the 403 is the app's permission, not the token.
+                    assert!(!why.contains("Reconnect the account under"), "{why}");
+
+                    // Once the permission is there, nothing retries it by itself.
+                    COMMENT_MODE.store(0, Ordering::SeqCst);
+                    let before = COMMENTS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    publish::publish_post(&state, id.parse().unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(COMMENTS.lock().unwrap().len(), before);
+                    let again = get_post(&s, &cookie, &id).await;
+                    assert_eq!(again["targets"][0]["comment_status"], "failed");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn recovery_fails_a_cut_off_first_comment_and_never_sends_it() {
+                    use socialreins_brain::models::post_targets;
+                    let (s, db, state, _, cookie, _, set) = team().await;
+                    let mut body = linkedin_post(&set, "Hello");
+                    body["first_comment"] = json!("Sources");
+                    let id = id_of(&create(&s, &cookie, body).await);
+                    publish::tick(&state).await.unwrap();
+                    let target = post_targets::Entity::find()
+                        .filter(post_targets::Column::PostId.eq(id.parse::<uuid::Uuid>().unwrap()))
+                        .one(&db)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let old = (Utc::now() - Duration::minutes(30)).fixed_offset();
+                    let calls = COMMENTS.lock().unwrap().len();
+
+                    // Cut off during the comment call: it may have posted.
+                    let cut = post_targets::ActiveModel {
+                        id: Set(target.id),
+                        comment_status: Set(Some("posting".into())),
+                        comment_id: Set(None),
+                        updated_at: Set(old),
+                        ..Default::default()
+                    };
+                    post_targets::Entity::update(cut).exec(&db).await.unwrap();
+                    publish::recover_stuck(&db).await.unwrap();
+                    let t = &get_post(&s, &cookie, &id).await["targets"][0].clone();
+                    assert_eq!(t["comment_status"], "failed");
+                    let why = t["comment_error"].as_str().unwrap();
+                    assert!(why.contains("may have posted"), "{why}");
+
+                    // Cut off after the post went up but before it was saved as published.
+                    let cut = post_targets::ActiveModel {
+                        id: Set(target.id),
+                        status: Set("publishing".into()),
+                        comment_status: Set(None),
+                        comment_error: Set(None),
+                        updated_at: Set(old),
+                        ..Default::default()
+                    };
+                    post_targets::Entity::update(cut).exec(&db).await.unwrap();
+                    publish::recover_stuck(&db).await.unwrap();
+                    let t = &get_post(&s, &cookie, &id).await["targets"][0].clone();
+                    assert_eq!(t["status"], "published");
+                    assert_eq!(t["comment_status"], "failed");
+                    let why = t["comment_error"].as_str().unwrap();
+                    assert!(why.starts_with("Not posted"), "{why}");
+                    assert_eq!(COMMENTS.lock().unwrap().len(), calls);
+                }
+
+                #[tokio::test]
+                #[serial]
                 async fn images_upload_first_and_the_post_names_them() {
                     let (s, db, state, base, cookie, _, set) = team().await;
                     // One image is `content.media`.
@@ -6466,6 +6706,11 @@ mod teams {
                 static QUOTA: AtomicBool = AtomicBool::new(false);
                 /// How the mock answers a delete: 0 as asked, 1 video gone, 2 scope missing.
                 static DELETE_MODE: AtomicU64 = AtomicU64::new(0);
+                /// Every comment thread the mock took: (bearer, query part, body).
+                /// `COMMENT_MODE` 1: the video is still processing.
+                static COMMENTS: std::sync::Mutex<Vec<(String, String, Value)>> =
+                    std::sync::Mutex::new(Vec::new());
+                static COMMENT_MODE: AtomicU64 = AtomicU64::new(0);
 
                 type Answer = (StatusCode, Json<Value>);
 
@@ -6501,6 +6746,7 @@ mod teams {
                     *FORCED_URL.lock().unwrap() = None;
                     QUOTA.store(false, Ordering::SeqCst);
                     DELETE_MODE.store(0, Ordering::SeqCst);
+                    COMMENT_MODE.store(0, Ordering::SeqCst);
                     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let base = format!("http://{}", listener.local_addr().unwrap());
                     let token = |Form(f): Form<HashMap<String, String>>| async move {
@@ -6655,6 +6901,31 @@ mod teams {
                         REMOVED.lock().unwrap().push(q["id"].clone());
                         StatusCode::NO_CONTENT.into_response()
                     };
+                    let comment = |h: HeaderMap,
+                                   Query(q): Query<HashMap<String, String>>,
+                                   Json(body): Json<Value>| async move {
+                        if !bearer_ok(&h) {
+                            return expired().into_response();
+                        }
+                        if COMMENT_MODE.load(Ordering::SeqCst) == 1 {
+                            let msg = "The API server failed to successfully process the request.";
+                            return google_error(StatusCode::BAD_REQUEST, "processingFailure", msg)
+                                .into_response();
+                        }
+                        let bearer = h.get("authorization").and_then(|v| v.to_str().ok());
+                        COMMENTS.lock().unwrap().push((
+                            bearer.unwrap_or_default().to_owned(),
+                            q["part"].clone(),
+                            body,
+                        ));
+                        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            Json(json!({"kind": "youtube#commentThread",
+                            "id": format!("Ugz{n}")})),
+                        )
+                            .into_response()
+                    };
                     let mut mp4 = vec![0u8; 64];
                     mp4[..12].copy_from_slice(b"\0\0\0\x18ftypisom");
                     let app = Router::new()
@@ -6662,6 +6933,7 @@ mod teams {
                         .route("/youtube/v3/channels", get(channels))
                         .route("/upload/youtube/v3/videos", post(start).put(upload))
                         .route("/youtube/v3/videos", delete(remove))
+                        .route("/youtube/v3/commentThreads", post(comment))
                         .route("/img.png", get(|| async { image("image/png", 64) }))
                         .route(
                             "/clip.mp4",
@@ -6682,6 +6954,7 @@ mod teams {
                     let mut y = YouTube::new(app).unwrap();
                     y.token_url = format!("{base}/token");
                     y.api_url = base.clone();
+                    y.comment_wait = std::time::Duration::ZERO;
                     config.youtube = y;
                     let disk = object_store::local::LocalFileSystem::new_with_prefix(media_dir())
                         .unwrap()
@@ -7046,6 +7319,74 @@ mod teams {
                     res.assert_status_ok();
                     assert_eq!(res.json::<Value>()["status"], "deleted");
                     assert_eq!(REMOVED.lock().unwrap().last(), Some(&video));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_first_comment_goes_on_the_new_video_as_the_channel() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let mut post = youtube_post(&set, "Short\ndescribed");
+                    post["first_comment"] = json!("Sources: example.org");
+                    let id = id_of(&create(&s, &cookie, post).await);
+                    set_media(&db, &base, &id, &["/clip.mp4"]).await;
+                    let before = COMMENTS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let t = &p["targets"][0];
+                    let video = t["remote_id"].as_str().unwrap().to_owned();
+                    let sent = COMMENTS.lock().unwrap()[before..].to_vec();
+                    assert_eq!(sent.len(), 1);
+                    assert_eq!(
+                        (sent[0].0.as_str(), sent[0].1.as_str()),
+                        ("Bearer yt", "snippet")
+                    );
+                    let snippet = &sent[0].2["snippet"];
+                    assert_eq!(snippet["channelId"], "UCabc123");
+                    assert_eq!(snippet["videoId"], video);
+                    let text = &snippet["topLevelComment"]["snippet"]["textOriginal"];
+                    assert_eq!(text, "Sources: example.org");
+                    assert_eq!(t["comment_status"], "posted");
+                    assert!(t["comment_id"].as_str().unwrap().starts_with("Ugz"));
+
+                    // Taking the video down takes its comments: only the video is deleted.
+                    let removed = REMOVED.lock().unwrap().len();
+                    let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                    res.assert_status_ok();
+                    assert_eq!(REMOVED.lock().unwrap()[removed..], [video]);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_video_youtube_still_processes_fails_only_the_comment() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    COMMENT_MODE.store(1, Ordering::SeqCst);
+                    let mut post = youtube_post(&set, "Short");
+                    post["first_comment"] = json!("Sources");
+                    let id = id_of(&create(&s, &cookie, post).await);
+                    set_media(&db, &base, &id, &["/clip.mp4"]).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(p["error"], Value::Null);
+                    let t = &p["targets"][0];
+                    assert_eq!(t["status"], "published");
+                    assert_eq!(t["comment_status"], "failed");
+                    let why = t["comment_error"].as_str().unwrap();
+                    assert!(why.starts_with("Comment:"), "{why}");
+
+                    // Not tried again, even when YouTube would take it now.
+                    COMMENT_MODE.store(0, Ordering::SeqCst);
+                    let before = COMMENTS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    publish::publish_post(&state, id.parse().unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(COMMENTS.lock().unwrap().len(), before);
+                    assert_eq!(
+                        get_post(&s, &cookie, &id).await["targets"][0]["comment_status"],
+                        "failed"
+                    );
                 }
 
                 #[tokio::test]
@@ -9283,6 +9624,12 @@ mod teams {
                                     return refused(200, "(#200) pages_manage_metadata is missing")
                                 }
                                 "subscribed_apps" => json!({"success": true}),
+                                // A first comment with REFUSE in it is turned down.
+                                "comments"
+                                    if f.get("message").is_some_and(|m| m.contains("REFUSE")) =>
+                                {
+                                    return refused(100, "(#100) Invalid comment")
+                                }
                                 "comments" | "replies" => json!({"id": format!("{node}_r{n}")}),
                                 "messages" => {
                                     let to = f.get("recipient").map(String::as_str);
@@ -9754,6 +10101,96 @@ mod teams {
                     let res = create(&s, &cookie, post).await;
                     assert_eq!(res.status_code(), 422);
                     res.assert_json(&json!({"error": "thread_not_supported"}));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_first_comment_follows_the_post_and_a_take_down_leaves_it_to_the_post() {
+                    let (s, db, state, base) = on_meta(true).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let ctx = (&s, &db, &state, base.as_str());
+
+                    // Facebook: the Page comments on its post id with the Page token.
+                    let mut post = meta_post(&set, "facebook", "hello");
+                    post["first_comment"] = json!("Sources: example.org");
+                    let (p, calls) = publish_one(ctx, &cookie, post, &[]).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(p["first_comment"], "Sources: example.org");
+                    let t = &p["targets"][0];
+                    let id = t["remote_id"].as_str().unwrap().to_owned();
+                    let paths: Vec<&str> = calls.iter().map(|c| c.0.as_str()).collect();
+                    assert_eq!(paths, ["101/feed", &format!("{id}/comments")]);
+                    assert_eq!(calls[1].1["message"], "Sources: example.org");
+                    assert_eq!(t["status"], "published");
+                    assert_eq!(t["comment_status"], "posted");
+                    let comment = t["comment_id"].as_str().unwrap().to_owned();
+                    assert!(comment.starts_with(&id), "{comment}");
+                    assert_eq!(t["comment_error"], Value::Null);
+                    let res = req(
+                        &s,
+                        Method::DELETE,
+                        &format!("/v1/posts/{}", p["id"].as_str().unwrap()),
+                        &cookie,
+                    )
+                    .await;
+                    res.assert_status_ok();
+                    assert_eq!(res.json::<Value>()["status"], "deleted");
+                    // Only the post is deleted: the comment goes with it.
+                    assert_eq!(REMOVED.lock().unwrap().last(), Some(&id));
+                    assert!(!REMOVED.lock().unwrap().contains(&comment));
+
+                    // Instagram: the account comments on the media id.
+                    let mut post = meta_post(&set, "instagram", "pic");
+                    post["first_comment"] = json!("Credit: Ann");
+                    let (p, calls) = publish_one(ctx, &cookie, post, &["/img.jpg"]).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let t = &p["targets"][0];
+                    let id = t["remote_id"].as_str().unwrap();
+                    assert_eq!(calls.len(), 3);
+                    assert_eq!(calls[2].0, format!("{id}/comments"));
+                    assert_eq!(calls[2].1["message"], "Credit: Ann");
+                    assert_eq!(t["comment_status"], "posted");
+
+                    // No first comment: nothing is sent and no status is set.
+                    let (p, calls) =
+                        publish_one(ctx, &cookie, meta_post(&set, "facebook", "plain"), &[]).await;
+                    assert_eq!(calls.len(), 1);
+                    assert_eq!(p["targets"][0]["comment_status"], Value::Null);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_refused_first_comment_leaves_the_post_published_and_is_not_retried() {
+                    let (s, db, state, base) = on_meta(true).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let mut post = meta_post(&set, "facebook", "hello");
+                    post["first_comment"] = json!("REFUSE me");
+                    let ctx = (&s, &db, &state, base.as_str());
+                    let (p, calls) = publish_one(ctx, &cookie, post, &[]).await;
+                    assert_eq!(calls.len(), 1, "the refused comment is not recorded");
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(p["error"], Value::Null);
+                    let t = &p["targets"][0];
+                    assert_eq!(t["status"], "published");
+                    assert_eq!(t["error"], Value::Null);
+                    assert_eq!(t["comment_status"], "failed");
+                    assert_eq!(t["comment_id"], Value::Null);
+                    let why = t["comment_error"].as_str().unwrap();
+                    assert!(why.contains("Invalid comment"), "{why}");
+
+                    // Later rounds, recovery and a second publish call never comment again.
+                    let id = p["id"].as_str().unwrap();
+                    let before = CALLS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    publish::publish_post(&state, id.parse().unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(CALLS.lock().unwrap().len(), before);
+                    let again = get_post(&s, &cookie, id).await;
+                    assert_eq!(again["targets"][0]["comment_status"], "failed");
+                    assert_eq!(again["status"], "published");
                 }
 
                 #[tokio::test]

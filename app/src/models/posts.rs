@@ -30,6 +30,9 @@ pub struct Model {
     /// Follow-up parts of a thread, `[{body, media}]`, each a reply to the one before.
     #[sea_orm(column_type = "JsonBinary")]
     pub thread: Json,
+    /// Text the account comments on the published post (Facebook, Instagram, LinkedIn, YouTube).
+    #[sea_orm(column_type = "Text", nullable)]
+    pub first_comment: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }

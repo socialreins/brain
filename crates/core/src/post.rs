@@ -30,6 +30,15 @@ pub const TIKTOK_MAX_MEDIA: usize = 35;
 /// X: 280 weighted characters (`x_weight`), 4 images or one video or GIF.
 pub const X_MAX_WEIGHT: usize = 280;
 pub const X_MAX_MEDIA: usize = 4;
+/// First comment limits, in characters. Meta, LinkedIn and Google document none for comments
+/// through their APIs (Google only answers `commentTextTooLong`), so these are the figures the
+/// platforms are widely reported to enforce; a comment over a real limit is refused at
+/// publish and shows as the target's `comment_error`, never as a failed post.
+pub const FACEBOOK_COMMENT_MAX_CHARS: usize = 8000;
+/// Instagram: the app's 2200-character caption and comment limit.
+pub const INSTAGRAM_COMMENT_MAX_CHARS: usize = 2200;
+pub const LINKEDIN_COMMENT_MAX_CHARS: usize = 1250;
+pub const YOUTUBE_COMMENT_MAX_CHARS: usize = 10_000;
 /// Follow-up parts a thread may have after its first post.
 pub const MAX_THREAD_PARTS: usize = 25;
 const MAX_URL_LEN: usize = 2048;
@@ -49,6 +58,9 @@ pub enum Invalid {
     MediaRequired,
     /// YouTube refuses `<` and `>` in a title or description.
     InvalidText,
+    /// The platform's publisher cannot post a first comment.
+    FirstCommentUnsupported,
+    FirstCommentTooLong,
 }
 
 impl Invalid {
@@ -63,6 +75,8 @@ impl Invalid {
             Self::ThreadUnsupported => "thread_not_supported",
             Self::MediaRequired => "media_required",
             Self::InvalidText => "invalid_text",
+            Self::FirstCommentUnsupported => "first_comment_not_supported",
+            Self::FirstCommentTooLong => "first_comment_too_long",
         }
     }
 }
@@ -185,6 +199,30 @@ pub fn validate(platform: &str, body: &str, media: &[String]) -> Result<(), Inva
     }
     if !media.iter().all(|m| https_url(m)) {
         return Err(Invalid::InvalidMedia);
+    }
+    Ok(())
+}
+
+/// The first comment as stored: `None` when absent or blank.
+pub fn first_comment(text: Option<&str>) -> Option<&str> {
+    text.filter(|t| !t.trim().is_empty())
+}
+
+/// Checks a first comment (already through `first_comment`) for `platform`: only Facebook,
+/// Instagram, LinkedIn and YouTube post one.
+pub fn validate_first_comment(platform: &str, text: Option<&str>) -> Result<(), Invalid> {
+    let Some(text) = text else {
+        return Ok(());
+    };
+    let max = match platform {
+        "facebook" => FACEBOOK_COMMENT_MAX_CHARS,
+        "instagram" => INSTAGRAM_COMMENT_MAX_CHARS,
+        "linkedin" => LINKEDIN_COMMENT_MAX_CHARS,
+        "youtube" => YOUTUBE_COMMENT_MAX_CHARS,
+        _ => return Err(Invalid::FirstCommentUnsupported),
+    };
+    if text.chars().count() > max {
+        return Err(Invalid::FirstCommentTooLong);
     }
     Ok(())
 }
@@ -505,6 +543,34 @@ mod tests {
             assert_eq!(
                 validate_thread(p, &[("two", &media(1)[..])]),
                 Err((Invalid::ThreadUnsupported, None))
+            );
+        }
+    }
+
+    #[test]
+    fn first_comments_are_for_four_platforms_with_their_limits() {
+        assert_eq!(first_comment(None), None);
+        assert_eq!(first_comment(Some(" \n")), None);
+        assert_eq!(first_comment(Some("src")), Some("src"));
+        for p in ["bluesky", "threads", "x", "tiktok"] {
+            assert_eq!(validate_first_comment(p, None), Ok(()), "{p} without");
+            assert_eq!(
+                validate_first_comment(p, Some("hi")),
+                Err(Invalid::FirstCommentUnsupported),
+                "{p}"
+            );
+        }
+        for (p, max) in [
+            ("facebook", 8000),
+            ("instagram", 2200),
+            ("linkedin", 1250),
+            ("youtube", 10_000),
+        ] {
+            assert_eq!(validate_first_comment(p, Some(&"é".repeat(max))), Ok(()));
+            assert_eq!(
+                validate_first_comment(p, Some(&"é".repeat(max + 1))),
+                Err(Invalid::FirstCommentTooLong),
+                "{p}"
             );
         }
     }
