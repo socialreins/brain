@@ -334,8 +334,7 @@ impl TikTok {
     }
 
     /// The most public privacy level the account may use: `PUBLIC_TO_EVERYONE` when TikTok
-    /// offers it, else the first it does (a private account, or an app TikTok has not reviewed,
-    /// only gets `SELF_ONLY`).
+    /// offers it, else the first it does.
     fn privacy(creator: &Value) -> Option<String> {
         let options: Vec<&str> = creator["privacy_level_options"]
             .as_array()?
@@ -347,6 +346,13 @@ impl TikTok {
             .find(|o| **o == "PUBLIC_TO_EVERYONE")
             .or(options.first())
             .map(|o| (*o).to_owned())
+    }
+
+    /// Whether the account is offered the privacy `level`.
+    fn offers(creator: &Value, level: &str) -> bool {
+        creator["privacy_level_options"]
+            .as_array()
+            .is_some_and(|o| o.iter().any(|v| v == level))
     }
 
     /// Posts `media` with `body` as its caption and waits for TikTok to finish. Never retried: a
@@ -368,7 +374,7 @@ impl TikTok {
                 "video/init",
                 json!({
                     "post_info": {
-                        "title": body.trim(), "privacy_level": privacy,
+                        "title": body.trim(),
                         "disable_duet": true, "disable_comment": true, "disable_stitch": true,
                     },
                     "source_info": {"source": "PULL_FROM_URL", "video_url": url},
@@ -379,7 +385,7 @@ impl TikTok {
                 json!({
                     "post_info": {
                         "title": photo_title(body), "description": body.trim(),
-                        "privacy_level": privacy, "disable_comment": true,
+                        "disable_comment": true,
                     },
                     "source_info": {
                         "source": "PULL_FROM_URL", "photo_cover_index": 0, "photo_images": urls,
@@ -389,12 +395,35 @@ impl TikTok {
             ),
         };
         let url = format!("{}/v2/post/publish/{path}/", self.api_url);
-        let data = self
-            .send(
-                self.client.post(url).bearer_auth(token).json(&payload),
+        let init = |level: &str| {
+            let mut payload = payload.clone();
+            payload["post_info"]["privacy_level"] = json!(level);
+            self.raw(
+                self.client.post(&url).bearer_auth(token).json(&payload),
                 "Post",
             )
-            .await?;
+        };
+        let (mut status, mut answer) = init(&privacy).await?;
+        // Until TikTok reviews the app it takes only `SELF_ONLY`. A refused init made no post, so
+        // asking again with it cannot post twice.
+        let offered = Self::offers(&creator, "SELF_ONLY");
+        if code(&answer) == "unaudited_client_can_only_post_to_private_accounts"
+            && privacy != "SELF_ONLY"
+            && offered
+        {
+            (status, answer) = init("SELF_ONLY").await?;
+        }
+        if !status.is_success() || !matches!(code(&answer), "ok" | "") {
+            let log_id = answer["error"]["log_id"].as_str().unwrap_or_default();
+            tracing::warn!(
+                status = status.as_u16(),
+                code = code(&answer),
+                log_id,
+                "tiktok refused a post"
+            );
+            return Err(refusal(status, &answer, "Post"));
+        }
+        let data = answer["data"].clone();
         let Some(publish_id) = data["publish_id"].as_str().filter(|p| !p.is_empty()) else {
             return Err(failed("Post: TikTok sent no post id."));
         };

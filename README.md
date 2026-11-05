@@ -334,7 +334,9 @@ reason); a status call that errors is asked again, since the post already exists
 4.5 minutes the target fails with "check the account before posting again". The privacy level is the most public one the account is offered (creator info), and
 comments, duets and stitches are off: TikTok's rules say a person turns them on, and SocialReins
 has no setting for that yet. Until TikTok audits the app, it only lets it post privately
-(`SELF_ONLY`) and from private accounts; the video then has no public id and no link. The saved
+(`SELF_ONLY`) and from private accounts: when TikTok refuses a level for that reason and offers
+`SELF_ONLY`, the init is asked again with it (the refused one made no post); the video then has
+no public id and no link. The saved
 id is the publish id; the permalink is `https://www.tiktok.com/@{username}/video/{id}` when the
 video is public. TikTok gives apps no way to delete a post, so a take down fails with a message
 that says to delete it in the TikTok app and the post stays `published`.
