@@ -43,6 +43,10 @@ cargo run -p socialreins-brain
   once, after its target is saved as `published`: `post_targets.comment_status` is claimed
   (`posting`) before the call and never reset, so it is never retried; a failure only sets
   `comment_error`. Take down deletes the post alone, the platform removes its comments.
+- `app/src/publish.rs`: a post's `cover` (one video; Instagram, Facebook, YouTube) is downloaded
+  with the media and checked before any target is posted (a bad one fails the target, nothing
+  goes out). Instagram gets it as `cover_url` in the publish call; Facebook and YouTube get it
+  set once on the live video after `published`, and a refusal only sets `post_targets.cover_error`.
 - `app/src/meta_inbox.rs` and `controllers/meta_webhook.rs`: `/webhooks/meta`. The signature of
   the raw body is checked before anything is parsed; items are stored before the `200` (unique
   on account and remote id, so redeliveries are harmless), names, links and automations run

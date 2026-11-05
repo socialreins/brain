@@ -497,8 +497,51 @@ impl Meta {
         ))
     }
 
-    /// Publishes on Instagram account `ig`: a container per item (a Reel for one video, a
-    /// carousel for several), polled until `FINISHED`, then published. Returns the media id and,
+    /// Sets the cover of video `video` (a Reel) as its preferred thumbnail:
+    /// `POST /{video-id}/thumbnails` with the image as `source` and `is_preferred=true`, the
+    /// call Meta's Reels guide points to for "a custom cover photo". The upload is a multipart
+    /// body, written by hand to keep reqwest's multipart feature out. Once, never retried.
+    pub async fn set_thumbnail(
+        &self,
+        token: &str,
+        video: &str,
+        (bytes, content_type): (&[u8], &str),
+    ) -> Result<(), PostError> {
+        if !graph_id(video) {
+            return Err(failed("This is not a Facebook video id."));
+        }
+        let edge = "srcover7d3f1b";
+        let ext = if content_type == "image/png" {
+            "png"
+        } else {
+            "jpg"
+        };
+        let mut body = format!(
+            "--{edge}\r\nContent-Disposition: form-data; name=\"is_preferred\"\r\n\r\ntrue\r\n\
+             --{edge}\r\nContent-Disposition: form-data; name=\"source\"; \
+             filename=\"cover.{ext}\"\r\nContent-Type: {content_type}\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(format!("\r\n--{edge}--\r\n").as_bytes());
+        let url = format!("{}/{}/{video}/thumbnails", self.graph_url, self.version);
+        let req = self
+            .client
+            .post(url)
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={edge}"),
+            )
+            .body(body);
+        let done = self.send(req, Some(token), None, "Cover").await?;
+        if done["success"] == false {
+            return Err(failed("Cover: Meta did not accept the image."));
+        }
+        Ok(())
+    }
+
+    /// Publishes on Instagram account `ig`: a container per item (a Reel for one video, with its
+    /// `cover` image's URL when given, a carousel for several), polled until `FINISHED`, then published. Returns the media id and,
     /// when Meta tells it, its permalink.
     pub async fn publish_instagram(
         &self,
@@ -506,6 +549,7 @@ impl Meta {
         token: &str,
         caption: &str,
         media: &[Item<'_>],
+        cover: Option<&str>,
     ) -> Result<(String, Option<String>), PostError> {
         if !graph_id(ig) {
             return Err(failed("This is not an Instagram account id."));
@@ -522,6 +566,10 @@ impl Meta {
             [one] => {
                 if one.video {
                     top.extend([("media_type", "REELS"), ("video_url", one.url)]);
+                    // `cover_url`: a JPEG on a public server, used over any frame offset.
+                    if let Some(cover) = cover {
+                        top.push(("cover_url", cover));
+                    }
                 } else {
                     top.push(("image_url", one.url));
                 }

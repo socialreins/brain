@@ -112,9 +112,47 @@ pub trait Publisher: Send + Sync {
         ))
     }
 
-    /// How long a first comment waits after the post is saved as published.
+    /// How long a first comment or a cover waits after the post is saved as published.
     fn comment_wait(&self) -> Duration {
         Duration::ZERO
+    }
+
+    /// The cover image types the platform takes (Instagram, Facebook, YouTube); none for the
+    /// rest, which `post::validate_cover` already refuses.
+    fn cover_types(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// The cover goes in the publish call (`publish_with_cover`, by its brain URL, Instagram)
+    /// rather than onto the live video afterwards (`set_cover`, from its bytes).
+    fn cover_in_publish(&self) -> bool {
+        false
+    }
+
+    /// `publish` of one video with its cover. Only where `cover_in_publish`.
+    async fn publish_with_cover(
+        &self,
+        account: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        _: &Attachment,
+    ) -> Result<Remote, PublishError> {
+        self.publish(account, secret, body, media, None).await
+    }
+
+    /// Sets the cover of the live video `remote_id`. Only where a cover is not
+    /// `cover_in_publish`: Facebook and YouTube. A failure is a warning, the post stays up.
+    async fn set_cover(
+        &self,
+        _: &social_accounts::Model,
+        _: &str,
+        _: &str,
+        _: &Attachment,
+    ) -> Result<(), PublishError> {
+        Err(PublishError::Failed(
+            "This platform cannot set a cover image.".into(),
+        ))
     }
 }
 
@@ -227,6 +265,9 @@ impl Publisher for Threads {
         threads::PUBLISH_TIMEOUT
     }
 }
+
+/// Cover types Facebook and YouTube take (Instagram's is JPEG only).
+const COVER_TYPES: [&str; 2] = ["image/jpeg", "image/png"];
 
 /// Each file as an item by URL, when its type is one of `types`; else which one is `what` not.
 fn by_type<'a>(
@@ -457,6 +498,24 @@ impl Publisher for YouTube {
         self.comment_wait
     }
 
+    fn cover_types(&self) -> &'static [&'static str] {
+        &COVER_TYPES
+    }
+
+    async fn set_cover(
+        &self,
+        _: &social_accounts::Model,
+        secret: &str,
+        remote_id: &str,
+        cover: &Attachment,
+    ) -> Result<(), PublishError> {
+        let file = youtube::File {
+            bytes: cover.bytes.clone(),
+            content_type: &cover.content_type,
+        };
+        self.set_thumbnail(secret, remote_id, &file).await
+    }
+
     fn name(&self) -> &'static str {
         "YouTube"
     }
@@ -594,6 +653,21 @@ impl Publisher for Facebook {
         self.0.comment(secret, remote_id, text).await
     }
 
+    fn cover_types(&self) -> &'static [&'static str] {
+        &COVER_TYPES
+    }
+
+    async fn set_cover(
+        &self,
+        _: &social_accounts::Model,
+        secret: &str,
+        remote_id: &str,
+        cover: &Attachment,
+    ) -> Result<(), PublishError> {
+        let file = (&cover.bytes[..], cover.content_type.as_str());
+        self.0.set_thumbnail(secret, remote_id, file).await
+    }
+
     fn name(&self) -> &'static str {
         "Facebook"
     }
@@ -625,7 +699,29 @@ impl Publisher for Instagram {
         let items = by_type(media, &meta::INSTAGRAM_TYPES, what)?;
         let (id, url) = self
             .0
-            .publish_instagram(&account.external_id, secret, body, &items)
+            .publish_instagram(&account.external_id, secret, body, &items, None)
+            .await?;
+        Ok(Remote {
+            id,
+            cid: String::new(),
+            url,
+        })
+    }
+
+    async fn publish_with_cover(
+        &self,
+        account: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        cover: &Attachment,
+    ) -> Result<Remote, PublishError> {
+        let what = "a JPEG image or an MP4 or MOV video";
+        let items = by_type(media, &meta::INSTAGRAM_TYPES, what)?;
+        let cover = Some(cover.url.as_str());
+        let (id, url) = self
+            .0
+            .publish_instagram(&account.external_id, secret, body, &items, cover)
             .await?;
         Ok(Remote {
             id,
@@ -656,6 +752,15 @@ impl Publisher for Instagram {
         text: &str,
     ) -> Result<String, PublishError> {
         self.0.comment(secret, remote_id, text).await
+    }
+
+    /// Instagram's `cover_url` takes a JPEG only.
+    fn cover_types(&self) -> &'static [&'static str] {
+        &["image/jpeg"]
+    }
+
+    fn cover_in_publish(&self) -> bool {
+        true
     }
 
     fn name(&self) -> &'static str {
@@ -726,6 +831,9 @@ pub const X_RECONNECT: &str = "X refused the account's token, or access was remo
                                Reconnect the account under Connections.";
 pub const META_RECONNECT: &str = "Meta refused the Page's token or a permission is missing. \
                                   Reconnect Facebook and Instagram under Connections.";
+const COVER_CUT_OFF: &str =
+    "Not set: publishing stopped before the cover image was set, and it is not \
+     retried. Set the cover on the platform yourself.";
 const COMMENT_CUT_OFF: &str =
     "Not posted: publishing stopped before the first comment went out, and it is not retried.";
 const STUCK: &str = "Unknown, check the account: publishing stopped midway and it may have posted.";
@@ -924,7 +1032,7 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
             .or_else(|| (platform == "x").then(|| x::status_url(None, &remote)));
         let stmt = sql(
             &with_event(
-                // Published here, so a first comment never went out and must not later: say so.
+                // Published here, so a first comment or a cover never went out and must not later: say so.
                 "UPDATE post_targets SET status = $3, remote_url = $2, error = $4, \
                  comment_status = CASE WHEN $3 = 'published' AND EXISTS (SELECT 1 FROM posts \
                    WHERE id = post_targets.post_id AND first_comment IS NOT NULL) \
@@ -932,6 +1040,8 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
                  comment_error = CASE WHEN $3 = 'published' AND EXISTS (SELECT 1 FROM posts \
                    WHERE id = post_targets.post_id AND first_comment IS NOT NULL) \
                    THEN $5 END, \
+                 cover_error = CASE WHEN $3 = 'published' AND EXISTS (SELECT 1 FROM posts \
+                   WHERE id = post_targets.post_id AND cover IS NOT NULL) THEN $6 END, \
                  published_at = COALESCE(published_at, now()), updated_at = now() \
                  WHERE id = $1 AND status = 'publishing'",
             ),
@@ -941,6 +1051,10 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
                 status.into(),
                 error.into(),
                 COMMENT_CUT_OFF.into(),
+                // Facebook and YouTube set the cover after publish; Instagram sends it with the video.
+                matches!(platform.as_str(), "facebook" | "youtube")
+                    .then_some(COVER_CUT_OFF)
+                    .into(),
             ],
         );
         db.execute_raw(stmt).await?;
@@ -1098,7 +1212,77 @@ async fn ingest(app: &AppState, post: &posts::Model) -> Media {
         .into_iter()
         .chain(thread.into_iter().flat_map(|p| p.media))
         .collect();
-    app.media.ingest_all(&app.db, post.id, &urls, cap).await
+    let cover: Vec<String> = post.cover.clone().into_iter().collect();
+    let cover_cap = cover_bytes(&post.platform);
+    let (mut found, covers) = tokio::join!(
+        app.media.ingest_all(&app.db, post.id, &urls, cap),
+        app.media.ingest_all(&app.db, post.id, &cover, cover_cap),
+    );
+    // A cover that is also a media link keeps the media's result, and then fails its type check.
+    for (url, got) in covers {
+        found.entry(url).or_insert(got);
+    }
+    found
+}
+
+/// The largest cover image stored for `platform`, as its API documents: Instagram 8 MB, Facebook
+/// 10 MB, YouTube 2 MB (the limit YouTube states for thumbnails).
+fn cover_bytes(platform: &str) -> usize {
+    match platform {
+        "instagram" => 8_000_000,
+        "facebook" => 10_000_000,
+        "youtube" => 2_000_000,
+        _ => crate::media::MAX_BYTES,
+    }
+}
+
+/// What to tell the user about a cover that could not be stored.
+fn cover_error(fail: Fail, platform: &str, name: &str) -> String {
+    match fail {
+        Fail::TooLarge => format!(
+            "The cover image is over {} MB, the largest {name} takes.",
+            cover_bytes(platform) / 1_000_000
+        ),
+        f => media_error(f, 1, platform).replacen("Image 1", "The cover image", 1),
+    }
+}
+
+/// The post's cover, checked and read before anything is posted, so a bad cover fails the target
+/// and never a live post. It needs the post's one media item to be a video, and a type the
+/// platform takes. Its bytes are read unless it goes in the publish call by URL.
+async fn load_cover(
+    app: &AppState,
+    publisher: &dyn Publisher,
+    post: &posts::Model,
+    (stored, media): (&Media, &[String]),
+) -> Result<Option<Attachment>, String> {
+    let Some(url) = post.cover.as_deref() else {
+        return Ok(None);
+    };
+    let video = matches!(media, [one] if matches!(
+        stored.get(one), Some(Ok(s)) if s.content_type.starts_with("video/")));
+    if !video {
+        return Err("A cover needs a post with exactly one video.".into());
+    }
+    let (platform, name) = (post.platform.as_str(), publisher.name());
+    let file = match stored.get(url) {
+        Some(Ok(file)) => file,
+        Some(Err(fail)) => return Err(cover_error(*fail, platform, name)),
+        None => return Err(cover_error(Fail::Storage, platform, name)),
+    };
+    let types = publisher.cover_types();
+    if !types.contains(&file.content_type.as_str()) {
+        return Err(match types.len() {
+            0 => format!("{name} cannot set a cover image."),
+            1 => format!("{name} takes a JPEG cover image."),
+            _ => format!("{name} takes a JPEG or PNG cover image."),
+        });
+    }
+    let how = (publisher.cover_in_publish(), platform);
+    let mut loaded = load(app, stored, &[url.to_owned()], how)
+        .await
+        .map_err(|m| m.replacen("Image 1", "The cover image", 1))?;
+    Ok(loaded.pop())
 }
 
 /// The largest file stored for `platform`: Bluesky takes 1 MB images; Threads fetches up to 8 MB
@@ -1223,7 +1407,7 @@ async fn send(
     publisher: &dyn Publisher,
     account: &social_accounts::Model,
     secret: &str,
-    (body, media): (&str, &[String]),
+    (body, media, cover): (&str, &[String], Option<&Attachment>),
     reply: Option<(&Remote, &Remote)>,
 ) -> Result<Remote, String> {
     let how = (publisher.by_url(), account.provider.as_str());
@@ -1240,7 +1424,20 @@ async fn send(
             ));
         }
     }
-    let sent = publisher.publish(account, secret, body, &media, reply);
+    let sent = async {
+        match cover {
+            Some(c) => {
+                publisher
+                    .publish_with_cover(account, secret, body, &media, c)
+                    .await
+            }
+            None => {
+                publisher
+                    .publish(account, secret, body, &media, reply)
+                    .await
+            }
+        }
+    };
     match tokio::time::timeout(publisher.timeout(), sent).await {
         Ok(Ok(remote)) => Ok(remote),
         Ok(Err(PublishError::Reconnect)) => Err(publisher.reconnect().to_owned()),
@@ -1283,13 +1480,18 @@ async fn publish_target(
     if let Some(msg) = media_problem(stored, &media, &thread, &post.platform) {
         return fail_target(db, id, &msg).await;
     }
+    let cover = match load_cover(app, publisher, post, (stored, &media)).await {
+        Ok(cover) => cover,
+        Err(msg) => return fail_target(db, id, &msg).await,
+    };
     let with = (app, stored);
+    let in_call = cover.as_ref().filter(|_| publisher.cover_in_publish());
     let root = match send(
         with,
         publisher,
         &account,
         &secret,
-        (&post.body, &media),
+        (&post.body, &media, in_call),
         None,
     )
     .await
@@ -1332,7 +1534,7 @@ async fn publish_target(
                 return fail_target(db, id, &msg).await;
             }
         };
-        let content = (part.body.as_str(), part.media.as_slice());
+        let content = (part.body.as_str(), part.media.as_slice(), None);
         let made = match send(
             with,
             publisher,
@@ -1390,11 +1592,50 @@ async fn publish_target(
     );
     let saved = db.execute_raw(stmt).await?;
     // Only after the post is saved as published on this target.
+    if saved.rows_affected() != 1 {
+        return Ok(());
+    }
+    if let Some(cover) = cover.filter(|_| !publisher.cover_in_publish()) {
+        set_cover(app, publisher, &account, (id, &root.id), &cover).await;
+    }
     match post.first_comment.as_deref() {
-        Some(text) if saved.rows_affected() == 1 => {
-            first_comment(app, publisher, &account, (id, &root.id), text).await
-        }
-        _ => Ok(()),
+        Some(text) => first_comment(app, publisher, &account, (id, &root.id), text).await,
+        None => Ok(()),
+    }
+}
+
+/// Sets the cover of a live video, once. Whatever happens only sets the target's `cover_error`
+/// (a warning): the target stays `published`, and nothing is retried, so no step can post a
+/// second copy.
+async fn set_cover(
+    app: &AppState,
+    publisher: &dyn Publisher,
+    account: &social_accounts::Model,
+    (target, remote_id): (Uuid, &str),
+    cover: &Attachment,
+) {
+    tokio::time::sleep(publisher.comment_wait()).await;
+    let sent = async {
+        // The token may have aged during the upload: fetch it again (renewed when near its end).
+        let secret = credential(app, account).await?;
+        publisher
+            .set_cover(account, &secret, remote_id, cover)
+            .await
+    };
+    let why = match tokio::time::timeout(TARGET_TIMEOUT, sent).await {
+        Ok(Ok(())) => return,
+        Ok(Err(PublishError::Reconnect)) => publisher.reconnect().to_owned(),
+        Ok(Err(PublishError::Failed(msg))) => msg,
+        Err(_) => "Timed out; the cover may have been set, check the account.".to_owned(),
+    };
+    tracing::info!(target = %target, "cover not set");
+    let msg = format!("The video is up, but its cover image was not set. {why}");
+    let stmt = sql(
+        "UPDATE post_targets SET cover_error = $2, updated_at = now() WHERE id = $1",
+        vec![target.into(), msg.into()],
+    );
+    if let Err(e) = app.db.execute_raw(stmt).await {
+        tracing::warn!(error = %e, target = %target, "cover warning not saved");
     }
 }
 

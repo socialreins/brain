@@ -394,6 +394,40 @@ impl YouTube {
             .ok_or_else(|| failed("Comment: YouTube sent no comment id."))
     }
 
+    /// Sets video `id`'s custom thumbnail (`thumbnails.set`, 50 quota units, any scope the
+    /// connection holds): `file` is a JPEG or PNG. YouTube allows it only for verified channels
+    /// (403 `forbidden`), which is worded as such. Once, never retried.
+    pub async fn set_thumbnail(
+        &self,
+        token: &str,
+        id: &str,
+        file: &File<'_>,
+    ) -> Result<(), PostError> {
+        if !video_id(id) {
+            return Err(failed("This is not a YouTube video id."));
+        }
+        let url = Url::parse_with_params(
+            &format!("{}/upload/youtube/v3/thumbnails/set", self.api_url),
+            [("videoId", id), ("uploadType", "media")],
+        )
+        .map_err(|_| failed("This is not a YouTube video id."))?;
+        let req = self
+            .client
+            .post(url)
+            .bearer_auth(token)
+            .header("content-type", file.content_type)
+            .body(file.bytes.clone());
+        let (status, _, body) = self.raw(req, "Cover").await?;
+        match (status.as_u16(), code(&body)) {
+            (200..=299, _) => Ok(()),
+            (403, "forbidden") => Err(failed(
+                "Cover: YouTube refused the custom thumbnail. Only verified channels can set \
+                 one: verify the channel in YouTube Studio.",
+            )),
+            _ => Err(refusal(status, &body, "Cover")),
+        }
+    }
+
     /// Takes a video down. A video already gone counts as down.
     pub async fn delete_video(&self, token: &str, id: &str) -> Result<(), PostError> {
         if !video_id(id) {
