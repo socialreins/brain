@@ -1,12 +1,13 @@
 //! LinkedIn (a member's own profile): the OAuth code swap, the OpenID profile, publishing with
-//! the Posts, Images and Videos APIs, and take down. A post is text, one or several images, or
-//! one video; media is uploaded as bytes first. Tokens last about 60 days; only partner apps get
+//! the Posts, Images, Videos and Documents APIs, and take down. A post is text, one or several
+//! images, one video, or one PDF shown as a document; media is uploaded as bytes first. Tokens last about 60 days; only partner apps get
 //! a refresh token. Errors carry no URL, token or secret.
 use std::time::Duration;
 
 use reqwest::{header::HeaderMap, Method, RequestBuilder, Url};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::bluesky::PostError;
 
@@ -19,7 +20,7 @@ pub const API_VERSION: &str = "202610";
 const SCOPES: &str = "openid profile email w_member_social";
 /// Used when LinkedIn leaves `expires_in` out.
 const DEFAULT_EXPIRES_IN: i64 = 60 * 24 * 3600;
-/// Video status checks: now, then after 1, 2, ... `POLLS - 1` times `poll_every`.
+/// Video and document status checks: now, then after 1, 2, ... `POLLS - 1` times `poll_every`.
 const POLLS: u32 = 10;
 /// Longest one post (uploads, video processing and the publish) may take.
 pub const PUBLISH_TIMEOUT: Duration = Duration::from_secs(420);
@@ -27,6 +28,11 @@ pub const PUBLISH_TIMEOUT: Duration = Duration::from_secs(420);
 pub const MAX_IMAGES: usize = 20;
 pub const IMAGE_TYPES: [&str; 3] = ["image/jpeg", "image/png", "image/gif"];
 pub const VIDEO_TYPE: &str = "video/mp4";
+pub const PDF_TYPE: &str = "application/pdf";
+/// Title of a document post whose body has no text to take one from.
+const DOCUMENT_TITLE: &str = "Document";
+/// Longest document title brain sends, in graphemes so an emoji is never cut apart.
+const TITLE_CHARS: usize = 100;
 
 /// The LinkedIn app (`LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET`). No `Debug`: it holds the
 /// secret.
@@ -88,6 +94,16 @@ fn reason(body: &Value, status: reqwest::StatusCode) -> String {
         format!("HTTP {}", status.as_u16())
     } else {
         msg
+    }
+}
+
+/// A document post's title: the body's first non-empty line cut to `TITLE_CHARS`, else
+/// `DOCUMENT_TITLE`.
+pub fn document_title(body: &str) -> String {
+    let line = body.lines().map(str::trim).find(|l| !l.is_empty());
+    match line {
+        Some(l) => l.graphemes(true).take(TITLE_CHARS).collect(),
+        None => DOCUMENT_TITLE.to_owned(),
     }
 }
 
@@ -252,8 +268,8 @@ impl LinkedIn {
         Ok(me)
     }
 
-    /// Posts as the member `sub`: text, one or several images, or one video. Returns the post's
-    /// URN.
+    /// Posts as the member `sub`: text, one or several images, one video, or one PDF as a
+    /// document titled by `document_title(text)`. Returns the post's URN.
     pub async fn publish_post(
         &self,
         sub: &str,
@@ -262,6 +278,12 @@ impl LinkedIn {
         media: &[File<'_>],
     ) -> Result<String, PostError> {
         let author = format!("urn:li:person:{sub}");
+        let pdfs = media.iter().filter(|m| m.content_type == PDF_TYPE).count();
+        if pdfs > 0 && media.len() > 1 {
+            return Err(failed(
+                "A LinkedIn document post takes exactly one PDF and nothing else.",
+            ));
+        }
         let videos = media
             .iter()
             .filter(|m| m.content_type == VIDEO_TYPE)
@@ -271,7 +293,10 @@ impl LinkedIn {
                 "LinkedIn takes one video, or images, but not both or several videos.",
             ));
         }
-        let content = if videos == 1 {
+        let content = if pdfs == 1 {
+            let id = self.upload_document(&author, token, media[0].bytes).await?;
+            Some(json!({"media": {"id": id, "title": document_title(text)}}))
+        } else if videos == 1 {
             let id = self.upload_video(&author, token, media[0].bytes).await?;
             Some(json!({"media": {"id": id}}))
         } else if media.is_empty() {
@@ -431,14 +456,36 @@ impl LinkedIn {
             .rest(Method::POST, "videos?action=finalizeUpload", token)
             .json(&finalize);
         self.send(req, "Upload").await?;
-        self.video_ready(video, token).await?;
+        self.asset_ready("videos", video, token).await?;
         Ok(video.to_owned())
     }
 
-    async fn video_ready(&self, video: &str, token: &str) -> Result<(), PostError> {
+    /// Uploads a PDF as one document (`POST /rest/documents?action=initializeUpload`, then the
+    /// bytes to its upload URL) and waits until LinkedIn has processed it. A file LinkedIn
+    /// refuses (over 300 pages, say) fails here with LinkedIn's reason.
+    async fn upload_document(
+        &self,
+        owner: &str,
+        token: &str,
+        bytes: &[u8],
+    ) -> Result<String, PostError> {
+        let request = json!({"initializeUploadRequest": {"owner": owner}});
+        let value = self.initialize("documents", token, request).await?;
+        let (Some(url), Some(document)) = (value["uploadUrl"].as_str(), value["document"].as_str())
+        else {
+            return Err(failed("Upload: LinkedIn sent no document upload URL."));
+        };
+        self.put(url, Some(token), bytes, PDF_TYPE).await?;
+        self.asset_ready("documents", document, token).await?;
+        Ok(document.to_owned())
+    }
+
+    /// Polls a `videos` or `documents` asset until it is AVAILABLE.
+    async fn asset_ready(&self, kind: &str, urn: &str, token: &str) -> Result<(), PostError> {
+        let what = kind.trim_end_matches('s');
         let path = format!(
-            "videos/{}",
-            encoded(video).ok_or_else(|| failed("Upload: bad video id."))?
+            "{kind}/{}",
+            encoded(urn).ok_or_else(|| failed(format!("Upload: bad {what} id.")))?
         );
         for i in 1..=POLLS {
             let req = self.rest(Method::GET, &path, token);
@@ -449,7 +496,7 @@ impl LinkedIn {
                     let why = body["processingFailureReason"].as_str().unwrap_or("failed");
                     let why: String = why.chars().take(200).collect();
                     return Err(failed(format!(
-                        "LinkedIn could not process the video: {why}"
+                        "LinkedIn could not process the {what}: {why}"
                     )));
                 }
                 _ => {}
@@ -458,9 +505,9 @@ impl LinkedIn {
                 tokio::time::sleep(self.poll_every * i).await;
             }
         }
-        Err(failed(
-            "LinkedIn did not finish processing the video in time.",
-        ))
+        Err(failed(format!(
+            "LinkedIn did not finish processing the {what} in time."
+        )))
     }
 
     /// Comments `text` on the post `urn` as the member `sub` (`POST /rest/socialActions/{urn}/
@@ -572,6 +619,19 @@ mod tests {
         ] {
             assert!(!l.upload_allowed(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_document_is_titled_by_the_first_line_of_the_body() {
+        assert_eq!(document_title("Q3 report\nmore text"), "Q3 report");
+        assert_eq!(document_title("\n  \n  Hello  \nx"), "Hello");
+        assert_eq!(document_title(""), "Document");
+        assert_eq!(document_title("   \n "), "Document");
+        assert_eq!(document_title(&"a".repeat(150)).chars().count(), 100);
+        // 99 letters, then a family emoji (one grapheme of seven chars): kept whole or not at all.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+        let title = document_title(&format!("{}{family}{family}", "a".repeat(99)));
+        assert_eq!(title, format!("{}{family}", "a".repeat(99)));
     }
 
     #[test]
