@@ -24,6 +24,8 @@ const DEFAULT_EXPIRES_IN: i64 = 3600;
 pub const PUBLISH_TIMEOUT: Duration = Duration::from_secs(480);
 /// The upload of the bytes itself, longer than the other calls' timeout.
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(420);
+/// Wait before a first comment on a video just uploaded.
+const COMMENT_WAIT: Duration = Duration::from_secs(10);
 pub const VIDEO_TYPES: [&str; 2] = ["video/mp4", "video/quicktime"];
 /// Until Google audits the API project, YouTube locks what it uploads to private whatever this
 /// says (see README).
@@ -44,6 +46,9 @@ pub struct YouTube {
     pub token_url: String,
     /// Serves both `/youtube/v3` and `/upload/youtube/v3`.
     pub api_url: String,
+    /// How long a first comment waits after the upload, since YouTube may refuse one on a video
+    /// it is still processing. Tests set it to zero.
+    pub comment_wait: Duration,
     client: reqwest::Client,
 }
 
@@ -166,6 +171,7 @@ impl YouTube {
             auth_url: AUTH_URL.into(),
             token_url: TOKEN_URL.into(),
             api_url: API_URL.into(),
+            comment_wait: COMMENT_WAIT,
             client,
         })
     }
@@ -359,6 +365,33 @@ impl YouTube {
             .ok_or_else(|| {
                 failed("Upload: YouTube sent no video id. It may have posted, check the channel.")
             })
+    }
+
+    /// Comments `text` on video `id` of `channel` as the channel (`commentThreads.insert`, scope
+    /// `youtube.force-ssl`, 50 quota units). Returns the comment thread's id. A video just
+    /// uploaded can still be refused (`processingFailure`): that is the caller's failed comment.
+    /// Once, never retried.
+    pub async fn comment(
+        &self,
+        token: &str,
+        channel: &str,
+        id: &str,
+        text: &str,
+    ) -> Result<String, PostError> {
+        if !video_id(id) {
+            return Err(failed("This is not a YouTube video id."));
+        }
+        let url = format!("{}/youtube/v3/commentThreads?part=snippet", self.api_url);
+        let body = json!({"snippet": {
+            "channelId": channel, "videoId": id,
+            "topLevelComment": {"snippet": {"textOriginal": text}}}});
+        let req = self.client.post(url).bearer_auth(token).json(&body);
+        let (_, body) = self.send(req, "Comment").await?;
+        body["id"]
+            .as_str()
+            .filter(|i| !i.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| failed("Comment: YouTube sent no comment id."))
     }
 
     /// Takes a video down. A video already gone counts as down.

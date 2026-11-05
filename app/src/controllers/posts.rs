@@ -67,6 +67,9 @@ pub struct Post {
     pub media: Vec<String>,
     /// Follow-up posts, each a reply to the one before.
     pub thread: Vec<ThreadPart>,
+    /// Text the same account comments on the post right after it is published (Facebook,
+    /// Instagram, LinkedIn, YouTube); each target says how it went (`comment_status`).
+    pub first_comment: Option<String>,
     /// `draft`, `scheduled`, `queued`, `published`, `failed` or `deleted`.
     pub status: String,
     pub scheduled_at: Option<DateTime<FixedOffset>>,
@@ -100,6 +103,13 @@ pub struct Target {
     /// The thread posts published so far, in order; a failed target names the one that did
     /// not go out.
     pub parts: Vec<TargetPart>,
+    /// The first comment: `null` when not tried (or the post has none), `posting`, `posted`
+    /// or `failed`. A failed comment never fails the post and is not retried.
+    pub comment_status: Option<String>,
+    /// The platform's id of the comment once `posted`.
+    pub comment_id: Option<String>,
+    /// Why the comment failed.
+    pub comment_error: Option<String>,
 }
 
 /// One follow-up post of a thread.
@@ -148,6 +158,13 @@ pub struct PostInput {
     /// `thread_not_supported`; a bad part answers its 1-based `part` with the error.
     #[serde(default)]
     pub thread: Vec<ThreadPart>,
+    /// A comment the account posts on the post right after it is published, e.g. for sources.
+    /// Only on Facebook (at most 8000 characters), Instagram (2200), LinkedIn (1250) and
+    /// YouTube (10000); other platforms answer `first_comment_not_supported`, and a longer one
+    /// `first_comment_too_long`. Blank counts as absent. It is posted once and never retried: a
+    /// failed comment leaves the post `published` and shows as the target's `comment_error`.
+    /// Taking the post down removes it with the comment.
+    pub first_comment: Option<String>,
     /// When to publish. Set: `scheduled`; absent or `null`: `draft`.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
     /// A list to put the post in (moving it there when it already is).
@@ -185,6 +202,12 @@ pub struct PostGroupInput {
     /// Each post's thread, unless its override has one.
     #[serde(default)]
     pub thread: Vec<ThreadPart>,
+    /// Each post's first comment, unless its override has one (`""` for none). Platforms that
+    /// cannot post one answer `first_comment_not_supported` unless they override it with `""`.
+    /// Without `platforms` the group covers every connected platform, so a group with a
+    /// `first_comment` fails with `first_comment_not_supported` naming the first platform that
+    /// cannot take it (Bluesky, Threads, TikTok, X): pass `platforms`.
+    pub first_comment: Option<String>,
     /// As in `POST /posts`, for every post.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
     /// A list to put every post in, in platform order.
@@ -197,12 +220,13 @@ pub struct PostGroupInput {
     pub overrides: BTreeMap<String, Override>,
 }
 
-/// One platform's own body, media or thread in a post group.
+/// One platform's own body, media, thread or first comment in a post group.
 #[derive(Deserialize, ToSchema, JsonSchema)]
 pub struct Override {
     pub body: Option<String>,
     pub media: Option<Vec<String>>,
     pub thread: Option<Vec<ThreadPart>>,
+    pub first_comment: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -245,6 +269,9 @@ async fn targets_of(
             error: t.error,
             published_at: t.published_at,
             parts: serde_json::from_value(t.parts).unwrap_or_default(),
+            comment_status: t.comment_status,
+            comment_id: t.comment_id,
+            comment_error: t.comment_error,
         });
     }
     Ok(map)
@@ -258,6 +285,7 @@ fn post_json(p: posts::Model, targets: Vec<Target>, lists: Vec<ListRef>) -> Post
         body: p.body,
         media: serde_json::from_value(p.media).unwrap_or_default(),
         thread: serde_json::from_value(p.thread).unwrap_or_default(),
+        first_comment: p.first_comment,
         status: p.status,
         scheduled_at: p.scheduled_at,
         published_at: p.published_at,
@@ -340,6 +368,10 @@ async fn checked(
             (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
         ));
     }
+    let comment = post::first_comment(input.first_comment.as_deref());
+    if let Err(e) = post::validate_first_comment(&input.platform, comment) {
+        return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, e.code())));
+    }
     set_for(db, a, input.social_set_id).await
 }
 
@@ -373,6 +405,11 @@ async fn set_for(
 fn when(input: &PostInput) -> Option<DateTime<FixedOffset>> {
     let now = Utc::now().fixed_offset();
     input.scheduled_at.map(|t| t.max(now))
+}
+
+/// The first comment as saved: blank is none.
+fn stored_comment(input: &PostInput) -> Option<String> {
+    post::first_comment(input.first_comment.as_deref()).map(str::to_owned)
 }
 
 fn status_for(input: &PostInput) -> &'static str {
@@ -526,6 +563,7 @@ async fn insert(
         body: Set(input.body.clone()),
         media: Set(serde_json::json!(input.media)),
         thread: Set(serde_json::json!(input.thread)),
+        first_comment: Set(stored_comment(input)),
         status: Set(status_for(input).into()),
         scheduled_at: Set(when(input)),
         created_by: Set(a.user_id),
@@ -601,6 +639,9 @@ pub async fn create_post_group(app: &AppState, a: &Actor, input: PostGroupInput)
                 thread: o
                     .and_then(|o| o.thread.clone())
                     .unwrap_or_else(|| input.thread.clone()),
+                first_comment: o
+                    .and_then(|o| o.first_comment.clone())
+                    .or_else(|| input.first_comment.clone()),
                 platform,
                 scheduled_at: input.scheduled_at,
                 list_id: input.list_id,
@@ -660,7 +701,7 @@ async fn naming(res: Response, platform: &str) -> Response {
     (status, Json(v)).into_response()
 }
 
-/// Replaces a `draft` or `scheduled` post's set, platform, body, media, thread and time; anything else
+/// Replaces a `draft` or `scheduled` post's set, platform, body, media, thread, first comment and time; anything else
 /// is `409 not_editable`.
 #[utoipa::path(put, path = "/posts/{id}", tag = "posts",
     security(("session" = []), ("api_token" = [])), request_body = PostInput,
@@ -701,6 +742,7 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) 
                 posts::Column::Thread,
                 serde_json::json!(input.thread).into(),
             )
+            .col_expr(posts::Column::FirstComment, stored_comment(&input).into())
             .col_expr(posts::Column::Status, status_for(&input).into())
             .col_expr(posts::Column::ScheduledAt, when(&input).into())
             .col_expr(posts::Column::UpdatedAt, Utc::now().fixed_offset().into())

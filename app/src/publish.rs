@@ -96,6 +96,26 @@ pub trait Publisher: Send + Sync {
 
     /// The public link to a published post.
     fn url(&self, account: &social_accounts::Model, remote_id: &str) -> Option<String>;
+
+    /// Comments `text` on the published post as the account and returns the comment's id. Only
+    /// Facebook, Instagram, LinkedIn and YouTube do (`post::validate_first_comment`). Taking the
+    /// post down removes its comments, so there is no delete.
+    async fn comment(
+        &self,
+        _: &social_accounts::Model,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<String, PublishError> {
+        Err(PublishError::Failed(
+            "This platform cannot post a first comment.".into(),
+        ))
+    }
+
+    /// How long a first comment waits after the post is saved as published.
+    fn comment_wait(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
 fn creds<'a>(account: &'a social_accounts::Model, secret: &'a str) -> bluesky::Creds<'a> {
@@ -282,6 +302,17 @@ impl Publisher for LinkedIn {
         Some(linkedin::post_url(remote_id))
     }
 
+    async fn comment(
+        &self,
+        account: &social_accounts::Model,
+        secret: &str,
+        remote_id: &str,
+        text: &str,
+    ) -> Result<String, PublishError> {
+        self.comment_post(&account.external_id, secret, remote_id, text)
+            .await
+    }
+
     fn name(&self) -> &'static str {
         "LinkedIn"
     }
@@ -407,6 +438,20 @@ impl Publisher for YouTube {
 
     fn url(&self, _: &social_accounts::Model, remote_id: &str) -> Option<String> {
         Some(youtube::watch_url(remote_id))
+    }
+
+    async fn comment(
+        &self,
+        account: &social_accounts::Model,
+        secret: &str,
+        remote_id: &str,
+        text: &str,
+    ) -> Result<String, PublishError> {
+        YouTube::comment(self, secret, &account.external_id, remote_id, text).await
+    }
+
+    fn comment_wait(&self) -> Duration {
+        self.comment_wait
     }
 
     fn name(&self) -> &'static str {
@@ -536,6 +581,16 @@ impl Publisher for Facebook {
         Some(format!("https://www.facebook.com/{remote_id}"))
     }
 
+    async fn comment(
+        &self,
+        _: &social_accounts::Model,
+        secret: &str,
+        remote_id: &str,
+        text: &str,
+    ) -> Result<String, PublishError> {
+        self.0.comment(secret, remote_id, text).await
+    }
+
     fn name(&self) -> &'static str {
         "Facebook"
     }
@@ -588,6 +643,16 @@ impl Publisher for Instagram {
     /// An Instagram permalink needs a lookup, done at publish (`Remote::url`).
     fn url(&self, _: &social_accounts::Model, _: &str) -> Option<String> {
         None
+    }
+
+    async fn comment(
+        &self,
+        _: &social_accounts::Model,
+        secret: &str,
+        remote_id: &str,
+        text: &str,
+    ) -> Result<String, PublishError> {
+        self.0.comment(secret, remote_id, text).await
     }
 
     fn name(&self) -> &'static str {
@@ -658,6 +723,8 @@ pub const X_RECONNECT: &str = "X refused the account's token, or access was remo
                                Reconnect the account under Connections.";
 pub const META_RECONNECT: &str = "Meta refused the Page's token or a permission is missing. \
                                   Reconnect Facebook and Instagram under Connections.";
+const COMMENT_CUT_OFF: &str =
+    "Not posted: publishing stopped before the first comment went out, and it is not retried.";
 const STUCK: &str = "Unknown, check the account: publishing stopped midway and it may have posted.";
 
 /// The token to call the platform with. YouTube's lasts an hour, X's two and TikTok's a day, so
@@ -854,15 +921,36 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
             .or_else(|| (platform == "x").then(|| x::status_url(None, &remote)));
         let stmt = sql(
             &with_event(
+                // Published here, so a first comment never went out and must not later: say so.
                 "UPDATE post_targets SET status = $3, remote_url = $2, error = $4, \
+                 comment_status = CASE WHEN $3 = 'published' AND EXISTS (SELECT 1 FROM posts \
+                   WHERE id = post_targets.post_id AND first_comment IS NOT NULL) \
+                   THEN 'failed' END, \
+                 comment_error = CASE WHEN $3 = 'published' AND EXISTS (SELECT 1 FROM posts \
+                   WHERE id = post_targets.post_id AND first_comment IS NOT NULL) \
+                   THEN $5 END, \
                  published_at = COALESCE(published_at, now()), updated_at = now() \
                  WHERE id = $1 AND status = 'publishing'",
             ),
-            vec![id.into(), url.into(), status.into(), error.into()],
+            vec![
+                id.into(),
+                url.into(),
+                status.into(),
+                error.into(),
+                COMMENT_CUT_OFF.into(),
+            ],
         );
         db.execute_raw(stmt).await?;
         posts.push(post);
     }
+    // A first comment cut off midway may have posted: it stays unsent, never tried again.
+    let stmt = sql(
+        "UPDATE post_targets SET comment_status = 'failed', comment_error = $1, \
+         updated_at = now() WHERE comment_status = 'posting' \
+         AND updated_at < now() - make_interval(mins => $2)",
+        vec![STUCK.into(), (STUCK_MINUTES as i32).into()],
+    );
+    db.execute_raw(stmt).await?;
     let stmt = sql(
         &with_event(
             "UPDATE post_targets SET status = 'failed', error = $1, updated_at = now() \
@@ -1269,12 +1357,78 @@ async fn publish_target(
         }
         parent = made;
     }
+    // A post with a first comment is claimed for it in this same statement (`posting`, only
+    // from null), so a crash after it falls into recovery of a stuck `posting` and never leaves
+    // a published target whose comment is silently forgotten.
     let stmt = sql(
         &with_event(
-            "UPDATE post_targets SET status = 'published', error = NULL, updated_at = now() \
-             WHERE id = $1 AND status = 'publishing'",
+            "UPDATE post_targets SET status = 'published', error = NULL, \
+             comment_status = CASE WHEN comment_status IS NULL AND EXISTS (SELECT 1 FROM posts \
+               WHERE id = post_targets.post_id AND first_comment IS NOT NULL) \
+               THEN 'posting' ELSE comment_status END, \
+             updated_at = now() WHERE id = $1 AND status = 'publishing'",
         ),
         vec![id.into()],
+    );
+    let saved = db.execute_raw(stmt).await?;
+    // Only after the post is saved as published on this target.
+    match post.first_comment.as_deref() {
+        Some(text) if saved.rows_affected() == 1 => {
+            first_comment(app, publisher, &account, (id, &root.id), text).await
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Posts the first comment on a published target, at most once: the claim (`comment_status`
+/// null to `posting`) was made by the statement that published the target and nothing resets
+/// it, so a crash, a timeout or a refusal is never followed by a second try that could post
+/// twice. Whatever happens only sets the comment's own columns: the target stays `published`.
+async fn first_comment(
+    app: &AppState,
+    publisher: &dyn Publisher,
+    account: &social_accounts::Model,
+    (target, remote_id): (Uuid, &str),
+    text: &str,
+) -> Result<(), DbErr> {
+    let db = &app.db;
+    // Only the claim made by that statement may send: any other state means it is not ours.
+    let held = sql(
+        "UPDATE post_targets SET updated_at = now() \
+         WHERE id = $1 AND status = 'published' AND comment_status = 'posting'",
+        vec![target.into()],
+    );
+    if db.execute_raw(held).await?.rows_affected() != 1 {
+        return Ok(());
+    }
+    tokio::time::sleep(publisher.comment_wait()).await;
+    let sent = async {
+        // The token may have aged during the upload: fetch it again (renewed when near its end).
+        let secret = credential(app, account).await?;
+        publisher.comment(account, &secret, remote_id, text).await
+    };
+    let outcome = match tokio::time::timeout(TARGET_TIMEOUT, sent).await {
+        Ok(Ok(comment_id)) => Ok(comment_id),
+        Ok(Err(PublishError::Reconnect)) => Err(publisher.reconnect().to_owned()),
+        Ok(Err(PublishError::Failed(msg))) => Err(msg),
+        Err(_) => Err("Timed out; the comment may have posted, check the account.".to_owned()),
+    };
+    let (status, comment_id, error) = match outcome {
+        Ok(comment_id) => ("posted", Some(comment_id), None),
+        Err(msg) => {
+            tracing::info!(target = %target, "first comment failed");
+            ("failed", None, Some(msg))
+        }
+    };
+    let stmt = sql(
+        "UPDATE post_targets SET comment_status = $2, comment_id = $3, comment_error = $4, \
+         updated_at = now() WHERE id = $1 AND comment_status = 'posting'",
+        vec![
+            target.into(),
+            status.into(),
+            comment_id.into(),
+            error.into(),
+        ],
     );
     db.execute_raw(stmt).await.map(|_| ())
 }

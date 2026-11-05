@@ -743,6 +743,25 @@ impl Meta {
         text(&got["permalink"])
     }
 
+    /// Comments `message` on a Facebook post, photo or Reel (`pages_manage_engagement`) or an
+    /// Instagram media (`instagram_manage_comments`): `POST {id}/comments` with the Page token,
+    /// so it comes from the Page or the Instagram account. Returns the comment's id. Once, never
+    /// retried.
+    pub async fn comment(&self, token: &str, id: &str, message: &str) -> Result<String, PostError> {
+        if !graph_id(id) {
+            return Err(failed("This is not a Meta post id."));
+        }
+        let made = self
+            .post(
+                &format!("{id}/comments"),
+                token,
+                &[("message", message)],
+                "Comment",
+            )
+            .await?;
+        id_of(&made).ok_or_else(|| failed("Comment: Meta sent no id."))
+    }
+
     /// Deletes a Facebook post, photo or Reel, or an Instagram media, with the Page token.
     pub async fn delete(&self, token: &str, id: &str) -> Result<(), PostError> {
         if !graph_id(id) {

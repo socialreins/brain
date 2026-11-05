@@ -39,6 +39,10 @@ cargo run -p socialreins-brain
   rest after 7 days; a storage error is only logged. Cleanup lists `posts/<post id>/` in the
   store, so it also catches files no row names. Local disk assumes one brain instance: run
   more than one replica only with the `S3_*` bucket.
+- `app/src/publish.rs`: a post's `first_comment` (Facebook, Instagram, LinkedIn, YouTube) goes out
+  once, after its target is saved as `published`: `post_targets.comment_status` is claimed
+  (`posting`) before the call and never reset, so it is never retried; a failure only sets
+  `comment_error`. Take down deletes the post alone, the platform removes its comments.
 - `app/src/meta_inbox.rs` and `controllers/meta_webhook.rs`: `/webhooks/meta`. The signature of
   the raw body is checked before anything is parsed; items are stored before the `200` (unique
   on account and remote id, so redeliveries are harmless), names, links and automations run
