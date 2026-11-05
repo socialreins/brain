@@ -831,6 +831,9 @@ pub const X_RECONNECT: &str = "X refused the account's token, or access was remo
                                Reconnect the account under Connections.";
 pub const META_RECONNECT: &str = "Meta refused the Page's token or a permission is missing. \
                                   Reconnect Facebook and Instagram under Connections.";
+const COVER_CUT_OFF: &str =
+    "Not set: publishing stopped before the cover image was set, and it is not \
+     retried. Set the cover on the platform yourself.";
 const COMMENT_CUT_OFF: &str =
     "Not posted: publishing stopped before the first comment went out, and it is not retried.";
 const STUCK: &str = "Unknown, check the account: publishing stopped midway and it may have posted.";
@@ -1029,7 +1032,7 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
             .or_else(|| (platform == "x").then(|| x::status_url(None, &remote)));
         let stmt = sql(
             &with_event(
-                // Published here, so a first comment never went out and must not later: say so.
+                // Published here, so a first comment or a cover never went out and must not later: say so.
                 "UPDATE post_targets SET status = $3, remote_url = $2, error = $4, \
                  comment_status = CASE WHEN $3 = 'published' AND EXISTS (SELECT 1 FROM posts \
                    WHERE id = post_targets.post_id AND first_comment IS NOT NULL) \
@@ -1037,6 +1040,8 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
                  comment_error = CASE WHEN $3 = 'published' AND EXISTS (SELECT 1 FROM posts \
                    WHERE id = post_targets.post_id AND first_comment IS NOT NULL) \
                    THEN $5 END, \
+                 cover_error = CASE WHEN $3 = 'published' AND EXISTS (SELECT 1 FROM posts \
+                   WHERE id = post_targets.post_id AND cover IS NOT NULL) THEN $6 END, \
                  published_at = COALESCE(published_at, now()), updated_at = now() \
                  WHERE id = $1 AND status = 'publishing'",
             ),
@@ -1046,6 +1051,10 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
                 status.into(),
                 error.into(),
                 COMMENT_CUT_OFF.into(),
+                // Facebook and YouTube set the cover after publish; Instagram sends it with the video.
+                matches!(platform.as_str(), "facebook" | "youtube")
+                    .then_some(COVER_CUT_OFF)
+                    .into(),
             ],
         );
         db.execute_raw(stmt).await?;

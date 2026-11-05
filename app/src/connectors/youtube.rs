@@ -421,7 +421,8 @@ impl YouTube {
         match (status.as_u16(), code(&body)) {
             (200..=299, _) => Ok(()),
             (403, "forbidden") => Err(failed(
-                "Cover: YouTube refused the custom thumbnail. Only verified channels can set                  one: verify the channel in YouTube Studio.",
+                "Cover: YouTube refused the custom thumbnail. Only verified channels can set \
+                 one: verify the channel in YouTube Studio.",
             )),
             _ => Err(refusal(status, &body, "Cover")),
         }

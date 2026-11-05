@@ -7860,7 +7860,47 @@ mod teams {
                     assert!(t["remote_id"].is_string());
                     let why = t["cover_error"].as_str().unwrap();
                     assert!(why.starts_with("The video is up, but its cover image was not set."));
-                    assert!(why.contains("verified"), "{why}");
+                    assert_eq!(
+                        why,
+                        "The video is up, but its cover image was not set. Cover: YouTube refused \
+                         the custom thumbnail. Only verified channels can set one: verify the \
+                         channel in YouTube Studio."
+                    );
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn recovery_marks_a_cut_off_cover_as_not_set_and_never_sets_it() {
+                    use socialreins_brain::models::post_targets;
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let ctx = (&s, &db, &state, base.as_str());
+                    let p = publish_covered(ctx, (&cookie, &set), "/cover.jpg").await;
+                    assert_eq!(p["targets"][0]["cover_error"], Value::Null);
+                    let id = p["id"].as_str().unwrap().to_owned();
+                    let target = post_targets::Entity::find()
+                        .filter(post_targets::Column::PostId.eq(id.parse::<uuid::Uuid>().unwrap()))
+                        .one(&db)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    // Cut off after the video went up but before it was saved as published.
+                    let cut = post_targets::ActiveModel {
+                        id: Set(target.id),
+                        status: Set("publishing".into()),
+                        updated_at: Set((Utc::now() - Duration::minutes(30)).fixed_offset()),
+                        ..Default::default()
+                    };
+                    post_targets::Entity::update(cut).exec(&db).await.unwrap();
+                    let thumbs = THUMBS.lock().unwrap().len();
+                    publish::recover_stuck(&db).await.unwrap();
+                    let t = &get_post(&s, &cookie, &id).await["targets"][0].clone();
+                    assert_eq!(t["status"], "published");
+                    assert_eq!(
+                        t["cover_error"],
+                        "Not set: publishing stopped before the cover image was set, and it is \
+                         not retried. Set the cover on the platform yourself."
+                    );
+                    assert_eq!(THUMBS.lock().unwrap().len(), thumbs, "never set afterwards");
                 }
 
                 #[tokio::test]
