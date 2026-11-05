@@ -319,18 +319,19 @@ state and cookie (`sr_tiktok`, scoped to `/connect/tiktok`). The callback swaps 
 call, and saves a `tiktok` account (`external_id` is the open id) in the team's Default set. The
 access token lasts a day and is stored with its expiry; the refresh token (a year) is sealed in the
 account's `meta`. Before each publish, a token with under ten minutes left is renewed and saved
-first, with the new refresh token if TikTok sends one (there is no daily job). A refused refresh
+first under a lock on the account row, with the new refresh token saved in the same transaction (there is no daily job). A refused refresh
 token or a refused call (`401`, `access_token_invalid`, `scope_not_authorized`) fails the target
 with "Reconnect the account under Connections".
 
 A TikTok post is one MP4 or MOV video, or 1 to 35 JPEG or WebP photos (no threads, no text-only
-posts: `media_required` without media; the caption is the body, at most 2200 characters). brain
+posts: `media_required` without media; the caption is the body, at most 2200 UTF-16 code units, so an emoji counts two). brain
 does not upload: TikTok downloads the media from brain's unguessable `/media/` links
 (`PULL_FROM_URL`, so the media domain must be verified under the TikTok app's URL properties).
 The post is `POST /v2/post/publish/video/init/` (or `content/init/` for photos, with the first
 line of the body as the photo title) as a direct post, then the publish status is asked every
 three seconds for up to 4.5 minutes until TikTok says `PUBLISH_COMPLETE` (or `FAILED`, with its
-reason). The privacy level is the most public one the account is offered (creator info), and
+reason); a status call that errors is asked again, since the post already exists, and after the
+4.5 minutes the target fails with "check the account before posting again". The privacy level is the most public one the account is offered (creator info), and
 comments, duets and stitches are off: TikTok's rules say a person turns them on, and SocialReins
 has no setting for that yet. Until TikTok audits the app, it only lets it post privately
 (`SELF_ONLY`) and from private accounts; the video then has no public id and no link. The saved

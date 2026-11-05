@@ -7292,6 +7292,9 @@ mod teams {
                 static PRIVACY: AtomicU64 = AtomicU64::new(0);
                 /// 0: the init works, 1: TikTok refuses it as unaudited, 2: the publish fails.
                 static MODE: AtomicU64 = AtomicU64::new(0);
+                /// The next status call fails with a server error, once.
+                static FLAKY: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
 
                 type Answer = (StatusCode, Json<Value>);
 
@@ -7420,6 +7423,13 @@ mod teams {
                             .as_str()
                             .unwrap()
                             .starts_with("v_pub_url~"));
+                        if FLAKY.swap(false, Ordering::SeqCst) {
+                            return refused(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "internal_error",
+                                "",
+                            );
+                        }
                         // The first answer says TikTok is still downloading.
                         if STATUS_CALLS
                             .fetch_add(1, Ordering::SeqCst)
@@ -7866,6 +7876,44 @@ mod teams {
                     let p = publish_files(&s, ctx, (&cookie, &set), ("b", &["/clip.mp4"])).await;
                     assert_eq!(p["status"], "published", "{p}");
                     assert_eq!(REFRESHES.load(Ordering::SeqCst), renewed + 1);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn two_renewals_at_once_spend_the_refresh_token_once() {
+                    let (_, db, state, _, _, team_id, _) = team().await;
+                    let row = tiktok_account(&db, &team_id).await;
+                    set_token(&db, row.id, 30).await;
+                    let renewed = REFRESHES.load(Ordering::SeqCst);
+                    let fresh = |a: social_accounts::Model| {
+                        let state = state.clone();
+                        tokio::spawn(
+                            async move { controllers::tiktok::fresh_token(&state, &a).await },
+                        )
+                    };
+                    let (one, two) = (fresh(row.clone()), fresh(row));
+                    let (one, two) = (one.await.unwrap(), two.await.unwrap());
+                    assert_eq!(one.unwrap(), "ttrefreshed");
+                    assert_eq!(two.unwrap(), "ttrefreshed");
+                    // The mock refuses a second use of the old refresh token.
+                    assert_eq!(REFRESHES.load(Ordering::SeqCst), renewed + 1);
+                    let row = tiktok_account(&db, &team_id).await;
+                    let sealed = row.meta["refresh_token"].as_str().unwrap();
+                    let plain = cipher()
+                        .decrypt(&URL_SAFE_NO_PAD.decode(sealed).unwrap())
+                        .unwrap();
+                    assert_eq!(plain, b"krefresh2");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_status_call_that_fails_once_does_not_fail_the_post() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    FLAKY.store(true, Ordering::SeqCst);
+                    let ctx = (&db, &state, base.as_str());
+                    let p = publish_files(&s, ctx, (&cookie, &set), ("a", &["/clip.mp4"])).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert!(!FLAKY.load(Ordering::SeqCst));
                 }
 
                 #[tokio::test]

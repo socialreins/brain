@@ -154,7 +154,11 @@ pub fn validate(platform: &str, body: &str, media: &[String]) -> Result<(), Inva
         "facebook" => (chars() > FACEBOOK_MAX_CHARS, FACEBOOK_MAX_MEDIA),
         "instagram" => (chars() > INSTAGRAM_MAX_CHARS, INSTAGRAM_MAX_MEDIA),
         "x" => (x_weight(body) > X_MAX_WEIGHT, X_MAX_MEDIA),
-        "tiktok" => (chars() > TIKTOK_MAX_CHARS, TIKTOK_MAX_MEDIA),
+        // TikTok counts UTF-16 code units, so an emoji is two.
+        "tiktok" => (
+            body.encode_utf16().count() > TIKTOK_MAX_CHARS,
+            TIKTOK_MAX_MEDIA,
+        ),
         "youtube" => {
             let (title, description) = youtube_text(body);
             let too_long = title.chars().count() > YOUTUBE_MAX_TITLE
@@ -404,6 +408,12 @@ mod tests {
         assert_eq!(validate("tiktok", &"a".repeat(2200), &media(1)), Ok(()));
         assert_eq!(
             validate("tiktok", &"a".repeat(2201), &media(1)),
+            Err(Invalid::TooLong)
+        );
+        // An emoji counts as two units.
+        assert_eq!(validate("tiktok", &"🙂".repeat(1100), &media(1)), Ok(()));
+        assert_eq!(
+            validate("tiktok", &"🙂".repeat(1101), &media(1)),
             Err(Invalid::TooLong)
         );
     }

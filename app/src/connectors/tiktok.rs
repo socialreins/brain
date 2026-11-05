@@ -24,7 +24,8 @@ pub const PUBLISH_TIMEOUT: Duration = Duration::from_secs(300);
 const POLL_FOR: Duration = Duration::from_secs(270);
 pub const VIDEO_TYPES: [&str; 2] = ["video/mp4", "video/quicktime"];
 pub const PHOTO_TYPES: [&str; 2] = ["image/jpeg", "image/webp"];
-/// A photo post's title is the first line of the body, cut to what TikTok allows.
+/// A photo post's title is the first line of the body, cut to what TikTok allows (it counts
+/// UTF-16 code units).
 const PHOTO_TITLE_MAX: usize = 90;
 
 /// What one post sends: a video, or photos, each by the link TikTok downloads it from.
@@ -161,12 +162,16 @@ fn refusal(status: StatusCode, body: &Value, step: &str) -> PostError {
 
 /// The first line of `body`, at most `PHOTO_TITLE_MAX` characters.
 fn photo_title(body: &str) -> String {
+    let mut units = 0;
     body.trim()
         .lines()
         .next()
         .unwrap_or_default()
         .chars()
-        .take(PHOTO_TITLE_MAX)
+        .take_while(|c| {
+            units += c.len_utf16();
+            units <= PHOTO_TITLE_MAX
+        })
         .collect()
 }
 
@@ -396,7 +401,9 @@ impl TikTok {
                 .post(&url)
                 .bearer_auth(token)
                 .json(&json!({ "publish_id": publish_id }));
-            let data = self.send(req, "Status").await?;
+            // The post exists once init answered, so a failed status call (a limit, a 5xx, the
+            // network) is asked again until the time is up, never reported as a failed post.
+            let data = self.send(req, "Status").await.unwrap_or(Value::Null);
             match data["status"].as_str().unwrap_or_default() {
                 "PUBLISH_COMPLETE" => {
                     let video_id = data["publicaly_available_post_id"]
@@ -416,7 +423,7 @@ impl TikTok {
             }
             if started.elapsed() >= POLL_FOR {
                 return Err(failed(
-                    "TikTok is still working on it and may post it soon. Check the account.",
+                    "TikTok has not said it is done and may still post it. Check the account before posting again.",
                 ));
             }
             tokio::time::sleep(self.poll_every).await;
@@ -526,5 +533,7 @@ mod tests {
         assert_eq!(photo_title("  Hello\nworld"), "Hello");
         assert_eq!(photo_title(&"a".repeat(200)).chars().count(), 90);
         assert_eq!(photo_title(""), "");
+        // An emoji is two units: 45 of them fill the 90.
+        assert_eq!(photo_title(&"🙂".repeat(60)).chars().count(), 45);
     }
 }

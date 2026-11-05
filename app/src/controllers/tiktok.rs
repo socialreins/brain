@@ -3,8 +3,8 @@
 //! with TikTok, fixed) swaps the code for an access token (a day) and a refresh token (a year),
 //! reads the account the consent picked and saves it as a `tiktok` account in that team's
 //! Default set. The refresh token is kept sealed in `meta`; `fresh_token` renews the access
-//! token whenever a call is about to be made with one near its end, and saves the refresh token
-//! TikTok sends back with it, if it is a new one.
+//! token under a lock on the account row whenever a call is about to be made with one near its
+//! end, and saves the refresh token TikTok sends back with it in the same transaction.
 use axum::{
     extract::{Query, State},
     http::HeaderMap,
@@ -13,8 +13,8 @@ use axum::{
     Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use chrono::{Duration, Utc};
-use sea_orm::{ActiveValue::Set, ConnectionTrait, DbBackend, Statement};
+use chrono::{DateTime, Duration, Utc};
+use sea_orm::{ActiveValue::Set, ConnectionTrait, DbBackend, DbErr, Statement, TransactionTrait};
 use uuid::Uuid;
 
 use super::{
@@ -50,54 +50,74 @@ fn seal(app: &AppState, refresh_token: &str) -> String {
     URL_SAFE_NO_PAD.encode(app.cipher.encrypt(refresh_token.as_bytes()))
 }
 
-/// The refresh token sealed in an account's `meta`.
-fn unseal(app: &AppState, account: &social_accounts::Model) -> Option<String> {
-    let sealed = account.meta["refresh_token"].as_str()?;
-    let bytes = URL_SAFE_NO_PAD.decode(sealed).ok()?;
-    String::from_utf8(app.cipher.decrypt(&bytes)?).ok()
+fn stmt(sql: &str, values: Vec<sea_orm::Value>) -> Statement {
+    Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
+}
+
+fn db_failed(e: DbErr) -> PostError {
+    tracing::error!(error = %e, "tiktok token save failed");
+    PostError::Failed("The TikTok token could not be renewed. Try again.".into())
 }
 
 /// The access token to call TikTok with: the stored one, or, when it ends within ten minutes
-/// (or has no end recorded), a new one from the refresh token, saved before it is used. A
-/// refresh token TikTok refuses, or none, is `Reconnect`. Two calls renewing at once both get a
-/// working token; the later save finds the row changed and leaves it.
+/// (or has no end recorded), a new one from the refresh token. It locks the account row and
+/// reads it again rather than trusting `account`, so two calls renewing at once spend the refresh
+/// token once: TikTok may answer a refresh with a new refresh token and drop the old one, so the
+/// new one is saved in the same transaction as the new access token, and a save that fails fails
+/// the call. A refresh token TikTok refuses, or none, is `Reconnect`.
 pub async fn fresh_token(
     app: &AppState,
     account: &social_accounts::Model,
 ) -> Result<String, PostError> {
+    let txn = app.db.begin().await.map_err(db_failed)?;
+    let row = txn
+        .query_one_raw(stmt(
+            "SELECT access_token, token_expires_at, meta FROM social_accounts \
+             WHERE id = $1 FOR UPDATE",
+            vec![account.id.into()],
+        ))
+        .await
+        .map_err(db_failed)?;
+    // The account was disconnected meanwhile.
+    let Some(row) = row else {
+        return Err(PostError::Reconnect);
+    };
+    let sealed: Vec<u8> = row.try_get("", "access_token").map_err(db_failed)?;
+    let expires: Option<DateTime<Utc>> = row.try_get("", "token_expires_at").map_err(db_failed)?;
+    let meta: serde_json::Value = row.try_get("", "meta").map_err(db_failed)?;
+    let live = expires.is_some_and(|t| t > Utc::now() + RENEW_WITHIN);
     let stored = app
         .cipher
-        .decrypt(&account.access_token)
+        .decrypt(&sealed)
         .and_then(|b| String::from_utf8(b).ok());
-    let live = account
-        .token_expires_at
-        .is_some_and(|t| t > Utc::now() + RENEW_WITHIN);
-    if let (true, Some(token)) = (live, &stored) {
-        return Ok(token.clone());
+    if let (true, Some(token)) = (live, stored) {
+        return Ok(token);
     }
-    let Some(refresh) = unseal(app, account) else {
+    let Some(refresh) = meta["refresh_token"]
+        .as_str()
+        .and_then(|s| URL_SAFE_NO_PAD.decode(s).ok())
+        .and_then(|b| app.cipher.decrypt(&b))
+        .and_then(|b| String::from_utf8(b).ok())
+    else {
         return Err(PostError::Reconnect);
     };
     let token = app.tiktok.refresh(&refresh).await?;
     let next = token.refresh_token.clone().unwrap_or(refresh);
-    let stmt = Statement::from_sql_and_values(
-        DbBackend::Postgres,
+    txn.execute_raw(stmt(
         "UPDATE social_accounts SET access_token = $2, \
-         meta = meta || jsonb_build_object('refresh_token', $5::text), \
+         meta = meta || jsonb_build_object('refresh_token', $4::text), \
          token_expires_at = now() + make_interval(secs => $3), updated_at = now() \
-         WHERE id = $1 AND access_token = $4",
-        [
+         WHERE id = $1",
+        vec![
             account.id.into(),
             app.cipher.encrypt(token.access_token.as_bytes()).into(),
             (token.expires_in as f64).into(),
-            account.access_token.clone().into(),
             seal(app, &next).into(),
         ],
-    );
-    // The token is good even when it could not be saved: the next call renews again.
-    if let Err(e) = app.db.execute_raw(stmt).await {
-        tracing::warn!(error = %e, account = %account.id, "tiktok token save failed");
-    }
+    ))
+    .await
+    .map_err(db_failed)?;
+    txn.commit().await.map_err(db_failed)?;
     Ok(token.access_token)
 }
 
