@@ -1531,10 +1531,19 @@ async fn publish_target(
         Ok(cover) => cover,
         Err(msg) => return fail_target(db, id, &msg).await,
     };
-    let tiktok: Option<tiktok::Options> = post
+    // The user chose these settings, so unreadable ones fail the target rather than post with defaults.
+    let tiktok = match post
         .tiktok
         .clone()
-        .and_then(|v| serde_json::from_value(v).ok());
+        .map(serde_json::from_value::<tiktok::Options>)
+    {
+        Some(Err(_)) => {
+            let msg = "The TikTok settings of this post could not be read. Open the post, choose them again and save it.";
+            return fail_target(db, id, msg).await;
+        }
+        Some(Ok(options)) => Some(options),
+        None => None,
+    };
     let with = (app, stored);
     let in_call = cover.as_ref().filter(|_| publisher.cover_in_publish());
     let root = match send(

@@ -9185,6 +9185,97 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
+                async fn the_account_endpoint_answers_404_outside_a_set_token_and_for_other_providers(
+                ) {
+                    let (s, db, _, _, cookie, team_id, _) = team().await;
+                    let id = tiktok_account(&db, &team_id).await.id;
+                    let res = req(&s, Method::POST, "/v1/social-sets", &cookie)
+                        .json(&json!({"name": "Clients"}))
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let clients = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                    let res = req(&s, Method::POST, "/v1/api-tokens", &cookie)
+                        .json(&json!({"name": "cm", "social_set_id": clients}))
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let secret = res.json::<Value>()["secret"].as_str().unwrap().to_owned();
+                    let url = format!("/v1/connections/{id}/tiktok");
+                    let by_token = |url: &str| {
+                        s.get(url)
+                            .add_header("authorization", format!("Bearer {secret}"))
+                    };
+                    // The account is only in the Default set, outside the token's set.
+                    assert_eq!(by_token(&url).await.status_code(), 404);
+                    // Added to the token's set, it is readable.
+                    let default = default_set(&db, &team_id).await.to_string();
+                    let res = req(
+                        &s,
+                        Method::PUT,
+                        &format!("/v1/connections/{id}/sets"),
+                        &cookie,
+                    )
+                    .json(&json!({"set_ids": [default, clients]}))
+                    .await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let res = by_token(&url).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    assert_eq!(res.json::<Value>()["nickname"], "Ann Lee");
+
+                    // An account of another provider is not a TikTok account.
+                    let now = Utc::now().fixed_offset();
+                    let other = uuid::Uuid::now_v7();
+                    let row = social_accounts::ActiveModel {
+                        id: Set(other),
+                        team_id: Set(team_id.parse().unwrap()),
+                        provider: Set("bluesky".into()),
+                        external_id: Set("did:plc:other".into()),
+                        access_token: Set(cipher().encrypt(b"x")),
+                        meta: Set(json!({})),
+                        dm_access: Set(false),
+                        created_at: Set(now),
+                        updated_at: Set(now),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::insert(row)
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                    let other_url = format!("/v1/connections/{other}/tiktok");
+                    let res = s
+                        .get(&other_url)
+                        .add_header("cookie", cookie.as_str())
+                        .await;
+                    assert_eq!(res.status_code(), 404, "{}", res.text());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn settings_that_cannot_be_read_fail_the_target_instead_of_using_defaults() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let inits = INITS.lock().unwrap().len();
+                    let mut post = tiktok_post(&set, "hi", &["/clip.mp4"]);
+                    post["tiktok"] = settings("PUBLIC_TO_EVERYONE");
+                    let id = id_of(&create(&s, &cookie, post).await);
+                    set_media(&db, &base, &id, &["/clip.mp4"]).await;
+                    let row = posts::ActiveModel {
+                        id: Set(id.parse().unwrap()),
+                        tiktok: Set(Some(json!({"privacy_level": 5}))),
+                        ..Default::default()
+                    };
+                    posts::Entity::update(row).exec(&db).await.unwrap();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    let msg = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(
+                        msg.contains("TikTok settings of this post could not be read"),
+                        "{msg}"
+                    );
+                    assert_eq!(INITS.lock().unwrap().len(), inits);
+                }
+
+                #[tokio::test]
+                #[serial]
                 async fn the_account_endpoint_asks_for_a_reconnect_when_the_token_is_dead() {
                     let (s, db, _, _, cookie, team_id, _) = team().await;
                     let account = tiktok_account(&db, &team_id).await.id;
