@@ -98,6 +98,11 @@ pub struct File<'a> {
     pub content_type: &'a str,
 }
 
+/// An upload YouTube answered without a video id: it may have posted, so a retry leaves it alone
+/// (`publish::outcome_unknown`).
+pub const NO_VIDEO_ID: &str =
+    "Upload: YouTube sent no video id. It may have posted, check the channel.";
+
 fn failed(msg: impl Into<String>) -> PostError {
     PostError::Failed(msg.into())
 }
@@ -363,9 +368,7 @@ impl YouTube {
             .as_str()
             .filter(|id| video_id(id))
             .map(str::to_owned)
-            .ok_or_else(|| {
-                failed("Upload: YouTube sent no video id. It may have posted, check the channel.")
-            })
+            .ok_or_else(|| failed(NO_VIDEO_ID))
     }
 
     /// Comments `text` on video `id` of `channel` as the channel (`commentThreads.insert`, scope

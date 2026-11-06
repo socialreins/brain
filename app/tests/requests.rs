@@ -4924,6 +4924,133 @@ mod teams {
 
             #[tokio::test]
             #[serial]
+            async fn a_retry_leaves_failures_that_may_have_posted_to_the_caller() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let made = req(&s, Method::POST, "/v1/post-groups", &cookie)
+                    .json(&json!({"social_set_id": set, "body": "REJECT me",
+                        "platforms": ["bluesky"], "scheduled_at": past()}))
+                    .await
+                    .json::<Value>();
+                let gid = made["group_id"].as_str().unwrap().to_owned();
+                let id = made["posts"][0]["id"].as_str().unwrap().to_owned();
+                publish::tick(&state).await.unwrap();
+                let target = get_post(&s, &cookie, &id).await["targets"][0]["id"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<uuid::Uuid>()
+                    .unwrap();
+                set_body(&db, &id, "fine", json!([])).await;
+                let fail_with = |error: String| {
+                    let db = &db;
+                    async move {
+                        let row = post_targets::ActiveModel {
+                            id: Set(target),
+                            status: Set("failed".into()),
+                            error: Set(Some(error)),
+                            ..Default::default()
+                        };
+                        post_targets::Entity::update(row).exec(db).await.unwrap();
+                    }
+                };
+                // Each kind of failure that may already have posted.
+                let kinds = [
+                    "Timed out; it may have posted, check the account.",
+                    "Thread post 2 of 3: Timed out; it may have posted, check the account. The posts before it are up.",
+                    "Unknown, check the account: publishing stopped midway and it may have posted.",
+                    "Unknown, check the account: publishing stopped midway and thread post 2 of 3 may have posted.",
+                    "Thread post 2 of 3 went out but could not be saved: it may be live, check the account.",
+                    "TikTok has not said it is done and may still post it. Check the account before posting again.",
+                    "Upload: YouTube sent no video id. It may have posted, check the channel.",
+                ];
+                let before = RECORDS.lock().unwrap().len();
+                for kind in kinds {
+                    fail_with(kind.to_owned()).await;
+                    let res = req(&s, Method::POST, &retry_url(&id), &cookie).await;
+                    assert_eq!(res.status_code(), 409, "{kind}: {}", res.text());
+                    let body = res.json::<Value>();
+                    assert_eq!(body["error"], "outcome_unknown", "{kind}");
+                    assert_eq!(body["targets"][0]["target_id"], target.to_string());
+                    assert_eq!(body["targets"][0]["error"], kind);
+                }
+                // A target cut off for real: recovery fails it, and the retry still refuses.
+                let cut = post_targets::ActiveModel {
+                    id: Set(target),
+                    status: Set("publishing".into()),
+                    error: Set(None),
+                    updated_at: Set((Utc::now() - Duration::minutes(20)).fixed_offset()),
+                    ..Default::default()
+                };
+                post_targets::Entity::update(cut).exec(&db).await.unwrap();
+                publish::recover_stuck(&db).await.unwrap();
+                let url = format!("/v1/post-groups/{gid}/retry");
+                let res = req(&s, Method::POST, &url, &cookie).await;
+                assert_eq!(res.status_code(), 409, "{}", res.text());
+                assert_eq!(res.json::<Value>()["error"], "outcome_unknown");
+                assert_eq!(RECORDS.lock().unwrap().len(), before, "nothing was sent");
+
+                // Next to a plain failure, the retry goes on and lists what it left alone.
+                let plain = uuid::Uuid::now_v7();
+                let row = post_targets::ActiveModel {
+                    id: Set(plain),
+                    post_id: Set(id.parse().unwrap()),
+                    social_account_id: Set(None),
+                    status: Set("failed".into()),
+                    error: Set(Some("Bluesky refused it (InvalidRequest).".into())),
+                    ..Default::default()
+                };
+                post_targets::Entity::insert(row)
+                    .exec_without_returning(&db)
+                    .await
+                    .unwrap();
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/post-groups/{gid}/retry"),
+                    &cookie,
+                )
+                .await;
+                assert_eq!(res.status_code(), 202, "{}", res.text());
+                let body = res.json::<Value>();
+                let skipped = body["skipped_targets"].as_array().unwrap();
+                assert_eq!(skipped.len(), 1);
+                assert_eq!(skipped[0]["target_id"], target.to_string());
+                assert_eq!(skipped[0]["reason"], "outcome_unknown");
+                settled(&s, &cookie, &id).await;
+                let row = post_targets::Entity::find_by_id(target)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(row.status, "failed", "the unsure target stays as it was");
+                assert_eq!(RECORDS.lock().unwrap().len(), before, "and was not sent");
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_retry_adds_no_target_for_an_account_that_joined_later() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let id = id_of(&create(&s, &cookie, input(&set, "REJECT me", Some(&past()))).await);
+                publish::tick(&state).await.unwrap();
+                assert_eq!(get_post(&s, &cookie, &id).await["status"], "failed");
+                // A second account joins the Default set after the first publish.
+                let res = connect(&s, &cookie, &new_handle(), APP_PASSWORD).await;
+                assert_eq!(res.status_code(), 201);
+                set_body(&db, &id, "fine", json!([])).await;
+                let before = RECORDS.lock().unwrap().len();
+                let res = req(&s, Method::POST, &retry_url(&id), &cookie).await;
+                assert_eq!(res.status_code(), 202, "{}", res.text());
+                let p = settled(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "published", "{p}");
+                assert_eq!(p["targets"].as_array().unwrap().len(), 1);
+                assert_eq!(RECORDS.lock().unwrap().len(), before + 1);
+            }
+
+            #[tokio::test]
+            #[serial]
             async fn a_group_reads_with_its_expected_targets_and_retries_as_one() {
                 let (s, db, state) = on_mock().await;
                 let (cookie, team_id, _) = owner_with_account(&s, &db).await;
@@ -9084,11 +9211,26 @@ mod teams {
                     settings: Value,
                 ) -> Value {
                     let mut post = tiktok_post(set, body, paths);
-                    post["tiktok"] = settings;
+                    // No settings is a row saved before they were required: the API no longer
+                    // takes one, so it is made with settings and cleared in the database.
+                    let legacy = settings.is_null();
+                    post["tiktok"] = if legacy {
+                        json!({"privacy_level": "SELF_ONLY"})
+                    } else {
+                        settings
+                    };
                     let res = create(s, cookie, post).await;
                     assert_eq!(res.status_code(), 201, "{}", res.text());
                     let id = id_of(&res);
                     set_media(db, base, &id, paths).await;
+                    if legacy {
+                        let row = posts::ActiveModel {
+                            id: Set(id.parse().unwrap()),
+                            tiktok: Set(None),
+                            ..Default::default()
+                        };
+                        posts::Entity::update(row).exec(db).await.unwrap();
+                    }
                     publish::tick(state).await.unwrap();
                     get_post(s, cookie, &id).await
                 }
@@ -9663,11 +9805,27 @@ mod teams {
                     let p = get_post(&s, &cookie, &id).await;
                     assert_eq!(p["tiktok"]["privacy_level"], "MUTUAL_FOLLOW_FRIENDS");
                     assert_eq!(p["tiktok"]["allow_comment"], true);
+                    // An update cannot remove them, and a new post needs them.
                     let res = req(&s, Method::PUT, &url, &cookie)
                         .json(&tiktok_post(&set, "hi", &["/clip.mp4"]))
                         .await;
-                    assert_eq!(res.status_code(), 200, "{}", res.text());
-                    assert_eq!(get_post(&s, &cookie, &id).await["tiktok"], Value::Null);
+                    assert_eq!(res.status_code(), 422, "{}", res.text());
+                    res.assert_json(&json!({"error": "tiktok_settings_required"}));
+                    let kept = get_post(&s, &cookie, &id).await;
+                    assert_eq!(kept["tiktok"]["privacy_level"], "MUTUAL_FOLLOW_FRIENDS");
+                    let res = create(&s, &cookie, tiktok_post(&set, "hi", &["/clip.mp4"])).await;
+                    assert_eq!(res.status_code(), 422, "{}", res.text());
+                    res.assert_json(&json!({"error": "tiktok_settings_required"}));
+                    // Another platform's post may switch to TikTok only with settings.
+                    let mut other = input(&set, "hi", None);
+                    let res = create(&s, &cookie, other.clone()).await;
+                    let bsky = id_of(&res);
+                    other["platform"] = json!("tiktok");
+                    other["media"] = json!(["https://a.example/clip.mp4"]);
+                    let res = req(&s, Method::PUT, &format!("/v1/posts/{bsky}"), &cookie)
+                        .json(&other)
+                        .await;
+                    assert_eq!(res.status_code(), 422, "{}", res.text());
                 }
 
                 #[tokio::test]

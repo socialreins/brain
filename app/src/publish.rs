@@ -1072,11 +1072,7 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
         let (done, total): (i32, i32) = (row.try_get("", "done")?, row.try_get("", "total")?);
         let platform: String = row.try_get("", "platform")?;
         let (status, error) = if done < total {
-            let msg = format!(
-                "Unknown, check the account: publishing stopped midway and thread post {} of \
-                 {total} may have posted.",
-                done + 1
-            );
+            let msg = cut_off_part(done + 1, total);
             ("failed", Some(msg))
         } else {
             ("published", None)
@@ -1204,27 +1200,36 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         let msg = format!("Publishing to {} is not available yet.", post.platform);
         return fail_post(db, id, &msg).await;
     }
-    let in_set = Query::select()
-        .column(membership::Column::SocialAccountId)
-        .from(membership::Entity)
-        .and_where(membership::Column::SocialSetId.eq(post.social_set_id))
-        .to_owned();
-    let accounts: Vec<Uuid> = social_accounts::Entity::find()
-        .select_only()
-        .column(social_accounts::Column::Id)
-        .filter(social_accounts::Column::TeamId.eq(post.team_id))
-        .filter(social_accounts::Column::Provider.eq(&post.platform))
-        .filter(social_accounts::Column::Id.in_subquery(in_set))
-        .into_tuple()
-        .all(db)
-        .await?;
-    for account in &accounts {
-        let stmt = sql(
-            "INSERT INTO post_targets (id, post_id, social_account_id, status) \
-             VALUES ($1, $2, $3, 'pending') ON CONFLICT (post_id, social_account_id) DO NOTHING",
-            vec![Uuid::now_v7().into(), id.into(), (*account).into()],
+    // Once only: a retry (or a restart picking the post up) works on the targets it has, and an
+    // account added to the set since gets none.
+    if !post.fanned_out {
+        let in_set = Query::select()
+            .column(membership::Column::SocialAccountId)
+            .from(membership::Entity)
+            .and_where(membership::Column::SocialSetId.eq(post.social_set_id))
+            .to_owned();
+        let accounts: Vec<Uuid> = social_accounts::Entity::find()
+            .select_only()
+            .column(social_accounts::Column::Id)
+            .filter(social_accounts::Column::TeamId.eq(post.team_id))
+            .filter(social_accounts::Column::Provider.eq(&post.platform))
+            .filter(social_accounts::Column::Id.in_subquery(in_set))
+            .into_tuple()
+            .all(db)
+            .await?;
+        for account in &accounts {
+            let stmt = sql(
+                "INSERT INTO post_targets (id, post_id, social_account_id, status) \
+                 VALUES ($1, $2, $3, 'pending') ON CONFLICT (post_id, social_account_id) DO NOTHING",
+                vec![Uuid::now_v7().into(), id.into(), (*account).into()],
+            );
+            db.execute_raw(stmt).await?;
+        }
+        let mark = sql(
+            "UPDATE posts SET fanned_out = true WHERE id = $1",
+            vec![id.into()],
         );
-        db.execute_raw(stmt).await?;
+        db.execute_raw(mark).await?;
     }
     let targets = post_targets::Entity::find()
         .filter(post_targets::Column::PostId.eq(id))
@@ -1456,13 +1461,45 @@ async fn fail_target(db: &DatabaseConnection, id: Uuid, msg: &str) -> Result<(),
 const UNFINISHED: &str = "jsonb_array_length(t.parts) < \
     (SELECT jsonb_array_length(p.thread) FROM posts p WHERE p.id = t.post_id)";
 
-/// Whether a retry may re-queue `target` of `post`: it `failed` before anything went out, or midway
-/// through a thread (the parts saved stay up and the rest follow them). A failed target whose
-/// thread is all out is done.
-pub fn retryable(target: &post_targets::Model, post: &posts::Model) -> bool {
+const TIMED_OUT: &str = "Timed out; it may have posted, check the account.";
+
+/// What a thread part that went out but could not be saved fails its target with.
+fn unsaved_part(n: usize, total: usize) -> String {
+    format!(
+        "Thread post {n} of {total} went out but could not be saved: it may be live, check \
+         the account."
+    )
+}
+
+/// What a target cut off midway through a thread fails with.
+fn cut_off_part(n: i32, total: i32) -> String {
+    format!(
+        "Unknown, check the account: publishing stopped midway and thread post {n} of \
+         {total} may have posted."
+    )
+}
+
+/// Whether a failure may already have posted: a timeout, a run cut off, a platform that never
+/// said it finished. Resending could post twice, so a retry leaves these to the caller, who
+/// checks the platform. Every such message holds one of these phrases (`MAY_HAVE_POSTED`).
+pub fn outcome_unknown(error: Option<&str>) -> bool {
+    error.is_some_and(|e| MAY_HAVE_POSTED.iter().any(|p| e.contains(p)))
+}
+
+pub const MAY_HAVE_POSTED: [&str; 3] = ["may have posted", "may still post", "may be live"];
+
+/// Whether a failed `target` of `post` could be sent again: it failed before anything went out,
+/// or midway through a thread (the parts saved stay up and the rest follow them). A failed
+/// target whose thread is all out is done.
+pub fn resendable(target: &post_targets::Model, post: &posts::Model) -> bool {
     let len = |v: &serde_json::Value| v.as_array().map_or(0, Vec::len);
     target.status == "failed"
         && (target.remote_id.is_none() || len(&target.parts) < len(&post.thread))
+}
+
+/// Whether a retry re-queues `target`: `resendable`, and not an `outcome_unknown` failure.
+pub fn retryable(target: &post_targets::Model, post: &posts::Model) -> bool {
+    resendable(target, post) && !outcome_unknown(target.error.as_deref())
 }
 
 /// Claims a target (`pending`, to `publishing`); false when another run has it. A target with a
@@ -1531,7 +1568,7 @@ async fn send(
         Ok(Err(PublishError::Reconnect)) => Err(refused(app, publisher, account).await),
         Ok(Err(PublishError::Denied)) => Err(publisher.reconnect().to_owned()),
         Ok(Err(PublishError::Failed(msg))) => Err(msg),
-        Err(_) => Err("Timed out; it may have posted, check the account.".to_owned()),
+        Err(_) => Err(TIMED_OUT.to_owned()),
     }
 }
 
@@ -1700,12 +1737,7 @@ async fn publish_target(
             vec![id.into(), saved.into()],
         );
         if let Err(e) = db.execute_raw(stmt).await {
-            let msg = format!(
-                "Thread post {} of {} went out but could not be saved: it may be live, check \
-                 the account.",
-                i + 1,
-                thread.len()
-            );
+            let msg = unsaved_part(i + 1, thread.len());
             // Best effort: with the database down, recovery fails it later with a like message.
             let _ = fail_target(db, id, &msg).await;
             return Err(e);
@@ -2037,5 +2069,35 @@ async fn delete_one(
         Err(_) => Some(format!(
             "{name}: {app} did not answer in time. Try again, or delete it in the app."
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_failure_that_may_have_posted_is_left_to_the_caller() {
+        let maybe = [
+            TIMED_OUT.to_owned(),
+            format!("Thread post 2 of 3: {TIMED_OUT} The posts before it are up."),
+            STUCK.to_owned(),
+            cut_off_part(2, 3),
+            unsaved_part(2, 3),
+            tiktok::NOT_DONE.to_owned(),
+            youtube::NO_VIDEO_ID.to_owned(),
+        ];
+        for m in &maybe {
+            assert!(outcome_unknown(Some(m)), "{m}");
+        }
+        for sure in [
+            "Bluesky refused it (InvalidRequest).",
+            "Thread post 2 of 3: Bluesky refused it (InvalidRequest). The posts before it are up.",
+            "The account was disconnected.",
+            "TikTok could not publish it (spam_risk).",
+        ] {
+            assert!(!outcome_unknown(Some(sure)), "{sure}");
+        }
+        assert!(!outcome_unknown(None));
     }
 }

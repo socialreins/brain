@@ -199,10 +199,11 @@ pub struct PostInput {
     /// the commercial content disclosure and the AI-generated flag. Branded content cannot be
     /// `SELF_ONLY`. Other platforms answer `tiktok_not_supported`; invalid settings answer
     /// `tiktok_privacy_required`, `invalid_tiktok_privacy`, `invalid_tiktok_disclosure`,
-    /// `tiktok_disclosure_incomplete` or `tiktok_branded_content_private`. `POST /post-groups`
-    /// requires them for a TikTok post (`422 tiktok_settings_required`); a single TikTok post
-    /// saved without them still goes out with the most public level the account is offered and
-    /// every interaction off, so send them.
+    /// `tiktok_disclosure_incomplete` or `tiktok_branded_content_private`. A TikTok post saved
+    /// without them (`POST /posts`, `PUT /posts/{id}` or `POST /post-groups`) is `422
+    /// tiktok_settings_required`, so an update cannot remove them either. Posts saved before
+    /// this rule without settings stay readable and still go out with the most public level
+    /// the account is offered and every interaction off.
     pub tiktok: Option<tiktok::Options>,
     /// When to publish. Set: `scheduled`; absent or `null`: `draft`.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
@@ -279,6 +280,37 @@ pub struct Override {
     pub first_comment: Option<String>,
     pub cover: Option<String>,
     pub tiktok: Option<tiktok::Options>,
+}
+
+/// A failed target a retry left alone because it may already have posted.
+#[derive(Clone, Serialize, ToSchema)]
+pub struct SkippedTarget {
+    pub target_id: Uuid,
+    pub post_id: Uuid,
+    pub social_account_id: Option<Uuid>,
+    /// Always `outcome_unknown`.
+    pub reason: String,
+    /// What the target failed with, e.g. `Timed out; it may have posted, check the account.`
+    pub error: Option<String>,
+}
+
+/// `POST /posts/{id}/retry`: the post, queued, and the failed targets left alone.
+#[derive(Serialize, ToSchema)]
+pub struct PostRetry {
+    #[serde(flatten)]
+    pub post: Post,
+    /// Failed targets that may already have posted (a timeout, a run cut off, a platform that
+    /// never said it was done). They were not re-queued: check the account on the platform.
+    pub skipped_targets: Vec<SkippedTarget>,
+}
+
+/// `POST /post-groups/{group_id}/retry`: the group, queued, and the failed targets left alone.
+#[derive(Serialize, ToSchema)]
+pub struct GroupRetry {
+    #[serde(flatten)]
+    pub group: PostGroup,
+    /// As in `PostRetry`.
+    pub skipped_targets: Vec<SkippedTarget>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -444,6 +476,14 @@ async fn checked(
     });
     if let Err(e) = post::validate_tiktok(&input.platform, choice) {
         return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, e.code())));
+    }
+    // The visibility has no default: brain never posts at the most public level unasked. (Rows
+    // saved before this still publish with the auto-picked level, and stay readable.)
+    if input.platform == "tiktok" && input.tiktok.is_none() {
+        return Ok(Err(reply(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "tiktok_settings_required",
+        )));
     }
     set_for(db, a, input.social_set_id).await
 }
@@ -742,12 +782,6 @@ pub async fn create_post_group(app: &AppState, a: &Actor, input: PostGroupInput)
                 position: input.position.map(|p| p.saturating_add(i)),
             };
             match insert(&txn, a, &one, Some(group)).await? {
-                // The visibility has no default: never publish at the most public level
-                // unasked. Checked after the post's own checks; the group rolls back.
-                Ok(_) if one.platform == "tiktok" && one.tiktok.is_none() => {
-                    let res = reply(StatusCode::UNPROCESSABLE_ENTITY, "tiktok_settings_required");
-                    return Ok(Err(naming(res, "tiktok").await));
-                }
                 Ok(p) => rows.push(p),
                 Err(res) => return Ok(Err(naming(res, &one.platform).await)),
             }
@@ -1089,7 +1123,7 @@ async fn requeue(
     app: &AppState,
     a: &Actor,
     ids: &[Uuid],
-) -> Result<Result<Vec<Uuid>, Response>, DbErr> {
+) -> Result<Result<(Vec<Uuid>, Vec<SkippedTarget>), Response>, DbErr> {
     let txn = app.db.begin().await?;
     // The rows are locked, so two retries (or a retry and a settle) cannot interleave.
     let rows = posts::Entity::find()
@@ -1117,19 +1151,37 @@ async fn requeue(
     }
     let mut again = Vec::new();
     let mut posts = Vec::new();
+    let mut skipped = Vec::new();
     for t in &targets {
         let post = rows.iter().find(|p| p.id == t.post_id);
         if let Some(p) = post.filter(|p| p.status == "published" || p.status == "failed") {
             if publish::retryable(t, p) {
                 again.push(t.id);
                 posts.push(p.id);
+            } else if publish::resendable(t, p) {
+                skipped.push(SkippedTarget {
+                    target_id: t.id,
+                    post_id: p.id,
+                    social_account_id: t.social_account_id,
+                    reason: "outcome_unknown".into(),
+                    error: t.error.clone(),
+                });
             }
         }
     }
     posts.sort();
     posts.dedup();
-    if again.is_empty() {
+    if again.is_empty() && skipped.is_empty() {
         return Ok(Err(reply(StatusCode::CONFLICT, "nothing_to_retry")));
+    }
+    if again.is_empty() {
+        let body = serde_json::json!({
+            "error": "outcome_unknown",
+            "message": "Every failed target may already have posted. Check each account on the \
+                        platform; nothing was sent again.",
+            "targets": skipped,
+        });
+        return Ok(Err((StatusCode::CONFLICT, Json(body)).into_response()));
     }
     let now = Utc::now().fixed_offset();
     post_targets::Entity::update_many()
@@ -1146,7 +1198,7 @@ async fn requeue(
         .exec(&txn)
         .await?;
     txn.commit().await?;
-    Ok(Ok(posts))
+    Ok(Ok((posts, skipped)))
 }
 
 /// Sends the posts `ids` (queued by `requeue`) in the background, each target once.
@@ -1162,18 +1214,22 @@ fn publish_in_background(app: &AppState, ids: Vec<Uuid>) {
 }
 
 /// Publishes a `published` or `failed` post's `failed` targets again; `202` with the queued
-/// post, poll it for the result. A `published` target is never sent again. A target that
-/// failed midway through a thread goes on after the parts already out; any other starts over,
-/// with the first comment and cover as the post says. A failure whose message says it may have
-/// posted (`Timed out; it may have posted`) can post twice: check the account first. `409
-/// publish_in_progress` while the post is `queued` or a target is `pending` or `publishing`,
-/// `409 nothing_to_retry` when no target failed. At most 10 publish, retry or take-down calls
-/// a minute per user. A retry does not count against the daily publish cap again. Webhooks: a
-/// target fires `post.target.failed` once, so a retry that fails again sends no second one.
+/// post, poll it for the result. A `published` target is never sent again, and no target is
+/// added for an account that joined the set since the first publish. A target that failed
+/// midway through a thread goes on after the parts already out; any other starts over, with the
+/// first comment and cover as the post says. A failure that may already have posted (a
+/// timeout, a run cut off, a platform that never said it was done) is not sent again: it is
+/// listed in `skipped_targets`, and when nothing else failed the answer is `409
+/// outcome_unknown` with those `targets` and a message to check the account on the platform.
+/// `409 publish_in_progress` while the post is `queued` or a target is `pending` or
+/// `publishing`, `409 nothing_to_retry` when no target failed. At most 10 publish, retry or
+/// take-down calls a minute per user. A retry does not count against the daily publish cap
+/// again. Webhooks: a target fires `post.target.failed` once, so a retry that fails again sends
+/// no second one.
 #[utoipa::path(post, path = "/posts/{id}/retry", tag = "posts",
     security(("session" = []), ("api_token" = [])),
     params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
-    responses((status = 202, body = Post), (status = 401, body = Error),
+    responses((status = 202, body = PostRetry), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 429, body = Error)))]
 async fn retry_post(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
@@ -1184,7 +1240,7 @@ async fn retry_post(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>)
         if find(&app.db, &a, id).await?.is_none() {
             return Ok(not_found());
         }
-        let queued = match requeue(&app, &a, &[id]).await? {
+        let (queued, skipped_targets) = match requeue(&app, &a, &[id]).await? {
             Ok(q) => q,
             Err(res) => return Ok(res),
         };
@@ -1193,19 +1249,24 @@ async fn retry_post(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>)
         };
         let p = one_json(&app.db, &a, p).await?;
         publish_in_background(&app, queued);
-        Ok::<_, DbErr>((StatusCode::ACCEPTED, Json(p)).into_response())
+        let body = PostRetry {
+            post: p,
+            skipped_targets,
+        };
+        Ok::<_, DbErr>((StatusCode::ACCEPTED, Json(body)).into_response())
     };
     done.await.unwrap_or_else(|e| internal(e, "post retry"))
 }
 
 /// `POST /posts/{id}/retry` for every post of a group at once: all or nothing, so `409
 /// publish_in_progress` when any post of the group is still going out. Posts with nothing to
-/// retry stay as they are; `409 nothing_to_retry` when none has a failed target. `202` with the
-/// group.
+/// retry stay as they are; `409 nothing_to_retry` when none has a failed target, `409
+/// outcome_unknown` when the only failures may already have posted. `202` with the group and
+/// the `skipped_targets`.
 #[utoipa::path(post, path = "/post-groups/{group_id}/retry", tag = "posts",
     security(("session" = []), ("api_token" = [])),
     params(("group_id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
-    responses((status = 202, body = PostGroup), (status = 401, body = Error),
+    responses((status = 202, body = GroupRetry), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 429, body = Error)))]
 async fn retry_group(
@@ -1225,14 +1286,18 @@ async fn retry_group(
         if ids.is_empty() {
             return Ok(not_found());
         }
-        let queued = match requeue(&app, &a, &ids).await? {
+        let (queued, skipped_targets) = match requeue(&app, &a, &ids).await? {
             Ok(q) => q,
             Err(res) => return Ok(res),
         };
         let rows = group_rows(&app.db, &a, group_id).await?;
         let group = group_json(&app.db, &a, group_id, rows).await?;
         publish_in_background(&app, queued);
-        Ok::<_, DbErr>((StatusCode::ACCEPTED, Json(group)).into_response())
+        let body = GroupRetry {
+            group,
+            skipped_targets,
+        };
+        Ok::<_, DbErr>((StatusCode::ACCEPTED, Json(body)).into_response())
     };
     done.await
         .unwrap_or_else(|e| internal(e, "post group retry"))
