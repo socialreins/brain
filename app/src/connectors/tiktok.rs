@@ -236,14 +236,12 @@ fn code(body: &Value) -> &str {
         .unwrap_or_default()
 }
 
-/// What a refused call means: a dead token or a missing permission is `Reconnect`, a limit or a
+/// What a refused call means: a dead token is `Reconnect`, a missing permission `Denied`, a limit or a
 /// review TikTok has not given says so, anything else is `Failed` with `step` and TikTok's reason.
 fn refusal(status: StatusCode, body: &Value, step: &str) -> PostError {
     match (status.as_u16(), code(body)) {
-        (401, _)
-        | (_, "access_token_invalid" | "scope_not_authorized" | "scope_permission_missed") => {
-            PostError::Reconnect
-        }
+        (401, _) | (_, "access_token_invalid") => PostError::Reconnect,
+        (_, "scope_not_authorized" | "scope_permission_missed") => PostError::Denied,
         // A revoked or expired refresh token, or a code that was already used.
         (_, "invalid_grant") => PostError::Reconnect,
         (_, "rate_limit_exceeded") => {
@@ -710,10 +708,7 @@ mod tests {
             r(400, "access_token_invalid"),
             PostError::Reconnect
         ));
-        assert!(matches!(
-            r(403, "scope_not_authorized"),
-            PostError::Reconnect
-        ));
+        assert!(matches!(r(403, "scope_not_authorized"), PostError::Denied));
         let PostError::Failed(msg) = r(403, "unaudited_client_can_only_post_to_private_accounts")
         else {
             panic!("expected a failure");

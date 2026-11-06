@@ -31,6 +31,7 @@ use super::{
 };
 use crate::{
     connectors::bluesky::{self, Error as BlueskyError},
+    expiry::{self, Status},
     models::{social_account_social_set as membership, social_accounts, social_sets},
     rate_limit::{daily_refund, daily_reserve, ClientIp},
     state::AppState,
@@ -63,10 +64,14 @@ pub struct Connection {
     /// when the subscription worked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub webhook_error: Option<String>,
-    /// X: the platform refused to renew the account's token, so it must be connected again.
-    /// Absent otherwise.
+    /// A publish, a renewal or the inbox found the platform refusing the account's token, so it
+    /// must be connected again. Absent otherwise.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub reconnect: bool,
+    /// `ok`; `expiring` when the token ends within 7 days and nothing renews it (the end is
+    /// `token_expires_at`); `reconnect` when it expired or the platform refused it. Connect the
+    /// account again (the provider's connect link) to clear either.
+    pub status: Status,
     /// The social sets holding the account; the team's Default set is always one of them.
     pub set_ids: Vec<Uuid>,
     pub created_at: DateTime<FixedOffset>,
@@ -148,7 +153,9 @@ async fn set_ids(
 }
 
 fn connection_json(a: social_accounts::Model, set_ids: Vec<Uuid>) -> Connection {
+    let status = expiry::status(&a, Utc::now());
     Connection {
+        status,
         id: a.id,
         provider: a.provider,
         external_id: a.external_id,

@@ -163,7 +163,9 @@ async fn fetch(app: &AppState, code: &str) -> Result<(Token, String, Profile), &
 fn log(e: &PostError, step: &str) {
     match e {
         PostError::Failed(why) => tracing::warn!(why, step, "tiktok connect failed"),
-        PostError::Reconnect => tracing::warn!(step, "tiktok refused the connect"),
+        PostError::Reconnect | PostError::Denied => {
+            tracing::warn!(step, "tiktok refused the connect")
+        }
     }
 }
 
@@ -259,7 +261,7 @@ async fn creator(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) ->
     };
     match found {
         Ok(creator) => Json(creator).into_response(),
-        Err(PostError::Reconnect) => {
+        Err(PostError::Reconnect | PostError::Denied) => {
             error(StatusCode::CONFLICT, "reconnect_required").into_response()
         }
         Err(PostError::Failed(why)) => {

@@ -32,6 +32,7 @@ use crate::{
         youtube::{self, YouTube},
     },
     controllers::posts::ThreadPart,
+    expiry,
     media::{Fail, Stored},
     models::{
         post_targets, posts, social_account_social_set as membership, social_accounts, social_sets,
@@ -883,6 +884,30 @@ async fn credential(
     app: &AppState,
     account: &social_accounts::Model,
 ) -> Result<String, PublishError> {
+    let got = read_credential(app, account).await;
+    if matches!(got, Err(PublishError::Reconnect)) {
+        expiry::flag_reconnect(&app.db, account.id).await;
+    }
+    got
+}
+
+/// What a publisher says when the platform refused the account's token on the main call of a
+/// publish, after flagging the account so the connections list asks for a reconnect. Side calls
+/// (cover, first comment, take down) and refused permissions (`Denied`) never flag: they only
+/// report their own error.
+async fn refused(
+    app: &AppState,
+    publisher: &dyn Publisher,
+    account: &social_accounts::Model,
+) -> String {
+    expiry::flag_reconnect(&app.db, account.id).await;
+    publisher.reconnect().to_owned()
+}
+
+async fn read_credential(
+    app: &AppState,
+    account: &social_accounts::Model,
+) -> Result<String, PublishError> {
     if account.provider == "youtube" {
         return crate::controllers::youtube::fresh_token(app, account).await;
     }
@@ -1487,7 +1512,8 @@ async fn send(
     };
     match tokio::time::timeout(publisher.timeout(), sent).await {
         Ok(Ok(remote)) => Ok(remote),
-        Ok(Err(PublishError::Reconnect)) => Err(publisher.reconnect().to_owned()),
+        Ok(Err(PublishError::Reconnect)) => Err(refused(app, publisher, account).await),
+        Ok(Err(PublishError::Denied)) => Err(publisher.reconnect().to_owned()),
         Ok(Err(PublishError::Failed(msg))) => Err(msg),
         Err(_) => Err("Timed out; it may have posted, check the account.".to_owned()),
     }
@@ -1517,9 +1543,15 @@ async fn publish_target(
     let Some(publisher) = publisher(app, &post.platform) else {
         return fail_target(db, id, "This platform cannot publish yet.").await;
     };
+    // An account already known to need a reconnect fails at once, without a call.
+    if expiry::status(&account, chrono::Utc::now()) == expiry::Status::Reconnect {
+        return fail_target(db, id, publisher.reconnect()).await;
+    }
     let secret = match credential(app, &account).await {
         Ok(secret) => secret,
-        Err(PublishError::Reconnect) => return fail_target(db, id, publisher.reconnect()).await,
+        Err(PublishError::Reconnect | PublishError::Denied) => {
+            return fail_target(db, id, publisher.reconnect()).await
+        }
         Err(PublishError::Failed(msg)) => return fail_target(db, id, &msg).await,
     };
     let media: Vec<String> = serde_json::from_value(post.media.clone()).unwrap_or_default();
@@ -1583,7 +1615,9 @@ async fn publish_target(
             Ok(secret) => secret,
             Err(e) => {
                 let why = match e {
-                    PublishError::Reconnect => publisher.reconnect().to_owned(),
+                    PublishError::Reconnect | PublishError::Denied => {
+                        publisher.reconnect().to_owned()
+                    }
                     PublishError::Failed(msg) => msg,
                 };
                 let msg = format!(
@@ -1684,7 +1718,7 @@ async fn set_cover(
     };
     let why = match tokio::time::timeout(TARGET_TIMEOUT, sent).await {
         Ok(Ok(())) => return,
-        Ok(Err(PublishError::Reconnect)) => publisher.reconnect().to_owned(),
+        Ok(Err(PublishError::Reconnect | PublishError::Denied)) => publisher.reconnect().to_owned(),
         Ok(Err(PublishError::Failed(msg))) => msg,
         Err(_) => "Timed out; the cover may have been set, check the account.".to_owned(),
     };
@@ -1728,7 +1762,9 @@ async fn first_comment(
     };
     let outcome = match tokio::time::timeout(TARGET_TIMEOUT, sent).await {
         Ok(Ok(comment_id)) => Ok(comment_id),
-        Ok(Err(PublishError::Reconnect)) => Err(publisher.reconnect().to_owned()),
+        Ok(Err(PublishError::Reconnect | PublishError::Denied)) => {
+            Err(publisher.reconnect().to_owned())
+        }
         Ok(Err(PublishError::Failed(msg))) => Err(msg),
         Err(_) => Err("Timed out; the comment may have posted, check the account.".to_owned()),
     };
@@ -1842,7 +1878,7 @@ pub async fn takedown(app: &AppState, post: &posts::Model) -> Result<Vec<String>
         let name = named(&account);
         let secret = match credential(app, &account).await {
             Ok(secret) => Some(secret),
-            Err(PublishError::Reconnect) => None,
+            Err(PublishError::Reconnect | PublishError::Denied) => None,
             Err(PublishError::Failed(msg)) => {
                 problems.push(format!(
                     "{name}: {msg} Delete the post in the app if it is still up."
@@ -1930,7 +1966,7 @@ async fn delete_one(
     let account = &account;
     let secret = match credential(app_state, account).await {
         Ok(secret) => secret,
-        Err(PublishError::Reconnect) => {
+        Err(PublishError::Reconnect | PublishError::Denied) => {
             return Some(format!(
                 "{name}: {} Or delete the post in the {app} app.",
                 publisher.reconnect()
@@ -1949,7 +1985,7 @@ async fn delete_one(
     .await;
     match done {
         Ok(Ok(())) => None,
-        Ok(Err(PublishError::Reconnect)) => Some(format!(
+        Ok(Err(PublishError::Reconnect | PublishError::Denied)) => Some(format!(
             "{name}: {} Or delete the post in the {app} app.",
             publisher.reconnect()
         )),

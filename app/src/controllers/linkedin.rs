@@ -85,7 +85,7 @@ async fn callback(
             tracing::warn!(why, "linkedin connect failed");
             return fail("linkedin_failed");
         }
-        Err(PostError::Reconnect) => {
+        Err(PostError::Reconnect | PostError::Denied) => {
             tracing::warn!("linkedin refused the new token");
             return fail("linkedin_failed");
         }
@@ -180,8 +180,14 @@ pub async fn refresh_tokens(app: &AppState) -> Result<u64, DbErr> {
                 tracing::warn!(account = %id, why, "linkedin token refresh failed");
                 continue;
             }
+            // A missing permission says nothing about the token: no flag.
+            Err(PostError::Denied) => {
+                tracing::warn!(account = %id, "linkedin denied the token refresh");
+                continue;
+            }
             Err(PostError::Reconnect) => {
                 tracing::warn!(account = %id, "linkedin refused the token refresh");
+                crate::expiry::flag_reconnect(&app.db, id).await;
                 continue;
             }
         };

@@ -375,6 +375,9 @@ const POST_COLLECTION: &str = "app.bsky.feed.post";
 pub enum PostError {
     /// The app password was refused: the account must be connected again.
     Reconnect,
+    /// The platform refused a permission, not the token: the user is told to reconnect (it may
+    /// grant the permission), but nothing marks the account as dead.
+    Denied,
     Failed(String),
 }
 

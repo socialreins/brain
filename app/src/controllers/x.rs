@@ -107,7 +107,7 @@ async fn fetch(
 fn log(e: &PostError, step: &str) {
     match e {
         PostError::Failed(why) => tracing::warn!(why, step, "x connect failed"),
-        PostError::Reconnect => tracing::warn!(step, "x refused the connect"),
+        PostError::Reconnect | PostError::Denied => tracing::warn!(step, "x refused the connect"),
     }
 }
 
@@ -312,7 +312,7 @@ pub async fn refresh_tokens(app: &AppState) -> Result<u64, DbErr> {
         let id: Uuid = row.try_get("", "id")?;
         match renew(app, id, JOB_RENEW_WITHIN).await {
             Ok((_, true)) => done += 1,
-            Ok((_, false)) | Err(PostError::Reconnect) => {}
+            Ok((_, false)) | Err(PostError::Reconnect | PostError::Denied) => {}
             Err(PostError::Failed(why)) => {
                 tracing::warn!(account = %id, why, "x token refresh failed");
             }

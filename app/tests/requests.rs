@@ -5606,6 +5606,19 @@ mod teams {
                     assert_eq!(got, (Some("threads".into()), None));
                 }
 
+                /// Marks the account as the platform refusing it, the way a dead token does.
+                pub(super) async fn set_flag(db: &DatabaseConnection, account: uuid::Uuid) {
+                    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+                    db.execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "UPDATE social_accounts SET meta = meta || '{\"reconnect\": true}' \
+                         WHERE id = $1",
+                        [account.into()],
+                    ))
+                    .await
+                    .unwrap();
+                }
+
                 pub(super) async fn set_role(
                     db: &DatabaseConnection,
                     user: uuid::Uuid,
@@ -5873,6 +5886,28 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
+                async fn connecting_again_clears_the_reconnect_flag() {
+                    let (s, db, _, _) = on_threads(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    connect_threads(&s, &cookie).await;
+                    set_flag(&db, threads_account(&db, &team_id).await.id).await;
+                    let a = list(&s, &cookie).await.remove(0);
+                    assert_eq!(
+                        (a["status"].as_str(), a["reconnect"].as_bool()),
+                        (Some("reconnect"), Some(true))
+                    );
+                    connect_threads(&s, &cookie).await;
+                    let a = list(&s, &cookie).await.remove(0);
+                    assert_eq!(a["status"], "ok");
+                    assert!(a.get("reconnect").is_none(), "{a}");
+                }
+
+                #[tokio::test]
+                #[serial]
                 async fn the_daily_refresh_extends_tokens_near_expiry() {
                     let (s, db, state, _) = on_threads(true).await;
                     let (_, cookie, _) = user(&s, &db).await;
@@ -5955,7 +5990,7 @@ mod teams {
             /// LinkedIn: the connect flow, publishing through the Posts, Images and Videos APIs
             /// mock, take down, expired tokens and the daily token renewal.
             mod linkedin_api {
-                use super::threads_api::{location, set_role};
+                use super::threads_api::{location, set_flag, set_role};
                 use super::*;
                 use axum::{
                     extract::{Form, Path, Query},
@@ -6600,6 +6635,8 @@ mod teams {
                     assert!(why.contains("w_member_social_feed"), "{why}");
                     // Not a reconnect prompt: the 403 is the app's permission, not the token.
                     assert!(!why.contains("Reconnect the account under"), "{why}");
+                    // And a side call never marks the account.
+                    assert_eq!(list(&s, &cookie).await[0]["status"], "ok");
 
                     // Once the permission is there, nothing retries it by itself. The target is
                     // sent again (queued, pending, unsent): only the `comment_status IS NULL`
@@ -7053,6 +7090,245 @@ mod teams {
                     linkedin::refresh_tokens(&state).await.unwrap();
                     let row = linkedin_account(&db, &team_id).await;
                     assert_eq!(cipher().decrypt(&row.access_token).unwrap(), b"lin");
+                }
+
+                // Token expiry and reconnect handling, on LinkedIn (60-day tokens, no refresh).
+
+                fn flag_of(a: &Value) -> (Option<&str>, Option<&str>) {
+                    (a["status"].as_str(), a["token_expires_at"].as_str())
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn the_list_says_when_an_account_needs_a_reconnect() {
+                    let (s, db, state, _, cookie, team_id, set) = team().await;
+                    let account = linkedin_account(&db, &team_id).await.id;
+                    let status = || async { list(&s, &cookie).await[0]["status"].clone() };
+                    assert_eq!(status().await, "ok");
+                    // A week or less left and nothing renews it.
+                    set_token(&db, account, "lin", 6).await;
+                    let a = list(&s, &cookie).await.remove(0);
+                    assert_eq!(flag_of(&a).0, Some("expiring"));
+                    assert!(flag_of(&a).1.is_some());
+                    assert!(a.get("reconnect").is_none());
+                    set_token(&db, account, "lin", 8).await;
+                    assert_eq!(status().await, "ok");
+                    set_token(&db, account, "lin", -1).await;
+                    assert_eq!(status().await, "reconnect");
+
+                    // A token LinkedIn refuses sets the flag, whatever its end date says.
+                    set_token(&db, account, "dead", 30).await;
+                    assert_eq!(status().await, "ok");
+                    let id = id_of(&create(&s, &cookie, linkedin_post(&set, "a")).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["targets"][0]["error"], publish::LINKEDIN_RECONNECT);
+                    let a = list(&s, &cookie).await.remove(0);
+                    assert_eq!(a["status"], "reconnect");
+                    assert_eq!(a["reconnect"], true);
+                    assert!(a["token_expires_at"].is_string(), "the end date stays");
+
+                    // Reconnecting replaces the token and clears the flag.
+                    connect_with(&s, &cookie, "good").await;
+                    let a = list(&s, &cookie).await.remove(0);
+                    assert_eq!(a["status"], "ok");
+                    assert!(a.get("reconnect").is_none(), "{a}");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn posts_for_a_flagged_account_fail_at_once_pointing_to_reconnect() {
+                    let (s, db, state, _, cookie, team_id, set) = team().await;
+                    let account = linkedin_account(&db, &team_id).await.id;
+                    // The token itself is fine; the flag alone stops the post before any call.
+                    set_flag(&db, account).await;
+                    let (posts, uploads) =
+                        (POSTS.lock().unwrap().len(), UPLOADS.lock().unwrap().len());
+                    let first = id_of(&create(&s, &cookie, linkedin_post(&set, "one")).await);
+                    let second = id_of(&create(&s, &cookie, linkedin_post(&set, "two")).await);
+                    publish::tick(&state).await.unwrap();
+                    for id in [first, second] {
+                        let p = get_post(&s, &cookie, &id).await;
+                        assert_eq!(p["status"], "failed", "{p}");
+                        let why = p["targets"][0]["error"].as_str().unwrap();
+                        assert_eq!(why, publish::LINKEDIN_RECONNECT);
+                        assert!(why.contains("Reconnect the account under Connections"));
+                    }
+                    assert_eq!(POSTS.lock().unwrap().len(), posts);
+                    assert_eq!(UPLOADS.lock().unwrap().len(), uploads);
+                    // After a reconnect the same account publishes again.
+                    connect_with(&s, &cookie, "good").await;
+                    let id = id_of(&create(&s, &cookie, linkedin_post(&set, "back")).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                }
+
+                /// `state` with its mailer pointed at a fake Resend, and what that took.
+                async fn mail_to_fake(
+                    state: &AppState,
+                ) -> (AppState, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+                    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let log = seen.clone();
+                    let app = Router::new().route(
+                        "/emails",
+                        post(move |Json(body): Json<Value>| async move {
+                            log.lock().unwrap().push(body);
+                            Json(json!({"id": "x"}))
+                        }),
+                    );
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let url = format!("http://{}/emails", listener.local_addr().unwrap());
+                    tokio::spawn(async move { axum::serve(listener, app).await });
+                    let mut state = state.clone();
+                    state.mailer = socialreins_brain::mail::Mailer::resend_at(
+                        &url,
+                        "re_test",
+                        "b@example.com",
+                    )
+                    .unwrap();
+                    (state, seen)
+                }
+
+                /// Adds a user to the team with `role`; returns its email.
+                async fn add_user(db: &DatabaseConnection, team_id: &str, role: &str) -> String {
+                    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+                    let (email, id) = (unique_email(), uuid::Uuid::now_v7());
+                    let team = team_id.parse::<uuid::Uuid>().unwrap();
+                    for (sql, values) in [
+                        (
+                            "INSERT INTO users (id, email, name) VALUES ($1, $2, 'T')",
+                            vec![id.into(), email.clone().into()],
+                        ),
+                        (
+                            "INSERT INTO team_user (team_id, user_id, role) VALUES ($1, $2, $3)",
+                            vec![team.into(), id.into(), role.into()],
+                        ),
+                    ] {
+                        let stmt = Statement::from_sql_and_values(DbBackend::Postgres, sql, values);
+                        db.execute_raw(stmt).await.unwrap();
+                    }
+                    email
+                }
+
+                /// The mails to `to` so far: (subject, text).
+                fn mails(seen: &std::sync::Mutex<Vec<Value>>, to: &str) -> Vec<(String, String)> {
+                    seen.lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|m| m["to"][0] == to)
+                        .map(|m| {
+                            let get = |k: &str| m[k].as_str().unwrap().to_owned();
+                            (get("subject"), get("text"))
+                        })
+                        .collect()
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_mail_nobody_received_is_tried_again_on_the_next_run() {
+                    let (s, db, state, _) = on_linkedin(true).await;
+                    let (owner, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    connect_with(&s, &cookie, "good").await;
+                    let account = linkedin_account(&db, &team_id).await.id;
+                    set_token(&db, account, "lin", 3).await;
+                    // The mail service is down: nothing went out, so the claim is released.
+                    let mut broken = state.clone();
+                    broken.mailer = socialreins_brain::mail::Mailer::resend_at(
+                        "http://127.0.0.1:9/emails",
+                        "k",
+                        "b@example.com",
+                    )
+                    .unwrap();
+                    socialreins_brain::expiry::notify(&broken).await.unwrap();
+                    let row = linkedin_account(&db, &team_id).await;
+                    assert!(row.meta.get("expiry_notice").is_none(), "{}", row.meta);
+                    // Once it works, the next run mails.
+                    let (state, seen) = mail_to_fake(&state).await;
+                    socialreins_brain::expiry::notify(&state).await.unwrap();
+                    assert_eq!(mails(&seen, &owner).len(), 1);
+                    let row = linkedin_account(&db, &team_id).await;
+                    assert_eq!(row.meta["expiry_notice"], "expiring");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn owners_and_admins_hear_once_a_week_before_and_once_when_it_ended() {
+                    let (s, db, state, _) = on_linkedin(true).await;
+                    let (owner, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    connect_with(&s, &cookie, "good").await;
+                    let (admin, member) = (
+                        add_user(&db, &team_id, "admin").await,
+                        add_user(&db, &team_id, "member").await,
+                    );
+                    let account = linkedin_account(&db, &team_id).await.id;
+                    let (state, seen) = mail_to_fake(&state).await;
+                    let count = |who: &str| mails(&seen, who).len();
+
+                    // Plenty of time left: nothing.
+                    set_token(&db, account, "lin", 30).await;
+                    socialreins_brain::expiry::notify(&state).await.unwrap();
+                    assert_eq!(count(&owner), 0);
+
+                    // Within a week: the owner and the admin, not the member, with the end date.
+                    set_token(&db, account, "lin", 5).await;
+                    socialreins_brain::expiry::notify(&state).await.unwrap();
+                    assert_eq!((count(&owner), count(&admin), count(&member)), (1, 1, 0));
+                    let (subject, text) = mails(&seen, &owner).remove(0);
+                    let end = (Utc::now() + Duration::days(5))
+                        .format("%Y-%m-%d")
+                        .to_string();
+                    assert!(
+                        subject.contains("LinkedIn") && subject.contains(&end),
+                        "{subject}"
+                    );
+                    assert!(text.contains("/app/connections"), "{text}");
+                    // Every later run, and a second instance racing it, stays quiet.
+                    let (a, b) = tokio::join!(
+                        socialreins_brain::expiry::notify(&state),
+                        socialreins_brain::expiry::notify(&state)
+                    );
+                    a.unwrap();
+                    b.unwrap();
+                    assert_eq!((count(&owner), count(&admin)), (1, 1));
+
+                    // Once it ended: one more mail each, then quiet again.
+                    set_token(&db, account, "lin", -1).await;
+                    socialreins_brain::expiry::notify(&state).await.unwrap();
+                    socialreins_brain::expiry::notify(&state).await.unwrap();
+                    assert_eq!((count(&owner), count(&admin), count(&member)), (2, 2, 0));
+                    assert!(mails(&seen, &owner)[1]
+                        .0
+                        .starts_with("Reconnect your LinkedIn"));
+
+                    // A reconnect starts a new cycle.
+                    connect_with(&s, &cookie, "good").await;
+                    set_token(&db, account, "lin", 3).await;
+                    socialreins_brain::expiry::notify(&state).await.unwrap();
+                    assert_eq!(count(&owner), 3);
+                    // So does a renewal: back above a week, then near the end again.
+                    set_token(&db, account, "lin", 40).await;
+                    socialreins_brain::expiry::notify(&state).await.unwrap();
+                    set_token(&db, account, "lin", 2).await;
+                    socialreins_brain::expiry::notify(&state).await.unwrap();
+                    assert_eq!(count(&owner), 4);
+
+                    // A refused token is announced too, even with a date far ahead.
+                    connect_with(&s, &cookie, "good").await;
+                    set_flag(&db, account).await;
+                    socialreins_brain::expiry::notify(&state).await.unwrap();
+                    assert_eq!(count(&owner), 5);
+                    assert!(mails(&seen, &owner)[4]
+                        .0
+                        .starts_with("Reconnect your LinkedIn"));
                 }
             }
 
@@ -10494,6 +10770,8 @@ mod teams {
                 static THUMBS: std::sync::Mutex<Vec<(String, String, String)>> =
                     std::sync::Mutex::new(Vec::new());
                 static THUMB_MODE: AtomicU64 = AtomicU64::new(0);
+                /// 1: deleting answers error code 200 (a missing permission, not a dead token).
+                static DELETE_MODE: AtomicU64 = AtomicU64::new(0);
 
                 type Answer = (axum::http::StatusCode, Json<Value>);
 
@@ -10533,6 +10811,7 @@ mod teams {
                 /// Page 102; code `none` grants no Page.
                 async fn mock_meta() -> String {
                     THUMB_MODE.store(0, Ordering::SeqCst);
+                    DELETE_MODE.store(0, Ordering::SeqCst);
                     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let base = format!("http://{}", listener.local_addr().unwrap());
                     let token = |Form(f): Form<HashMap<String, String>>| async move {
@@ -10672,6 +10951,9 @@ mod teams {
                     let remove = |h: axum::http::HeaderMap, Path(id): Path<String>| async move {
                         if !page_token(&h) {
                             return refused(190, "expired");
+                        }
+                        if DELETE_MODE.load(Ordering::SeqCst) == 1 {
+                            return refused(200, "Permissions error");
                         }
                         REMOVED.lock().unwrap().push(id);
                         ok(json!({"success": true}))
@@ -11094,6 +11376,50 @@ mod teams {
                     let res = create(&s, &cookie, post).await;
                     assert_eq!(res.status_code(), 422);
                     res.assert_json(&json!({"error": "thread_not_supported"}));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn only_a_dead_token_on_the_main_call_marks_the_account() {
+                    let (s, db, state, base) = on_meta(true).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let ctx = (&s, &db, &state, base.as_str());
+                    let status = |provider: &'static str| {
+                        let (s, cookie) = (&s, &cookie);
+                        async move {
+                            let all = list(s, cookie).await;
+                            let a = all.iter().find(|a| a["provider"] == provider).unwrap();
+                            a["status"].clone()
+                        }
+                    };
+                    let (p, _) =
+                        publish_one(ctx, &cookie, meta_post(&set, "facebook", "hi"), &[]).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    // A permission error (code 200) on take down is that action's own error.
+                    DELETE_MODE.store(1, Ordering::SeqCst);
+                    let path = format!("/v1/posts/{}", p["id"].as_str().unwrap());
+                    let res = req(&s, Method::DELETE, &path, &cookie).await;
+                    assert_ne!(res.json::<Value>()["status"], "deleted", "{}", res.text());
+                    DELETE_MODE.store(0, Ordering::SeqCst);
+                    assert_eq!(status("facebook").await, "ok");
+
+                    // Error 190 on the main publish call is a dead token.
+                    let page = account(&db, &team_id, "facebook", "101").await;
+                    let dead = social_accounts::ActiveModel {
+                        id: Set(page.id),
+                        access_token: Set(cipher().encrypt(b"dead")),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(dead)
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                    let post = meta_post(&set, "facebook", "again");
+                    let (p, _) = publish_one(ctx, &cookie, post, &[]).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    assert_eq!(p["targets"][0]["error"], publish::META_RECONNECT);
+                    assert_eq!(status("facebook").await, "reconnect");
                 }
 
                 #[tokio::test]
