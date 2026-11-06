@@ -2,6 +2,7 @@ pub mod automations;
 pub mod config;
 pub mod connectors;
 pub mod controllers;
+pub mod expiry;
 pub mod inbox;
 pub mod mail;
 pub mod mcp;

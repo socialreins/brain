@@ -304,6 +304,7 @@ pub async fn ingest(app: &AppState, account: social_accounts::Model) -> Result<(
                 vec![account.id.into()],
             );
             db.execute_raw(stmt).await?;
+            crate::expiry::flag_reconnect(db, account.id).await;
             return Ok(());
         }
         Err(e) => tracing::warn!(code = e.code(), account = %account.id, "notifications failed"),

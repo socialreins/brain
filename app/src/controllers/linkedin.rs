@@ -182,6 +182,7 @@ pub async fn refresh_tokens(app: &AppState) -> Result<u64, DbErr> {
             }
             Err(PostError::Reconnect) => {
                 tracing::warn!(account = %id, "linkedin refused the token refresh");
+                crate::expiry::flag_reconnect(&app.db, id).await;
                 continue;
             }
         };

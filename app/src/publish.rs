@@ -32,6 +32,7 @@ use crate::{
         youtube::{self, YouTube},
     },
     controllers::posts::ThreadPart,
+    expiry,
     media::{Fail, Stored},
     models::{
         post_targets, posts, social_account_social_set as membership, social_accounts, social_sets,
@@ -883,6 +884,28 @@ async fn credential(
     app: &AppState,
     account: &social_accounts::Model,
 ) -> Result<String, PublishError> {
+    let got = read_credential(app, account).await;
+    if matches!(got, Err(PublishError::Reconnect)) {
+        expiry::flag_reconnect(&app.db, account.id).await;
+    }
+    got
+}
+
+/// What a publisher says when the platform refused the account, after flagging the account so
+/// the connections list asks for a reconnect.
+async fn refused(
+    app: &AppState,
+    publisher: &dyn Publisher,
+    account: &social_accounts::Model,
+) -> String {
+    expiry::flag_reconnect(&app.db, account.id).await;
+    publisher.reconnect().to_owned()
+}
+
+async fn read_credential(
+    app: &AppState,
+    account: &social_accounts::Model,
+) -> Result<String, PublishError> {
     if account.provider == "youtube" {
         return crate::controllers::youtube::fresh_token(app, account).await;
     }
@@ -1487,7 +1510,7 @@ async fn send(
     };
     match tokio::time::timeout(publisher.timeout(), sent).await {
         Ok(Ok(remote)) => Ok(remote),
-        Ok(Err(PublishError::Reconnect)) => Err(publisher.reconnect().to_owned()),
+        Ok(Err(PublishError::Reconnect)) => Err(refused(app, publisher, account).await),
         Ok(Err(PublishError::Failed(msg))) => Err(msg),
         Err(_) => Err("Timed out; it may have posted, check the account.".to_owned()),
     }
@@ -1517,6 +1540,10 @@ async fn publish_target(
     let Some(publisher) = publisher(app, &post.platform) else {
         return fail_target(db, id, "This platform cannot publish yet.").await;
     };
+    // An account already known to need a reconnect fails at once, without a call.
+    if expiry::status(&account, chrono::Utc::now()) == expiry::Status::Reconnect {
+        return fail_target(db, id, publisher.reconnect()).await;
+    }
     let secret = match credential(app, &account).await {
         Ok(secret) => secret,
         Err(PublishError::Reconnect) => return fail_target(db, id, publisher.reconnect()).await,
@@ -1684,7 +1711,7 @@ async fn set_cover(
     };
     let why = match tokio::time::timeout(TARGET_TIMEOUT, sent).await {
         Ok(Ok(())) => return,
-        Ok(Err(PublishError::Reconnect)) => publisher.reconnect().to_owned(),
+        Ok(Err(PublishError::Reconnect)) => refused(app, publisher, account).await,
         Ok(Err(PublishError::Failed(msg))) => msg,
         Err(_) => "Timed out; the cover may have been set, check the account.".to_owned(),
     };
@@ -1728,7 +1755,7 @@ async fn first_comment(
     };
     let outcome = match tokio::time::timeout(TARGET_TIMEOUT, sent).await {
         Ok(Ok(comment_id)) => Ok(comment_id),
-        Ok(Err(PublishError::Reconnect)) => Err(publisher.reconnect().to_owned()),
+        Ok(Err(PublishError::Reconnect)) => Err(refused(app, publisher, account).await),
         Ok(Err(PublishError::Failed(msg))) => Err(msg),
         Err(_) => Err("Timed out; the comment may have posted, check the account.".to_owned()),
     };
@@ -1951,7 +1978,7 @@ async fn delete_one(
         Ok(Ok(())) => None,
         Ok(Err(PublishError::Reconnect)) => Some(format!(
             "{name}: {} Or delete the post in the {app} app.",
-            publisher.reconnect()
+            refused(app_state, publisher, account).await
         )),
         Ok(Err(PublishError::Failed(msg))) => Some(format!(
             "{name}: {msg} Delete the post in the {app} app if it is still up."
