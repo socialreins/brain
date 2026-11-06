@@ -205,6 +205,11 @@ pub struct Posted {
     pub video_id: Option<String>,
 }
 
+/// A video TikTok never reported done: it may still post, so a retry leaves it alone
+/// (`publish::outcome_unknown`).
+pub const NOT_DONE: &str =
+    "TikTok has not said it is done and may still post it. Check the account before posting again.";
+
 fn failed(msg: impl Into<String>) -> PostError {
     PostError::Failed(msg.into())
 }
@@ -616,9 +621,7 @@ impl TikTok {
                 _ => {}
             }
             if started.elapsed() >= POLL_FOR {
-                return Err(failed(
-                    "TikTok has not said it is done and may still post it. Check the account before posting again.",
-                ));
+                return Err(failed(NOT_DONE));
             }
             tokio::time::sleep(self.poll_every).await;
         }

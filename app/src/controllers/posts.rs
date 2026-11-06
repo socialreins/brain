@@ -4,7 +4,8 @@
 //! Posts of a deleted set are hidden (and held back) until the set is restored. Every route
 //! takes an API token too (`Actor`); a set token only sees and writes its set's posts. Token
 //! writes take an optional `Idempotency-Key` header (see `idempotency`). `POST /post-groups`
-//! creates one post per platform in one go, tied by a `group_id`.
+//! creates one post per platform in one go, tied by a `group_id`; `POST /posts/{id}/retry` and
+//! `POST /post-groups/{group_id}/retry` publish the targets that failed again.
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use axum::{
@@ -31,6 +32,7 @@ use super::{
     api_tokens::Actor,
     auth::{internal, Body},
     connections::live_sets,
+    idempotency::IDEMPOTENCY,
     lists::{self, lists_of, ListRef},
     waitlist::{error, Error},
 };
@@ -144,6 +146,8 @@ pub struct PostInput {
     /// the token's set and any other set is `invalid_set`.
     pub social_set_id: Option<Uuid>,
     /// `bluesky`, `threads`, `linkedin`, `facebook`, `instagram`, `youtube`, `x` or `tiktok` (the platforms that publish today).
+    /// A post goes to every account of its platform in its set (one target each), not to a
+    /// chosen one: to post to one account, give it a set of its own.
     pub platform: String,
     /// At most 300 graphemes on Bluesky, 500 characters on Threads, 3000 on LinkedIn, 63206 on Facebook, 2200 on
     /// Instagram, 280 on X as X counts them (a link is 23, a CJK character or emoji 2). On YouTube the first line is the video's title (required, at most 100 characters)
@@ -151,6 +155,13 @@ pub struct PostInput {
     /// (`invalid_text`). On TikTok at most 2200 characters, the video's caption.
     #[serde(default)]
     pub body: String,
+    /// A PDF is a LinkedIn document: it must be the post's only media item, and the file's bytes
+    /// decide (not the URL's extension). LinkedIn shows it as a swipeable document titled by the
+    /// body's first non-empty line (at most 100 characters, else `Document`), and refuses files
+    /// over 300 pages with its own reason on the target. Any other platform fails the target
+    /// (`Image N is a PDF...`) before posting, and a PDF next to other media fails it too. At most
+    /// 100 MB.
+    ///
     /// Public `https://` media URLs: on Bluesky at most 4 images (JPEG, PNG, WebP or GIF, 1 MB
     /// each), on Threads at most 20 JPEG or PNG images or MP4 or MOV videos, on LinkedIn at most 20 JPEG, PNG or GIF images or one MP4 video, on Facebook at most
     /// 10 JPEG, PNG or GIF images or one MP4 or MOV video (a Reel), on Instagram 1 to 10 JPEG
@@ -188,8 +199,11 @@ pub struct PostInput {
     /// the commercial content disclosure and the AI-generated flag. Branded content cannot be
     /// `SELF_ONLY`. Other platforms answer `tiktok_not_supported`; invalid settings answer
     /// `tiktok_privacy_required`, `invalid_tiktok_privacy`, `invalid_tiktok_disclosure`,
-    /// `tiktok_disclosure_incomplete` or `tiktok_branded_content_private`. Without them a TikTok
-    /// post goes out with the most public level the account is offered and every interaction off.
+    /// `tiktok_disclosure_incomplete` or `tiktok_branded_content_private`. A TikTok post saved
+    /// without them (`POST /posts`, `PUT /posts/{id}` or `POST /post-groups`) is `422
+    /// tiktok_settings_required`, so an update cannot remove them either. Posts saved before
+    /// this rule without settings stay readable and still go out with the most public level
+    /// the account is offered and every interaction off.
     pub tiktok: Option<tiktok::Options>,
     /// When to publish. Set: `scheduled`; absent or `null`: `draft`.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
@@ -216,8 +230,10 @@ pub struct PostQuery {
 pub struct PostGroupInput {
     /// As in `POST /posts`.
     pub social_set_id: Option<Uuid>,
-    /// The platforms to post to, one post each. Absent: every platform brain publishes to
-    /// with a connected account in the set (`422 no_accounts` when there is none).
+    /// The platforms to post to, one post each, each going to every account of that platform
+    /// in the set (one target per account). Absent: every platform brain publishes to with a
+    /// connected account in the set (`422 no_accounts` when there is none), which includes
+    /// TikTok, so then `tiktok` is required too.
     pub platforms: Option<Vec<String>>,
     /// Each post's body, unless its override has one.
     #[serde(default)]
@@ -238,7 +254,10 @@ pub struct PostGroupInput {
     /// cover answer `cover_not_supported` unless they override it with `""`, so pass
     /// `platforms` or override.
     pub cover: Option<String>,
-    /// The TikTok post's settings, unless its override has some. Other platforms get none.
+    /// The TikTok post's settings, unless its override has some. Other platforms get none. A
+    /// group with a TikTok post and no `tiktok.privacy_level` (here or in the override) is
+    /// `422 {"error":"tiktok_settings_required","platform":"tiktok"}`: the visibility has no
+    /// default, and brain never picks the most public one for you.
     pub tiktok: Option<tiktok::Options>,
     /// As in `POST /posts`, for every post.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
@@ -263,11 +282,47 @@ pub struct Override {
     pub tiktok: Option<tiktok::Options>,
 }
 
+/// A failed target a retry left alone because it may already have posted.
+#[derive(Clone, Serialize, ToSchema)]
+pub struct SkippedTarget {
+    pub target_id: Uuid,
+    pub post_id: Uuid,
+    pub social_account_id: Option<Uuid>,
+    /// Always `outcome_unknown`.
+    pub reason: String,
+    /// What the target failed with, e.g. `Timed out; it may have posted, check the account.`
+    pub error: Option<String>,
+}
+
+/// `POST /posts/{id}/retry`: the post, queued, and the failed targets left alone.
+#[derive(Serialize, ToSchema)]
+pub struct PostRetry {
+    #[serde(flatten)]
+    pub post: Post,
+    /// Failed targets that may already have posted (a timeout, a run cut off, a platform that
+    /// never said it was done). They were not re-queued: check the account on the platform.
+    pub skipped_targets: Vec<SkippedTarget>,
+}
+
+/// `POST /post-groups/{group_id}/retry`: the group, queued, and the failed targets left alone.
+#[derive(Serialize, ToSchema)]
+pub struct GroupRetry {
+    #[serde(flatten)]
+    pub group: PostGroup,
+    /// As in `PostRetry`.
+    pub skipped_targets: Vec<SkippedTarget>,
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct PostGroup {
     pub group_id: Uuid,
-    /// One post per platform, in platform order.
+    /// One post per platform, in the order they were given.
     pub posts: Vec<Post>,
+    /// How many targets the group will have once everything has gone out: one per account of
+    /// each post's platform in its set. A post that already has targets counts those, one that
+    /// has none yet counts the accounts it will fan out to now. Every target has reported when
+    /// that many targets (across `posts`) are `published`, `failed` or `deleted`.
+    pub expected_targets: u64,
 }
 
 fn reply(status: StatusCode, code: &str) -> Response {
@@ -422,6 +477,14 @@ async fn checked(
     if let Err(e) = post::validate_tiktok(&input.platform, choice) {
         return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, e.code())));
     }
+    // The visibility has no default: brain never posts at the most public level unasked. (Rows
+    // saved before this still publish with the auto-picked level, and stay readable.)
+    if input.platform == "tiktok" && input.tiktok.is_none() {
+        return Ok(Err(reply(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "tiktok_settings_required",
+        )));
+    }
     set_for(db, a, input.social_set_id).await
 }
 
@@ -568,7 +631,7 @@ pub async fn get_post(app: &AppState, a: &Actor, id: Uuid) -> Response {
 /// most 2000 per team.
 #[utoipa::path(post, path = "/posts", tag = "posts",
     security(("session" = []), ("api_token" = [])), request_body = PostInput,
-    params(("Idempotency-Key" = Option<String>, Header, description = "With an API token: 1 to 255 printable ASCII characters. A retry with the same key, path and body replays the first answer for 30 days")),
+    params(("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 201, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 409, body = Error), (status = 422, body = Error)))]
 async fn create(State(app): State<AppState>, a: Actor, Body(input): Body<PostInput>) -> Response {
@@ -649,7 +712,7 @@ async fn insert(
 /// `"platform"` added, e.g. `422 {"error":"too_long","platform":"bluesky"}`.
 #[utoipa::path(post, path = "/post-groups", tag = "posts",
     security(("session" = []), ("api_token" = [])), request_body = PostGroupInput,
-    params(("Idempotency-Key" = Option<String>, Header, description = "With an API token: 1 to 255 printable ASCII characters. A retry with the same key, path and body replays the first answer for 30 days")),
+    params(("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 201, body = PostGroup), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error)))]
@@ -724,16 +787,84 @@ pub async fn create_post_group(app: &AppState, a: &Actor, input: PostGroupInput)
             }
         }
         txn.commit().await?;
-        let posts = posts_json(&app.db, a, rows).await?;
-        Ok::<_, DbErr>(Ok(PostGroup {
-            group_id: group,
-            posts,
-        }))
+        group_json(&app.db, a, group, rows).await.map(Ok)
     };
     match made.await {
         Ok(Ok(g)) => (StatusCode::CREATED, Json(g)).into_response(),
         Ok(Err(res)) => res,
         Err(e) => internal(e, "post group insert"),
+    }
+}
+
+/// The group's posts with their targets, and how many targets it will have in all.
+async fn group_json(
+    db: &impl ConnectionTrait,
+    a: &Actor,
+    group_id: Uuid,
+    rows: Vec<posts::Model>,
+) -> Result<PostGroup, DbErr> {
+    let posts = posts_json(db, a, rows).await?;
+    let mut expected_targets = 0;
+    for p in &posts {
+        expected_targets += if p.targets.is_empty() {
+            let in_set = Select::select()
+                .column(membership::Column::SocialAccountId)
+                .from(membership::Entity)
+                .and_where(membership::Column::SocialSetId.eq(p.social_set_id))
+                .to_owned();
+            social_accounts::Entity::find()
+                .filter(social_accounts::Column::TeamId.eq(a.team.id))
+                .filter(social_accounts::Column::Provider.eq(&p.platform))
+                .filter(social_accounts::Column::Id.in_subquery(in_set))
+                .count(db)
+                .await?
+        } else {
+            p.targets.len() as u64
+        };
+    }
+    Ok(PostGroup {
+        group_id,
+        posts,
+        expected_targets,
+    })
+}
+
+/// The live posts of a group the caller may see, in creation order.
+async fn group_rows(
+    db: &impl ConnectionTrait,
+    a: &Actor,
+    group_id: Uuid,
+) -> Result<Vec<posts::Model>, DbErr> {
+    posts::Entity::find()
+        .filter(posts::Column::GroupId.eq(group_id))
+        .filter(posts::Column::TeamId.eq(a.team.id))
+        .filter(posts::Column::SocialSetId.in_subquery(live_sets()))
+        .filter(in_scope(a))
+        .order_by_asc(posts::Column::CreatedAt)
+        .order_by_asc(posts::Column::Id)
+        .all(db)
+        .await
+}
+
+/// One post group: its posts with their targets, and `expected_targets`, so a client can tell
+/// when every target has reported. `404` for a group of another team, outside a set token's
+/// set, or in a deleted set.
+#[utoipa::path(get, path = "/post-groups/{group_id}", tag = "posts",
+    security(("session" = []), ("api_token" = [])), params(("group_id" = Uuid, Path)),
+    responses((status = 200, body = PostGroup), (status = 401, body = Error),
+        (status = 404, body = Error)))]
+async fn show_group(State(app): State<AppState>, a: Actor, Path(group_id): Path<Uuid>) -> Response {
+    let found = async {
+        let rows = group_rows(&app.db, &a, group_id).await?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        group_json(&app.db, &a, group_id, rows).await.map(Some)
+    };
+    match found.await {
+        Ok(Some(g)) => Json(g).into_response(),
+        Ok(None) => not_found(),
+        Err(e) => internal(e, "post group read"),
     }
 }
 
@@ -776,7 +907,7 @@ async fn naming(res: Response, platform: &str) -> Response {
 /// is `409 not_editable`.
 #[utoipa::path(put, path = "/posts/{id}", tag = "posts",
     security(("session" = []), ("api_token" = [])), request_body = PostInput,
-    params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = "With an API token: 1 to 255 printable ASCII characters. A retry with the same key, path and body replays the first answer for 30 days")),
+    params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 200, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error)))]
@@ -861,7 +992,7 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) 
 /// result. At most 10 publish or take-down calls a minute per user; with scheduled posts, at
 /// most 100 published a day per team (`429 publish_quota`).
 #[utoipa::path(post, path = "/posts/{id}/publish", tag = "posts",
-    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = "With an API token: 1 to 255 printable ASCII characters. A retry with the same key, path and body replays the first answer for 30 days")),
+    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 202, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 429, body = Error)))]
@@ -917,7 +1048,7 @@ async fn publish_now(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>
 /// {"error":"takedown_failed","message"}` says what to do, and a retry only tries what is still
 /// up. `queued` and `failed`: `409 not_deletable`.
 #[utoipa::path(delete, path = "/posts/{id}", tag = "posts",
-    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = "With an API token: 1 to 255 printable ASCII characters. A retry with the same key, path and body replays the first answer for 30 days")),
+    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 204), (status = 200, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error), (status = 429, body = Error)))]
@@ -982,14 +1113,208 @@ pub async fn delete_post(app: &AppState, a: &Actor, id: Uuid) -> Response {
     }
 }
 
+/// Re-queues the retryable targets of the posts `ids` in one transaction and returns the posts
+/// to publish. Retryable: `failed` targets of `published` or `failed` posts (never a
+/// `published` one), those cut off midway through a thread continuing after the parts already out.
+/// Nothing changes unless every post is settled: `409 publish_in_progress` while a post is
+/// `queued` or a target is `pending` or `publishing`, `409 nothing_to_retry` without a
+/// retryable target.
+async fn requeue(
+    app: &AppState,
+    a: &Actor,
+    ids: &[Uuid],
+) -> Result<Result<(Vec<Uuid>, Vec<SkippedTarget>), Response>, DbErr> {
+    let txn = app.db.begin().await?;
+    // The rows are locked, so two retries (or a retry and a settle) cannot interleave.
+    let rows = posts::Entity::find()
+        .filter(posts::Column::Id.is_in(ids.iter().copied()))
+        .filter(posts::Column::TeamId.eq(a.team.id))
+        .filter(posts::Column::SocialSetId.in_subquery(live_sets()))
+        .filter(in_scope(a))
+        .order_by_asc(posts::Column::Id)
+        .lock_exclusive()
+        .all(&txn)
+        .await?;
+    if rows.len() != ids.len() {
+        return Ok(Err(not_found()));
+    }
+    let targets = post_targets::Entity::find()
+        .filter(post_targets::Column::PostId.is_in(ids.iter().copied()))
+        .all(&txn)
+        .await?;
+    let busy = rows.iter().any(|p| p.status == "queued")
+        || targets
+            .iter()
+            .any(|t| t.status == "pending" || t.status == "publishing");
+    if busy {
+        return Ok(Err(reply(StatusCode::CONFLICT, "publish_in_progress")));
+    }
+    let mut again = Vec::new();
+    let mut posts = Vec::new();
+    let mut skipped = Vec::new();
+    for t in &targets {
+        let post = rows.iter().find(|p| p.id == t.post_id);
+        if let Some(p) = post.filter(|p| p.status == "published" || p.status == "failed") {
+            if publish::retryable(t, p) {
+                again.push(t.id);
+                posts.push(p.id);
+            } else if publish::resendable(t, p) {
+                skipped.push(SkippedTarget {
+                    target_id: t.id,
+                    post_id: p.id,
+                    social_account_id: t.social_account_id,
+                    reason: "outcome_unknown".into(),
+                    error: t.error.clone(),
+                });
+            }
+        }
+    }
+    posts.sort();
+    posts.dedup();
+    if again.is_empty() && skipped.is_empty() {
+        return Ok(Err(reply(StatusCode::CONFLICT, "nothing_to_retry")));
+    }
+    if again.is_empty() {
+        let body = serde_json::json!({
+            "error": "outcome_unknown",
+            "message": "Every failed target may already have posted. Check each account on the \
+                        platform; nothing was sent again.",
+            "targets": skipped,
+        });
+        return Ok(Err((StatusCode::CONFLICT, Json(body)).into_response()));
+    }
+    let now = Utc::now().fixed_offset();
+    post_targets::Entity::update_many()
+        .col_expr(post_targets::Column::Status, "pending".into())
+        .col_expr(post_targets::Column::Error, Option::<String>::None.into())
+        .col_expr(post_targets::Column::UpdatedAt, now.into())
+        .filter(post_targets::Column::Id.is_in(again))
+        .exec(&txn)
+        .await?;
+    posts::Entity::update_many()
+        .col_expr(posts::Column::Status, "queued".into())
+        .col_expr(posts::Column::UpdatedAt, now.into())
+        .filter(posts::Column::Id.is_in(posts.iter().copied()))
+        .exec(&txn)
+        .await?;
+    txn.commit().await?;
+    Ok(Ok((posts, skipped)))
+}
+
+/// Sends the posts `ids` (queued by `requeue`) in the background, each target once.
+fn publish_in_background(app: &AppState, ids: Vec<Uuid>) {
+    for id in ids {
+        let app = app.clone();
+        tokio::spawn(async move {
+            if let Err(e) = publish::publish_post(&app, id).await {
+                tracing::error!(error = %e, post = %id, "retry failed");
+            }
+        });
+    }
+}
+
+/// Publishes a `published` or `failed` post's `failed` targets again; `202` with the queued
+/// post, poll it for the result. A `published` target is never sent again, and no target is
+/// added for an account that joined the set since the first publish. A target that failed
+/// midway through a thread goes on after the parts already out; any other starts over, with the
+/// first comment and cover as the post says. A failure that may already have posted (a
+/// timeout, a run cut off, a platform that never said it was done) is not sent again: it is
+/// listed in `skipped_targets`, and when nothing else failed the answer is `409
+/// outcome_unknown` with those `targets` and a message to check the account on the platform.
+/// `409 publish_in_progress` while the post is `queued` or a target is `pending` or
+/// `publishing`, `409 nothing_to_retry` when no target failed. At most 10 publish, retry or
+/// take-down calls a minute per user. A retry does not count against the daily publish cap
+/// again. Webhooks: a target fires `post.target.failed` once, so a retry that fails again sends
+/// no second one.
+#[utoipa::path(post, path = "/posts/{id}/retry", tag = "posts",
+    security(("session" = []), ("api_token" = [])),
+    params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    responses((status = 202, body = PostRetry), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
+        (status = 429, body = Error)))]
+async fn retry_post(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
+    if !app.post_limiter.hit(a.key()) {
+        return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    }
+    let done = async {
+        if find(&app.db, &a, id).await?.is_none() {
+            return Ok(not_found());
+        }
+        let (queued, skipped_targets) = match requeue(&app, &a, &[id]).await? {
+            Ok(q) => q,
+            Err(res) => return Ok(res),
+        };
+        let Some(p) = find(&app.db, &a, id).await? else {
+            return Ok(not_found());
+        };
+        let p = one_json(&app.db, &a, p).await?;
+        publish_in_background(&app, queued);
+        let body = PostRetry {
+            post: p,
+            skipped_targets,
+        };
+        Ok::<_, DbErr>((StatusCode::ACCEPTED, Json(body)).into_response())
+    };
+    done.await.unwrap_or_else(|e| internal(e, "post retry"))
+}
+
+/// `POST /posts/{id}/retry` for every post of a group at once: all or nothing, so `409
+/// publish_in_progress` when any post of the group is still going out. Posts with nothing to
+/// retry stay as they are; `409 nothing_to_retry` when none has a failed target, `409
+/// outcome_unknown` when the only failures may already have posted. `202` with the group and
+/// the `skipped_targets`.
+#[utoipa::path(post, path = "/post-groups/{group_id}/retry", tag = "posts",
+    security(("session" = []), ("api_token" = [])),
+    params(("group_id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    responses((status = 202, body = GroupRetry), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
+        (status = 429, body = Error)))]
+async fn retry_group(
+    State(app): State<AppState>,
+    a: Actor,
+    Path(group_id): Path<Uuid>,
+) -> Response {
+    if !app.post_limiter.hit(a.key()) {
+        return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    }
+    let done = async {
+        let ids: Vec<Uuid> = group_rows(&app.db, &a, group_id)
+            .await?
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        if ids.is_empty() {
+            return Ok(not_found());
+        }
+        let (queued, skipped_targets) = match requeue(&app, &a, &ids).await? {
+            Ok(q) => q,
+            Err(res) => return Ok(res),
+        };
+        let rows = group_rows(&app.db, &a, group_id).await?;
+        let group = group_json(&app.db, &a, group_id, rows).await?;
+        publish_in_background(&app, queued);
+        let body = GroupRetry {
+            group,
+            skipped_targets,
+        };
+        Ok::<_, DbErr>((StatusCode::ACCEPTED, Json(body)).into_response())
+    };
+    done.await
+        .unwrap_or_else(|e| internal(e, "post group retry"))
+}
+
 pub fn api() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(list, create))
         .routes(routes!(show, update, destroy))
         .routes(routes!(publish_now))
+        .routes(routes!(retry_post))
 }
 
 /// `POST /post-groups`, apart so it can take a larger body than the rest of `/v1`.
 pub fn groups_api() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(create_group))
+    OpenApiRouter::new()
+        .routes(routes!(create_group))
+        .routes(routes!(show_group))
+        .routes(routes!(retry_group))
 }

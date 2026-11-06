@@ -85,6 +85,22 @@ async fn show(State(app): State<AppState>, t: InTeam) -> Response {
 /// Sets the webhook URL. A new webhook gets a signing secret, answered once (`201`); a change
 /// keeps the secret (`200`). Owners and admins, with a sign-in from the last 10 minutes (else
 /// `403 reauth_required`).
+///
+/// Events, each a JSON `POST` `{id, type, created_at, data}` with `SocialReins-Signature:
+/// t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>" keyed by the whole secret>`,
+/// `SocialReins-Event` and `SocialReins-Delivery` headers; a 2xx is delivery, anything else is
+/// retried after 1 and 5 minutes, 30 minutes, 2, 6, 12 and 24 hours, then dropped:
+///
+/// - `post.target.published`, `post.target.failed`, `post.target.deleted`: one per target and
+///   event, never twice, when that account's target reaches the status (a take down is
+///   `deleted`). `data`: `post_id`, `group_id` (null for a single post), `target_id`,
+///   `social_account_id`, `platform`, `status`, `remote_url`, `error`. A post that settles as
+///   `published` can still hold failed targets, so read each target's event, and `failed` is
+///   not final: a retry (`POST /posts/{id}/retry`) can end in `published`, but a target that
+///   fails again does not send a second `failed`.
+/// - `ping`: only from `POST /team/webhook/test`, with an empty `data`.
+///
+/// Delivery order is not guaranteed, so use `created_at`.
 #[utoipa::path(put, path = "/team/webhook", tag = "webhooks", request_body = WebhookInput,
     responses((status = 201, body = NewWebhookReply), (status = 200, body = Webhook),
         (status = 401, body = Error), (status = 403, body = Error), (status = 422, body = Error)))]

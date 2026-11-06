@@ -2,7 +2,7 @@
 //! settle the post; and take published posts down. A thread goes out root first, then each
 //! part as a reply to the one before, each saved on its target the moment the platform takes
 //! it. Every step is a conditional update, so two instances (or a tick and "publish now") never
-//! send a post twice. A publish is never retried: a retry could post twice. Each target status change queues its webhook event in the same
+//! send a post twice. Nothing retries by itself (a retry could post twice); only `POST /posts/{id}/retry` re-queues failed targets, and only on request. Each target status change queues its webhook event in the same
 //! statement (`webhooks::with_event`). Media is downloaded into brain's storage before any
 //! target is claimed (`media.rs`) and deleted once the post settles.
 use std::{
@@ -1072,11 +1072,7 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
         let (done, total): (i32, i32) = (row.try_get("", "done")?, row.try_get("", "total")?);
         let platform: String = row.try_get("", "platform")?;
         let (status, error) = if done < total {
-            let msg = format!(
-                "Unknown, check the account: publishing stopped midway and thread post {} of \
-                 {total} may have posted.",
-                done + 1
-            );
+            let msg = cut_off_part(done + 1, total);
             ("failed", Some(msg))
         } else {
             ("published", None)
@@ -1204,27 +1200,36 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         let msg = format!("Publishing to {} is not available yet.", post.platform);
         return fail_post(db, id, &msg).await;
     }
-    let in_set = Query::select()
-        .column(membership::Column::SocialAccountId)
-        .from(membership::Entity)
-        .and_where(membership::Column::SocialSetId.eq(post.social_set_id))
-        .to_owned();
-    let accounts: Vec<Uuid> = social_accounts::Entity::find()
-        .select_only()
-        .column(social_accounts::Column::Id)
-        .filter(social_accounts::Column::TeamId.eq(post.team_id))
-        .filter(social_accounts::Column::Provider.eq(&post.platform))
-        .filter(social_accounts::Column::Id.in_subquery(in_set))
-        .into_tuple()
-        .all(db)
-        .await?;
-    for account in &accounts {
-        let stmt = sql(
-            "INSERT INTO post_targets (id, post_id, social_account_id, status) \
-             VALUES ($1, $2, $3, 'pending') ON CONFLICT (post_id, social_account_id) DO NOTHING",
-            vec![Uuid::now_v7().into(), id.into(), (*account).into()],
+    // Once only: a retry (or a restart picking the post up) works on the targets it has, and an
+    // account added to the set since gets none.
+    if !post.fanned_out {
+        let in_set = Query::select()
+            .column(membership::Column::SocialAccountId)
+            .from(membership::Entity)
+            .and_where(membership::Column::SocialSetId.eq(post.social_set_id))
+            .to_owned();
+        let accounts: Vec<Uuid> = social_accounts::Entity::find()
+            .select_only()
+            .column(social_accounts::Column::Id)
+            .filter(social_accounts::Column::TeamId.eq(post.team_id))
+            .filter(social_accounts::Column::Provider.eq(&post.platform))
+            .filter(social_accounts::Column::Id.in_subquery(in_set))
+            .into_tuple()
+            .all(db)
+            .await?;
+        for account in &accounts {
+            let stmt = sql(
+                "INSERT INTO post_targets (id, post_id, social_account_id, status) \
+                 VALUES ($1, $2, $3, 'pending') ON CONFLICT (post_id, social_account_id) DO NOTHING",
+                vec![Uuid::now_v7().into(), id.into(), (*account).into()],
+            );
+            db.execute_raw(stmt).await?;
+        }
+        let mark = sql(
+            "UPDATE posts SET fanned_out = true WHERE id = $1",
+            vec![id.into()],
         );
-        db.execute_raw(stmt).await?;
+        db.execute_raw(mark).await?;
     }
     let targets = post_targets::Entity::find()
         .filter(post_targets::Column::PostId.eq(id))
@@ -1452,11 +1457,59 @@ async fn fail_target(db: &DatabaseConnection, id: Uuid, msg: &str) -> Result<(),
     db.execute_raw(stmt).await.map(|_| ())
 }
 
-/// Claims a target (`pending` with no remote id, to `publishing`); false when another run has it.
+/// A pending target that is up but whose thread is not all out yet.
+const UNFINISHED: &str = "jsonb_array_length(t.parts) < \
+    (SELECT jsonb_array_length(p.thread) FROM posts p WHERE p.id = t.post_id)";
+
+const TIMED_OUT: &str = "Timed out; it may have posted, check the account.";
+
+/// What a thread part that went out but could not be saved fails its target with.
+fn unsaved_part(n: usize, total: usize) -> String {
+    format!(
+        "Thread post {n} of {total} went out but could not be saved: it may be live, check \
+         the account."
+    )
+}
+
+/// What a target cut off midway through a thread fails with.
+fn cut_off_part(n: i32, total: i32) -> String {
+    format!(
+        "Unknown, check the account: publishing stopped midway and thread post {n} of \
+         {total} may have posted."
+    )
+}
+
+/// Whether a failure may already have posted: a timeout, a run cut off, a platform that never
+/// said it finished. Resending could post twice, so a retry leaves these to the caller, who
+/// checks the platform. Every such message holds one of these phrases (`MAY_HAVE_POSTED`).
+pub fn outcome_unknown(error: Option<&str>) -> bool {
+    error.is_some_and(|e| MAY_HAVE_POSTED.iter().any(|p| e.contains(p)))
+}
+
+pub const MAY_HAVE_POSTED: [&str; 3] = ["may have posted", "may still post", "may be live"];
+
+/// Whether a failed `target` of `post` could be sent again: it failed before anything went out,
+/// or midway through a thread (the parts saved stay up and the rest follow them). A failed
+/// target whose thread is all out is done.
+pub fn resendable(target: &post_targets::Model, post: &posts::Model) -> bool {
+    let len = |v: &serde_json::Value| v.as_array().map_or(0, Vec::len);
+    target.status == "failed"
+        && (target.remote_id.is_none() || len(&target.parts) < len(&post.thread))
+}
+
+/// Whether a retry re-queues `target`: `resendable`, and not an `outcome_unknown` failure.
+pub fn retryable(target: &post_targets::Model, post: &posts::Model) -> bool {
+    resendable(target, post) && !outcome_unknown(target.error.as_deref())
+}
+
+/// Claims a target (`pending`, to `publishing`); false when another run has it. A target with a
+/// remote id is claimed only to finish its thread (a retry), never to send its root again.
 pub async fn claim_target(db: &DatabaseConnection, id: Uuid) -> Result<bool, DbErr> {
     let stmt = sql(
-        "UPDATE post_targets SET status = 'publishing', updated_at = now() \
-         WHERE id = $1 AND status = 'pending' AND remote_id IS NULL",
+        &format!(
+            "UPDATE post_targets t SET status = 'publishing', updated_at = now() \
+             WHERE t.id = $1 AND t.status = 'pending' AND (t.remote_id IS NULL OR {UNFINISHED})"
+        ),
         vec![id.into()],
     );
     Ok(db.execute_raw(stmt).await?.rows_affected() == 1)
@@ -1515,7 +1568,7 @@ async fn send(
         Ok(Err(PublishError::Reconnect)) => Err(refused(app, publisher, account).await),
         Ok(Err(PublishError::Denied)) => Err(publisher.reconnect().to_owned()),
         Ok(Err(PublishError::Failed(msg))) => Err(msg),
-        Err(_) => Err("Timed out; it may have posted, check the account.".to_owned()),
+        Err(_) => Err(TIMED_OUT.to_owned()),
     }
 }
 
@@ -1533,7 +1586,7 @@ async fn publish_target(
         return Ok(());
     }
     let target = post_targets::Entity::find_by_id(id).one(db).await?;
-    let account = match target.and_then(|t| t.social_account_id) {
+    let account = match target.as_ref().and_then(|t| t.social_account_id) {
         Some(a) => social_accounts::Entity::find_by_id(a).one(db).await?,
         None => None,
     };
@@ -1578,37 +1631,62 @@ async fn publish_target(
     };
     let with = (app, stored);
     let in_call = cover.as_ref().filter(|_| publisher.cover_in_publish());
-    let root = match send(
-        with,
-        publisher,
-        &account,
-        &secret,
-        (&post.body, &media, in_call, tiktok.as_ref()),
-        None,
-    )
-    .await
-    {
-        Ok(remote) => remote,
-        Err(msg) => return fail_target(db, id, &msg).await,
+    // A retried thread goes on from the parts already out: its root and saved parts stay.
+    let saved: Vec<serde_json::Value> = target
+        .as_ref()
+        .and_then(|t| t.parts.as_array().cloned())
+        .unwrap_or_default();
+    let resumed = target.as_ref().and_then(|t| {
+        Some(Remote {
+            id: t.remote_id.clone()?,
+            cid: t.remote_cid.clone().unwrap_or_default(),
+            url: t.remote_url.clone(),
+        })
+    });
+    let root = match resumed {
+        Some(root) => root,
+        None => {
+            let root = match send(
+                with,
+                publisher,
+                &account,
+                &secret,
+                (&post.body, &media, in_call, tiktok.as_ref()),
+                None,
+            )
+            .await
+            {
+                Ok(remote) => remote,
+                Err(msg) => return fail_target(db, id, &msg).await,
+            };
+            // The remote id first: whatever fails after this, the post is known to be live.
+            let stmt = sql(
+                "UPDATE post_targets SET remote_id = $2, remote_cid = $3, remote_url = $4, \
+                 published_at = now(), updated_at = now() WHERE id = $1",
+                vec![
+                    id.into(),
+                    root.id.clone().into(),
+                    root.cid.clone().into(),
+                    root.url
+                        .clone()
+                        .or_else(|| publisher.url(&account, &root.id))
+                        .into(),
+                ],
+            );
+            db.execute_raw(stmt).await?;
+            root
+        }
     };
-    // The remote id first: whatever fails after this, the post is known to be live.
-    let stmt = sql(
-        "UPDATE post_targets SET remote_id = $2, remote_cid = $3, remote_url = $4, \
-         published_at = now(), updated_at = now() WHERE id = $1",
-        vec![
-            id.into(),
-            root.id.clone().into(),
-            root.cid.clone().into(),
-            root.url
-                .clone()
-                .or_else(|| publisher.url(&account, &root.id))
-                .into(),
-        ],
-    );
-    db.execute_raw(stmt).await?;
     // Each part right after the platform takes it, so its parent is always saved before it.
-    let mut parent = root.clone();
-    for (i, part) in thread.iter().enumerate() {
+    let mut parent = saved.last().map_or_else(
+        || root.clone(),
+        |p| Remote {
+            id: p["remote_id"].as_str().unwrap_or_default().to_owned(),
+            cid: p["cid"].as_str().unwrap_or_default().to_owned(),
+            url: p["remote_url"].as_str().map(str::to_owned),
+        },
+    );
+    for (i, part) in thread.iter().enumerate().skip(saved.len()) {
         // A thread can outlast the token it started with: fetch the credential again before
         // each part (renewed when near its end, through the locked path).
         let secret = match credential(app, &account).await {
@@ -1659,12 +1737,7 @@ async fn publish_target(
             vec![id.into(), saved.into()],
         );
         if let Err(e) = db.execute_raw(stmt).await {
-            let msg = format!(
-                "Thread post {} of {} went out but could not be saved: it may be live, check \
-                 the account.",
-                i + 1,
-                thread.len()
-            );
+            let msg = unsaved_part(i + 1, thread.len());
             // Best effort: with the database down, recovery fails it later with a like message.
             let _ = fail_target(db, id, &msg).await;
             return Err(e);
@@ -1842,7 +1915,8 @@ pub async fn settle(db: &DatabaseConnection, id: Uuid) -> Result<(), DbErr> {
     let error = (!errors.is_empty()).then(|| errors.join("; "));
     let stmt = sql(
         "UPDATE posts SET status = $2, error = $3, updated_at = now(), \
-         published_at = CASE WHEN $2 = 'published' THEN now() ELSE published_at END \
+         published_at = CASE WHEN $2 = 'published' THEN COALESCE(published_at, now()) \
+           ELSE published_at END \
          WHERE id = $1 AND status = 'queued'",
         vec![id.into(), status.into(), error.into()],
     );
@@ -1995,5 +2069,35 @@ async fn delete_one(
         Err(_) => Some(format!(
             "{name}: {app} did not answer in time. Try again, or delete it in the app."
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_failure_that_may_have_posted_is_left_to_the_caller() {
+        let maybe = [
+            TIMED_OUT.to_owned(),
+            format!("Thread post 2 of 3: {TIMED_OUT} The posts before it are up."),
+            STUCK.to_owned(),
+            cut_off_part(2, 3),
+            unsaved_part(2, 3),
+            tiktok::NOT_DONE.to_owned(),
+            youtube::NO_VIDEO_ID.to_owned(),
+        ];
+        for m in &maybe {
+            assert!(outcome_unknown(Some(m)), "{m}");
+        }
+        for sure in [
+            "Bluesky refused it (InvalidRequest).",
+            "Thread post 2 of 3: Bluesky refused it (InvalidRequest). The posts before it are up.",
+            "The account was disconnected.",
+            "TikTok could not publish it (spam_risk).",
+        ] {
+            assert!(!outcome_unknown(Some(sure)), "{sure}");
+        }
+        assert!(!outcome_unknown(None));
     }
 }
