@@ -4982,6 +4982,48 @@ mod teams {
                 .await;
                 assert_eq!(res.status_code(), 404);
 
+                // Another team's token gets 404 for both retries and changes nothing.
+                let (_, stranger, _) = user(&s, &db).await;
+                let res = req(&s, Method::POST, "/v1/api-tokens", &stranger)
+                    .json(&json!({"name": "theirs"}))
+                    .await;
+                let theirs = format!("Bearer {}", res.json::<Value>()["secret"].as_str().unwrap());
+                set_body(&db, &post, "REJECT again", json!([])).await;
+                let row = post_targets::Entity::find()
+                    .filter(post_targets::Column::PostId.eq(post.parse::<uuid::Uuid>().unwrap()))
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let failed = post_targets::ActiveModel {
+                    id: Set(row.id),
+                    status: Set("failed".into()),
+                    ..Default::default()
+                };
+                post_targets::Entity::update(failed)
+                    .exec(&db)
+                    .await
+                    .unwrap();
+                for path in [retry_url(&post), url.clone()] {
+                    let res = s
+                        .post(&path)
+                        .add_header("authorization", theirs.as_str())
+                        .await;
+                    assert_eq!(res.status_code(), 404, "{path}");
+                }
+                let row = post_targets::Entity::find_by_id(row.id)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(row.status, "failed", "untouched");
+                let kept = posts::Entity::find_by_id(post.parse::<uuid::Uuid>().unwrap())
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(kept.status, "published", "untouched");
+
                 // A set token of another set neither reads nor retries the group.
                 let res = req(&s, Method::POST, "/v1/social-sets", &cookie)
                     .json(&json!({"name": "Clients"}))

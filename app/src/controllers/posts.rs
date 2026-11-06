@@ -1094,6 +1094,7 @@ async fn requeue(
     // The rows are locked, so two retries (or a retry and a settle) cannot interleave.
     let rows = posts::Entity::find()
         .filter(posts::Column::Id.is_in(ids.iter().copied()))
+        .filter(posts::Column::TeamId.eq(a.team.id))
         .filter(posts::Column::SocialSetId.in_subquery(live_sets()))
         .filter(in_scope(a))
         .order_by_asc(posts::Column::Id)
@@ -1180,6 +1181,9 @@ async fn retry_post(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>)
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let done = async {
+        if find(&app.db, &a, id).await?.is_none() {
+            return Ok(not_found());
+        }
         let queued = match requeue(&app, &a, &[id]).await? {
             Ok(q) => q,
             Err(res) => return Ok(res),
