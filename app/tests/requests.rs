@@ -4065,6 +4065,10 @@ mod teams {
 
                 let doc = s.get("/openapi.json").await.json::<Value>();
                 assert!(doc["paths"]["/post-groups"]["post"].is_object());
+                assert!(doc["paths"]["/post-groups/{group_id}"]["get"].is_object());
+                assert!(doc["paths"]["/post-groups/{group_id}/retry"]["post"].is_object());
+                assert!(doc["paths"]["/posts/{id}/retry"]["post"].is_object());
+                assert!(doc["paths"]["/idempotency/{key}"]["get"].is_object());
             }
 
             #[tokio::test]
@@ -4770,6 +4774,241 @@ mod teams {
                 assert_eq!(body["targets"][0]["status"], "deleted");
             }
 
+            fn retry_url(id: &str) -> String {
+                format!("/v1/posts/{id}/retry")
+            }
+
+            async fn set_body(db: &DatabaseConnection, id: &str, body: &str, thread: Value) {
+                let row = posts::ActiveModel {
+                    id: Set(id.parse().unwrap()),
+                    body: Set(body.into()),
+                    thread: Set(thread),
+                    ..Default::default()
+                };
+                posts::Entity::update(row).exec(db).await.unwrap();
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_retry_continues_a_thread_after_its_saved_parts() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let body = thread_input(&set, "one", &["two", "REJECT three", "four"]);
+                let id = id_of(&create(&s, &cookie, body).await);
+                publish::tick(&state).await.unwrap();
+                let p = get_post(&s, &cookie, &id).await;
+                let t = &p["targets"][0];
+                assert_eq!(
+                    (p["status"].as_str(), t["status"].as_str()),
+                    (Some("published"), Some("failed"))
+                );
+                let root = t["remote_id"].as_str().unwrap().to_owned();
+                let first_part = t["parts"][0]["remote_id"].clone();
+
+                // Nothing is sent again while it still fails the same way: it fails at part 3.
+                set_body(
+                    &db,
+                    &id,
+                    "one",
+                    json!([{"body": "two"}, {"body": "three"}, {"body": "four"}]),
+                )
+                .await;
+                let before = RECORDS.lock().unwrap().len();
+                let res = req(&s, Method::POST, &retry_url(&id), &cookie).await;
+                assert_eq!(res.status_code(), 202, "{}", res.text());
+                assert_eq!(res.json::<Value>()["status"], "queued");
+                let p = settled(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "published", "{p}");
+                assert_eq!(p["error"], Value::Null);
+                let t = &p["targets"][0];
+                assert_eq!(t["status"], "published");
+                assert_eq!(t["error"], Value::Null);
+                assert_eq!(t["remote_id"], root.as_str());
+                assert_eq!(t["parts"].as_array().unwrap().len(), 3);
+                // The root and part one are not posted again: three and four follow part one.
+                let records: Vec<Value> = RECORDS.lock().unwrap()[before..].to_vec();
+                let texts: Vec<&str> = records
+                    .iter()
+                    .map(|r| r["record"]["text"].as_str().unwrap())
+                    .collect();
+                assert_eq!(texts, ["three", "four"]);
+                let reply = |i: usize| records[i]["record"]["reply"].clone();
+                assert_eq!(reply(0)["root"]["uri"], root.as_str());
+                assert_eq!(reply(0)["parent"]["uri"], first_part);
+                assert_eq!(reply(1)["parent"]["uri"], t["parts"][1]["remote_id"]);
+
+                // Published now: nothing to retry.
+                let res = req(&s, Method::POST, &retry_url(&id), &cookie).await;
+                assert_eq!(res.status_code(), 409);
+                res.assert_json(&json!({"error": "nothing_to_retry"}));
+                assert_eq!(RECORDS.lock().unwrap().len(), before + 2);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_retry_sends_failed_targets_only_and_waits_for_a_busy_post() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let id = id_of(&create(&s, &cookie, input(&set, "REJECT me", Some(&past()))).await);
+                publish::tick(&state).await.unwrap();
+                let p = get_post(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "failed", "{p}");
+                // A second account's target is already up (its account is gone), never sent again.
+                let other = uuid::Uuid::now_v7();
+                let up = post_targets::ActiveModel {
+                    id: Set(other),
+                    post_id: Set(id.parse().unwrap()),
+                    social_account_id: Set(None),
+                    status: Set("published".into()),
+                    remote_id: Set(Some("at://did:plc:gone/app.bsky.feed.post/up".into())),
+                    ..Default::default()
+                };
+                post_targets::Entity::insert(up)
+                    .exec_without_returning(&db)
+                    .await
+                    .unwrap();
+                set_body(&db, &id, "fine", json!([])).await;
+
+                // A target mid-publish holds the whole retry back.
+                let mid = |status: &'static str| {
+                    let db = &db;
+                    async move {
+                        let row = post_targets::ActiveModel {
+                            id: Set(other),
+                            status: Set(status.into()),
+                            ..Default::default()
+                        };
+                        post_targets::Entity::update(row).exec(db).await.unwrap();
+                    }
+                };
+                mid("publishing").await;
+                let before = RECORDS.lock().unwrap().len();
+                let res = req(&s, Method::POST, &retry_url(&id), &cookie).await;
+                assert_eq!(res.status_code(), 409);
+                res.assert_json(&json!({"error": "publish_in_progress"}));
+                mid("published").await;
+
+                let res = req(&s, Method::POST, &retry_url(&id), &cookie).await;
+                assert_eq!(res.status_code(), 202, "{}", res.text());
+                let p = settled(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "published", "{p}");
+                assert_eq!(
+                    RECORDS.lock().unwrap().len(),
+                    before + 1,
+                    "one send, not two"
+                );
+                let targets = p["targets"].as_array().unwrap();
+                assert_eq!(targets.len(), 2);
+                assert!(targets.iter().all(|t| t["status"] == "published"));
+                let up = targets
+                    .iter()
+                    .find(|t| t["id"] == other.to_string())
+                    .unwrap();
+                assert_eq!(up["remote_id"], "at://did:plc:gone/app.bsky.feed.post/up");
+
+                // Unknown, drafts and scheduled posts have nothing to retry.
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &retry_url(&uuid::Uuid::now_v7().to_string()),
+                    &cookie,
+                )
+                .await;
+                assert_eq!(res.status_code(), 404);
+                let draft = id_of(&create(&s, &cookie, input(&set, "d", None)).await);
+                let res = req(&s, Method::POST, &retry_url(&draft), &cookie).await;
+                res.assert_json(&json!({"error": "nothing_to_retry"}));
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_group_reads_with_its_expected_targets_and_retries_as_one() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let res = req(&s, Method::POST, "/v1/post-groups", &cookie)
+                    .json(&json!({"social_set_id": set, "body": "REJECT me",
+                        "platforms": ["bluesky"], "scheduled_at": past()}))
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let made = res.json::<Value>();
+                assert_eq!(made["expected_targets"], 1);
+                let gid = made["group_id"].as_str().unwrap().to_owned();
+                let post = made["posts"][0]["id"].as_str().unwrap().to_owned();
+                let group = |path: String| req(&s, Method::GET, &path, &cookie);
+                let read = group(format!("/v1/post-groups/{gid}")).await;
+                assert_eq!(read.status_code(), 200, "{}", read.text());
+                let read = read.json::<Value>();
+                assert_eq!(read["group_id"], gid.as_str());
+                assert_eq!(read["expected_targets"], 1);
+                assert_eq!(read["posts"][0]["targets"], json!([]));
+                let nobody = uuid::Uuid::now_v7();
+                assert_eq!(
+                    group(format!("/v1/post-groups/{nobody}"))
+                        .await
+                        .status_code(),
+                    404
+                );
+
+                publish::tick(&state).await.unwrap();
+                let read = group(format!("/v1/post-groups/{gid}"))
+                    .await
+                    .json::<Value>();
+                assert_eq!(read["posts"][0]["status"], "failed", "{read}");
+                assert_eq!(read["expected_targets"], 1, "the target it has");
+                assert_eq!(read["posts"][0]["targets"][0]["status"], "failed");
+
+                set_body(&db, &post, "fine", json!([])).await;
+                let url = format!("/v1/post-groups/{gid}/retry");
+                let res = req(&s, Method::POST, &url, &cookie).await;
+                assert_eq!(res.status_code(), 202, "{}", res.text());
+                let body = res.json::<Value>();
+                assert_eq!(body["group_id"], gid.as_str());
+                assert_eq!(body["expected_targets"], 1);
+                assert_eq!(body["posts"][0]["status"], "queued");
+                let p = settled(&s, &cookie, &post).await;
+                assert_eq!(p["status"], "published", "{p}");
+                let res = req(&s, Method::POST, &url, &cookie).await;
+                assert_eq!(res.status_code(), 409);
+                res.assert_json(&json!({"error": "nothing_to_retry"}));
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/post-groups/{nobody}/retry"),
+                    &cookie,
+                )
+                .await;
+                assert_eq!(res.status_code(), 404);
+
+                // A set token of another set neither reads nor retries the group.
+                let res = req(&s, Method::POST, "/v1/social-sets", &cookie)
+                    .json(&json!({"name": "Clients"}))
+                    .await;
+                let clients = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                let res = req(&s, Method::POST, "/v1/api-tokens", &cookie)
+                    .json(&json!({"name": "cm", "social_set_id": clients}))
+                    .await;
+                let secret = res.json::<Value>()["secret"].as_str().unwrap().to_owned();
+                let auth = format!("Bearer {secret}");
+                let res = s
+                    .get(&format!("/v1/post-groups/{gid}"))
+                    .add_header("authorization", auth.as_str())
+                    .await;
+                assert_eq!(res.status_code(), 404);
+                let res = s
+                    .post(&url)
+                    .add_header("authorization", auth.as_str())
+                    .await;
+                assert_eq!(res.status_code(), 404);
+                let res = s
+                    .post(&retry_url(&post))
+                    .add_header("authorization", auth.as_str())
+                    .await;
+                assert_eq!(res.status_code(), 404);
+            }
+
             #[tokio::test]
             #[serial]
             async fn a_part_that_will_not_come_down_keeps_the_root_up() {
@@ -5047,6 +5286,7 @@ mod teams {
                 let res = group(json!({"social_set_id": set, "body": "hi", "media": clip,
                     "platforms": ["tiktok", "youtube", "facebook"],
                     "cover": "https://a.example/c.jpg",
+                    "tiktok": {"privacy_level": "SELF_ONLY"},
                     "overrides": {"tiktok": {"cover": ""},
                         "facebook": {"cover": "https://a.example/own.png"}}}))
                 .await;
@@ -9391,7 +9631,7 @@ mod teams {
                 #[tokio::test]
                 #[serial]
                 async fn a_post_group_gives_the_settings_to_its_tiktok_post() {
-                    let (s, _, _, _, cookie, _, set) = team().await;
+                    let (s, db, _, _, cookie, _, set) = team().await;
                     let group = |extra: Value| {
                         let mut v = json!({"social_set_id": set, "body": "hi",
                             "media": ["https://a.example/clip.mp4"], "platforms": ["tiktok"]});
@@ -9415,6 +9655,20 @@ mod teams {
                     assert_eq!(res.status_code(), 422);
                     res.assert_json(&json!({"error": "tiktok_privacy_required",
                         "platform": "tiktok"}));
+                    // No settings at all never means the most public level: refused, nothing made.
+                    let count = || async { posts::Entity::find().count(&db).await.unwrap() };
+                    let before = count().await;
+                    let res = make(group(json!({}))).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "tiktok_settings_required",
+                        "platform": "tiktok"}));
+                    // Also when TikTok is in the group by default (no `platforms`).
+                    let mut all = group(json!({}));
+                    all.as_object_mut().unwrap().remove("platforms");
+                    let res = make(all).await;
+                    assert_eq!(res.status_code(), 422, "{}", res.text());
+                    assert_eq!(res.json::<Value>()["error"], "tiktok_settings_required");
+                    assert_eq!(count().await, before);
                 }
 
                 #[tokio::test]
@@ -14537,6 +14791,82 @@ mod teams {
                         assert!(res.maybe_header("idempotent-replayed").is_none());
                     }
                     assert_eq!(posts(&s, &cm).await, 4);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_lost_response_is_found_by_its_key_and_retry_takes_the_header() {
+                    let (s, db) = on_mock(120).await;
+                    let (owner, set, cm) = team(&s, &db).await;
+                    let made = create(&s, &cm, "order 1/a", &post_body(Some(&set), "once")).await;
+                    assert_eq!(made.status_code(), 201, "{}", made.text());
+                    let id = made.json::<Value>()["id"].as_str().unwrap().to_owned();
+                    let url = "/v1/idempotency/order%201%2Fa";
+                    let found = bearer(&s, Method::GET, url, &cm).await;
+                    assert_eq!(found.status_code(), 200, "{}", found.text());
+                    let r = found.json::<Value>();
+                    assert_eq!(
+                        (r["key"].as_str(), r["method"].as_str(), r["path"].as_str()),
+                        (Some("order 1/a"), Some("POST"), Some("/posts"))
+                    );
+                    assert_eq!(
+                        (r["status"].as_str(), r["response_status"].as_u64()),
+                        (Some("done"), Some(201))
+                    );
+                    assert_eq!(r["response_body"]["id"], id.as_str());
+                    assert!(r["expires_at"].as_str().unwrap() > r["created_at"].as_str().unwrap());
+
+                    // The team's other tokens see it; a set token, another team and strangers do not.
+                    let other = make_token(&s, &owner, json!({"name": "cm2"})).await;
+                    let other = other["secret"].as_str().unwrap();
+                    assert_eq!(bearer(&s, Method::GET, url, other).await.status_code(), 200);
+                    let limited =
+                        make_token(&s, &owner, json!({"name": "one", "social_set_id": set})).await;
+                    let limited = limited["secret"].as_str().unwrap();
+                    assert_eq!(
+                        bearer(&s, Method::GET, url, limited).await.status_code(),
+                        404
+                    );
+                    let (_, _, them) = team(&s, &db).await;
+                    assert_eq!(bearer(&s, Method::GET, url, &them).await.status_code(), 404);
+                    let res = bearer(&s, Method::GET, "/v1/idempotency/nope", &cm).await;
+                    res.assert_json(&json!({"error": "not_found"}));
+                    assert_eq!(s.get(url).await.status_code(), 401);
+
+                    // A set token finds its own keys.
+                    let own = bearer(&s, Method::POST, "/v1/posts", limited)
+                        .add_header("idempotency-key", "mine")
+                        .json(&post_body(None, "in my set"))
+                        .await;
+                    assert_eq!(own.status_code(), 201, "{}", own.text());
+                    let res = bearer(&s, Method::GET, "/v1/idempotency/mine", limited).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    assert_eq!(
+                        bearer(&s, Method::GET, "/v1/idempotency/mine", &cm)
+                            .await
+                            .status_code(),
+                        404
+                    );
+
+                    // Gone after the 30 days.
+                    let old = Statement::from_string(
+                        DbBackend::Postgres,
+                        "UPDATE idempotency_keys SET created_at = now() - interval '31 days' \
+                         WHERE key = 'order 1/a'",
+                    );
+                    db.execute_raw(old).await.unwrap();
+                    assert_eq!(bearer(&s, Method::GET, url, &cm).await.status_code(), 404);
+
+                    // The retry routes take the header too: a refused retry replays.
+                    let path = format!("/v1/posts/{id}/retry");
+                    for i in 0..2 {
+                        let res = bearer(&s, Method::POST, &path, &cm)
+                            .add_header("idempotency-key", "retry-1")
+                            .await;
+                        assert_eq!(res.status_code(), 409, "{}", res.text());
+                        res.assert_json(&json!({"error": "nothing_to_retry"}));
+                        assert_eq!(res.maybe_header("idempotent-replayed").is_some(), i == 1);
+                    }
                 }
 
                 #[tokio::test]

@@ -2,7 +2,7 @@
 //! settle the post; and take published posts down. A thread goes out root first, then each
 //! part as a reply to the one before, each saved on its target the moment the platform takes
 //! it. Every step is a conditional update, so two instances (or a tick and "publish now") never
-//! send a post twice. A publish is never retried: a retry could post twice. Each target status change queues its webhook event in the same
+//! send a post twice. Nothing retries by itself (a retry could post twice); only `POST /posts/{id}/retry` re-queues failed targets, and only on request. Each target status change queues its webhook event in the same
 //! statement (`webhooks::with_event`). Media is downloaded into brain's storage before any
 //! target is claimed (`media.rs`) and deleted once the post settles.
 use std::{
@@ -1452,11 +1452,27 @@ async fn fail_target(db: &DatabaseConnection, id: Uuid, msg: &str) -> Result<(),
     db.execute_raw(stmt).await.map(|_| ())
 }
 
-/// Claims a target (`pending` with no remote id, to `publishing`); false when another run has it.
+/// A pending target that is up but whose thread is not all out yet.
+const UNFINISHED: &str = "jsonb_array_length(t.parts) < \
+    (SELECT jsonb_array_length(p.thread) FROM posts p WHERE p.id = t.post_id)";
+
+/// Whether a retry may re-queue `target` of `post`: it `failed` before anything went out, or midway
+/// through a thread (the parts saved stay up and the rest follow them). A failed target whose
+/// thread is all out is done.
+pub fn retryable(target: &post_targets::Model, post: &posts::Model) -> bool {
+    let len = |v: &serde_json::Value| v.as_array().map_or(0, Vec::len);
+    target.status == "failed"
+        && (target.remote_id.is_none() || len(&target.parts) < len(&post.thread))
+}
+
+/// Claims a target (`pending`, to `publishing`); false when another run has it. A target with a
+/// remote id is claimed only to finish its thread (a retry), never to send its root again.
 pub async fn claim_target(db: &DatabaseConnection, id: Uuid) -> Result<bool, DbErr> {
     let stmt = sql(
-        "UPDATE post_targets SET status = 'publishing', updated_at = now() \
-         WHERE id = $1 AND status = 'pending' AND remote_id IS NULL",
+        &format!(
+            "UPDATE post_targets t SET status = 'publishing', updated_at = now() \
+             WHERE t.id = $1 AND t.status = 'pending' AND (t.remote_id IS NULL OR {UNFINISHED})"
+        ),
         vec![id.into()],
     );
     Ok(db.execute_raw(stmt).await?.rows_affected() == 1)
@@ -1533,7 +1549,7 @@ async fn publish_target(
         return Ok(());
     }
     let target = post_targets::Entity::find_by_id(id).one(db).await?;
-    let account = match target.and_then(|t| t.social_account_id) {
+    let account = match target.as_ref().and_then(|t| t.social_account_id) {
         Some(a) => social_accounts::Entity::find_by_id(a).one(db).await?,
         None => None,
     };
@@ -1578,37 +1594,62 @@ async fn publish_target(
     };
     let with = (app, stored);
     let in_call = cover.as_ref().filter(|_| publisher.cover_in_publish());
-    let root = match send(
-        with,
-        publisher,
-        &account,
-        &secret,
-        (&post.body, &media, in_call, tiktok.as_ref()),
-        None,
-    )
-    .await
-    {
-        Ok(remote) => remote,
-        Err(msg) => return fail_target(db, id, &msg).await,
+    // A retried thread goes on from the parts already out: its root and saved parts stay.
+    let saved: Vec<serde_json::Value> = target
+        .as_ref()
+        .and_then(|t| t.parts.as_array().cloned())
+        .unwrap_or_default();
+    let resumed = target.as_ref().and_then(|t| {
+        Some(Remote {
+            id: t.remote_id.clone()?,
+            cid: t.remote_cid.clone().unwrap_or_default(),
+            url: t.remote_url.clone(),
+        })
+    });
+    let root = match resumed {
+        Some(root) => root,
+        None => {
+            let root = match send(
+                with,
+                publisher,
+                &account,
+                &secret,
+                (&post.body, &media, in_call, tiktok.as_ref()),
+                None,
+            )
+            .await
+            {
+                Ok(remote) => remote,
+                Err(msg) => return fail_target(db, id, &msg).await,
+            };
+            // The remote id first: whatever fails after this, the post is known to be live.
+            let stmt = sql(
+                "UPDATE post_targets SET remote_id = $2, remote_cid = $3, remote_url = $4, \
+                 published_at = now(), updated_at = now() WHERE id = $1",
+                vec![
+                    id.into(),
+                    root.id.clone().into(),
+                    root.cid.clone().into(),
+                    root.url
+                        .clone()
+                        .or_else(|| publisher.url(&account, &root.id))
+                        .into(),
+                ],
+            );
+            db.execute_raw(stmt).await?;
+            root
+        }
     };
-    // The remote id first: whatever fails after this, the post is known to be live.
-    let stmt = sql(
-        "UPDATE post_targets SET remote_id = $2, remote_cid = $3, remote_url = $4, \
-         published_at = now(), updated_at = now() WHERE id = $1",
-        vec![
-            id.into(),
-            root.id.clone().into(),
-            root.cid.clone().into(),
-            root.url
-                .clone()
-                .or_else(|| publisher.url(&account, &root.id))
-                .into(),
-        ],
-    );
-    db.execute_raw(stmt).await?;
     // Each part right after the platform takes it, so its parent is always saved before it.
-    let mut parent = root.clone();
-    for (i, part) in thread.iter().enumerate() {
+    let mut parent = saved.last().map_or_else(
+        || root.clone(),
+        |p| Remote {
+            id: p["remote_id"].as_str().unwrap_or_default().to_owned(),
+            cid: p["cid"].as_str().unwrap_or_default().to_owned(),
+            url: p["remote_url"].as_str().map(str::to_owned),
+        },
+    );
+    for (i, part) in thread.iter().enumerate().skip(saved.len()) {
         // A thread can outlast the token it started with: fetch the credential again before
         // each part (renewed when near its end, through the locked path).
         let secret = match credential(app, &account).await {
@@ -1842,7 +1883,8 @@ pub async fn settle(db: &DatabaseConnection, id: Uuid) -> Result<(), DbErr> {
     let error = (!errors.is_empty()).then(|| errors.join("; "));
     let stmt = sql(
         "UPDATE posts SET status = $2, error = $3, updated_at = now(), \
-         published_at = CASE WHEN $2 = 'published' THEN now() ELSE published_at END \
+         published_at = CASE WHEN $2 = 'published' THEN COALESCE(published_at, now()) \
+           ELSE published_at END \
          WHERE id = $1 AND status = 'queued'",
         vec![id.into(), status.into(), error.into()],
     );

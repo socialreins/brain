@@ -7,25 +7,34 @@
 //! with anything else, `422 idempotency_key_reused`. 5xx and 429 answers are not stored, so a retry runs again; every
 //! other answer is. A first run left unfinished for 10 minutes (a crash) is run again. Keys live
 //! 30 days. Sessions ignore the header. A request this layer answers itself counts once against
-//! the token's rate limit, as the route would have.
+//! the token's rate limit, as the route would have. `GET /idempotency/{key}` answers what a key
+//! stored, for a caller that lost the response.
 use axum::{
     body::{to_bytes, Body},
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::{header, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
+    Json,
 };
+use chrono::{DateTime, FixedOffset};
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement, Value};
+use serde::Serialize;
 use socialreins_core::token;
 use tracing::Instrument;
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use super::{
-    api_tokens::{bearer_secret, find_live, limited},
+    api_tokens::{bearer_secret, find_live, limited, Actor},
     auth::internal,
-    waitlist::error,
+    waitlist::{error, Error},
 };
 use crate::{models::api_tokens, state::AppState};
+
+/// The `Idempotency-Key` header, as every `/v1` write documents it.
+pub const IDEMPOTENCY: &str = "With an API token: 1 to 255 printable ASCII characters. Sent again for 30 days, the same key replays the first answer (`Idempotent-Replayed: true`) when the method, path and request body are byte for byte the same (the raw bytes, not the parsed JSON: another key order or whitespace is a different body), else `422 idempotency_key_reused`; `409 idempotency_in_progress` while the first request still runs. The token's team shares keys, a set token's keys are its own set's. 5xx and 429 answers are not stored, so a retry runs again. Lost the response? `GET /idempotency/{key}` says what the key made";
 
 /// How long a key and its response are kept.
 pub const KEEP_DAYS: i64 = 30;
@@ -249,6 +258,83 @@ async fn forget(app: &AppState, team: Uuid, key: &str) {
     if let Err(e) = app.db.execute_raw(gone).await {
         tracing::warn!(error = %e, "idempotency key not dropped");
     }
+}
+
+/// What an `Idempotency-Key` stored.
+#[derive(Serialize, ToSchema)]
+pub struct Record {
+    pub key: String,
+    pub method: String,
+    /// Relative to the `/v1` server URL, e.g. `/posts`.
+    pub path: String,
+    /// `done` once the answer is stored; `in_progress` while the first request runs (or was lost
+    /// to a crash, which a retry with the same key then runs again after 10 minutes).
+    pub status: String,
+    /// The stored HTTP status; `null` while `in_progress`.
+    pub response_status: Option<u16>,
+    /// The stored JSON body, e.g. the created post or post group with its ids; `null` while
+    /// `in_progress`, or when the answer had no JSON body (a `204`).
+    #[schema(value_type = Option<Object>)]
+    pub response_body: Option<serde_json::Value>,
+    pub created_at: DateTime<FixedOffset>,
+    /// When the key is forgotten, 30 days after `created_at`.
+    pub expires_at: DateTime<FixedOffset>,
+}
+
+/// What `Idempotency-Key` `key` made, for a caller that lost the response (even days later,
+/// within the 30 days keys are kept): the stored status and body of the first request, which
+/// holds the id of the post or post group it created. URL-encode the key. Keys are scoped as
+/// when sending them: the token's team, and a set token only sees its own set's keys (a
+/// whole-team token, only keys made without a set). `404` for an unknown, expired or other
+/// scope's key, and for a key whose first request answered 5xx or 429 (those are not stored:
+/// send the request again with the same key).
+#[utoipa::path(get, path = "/idempotency/{key}", tag = "idempotency",
+    security(("session" = []), ("api_token" = [])), params(("key" = String, Path)),
+    responses((status = 200, body = Record), (status = 401, body = Error),
+        (status = 404, body = Error)))]
+async fn lookup(State(app): State<AppState>, a: Actor, Path(key): Path<String>) -> Response {
+    let found = app
+        .db
+        .query_one_raw(sql(
+            "SELECT key, method, path, status, response_status, response_body, created_at, \
+             created_at + make_interval(days => $4) AS expires_at FROM idempotency_keys \
+             WHERE team_id = $1 AND key = $2 AND social_set_id IS NOT DISTINCT FROM $3 \
+             AND created_at > now() - make_interval(days => $4)",
+            vec![
+                a.team.id.into(),
+                key.into(),
+                a.set_id().into(),
+                (KEEP_DAYS as i32).into(),
+            ],
+        ))
+        .await;
+    let row = match found {
+        Ok(Some(r)) => r,
+        Ok(None) => return reply(StatusCode::NOT_FOUND, "not_found"),
+        Err(e) => return internal(e, "idempotency lookup"),
+    };
+    let record = || -> Result<Record, DbErr> {
+        let status: Option<i16> = row.try_get("", "response_status")?;
+        let body: Option<Vec<u8>> = row.try_get("", "response_body")?;
+        Ok(Record {
+            key: row.try_get("", "key")?,
+            method: row.try_get("", "method")?,
+            path: row.try_get("", "path")?,
+            status: row.try_get("", "status")?,
+            response_status: status.and_then(|s| u16::try_from(s).ok()),
+            response_body: body.and_then(|b| serde_json::from_slice(&b).ok()),
+            created_at: row.try_get("", "created_at")?,
+            expires_at: row.try_get("", "expires_at")?,
+        })
+    };
+    match record() {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => internal(e, "idempotency lookup"),
+    }
+}
+
+pub fn api() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(lookup))
 }
 
 /// The purge of keys older than `KEEP_DAYS`, run hourly by `scheduler`.

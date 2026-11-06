@@ -30,6 +30,7 @@ use super::{
     api_tokens::Actor,
     auth::{internal, Body},
     connections::live_sets,
+    idempotency::IDEMPOTENCY,
     posts::{self, Post},
     waitlist::{error, Error},
 };
@@ -37,8 +38,6 @@ use crate::{
     models::{post_lists, posts as post_rows, social_sets},
     state::AppState,
 };
-
-const IDEMPOTENCY: &str = "With an API token: 1 to 255 printable ASCII characters. A retry with the same key, path and body replays the first answer for 30 days";
 
 #[derive(Serialize, ToSchema)]
 pub struct PostList {

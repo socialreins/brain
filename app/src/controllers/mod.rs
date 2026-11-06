@@ -87,6 +87,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(social_sets::api())
         .merge(posts::api().layer(DefaultBodyLimit::max(MAX_GROUP_BODY_BYTES)))
         .merge(posts::groups_api().layer(DefaultBodyLimit::max(MAX_GROUP_BODY_BYTES)))
+        .merge(idempotency::api())
         .merge(lists::api())
         .merge(inbox::api())
         // Two DM texts of 1000 graphemes can pass 4 KiB.
