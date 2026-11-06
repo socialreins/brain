@@ -184,7 +184,7 @@ impl LinkedIn {
             .map(String::from)
     }
 
-    /// Sends a call: its headers and JSON body. A refused token or permission is `Reconnect`,
+    /// Sends a call: its headers and JSON body. A refused token is `Reconnect`, a refused permission `Denied`,
     /// anything else not 2xx is `Failed` with `step` and LinkedIn's reason.
     async fn send(&self, req: RequestBuilder, step: &str) -> Result<(HeaderMap, Value), PostError> {
         let res = req.send().await.map_err(|e| {
@@ -197,8 +197,11 @@ impl LinkedIn {
         if status.is_success() {
             return Ok((headers, body));
         }
-        if matches!(status.as_u16(), 401 | 403) {
-            return Err(PostError::Reconnect);
+        // A 401 is a dead token; a 403 is a missing permission, which leaves the account alone.
+        match status.as_u16() {
+            401 => return Err(PostError::Reconnect),
+            403 => return Err(PostError::Denied),
+            _ => {}
         }
         Err(failed(format!("{step}: {}", reason(&body, status))))
     }
@@ -532,7 +535,7 @@ impl LinkedIn {
         let req = self.rest(Method::POST, &path, token).json(&body);
         let (headers, body) = match self.send(req, "Comment").await {
             Ok(done) => done,
-            Err(PostError::Reconnect) => {
+            Err(PostError::Reconnect | PostError::Denied) => {
                 return Err(failed(
                     "Comment: LinkedIn refused it. The app may lack the w_member_social_feed \
                      permission, or the token expired; reconnect the account if it did.",

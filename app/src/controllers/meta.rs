@@ -117,9 +117,11 @@ async fn subscribe(meta: &Meta, page: &Page) -> Option<String> {
     let call = meta.subscribe_page(&page.id, &page.access_token);
     let why = match tokio::time::timeout(SUBSCRIBE_WAIT, call).await {
         Ok(Ok(())) => return None,
-        Ok(Err(PostError::Reconnect)) => "Webhook: Meta refused the Page's token, or the \
+        Ok(Err(PostError::Reconnect | PostError::Denied)) => {
+            "Webhook: Meta refused the Page's token, or the \
             pages_manage_metadata permission is missing."
-            .to_owned(),
+                .to_owned()
+        }
         Ok(Err(PostError::Failed(why))) => why,
         Err(_) => "Webhook: Meta took too long.".to_owned(),
     };
@@ -334,7 +336,7 @@ async fn callback(
             tracing::warn!(why, "meta connect failed");
             return fail("meta_failed");
         }
-        Err(PostError::Reconnect) => {
+        Err(PostError::Reconnect | PostError::Denied) => {
             tracing::warn!("meta refused the new token");
             return fail("meta_failed");
         }

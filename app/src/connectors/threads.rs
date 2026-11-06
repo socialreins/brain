@@ -89,10 +89,26 @@ pub(super) fn reason(body: &Value, status: reqwest::StatusCode) -> String {
 }
 
 /// The token is expired, revoked or missing a permission: only a new sign-in helps.
-pub(super) fn needs_reconnect(body: &Value) -> bool {
+/// Code 190: the token itself is expired or revoked.
+pub(super) fn token_dead(body: &Value) -> bool {
+    body["error"]["code"].as_i64() == Some(190)
+}
+
+/// Codes 10 and 200 to 299: a permission is missing, which says nothing about the token.
+fn denied(body: &Value) -> bool {
     body["error"]["code"]
         .as_i64()
-        .is_some_and(|c| c == 190 || c == 10 || (200..300).contains(&c))
+        .is_some_and(|c| c == 10 || (200..300).contains(&c))
+}
+
+/// What a Graph refusal means for the account: `Reconnect` for a dead token, `Denied` for a
+/// missing permission, else nothing.
+pub(super) fn dead_or_denied(body: &Value) -> Option<PostError> {
+    if token_dead(body) {
+        Some(PostError::Reconnect)
+    } else {
+        denied(body).then_some(PostError::Denied)
+    }
 }
 
 impl Threads {
@@ -164,8 +180,8 @@ impl Threads {
         if status.is_success() {
             return Ok(body);
         }
-        if needs_reconnect(&body) {
-            return Err(PostError::Reconnect);
+        if let Some(refusal) = dead_or_denied(&body) {
+            return Err(refusal);
         }
         Err(failed(format!("{step}: {}", reason(&body, status))))
     }
@@ -459,14 +475,18 @@ mod tests {
             "code": 100}});
         let r = reason(&body, reqwest::StatusCode::BAD_REQUEST);
         assert_eq!(r, "Bad thing");
-        assert!(!needs_reconnect(&body));
+        assert_eq!(dead_or_denied(&body), None);
         assert_eq!(
             reason(&Value::Null, reqwest::StatusCode::BAD_GATEWAY),
             "HTTP 502"
         );
-        for code in [190, 10, 200, 299] {
-            assert!(needs_reconnect(&json!({"error": {"code": code}})), "{code}");
+        // Only 190 says the token is dead; a missing permission must not mark the account.
+        let code = |c: i64| dead_or_denied(&json!({"error": {"code": c}}));
+        assert_eq!(code(190), Some(PostError::Reconnect));
+        for c in [10, 200, 299] {
+            assert_eq!(code(c), Some(PostError::Denied), "{c}");
         }
+        assert_eq!(code(300), None);
     }
 
     #[test]

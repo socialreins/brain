@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use super::{
     bluesky::{InboxError, PostError},
-    threads::{id_of, needs_reconnect, reason, Item},
+    threads::{dead_or_denied, id_of, reason, Item},
 };
 
 const AUTH_URL: &str = "https://www.facebook.com";
@@ -267,7 +267,9 @@ impl Meta {
             .await
             .map_err(|refused| match refused {
                 Refused::Unreachable => failed(format!("{step}: Meta could not be reached.")),
-                Refused::Graph(_, body) if needs_reconnect(&body) => PostError::Reconnect,
+                Refused::Graph(_, body) if dead_or_denied(&body).is_some() => {
+                    dead_or_denied(&body).unwrap_or(PostError::Reconnect)
+                }
                 Refused::Graph(status, body) => {
                     failed(format!("{step}: {}", reason(&body, status)))
                 }

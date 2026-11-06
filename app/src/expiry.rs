@@ -1,10 +1,15 @@
 //! When an account's token ends or the platform refused it, and who hears about it.
 //!
 //! Nothing new is stored for the status: it is computed from `token_expires_at` and
-//! `meta.reconnect` (set when a publisher, a refresh or the inbox hits `Reconnect`, as X's renewal
-//! always did; every connect flow replaces `meta`, so reconnecting clears it). The daily mail
-//! keeps its own once-per-cycle mark in `meta.expiry_notice` for the same reason: a reconnect
-//! or a renewal starts a new cycle.
+//! `meta.reconnect` (set only when a token is found dead: a refused renewal, or a main publish
+//! call the platform answers with a dead-token signal; a refused permission or a failing side
+//! call such as a cover, a first comment or a take down never sets it; every connect flow
+//! replaces `meta`, so reconnecting clears it). The daily mail keeps its own once-per-cycle mark
+//! in `meta.expiry_notice` for the same reason: a reconnect or a renewal starts a new cycle.
+//!
+//! The first run mails for every account already flagged or past due. A data import that brings
+//! such accounts in must set `meta.expiry_notice` (`expired` or `expiring`) on them first, or
+//! their teams get a burst of mail.
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, EntityTrait, Statement, TransactionTrait, Value};
 use serde::Serialize;
@@ -144,10 +149,15 @@ pub async fn notify(app: &AppState) -> Result<u64, DbErr> {
         if app.db.execute_raw(claim).await?.rows_affected() != 1 {
             continue;
         }
-        if tell_admins(app, &a, level).await? {
-            done += 1;
-        } else {
-            release(app, &a).await?;
+        // Nobody mailed, or the recipients could not be read: release the claim so the next
+        // run tries again.
+        match tell_admins(app, &a, level).await {
+            Ok(true) => done += 1,
+            Ok(false) => release(app, &a).await?,
+            Err(e) => {
+                tracing::warn!(error = %e, account = %a.id, "expiry mail recipients not read");
+                release(app, &a).await?;
+            }
         }
     }
     lock.commit().await?;

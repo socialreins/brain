@@ -128,11 +128,12 @@ fn code(body: &Value) -> &str {
         .unwrap_or_default()
 }
 
-/// What a refused call means: a dead token or a missing permission is `Reconnect`, an
+/// What a refused call means: a dead token is `Reconnect`, a missing permission `Denied`, an
 /// exhausted quota says so, anything else is `Failed` with `step` and Google's reason.
 fn refusal(status: StatusCode, body: &Value, step: &str) -> PostError {
     match (status.as_u16(), code(body)) {
-        (401, _) | (403, "insufficientPermissions" | "authError") => PostError::Reconnect,
+        (401, _) | (403, "authError") => PostError::Reconnect,
+        (403, "insufficientPermissions") => PostError::Denied,
         // A revoked or expired refresh token, or a code that was already used.
         (400, _) if body["error"] == "invalid_grant" => PostError::Reconnect,
         (_, "quotaExceeded" | "dailyLimitExceeded") => failed(QUOTA),
@@ -518,6 +519,10 @@ mod tests {
         assert!(matches!(err(401, Value::Null), PostError::Reconnect));
         assert!(matches!(
             err(403, nested("insufficientPermissions")),
+            PostError::Denied
+        ));
+        assert!(matches!(
+            err(403, nested("authError")),
             PostError::Reconnect
         ));
         assert!(matches!(
@@ -529,18 +534,18 @@ mod tests {
         ));
         match err(403, nested("quotaExceeded")) {
             PostError::Failed(m) => assert!(m.contains("daily quota"), "{m}"),
-            PostError::Reconnect => panic!("quota is not a reconnect"),
+            PostError::Reconnect | PostError::Denied => panic!("quota is not a reconnect"),
         }
         match err(
             400,
             json!({"error": {"message": "Bad https://x.example/?access_token=a title"}}),
         ) {
             PostError::Failed(m) => assert_eq!(m, "Upload: Bad title"),
-            PostError::Reconnect => panic!(),
+            PostError::Reconnect | PostError::Denied => panic!(),
         }
         match err(502, Value::Null) {
             PostError::Failed(m) => assert_eq!(m, "Upload: HTTP 502"),
-            PostError::Reconnect => panic!(),
+            PostError::Reconnect | PostError::Denied => panic!(),
         }
     }
 

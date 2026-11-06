@@ -67,7 +67,7 @@ async fn callback(
             tracing::warn!(why, "threads connect failed");
             return fail("threads_failed");
         }
-        Err(PostError::Reconnect) => {
+        Err(PostError::Reconnect | PostError::Denied) => {
             tracing::warn!("threads refused the new token");
             return fail("threads_failed");
         }
@@ -100,6 +100,7 @@ async fn callback(
         social_accounts::Column::AvatarUrl,
         social_accounts::Column::AccessToken,
         social_accounts::Column::TokenExpiresAt,
+        social_accounts::Column::Meta,
         social_accounts::Column::UpdatedAt,
     ];
     if let Err(e) = save_account(&app.db, (team_id, new_id), row, refresh).await {
@@ -151,6 +152,11 @@ pub async fn refresh_tokens(app: &AppState) -> Result<u64, DbErr> {
             Ok(t) => t,
             Err(PostError::Failed(why)) => {
                 tracing::warn!(account = %id, why, "threads token refresh failed");
+                continue;
+            }
+            // A missing permission says nothing about the token: no flag.
+            Err(PostError::Denied) => {
+                tracing::warn!(account = %id, "threads denied the token refresh");
                 continue;
             }
             Err(PostError::Reconnect) => {

@@ -134,7 +134,9 @@ async fn fetch(
 fn log(e: &PostError, step: &str) {
     match e {
         PostError::Failed(why) => tracing::warn!(why, step, "youtube connect failed"),
-        PostError::Reconnect => tracing::warn!(step, "youtube refused the connect"),
+        PostError::Reconnect | PostError::Denied => {
+            tracing::warn!(step, "youtube refused the connect")
+        }
     }
 }
 
