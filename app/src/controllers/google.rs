@@ -23,7 +23,8 @@ use socialreins_core::{email, oauth, team, token};
 
 use super::{
     auth::{
-        cookie_value, find_user, named_cookie, refused, signed_in, start_session, user_for_sign_in,
+        cookie_value, find_user, may_sign_up, named_cookie, refused, signed_in, start_session,
+        user_for_sign_in,
     },
     waitlist::error,
 };
@@ -171,7 +172,12 @@ async fn account_for(
     };
     let (user, created) = if id.owns_email() {
         if login_only && find_user(app, &email).await?.is_none() {
-            return Ok(Outcome::NoAccount);
+            let open = may_sign_up(app, &email).await?;
+            return Ok(if open {
+                Outcome::NoAccount
+            } else {
+                Outcome::Closed
+            });
         }
         match user_for_sign_in(app, &email, None).await? {
             Some(found) => found,

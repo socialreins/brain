@@ -29,7 +29,7 @@ use super::{
 use crate::{
     config::origin,
     models::{magic_links, sessions, users},
-    rate_limit::ClientIp,
+    rate_limit::{self, ClientIp},
     state::AppState,
     turnstile,
 };
@@ -41,6 +41,8 @@ const SESSION_DAYS: i64 = 30;
 const MAX_LIVE_LINKS: u64 = 3;
 /// Longest display name, in characters after trimming.
 const MAX_USER_NAME_CHARS: usize = 80;
+/// "No account" emails one address can get a day from login attempts.
+const LOGIN_NOTICES_PER_DAY: i64 = 3;
 
 #[derive(Deserialize)]
 struct LinkRequest {
@@ -113,6 +115,9 @@ async fn send_link(
     {
         return Ok(());
     }
+    if login_only && !known {
+        return send_no_account_notice(app, &email).await;
+    }
     let now = Utc::now().fixed_offset();
     magic_links::Entity::delete_many()
         .filter(magic_links::Column::ExpiresAt.lt(now))
@@ -125,19 +130,6 @@ async fn send_link(
     else {
         return Ok(());
     };
-    if login_only && !known {
-        // The unsent link still counts, so this mail is capped per inbox like any other.
-        let text = format!(
-            "Someone tried to log in to SocialReins with this email, but it has no account yet.\n\n\
-             To create one, sign up here:\n\n{}/signup\n\nIf this was not you, ignore this email.\n",
-            app.web_url
-        );
-        return app
-            .mailer
-            .send(&email, "No SocialReins account for this email", text)
-            .await
-            .map_err(|e| format!("mail: {e}"));
-    }
     let url = format!("{}/auth/magic/{secret}", app.brain_url);
     let text = format!(
         "Open this link to sign in to SocialReins:\n\n{url}\n\nIt works once and expires in \
@@ -145,6 +137,30 @@ async fn send_link(
     );
     app.mailer
         .send(&email, "Your sign-in link", text)
+        .await
+        .map_err(|e| format!("mail: {e}"))
+}
+
+/// Tells an email with no account how to create one, at most `LOGIN_NOTICES_PER_DAY` times. The
+/// count is its own, so login attempts never use up the links a sign-up needs.
+async fn send_no_account_notice(app: &AppState, email: &str) -> Result<(), String> {
+    let caps = [(
+        format!("login_notice:{}", token::hash(email)),
+        LOGIN_NOTICES_PER_DAY,
+    )];
+    let reserved = rate_limit::daily_reserve(&app.db, &caps)
+        .await
+        .map_err(|e| format!("notice cap: {e}"))?;
+    if reserved.is_none() {
+        return Ok(());
+    }
+    let text = format!(
+        "Someone tried to log in to SocialReins with this email, but it has no account yet.\n\n\
+         To create one, sign up here:\n\n{}/signup\n\nIf this was not you, ignore this email.\n",
+        app.web_url
+    );
+    app.mailer
+        .send(email, "No SocialReins account for this email", text)
         .await
         .map_err(|e| format!("mail: {e}"))
 }
@@ -224,7 +240,7 @@ async fn sign_up(app: &AppState, email: &str) -> Result<SignUp, DbErr> {
 
 /// `sign_up` as a yes or no, without the lock `create_first_user` takes: for deciding whether
 /// to send a link at all.
-async fn may_sign_up(app: &AppState, email: &str) -> Result<bool, DbErr> {
+pub(crate) async fn may_sign_up(app: &AppState, email: &str) -> Result<bool, DbErr> {
     Ok(match sign_up(app, email).await? {
         SignUp::Allowed => true,
         SignUp::FirstOnly => users::Entity::find().one(&app.db).await?.is_none(),

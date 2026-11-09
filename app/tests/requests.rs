@@ -16248,8 +16248,11 @@ mod waitlist_confirm {
             .json(&body)
             .await
             .assert_status(axum::http::StatusCode::ACCEPTED);
+        for _ in 0..3 {
+            s.post("/auth/link").json(&body).await;
+        }
         let sent = mails(&seen, &unknown).await;
-        assert_eq!(sent.len(), 1);
+        assert_eq!(sent.len(), 3, "capped per day");
         let text = sent[0]["text"].as_str().unwrap();
         assert!(text.contains(&format!("{web}/signup")), "{text}");
         assert!(!text.contains("/auth/magic/"), "{text}");
@@ -16260,6 +16263,20 @@ mod waitlist_confirm {
             .unwrap();
         assert!(created.is_none());
 
+        // Login attempts do not use up the links a sign-up needs.
+        let signup = json!({"email": unknown, "name": "Ann"});
+        s.post("/auth/link")
+            .json(&signup)
+            .await
+            .assert_status(axum::http::StatusCode::ACCEPTED);
+        let sent = mails(&seen, &unknown).await;
+        assert!(sent[3]["text"].as_str().unwrap().contains("/auth/magic/"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_login_link_still_signs_in_a_known_email() {
+        let (s, db, seen, _) = app().await;
         let known = unique_email();
         let secret = auth::link(&db, &known, Duration::minutes(15)).await;
         auth::open(&s, &secret).await;
