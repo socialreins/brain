@@ -1080,39 +1080,6 @@ pub async fn delete_post(app: &AppState, a: &Actor, id: Uuid) -> Response {
                 Err(e) => internal(e, "post delete"),
             }
         }
-        // A failed post can go when nothing of it reached the platform or might have.
-        "failed" => {
-            let targets = post_targets::Entity::find()
-                .filter(post_targets::Column::PostId.eq(id))
-                .all(&app.db)
-                .await;
-            let targets = match targets {
-                Ok(t) => t,
-                Err(e) => return internal(e, "post read"),
-            };
-            let maybe_live = targets.iter().any(|t| {
-                t.remote_id.is_some()
-                    || t.status != "failed"
-                    || publish::outcome_unknown(t.error.as_deref())
-            });
-            if maybe_live {
-                return reply(StatusCode::CONFLICT, "not_deletable");
-            }
-            let gone = posts::Entity::delete_many()
-                .filter(posts::Column::Id.eq(id))
-                .filter(posts::Column::Status.eq("failed"))
-                .filter(in_scope(a))
-                .exec(&app.db)
-                .await;
-            match gone {
-                Ok(r) if r.rows_affected == 1 => {
-                    app.media.release_post(&app.db, id).await;
-                    StatusCode::NO_CONTENT.into_response()
-                }
-                Ok(_) => reply(StatusCode::CONFLICT, "not_deletable"),
-                Err(e) => internal(e, "post delete"),
-            }
-        }
         "published" | "deleted" => {
             if found.status == "published" {
                 if !app.post_limiter.hit(a.key()) {
