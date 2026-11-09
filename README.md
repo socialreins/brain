@@ -33,7 +33,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/v1/waitlist/count` | `{"count":n}`: every signup, verified or not, cached for 30 seconds |
 | GET | `/v1/admin/waitlist` | `ADMIN_EMAILS` only, session cookie: `{"total","verified","signups":[{"id","email","source","created_at","verified_at"}]}`, newest first, at most 1000 (`?verified=true\|false` filters the list) |
 | POST | `/v1/contact` | `{"name","email","message"}` mails `CONTACT_TO`, `202 {}` |
-| POST | `/auth/link` | `{"email":"..."}` emails a sign-in link, `202 {"status":"sent"}` |
+| POST | `/auth/link` | `{"email":"...","name":"..."}` emails a sign-in link, `202 {"status":"sent"}`. `name` is optional, 1 to 80 characters (else `422 invalid_name`), and only names an account this link creates |
 | GET | `/auth/magic/{token}` | The emailed link: a page with a sign-in button, does not use the link |
 | POST | `/auth/magic` | Form field `token`: uses the link, sets the session cookie, redirects to `WEB_URL` |
 | GET | `/auth/me` | The signed-in user with `is_admin` (in `ADMIN_EMAILS`), or `401 {"error":"unauthorized"}` |

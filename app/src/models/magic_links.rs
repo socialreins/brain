@@ -9,6 +9,9 @@ pub struct Model {
     /// Always lowercased. The account is created on redeem if it does not exist yet.
     #[sea_orm(column_type = "Text")]
     pub email: String,
+    /// The name asked for on sign-up, used only if this link creates the account.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub name: Option<String>,
     pub expires_at: DateTimeWithTimeZone,
     pub created_at: DateTimeWithTimeZone,
 }

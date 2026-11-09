@@ -329,6 +329,55 @@ mod auth {
 
     #[tokio::test]
     #[serial]
+    async fn a_name_on_the_link_names_only_a_new_account() {
+        let (s, db) = server_where(|_| {}).await;
+        let email = unique_email();
+        let body = json!({"email": email, "name": "  Ann Lee "});
+        assert_eq!(s.post("/auth/link").json(&body).await.status_code(), 202);
+        assert_eq!(links_eventually(&db, &email, 1).await, 1);
+        let row = magic_links::Entity::find()
+            .filter(magic_links::Column::Email.eq(email.as_str()))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.name.as_deref(), Some("Ann Lee"));
+
+        // A link can only be redeemed by its secret, so store one carrying the name.
+        let secret = link(&db, &email, Duration::minutes(15)).await;
+        magic_links::Entity::update_many()
+            .col_expr(
+                magic_links::Column::Name,
+                sea_orm::sea_query::Expr::value("Ann Lee"),
+            )
+            .filter(magic_links::Column::TokenHash.eq(token::hash(&secret)))
+            .exec(&db)
+            .await
+            .unwrap();
+        open(&s, &secret).await;
+        assert_eq!(user(&db, &email).await.unwrap().name, "Ann Lee");
+
+        let again = link(&db, &email, Duration::minutes(15)).await;
+        magic_links::Entity::update_many()
+            .col_expr(
+                magic_links::Column::Name,
+                sea_orm::sea_query::Expr::value("Someone Else"),
+            )
+            .filter(magic_links::Column::TokenHash.eq(token::hash(&again)))
+            .exec(&db)
+            .await
+            .unwrap();
+        open(&s, &again).await;
+        assert_eq!(user(&db, &email).await.unwrap().name, "Ann Lee", "kept");
+
+        let blank = json!({"email": unique_email(), "name": "   "});
+        let res = s.post("/auth/link").json(&blank).await;
+        assert_eq!(res.status_code(), 422);
+        res.assert_json(&json!({"error": "invalid_name"}));
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn link_signs_up_once_and_me_returns_the_user() {
         let (s, db) = server_where(|_| {}).await;
         let email = unique_email();

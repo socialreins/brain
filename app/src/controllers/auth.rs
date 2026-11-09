@@ -45,6 +45,8 @@ const MAX_USER_NAME_CHARS: usize = 80;
 #[derive(Deserialize)]
 struct LinkRequest {
     email: String,
+    /// The name for a new account, from the sign-up form. An existing account keeps its own.
+    name: Option<String>,
     turnstile_token: Option<String>,
 }
 
@@ -71,12 +73,19 @@ async fn request_link(
     let Some(email) = email::normalize(&body.email) else {
         return error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_email").into_response();
     };
+    let name = match body.name.as_deref() {
+        Some(raw) => match team::name_up_to(raw, MAX_USER_NAME_CHARS) {
+            Some(name) => Some(name),
+            None => return error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name").into_response(),
+        },
+        None => None,
+    };
     let token = body.turnstile_token.as_deref();
     if let Err(r) = turnstile::check(app.turnstile.as_ref(), token, ip).await {
         return r.into_response();
     }
     tokio::spawn(async move {
-        if let Err(e) = send_link(&app, email).await {
+        if let Err(e) = send_link(&app, email, name).await {
             tracing::error!(error = %e, "magic link not sent");
         }
     });
@@ -84,7 +93,7 @@ async fn request_link(
 }
 
 /// Errors carry the failure only, never the email or the token.
-async fn send_link(app: &AppState, email: String) -> Result<(), String> {
+async fn send_link(app: &AppState, email: String, name: Option<String>) -> Result<(), String> {
     if !may_sign_up(app, &email)
         .await
         .map_err(|e| format!("sign-up check: {e}"))?
@@ -101,7 +110,7 @@ async fn send_link(app: &AppState, email: String) -> Result<(), String> {
         .exec(&app.db)
         .await
         .map_err(|e| format!("magic link cleanup: {e}"))?;
-    let Some(secret) = insert_capped_link(app, &email)
+    let Some(secret) = insert_capped_link(app, &email, name)
         .await
         .map_err(|e| format!("magic link insert: {e}"))?
     else {
@@ -121,7 +130,11 @@ async fn send_link(app: &AppState, email: String) -> Result<(), String> {
 /// Stores a new link unless `email` already holds `MAX_LIVE_LINKS` unexpired ones, which caps
 /// mail to one inbox no matter how many IPs ask. The count and insert run under a per-email
 /// advisory lock, so concurrent requests cannot both pass the check. Returns the new token.
-async fn insert_capped_link(app: &AppState, email: &str) -> Result<Option<String>, DbErr> {
+async fn insert_capped_link(
+    app: &AppState,
+    email: &str,
+    name: Option<String>,
+) -> Result<Option<String>, DbErr> {
     let txn = app.db.begin().await?;
     let lock = "SELECT pg_advisory_xact_lock(hashtext($1))";
     txn.execute_raw(Statement::from_sql_and_values(
@@ -143,6 +156,7 @@ async fn insert_capped_link(app: &AppState, email: &str) -> Result<Option<String
     let link = magic_links::ActiveModel {
         token_hash: Set(token::hash(&secret)),
         email: Set(email.to_owned()),
+        name: Set(name),
         expires_at: Set(now + Duration::minutes(LINK_MINUTES)),
         ..Default::default()
     };
@@ -198,7 +212,11 @@ async fn may_sign_up(app: &AppState, email: &str) -> Result<bool, DbErr> {
 
 /// `SignUp::FirstOnly`: creates the account only if none exists. The advisory lock makes
 /// concurrent first sign-ups take turns, so exactly one sees an empty `users` table.
-async fn create_first_user(app: &AppState, email: &str) -> Result<Option<users::Model>, DbErr> {
+async fn create_first_user(
+    app: &AppState,
+    email: &str,
+    name: Option<&str>,
+) -> Result<Option<users::Model>, DbErr> {
     const FIRST_ACCOUNT_LOCK: i64 = 0x0053_5246_4952_5354; // "SRFIRST"
     let txn = app.db.begin().await?;
     txn.execute_raw(Statement::from_sql_and_values(
@@ -210,7 +228,7 @@ async fn create_first_user(app: &AppState, email: &str) -> Result<Option<users::
     if users::Entity::find().one(&txn).await?.is_some() {
         return Ok(None);
     }
-    let user = create_user(&txn, email).await?;
+    let user = create_user(&txn, email, name).await?;
     txn.commit().await?;
     Ok(Some(user))
 }
@@ -220,13 +238,14 @@ async fn create_first_user(app: &AppState, email: &str) -> Result<Option<users::
 pub(crate) async fn user_for_sign_in(
     app: &AppState,
     email: &str,
+    name: Option<&str>,
 ) -> Result<Option<(users::Model, bool)>, DbErr> {
     if let Some(user) = find_user(app, email).await? {
         return Ok(Some((user, false)));
     }
     let created = match sign_up(app, email).await? {
-        SignUp::Allowed => Some(create_user(&app.db, email).await?),
-        SignUp::FirstOnly => create_first_user(app, email).await?,
+        SignUp::Allowed => Some(create_user(&app.db, email, name).await?),
+        SignUp::FirstOnly => create_first_user(app, email, name).await?,
         SignUp::Refused => None,
     };
     Ok(created.map(|user| (user, true)))
@@ -302,7 +321,7 @@ async fn redeem(
     if link.expires_at < Utc::now() {
         return refused(&app, "invalid_link");
     }
-    let user = match user_for_sign_in(&app, &link.email).await {
+    let user = match user_for_sign_in(&app, &link.email, link.name.as_deref()).await {
         Ok(Some((user, _))) => user,
         Ok(None) => return refused(&app, "registration_disabled"),
         Err(e) => return internal(e, "sign-in user"),
@@ -399,12 +418,16 @@ impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for Body<T> {
     }
 }
 
-async fn create_user(db: &impl ConnectionTrait, email: &str) -> Result<users::Model, DbErr> {
-    let name = email.split('@').next().unwrap_or_default().to_owned();
+async fn create_user(
+    db: &impl ConnectionTrait,
+    email: &str,
+    name: Option<&str>,
+) -> Result<users::Model, DbErr> {
+    let name = name.unwrap_or_else(|| email.split('@').next().unwrap_or_default());
     let row = users::ActiveModel {
         id: Set(uuid::Uuid::now_v7()),
         email: Set(email.to_owned()),
-        name: Set(name),
+        name: Set(name.to_owned()),
         ..Default::default()
     };
     // Two links for one new email redeemed at once: the second insert is a no-op.
