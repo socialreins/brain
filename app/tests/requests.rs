@@ -16210,6 +16210,17 @@ mod waitlist_confirm {
             .collect()
     }
 
+    /// The mails sent to `email`, waiting up to 5 seconds for at least `want` of them.
+    async fn mails_at_least(seen: &Seen, email: &str, want: usize) -> Vec<Value> {
+        for _ in 0..33 {
+            let sent = mails(seen, email).await;
+            if sent.len() >= want {
+                return sent;
+            }
+        }
+        mails(seen, email).await
+    }
+
     fn token_of(mail: &Value) -> String {
         let text = mail["text"].as_str().unwrap();
         let (_, rest) = text.split_once("/waitlist/verify?token=").unwrap();
@@ -16251,8 +16262,8 @@ mod waitlist_confirm {
         for _ in 0..3 {
             s.post("/auth/link").json(&body).await;
         }
-        let sent = mails(&seen, &unknown).await;
-        assert_eq!(sent.len(), 3, "capped per day");
+        let sent = mails_at_least(&seen, &unknown, 3).await;
+        assert_eq!(mails(&seen, &unknown).await.len(), 3, "capped per day");
         let text = sent[0]["text"].as_str().unwrap();
         assert!(text.contains(&format!("{web}/signup")), "{text}");
         assert!(!text.contains("/auth/magic/"), "{text}");
@@ -16269,7 +16280,7 @@ mod waitlist_confirm {
             .json(&signup)
             .await
             .assert_status(axum::http::StatusCode::ACCEPTED);
-        let sent = mails(&seen, &unknown).await;
+        let sent = mails_at_least(&seen, &unknown, 4).await;
         assert!(sent[3]["text"].as_str().unwrap().contains("/auth/magic/"));
     }
 
@@ -16285,7 +16296,7 @@ mod waitlist_confirm {
             .json(&body)
             .await
             .assert_status(axum::http::StatusCode::ACCEPTED);
-        let sent = mails(&seen, &known).await;
+        let sent = mails_at_least(&seen, &known, 1).await;
         assert!(sent[0]["text"].as_str().unwrap().contains("/auth/magic/"));
     }
 
