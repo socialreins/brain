@@ -2545,6 +2545,10 @@ mod teams {
                 .route("/xrpc/com.atproto.server.createSession", post(session))
                 .route("/xrpc/app.bsky.actor.getProfile", get(profile))
                 .route("/xrpc/com.atproto.repo.uploadBlob", post(upload_blob))
+                .route("/xrpc/com.atproto.server.getServiceAuth", get(service_auth))
+                .route("/xrpc/app.bsky.video.uploadVideo", post(upload_video))
+                .route("/xrpc/app.bsky.video.getJobStatus", get(video_job))
+                .route("/clip.mp4", get(|| async { mp4_file() }))
                 .route("/xrpc/com.atproto.repo.createRecord", post(create_record))
                 .route("/xrpc/com.atproto.repo.deleteRecord", post(delete_record))
                 .route(
@@ -2757,6 +2761,70 @@ mod teams {
             (axum::http::StatusCode::OK, Json(json!({ "blob": blob })))
         }
 
+        /// A 1080x1920 MP4 header, as far as sniffing and the embed's aspect ratio read it.
+        fn mp4_file() -> impl axum::response::IntoResponse {
+            let mut tkhd = vec![0u8; 84];
+            tkhd[40..44].copy_from_slice(&0x10000u32.to_be_bytes());
+            tkhd[76..80].copy_from_slice(&(1080u32 << 16).to_be_bytes());
+            tkhd[80..84].copy_from_slice(&(1920u32 << 16).to_be_bytes());
+            let wrap = |name: &[u8; 4], body: Vec<u8>| {
+                let mut b = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+                b.extend_from_slice(name);
+                b.extend(body);
+                b
+            };
+            let mut file = wrap(b"ftyp", b"mp42\0\0\0\0".to_vec());
+            file.extend(wrap(b"moov", wrap(b"trak", wrap(b"tkhd", tkhd))));
+            ([(axum::http::header::CONTENT_TYPE, "video/mp4")], file)
+        }
+
+        async fn service_auth(
+            headers: axum::http::HeaderMap,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> (axum::http::StatusCode, Json<Value>) {
+            if !authorized(&headers) || q["lxm"] != "com.atproto.repo.uploadBlob" {
+                return (axum::http::StatusCode::UNAUTHORIZED, Json(json!({})));
+            }
+            assert_eq!(q["aud"], "did:web:127.0.0.1");
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({"token": "video-token"})),
+            )
+        }
+
+        /// Only the service token is taken: the session must never reach the video service.
+        async fn upload_video(
+            headers: axum::http::HeaderMap,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> (axum::http::StatusCode, Json<Value>) {
+            let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
+            if auth != Some("Bearer video-token") || !q.contains_key("did") {
+                return (axum::http::StatusCode::UNAUTHORIZED, Json(json!({})));
+            }
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({"jobId": "job1", "state": "JOB_STATE_CREATED"})),
+            )
+        }
+
+        /// The next video job ends as Bluesky ends one for a video it already has.
+        static VIDEO_KNOWN: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+
+        async fn video_job() -> Json<Value> {
+            let blob = json!({"$type": "blob", "ref": {"$link": "bafyvideo"},
+                "mimeType": "video/mp4", "size": 9});
+            if VIDEO_KNOWN.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Json(
+                    json!({"jobStatus": {"jobId": "job1", "state": "JOB_STATE_FAILED",
+                    "error": "already_exists", "blob": blob}}),
+                );
+            }
+            Json(
+                json!({"jobStatus": {"jobId": "job1", "state": "JOB_STATE_COMPLETED", "blob": blob}}),
+            )
+        }
+
         /// Text with `REJECT` is refused with a leaky message; text with `STICKY` gets a
         /// record key that cannot be deleted.
         async fn create_record(
@@ -2819,7 +2887,8 @@ mod teams {
             let base = mock_bluesky().await;
             server_where(|c| {
                 c.bluesky.appview = base.clone();
-                c.bluesky.plc = base;
+                c.bluesky.plc = base.clone();
+                c.bluesky.video = base;
                 c.bluesky.allow_insecure_pds = !secure;
             })
             .await
@@ -3660,7 +3729,8 @@ mod teams {
                 let mut config = Config::from_env().expect("test config");
                 config.trust_proxy = true;
                 config.bluesky.appview = base.clone();
-                config.bluesky.plc = base;
+                config.bluesky.plc = base.clone();
+                config.bluesky.video = base;
                 config.bluesky.allow_insecure_pds = true;
                 let disk = object_store::local::LocalFileSystem::new_with_prefix(media_dir())
                     .unwrap()
@@ -4126,6 +4196,32 @@ mod teams {
 
             #[tokio::test]
             #[serial]
+            async fn the_tick_publishes_a_bluesky_video() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let base = pds_of(&db, &team_id).await;
+                let id = id_of(&create(&s, &cookie, input(&set, "video", Some(&past()))).await);
+                set_media(&db, &base, &id, &["/clip.mp4"]).await;
+                publish::tick(&state).await.unwrap();
+                let p = get_post(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "published", "{p}");
+                let record = RECORDS.lock().unwrap().last().cloned().unwrap();
+                let embed = &record["record"]["embed"];
+                assert_eq!(embed["$type"], "app.bsky.embed.video");
+                assert_eq!(embed["video"]["ref"]["$link"], "bafyvideo");
+                assert_eq!(embed["aspectRatio"], json!({"width": 1080, "height": 1920}));
+
+                // A retry finds the video already processed and reuses its blob.
+                VIDEO_KNOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+                let id = id_of(&create(&s, &cookie, input(&set, "again", Some(&past()))).await);
+                set_media(&db, &base, &id, &["/clip.mp4"]).await;
+                publish::tick(&state).await.unwrap();
+                assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+            }
+
+            #[tokio::test]
+            #[serial]
             async fn the_tick_publishes_due_posts_with_images() {
                 let (s, db, state) = on_mock().await;
                 let (cookie, team_id, _) = owner_with_account(&s, &db).await;
@@ -4351,6 +4447,11 @@ mod teams {
                         "big",
                         vec!["/big.png"],
                         "Image 1 is over 1 MB, Bluesky's limit.",
+                    ),
+                    (
+                        "mixed",
+                        vec!["/img.png", "/clip.mp4"],
+                        "Bluesky takes up to 4 images or one video, not a mix.",
                     ),
                     (
                         "html",

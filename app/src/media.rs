@@ -63,6 +63,7 @@ pub enum Fail {
 pub struct Stored {
     pub key: String,
     pub content_type: String,
+    pub size: i64,
 }
 
 impl Media {
@@ -154,7 +155,7 @@ impl Media {
         };
         let found = db
             .query_one_raw(sql(
-                "SELECT storage_key, content_type FROM post_media \
+                "SELECT storage_key, content_type, size FROM post_media \
                  WHERE post_id = $1 AND source_url = $2",
                 vec![post.into(), url.into()],
             ))
@@ -181,7 +182,7 @@ impl Media {
                 "INSERT INTO post_media (id, post_id, source_url, storage_key, content_type, size) \
                  VALUES ($1, $2, $3, $4, $5, $6) \
                  ON CONFLICT (post_id, source_url) DO UPDATE SET post_id = EXCLUDED.post_id \
-                 RETURNING storage_key, content_type",
+                 RETURNING storage_key, content_type, size",
                 vec![
                     Uuid::now_v7().into(),
                     post.into(),
@@ -439,6 +440,7 @@ fn stored(row: &sea_orm::QueryResult) -> Result<Stored, DbErr> {
     Ok(Stored {
         key: row.try_get("", "storage_key")?,
         content_type: row.try_get("", "content_type")?,
+        size: row.try_get("", "size")?,
     })
 }
 

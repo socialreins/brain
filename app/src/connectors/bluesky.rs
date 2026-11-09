@@ -10,7 +10,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, Utc};
 use reqwest::{StatusCode, Url};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
@@ -20,6 +20,8 @@ use serde_json::Value;
 pub struct Bluesky {
     pub appview: String,
     pub plc: String,
+    /// Bluesky's video service, which takes uploads and makes the blob a post embeds.
+    pub video: String,
     /// Tests only, never read from the environment: lets the PDS be a plain `http://127.0.0.1`
     /// mock. Names still resolve to public addresses only.
     pub allow_insecure_pds: bool,
@@ -192,6 +194,7 @@ impl Bluesky {
         Ok(Self {
             appview: appview.into(),
             plc: plc.into(),
+            video: VIDEO_SERVICE.into(),
             allow_insecure_pds: false,
             client,
             sessions: Arc::default(),
@@ -368,6 +371,14 @@ impl Bluesky {
 pub const MAX_IMAGE_BYTES: usize = 1_000_000;
 const IMAGE_TYPES: [&str; 4] = ["image/jpeg", "image/png", "image/webp", "image/gif"];
 const POST_COLLECTION: &str = "app.bsky.feed.post";
+const VIDEO_SERVICE: &str = "https://video.bsky.app";
+const VIDEO_UPLOAD_TIMEOUT: Duration = Duration::from_secs(150);
+/// How long Bluesky gets to process an uploaded video.
+const VIDEO_WAIT: Duration = Duration::from_secs(120);
+const VIDEO_POLL: Duration = Duration::from_secs(2);
+pub const MIXED_MEDIA: &str = "Bluesky takes up to 4 images or one video, not a mix.";
+/// A post can be one upload and one wait, and the record after them.
+pub const PUBLISH_TIMEOUT: Duration = Duration::from_secs(360);
 
 /// Why a publish or takedown did not happen. Messages are safe to store and show: they never
 /// hold a URL, token or secret.
@@ -389,7 +400,9 @@ fn failed(msg: impl Into<String>) -> PostError {
 fn xrpc_code(body: &Value, status: StatusCode) -> String {
     match body["error"].as_str() {
         Some(e)
-            if !e.is_empty() && e.len() <= 40 && e.chars().all(|c| c.is_ascii_alphanumeric()) =>
+            if !e.is_empty()
+                && e.len() <= 40
+                && e.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
         {
             e.to_owned()
         }
@@ -415,6 +428,47 @@ fn post_key(uri: &str) -> Option<(&str, &str)> {
     };
     (parts.next().is_none() && collection == POST_COLLECTION && plain(did) && plain(rkey))
         .then_some((did, rkey))
+}
+
+/// The boxes named `name` directly in `data`, an MP4 or MOV box list; stops at a malformed one.
+fn boxes<'a>(data: &'a [u8], name: &[u8; 4]) -> Vec<&'a [u8]> {
+    let (mut found, mut rest) = (Vec::new(), data);
+    while rest.len() >= 8 {
+        let short = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        let (size, head) = match short {
+            0 => (rest.len(), 8),
+            1 if rest.len() >= 16 => {
+                let wide: [u8; 8] = rest[8..16].try_into().unwrap_or_default();
+                (usize::try_from(u64::from_be_bytes(wide)).unwrap_or(0), 16)
+            }
+            n => (n, 8),
+        };
+        if size < head || size > rest.len() {
+            break;
+        }
+        if &rest[4..8] == name {
+            found.push(&rest[head..size]);
+        }
+        rest = &rest[size..];
+    }
+    found
+}
+
+/// The display size of an MP4 or MOV's first video track, for the player's shape in the feed.
+fn mp4_size(data: &[u8]) -> Option<(u32, u32)> {
+    let word = |t: &[u8], at: usize| -> Option<u32> {
+        Some(u32::from_be_bytes(t.get(at..at + 4)?.try_into().ok()?))
+    };
+    let moov = *boxes(data, b"moov").first()?;
+    boxes(moov, b"trak").into_iter().find_map(|trak| {
+        let tkhd = *boxes(trak, b"tkhd").first()?;
+        // The width sits at 76 in a version 0 `tkhd` and 88 in version 1, the matrix 36 before it.
+        let at = if *tkhd.first()? == 1 { 88 } else { 76 };
+        let (w, h) = (word(tkhd, at)? >> 16, word(tkhd, at + 4)? >> 16);
+        // A quarter turn (phone video) has a zero first matrix entry.
+        let turned = word(tkhd, at - 36)? == 0;
+        (w > 0 && h > 0).then_some(if turned { (h, w) } else { (w, h) })
+    })
 }
 
 impl Bluesky {
@@ -489,7 +543,7 @@ impl Bluesky {
         Err(PostError::Reconnect)
     }
 
-    /// Publishes a post with up to 4 images `(bytes, type)`, a reply when `reply` holds `(parent, root)`;
+    /// Publishes a post with up to 4 images or one video `(bytes, type)`, a reply when `reply` holds `(parent, root)`;
     /// returns its `(at:// uri, cid)`.
     pub async fn publish_post(
         &self,
@@ -511,32 +565,39 @@ impl Bluesky {
         reply: Option<(Ref<'_>, Ref<'_>)>,
     ) -> Result<(String, String), PostError> {
         let (pds, jwt) = (&s.pds, &s.jwt);
-        let mut images = Vec::new();
-        for (i, (bytes, mime)) in media.iter().enumerate() {
-            if !IMAGE_TYPES.contains(mime) {
-                let n = i + 1;
-                return Err(failed(format!(
-                    "Image {n} is not a JPEG, PNG, WebP or GIF."
-                )));
-            }
-            let up = self
-                .call(
-                    pds,
-                    jwt,
-                    "com.atproto.repo.uploadBlob",
-                    bytes.to_vec().into(),
-                    mime,
-                )
-                .await?;
-            if !up["blob"].is_object() {
-                return Err(failed("Bluesky did not take an image."));
-            }
-            images.push(serde_json::json!({ "alt": "", "image": up["blob"] }));
-        }
         let mut record = post_record(text, &[], reply);
-        if !images.is_empty() {
-            record["embed"] =
-                serde_json::json!({ "$type": "app.bsky.embed.images", "images": images });
+        if media.iter().any(|(_, mime)| mime.starts_with("video/")) {
+            let [(bytes, mime)] = media else {
+                return Err(failed(MIXED_MEDIA));
+            };
+            record["embed"] = self.video_embed(&s, did, bytes, mime).await?;
+        } else {
+            let mut images = Vec::new();
+            for (i, (bytes, mime)) in media.iter().enumerate() {
+                if !IMAGE_TYPES.contains(mime) {
+                    let n = i + 1;
+                    return Err(failed(format!(
+                        "Image {n} is not a JPEG, PNG, WebP or GIF."
+                    )));
+                }
+                let up = self
+                    .call(
+                        pds,
+                        jwt,
+                        "com.atproto.repo.uploadBlob",
+                        bytes.to_vec().into(),
+                        mime,
+                    )
+                    .await?;
+                if !up["blob"].is_object() {
+                    return Err(failed("Bluesky did not take an image."));
+                }
+                images.push(serde_json::json!({ "alt": "", "image": up["blob"] }));
+            }
+            if !images.is_empty() {
+                record["embed"] =
+                    serde_json::json!({ "$type": "app.bsky.embed.images", "images": images });
+            }
         }
         let body =
             serde_json::json!({ "repo": did, "collection": POST_COLLECTION, "record": record });
@@ -548,6 +609,130 @@ impl Bluesky {
                 Ok((uri.to_owned(), cid.to_owned()))
             }
             _ => Err(failed("Bluesky did not return the post's id.")),
+        }
+    }
+
+    /// Uploads a video to Bluesky's video service, waits until it is processed and returns the
+    /// post embed. The service takes a short-lived token the PDS signs for it, never the session.
+    async fn video_embed(
+        &self,
+        s: &Live,
+        did: &str,
+        bytes: &[u8],
+        mime: &str,
+    ) -> Result<Value, PostError> {
+        let host = Url::parse(&s.pds)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .ok_or_else(|| failed("Bluesky could not be reached."))?;
+        let aud = format!("did:web:{host}");
+        let exp = (Utc::now().timestamp() + 1800).to_string();
+        let query = [
+            ("aud", aud.as_str()),
+            ("lxm", "com.atproto.repo.uploadBlob"),
+            ("exp", exp.as_str()),
+        ];
+        let unreachable = |e: reqwest::Error| {
+            tracing::warn!(error = %e.without_url(), "bluesky video call failed");
+            failed("Bluesky could not be reached.")
+        };
+        let res = self
+            .client
+            .get(format!("{}/xrpc/com.atproto.server.getServiceAuth", s.pds))
+            .bearer_auth(&s.jwt)
+            .query(&query)
+            .send()
+            .await
+            .map_err(unreachable)?;
+        let status = res.status();
+        let auth: Value = json_body(res, "getServiceAuth").await.unwrap_or_default();
+        let Some(token) = auth["token"].as_str().filter(|_| status == StatusCode::OK) else {
+            let code = xrpc_code(&auth, status);
+            // An expired or revoked session answers 400 with these, as in `call`.
+            let expired = status == StatusCode::BAD_REQUEST
+                && matches!(code.as_str(), "ExpiredToken" | "InvalidToken");
+            return Err(if status == StatusCode::UNAUTHORIZED || expired {
+                PostError::Reconnect
+            } else {
+                failed(format!("Bluesky refused the video upload ({code})."))
+            });
+        };
+        let res = self
+            .client
+            .post(format!("{}/xrpc/app.bsky.video.uploadVideo", self.video))
+            .bearer_auth(token)
+            .query(&[("did", did), ("name", "video.mp4")])
+            .header(reqwest::header::CONTENT_TYPE, mime)
+            .timeout(VIDEO_UPLOAD_TIMEOUT)
+            .body(bytes.to_vec())
+            .send()
+            .await
+            .map_err(unreachable)?;
+        let status = res.status();
+        let up: Value = json_body(res, "uploadVideo").await.unwrap_or_default();
+        // The service answers the job flat, and 409 with the same job for a video it already has.
+        let job = if up["jobStatus"].is_object() {
+            &up["jobStatus"]
+        } else {
+            &up
+        };
+        let known = status.is_success() || status == StatusCode::CONFLICT;
+        let blob = if job["blob"].is_object() {
+            job["blob"].clone()
+        } else if let Some(job_id) = job["jobId"].as_str().filter(|_| known) {
+            self.finished_video(job_id).await?
+        } else {
+            return Err(failed(match status {
+                StatusCode::TOO_MANY_REQUESTS => {
+                    "Bluesky is rate limiting this account.".to_owned()
+                }
+                _ => format!("Bluesky refused the video ({}).", xrpc_code(&up, status)),
+            }));
+        };
+        let mut embed = serde_json::json!({ "$type": "app.bsky.embed.video", "video": blob });
+        if let Some((width, height)) = mp4_size(bytes) {
+            embed["aspectRatio"] = serde_json::json!({ "width": width, "height": height });
+        }
+        Ok(embed)
+    }
+
+    /// The blob of a video job, once Bluesky has processed it.
+    async fn finished_video(&self, job_id: &str) -> Result<Value, PostError> {
+        let url = format!("{}/xrpc/app.bsky.video.getJobStatus", self.video);
+        let deadline = std::time::Instant::now() + VIDEO_WAIT;
+        loop {
+            let res = self
+                .client
+                .get(&url)
+                .query(&[("jobId", job_id)])
+                .send()
+                .await;
+            // A failed poll says nothing about the job: only the deadline ends the wait.
+            let status: Value = match res {
+                Ok(res) => json_body(res, "getJobStatus").await.unwrap_or_default(),
+                Err(_) => Value::Null,
+            };
+            let job = if status["jobStatus"].is_object() {
+                &status["jobStatus"]
+            } else {
+                &status
+            };
+            // A video Bluesky already has ends as a failed job that still carries its blob.
+            if job["blob"].is_object() {
+                return Ok(job["blob"].clone());
+            }
+            match job["state"].as_str() {
+                Some("JOB_STATE_COMPLETED") => {
+                    return Err(failed("Bluesky did not return the processed video."))
+                }
+                Some("JOB_STATE_FAILED") => {
+                    return Err(failed("Bluesky could not process the video."))
+                }
+                _ if std::time::Instant::now() >= deadline => {
+                    return Err(failed("Bluesky took too long to process the video."))
+                }
+                _ => tokio::time::sleep(VIDEO_POLL).await,
+            }
         }
     }
 
@@ -1211,6 +1396,32 @@ mod tests {
         ] {
             assert_eq!(post_url(bad), None, "{bad}");
         }
+    }
+
+    fn mp4(width: u32, height: u32, matrix_a: u32) -> Vec<u8> {
+        let mut tkhd = vec![0u8; 84];
+        tkhd[40..44].copy_from_slice(&matrix_a.to_be_bytes());
+        tkhd[76..80].copy_from_slice(&(width << 16).to_be_bytes());
+        tkhd[80..84].copy_from_slice(&(height << 16).to_be_bytes());
+        let wrap = |name: &[u8; 4], body: Vec<u8>| {
+            let mut b = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+            b.extend_from_slice(name);
+            b.extend(body);
+            b
+        };
+        let mut file = wrap(b"ftyp", b"mp42\0\0\0\0".to_vec());
+        file.extend(wrap(b"moov", wrap(b"trak", wrap(b"tkhd", tkhd))));
+        file
+    }
+
+    #[test]
+    fn mp4_size_reads_the_track_header() {
+        assert_eq!(mp4_size(&mp4(1080, 1920, 0x10000)), Some((1080, 1920)));
+        assert_eq!(mp4_size(&mp4(1920, 1080, 0)), Some((1080, 1920)), "turned");
+        assert_eq!(mp4_size(&mp4(0, 0, 0x10000)), None);
+        assert_eq!(mp4_size(b"not a video"), None);
+        let cut = mp4(1080, 1920, 0x10000);
+        assert_eq!(mp4_size(&cut[..cut.len() - 10]), None);
     }
 
     #[test]

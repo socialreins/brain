@@ -203,6 +203,10 @@ impl Publisher for Bluesky {
         Ok(Remote { id, cid, url: None })
     }
 
+    fn timeout(&self) -> Duration {
+        bluesky::PUBLISH_TIMEOUT
+    }
+
     fn name(&self) -> &'static str {
         "Bluesky"
     }
@@ -1272,7 +1276,7 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
 type Media = HashMap<String, Result<Stored, Fail>>;
 
 async fn ingest(app: &AppState, post: &posts::Model) -> Media {
-    let cap = max_bytes(&post.platform);
+    let cap = crate::media::MAX_BYTES;
     let thread: Vec<ThreadPart> = serde_json::from_value(post.thread.clone()).unwrap_or_default();
     let root: Vec<String> = serde_json::from_value(post.media.clone()).unwrap_or_default();
     let urls: Vec<String> = root
@@ -1352,15 +1356,6 @@ async fn load_cover(
     Ok(loaded.pop())
 }
 
-/// The largest file stored for `platform`: Bluesky takes 1 MB images; Threads fetches up to 8 MB
-/// images and 1 GB videos itself, so brain's own cap holds there.
-fn max_bytes(platform: &str) -> usize {
-    match platform {
-        "bluesky" => bluesky::MAX_IMAGE_BYTES,
-        _ => crate::media::MAX_BYTES,
-    }
-}
-
 /// What to tell the user about image `n` that could not be stored.
 fn media_error(fail: Fail, n: usize, platform: &str) -> String {
     match fail {
@@ -1371,12 +1366,9 @@ fn media_error(fail: Fail, n: usize, platform: &str) -> String {
         ),
         Fail::Http(code) => format!("Image {n} could not be downloaded (HTTP {code})."),
         Fail::Unreachable => format!("Image {n} could not be downloaded."),
-        Fail::TooLarge if platform == "bluesky" => {
-            format!("Image {n} is over 1 MB, Bluesky's limit.")
-        }
         Fail::TooLarge => format!(
             "Image {n} is over {} MB, the largest file SocialReins takes.",
-            max_bytes(platform) / 1_000_000
+            crate::media::MAX_BYTES / 1_000_000
         ),
         Fail::Unsupported if platform == "linkedin" => {
             format!("Image {n} is not a JPEG, PNG or GIF image, an MP4 video or a PDF.")
@@ -1398,10 +1390,22 @@ fn media_problem(
     platform: &str,
 ) -> Option<String> {
     let first = |urls: &[String]| {
+        let video = |u: &String| matches!(media.get(u), Some(Ok(s)) if s.content_type.starts_with("video/"));
+        if platform == "bluesky" && urls.len() > 1 && urls.iter().any(video) {
+            return Some(bluesky::MIXED_MEDIA.to_owned());
+        }
         urls.iter()
             .enumerate()
             .find_map(|(i, u)| match media.get(u) {
                 Some(Err(f)) => Some(media_error(*f, i + 1, platform)),
+                // Only known once stored: a Bluesky video may be 100 MB, an image 1 MB.
+                Some(Ok(s))
+                    if platform == "bluesky"
+                        && !s.content_type.starts_with("video/")
+                        && s.size > bluesky::MAX_IMAGE_BYTES as i64 =>
+                {
+                    Some(format!("Image {} is over 1 MB, Bluesky's limit.", i + 1))
+                }
                 _ => None,
             })
     };
