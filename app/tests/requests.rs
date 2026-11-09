@@ -2807,9 +2807,19 @@ mod teams {
             )
         }
 
+        /// The next video job ends as Bluesky ends one for a video it already has.
+        static VIDEO_KNOWN: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+
         async fn video_job() -> Json<Value> {
             let blob = json!({"$type": "blob", "ref": {"$link": "bafyvideo"},
                 "mimeType": "video/mp4", "size": 9});
+            if VIDEO_KNOWN.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Json(
+                    json!({"jobStatus": {"jobId": "job1", "state": "JOB_STATE_FAILED",
+                    "error": "already_exists", "blob": blob}}),
+                );
+            }
             Json(
                 json!({"jobStatus": {"jobId": "job1", "state": "JOB_STATE_COMPLETED", "blob": blob}}),
             )
@@ -4201,6 +4211,13 @@ mod teams {
                 assert_eq!(embed["$type"], "app.bsky.embed.video");
                 assert_eq!(embed["video"]["ref"]["$link"], "bafyvideo");
                 assert_eq!(embed["aspectRatio"], json!({"width": 1080, "height": 1920}));
+
+                // A retry finds the video already processed and reuses its blob.
+                VIDEO_KNOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+                let id = id_of(&create(&s, &cookie, input(&set, "again", Some(&past()))).await);
+                set_media(&db, &base, &id, &["/clip.mp4"]).await;
+                publish::tick(&state).await.unwrap();
+                assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
             }
 
             #[tokio::test]

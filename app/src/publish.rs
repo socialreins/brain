@@ -1390,6 +1390,10 @@ fn media_problem(
     platform: &str,
 ) -> Option<String> {
     let first = |urls: &[String]| {
+        let video = |u: &String| matches!(media.get(u), Some(Ok(s)) if s.content_type.starts_with("video/"));
+        if platform == "bluesky" && urls.len() > 1 && urls.iter().any(video) {
+            return Some(bluesky::MIXED_MEDIA.to_owned());
+        }
         urls.iter()
             .enumerate()
             .find_map(|(i, u)| match media.get(u) {

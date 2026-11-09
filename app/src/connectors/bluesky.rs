@@ -372,10 +372,11 @@ pub const MAX_IMAGE_BYTES: usize = 1_000_000;
 const IMAGE_TYPES: [&str; 4] = ["image/jpeg", "image/png", "image/webp", "image/gif"];
 const POST_COLLECTION: &str = "app.bsky.feed.post";
 const VIDEO_SERVICE: &str = "https://video.bsky.app";
-const VIDEO_UPLOAD_TIMEOUT: Duration = Duration::from_secs(180);
+const VIDEO_UPLOAD_TIMEOUT: Duration = Duration::from_secs(150);
 /// How long Bluesky gets to process an uploaded video.
-const VIDEO_WAIT: Duration = Duration::from_secs(150);
+const VIDEO_WAIT: Duration = Duration::from_secs(120);
 const VIDEO_POLL: Duration = Duration::from_secs(2);
+pub const MIXED_MEDIA: &str = "Bluesky takes up to 4 images or one video, not a mix.";
 /// A post can be one upload and one wait, and the record after them.
 pub const PUBLISH_TIMEOUT: Duration = Duration::from_secs(360);
 
@@ -567,9 +568,7 @@ impl Bluesky {
         let mut record = post_record(text, &[], reply);
         if media.iter().any(|(_, mime)| mime.starts_with("video/")) {
             let [(bytes, mime)] = media else {
-                return Err(failed(
-                    "Bluesky takes up to 4 images or one video, not a mix.",
-                ));
+                return Err(failed(MIXED_MEDIA));
             };
             record["embed"] = self.video_embed(&s, did, bytes, mime).await?;
         } else {
@@ -648,12 +647,14 @@ impl Bluesky {
         let status = res.status();
         let auth: Value = json_body(res, "getServiceAuth").await.unwrap_or_default();
         let Some(token) = auth["token"].as_str().filter(|_| status == StatusCode::OK) else {
-            return Err(match status {
-                StatusCode::UNAUTHORIZED => PostError::Reconnect,
-                _ => failed(format!(
-                    "Bluesky refused the video upload ({}).",
-                    xrpc_code(&auth, status)
-                )),
+            let code = xrpc_code(&auth, status);
+            // An expired or revoked session answers 400 with these, as in `call`.
+            let expired = status == StatusCode::BAD_REQUEST
+                && matches!(code.as_str(), "ExpiredToken" | "InvalidToken");
+            return Err(if status == StatusCode::UNAUTHORIZED || expired {
+                PostError::Reconnect
+            } else {
+                failed(format!("Bluesky refused the video upload ({code})."))
             });
         };
         let res = self
@@ -676,7 +677,11 @@ impl Bluesky {
             &up
         };
         let known = status.is_success() || status == StatusCode::CONFLICT;
-        let Some(job_id) = job["jobId"].as_str().filter(|_| known) else {
+        let blob = if job["blob"].is_object() {
+            job["blob"].clone()
+        } else if let Some(job_id) = job["jobId"].as_str().filter(|_| known) {
+            self.finished_video(job_id).await?
+        } else {
             return Err(failed(match status {
                 StatusCode::TOO_MANY_REQUESTS => {
                     "Bluesky is rate limiting this account.".to_owned()
@@ -684,7 +689,6 @@ impl Bluesky {
                 _ => format!("Bluesky refused the video ({}).", xrpc_code(&up, status)),
             }));
         };
-        let blob = self.finished_video(job_id).await?;
         let mut embed = serde_json::json!({ "$type": "app.bsky.embed.video", "video": blob });
         if let Some((width, height)) = mp4_size(bytes) {
             embed["aspectRatio"] = serde_json::json!({ "width": width, "height": height });
@@ -705,16 +709,19 @@ impl Bluesky {
                 .await;
             // A failed poll says nothing about the job: only the deadline ends the wait.
             let status: Value = match res {
-                Ok(res) if res.status() == StatusCode::OK => {
-                    json_body(res, "getJobStatus").await.unwrap_or_default()
-                }
-                _ => Value::Null,
+                Ok(res) => json_body(res, "getJobStatus").await.unwrap_or_default(),
+                Err(_) => Value::Null,
             };
-            let job = &status["jobStatus"];
+            let job = if status["jobStatus"].is_object() {
+                &status["jobStatus"]
+            } else {
+                &status
+            };
+            // A video Bluesky already has ends as a failed job that still carries its blob.
+            if job["blob"].is_object() {
+                return Ok(job["blob"].clone());
+            }
             match job["state"].as_str() {
-                Some("JOB_STATE_COMPLETED") if job["blob"].is_object() => {
-                    return Ok(job["blob"].clone())
-                }
                 Some("JOB_STATE_COMPLETED") => {
                     return Err(failed("Bluesky did not return the processed video."))
                 }
