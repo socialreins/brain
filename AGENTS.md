@@ -33,7 +33,7 @@ cargo run -p socialreins-brain
   session cookie only.
 - `app/src/media.rs`: post media. Publishing downloads each URL (Drive share links rewritten)
   once into local disk (`MEDIA_DIR`) or an S3-compatible bucket (`S3_*`, `config.rs`), saved in
-  `post_media`, and the publisher reads the stored bytes (LinkedIn, YouTube and X upload them themselves; a PDF is LinkedIn's document post only, any other platform's target fails it in `publish::send`), or (Threads, Facebook, Instagram and TikTok,
+  `post_media`, and the publisher reads the stored bytes (LinkedIn, YouTube, X and Bluesky upload them themselves; a PDF is LinkedIn's document post only, any other platform's target fails it in `publish::send`), or (Threads, Facebook, Instagram and TikTok,
   which download media themselves) gets an unguessable `/media/` link to them (`media::link`, `controllers/media.rs`). Every download goes through
   `PublicOnly`. Files go once the post settles or is deleted, and the hourly sweep deletes the
   rest after 7 days; a storage error is only logged. Cleanup lists `posts/<post id>/` in the
@@ -62,6 +62,8 @@ cargo run -p socialreins-brain
 - No em dashes in any text: code, comments, docs, commit messages, PR bodies. Use a comma, a
   colon or two sentences. CI fails on one.
 - Ship through a pull request with green CI. No direct pushes to `main`.
+- Do not re-run CI on an older `main` commit once a newer one is merged: Railway deploys the
+  re-run commit over the newer one, and re-running CI on the newer commit does not deploy it again.
 - Never force-push.
 - Never commit or log secrets. `.env` is gitignored; `Config` has no `Debug` because
   `DATABASE_URL` holds a password.
