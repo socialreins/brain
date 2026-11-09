@@ -275,7 +275,7 @@ responses over 64 KiB are dropped.
 Threads (when `THREADS_APP_ID` and `THREADS_APP_SECRET` are set) connects by OAuth. The web app
 navigates to `GET /connections/threads/redirect`, which needs an owner or admin of the current
 team (5 a minute per user) and sends the browser to `threads.com/oauth/authorize` with the
-scopes `threads_basic`, `threads_content_publish` and `threads_delete`. The attempt (the state's
+scopes `threads_basic`, `threads_content_publish`, `threads_manage_replies` and `threads_delete`. The attempt (the state's
 SHA-256, the team and the user) is kept in Postgres for 10 minutes and used once; the browser
 holds the state in an HttpOnly cookie scoped to `/connect/threads`, compared in constant time.
 The callback needs the same signed-in user, still an owner or admin of that team, swaps the code

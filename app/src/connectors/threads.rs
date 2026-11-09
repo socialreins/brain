@@ -13,7 +13,7 @@ use super::bluesky::PostError;
 const AUTH_URL: &str = "https://threads.com/oauth/authorize";
 const GRAPH_URL: &str = "https://graph.threads.com";
 const VERSION: &str = "v1.0";
-const SCOPES: &str = "threads_basic,threads_content_publish,threads_delete";
+const SCOPES: &str = "threads_basic,threads_content_publish,threads_manage_replies,threads_delete";
 /// A long-lived token lasts 60 days; used when Threads leaves `expires_in` out.
 const DEFAULT_EXPIRES_IN: i64 = 60 * 24 * 3600;
 /// Container status checks: now, then after 1, 2, ... `POLLS - 1` times `poll_every`.
@@ -458,7 +458,7 @@ mod tests {
         assert_eq!(q["client_id"], "app");
         assert_eq!(
             q["scope"],
-            "threads_basic,threads_content_publish,threads_delete"
+            "threads_basic,threads_content_publish,threads_manage_replies,threads_delete"
         );
         assert_eq!(q["state"], "st");
         assert_eq!(q["response_type"], "code");
