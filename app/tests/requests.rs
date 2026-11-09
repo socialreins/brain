@@ -4558,9 +4558,22 @@ mod teams {
                     assert_eq!(p["error"], format!("@{handle}: {msg}"));
                     assert!(!p.to_string().contains("secret.example"));
                     let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
-                    assert_eq!(res.status_code(), 409);
-                    res.assert_json(&json!({"error": "not_deletable"}));
+                    assert_eq!(res.status_code(), 204, "nothing went out: {text}");
                 }
+
+                // A failure that may have posted stays, so it is not lost while it could be live.
+                use sea_orm::ConnectionTrait;
+                let id = id_of(&create(&s, &cookie, input(&set, "REJECT", Some(&past()))).await);
+                publish::tick(&state).await.unwrap();
+                db.execute_unprepared(&format!(
+                    "UPDATE post_targets SET error = 'Timed out; it may have posted, check the account.' \
+                     WHERE post_id = '{id}'"
+                ))
+                .await
+                .unwrap();
+                let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                assert_eq!(res.status_code(), 409);
+                res.assert_json(&json!({"error": "not_deletable"}));
 
                 // A refused app password asks for a reconnect, on publish and on takedown.
                 let id = id_of(&create(&s, &cookie, input(&set, "fine", Some(&past()))).await);
