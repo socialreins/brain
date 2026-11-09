@@ -29,7 +29,7 @@ use super::{
 use crate::{
     config::origin,
     models::{magic_links, sessions, users},
-    rate_limit::ClientIp,
+    rate_limit::{self, ClientIp},
     state::AppState,
     turnstile,
 };
@@ -41,12 +41,17 @@ const SESSION_DAYS: i64 = 30;
 const MAX_LIVE_LINKS: u64 = 3;
 /// Longest display name, in characters after trimming.
 const MAX_USER_NAME_CHARS: usize = 80;
+/// "No account" emails one address can get a day from login attempts.
+const LOGIN_NOTICES_PER_DAY: i64 = 3;
 
 #[derive(Deserialize)]
 struct LinkRequest {
     email: String,
     /// The name for a new account, from the sign-up form. An existing account keeps its own.
     name: Option<String>,
+    /// From the login page: an email without an account gets a pointer to sign up, not a link.
+    #[serde(default)]
+    login_only: bool,
     turnstile_token: Option<String>,
 }
 
@@ -85,7 +90,7 @@ async fn request_link(
         return r.into_response();
     }
     tokio::spawn(async move {
-        if let Err(e) = send_link(&app, email, name).await {
+        if let Err(e) = send_link(&app, email, name, body.login_only).await {
             tracing::error!(error = %e, "magic link not sent");
         }
     });
@@ -93,16 +98,25 @@ async fn request_link(
 }
 
 /// Errors carry the failure only, never the email or the token.
-async fn send_link(app: &AppState, email: String, name: Option<String>) -> Result<(), String> {
-    if !may_sign_up(app, &email)
+async fn send_link(
+    app: &AppState,
+    email: String,
+    name: Option<String>,
+    login_only: bool,
+) -> Result<(), String> {
+    let known = find_user(app, &email)
         .await
-        .map_err(|e| format!("sign-up check: {e}"))?
-        && find_user(app, &email)
+        .map_err(|e| format!("user lookup: {e}"))?
+        .is_some();
+    if !known
+        && !may_sign_up(app, &email)
             .await
-            .map_err(|e| format!("user lookup: {e}"))?
-            .is_none()
+            .map_err(|e| format!("sign-up check: {e}"))?
     {
         return Ok(());
+    }
+    if login_only && !known {
+        return send_no_account_notice(app, &email).await;
     }
     let now = Utc::now().fixed_offset();
     magic_links::Entity::delete_many()
@@ -123,6 +137,30 @@ async fn send_link(app: &AppState, email: String, name: Option<String>) -> Resul
     );
     app.mailer
         .send(&email, "Your sign-in link", text)
+        .await
+        .map_err(|e| format!("mail: {e}"))
+}
+
+/// Tells an email with no account how to create one, at most `LOGIN_NOTICES_PER_DAY` times. The
+/// count is its own, so login attempts never use up the links a sign-up needs.
+async fn send_no_account_notice(app: &AppState, email: &str) -> Result<(), String> {
+    let caps = [(
+        format!("login_notice:{}", token::hash(email)),
+        LOGIN_NOTICES_PER_DAY,
+    )];
+    let reserved = rate_limit::daily_reserve(&app.db, &caps)
+        .await
+        .map_err(|e| format!("notice cap: {e}"))?;
+    if reserved.is_none() {
+        return Ok(());
+    }
+    let text = format!(
+        "Someone tried to log in to SocialReins with this email, but it has no account yet.\n\n\
+         To create one, sign up here:\n\n{}/signup\n\nIf this was not you, ignore this email.\n",
+        app.web_url
+    );
+    app.mailer
+        .send(email, "No SocialReins account for this email", text)
         .await
         .map_err(|e| format!("mail: {e}"))
 }
@@ -202,7 +240,7 @@ async fn sign_up(app: &AppState, email: &str) -> Result<SignUp, DbErr> {
 
 /// `sign_up` as a yes or no, without the lock `create_first_user` takes: for deciding whether
 /// to send a link at all.
-async fn may_sign_up(app: &AppState, email: &str) -> Result<bool, DbErr> {
+pub(crate) async fn may_sign_up(app: &AppState, email: &str) -> Result<bool, DbErr> {
     Ok(match sign_up(app, email).await? {
         SignUp::Allowed => true,
         SignUp::FirstOnly => users::Entity::find().one(&app.db).await?.is_none(),

@@ -2,7 +2,8 @@
 //! state, nonce and PKCE challenge; `GET /auth/google/callback` checks them, signs the Google
 //! account in (by its linked `sub`, else its verified email, else a new account under the
 //! magic link's sign-up rules) and lands on the web app. Failures land on
-//! `{WEB_URL}/login?error=google_failed` (or `registration_disabled`), with no details.
+//! `{WEB_URL}/login?error=google_failed` (or `registration_disabled`), with no details. With
+//! `mode=login` a Google account without an account here lands on `/signup?error=no_account`.
 //! `GET /auth/providers` says whether Google is set up.
 use axum::{
     extract::{Query, State},
@@ -21,7 +22,10 @@ use serde_json::json;
 use socialreins_core::{email, oauth, team, token};
 
 use super::{
-    auth::{cookie_value, named_cookie, refused, signed_in, start_session, user_for_sign_in},
+    auth::{
+        cookie_value, find_user, may_sign_up, named_cookie, refused, signed_in, start_session,
+        user_for_sign_in,
+    },
     waitlist::error,
 };
 use crate::{connectors::google::Identity, models::users, rate_limit::ClientIp, state::AppState};
@@ -48,6 +52,8 @@ async fn providers(State(app): State<AppState>) -> Json<serde_json::Value> {
 #[derive(Deserialize)]
 struct Start {
     next: Option<String>,
+    /// `login`: only sign in to an existing account, never create one.
+    mode: Option<String>,
 }
 
 /// `GET /auth/google/start?next=/path`: `next` must be a path on the web app, else `/app`.
@@ -74,8 +80,8 @@ async fn start(
             .await?;
         let stmt = Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "INSERT INTO oauth_states (state_hash, nonce, verifier, next, expires_at) \
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO oauth_states (state_hash, nonce, verifier, next, expires_at, login_only) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
             [
                 token::hash(&state).into(),
                 nonce.clone().into(),
@@ -84,6 +90,7 @@ async fn start(
                 (Utc::now() + Duration::minutes(STATE_MINUTES))
                     .fixed_offset()
                     .into(),
+                (q.mode.as_deref() == Some("login")).into(),
             ],
         );
         app.db.execute_raw(stmt).await.map(|_| ())
@@ -109,11 +116,11 @@ struct Callback {
 async fn take_state(
     app: &AppState,
     state: &str,
-) -> Result<Option<(String, String, String)>, DbErr> {
+) -> Result<Option<(String, String, String, bool)>, DbErr> {
     let stmt = Statement::from_sql_and_values(
         DbBackend::Postgres,
         "DELETE FROM oauth_states WHERE state_hash = $1 AND provider IS NULL \
-         RETURNING nonce, verifier, next, \
+         RETURNING nonce, verifier, next, login_only, \
          expires_at > now() AS live",
         [token::hash(state).into()],
     );
@@ -127,6 +134,7 @@ async fn take_state(
                 row.try_get("", "nonce").ok()?,
                 row.try_get("", "verifier").ok()?,
                 row.try_get("", "next").ok()?,
+                row.try_get("", "login_only").ok()?,
             ))
         })
         .flatten())
@@ -138,6 +146,8 @@ enum Outcome {
     Closed,
     /// The email's account is linked to another Google account.
     Conflict,
+    /// `mode=login`, and this Google account has no account here.
+    NoAccount,
 }
 
 /// The account a Google identity signs in to: its linked `sub`; else, when Google vouches for
@@ -148,6 +158,7 @@ async fn account_for(
     app: &AppState,
     id: &Identity,
     current: Option<&super::auth::CurrentUser>,
+    login_only: bool,
 ) -> Result<Outcome, DbErr> {
     let linked = users::Entity::find()
         .filter(users::Column::GoogleSub.eq(&id.sub))
@@ -160,6 +171,14 @@ async fn account_for(
         return Ok(Outcome::Conflict);
     };
     let (user, created) = if id.owns_email() {
+        if login_only && find_user(app, &email).await?.is_none() {
+            let open = may_sign_up(app, &email).await?;
+            return Ok(if open {
+                Outcome::NoAccount
+            } else {
+                Outcome::Closed
+            });
+        }
         match user_for_sign_in(app, &email, None).await? {
             Some(found) => found,
             None => return Ok(Outcome::Closed),
@@ -229,7 +248,7 @@ async fn callback(
     if !from_this_browser {
         return fail("google_failed");
     }
-    let (nonce, verifier, next) = match take_state(&app, &state).await {
+    let (nonce, verifier, next, login_only) = match take_state(&app, &state).await {
         Ok(Some(found)) => found,
         Ok(None) => return fail("google_failed"),
         Err(e) => {
@@ -250,10 +269,14 @@ async fn callback(
             return fail("google_failed");
         }
     };
-    let (user, created) = match account_for(&app, &identity, current.as_ref()).await {
+    let (user, created) = match account_for(&app, &identity, current.as_ref(), login_only).await {
         Ok(Outcome::User(user, created)) => (user, created),
         Ok(Outcome::Closed) => return fail("registration_disabled"),
         Ok(Outcome::Conflict) => return fail("google_failed"),
+        Ok(Outcome::NoAccount) => {
+            let to = format!("{}/signup?error=no_account", app.web_url);
+            return ([(header::SET_COOKIE, clear)], Redirect::to(&to)).into_response();
+        }
         Err(e) => {
             tracing::error!(error = %e, "google account lookup failed");
             return fail("google_failed");

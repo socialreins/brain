@@ -983,6 +983,36 @@ mod auth {
 
         #[tokio::test]
         #[serial]
+        async fn login_mode_signs_in_existing_accounts_and_creates_none() {
+            let (s, db) = google_server(|_| {}).await;
+            let st = begin(&s, "?mode=login").await;
+            let email = unique_email();
+            let (to, session) = finish(
+                &s,
+                &st.state,
+                Some(&st.cookie),
+                &claims(&st, &sub(), &email),
+            )
+            .await;
+            assert_eq!(to, "http://localhost:3000/signup?error=no_account");
+            assert!(session.is_none());
+            assert!(user(&db, &email).await.is_none());
+
+            let (email, _) = signed_in(&s, &db).await;
+            let st = begin(&s, "?mode=login").await;
+            let (to, session) = finish(
+                &s,
+                &st.state,
+                Some(&st.cookie),
+                &claims(&st, &sub(), &email),
+            )
+            .await;
+            assert_eq!(to, "http://localhost:3000/app");
+            assert!(session.is_some());
+        }
+
+        #[tokio::test]
+        #[serial]
         async fn existing_accounts_match_by_sub_then_by_verified_email() {
             let (s, db) = google_server(|_| {}).await;
             let (email, _) = signed_in(&s, &db).await;
@@ -16180,6 +16210,17 @@ mod waitlist_confirm {
             .collect()
     }
 
+    /// The mails sent to `email`, waiting up to 5 seconds for at least `want` of them.
+    async fn mails_at_least(seen: &Seen, email: &str, want: usize) -> Vec<Value> {
+        for _ in 0..33 {
+            let sent = mails(seen, email).await;
+            if sent.len() >= want {
+                return sent;
+            }
+        }
+        mails(seen, email).await
+    }
+
     fn token_of(mail: &Value) -> String {
         let text = mail["text"].as_str().unwrap();
         let (_, rest) = text.split_once("/waitlist/verify?token=").unwrap();
@@ -16206,6 +16247,57 @@ mod waitlist_confirm {
             .exec(db)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_login_link_points_an_unknown_email_to_sign_up() {
+        let (s, db, seen, web) = app().await;
+        let unknown = unique_email();
+        let body = json!({"email": unknown, "login_only": true});
+        s.post("/auth/link")
+            .json(&body)
+            .await
+            .assert_status(axum::http::StatusCode::ACCEPTED);
+        for _ in 0..3 {
+            s.post("/auth/link").json(&body).await;
+        }
+        let sent = mails_at_least(&seen, &unknown, 3).await;
+        assert_eq!(mails(&seen, &unknown).await.len(), 3, "capped per day");
+        let text = sent[0]["text"].as_str().unwrap();
+        assert!(text.contains(&format!("{web}/signup")), "{text}");
+        assert!(!text.contains("/auth/magic/"), "{text}");
+        let created = socialreins_brain::models::users::Entity::find()
+            .filter(socialreins_brain::models::users::Column::Email.eq(unknown.as_str()))
+            .one(&db)
+            .await
+            .unwrap();
+        assert!(created.is_none());
+
+        // Login attempts do not use up the links a sign-up needs.
+        let signup = json!({"email": unknown, "name": "Ann"});
+        s.post("/auth/link")
+            .json(&signup)
+            .await
+            .assert_status(axum::http::StatusCode::ACCEPTED);
+        let sent = mails_at_least(&seen, &unknown, 4).await;
+        assert!(sent[3]["text"].as_str().unwrap().contains("/auth/magic/"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_login_link_still_signs_in_a_known_email() {
+        let (s, db, seen, _) = app().await;
+        let known = unique_email();
+        let secret = auth::link(&db, &known, Duration::minutes(15)).await;
+        auth::open(&s, &secret).await;
+        let body = json!({"email": known, "login_only": true});
+        s.post("/auth/link")
+            .json(&body)
+            .await
+            .assert_status(axum::http::StatusCode::ACCEPTED);
+        let sent = mails_at_least(&seen, &known, 1).await;
+        assert!(sent[0]["text"].as_str().unwrap().contains("/auth/magic/"));
     }
 
     async fn join(s: &TestServer, email: &str) {

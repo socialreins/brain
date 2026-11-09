@@ -33,14 +33,14 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/v1/waitlist/count` | `{"count":n}`: every signup, verified or not, cached for 30 seconds |
 | GET | `/v1/admin/waitlist` | `ADMIN_EMAILS` only, session cookie: `{"total","verified","signups":[{"id","email","source","created_at","verified_at"}]}`, newest first, at most 1000 (`?verified=true\|false` filters the list) |
 | POST | `/v1/contact` | `{"name","email","message"}` mails `CONTACT_TO`, `202 {}` |
-| POST | `/auth/link` | `{"email":"...","name":"..."}` emails a sign-in link, `202 {"status":"sent"}`. `name` is optional, 1 to 80 characters (else `422 invalid_name`), and only names an account this link creates |
+| POST | `/auth/link` | `{"email":"...","name":"..."}` emails a sign-in link, `202 {"status":"sent"}`. `name` is optional, 1 to 80 characters (else `422 invalid_name`), and only names an account this link creates. With `"login_only":true`, an email without an account is sent a pointer to sign up instead of a link |
 | GET | `/auth/magic/{token}` | The emailed link: a page with a sign-in button, does not use the link |
 | POST | `/auth/magic` | Form field `token`: uses the link, sets the session cookie, redirects to `WEB_URL` |
 | GET | `/auth/me` | The signed-in user with `is_admin` (in `ADMIN_EMAILS`), or `401 {"error":"unauthorized"}` |
 | PATCH | `/auth/me` | `{"name":"..."}`: trimmed, 1 to 80 characters, no control characters, else `422 {"error":"invalid_name"}`. Replies like `GET /auth/me`. Origin must be in `CORS_ORIGINS` |
 | POST | `/auth/logout` | Deletes the session, `204`. Origin must be in `CORS_ORIGINS` |
 | GET | `/auth/providers` | `{"google":bool,"turnstile_site_key":"..."\|null}`: the optional sign-in methods this install offers, and the Turnstile key when the captcha is on |
-| GET | `/auth/google/start?next=/path` | Redirects to Google (`404` when Google is not configured). `next` must be a path on the web app, else `/app` |
+| GET | `/auth/google/start?next=/path&mode=login` | Redirects to Google (`404` when Google is not configured). `next` must be a path on the web app, else `/app`. `mode=login` never creates an account: a new Google account lands on `WEB_URL/signup?error=no_account` |
 | GET | `/auth/google/callback` | Google's redirect back: sets the session cookie and redirects to `WEB_URL` + `next`, or `WEB_URL/welcome` for a new account, or `WEB_URL/login?error=google_failed` (or `registration_disabled`) |
 | GET | `/review-login/{token}` | App Review sign-in, only while `REVIEW_LOGIN_TOKEN` is set (else `404`, as for a wrong token): signs the browser in to the demo user `review@socialreins.com` and redirects (`303`) to `WEB_URL/app`. See [App Review login](#app-review-login) |
 | POST | `/auth/passkeys/register/start` | Needs a sign-in from the last 10 minutes: `{"challenge_id","options"}` for `navigator.credentials.create` |
