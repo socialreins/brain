@@ -895,6 +895,14 @@ async fn credential(
     got
 }
 
+/// What a failure says when the platform refused a permission, not the token.
+fn denied(publisher: &dyn Publisher) -> String {
+    format!(
+        "{} refused a permission this needs. Reconnect the account and allow everything it asks for.",
+        publisher.name()
+    )
+}
+
 /// What a publisher says when the platform refused the account's token on the main call of a
 /// publish, after flagging the account so the connections list asks for a reconnect. Side calls
 /// (cover, first comment, take down) and refused permissions (`Denied`) never flag: they only
@@ -1570,7 +1578,7 @@ async fn send(
     match tokio::time::timeout(publisher.timeout(), sent).await {
         Ok(Ok(remote)) => Ok(remote),
         Ok(Err(PublishError::Reconnect)) => Err(refused(app, publisher, account).await),
-        Ok(Err(PublishError::Denied)) => Err(publisher.reconnect().to_owned()),
+        Ok(Err(PublishError::Denied)) => Err(denied(publisher)),
         Ok(Err(PublishError::Failed(msg))) => Err(msg),
         Err(_) => Err(TIMED_OUT.to_owned()),
     }
@@ -1697,9 +1705,8 @@ async fn publish_target(
             Ok(secret) => secret,
             Err(e) => {
                 let why = match e {
-                    PublishError::Reconnect | PublishError::Denied => {
-                        publisher.reconnect().to_owned()
-                    }
+                    PublishError::Reconnect => publisher.reconnect().to_owned(),
+                    PublishError::Denied => denied(publisher),
                     PublishError::Failed(msg) => msg,
                 };
                 let msg = format!(
@@ -1795,7 +1802,8 @@ async fn set_cover(
     };
     let why = match tokio::time::timeout(TARGET_TIMEOUT, sent).await {
         Ok(Ok(())) => return,
-        Ok(Err(PublishError::Reconnect | PublishError::Denied)) => publisher.reconnect().to_owned(),
+        Ok(Err(PublishError::Reconnect)) => publisher.reconnect().to_owned(),
+        Ok(Err(PublishError::Denied)) => denied(publisher),
         Ok(Err(PublishError::Failed(msg))) => msg,
         Err(_) => "Timed out; the cover may have been set, check the account.".to_owned(),
     };
@@ -1839,9 +1847,8 @@ async fn first_comment(
     };
     let outcome = match tokio::time::timeout(TARGET_TIMEOUT, sent).await {
         Ok(Ok(comment_id)) => Ok(comment_id),
-        Ok(Err(PublishError::Reconnect | PublishError::Denied)) => {
-            Err(publisher.reconnect().to_owned())
-        }
+        Ok(Err(PublishError::Reconnect)) => Err(publisher.reconnect().to_owned()),
+        Ok(Err(PublishError::Denied)) => Err(denied(publisher)),
         Ok(Err(PublishError::Failed(msg))) => Err(msg),
         Err(_) => Err("Timed out; the comment may have posted, check the account.".to_owned()),
     };
