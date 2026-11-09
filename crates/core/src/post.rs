@@ -1,7 +1,7 @@
 //! Post rules that do not need a database: per-platform limits and link facets.
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Bluesky: 300 graphemes, 4 images.
+/// Bluesky: 300 graphemes, 4 images or one video.
 pub const BLUESKY_MAX_GRAPHEMES: usize = 300;
 /// Bluesky also caps the text at 3000 UTF-8 bytes.
 pub const BLUESKY_MAX_BYTES: usize = 3000;
