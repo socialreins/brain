@@ -47,6 +47,9 @@ struct LinkRequest {
     email: String,
     /// The name for a new account, from the sign-up form. An existing account keeps its own.
     name: Option<String>,
+    /// From the login page: an email without an account gets a pointer to sign up, not a link.
+    #[serde(default)]
+    login_only: bool,
     turnstile_token: Option<String>,
 }
 
@@ -85,7 +88,7 @@ async fn request_link(
         return r.into_response();
     }
     tokio::spawn(async move {
-        if let Err(e) = send_link(&app, email, name).await {
+        if let Err(e) = send_link(&app, email, name, body.login_only).await {
             tracing::error!(error = %e, "magic link not sent");
         }
     });
@@ -93,14 +96,20 @@ async fn request_link(
 }
 
 /// Errors carry the failure only, never the email or the token.
-async fn send_link(app: &AppState, email: String, name: Option<String>) -> Result<(), String> {
-    if !may_sign_up(app, &email)
+async fn send_link(
+    app: &AppState,
+    email: String,
+    name: Option<String>,
+    login_only: bool,
+) -> Result<(), String> {
+    let known = find_user(app, &email)
         .await
-        .map_err(|e| format!("sign-up check: {e}"))?
-        && find_user(app, &email)
+        .map_err(|e| format!("user lookup: {e}"))?
+        .is_some();
+    if !known
+        && !may_sign_up(app, &email)
             .await
-            .map_err(|e| format!("user lookup: {e}"))?
-            .is_none()
+            .map_err(|e| format!("sign-up check: {e}"))?
     {
         return Ok(());
     }
@@ -116,6 +125,19 @@ async fn send_link(app: &AppState, email: String, name: Option<String>) -> Resul
     else {
         return Ok(());
     };
+    if login_only && !known {
+        // The unsent link still counts, so this mail is capped per inbox like any other.
+        let text = format!(
+            "Someone tried to log in to SocialReins with this email, but it has no account yet.\n\n\
+             To create one, sign up here:\n\n{}/signup\n\nIf this was not you, ignore this email.\n",
+            app.web_url
+        );
+        return app
+            .mailer
+            .send(&email, "No SocialReins account for this email", text)
+            .await
+            .map_err(|e| format!("mail: {e}"));
+    }
     let url = format!("{}/auth/magic/{secret}", app.brain_url);
     let text = format!(
         "Open this link to sign in to SocialReins:\n\n{url}\n\nIt works once and expires in \
