@@ -25,6 +25,7 @@ mod m20261114_000001_first_comment;
 mod m20261115_000001_video_cover;
 mod m20261116_000001_tiktok_settings;
 mod m20261117_000001_post_fanned_out;
+mod m20261118_000001_magic_link_name;
 
 pub struct Migrator;
 
@@ -57,6 +58,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261115_000001_video_cover::Migration),
             Box::new(m20261116_000001_tiktok_settings::Migration),
             Box::new(m20261117_000001_post_fanned_out::Migration),
+            Box::new(m20261118_000001_magic_link_name::Migration),
             // inject-above (do not remove this comment)
         ]
     }

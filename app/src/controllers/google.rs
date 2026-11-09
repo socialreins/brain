@@ -160,7 +160,7 @@ async fn account_for(
         return Ok(Outcome::Conflict);
     };
     let (user, created) = if id.owns_email() {
-        match user_for_sign_in(app, &email).await? {
+        match user_for_sign_in(app, &email, None).await? {
             Some(found) => found,
             None => return Ok(Outcome::Closed),
         }
