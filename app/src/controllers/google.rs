@@ -2,8 +2,10 @@
 //! state, nonce and PKCE challenge; `GET /auth/google/callback` checks them, signs the Google
 //! account in (by its linked `sub`, else its verified email, else a new account under the
 //! magic link's sign-up rules) and lands on the web app. Failures land on
-//! `{WEB_URL}/login?error=google_failed` (or `registration_disabled`), with no details. With
-//! `mode=login` a Google account without an account here lands on `/signup?error=no_account`.
+//! `{WEB_URL}/login?error=google_failed`, with no details. A new account that sign-up refuses
+//! goes on the waitlist as verified and lands on `{WEB_URL}/signup?waitlisted=1`. With
+//! `mode=login` a Google account without an account here lands on `/signup?error=no_account`,
+//! or on `/login?error=registration_disabled` when sign-up would refuse it.
 //! `GET /auth/providers` says whether Google is set up.
 use axum::{
     extract::{Query, State},
@@ -26,7 +28,7 @@ use super::{
         cookie_value, find_user, may_sign_up, named_cookie, refused, signed_in, start_session,
         user_for_sign_in,
     },
-    waitlist::error,
+    waitlist::{self, error},
 };
 use crate::{connectors::google::Identity, models::users, rate_limit::ClientIp, state::AppState};
 
@@ -142,8 +144,10 @@ async fn take_state(
 
 enum Outcome {
     User(users::Model, bool),
-    /// Sign-up is closed to this email.
+    /// `mode=login`, and sign-up is closed to this email.
     Closed,
+    /// Sign-up is closed to this email, now on the waitlist.
+    Waitlisted,
     /// The email's account is linked to another Google account.
     Conflict,
     /// `mode=login`, and this Google account has no account here.
@@ -181,7 +185,10 @@ async fn account_for(
         }
         match user_for_sign_in(app, &email, None).await? {
             Some(found) => found,
-            None => return Ok(Outcome::Closed),
+            None => {
+                waitlist::add_verified(app, &email, "google").await?;
+                return Ok(Outcome::Waitlisted);
+            }
         }
     } else {
         match current {
@@ -273,6 +280,10 @@ async fn callback(
         Ok(Outcome::User(user, created)) => (user, created),
         Ok(Outcome::Closed) => return fail("registration_disabled"),
         Ok(Outcome::Conflict) => return fail("google_failed"),
+        Ok(Outcome::Waitlisted) => {
+            let to = format!("{}/signup?waitlisted=1", app.web_url);
+            return ([(header::SET_COOKIE, clear)], Redirect::to(&to)).into_response();
+        }
         Ok(Outcome::NoAccount) => {
             let to = format!("{}/signup?error=no_account", app.web_url);
             return ([(header::SET_COOKIE, clear)], Redirect::to(&to)).into_response();

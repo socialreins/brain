@@ -1029,6 +1029,29 @@ mod auth {
         drop_db(db, &name).await;
     }
 
+    /// An email entry in `SIGNUP_DOMAINS` admits that address alone (any case), not its domain.
+    #[tokio::test]
+    #[serial]
+    async fn signup_domains_admit_listed_emails() {
+        let domain = format!("{}.test", uuid::Uuid::now_v7().simple());
+        let listed = format!("{}@{domain}", uuid::Uuid::now_v7());
+        let (s, db) =
+            server_where(|c| c.signup_domains = vec!["harun.dev".into(), listed.clone()]).await;
+        let other = format!("{}@{domain}", uuid::Uuid::now_v7());
+        let (to, cookie) = open(&s, &link(&db, &other, Duration::minutes(15)).await).await;
+        assert!(to.ends_with("/login?error=registration_disabled"));
+        assert!(cookie.is_none() && user(&db, &other).await.is_none());
+        s.post("/auth/link")
+            .json(&json!({"email": listed.to_uppercase()}))
+            .await
+            .assert_status(axum::http::StatusCode::ACCEPTED);
+        assert_eq!(links_eventually(&db, &listed, 1).await, 1);
+        assert!(open(&s, &link(&db, &listed, Duration::minutes(15)).await)
+            .await
+            .1
+            .is_some());
+    }
+
     /// Unset `SIGNUP_DOMAINS` leaves registration open to any domain.
     #[tokio::test]
     #[serial]
@@ -1444,9 +1467,57 @@ mod auth {
 
         #[tokio::test]
         #[serial]
-        async fn closed_registration_refuses_new_google_accounts() {
-            let (s, db) = google_server(|c| c.registration_disabled = true).await;
+        async fn closed_registration_puts_new_google_accounts_on_the_waitlist() {
+            let waitlisted = |db: DatabaseConnection, email: String| async move {
+                waitlist_signups::Entity::find()
+                    .filter(waitlist_signups::Column::Email.eq(email))
+                    .one(&db)
+                    .await
+                    .unwrap()
+            };
+            let (s, db) = google_server(|c| {
+                c.registration_disabled = true;
+                // Not the first-account rule, even on an empty test database.
+                c.owner_email = Some(unique_email());
+            })
+            .await;
             let st = begin(&s, "").await;
+            let email = unique_email();
+            let (to, session) = finish(
+                &s,
+                &st.state,
+                Some(&st.cookie),
+                &claims(&st, &sub(), &email),
+            )
+            .await;
+            assert_eq!(to, "http://localhost:3000/signup?waitlisted=1");
+            assert!(session.is_none());
+            assert!(user(&db, &email).await.is_none());
+            let row = waitlisted(db.clone(), email.clone()).await.unwrap();
+            assert!(row.verified_at.is_some(), "Google vouches for the mailbox");
+            assert_eq!(row.source.as_deref(), Some("google"));
+
+            // An unverified signup becomes verified and keeps its source.
+            let email = unique_email();
+            s.post("/v1/waitlist")
+                .json(&json!({"email": email, "source": "landing"}))
+                .await
+                .assert_status_ok();
+            let st = begin(&s, "").await;
+            let (to, _) = finish(
+                &s,
+                &st.state,
+                Some(&st.cookie),
+                &claims(&st, &sub(), &email),
+            )
+            .await;
+            assert_eq!(to, "http://localhost:3000/signup?waitlisted=1");
+            let row = waitlisted(db.clone(), email.clone()).await.unwrap();
+            assert!(row.verified_at.is_some());
+            assert_eq!(row.source.as_deref(), Some("landing"));
+
+            // Login only: refused as before, and not put on the waitlist.
+            let st = begin(&s, "?mode=login").await;
             let email = unique_email();
             let (to, session) = finish(
                 &s,
@@ -1460,7 +1531,7 @@ mod auth {
                 "http://localhost:3000/login?error=registration_disabled"
             );
             assert!(session.is_none());
-            assert!(user(&db, &email).await.is_none());
+            assert!(waitlisted(db, email).await.is_none());
         }
 
         #[tokio::test]
@@ -16529,8 +16600,15 @@ mod waitlist_confirm {
     }
 
     async fn app() -> (TestServer, DatabaseConnection, Seen, String) {
+        app_where(|_| {}).await
+    }
+
+    async fn app_where(
+        edit: impl FnOnce(&mut Config),
+    ) -> (TestServer, DatabaseConnection, Seen, String) {
         let mut config = Config::from_env().expect("DATABASE_URL must point at a test Postgres");
         config.admin_emails = vec![ADMIN.into()];
+        edit(&mut config);
         let (url, seen) = resend().await;
         config.mailer = Mailer::resend_at(&url, "re_test", "brain@example.com").unwrap();
         let web = config.web_url.clone();
@@ -16637,6 +16715,58 @@ mod waitlist_confirm {
             .assert_status(axum::http::StatusCode::ACCEPTED);
         let sent = mails_at_least(&seen, &known, 1).await;
         assert!(sent[0]["text"].as_str().unwrap().contains("/auth/magic/"));
+    }
+
+    /// A sign-up `SIGNUP_DOMAINS` refuses gets the usual 202 and joins the waitlist (source
+    /// `signup`, unverified) with one confirmation email saying sign-ups are closed, under the
+    /// waitlist's hourly limit; a refused login attempt gets nothing.
+    #[tokio::test]
+    #[serial]
+    async fn a_refused_sign_up_joins_the_waitlist() {
+        let (s, db, seen, web) =
+            app_where(|c| c.signup_domains = vec!["only-this.test".into()]).await;
+        let email = unique_email();
+        for _ in 0..2 {
+            let res = s
+                .post("/auth/link")
+                .json(&json!({"email": email, "name": "Ann"}))
+                .await;
+            assert_eq!(res.status_code(), 202);
+            assert_eq!(res.text(), r#"{"status":"sent"}"#);
+        }
+        let sent = mails_at_least(&seen, &email, 1).await;
+        assert_eq!(sent.len(), 1, "one confirmation an hour");
+        assert_eq!(
+            sent[0]["subject"],
+            "Confirm your spot on the SocialReins waitlist"
+        );
+        let text = sent[0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(
+                "Sign-ups are closed for now. We've added you to the waitlist and will email \
+                 you when SocialReins is live."
+            ),
+            "{text}"
+        );
+        assert!(text.contains(&format!("{web}/waitlist/verify?token=")));
+        assert!(!text.contains("/auth/magic/"), "{text}");
+        let r = row(&db, &email).await;
+        assert_eq!(r.source.as_deref(), Some("signup"));
+        assert!(r.verified_at.is_none());
+        assert!(verify(&s, &token_of(&sent[0])).await);
+
+        let login = unique_email();
+        s.post("/auth/link")
+            .json(&json!({"email": login, "login_only": true}))
+            .await
+            .assert_status(axum::http::StatusCode::ACCEPTED);
+        assert!(mails(&seen, &login).await.is_empty());
+        let none = waitlist_signups::Entity::find()
+            .filter(waitlist_signups::Column::Email.eq(login.as_str()))
+            .one(&db)
+            .await
+            .unwrap();
+        assert!(none.is_none());
     }
 
     async fn join(s: &TestServer, email: &str) {

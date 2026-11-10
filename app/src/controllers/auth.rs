@@ -24,7 +24,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::{
     teams,
-    waitlist::{error, rejected, Error, Reply},
+    waitlist::{self, error, rejected, Error, Reply},
 };
 use crate::{
     config::origin,
@@ -61,8 +61,9 @@ pub(crate) fn internal(e: impl std::fmt::Display, what: &str) -> Response {
 }
 
 /// Same 202, at the same speed, for a new email, a known one, and one refused by
-/// `REGISTRATION_DISABLED`: the lookup, insert and mail all run after the reply, so neither the
-/// body nor the timing says whether an account exists.
+/// `REGISTRATION_DISABLED` or `SIGNUP_DOMAINS` (which goes on the waitlist instead, see
+/// `send_link`): the lookup, insert and mail all run after the reply, so neither the body nor
+/// the timing says whether an account exists.
 async fn request_link(
     State(app): State<AppState>,
     ClientIp(ip): ClientIp,
@@ -90,16 +91,20 @@ async fn request_link(
         return r.into_response();
     }
     tokio::spawn(async move {
-        if let Err(e) = send_link(&app, email, name, body.login_only).await {
+        if let Err(e) = send_link(&app, ip, email, name, body.login_only).await {
             tracing::error!(error = %e, "magic link not sent");
         }
     });
     (StatusCode::ACCEPTED, Json(json!({"status": "sent"}))).into_response()
 }
 
-/// Errors carry the failure only, never the email or the token.
+/// Errors carry the failure only, never the email or the token. A sign-up refused to a new email
+/// puts it on the waitlist (source `signup`) under the waitlist's own rules: one confirmation
+/// email at most hourly, within its per-IP and daily caps, none once verified. A refused login
+/// attempt gets nothing.
 async fn send_link(
     app: &AppState,
+    ip: Option<std::net::IpAddr>,
     email: String,
     name: Option<String>,
     login_only: bool,
@@ -113,6 +118,15 @@ async fn send_link(
             .await
             .map_err(|e| format!("sign-up check: {e}"))?
     {
+        if login_only {
+            return Ok(());
+        }
+        let secret = waitlist::add(app, &email, Some("signup".into()))
+            .await
+            .map_err(|e| format!("waitlist add: {e}"))?;
+        if let Some(secret) = secret {
+            waitlist::send_confirmation(app, ip, &email, &secret, waitlist::SIGN_UP_CLOSED).await;
+        }
         return Ok(());
     }
     if login_only && !known {
@@ -223,14 +237,15 @@ enum SignUp {
     Refused,
 }
 
-/// Open registration admits anyone whose domain is in `SIGNUP_DOMAINS` (any domain when it is
-/// empty). Closed (`REGISTRATION_DISABLED`) admits only, with no `OWNER_EMAIL`, whoever of
+/// Open registration admits anyone whose domain or exact address is in `SIGNUP_DOMAINS` (anyone
+/// when it is empty). Closed (`REGISTRATION_DISABLED`) admits only, with no `OWNER_EMAIL`, whoever of
 /// those signs up first. `OWNER_EMAIL` and invited emails are always admitted.
 async fn sign_up(app: &AppState, email: &str) -> Result<SignUp, DbErr> {
+    // Domain entries have no `@` and email entries do, so one equality test serves both.
     let domain_ok = app.signup_domains.is_empty()
         || email
             .rsplit_once('@')
-            .is_some_and(|(_, d)| app.signup_domains.iter().any(|a| a == d));
+            .is_some_and(|(_, d)| app.signup_domains.iter().any(|a| a == d || a == email));
     if (domain_ok && !app.registration_disabled)
         || app.owner_email.as_deref() == Some(email)
         || teams::invited(&app.db, email).await?

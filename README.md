@@ -41,7 +41,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | POST | `/auth/logout` | Deletes the session, `204`. Origin must be in `CORS_ORIGINS` |
 | GET | `/auth/providers` | `{"google":bool,"turnstile_site_key":"..."\|null}`: the optional sign-in methods this install offers, and the Turnstile key when the captcha is on |
 | GET | `/auth/google/start?next=/path&mode=login` | Redirects to Google (`404` when Google is not configured). `next` must be a path on the web app, else `/app`. `mode=login` never creates an account: a new Google account lands on `WEB_URL/signup?error=no_account` |
-| GET | `/auth/google/callback` | Google's redirect back: sets the session cookie and redirects to `WEB_URL` + `next`, or `WEB_URL/welcome` for a new account, or `WEB_URL/login?error=google_failed` (or `registration_disabled`) |
+| GET | `/auth/google/callback` | Google's redirect back: sets the session cookie and redirects to `WEB_URL` + `next`, or `WEB_URL/welcome` for a new account, or `WEB_URL/login?error=google_failed` (or `registration_disabled` with `mode=login`), or `WEB_URL/signup?waitlisted=1` when sign-up is refused and the email joined the waitlist |
 | GET | `/review-login/{token}` | App Review sign-in, only while `REVIEW_LOGIN_TOKEN` is set (else `404`, as for a wrong token): signs the browser in to the demo user `review@socialreins.com` and redirects (`303`) to `WEB_URL/app`. See [App Review login](#app-review-login) |
 | POST | `/auth/passkeys/register/start` | Needs a sign-in from the last 10 minutes: `{"challenge_id","options"}` for `navigator.credentials.create` |
 | POST | `/auth/passkeys/register/finish` | `{"challenge_id","credential","name"}`: stores the passkey, `201` |
@@ -131,7 +131,7 @@ rate limit and before anything is stored or sent: a missing or rejected token ge
 `/v1/waitlist` always ignores it.
 
 Sign-in is by magic link, Google or passkey; there are no passwords. `POST /auth/link` answers the same `202`, at the same speed,
-whether or not the email has an account (or is refused by `REGISTRATION_DISABLED` or `SIGNUP_DOMAINS`): the lookup
+whether or not the email has an account (or is refused by `REGISTRATION_DISABLED` or `SIGNUP_DOMAINS`, see sign-up rules below): the lookup
 and the mail run after the reply. Opening the link shows a button that posts it back, so mail
 scanners that prefetch links cannot use it up, and `POST /auth/magic` only accepts a post
 whose `Origin` (or `Referer`) is `BRAIN_URL`. One email holds at most 3 unexpired links. The link works once, for 15 minutes; using it
@@ -139,6 +139,19 @@ creates the account if needed, then a 30-day session in the HttpOnly,
 SameSite=Lax `sr_session` cookie (`Secure` unless `BRAIN_URL` is `http://`). A dead link
 redirects to `WEB_URL/login?error=invalid_link` (or `registration_disabled`). Only SHA-256
 hashes of link and session tokens are stored. `POST /auth/link` and `POST /auth/magic` share 5 requests a minute per IP.
+
+Sign-up rules: an existing account always signs in. A new account needs its whole address or
+its domain in `SIGNUP_DOMAINS` (anyone when unset) and open registration (`REGISTRATION_DISABLED`
+off); `OWNER_EMAIL` and invited emails are always admitted. Anyone else who tries to sign up
+goes on the waitlist instead. By email link (not `login_only`): the same `202`, and after the
+reply the address joins the waitlist (source `signup`) with the waitlist's own confirmation
+email, which starts "Sign-ups are closed for now. We've added you to the waitlist and will email
+you when SocialReins is live." It follows the waitlist's rules: unverified until the link is
+used, at most one email an hour per address, none once verified, 20 a day per IP and 500 a day
+overall. By Google: the address joins the waitlist as verified (source `google`; a known
+unverified signup becomes verified) and the browser lands on `WEB_URL/signup?waitlisted=1`. A
+refused login-only attempt (the login page's email link, or Google with `mode=login`) joins
+nothing: the link sends nothing and Google lands on `WEB_URL/login?error=registration_disabled`.
 
 Google sign-in (when `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are set) uses the
 authorization code flow with PKCE, a state and a nonce. The attempt is kept in Postgres for 10
@@ -572,7 +585,7 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `PASSKEY_RP_ID` | no | The host of `PASSKEY_RP_ORIGIN`. WebAuthn relying party id: the domain web and brain share, e.g. `socialreins.com` |
 | `PASSKEY_RP_ORIGIN` | no | The origin of `WEB_URL`. Where the browser runs the passkey ceremonies |
 | `REGISTRATION_DISABLED` | no | `false`. `true` closes sign-up: only `OWNER_EMAIL` and invited emails can sign up (with no `OWNER_EMAIL`, the first account to sign up, then invited emails); existing users still sign in |
-| `SIGNUP_DOMAINS` | no | Comma-separated email domains, e.g. `harun.dev,socialreins.com` (trimmed, any case). When set, a new account's email domain must be one of them exactly (a subdomain does not count); `OWNER_EMAIL` and invited emails are exempt, existing users still sign in, and a refusal looks like `REGISTRATION_DISABLED`'s. An entry that is not a plain domain fails startup. Unset or blank: any domain |
+| `SIGNUP_DOMAINS` | no | Comma-separated email domains and email addresses, e.g. `harun.dev,socialreins.com,jane@example.com` (trimmed, any case). When set, a new account's email domain must be one of the domains exactly (a subdomain does not count) or its whole address one of the emails; `OWNER_EMAIL` and invited emails are exempt, existing users still sign in, and anyone else who signs up goes on the waitlist (see sign-up rules). An entry with an `@` must be a valid email address, any other must be a plain domain, else startup fails. Unset or blank: anyone |
 | `OWNER_EMAIL` | no | With `REGISTRATION_DISABLED=true`, the one new email allowed to sign up besides invited ones, any case. Recommended for personal installs: otherwise whoever signs up first owns the install |
 | `RESEND_API_KEY` | no | Send mail through the Resend HTTPS API (works where outbound SMTP is blocked, like Railway) |
 | `SMTP_URL` | no | Send mail through any SMTP server, e.g. `smtps://user:pass@smtp.example.com`. Used when `RESEND_API_KEY` is unset |
