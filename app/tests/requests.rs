@@ -12554,6 +12554,8 @@ mod teams {
                     assert_eq!(calls[0].1["media_type"], "IMAGE");
                     assert_eq!(calls[0].1["is_carousel_item"], "true");
                     assert_eq!(calls[1].1["media_type"], "VIDEO");
+                    assert_eq!(calls[1].1["is_carousel_item"], "true");
+                    assert!(calls[1].1["video_url"].ends_with(".mp4"));
                     assert_eq!(calls[2].1["media_type"], "CAROUSEL");
                     assert_eq!(calls[2].1["caption"], "both");
                     assert_eq!(calls[2].1["children"].split(',').count(), 2);

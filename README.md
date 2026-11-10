@@ -191,7 +191,7 @@ images of at most 1 MB from public https URLs, links become facets) and Threads 
 characters, up to 20 JPEG or PNG images or MP4 or MOV videos as a carousel), LinkedIn (3000
 characters, up to 20 JPEG, PNG or GIF images, one MP4 video or one PDF as a document, no threads), Facebook (63206
 characters, up to 10 JPEG, PNG or GIF images or one MP4 or MOV video) and Instagram (2200
-characters, 1 to 10 JPEG images or MP4 or MOV videos, `media_required` without one), YouTube
+characters, 1 to 20 JPEG images or MP4 or MOV videos, `media_required` without one), YouTube
 (one MP4 or MOV video, a title and a description, no threads), X (280 characters as X counts
 them, up to 4 images or one GIF or one video, threads) and TikTok (2200 characters, one MP4 or MOV
 video or 1 to 35 JPEG or WebP photos, `media_required` without one, no threads) publish today.
