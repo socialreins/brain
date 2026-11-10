@@ -83,9 +83,9 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET, POST | `/v1/social-sets` | The current team's live sets with `account_ids`, Default first (`?deleted=true`: deleted ones still restorable); create one (`{"name"}`, owner, admin) |
 | PATCH, DELETE | `/v1/social-sets/{id}` | Rename (`{"name"}`, the Default set too); delete (sign-in from the last 10 minutes, not the Default set), restorable for 30 days. Owner, admin |
 | POST | `/v1/social-sets/{id}/restore` | Restore a set deleted in the last 30 days, with its accounts (owner, admin) |
-| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&group_id=&from=&to=` on `scheduled_at`), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"thread":[{"body","media"}],"first_comment","cover","tiktok","scheduled_at"}`; any member). `first_comment`: see "First comment" below; `cover`: see "Video cover"; `tiktok`: see "TikTok settings". `thread`: up to 25 follow-up posts, each a reply to the one before and checked like the post (`422 {"error","part"}` names a bad one); each part is saved on its target as it goes out, a target whose part fails is `failed` naming it with the parts before it kept, and a takedown deletes the parts last first, then the root |
+| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&group_id=&from=&to=` on `scheduled_at`), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"thread":[{"body","media"}],"first_comment","cover","tiktok","youtube","scheduled_at"}`; any member). `first_comment`: see "First comment" below; `cover`: see "Video cover"; `tiktok`: see "TikTok settings"; `youtube`: see YouTube below. `thread`: up to 25 follow-up posts, each a reply to the one before and checked like the post (`422 {"error","part"}` names a bad one); each part is saved on its target as it goes out, a target whose part fails is `failed` naming it with the parts before it kept, and a takedown deletes the parts last first, then the root |
 | GET, PUT, DELETE | `/v1/posts/{id}` | One post with its `targets`; replace a `draft` or `scheduled` one; delete (`204` for draft or scheduled, `200` after taking a published one down, `422 takedown_failed` with a `message`, `409` for queued or failed) |
-| POST | `/v1/post-groups` | One post per platform of a set in one call (`{"social_set_id","platforms","body","media","scheduled_at","list_id","position","thread","first_comment","cover","tiktok","overrides":{"<platform>":{"body","media","thread","first_comment","cover","tiktok"}}}`; `platforms` defaults to those brain publishes to with a connected account; bodies up to 64 KiB): `201 {"group_id","posts"}`; an invalid post creates nothing and its error names the `platform` |
+| POST | `/v1/post-groups` | One post per platform of a set in one call (`{"social_set_id","platforms","body","media","scheduled_at","list_id","position","thread","first_comment","cover","tiktok","youtube","overrides":{"<platform>":{"body","media","thread","first_comment","cover","tiktok","youtube"}}}`; `platforms` defaults to those brain publishes to with a connected account; bodies up to 64 KiB): `201 {"group_id","posts"}`; an invalid post creates nothing and its error names the `platform` |
 | POST | `/v1/posts/{id}/publish` | Publish a draft or scheduled post now: `202` with the post `queued`; poll it for the result |
 | GET, POST | `/v1/lists` | Post lists (ordered groups such as a series), or create one (`{"name","social_set_id"}`; no set means team-wide, or the token's own set for a set token) |
 | GET, PATCH, DELETE | `/v1/lists/{id}` | One list with its `items` (`post_id`, 1-based `position`, `post`); rename (`{"name"}`); delete (posts stay) |
@@ -352,13 +352,17 @@ bytes); `too_long` over either, and `invalid_text` for a `<` or `>`, which YouTu
 are just vertical videos up to three minutes, so there is no separate call. brain downloads the
 video into its storage (100 MB at most) and uploads the bytes itself: `POST
 /upload/youtube/v3/videos?uploadType=resumable&part=snippet,status` with the metadata
-(`privacyStatus` `public`, `selfDeclaredMadeForKids` `false`), then one `PUT` of the bytes to the
+(`privacyStatus` from the post's settings, `selfDeclaredMadeForKids` `false`), then one `PUT` of the bytes to the
 session URL from the `Location` header. brain sends the token only to a session URL that is https
 on `googleapis.com`. The video id is saved the moment YouTube answers, before anything else; the
-permalink is `https://www.youtube.com/watch?v={id}`; nothing is retried or resumed. Privacy is
-always `public`: the post model has no place for per-post platform options. Until Google audits
-the API project, YouTube locks every upload from it to private whatever is asked, so the video
-shows up private in YouTube Studio; apply for the audit before relying on it. A video upload costs
+permalink is `https://www.youtube.com/watch?v={id}`; nothing is retried or resumed. A YouTube
+post may carry `youtube`: `{"privacy"}` (saved as `posts.youtube`, returned on the post), the
+video's visibility: `private`, `unlisted` or `public`. Without `youtube`, or without `privacy`,
+the video is `private`. Another value is `422 invalid_youtube_privacy`, and other platforms answer
+`youtube_not_supported`. A group takes `youtube` for its YouTube post only, with an override
+(`overrides.youtube.youtube`). Until Google audits the API project, YouTube locks every upload
+from it to private whatever the post chose, so the video shows up private in YouTube Studio;
+apply for the audit before relying on `unlisted` or `public`. A video upload costs
 1,600 of the project's 10,000 daily quota units, shared by every team on the install, so about six
 a day (a first comment costs 50 more, `commentThreads.insert`); when Google answers `quotaExceeded` the target fails with a message saying so. A takedown
 is `DELETE /youtube/v3/videos?id={id}` (a video already gone counts as down; a channel connected

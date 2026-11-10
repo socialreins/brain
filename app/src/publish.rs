@@ -154,6 +154,18 @@ pub trait Publisher: Send + Sync {
         self.publish(account, secret, body, media, None).await
     }
 
+    /// `publish` with the YouTube settings the user chose for the post. Only YouTube has any.
+    async fn publish_with_youtube(
+        &self,
+        account: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        _: &youtube::Options,
+    ) -> Result<Remote, PublishError> {
+        self.publish(account, secret, body, media, None).await
+    }
+
     /// Sets the cover of the live video `remote_id`. Only where a cover is not
     /// `cover_in_publish`: Facebook and YouTube. A failure is a warning, the post stays up.
     async fn set_cover(
@@ -453,16 +465,30 @@ impl Publisher for X {
 
 #[async_trait]
 impl Publisher for YouTube {
-    /// One MP4 or MOV video, titled by the first line of the body. `secret` is already renewed
-    /// (`credential`). The video id is returned the moment YouTube has the bytes, and the caller
-    /// saves it first.
+    /// A post without YouTube settings: private.
     async fn publish(
+        &self,
+        account: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        _: Option<(&Remote, &Remote)>,
+    ) -> Result<Remote, PublishError> {
+        let options = youtube::Options::default();
+        self.publish_with_youtube(account, secret, body, media, &options)
+            .await
+    }
+
+    /// One MP4 or MOV video, titled by the first line of the body, with the chosen visibility.
+    /// `secret` is already renewed (`credential`). The video id is returned the moment YouTube
+    /// has the bytes, and the caller saves it first.
+    async fn publish_with_youtube(
         &self,
         _: &social_accounts::Model,
         secret: &str,
         body: &str,
         media: &[Attachment],
-        _: Option<(&Remote, &Remote)>,
+        options: &youtube::Options,
     ) -> Result<Remote, PublishError> {
         let [video] = media else {
             return Err(PublishError::Failed(
@@ -479,7 +505,12 @@ impl Publisher for YouTube {
             content_type: &video.content_type,
         };
         let id = self
-            .upload(secret, socialreins_core::post::youtube_text(body), &file)
+            .upload(
+                secret,
+                socialreins_core::post::youtube_text(body),
+                &file,
+                options.privacy(),
+            )
             .await?;
         Ok(Remote {
             id,
@@ -1534,11 +1565,12 @@ async fn send(
     publisher: &dyn Publisher,
     account: &social_accounts::Model,
     secret: &str,
-    (body, media, cover, tiktok): (
+    (body, media, cover, tiktok, youtube): (
         &str,
         &[String],
         Option<&Attachment>,
         Option<&tiktok::Options>,
+        Option<&youtube::Options>,
     ),
     reply: Option<(&Remote, &Remote)>,
 ) -> Result<Remote, String> {
@@ -1557,18 +1589,23 @@ async fn send(
         }
     }
     let sent = async {
-        match (cover, tiktok) {
-            (Some(c), _) => {
+        match (cover, tiktok, youtube) {
+            (Some(c), _, _) => {
                 publisher
                     .publish_with_cover(account, secret, body, &media, c)
                     .await
             }
-            (None, Some(t)) => {
+            (None, Some(t), _) => {
                 publisher
                     .publish_with_tiktok(account, secret, body, &media, t)
                     .await
             }
-            (None, None) => {
+            (None, None, Some(y)) => {
+                publisher
+                    .publish_with_youtube(account, secret, body, &media, y)
+                    .await
+            }
+            (None, None, None) => {
                 publisher
                     .publish(account, secret, body, &media, reply)
                     .await
@@ -1641,6 +1678,18 @@ async fn publish_target(
         Some(Ok(options)) => Some(options),
         None => None,
     };
+    let youtube = match post
+        .youtube
+        .clone()
+        .map(serde_json::from_value::<youtube::Options>)
+    {
+        Some(Err(_)) => {
+            let msg = "The YouTube settings of this post could not be read. Open the post, choose them again and save it.";
+            return fail_target(db, id, msg).await;
+        }
+        Some(Ok(options)) => Some(options),
+        None => None,
+    };
     let with = (app, stored);
     let in_call = cover.as_ref().filter(|_| publisher.cover_in_publish());
     // A retried thread goes on from the parts already out: its root and saved parts stay.
@@ -1663,7 +1712,13 @@ async fn publish_target(
                 publisher,
                 &account,
                 &secret,
-                (&post.body, &media, in_call, tiktok.as_ref()),
+                (
+                    &post.body,
+                    &media,
+                    in_call,
+                    tiktok.as_ref(),
+                    youtube.as_ref(),
+                ),
                 None,
             )
             .await
@@ -1717,7 +1772,7 @@ async fn publish_target(
                 return fail_target(db, id, &msg).await;
             }
         };
-        let content = (part.body.as_str(), part.media.as_slice(), None, None);
+        let content = (part.body.as_str(), part.media.as_slice(), None, None, None);
         let made = match send(
             with,
             publisher,

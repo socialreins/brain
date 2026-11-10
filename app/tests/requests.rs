@@ -8807,7 +8807,8 @@ mod teams {
                         meta["snippet"]["description"],
                         "Second line of the description\nand a third"
                     );
-                    assert_eq!(meta["status"]["privacyStatus"], "public");
+                    // No YouTube settings: private.
+                    assert_eq!(meta["status"]["privacyStatus"], "private");
                     assert_eq!(meta["status"]["selfDeclaredMadeForKids"], false);
                     assert_eq!((length.as_str(), kind.as_str()), ("64", "video/mp4"));
                     let (size, sent) = PUTS.lock().unwrap()[puts].clone();
@@ -8831,6 +8832,113 @@ mod teams {
                     res.assert_status_ok();
                     assert_eq!(res.json::<Value>()["status"], "deleted");
                     assert_eq!(REMOVED.lock().unwrap().last(), Some(&video));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn the_chosen_visibility_goes_with_the_upload() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    for privacy in [None, Some("private"), Some("unlisted"), Some("public")] {
+                        let mut post = youtube_post(&set, "Short");
+                        post["youtube"] = match privacy {
+                            Some(p) => json!({"privacy": p}),
+                            None => json!({}),
+                        };
+                        let id = id_of(&create(&s, &cookie, post).await);
+                        let saved = get_post(&s, &cookie, &id).await;
+                        assert_eq!(saved["youtube"]["privacy"], json!(privacy));
+                        set_media(&db, &base, &id, &["/clip.mp4"]).await;
+                        let starts = STARTS.lock().unwrap().len();
+                        publish::tick(&state).await.unwrap();
+                        let p = get_post(&s, &cookie, &id).await;
+                        assert_eq!(p["status"], "published", "{p}");
+                        let meta = STARTS.lock().unwrap()[starts].0.clone();
+                        let want = privacy.unwrap_or("private");
+                        assert_eq!(meta["status"]["privacyStatus"], want);
+                    }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn youtube_settings_are_checked_when_a_post_is_saved() {
+                    let (s, _, _, _, cookie, _, set) = team().await;
+                    let with = |y: Value| {
+                        let mut v = youtube_post(&set, "Short");
+                        v["youtube"] = y;
+                        v
+                    };
+                    for bad in ["Public", "hidden", ""] {
+                        let res = create(&s, &cookie, with(json!({"privacy": bad}))).await;
+                        assert_eq!(res.status_code(), 422, "{bad}: {}", res.text());
+                        res.assert_json(&json!({"error": "invalid_youtube_privacy"}));
+                    }
+                    // Unknown fields are not ignored.
+                    let res = create(&s, &cookie, with(json!({"visibility": "public"}))).await;
+                    assert!(res.status_code().is_client_error());
+                    // Not for another platform.
+                    let mut v = input(&set, "hi", None);
+                    v["youtube"] = json!({"privacy": "public"});
+                    let res = create(&s, &cookie, v).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "youtube_not_supported"}));
+
+                    // A replace is checked the same way, and replaces the settings.
+                    let ok = create(&s, &cookie, with(json!({"privacy": "unlisted"}))).await;
+                    assert_eq!(ok.status_code(), 201, "{}", ok.text());
+                    let id = id_of(&ok);
+                    let url = format!("/v1/posts/{id}");
+                    let res = req(&s, Method::PUT, &url, &cookie)
+                        .json(&with(json!({"privacy": "everyone"})))
+                        .await;
+                    assert_eq!(res.status_code(), 422);
+                    let res = req(&s, Method::PUT, &url, &cookie)
+                        .json(&with(json!({"privacy": "public"})))
+                        .await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["youtube"]["privacy"], "public");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_post_group_gives_the_settings_to_its_youtube_post() {
+                    let (s, _, _, _, cookie, _, set) = team().await;
+                    let make = |extra: Value| {
+                        let mut v = json!({"social_set_id": set, "body": "Short",
+                            "media": ["https://a.example/clip.mp4"],
+                            "platforms": ["youtube", "bluesky"],
+                            "overrides": {"bluesky": {"media": []}}});
+                        v.as_object_mut()
+                            .unwrap()
+                            .extend(extra.as_object().unwrap().clone());
+                        req(&s, Method::POST, "/v1/post-groups", &cookie).json(&v)
+                    };
+                    let privacy_of = |g: &Value, platform: &str| {
+                        let posts = g["posts"].as_array().unwrap();
+                        let p = posts.iter().find(|p| p["platform"] == platform).unwrap();
+                        p["youtube"].clone()
+                    };
+                    let res = make(json!({"youtube": {"privacy": "unlisted"}})).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let g = res.json::<Value>();
+                    assert_eq!(privacy_of(&g, "youtube")["privacy"], "unlisted");
+                    // Other platforms get none.
+                    assert_eq!(privacy_of(&g, "bluesky"), Value::Null);
+                    let both = json!({"youtube": {"privacy": "unlisted"}, "overrides":
+                        {"bluesky": {"media": []}, "youtube": {"youtube": {"privacy": "public"}}}});
+                    let g = make(both).await.json::<Value>();
+                    assert_eq!(privacy_of(&g, "youtube")["privacy"], "public");
+                    let res = make(json!({"youtube": {"privacy": "secret"}})).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "invalid_youtube_privacy",
+                        "platform": "youtube"}));
+                    // An override on another platform is refused like TikTok's.
+                    let res = make(json!({"overrides": {"bluesky": {"media": [],
+                        "youtube": {"privacy": "public"}}}}))
+                    .await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "youtube_not_supported",
+                        "platform": "bluesky"}));
                 }
 
                 #[tokio::test]
