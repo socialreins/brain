@@ -12,13 +12,13 @@ pub const THREADS_MAX_MEDIA: usize = 20;
 /// LinkedIn: 3000 characters, 20 images (or one video).
 pub const LINKEDIN_MAX_CHARS: usize = 3000;
 pub const LINKEDIN_MAX_MEDIA: usize = 20;
-/// Facebook: 63206 characters; 10 images or one video, kept to Instagram's carousel size so one
-/// post group fits both.
+/// Facebook: 63206 characters; 10 images or one video. Meta documents no photo limit for a Page
+/// post, so 10 is ours.
 pub const FACEBOOK_MAX_CHARS: usize = 63_206;
 pub const FACEBOOK_MAX_MEDIA: usize = 10;
-/// Instagram: a 2200-character caption on 1 to 10 images or videos (a carousel).
+/// Instagram: a 2200-character caption on 1 to 20 images or videos (a carousel, Meta's limit).
 pub const INSTAGRAM_MAX_CHARS: usize = 2200;
-pub const INSTAGRAM_MAX_MEDIA: usize = 10;
+pub const INSTAGRAM_MAX_MEDIA: usize = 20;
 /// YouTube: one video; its title is the body's first line (100 characters), its description the
 /// rest (5000 bytes). YouTube refuses `<` and `>` in either.
 pub const YOUTUBE_MAX_TITLE: usize = 100;
@@ -628,13 +628,13 @@ mod tests {
             Err(Invalid::MediaRequired)
         );
         assert_eq!(validate("instagram", "", &media(1)), Ok(()));
-        assert_eq!(validate("instagram", &"a".repeat(2200), &media(10)), Ok(()));
+        assert_eq!(validate("instagram", &"a".repeat(2200), &media(20)), Ok(()));
         assert_eq!(
             validate("instagram", &"a".repeat(2201), &media(1)),
             Err(Invalid::TooLong)
         );
         assert_eq!(
-            validate("instagram", "x", &media(11)),
+            validate("instagram", "x", &media(21)),
             Err(Invalid::TooManyImages)
         );
         assert_eq!(validate("instagram", " ", &[]), Err(Invalid::Empty));

@@ -164,7 +164,7 @@ pub struct PostInput {
     ///
     /// Public `https://` media URLs: on Bluesky at most 4 images (JPEG, PNG, WebP or GIF, 1 MB
     /// each), on Threads at most 20 JPEG or PNG images or MP4 or MOV videos, on LinkedIn at most 20 JPEG, PNG or GIF images or one MP4 video, on Facebook at most
-    /// 10 JPEG, PNG or GIF images or one MP4 or MOV video (a Reel), on Instagram 1 to 10 JPEG
+    /// 10 JPEG, PNG or GIF images or one MP4 or MOV video (a Reel), on Instagram 1 to 20 JPEG
     /// images or MP4 or MOV videos (`media_required` without one), on YouTube exactly one MP4 or
     /// MOV video (`media_required` without one), on X at most 4 JPEG, PNG or WebP images, or one
     /// GIF, or one MP4 or MOV video, on TikTok one MP4 or MOV video or 1 to 35 JPEG or WebP
