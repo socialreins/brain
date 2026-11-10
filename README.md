@@ -335,9 +335,9 @@ redirect URI `{BRAIN_URL}/connect/youtube/callback`, state and cookie (`sr_youtu
 consent screen and enable the YouTube Data API v3 in the Google Cloud project. The callback swaps
 the code at `oauth2.googleapis.com/token`, needs the refresh token `prompt=consent` brings, reads
 `GET /youtube/v3/channels?part=snippet&mine=true` (id, title, `@handle`, thumbnail) and saves a
-`youtube` account (`external_id` is the channel id) in the team's Default set. A Google account
-with several channels or brand accounts connects the one the consent picked; connect again for
-another. Error codes `youtube_failed`, `no_channel` (the Google account has no channel) and
+`youtube` account (`external_id` is the channel id) in the team's Default set. Google always shows its
+account chooser (`prompt=select_account consent`), which lists Brand Account channels too, so
+pick the channel there; connect again for another. Error codes `youtube_failed`, `no_channel` (the Google account has no channel) and
 `missing_scopes` (granular consent: the token Google returned lacks one of the three scopes, so
 nothing is saved) besides the Threads ones. The access token lasts an hour and is stored with its expiry; the
 refresh token is sealed in the account's `meta`. Before each publish or take down, a token with
