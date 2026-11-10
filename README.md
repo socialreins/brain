@@ -4,7 +4,7 @@
 
 The Rust backend for [SocialReins](https://socialreins.com), a social media manager for
 scheduling and publishing posts across platforms. For the project overview, roadmap and the
-other repos, see the main repo [socialreins/web](https://github.com/socialreins/web).
+other repos, see the main repo [socialreins/socialreins](https://github.com/socialreins/socialreins).
 
 Right now brain serves the waitlist behind the socialreins.com landing page and magic link
 sign-in. Publishing, teams and the MCP server come later.
@@ -635,7 +635,7 @@ safe.
 Self-hosters use the published image, `ghcr.io/socialreins/brain` (`linux/amd64` and
 `linux/arm64`): `:main` and `:<commit sha>` follow `main`, `:vX.Y.Z` and `:latest` follow
 releases (`.github/workflows/image.yml`). The install guide lives in
-[socialreins/web](https://github.com/socialreins/web#self-host).
+[socialreins/socialreins](https://github.com/socialreins/socialreins#self-host).
 
 ## License
 
