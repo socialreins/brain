@@ -78,6 +78,10 @@ pub enum Invalid {
     TikTokDisclosureIncomplete,
     /// Branded content cannot be private (`SELF_ONLY`).
     TikTokBrandedPrivate,
+    /// YouTube settings on a post for another platform.
+    YouTubeUnsupported,
+    /// Not `private`, `unlisted` or `public`.
+    InvalidYouTubePrivacy,
 }
 
 impl Invalid {
@@ -103,6 +107,8 @@ impl Invalid {
             Self::InvalidTikTokDisclosure => "invalid_tiktok_disclosure",
             Self::TikTokDisclosureIncomplete => "tiktok_disclosure_incomplete",
             Self::TikTokBrandedPrivate => "tiktok_branded_content_private",
+            Self::YouTubeUnsupported => "youtube_not_supported",
+            Self::InvalidYouTubePrivacy => "invalid_youtube_privacy",
         }
     }
 }
@@ -324,6 +330,25 @@ pub fn validate_tiktok(platform: &str, choice: Option<TikTokChoice>) -> Result<(
         return Err(Invalid::TikTokBrandedPrivate);
     }
     Ok(())
+}
+
+/// The visibilities a YouTube upload may have (`privacyStatus`).
+pub const YOUTUBE_PRIVACY: [&str; 3] = ["private", "unlisted", "public"];
+
+/// Checks a post's YouTube settings for `platform`: only YouTube takes them, and a `privacy`
+/// given must be one YouTube knows. `settings` is `None` without settings, else their privacy
+/// (`None` there means private).
+pub fn validate_youtube(platform: &str, settings: Option<Option<&str>>) -> Result<(), Invalid> {
+    let Some(privacy) = settings else {
+        return Ok(());
+    };
+    if platform != "youtube" {
+        return Err(Invalid::YouTubeUnsupported);
+    }
+    match privacy {
+        Some(p) if !YOUTUBE_PRIVACY.contains(&p) => Err(Invalid::InvalidYouTubePrivacy),
+        _ => Ok(()),
+    }
 }
 
 /// Checks a thread's follow-up parts `(body, media)` for `platform`, each as a post of its own.
@@ -697,6 +722,24 @@ mod tests {
         for p in ["tiktok", "x", "linkedin", "threads", "bluesky"] {
             assert_eq!(validate_cover(p, c, &one), Err(Invalid::CoverUnsupported));
         }
+    }
+
+    #[test]
+    fn youtube_settings_name_a_known_visibility_on_youtube_only() {
+        assert_eq!(validate_youtube("x", None), Ok(()));
+        assert_eq!(validate_youtube("youtube", None), Ok(()));
+        assert_eq!(validate_youtube("youtube", Some(None)), Ok(()));
+        for p in YOUTUBE_PRIVACY {
+            assert_eq!(validate_youtube("youtube", Some(Some(p))), Ok(()));
+        }
+        assert_eq!(
+            validate_youtube("youtube", Some(Some("Public"))),
+            Err(Invalid::InvalidYouTubePrivacy)
+        );
+        assert_eq!(
+            validate_youtube("tiktok", Some(Some("public"))),
+            Err(Invalid::YouTubeUnsupported)
+        );
     }
 
     #[test]

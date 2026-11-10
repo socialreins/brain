@@ -39,6 +39,9 @@ pub struct Model {
     /// TikTok settings (`connectors::tiktok::Options`); null for none.
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub tiktok: Option<Json>,
+    /// YouTube settings (`connectors::youtube::Options`); null for none (private).
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub youtube: Option<Json>,
     /// The targets were created (one per account of the platform in the set); a retry never
     /// adds more.
     pub fanned_out: bool,

@@ -48,6 +48,7 @@ cargo run -p socialreins-brain
   goes out). Instagram gets it as `cover_url` in the publish call; Facebook and YouTube get it
   set once on the live video after `published`, and a refusal only sets `post_targets.cover_error`.
 - TikTok per-post settings (`posts.tiktok`, `connectors::tiktok::Options`): validated on save by `post::validate_tiktok` (privacy required, disclosure complete, branded content not private); `Publisher::publish_with_tiktok` hands them to `TikTok::post`, which checks the chosen level against the live creator info and keeps an interaction off when the creator disabled it. No settings (API posts): the old most-public, all-off behaviour. `GET /v1/connections/{id}/tiktok` is the editor's creator info.
+- YouTube per-post settings (`posts.youtube`, `connectors::youtube::Options`): `privacy` is `private` (also the default with none), `unlisted` or `public`, checked on save by `post::validate_youtube`; `Publisher::publish_with_youtube` sends it as `privacyStatus`.
 - `app/src/meta_inbox.rs` and `controllers/meta_webhook.rs`: `/webhooks/meta`. The signature of
   the raw body is checked before anything is parsed; items are stored before the `200` (unique
   on account and remote id, so redeliveries are harmless), names, links and automations run

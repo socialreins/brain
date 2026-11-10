@@ -37,7 +37,7 @@ use super::{
     waitlist::{error, Error},
 };
 use crate::{
-    connectors::tiktok,
+    connectors::{tiktok, youtube},
     models::{
         post_targets, posts, social_account_social_set as membership, social_accounts, social_sets,
         teams,
@@ -77,6 +77,8 @@ pub struct Post {
     pub cover: Option<String>,
     /// TikTok settings of a TikTok post, when it has any.
     pub tiktok: Option<tiktok::Options>,
+    /// YouTube settings of a YouTube post, when it has any; none (or no `privacy`) is private.
+    pub youtube: Option<youtube::Options>,
     /// `draft`, `scheduled`, `queued`, `published`, `failed` or `deleted`.
     pub status: String,
     pub scheduled_at: Option<DateTime<FixedOffset>>,
@@ -205,6 +207,11 @@ pub struct PostInput {
     /// this rule without settings stay readable and still go out with the most public level
     /// the account is offered and every interaction off.
     pub tiktok: Option<tiktok::Options>,
+    /// YouTube's per-post settings: `privacy` is the video's visibility, `private` (the
+    /// default, also without `youtube`), `unlisted` or `public`. Other platforms answer
+    /// `youtube_not_supported`, another value `invalid_youtube_privacy`. Until Google audits the
+    /// API project, YouTube keeps every upload private whatever is chosen.
+    pub youtube: Option<youtube::Options>,
     /// When to publish. Set: `scheduled`; absent or `null`: `draft`.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
     /// A list to put the post in (moving it there when it already is).
@@ -259,6 +266,9 @@ pub struct PostGroupInput {
     /// `422 {"error":"tiktok_settings_required","platform":"tiktok"}`: the visibility has no
     /// default, and brain never picks the most public one for you.
     pub tiktok: Option<tiktok::Options>,
+    /// The YouTube post's settings, unless its override has some. Other platforms get none.
+    /// Without them the video is private.
+    pub youtube: Option<youtube::Options>,
     /// As in `POST /posts`, for every post.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
     /// A list to put every post in, in platform order.
@@ -280,6 +290,7 @@ pub struct Override {
     pub first_comment: Option<String>,
     pub cover: Option<String>,
     pub tiktok: Option<tiktok::Options>,
+    pub youtube: Option<youtube::Options>,
 }
 
 /// A failed target a retry left alone because it may already have posted.
@@ -378,6 +389,7 @@ fn post_json(p: posts::Model, targets: Vec<Target>, lists: Vec<ListRef>) -> Post
         first_comment: p.first_comment,
         cover: p.cover,
         tiktok: p.tiktok.and_then(|v| serde_json::from_value(v).ok()),
+        youtube: p.youtube.and_then(|v| serde_json::from_value(v).ok()),
         status: p.status,
         scheduled_at: p.scheduled_at,
         published_at: p.published_at,
@@ -477,6 +489,10 @@ async fn checked(
     if let Err(e) = post::validate_tiktok(&input.platform, choice) {
         return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, e.code())));
     }
+    let privacy = input.youtube.as_ref().map(|y| y.privacy.as_deref());
+    if let Err(e) = post::validate_youtube(&input.platform, privacy) {
+        return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, e.code())));
+    }
     // The visibility has no default: brain never posts at the most public level unasked. (Rows
     // saved before this still publish with the auto-picked level, and stay readable.)
     if input.platform == "tiktok" && input.tiktok.is_none() {
@@ -531,6 +547,14 @@ fn stored_tiktok(input: &PostInput) -> Option<serde_json::Value> {
         .tiktok
         .as_ref()
         .and_then(|t| serde_json::to_value(t).ok())
+}
+
+/// The YouTube settings as saved.
+fn stored_youtube(input: &PostInput) -> Option<serde_json::Value> {
+    input
+        .youtube
+        .as_ref()
+        .and_then(|y| serde_json::to_value(y).ok())
 }
 
 /// The cover as saved: blank is none.
@@ -692,6 +716,7 @@ async fn insert(
         first_comment: Set(stored_comment(input)),
         cover: Set(stored_cover(input)),
         tiktok: Set(stored_tiktok(input)),
+        youtube: Set(stored_youtube(input)),
         status: Set(status_for(input).into()),
         scheduled_at: Set(when(input)),
         created_by: Set(a.user_id),
@@ -776,6 +801,9 @@ pub async fn create_post_group(app: &AppState, a: &Actor, input: PostGroupInput)
                 tiktok: o
                     .and_then(|o| o.tiktok.clone())
                     .or_else(|| input.tiktok.clone().filter(|_| platform == "tiktok")),
+                youtube: o
+                    .and_then(|o| o.youtube.clone())
+                    .or_else(|| input.youtube.clone().filter(|_| platform == "youtube")),
                 platform,
                 scheduled_at: input.scheduled_at,
                 list_id: input.list_id,
@@ -947,6 +975,7 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) 
             .col_expr(posts::Column::FirstComment, stored_comment(&input).into())
             .col_expr(posts::Column::Cover, stored_cover(&input).into())
             .col_expr(posts::Column::Tiktok, stored_tiktok(&input).into())
+            .col_expr(posts::Column::Youtube, stored_youtube(&input).into())
             .col_expr(posts::Column::Status, status_for(&input).into())
             .col_expr(posts::Column::ScheduledAt, when(&input).into())
             .col_expr(posts::Column::UpdatedAt, Utc::now().fixed_offset().into())

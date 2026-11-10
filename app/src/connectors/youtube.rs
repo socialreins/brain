@@ -5,8 +5,10 @@
 use std::time::Duration;
 
 use reqwest::{header::HeaderMap, Method, RequestBuilder, StatusCode, Url};
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use utoipa::ToSchema;
 
 use super::{
     bluesky::PostError,
@@ -27,12 +29,27 @@ const UPLOAD_TIMEOUT: Duration = Duration::from_secs(420);
 /// Wait before a first comment on a video just uploaded.
 const COMMENT_WAIT: Duration = Duration::from_secs(10);
 pub const VIDEO_TYPES: [&str; 2] = ["video/mp4", "video/quicktime"];
-/// Until Google audits the API project, YouTube locks what it uploads to private whatever this
-/// says (see README).
-const PRIVACY: &str = "public";
+/// The visibility of an upload without a choice. Until Google audits the API project, YouTube
+/// locks what it uploads to private whatever the post chose (see README).
+pub const DEFAULT_PRIVACY: &str = "private";
 
 const QUOTA: &str = "YouTube's daily quota for this app is used up (an upload costs 1,600 of the \
                      10,000 units a day). Try again after midnight Pacific time.";
+
+/// A YouTube post's per-post settings. None, or no `privacy`, uploads as private.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Options {
+    /// `private` (the default), `unlisted` or `public`: the video's `privacyStatus`.
+    pub privacy: Option<String>,
+}
+
+impl Options {
+    /// The `privacyStatus` to upload with.
+    pub fn privacy(&self) -> &str {
+        self.privacy.as_deref().unwrap_or(DEFAULT_PRIVACY)
+    }
+}
 
 /// The Google client (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`), the same one as Google
 /// sign-in, under its own redirect URI. No `Debug`: it holds the secret.
@@ -325,19 +342,20 @@ impl YouTube {
         google || api
     }
 
-    /// Uploads `video` as a public video titled `title` and returns its id. A resumable
-    /// session (`uploadType=resumable`), then one `PUT` of all the bytes; never resumed or
-    /// retried, since a retry could post twice. The token goes along only to a session URL that
+    /// Uploads `video` titled `title`, with `privacy` as its `privacyStatus`, and returns its id.
+    /// A resumable session (`uploadType=resumable`), then one `PUT` of all the bytes; never
+    /// resumed or retried, since a retry could post twice. The token goes along only to a session URL that
     /// passed `upload_allowed`.
     pub async fn upload(
         &self,
         token: &str,
         (title, description): (&str, &str),
         video: &File<'_>,
+        privacy: &str,
     ) -> Result<String, PostError> {
         let meta = json!({
             "snippet": {"title": title, "description": description},
-            "status": {"privacyStatus": PRIVACY, "selfDeclaredMadeForKids": false},
+            "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": false},
         });
         let start = format!(
             "{}/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
