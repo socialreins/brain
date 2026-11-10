@@ -8498,7 +8498,7 @@ mod teams {
                         "http://localhost:8080/connect/youtube/callback"
                     );
                     assert_eq!(q["access_type"], "offline");
-                    assert_eq!(q["prompt"], "consent");
+                    assert_eq!(q["prompt"], "select_account consent");
                     assert_eq!(q["include_granted_scopes"], "false");
                     assert_eq!(
                         q["scope"],

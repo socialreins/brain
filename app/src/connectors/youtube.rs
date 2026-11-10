@@ -188,7 +188,9 @@ impl YouTube {
     }
 
     /// Where `GET /connections/youtube/redirect` sends the browser; `None` when not configured.
-    /// `prompt=consent` makes Google return a refresh token every time, and
+    /// `prompt=consent` makes Google return a refresh token every time; `select_account` shows the
+    /// account chooser, which also lists Brand Account channels (without it Google picks the
+    /// signed-in account's own channel), and
     /// `include_granted_scopes=false` keeps the sign-in scopes out of this grant.
     pub fn authorize_url(&self, redirect_uri: &str, state: &str) -> Option<String> {
         let (id, _) = self.app.as_ref()?;
@@ -199,7 +201,7 @@ impl YouTube {
             ("state", state),
             ("scope", SCOPES),
             ("access_type", "offline"),
-            ("prompt", "consent"),
+            ("prompt", "select_account consent"),
             ("include_granted_scopes", "false"),
         ];
         Url::parse_with_params(&self.auth_url, params)
@@ -467,7 +469,7 @@ mod tests {
         assert_eq!(q["state"], "st");
         assert_eq!(q["response_type"], "code");
         assert_eq!(q["access_type"], "offline");
-        assert_eq!(q["prompt"], "consent");
+        assert_eq!(q["prompt"], "select_account consent");
         assert_eq!(q["include_granted_scopes"], "false");
         let scopes: Vec<&str> = q["scope"].split(' ').collect();
         assert_eq!(
