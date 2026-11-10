@@ -812,6 +812,235 @@ mod auth {
         drop_db(db, &name).await;
     }
 
+    /// A new account's personal team takes the first word of its name, else the email's local
+    /// part.
+    #[tokio::test]
+    #[serial]
+    async fn personal_team_is_named_after_the_first_word() {
+        use socialreins_brain::models::{team_user, teams};
+        let (s, db) = server_where(|_| {}).await;
+        let team_of = |email: String| {
+            let db = db.clone();
+            async move {
+                let id = user(&db, &email).await.unwrap().id;
+                let m = team_user::Entity::find()
+                    .filter(team_user::Column::UserId.eq(id))
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                teams::Entity::find_by_id(m.team_id)
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .name
+            }
+        };
+        let named = unique_email();
+        let secret = token::new();
+        magic_links::Entity::insert(magic_links::ActiveModel {
+            token_hash: Set(token::hash(&secret)),
+            email: Set(named.clone()),
+            name: Set(Some("Harun R. Rayhan".into())),
+            expires_at: Set((Utc::now() + Duration::minutes(15)).fixed_offset()),
+            ..Default::default()
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+        assert!(open(&s, &secret).await.1.is_some());
+        assert_eq!(team_of(named).await, "Harun");
+
+        let blank = unique_email();
+        users::Entity::insert(users::ActiveModel {
+            id: Set(uuid::Uuid::now_v7()),
+            email: Set(blank.clone()),
+            name: Set("  ".into()),
+            ..Default::default()
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+        assert!(open(&s, &link(&db, &blank, Duration::minutes(15)).await)
+            .await
+            .1
+            .is_some());
+        assert_eq!(
+            team_of(blank.clone()).await,
+            blank.split('@').next().unwrap()
+        );
+
+        // A first word with no letter or digit (a zero-width space) falls back too.
+        let invisible = unique_email();
+        users::Entity::insert(users::ActiveModel {
+            id: Set(uuid::Uuid::now_v7()),
+            email: Set(invisible.clone()),
+            name: Set("\u{200B} Bob".into()),
+            ..Default::default()
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+        assert!(
+            open(&s, &link(&db, &invisible, Duration::minutes(15)).await)
+                .await
+                .1
+                .is_some()
+        );
+        assert_eq!(
+            team_of(invisible.clone()).await,
+            invisible.split('@').next().unwrap()
+        );
+    }
+
+    /// `SIGNUP_DOMAINS`: only listed domains (exact, any case) create accounts; an invited email
+    /// still does, and existing accounts still sign in.
+    #[tokio::test]
+    #[serial]
+    async fn signup_domains_limit_new_accounts() {
+        use socialreins_brain::models::{team_invitations, team_user};
+        let domain = format!("{}.test", uuid::Uuid::now_v7().simple());
+        let at = |d: &str| format!("{}@{d}", uuid::Uuid::now_v7());
+        let (s, db) = server_where(|c| c.signup_domains = vec![domain.clone()]).await;
+        // A second server, so the 5 a minute magic link limit per IP holds for each.
+        let (s2, _) = server_where(|c| c.signup_domains = vec![domain.clone()]).await;
+        let refused = |to: String| assert!(to.ends_with("/login?error=registration_disabled"));
+
+        let allowed = at(&domain);
+        assert!(open(&s, &link(&db, &allowed, Duration::minutes(15)).await)
+            .await
+            .1
+            .is_some());
+
+        for email in [at("example.com"), at(&format!("mail.{domain}"))] {
+            let (to, cookie) = open(&s2, &link(&db, &email, Duration::minutes(15)).await).await;
+            refused(to);
+            assert!(cookie.is_none() && user(&db, &email).await.is_none());
+        }
+
+        // An account made before the list existed still signs in.
+        let (open_server, _) = server_where(|_| {}).await;
+        let old = unique_email();
+        assert!(
+            open(&open_server, &link(&db, &old, Duration::minutes(15)).await)
+                .await
+                .1
+                .is_some()
+        );
+        assert!(open(&s2, &link(&db, &old, Duration::minutes(15)).await)
+            .await
+            .1
+            .is_some());
+
+        // Through `POST /auth/link`: the same 202 either way, but only the listed domain, sent in
+        // upper case, gets a link.
+        let stranger = at("example.com");
+        let upper = at(&domain.to_uppercase());
+        for (server, email) in [(&s2, &stranger), (&s, &upper)] {
+            let res = server
+                .post("/auth/link")
+                .json(&json!({"email": email}))
+                .await;
+            assert_eq!(res.status_code(), 202);
+            assert_eq!(res.json::<Value>(), json!({"status": "sent"}));
+        }
+        assert_eq!(links_eventually(&db, &upper.to_lowercase(), 1).await, 1);
+        assert_eq!(links(&db, &stranger).await, 0, "no link for another domain");
+        assert!(user(&db, &stranger).await.is_none());
+
+        let inviter = user(&db, &allowed).await.unwrap().id;
+        let team = team_user::Entity::find()
+            .filter(team_user::Column::UserId.eq(inviter))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .team_id;
+        let invited = unique_email();
+        team_invitations::Entity::insert(team_invitations::ActiveModel {
+            id: Set(uuid::Uuid::now_v7()),
+            team_id: Set(team),
+            email: Set(invited.clone()),
+            role: Set("member".into()),
+            token_hash: Set(token::hash(&token::new())),
+            invited_by: Set(Some(inviter)),
+            expires_at: Set((Utc::now() + Duration::days(7)).fixed_offset()),
+            ..Default::default()
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+        assert!(open(&s, &link(&db, &invited, Duration::minutes(15)).await)
+            .await
+            .1
+            .is_some());
+    }
+
+    /// `OWNER_EMAIL` signs up outside `SIGNUP_DOMAINS`; with `REGISTRATION_DISABLED` too, a
+    /// listed domain alone is not enough.
+    #[tokio::test]
+    #[serial]
+    async fn signup_domains_with_owner_and_closed_registration() {
+        let domain = format!("{}.test", uuid::Uuid::now_v7().simple());
+        let owner = unique_email();
+        let (s, db) = server_where(|c| {
+            c.signup_domains = vec![domain.clone()];
+            c.owner_email = Some(owner.clone());
+        })
+        .await;
+        assert!(open(&s, &link(&db, &owner, Duration::minutes(15)).await)
+            .await
+            .1
+            .is_some());
+
+        let owner = unique_email();
+        let (s, db) = server_where(|c| {
+            c.signup_domains = vec![domain.clone()];
+            c.owner_email = Some(owner.clone());
+            c.registration_disabled = true;
+        })
+        .await;
+        let listed = format!("{}@{domain}", uuid::Uuid::now_v7());
+        let (to, cookie) = open(&s, &link(&db, &listed, Duration::minutes(15)).await).await;
+        assert!(to.ends_with("/login?error=registration_disabled"));
+        assert!(cookie.is_none() && user(&db, &listed).await.is_none());
+        assert!(open(&s, &link(&db, &owner, Duration::minutes(15)).await)
+            .await
+            .1
+            .is_some());
+    }
+
+    /// Closed registration without `OWNER_EMAIL` and with `SIGNUP_DOMAINS`: the first account
+    /// must still be on a listed domain.
+    #[tokio::test]
+    #[serial]
+    async fn first_account_needs_a_listed_domain() {
+        let domain = format!("{}.test", uuid::Uuid::now_v7().simple());
+        let (s, db, name) = empty_db_server(|c| c.signup_domains = vec![domain.clone()]).await;
+        let (to, cookie) = open(&s, &link(&db, &unique_email(), Duration::minutes(15)).await).await;
+        assert!(to.ends_with("/login?error=registration_disabled"));
+        assert!(cookie.is_none() && users_count(&db).await == 0);
+        let listed = format!("{}@{domain}", uuid::Uuid::now_v7());
+        assert!(open(&s, &link(&db, &listed, Duration::minutes(15)).await)
+            .await
+            .1
+            .is_some());
+        drop_db(db, &name).await;
+    }
+
+    /// Unset `SIGNUP_DOMAINS` leaves registration open to any domain.
+    #[tokio::test]
+    #[serial]
+    async fn no_signup_domains_is_open() {
+        let (s, db) = server_where(|c| c.signup_domains.clear()).await;
+        let email = format!("{}@any-domain.test", uuid::Uuid::now_v7());
+        assert!(open(&s, &link(&db, &email, Duration::minutes(15)).await)
+            .await
+            .1
+            .is_some());
+    }
+
     /// Google sign-in against a mock token endpoint. The test passes the id_token claims as the
     /// `code`; the mock adds issuer, audience and expiry unless the claims set them.
     mod google {

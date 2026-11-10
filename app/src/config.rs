@@ -52,6 +52,9 @@ pub struct Config {
     pub registration_disabled: bool,
     /// `OWNER_EMAIL`, normalized: the one stranger a closed install still lets sign up.
     pub owner_email: Option<String>,
+    /// `SIGNUP_DOMAINS`, lowercased: when not empty, a new account's email domain must be one of
+    /// these exactly (`OWNER_EMAIL` and invited emails excepted); existing users still sign in.
+    pub signup_domains: Vec<String>,
     /// `RESEND_API_KEY`, else `SMTP_URL` (either needs `MAIL_FROM`), else the log, which needs
     /// `MAIL_LOG=true` so sign-in links never reach the log by accident.
     pub mailer: Mailer,
@@ -182,6 +185,7 @@ impl Config {
             web_url,
             registration_disabled: flag("REGISTRATION_DISABLED")?,
             owner_email: owner_email(var("OWNER_EMAIL"))?,
+            signup_domains: signup_domains(var("SIGNUP_DOMAINS"))?,
             mailer,
             webauthn,
             cipher: Arc::new(cipher),
@@ -214,6 +218,33 @@ impl Config {
 fn owner_email(raw: Option<String>) -> Result<Option<String>, &'static str> {
     raw.map(|e| socialreins_core::email::normalize(&e).ok_or("OWNER_EMAIL: not an email address"))
         .transpose()
+}
+
+/// `SIGNUP_DOMAINS`: comma-separated, each trimmed and lowercased; blank entries are skipped.
+/// Blank means open. Otherwise every entry must be a plain domain and at least one must be
+/// given, so a typo fails at startup instead of silently closing or opening sign-up.
+fn signup_domains(raw: Option<String>) -> Result<Vec<String>, String> {
+    let raw = raw.unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let domains: Vec<String> = raw
+        .split(',')
+        .map(|d| d.trim().to_lowercase())
+        .filter(|d| !d.is_empty())
+        .collect();
+    if domains.is_empty() {
+        return Err("SIGNUP_DOMAINS: no domain given".into());
+    }
+    for d in &domains {
+        let plain = !d.contains('@')
+            && !d.chars().any(char::is_whitespace)
+            && d.split('.').all(|label| !label.is_empty());
+        if !plain {
+            return Err(format!("SIGNUP_DOMAINS: not a plain domain: {d}"));
+        }
+    }
+    Ok(domains)
 }
 
 /// `ADMIN_EMAILS`: each address normalized like `OWNER_EMAIL`; blank entries are skipped.
@@ -352,6 +383,27 @@ mod tests {
         );
         assert!(owner("not-an-email").is_err());
         assert_eq!(super::owner_email(None).unwrap(), None);
+    }
+
+    #[test]
+    fn signup_domains_split_and_lowercase() {
+        let domains = |v: &str| super::signup_domains(Some(v.into()));
+        assert_eq!(
+            domains(" Harun.dev, ,socialreins.com,").unwrap(),
+            ["harun.dev", "socialreins.com"]
+        );
+        assert!(super::signup_domains(None).unwrap().is_empty());
+        assert!(domains("  ").unwrap().is_empty());
+        for bad in [
+            " , ",
+            "me@harun.dev",
+            ".harun.dev",
+            "harun.dev.",
+            "harun..dev",
+            "har un.dev",
+        ] {
+            assert!(domains(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
