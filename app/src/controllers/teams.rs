@@ -226,7 +226,8 @@ pub(crate) async fn ensure_team(db: &DatabaseConnection, user_id: Uuid) -> Resul
         .await?;
     if teams == 0 {
         // The first word of the name ("Harun R. Rayhan" gives "Harun"), else the email's local part.
-        let first = user.name.split_whitespace().next();
+        let first =
+            (user.name.split_whitespace().next()).filter(|w| w.chars().any(char::is_alphanumeric));
         let name: String = first
             .unwrap_or_else(|| user.email.split('@').next().unwrap_or_default())
             .chars()

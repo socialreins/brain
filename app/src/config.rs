@@ -185,7 +185,7 @@ impl Config {
             web_url,
             registration_disabled: flag("REGISTRATION_DISABLED")?,
             owner_email: owner_email(var("OWNER_EMAIL"))?,
-            signup_domains: signup_domains(var("SIGNUP_DOMAINS")),
+            signup_domains: signup_domains(var("SIGNUP_DOMAINS"))?,
             mailer,
             webauthn,
             cipher: Arc::new(cipher),
@@ -221,12 +221,30 @@ fn owner_email(raw: Option<String>) -> Result<Option<String>, &'static str> {
 }
 
 /// `SIGNUP_DOMAINS`: comma-separated, each trimmed and lowercased; blank entries are skipped.
-fn signup_domains(raw: Option<String>) -> Vec<String> {
-    raw.unwrap_or_default()
+/// Blank means open. Otherwise every entry must be a plain domain and at least one must be
+/// given, so a typo fails at startup instead of silently closing or opening sign-up.
+fn signup_domains(raw: Option<String>) -> Result<Vec<String>, String> {
+    let raw = raw.unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let domains: Vec<String> = raw
         .split(',')
         .map(|d| d.trim().to_lowercase())
         .filter(|d| !d.is_empty())
-        .collect()
+        .collect();
+    if domains.is_empty() {
+        return Err("SIGNUP_DOMAINS: no domain given".into());
+    }
+    for d in &domains {
+        let plain = !d.contains('@')
+            && !d.chars().any(char::is_whitespace)
+            && d.split('.').all(|label| !label.is_empty());
+        if !plain {
+            return Err(format!("SIGNUP_DOMAINS: not a plain domain: {d}"));
+        }
+    }
+    Ok(domains)
 }
 
 /// `ADMIN_EMAILS`: each address normalized like `OWNER_EMAIL`; blank entries are skipped.
@@ -369,11 +387,23 @@ mod tests {
 
     #[test]
     fn signup_domains_split_and_lowercase() {
+        let domains = |v: &str| super::signup_domains(Some(v.into()));
         assert_eq!(
-            super::signup_domains(Some(" Harun.dev, ,socialreins.com,".into())),
+            domains(" Harun.dev, ,socialreins.com,").unwrap(),
             ["harun.dev", "socialreins.com"]
         );
-        assert!(super::signup_domains(None).is_empty());
+        assert!(super::signup_domains(None).unwrap().is_empty());
+        assert!(domains("  ").unwrap().is_empty());
+        for bad in [
+            " , ",
+            "me@harun.dev",
+            ".harun.dev",
+            "harun.dev.",
+            "harun..dev",
+            "har un.dev",
+        ] {
+            assert!(domains(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

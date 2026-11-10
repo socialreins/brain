@@ -870,6 +870,28 @@ mod auth {
             team_of(blank.clone()).await,
             blank.split('@').next().unwrap()
         );
+
+        // A first word with no letter or digit (a zero-width space) falls back too.
+        let invisible = unique_email();
+        users::Entity::insert(users::ActiveModel {
+            id: Set(uuid::Uuid::now_v7()),
+            email: Set(invisible.clone()),
+            name: Set("\u{200B} Bob".into()),
+            ..Default::default()
+        })
+        .exec_without_returning(&db)
+        .await
+        .unwrap();
+        assert!(
+            open(&s, &link(&db, &invisible, Duration::minutes(15)).await)
+                .await
+                .1
+                .is_some()
+        );
+        assert_eq!(
+            team_of(invisible.clone()).await,
+            invisible.split('@').next().unwrap()
+        );
     }
 
     /// `SIGNUP_DOMAINS`: only listed domains (exact, any case) create accounts; an invited email
@@ -887,11 +909,6 @@ mod auth {
 
         let allowed = at(&domain);
         assert!(open(&s, &link(&db, &allowed, Duration::minutes(15)).await)
-            .await
-            .1
-            .is_some());
-        let upper = at(&domain.to_uppercase()).to_lowercase();
-        assert!(open(&s, &link(&db, &upper, Duration::minutes(15)).await)
             .await
             .1
             .is_some());
@@ -915,6 +932,22 @@ mod auth {
             .await
             .1
             .is_some());
+
+        // Through `POST /auth/link`: the same 202 either way, but only the listed domain, sent in
+        // upper case, gets a link.
+        let stranger = at("example.com");
+        let upper = at(&domain.to_uppercase());
+        for (server, email) in [(&s2, &stranger), (&s, &upper)] {
+            let res = server
+                .post("/auth/link")
+                .json(&json!({"email": email}))
+                .await;
+            assert_eq!(res.status_code(), 202);
+            assert_eq!(res.json::<Value>(), json!({"status": "sent"}));
+        }
+        assert_eq!(links_eventually(&db, &upper.to_lowercase(), 1).await, 1);
+        assert_eq!(links(&db, &stranger).await, 0, "no link for another domain");
+        assert!(user(&db, &stranger).await.is_none());
 
         let inviter = user(&db, &allowed).await.unwrap().id;
         let team = team_user::Entity::find()
@@ -942,6 +975,58 @@ mod auth {
             .await
             .1
             .is_some());
+    }
+
+    /// `OWNER_EMAIL` signs up outside `SIGNUP_DOMAINS`; with `REGISTRATION_DISABLED` too, a
+    /// listed domain alone is not enough.
+    #[tokio::test]
+    #[serial]
+    async fn signup_domains_with_owner_and_closed_registration() {
+        let domain = format!("{}.test", uuid::Uuid::now_v7().simple());
+        let owner = unique_email();
+        let (s, db) = server_where(|c| {
+            c.signup_domains = vec![domain.clone()];
+            c.owner_email = Some(owner.clone());
+        })
+        .await;
+        assert!(open(&s, &link(&db, &owner, Duration::minutes(15)).await)
+            .await
+            .1
+            .is_some());
+
+        let owner = unique_email();
+        let (s, db) = server_where(|c| {
+            c.signup_domains = vec![domain.clone()];
+            c.owner_email = Some(owner.clone());
+            c.registration_disabled = true;
+        })
+        .await;
+        let listed = format!("{}@{domain}", uuid::Uuid::now_v7());
+        let (to, cookie) = open(&s, &link(&db, &listed, Duration::minutes(15)).await).await;
+        assert!(to.ends_with("/login?error=registration_disabled"));
+        assert!(cookie.is_none() && user(&db, &listed).await.is_none());
+        assert!(open(&s, &link(&db, &owner, Duration::minutes(15)).await)
+            .await
+            .1
+            .is_some());
+    }
+
+    /// Closed registration without `OWNER_EMAIL` and with `SIGNUP_DOMAINS`: the first account
+    /// must still be on a listed domain.
+    #[tokio::test]
+    #[serial]
+    async fn first_account_needs_a_listed_domain() {
+        let domain = format!("{}.test", uuid::Uuid::now_v7().simple());
+        let (s, db, name) = empty_db_server(|c| c.signup_domains = vec![domain.clone()]).await;
+        let (to, cookie) = open(&s, &link(&db, &unique_email(), Duration::minutes(15)).await).await;
+        assert!(to.ends_with("/login?error=registration_disabled"));
+        assert!(cookie.is_none() && users_count(&db).await == 0);
+        let listed = format!("{}@{domain}", uuid::Uuid::now_v7());
+        assert!(open(&s, &link(&db, &listed, Duration::minutes(15)).await)
+            .await
+            .1
+            .is_some());
+        drop_db(db, &name).await;
     }
 
     /// Unset `SIGNUP_DOMAINS` leaves registration open to any domain.
