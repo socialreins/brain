@@ -223,18 +223,23 @@ enum SignUp {
     Refused,
 }
 
-/// Open registration admits anyone. Closed (`REGISTRATION_DISABLED`) admits `OWNER_EMAIL` and
-/// invited emails, or, with no `OWNER_EMAIL`, whoever signs up first.
+/// Open registration admits anyone whose domain is in `SIGNUP_DOMAINS` (any domain when it is
+/// empty). Closed (`REGISTRATION_DISABLED`) admits only, with no `OWNER_EMAIL`, whoever of
+/// those signs up first. `OWNER_EMAIL` and invited emails are always admitted.
 async fn sign_up(app: &AppState, email: &str) -> Result<SignUp, DbErr> {
-    if !app.registration_disabled
+    let domain_ok = app.signup_domains.is_empty()
+        || email
+            .rsplit_once('@')
+            .is_some_and(|(_, d)| app.signup_domains.iter().any(|a| a == d));
+    if (domain_ok && !app.registration_disabled)
         || app.owner_email.as_deref() == Some(email)
         || teams::invited(&app.db, email).await?
     {
         return Ok(SignUp::Allowed);
     }
     Ok(match app.owner_email {
-        None => SignUp::FirstOnly,
-        Some(_) => SignUp::Refused,
+        None if domain_ok => SignUp::FirstOnly,
+        _ => SignUp::Refused,
     })
 }
 

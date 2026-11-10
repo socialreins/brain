@@ -52,6 +52,9 @@ pub struct Config {
     pub registration_disabled: bool,
     /// `OWNER_EMAIL`, normalized: the one stranger a closed install still lets sign up.
     pub owner_email: Option<String>,
+    /// `SIGNUP_DOMAINS`, lowercased: when not empty, a new account's email domain must be one of
+    /// these exactly (`OWNER_EMAIL` and invited emails excepted); existing users still sign in.
+    pub signup_domains: Vec<String>,
     /// `RESEND_API_KEY`, else `SMTP_URL` (either needs `MAIL_FROM`), else the log, which needs
     /// `MAIL_LOG=true` so sign-in links never reach the log by accident.
     pub mailer: Mailer,
@@ -182,6 +185,7 @@ impl Config {
             web_url,
             registration_disabled: flag("REGISTRATION_DISABLED")?,
             owner_email: owner_email(var("OWNER_EMAIL"))?,
+            signup_domains: signup_domains(var("SIGNUP_DOMAINS")),
             mailer,
             webauthn,
             cipher: Arc::new(cipher),
@@ -214,6 +218,15 @@ impl Config {
 fn owner_email(raw: Option<String>) -> Result<Option<String>, &'static str> {
     raw.map(|e| socialreins_core::email::normalize(&e).ok_or("OWNER_EMAIL: not an email address"))
         .transpose()
+}
+
+/// `SIGNUP_DOMAINS`: comma-separated, each trimmed and lowercased; blank entries are skipped.
+fn signup_domains(raw: Option<String>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(|d| d.trim().to_lowercase())
+        .filter(|d| !d.is_empty())
+        .collect()
 }
 
 /// `ADMIN_EMAILS`: each address normalized like `OWNER_EMAIL`; blank entries are skipped.
@@ -352,6 +365,15 @@ mod tests {
         );
         assert!(owner("not-an-email").is_err());
         assert_eq!(super::owner_email(None).unwrap(), None);
+    }
+
+    #[test]
+    fn signup_domains_split_and_lowercase() {
+        assert_eq!(
+            super::signup_domains(Some(" Harun.dev, ,socialreins.com,".into())),
+            ["harun.dev", "socialreins.com"]
+        );
+        assert!(super::signup_domains(None).is_empty());
     }
 
     #[test]

@@ -131,7 +131,7 @@ rate limit and before anything is stored or sent: a missing or rejected token ge
 `/v1/waitlist` always ignores it.
 
 Sign-in is by magic link, Google or passkey; there are no passwords. `POST /auth/link` answers the same `202`, at the same speed,
-whether or not the email has an account (or is refused by `REGISTRATION_DISABLED`): the lookup
+whether or not the email has an account (or is refused by `REGISTRATION_DISABLED` or `SIGNUP_DOMAINS`): the lookup
 and the mail run after the reply. Opening the link shows a button that posts it back, so mail
 scanners that prefetch links cannot use it up, and `POST /auth/magic` only accepts a post
 whose `Origin` (or `Referer`) is `BRAIN_URL`. One email holds at most 3 unexpired links. The link works once, for 15 minutes; using it
@@ -165,15 +165,15 @@ Postgres for 5 minutes and the matching `finish` uses it once. The state-changin
 this section only accept requests whose `Origin` (or `Referer`) is one of `CORS_ORIGINS`, else
 `403 {"error":"forbidden_origin"}`.
 
-Teams: every sign-in gives a user with no team a personal team, owned by them, with its Default
-social set. The team routes use the session cookie, and the state-changing ones the same origin
+Teams: every sign-in gives a user with no team a personal team named after the first word of
+their name, owned by them, with its Default social set. The team routes use the session cookie, and the state-changing ones the same origin
 check. They only reach the caller's own teams: anything else is `404 {"error":"not_found"}`,
 and a role that may not act gets `403 {"error":"forbidden"}`. The last owner cannot be demoted
 or leave (`409 last_owner`), and a user's last team cannot be deleted (`409 last_team`).
 Deleting a team needs a sign-in from the last 10 minutes. Invitations email a
 link to `WEB_URL/invitations/{token}` that works once within 7 days, for the invited email only
 (`403 email_mismatch`); only its SHA-256 is stored. An invited email may sign up even with
-`REGISTRATION_DISABLED`. Each user sends at most 10 invitations a minute and 50 a day, each
+`REGISTRATION_DISABLED` or outside `SIGNUP_DOMAINS`. Each user sends at most 10 invitations a minute and 50 a day, each
 team 50 a day, and one address gets at most 3 a day from one team and 20 a day overall; only
 sent invitations count. Re-inviting a pending address replaces its invitation. Each user creates at most 10 teams a day. The daily caps are
 counted in Postgres (`rate_limit_hits`), so deletes and restarts do not reset them. Team names are 1 to 60 characters. An invitation dies with its inviter's right to
@@ -568,6 +568,7 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `PASSKEY_RP_ID` | no | The host of `PASSKEY_RP_ORIGIN`. WebAuthn relying party id: the domain web and brain share, e.g. `socialreins.com` |
 | `PASSKEY_RP_ORIGIN` | no | The origin of `WEB_URL`. Where the browser runs the passkey ceremonies |
 | `REGISTRATION_DISABLED` | no | `false`. `true` closes sign-up: only `OWNER_EMAIL` and invited emails can sign up (with no `OWNER_EMAIL`, the first account to sign up, then invited emails); existing users still sign in |
+| `SIGNUP_DOMAINS` | no | Comma-separated email domains, e.g. `harun.dev,socialreins.com` (trimmed, any case). When set, a new account's email domain must be one of them exactly (a subdomain does not count); `OWNER_EMAIL` and invited emails are exempt, existing users still sign in, and a refusal looks like `REGISTRATION_DISABLED`'s. Unset: any domain |
 | `OWNER_EMAIL` | no | With `REGISTRATION_DISABLED=true`, the one new email allowed to sign up besides invited ones, any case. Recommended for personal installs: otherwise whoever signs up first owns the install |
 | `RESEND_API_KEY` | no | Send mail through the Resend HTTPS API (works where outbound SMTP is blocked, like Railway) |
 | `SMTP_URL` | no | Send mail through any SMTP server, e.g. `smtps://user:pass@smtp.example.com`. Used when `RESEND_API_KEY` is unset |
