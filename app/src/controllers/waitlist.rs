@@ -115,33 +115,63 @@ async fn join(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Requ
     {
         return error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_source");
     }
-    let row = waitlist_signups::ActiveModel {
-        id: Set(Uuid::now_v7()),
-        email: Set(email.clone()),
-        source: Set(source),
-        ..Default::default()
-    };
-    // DO NOTHING on a known email: the first signup (and its source) wins, and the reply is the same.
-    let insert = waitlist_signups::Entity::insert(row)
-        .on_conflict_do_nothing_on([waitlist_signups::Column::Email])
-        .exec_without_returning(&app.db)
-        .await;
-    if let Err(e) = insert {
-        tracing::error!(error = %e, "waitlist insert failed");
-        return error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
-    }
-    let secret = match claim_confirmation(&app, &email).await {
+    let secret = match add(&app, &email, source).await {
         Ok(secret) => secret,
         Err(e) => {
-            tracing::error!(error = %e, "waitlist confirmation claim failed");
+            tracing::error!(error = %e, "waitlist join failed");
             return error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
         }
     };
     if let Some(secret) = secret {
         // A failed mail keeps the row and the ok reply; the error carries no email or token.
-        tokio::spawn(async move { send_confirmation(&app, ip, &email, &secret).await });
+        tokio::spawn(async move { send_confirmation(&app, ip, &email, &secret, JOINED).await });
     }
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// The confirmation email's first line after `POST /v1/waitlist`.
+pub(crate) const JOINED: &str = "Thanks for joining the SocialReins waitlist.";
+/// The confirmation email's first line when sign-up refused the email and put it on the list.
+pub(crate) const SIGN_UP_CLOSED: &str = "Sign-ups are closed for now. We've added you to the \
+    waitlist and will email you when SocialReins is live.";
+
+/// Puts `email` on the list (a known email keeps its first row and source) and claims a
+/// confirmation for it (`claim_confirmation`). Returns the token to mail, if any.
+pub(crate) async fn add(
+    app: &AppState,
+    email: &str,
+    source: Option<String>,
+) -> Result<Option<String>, sea_orm::DbErr> {
+    let row = waitlist_signups::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        email: Set(email.to_owned()),
+        source: Set(source),
+        ..Default::default()
+    };
+    // DO NOTHING on a known email: the first signup (and its source) wins, and the reply is the same.
+    waitlist_signups::Entity::insert(row)
+        .on_conflict_do_nothing_on([waitlist_signups::Column::Email])
+        .exec_without_returning(&app.db)
+        .await?;
+    claim_confirmation(app, email).await
+}
+
+/// Puts `email` on the list as verified, for a mailbox Google vouches for. A known email keeps
+/// its row and source and becomes verified if it was not.
+pub(crate) async fn add_verified(
+    app: &AppState,
+    email: &str,
+    source: &str,
+) -> Result<(), sea_orm::DbErr> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    let stmt = Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "INSERT INTO waitlist_signups (id, email, source, verified_at) VALUES ($1, $2, $3, now()) \
+         ON CONFLICT (email) DO UPDATE \
+         SET verified_at = COALESCE(waitlist_signups.verified_at, now())",
+        [Uuid::now_v7().into(), email.into(), source.into()],
+    );
+    app.db.execute_raw(stmt).await.map(|_| ())
 }
 
 /// Gives the unverified `email` a new link token unless one went out in the last hour, and
@@ -170,11 +200,12 @@ async fn claim_confirmation(app: &AppState, email: &str) -> Result<Option<String
 /// counted, so a refused IP uses up none of the global allowance. Unsent (a cap reached or mail
 /// failed), the claim is undone so the next signup of this email may try again; logs carry no
 /// email or token.
-async fn send_confirmation(
+pub(crate) async fn send_confirmation(
     app: &AppState,
     ip: Option<std::net::IpAddr>,
     email: &str,
     secret: &str,
+    intro: &str,
 ) {
     let ip = ip.map_or_else(|| "unknown".into(), |ip| rate_limit::bucket(ip).to_string());
     let caps = [
@@ -197,8 +228,7 @@ async fn send_confirmation(
     };
     let url = format!("{}/waitlist/verify?token={secret}", app.web_url);
     let text = format!(
-        "Thanks for joining the SocialReins waitlist.\n\nConfirm my email:\n{url}\n\nIf you \
-         did not sign up, ignore this email.\n"
+        "{intro}\n\nConfirm my email:\n{url}\n\nIf you did not sign up, ignore this email.\n"
     );
     let subject = "Confirm your spot on the SocialReins waitlist";
     if let Err(e) = app.mailer.send(email, subject, text).await {
