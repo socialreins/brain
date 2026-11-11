@@ -562,26 +562,35 @@ pub fn sniff(head: &[u8]) -> Option<&'static str> {
     }
 }
 
-/// Largest decoded image `to_jpeg` works on, so a small file cannot claim a huge canvas.
-const MAX_DECODED: u64 = 256_000_000;
+/// Largest image `to_jpeg` decodes, so a small file cannot claim a huge canvas: its copies stay
+/// within a few hundred MB.
+const MAX_PIXELS: u64 = 25_000_000;
 
 /// An image (PNG or WebP) as a JPEG at quality 90, at its own size, any transparency laid on
-/// white; `None` when it does not decode.
+/// white; `None` when it does not decode or is over `MAX_PIXELS`.
 pub fn to_jpeg(bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()?;
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(MAX_DECODED);
-    reader.limits(limits);
-    let mut rgba = reader.decode().ok()?.into_rgba8();
-    for p in rgba.pixels_mut() {
-        let a = u16::from(p[3]);
-        for c in &mut p.0[..3] {
-            *c = ((u16::from(*c) * a + 255 * (255 - a)) / 255) as u8;
-        }
+    let reader = || {
+        image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()
+    };
+    let (w, h) = reader()?.into_dimensions().ok()?;
+    if u64::from(w) * u64::from(h) > MAX_PIXELS {
+        return None;
     }
-    let rgb = image::DynamicImage::ImageRgba8(rgba).into_rgb8();
+    let decoded = reader()?.decode().ok()?;
+    let rgb = if decoded.color().has_alpha() {
+        let mut rgba = decoded.into_rgba8();
+        for p in rgba.pixels_mut() {
+            let a = u16::from(p[3]);
+            for c in &mut p.0[..3] {
+                *c = ((u16::from(*c) * a + 255 * (255 - a)) / 255) as u8;
+            }
+        }
+        image::DynamicImage::ImageRgba8(rgba).into_rgb8()
+    } else {
+        decoded.into_rgb8()
+    };
     let mut out = Vec::new();
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
         .encode_image(&rgb)
@@ -626,6 +635,29 @@ mod tests {
             "opaque keeps its colour"
         );
         assert_eq!(to_jpeg(b"\x89PNG\r\n\x1a\n not really"), None);
+
+        // A WebP the same way.
+        let mut webp = Vec::new();
+        png.write_to(
+            &mut std::io::Cursor::new(&mut webp),
+            image::ImageFormat::WebP,
+        )
+        .unwrap();
+        assert_eq!(sniff(&webp), Some("image/webp"));
+        let back = image::load_from_memory(&to_jpeg(&webp).unwrap())
+            .unwrap()
+            .into_rgb8();
+        assert!(near(back.get_pixel(4, 8).0, [255, 255, 255]));
+
+        // A canvas past the decode cap is refused, however small its file.
+        let huge = image::GrayImage::new(5_001, 5_000);
+        let mut bytes = Vec::new();
+        huge.write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        assert_eq!(to_jpeg(&bytes), None);
     }
 
     #[test]
