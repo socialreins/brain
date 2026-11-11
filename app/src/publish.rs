@@ -1332,6 +1332,20 @@ async fn ingest(app: &AppState, post: &posts::Model) -> Media {
     for (url, got) in covers {
         found.entry(url).or_insert(got);
     }
+    // Instagram (posts, carousel items, covers) takes JPEG images only, TikTok photos JPEG or
+    // WebP: other images it can read become JPEGs. Other platforms keep the original file.
+    let to_jpeg: &[&str] = match post.platform.as_str() {
+        "instagram" => &["image/png", "image/webp"],
+        "tiktok" => &["image/png"],
+        _ => &[],
+    };
+    for (url, got) in found.iter_mut() {
+        if let Ok(file) = got {
+            if to_jpeg.contains(&file.content_type.as_str()) {
+                *file = app.media.as_jpeg(&app.db, post.id, url, file.clone()).await;
+            }
+        }
+    }
     found
 }
 

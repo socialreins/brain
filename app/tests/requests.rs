@@ -3116,6 +3116,20 @@ mod teams {
             ([("content-type", content_type)], bytes).into_response()
         }
 
+        /// A real PNG with transparency, which brain can convert.
+        fn real_png() -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let img =
+                image::RgbaImage::from_fn(16, 16, |x, _| image::Rgba([9, 9, 9, (x * 16) as u8]));
+            let mut bytes = Vec::new();
+            img.write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+            ([("content-type", "image/png")], bytes).into_response()
+        }
+
         fn authorized(headers: &axum::http::HeaderMap) -> bool {
             headers
                 .get("authorization")
@@ -6393,6 +6407,7 @@ mod teams {
                         .route("/v1.0/{user}/threads_publish", post(publish))
                         .route("/v1.0/{id}", get(node).merge(delete(remove)))
                         .route("/img.png", get(|| async { image("image/png", 64) }))
+                        .route("/photo.png", get(|| async { real_png() }))
                         .route(
                             "/clip.mp4",
                             get(move || async move { ([("content-type", "video/mp4")], mp4) }),
@@ -8518,6 +8533,7 @@ mod teams {
                         .route("/youtube/v3/videos", delete(remove))
                         .route("/youtube/v3/commentThreads", post(comment))
                         .route("/img.png", get(|| async { image("image/png", 64) }))
+                        .route("/photo.png", get(|| async { real_png() }))
                         .route(
                             "/clip.mp4",
                             get(move || async move { ([("content-type", "video/mp4")], mp4) }),
@@ -9630,6 +9646,7 @@ mod teams {
                         .route("/a.jpg", get(|| async { jpeg() }))
                         .route("/b.jpg", get(|| async { jpeg() }))
                         .route("/img.png", get(|| async { image("image/png", 64) }))
+                        .route("/photo.png", get(|| async { real_png() }))
                         .route(
                             "/clip.mp4",
                             get(move || async move { ([("content-type", "video/mp4")], mp4) }),
@@ -10047,6 +10064,13 @@ mod teams {
                         "{msg}"
                     );
                     assert_eq!(INITS.lock().unwrap().len(), inits);
+
+                    // A PNG brain can read goes out as a JPEG photo.
+                    let p = publish_files(&s, ctx, (&cookie, &set), ("a", &["/photo.png"])).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let (_, sent) = INITS.lock().unwrap()[inits].clone();
+                    let url = sent["source_info"]["photo_images"][0].as_str().unwrap();
+                    assert!(url.ends_with(".jpg"), "{url}");
                 }
 
                 #[tokio::test]
@@ -12042,6 +12066,7 @@ mod teams {
                             get(move || async move { ([("content-type", "image/jpeg")], jpeg) }),
                         )
                         .route("/img.png", get(|| async { image("image/png", 64) }))
+                        .route("/photo.png", get(|| async { real_png() }))
                         .route(
                             "/clip.mp4",
                             get(move || async move { ([("content-type", "video/mp4")], mp4) }),
@@ -12603,7 +12628,16 @@ mod teams {
                     assert!(cover.ends_with(".jpg"), "{cover}");
                     assert_eq!(calls[1].0, "1784/media_publish");
 
-                    // Instagram takes a JPEG only; the post never starts.
+                    // A PNG cover brain can read goes out as a JPEG.
+                    let post = meta_post(&set, "instagram", "reel");
+                    let (p, calls) =
+                        publish_covered(ctx, &cookie, post, (&["/clip.mp4"], "/photo.png")).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let cover = &calls[0].1["cover_url"];
+                    assert!(cover.ends_with(".jpg"), "{cover}");
+
+                    // Instagram takes a JPEG only, and this PNG does not decode; the post never
+                    // starts.
                     let post = meta_post(&set, "instagram", "reel");
                     let (p, calls) =
                         publish_covered(ctx, &cookie, post, (&["/clip.mp4"], "/img.png")).await;
@@ -12750,6 +12784,20 @@ mod teams {
                         p["targets"][0]["error"],
                         "Image 1 is not a JPEG image or an MP4 or MOV video."
                     );
+
+                    // A PNG brain can read goes out as a JPEG, alone or as a carousel item.
+                    let post = meta_post(&set, "instagram", "real png");
+                    let (p, calls) = publish_one(ctx, &cookie, post, &["/photo.png"]).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let url = &calls[0].1["image_url"];
+                    assert!(url.starts_with("http://localhost:8080/media/"), "{url}");
+                    assert!(url.ends_with(".jpg"), "{url}");
+                    let post = meta_post(&set, "instagram", "png carousel");
+                    let (p, calls) =
+                        publish_one(ctx, &cookie, post, &["/photo.png", "/clip.mp4"]).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(calls[0].1["is_carousel_item"], "true");
+                    assert!(calls[0].1["image_url"].ends_with(".jpg"), "{:?}", calls[0]);
 
                     // A token Meta refuses fails the target with what to do.
                     let ig = account(&db, &team_id, "instagram", "1784").await;
