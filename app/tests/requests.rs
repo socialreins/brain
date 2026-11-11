@@ -10477,6 +10477,27 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
+                async fn a_retry_checks_the_level_against_the_failed_account() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    MODE.store(3, Ordering::SeqCst);
+                    let ctx = (&db, &state, base.as_str());
+                    let chosen = settings("FOLLOWER_OF_CREATOR");
+                    let p = publish_with(&s, ctx, (&cookie, &set), ("hi", &["/clip.mp4"]), chosen)
+                        .await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    let url = format!("/v1/posts/{}/retry", p["id"].as_str().unwrap());
+                    MODE.store(0, Ordering::SeqCst);
+                    PRIVACY.store(1, Ordering::SeqCst);
+                    let res = req(&s, Method::POST, &url, &cookie).await;
+                    assert_eq!(res.status_code(), 422, "{}", res.text());
+                    assert_eq!(res.json::<Value>()["error"], "tiktok_privacy_not_offered");
+                    PRIVACY.store(0, Ordering::SeqCst);
+                    let res = req(&s, Method::POST, &url, &cookie).await;
+                    assert_eq!(res.status_code(), 202, "{}", res.text());
+                }
+
+                #[tokio::test]
+                #[serial]
                 async fn a_tiktok_video_next_to_a_photo_is_refused_when_saved() {
                     let (s, _, _, _, cookie, _, set) = team().await;
                     let mut post = tiktok_post(&set, "hi", &[]);

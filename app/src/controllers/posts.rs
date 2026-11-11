@@ -38,6 +38,7 @@ use super::{
 };
 use crate::{
     connectors::{tiktok, youtube},
+    media::Probed,
     models::{
         post_targets, posts, social_account_social_set as membership, social_accounts, social_sets,
         teams,
@@ -658,29 +659,27 @@ fn refused(e: post::Invalid, platform: &str, detail: &str, part: Option<usize>) 
     (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
 }
 
-/// The checks that need a call out, so they run outside any transaction, after the request's
-/// own rules passed: each media file and the cover, probed for type and size
-/// (`Media::probe_all`), and a TikTok post's privacy level against what each TikTok account of
-/// `set` is offered now. Only a definite violation answers (`refused`); a probe or TikTok call
-/// that gets no answer passes, and publishing checks again.
-async fn preflight(
-    app: &AppState,
-    a: &Actor,
-    set: Uuid,
-    d: Draft<'_>,
-) -> Result<Option<Response>, DbErr> {
-    let urls: Vec<String> = d
-        .media
+/// Every URL `preflight` probes for a post: its media, its thread's and its cover.
+fn draft_urls(d: &Draft<'_>) -> Vec<String> {
+    d.media
         .iter()
         .chain(d.thread.iter().flat_map(|p| &p.media))
         .cloned()
         .chain(d.cover.map(str::to_owned))
-        .collect();
-    let probed = if urls.is_empty() {
+        .collect()
+}
+
+/// `Media::probe_all` of `urls`, none when there are none.
+async fn probe(app: &AppState, urls: &[String]) -> HashMap<String, Probed> {
+    if urls.is_empty() {
         HashMap::new()
     } else {
-        app.media.probe_all(&urls).await
-    };
+        app.media.probe_all(urls).await
+    }
+}
+
+/// `refused` when what the probes found of the post's media or cover breaks its platform's rules.
+fn media_refusal(d: &Draft<'_>, probed: &HashMap<String, Probed>) -> Option<Response> {
     let fact = |u: &str| {
         probed.get(u).map(|p| post::MediaFact {
             content_type: p.content_type,
@@ -689,53 +688,91 @@ async fn preflight(
     };
     let facts = |m: &[String]| m.iter().map(|u| fact(u)).collect::<Vec<_>>();
     if let Err((e, detail)) = post::validate_media_facts(d.platform, &facts(d.media)) {
-        return Ok(Some(refused(e, d.platform, &detail, None)));
+        return Some(refused(e, d.platform, &detail, None));
     }
     for (i, p) in d.thread.iter().enumerate() {
         if let Err((e, detail)) = post::validate_media_facts(d.platform, &facts(&p.media)) {
-            return Ok(Some(refused(e, d.platform, &detail, Some(i + 1))));
+            return Some(refused(e, d.platform, &detail, Some(i + 1)));
         }
     }
-    if let Some(cover) = d.cover {
-        let video = d.media.first().and_then(|u| fact(u));
-        let cover = fact(cover);
-        if let Err((e, detail)) = post::validate_cover_facts(d.platform, cover, video) {
-            return Ok(Some(refused(e, d.platform, &detail, None)));
-        }
+    let cover = d.cover?;
+    let video = d.media.first().and_then(|u| fact(u));
+    post::validate_cover_facts(d.platform, fact(cover), video)
+        .err()
+        .map(|(e, detail)| refused(e, d.platform, &detail, None))
+}
+
+/// The TikTok level `preflight` checks: a TikTok post's chosen one.
+fn tiktok_level<'a>(d: &Draft<'a>) -> Option<&'a str> {
+    d.tiktok
+        .and_then(|t| t.privacy_level.as_deref())
+        .filter(|_| d.platform == "tiktok")
+}
+
+/// The checks that need a call out, so they run outside any transaction, after the request's
+/// own rules passed: each media file and the cover, probed for type and size
+/// (`Media::probe_all`), and a TikTok post's privacy level against what the TikTok accounts of
+/// `set` are offered now (only the accounts in `only` when given: a retry's failed ones). Only a
+/// definite violation answers (`refused`); a probe or TikTok call that gets no answer passes,
+/// and publishing checks again.
+async fn preflight(
+    app: &AppState,
+    a: &Actor,
+    set: Uuid,
+    d: Draft<'_>,
+    only: Option<&[Uuid]>,
+) -> Result<Option<Response>, DbErr> {
+    if let Some(res) = media_refusal(&d, &probe(app, &draft_urls(&d)).await) {
+        return Ok(Some(res));
     }
-    let level = d.tiktok.and_then(|t| t.privacy_level.as_deref());
-    match level {
-        Some(level) if d.platform == "tiktok" => tiktok_offered(app, a, set, level).await,
-        _ => Ok(None),
+    match tiktok_level(&d) {
+        Some(level) => tiktok_offered(app, a, set, level, only).await,
+        None => Ok(None),
     }
 }
 
-/// `refused` when a TikTok account of `set` is not offered `level` right now. An account that
-/// cannot post at all (a daily limit), or whose creator info does not come in time, passes.
+/// `refused` when a TikTok account of `set` (of `only`, when given) is not offered `level` right
+/// now, naming the first. One level goes to every account of the set and the editor offers only
+/// the levels all of them have, so one account without it already makes the post fail there.
+/// An account that cannot post at all (a daily limit), or whose creator info does not come in
+/// time, passes. The calls run at once, each detached, so a token renewal cut off by the time
+/// limit still saves the new refresh token.
 async fn tiktok_offered(
     app: &AppState,
     a: &Actor,
     set: Uuid,
     level: &str,
+    only: Option<&[Uuid]>,
 ) -> Result<Option<Response>, DbErr> {
     let in_set = Select::select()
         .column(membership::Column::SocialAccountId)
         .from(membership::Entity)
         .and_where(membership::Column::SocialSetId.eq(set))
         .to_owned();
-    let accounts = social_accounts::Entity::find()
+    let mut sel = social_accounts::Entity::find()
         .filter(social_accounts::Column::TeamId.eq(a.team.id))
         .filter(social_accounts::Column::Provider.eq("tiktok"))
-        .filter(social_accounts::Column::Id.in_subquery(in_set))
+        .filter(social_accounts::Column::Id.in_subquery(in_set));
+    if let Some(ids) = only {
+        sel = sel.filter(social_accounts::Column::Id.is_in(ids.iter().copied()));
+    }
+    let accounts = sel
         .order_by_asc(social_accounts::Column::Id)
         .all(&app.db)
         .await?;
-    for account in accounts {
-        let info = async {
-            let token = super::tiktok::fresh_token(app, &account).await?;
-            app.tiktok.creator_info(&token).await
-        };
-        let Ok(Ok(creator)) = tokio::time::timeout(CREATOR_TIMEOUT, info).await else {
+    let asked: Vec<_> = accounts
+        .iter()
+        .map(|account| {
+            let (app, account) = (app.clone(), account.clone());
+            tokio::spawn(async move {
+                let token = super::tiktok::fresh_token(&app, &account).await?;
+                app.tiktok.creator_info(&token).await
+            })
+        })
+        .collect();
+    let until = tokio::time::Instant::now() + CREATOR_TIMEOUT;
+    for (account, call) in accounts.iter().zip(asked) {
+        let Ok(Ok(Ok(creator))) = tokio::time::timeout_at(until, call).await else {
             continue;
         };
         let offered = &creator.privacy_level_options;
@@ -775,7 +812,7 @@ async fn checked_fully(
         Ok(set) => set,
         Err(res) => return Ok(Err(res)),
     };
-    Ok(match preflight(app, a, set, input.into()).await? {
+    Ok(match preflight(app, a, set, input.into(), None).await? {
         Some(res) => Err(res),
         None => Ok(set),
     })
@@ -1097,12 +1134,28 @@ pub async fn create_post_group(app: &AppState, a: &Actor, input: PostGroupInput)
                 list_id: input.list_id,
                 position: input.position.map(|p| p.saturating_add(i)),
             };
-            // Every post passes before anything is written, and the calls out stay outside
-            // the transaction.
-            if let Err(res) = checked_fully(app, a, &one).await? {
+            // Every post passes its own rules before anything is called or written.
+            if let Err(res) = checked(&app.db, a, &one).await? {
                 return Ok(Err(naming(res, &one.platform).await));
             }
             inputs.push(one);
+        }
+        // Then `preflight` for the whole group, outside the transaction: every URL probed once,
+        // and the TikTok level asked once.
+        let drafts: Vec<Draft> = inputs.iter().map(Draft::from).collect();
+        let mut urls: Vec<String> = drafts.iter().flat_map(draft_urls).collect();
+        urls.sort();
+        urls.dedup();
+        let probed = probe(app, &urls).await;
+        for d in &drafts {
+            if let Some(res) = media_refusal(d, &probed) {
+                return Ok(Err(res));
+            }
+        }
+        if let Some(level) = drafts.iter().find_map(tiktok_level) {
+            if let Some(res) = tiktok_offered(app, a, set, level, None).await? {
+                return Ok(Err(res));
+            }
         }
         let txn = app.db.begin().await?;
         let mut rows = Vec::with_capacity(inputs.len());
@@ -1447,13 +1500,21 @@ async fn preflight_saved(
     a: &Actor,
     p: &posts::Model,
 ) -> Result<Option<Response>, DbErr> {
-    // Only a post with a failed target goes out again; the rest answer as `requeue` says.
-    let failed = post_targets::Entity::find()
+    // Only a settled post with retryable targets goes out again, to those targets' accounts; the
+    // rest answer as `requeue` says (`publish_in_progress`, `nothing_to_retry`), unchanged.
+    let targets = post_targets::Entity::find()
         .filter(post_targets::Column::PostId.eq(p.id))
-        .filter(post_targets::Column::Status.eq("failed"))
-        .count(&app.db)
+        .all(&app.db)
         .await?;
-    if failed == 0 {
+    let busy = targets
+        .iter()
+        .any(|t| t.status == "pending" || t.status == "publishing");
+    let again: Vec<Uuid> = targets
+        .iter()
+        .filter(|t| publish::retryable(t, p))
+        .filter_map(|t| t.social_account_id)
+        .collect();
+    if busy || again.is_empty() || !matches!(p.status.as_str(), "published" | "failed") {
         return Ok(None);
     }
     let media: Vec<String> = serde_json::from_value(p.media.clone()).unwrap_or_default();
@@ -1469,7 +1530,7 @@ async fn preflight_saved(
         cover: p.cover.as_deref(),
         tiktok: tiktok.as_ref(),
     };
-    preflight(app, a, p.social_set_id, d).await
+    preflight(app, a, p.social_set_id, d, Some(&again)).await
 }
 
 /// Re-queues the retryable targets of the posts `ids` in one transaction and returns the posts
