@@ -1,6 +1,8 @@
 //! API tokens: bearer secrets owned by a team, for servers such as Content Machine. Owners and
 //! admins list, create and revoke them with a session. A token is whole-team or limited to one
 //! social set; a set token sees nothing outside its set, answered as `404` like a missing record.
+//! A token may also be read-only (alone or with a set): every write it sends is `403
+//! read_only_token` (the `Actor` extractor, the idempotency layer and the `/mcp` write tools).
 //! `Actor` is the extractor of the few routes that take a token as well as a session.
 use axum::{
     extract::{FromRequestParts, Path, State},
@@ -52,6 +54,9 @@ pub struct ApiToken {
     pub last_used_at: Option<DateTime<FixedOffset>>,
     pub expires_at: Option<DateTime<FixedOffset>>,
     pub created_at: DateTime<FixedOffset>,
+    /// Reads only: any `POST`, `PUT`, `PATCH` or `DELETE` (and any `/mcp` write tool) is
+    /// `403 read_only_token`.
+    pub read_only: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -69,6 +74,9 @@ pub struct NewToken {
     pub social_set_id: Option<Uuid>,
     /// 1 to 3650; absent or `null`: never expires.
     pub expires_in_days: Option<i64>,
+    /// `true`: the token can only read (see `ApiToken.read_only`). Default `false`.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -95,6 +103,11 @@ fn forbidden() -> Response {
     reply(StatusCode::FORBIDDEN, "forbidden")
 }
 
+/// The answer to a write sent with a read-only token.
+pub fn read_only_token() -> Response {
+    reply(StatusCode::FORBIDDEN, "read_only_token")
+}
+
 fn invalid_token() -> Response {
     reply(StatusCode::UNAUTHORIZED, "invalid_token")
 }
@@ -109,6 +122,7 @@ fn token_json(t: api_tokens::Model) -> ApiToken {
         last_used_at: t.last_used_at,
         expires_at: t.expires_at,
         created_at: t.created_at,
+        read_only: t.read_only,
     }
 }
 
@@ -140,6 +154,11 @@ impl Actor {
     /// The one set a set token is limited to.
     pub fn set_id(&self) -> Option<Uuid> {
         self.token.as_ref().and_then(|t| t.social_set_id)
+    }
+
+    /// Whether the caller is a read-only token.
+    pub fn read_only(&self) -> bool {
+        self.token.as_ref().is_some_and(|t| t.read_only)
     }
 
     /// The key of per-caller rate limits: the user, or the token.
@@ -220,7 +239,11 @@ impl FromRequestParts<AppState> for Actor {
 
     async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, Response> {
         if let Some(auth) = parts.headers.get(header::AUTHORIZATION) {
-            return Self::from_bearer(app, Some(auth)).await.map_err(|r| *r);
+            let a = Self::from_bearer(app, Some(auth)).await.map_err(|r| *r)?;
+            if a.read_only() && !parts.method.is_safe() {
+                return Err(read_only_token());
+            }
+            return Ok(a);
         }
         if !parts.method.is_safe() {
             FromWeb::from_request_parts(parts, app)
@@ -381,6 +404,7 @@ async fn create(
             prefix_hint: Set(secret[..prefix.len() + HINT_CHARS].to_owned()),
             created_by: Set(Some(t.current.0.id)),
             expires_at: Set(expires_at),
+            read_only: Set(body.read_only),
             ..Default::default()
         };
         let row = api_tokens::Entity::insert(row)

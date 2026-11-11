@@ -27,7 +27,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use super::{
-    api_tokens::{bearer_secret, find_live, limited, Actor},
+    api_tokens::{bearer_secret, find_live, limited, read_only_token, Actor},
     auth::internal,
     waitlist::{error, Error},
 };
@@ -87,6 +87,9 @@ pub async fn layer(State(app): State<AppState>, req: Request, next: Next) -> Res
     };
     // A request answered here skips the route, so it counts against the limit here, once.
     let answer = |res: Response| limited(&app, token.id).unwrap_or(res);
+    if token.read_only {
+        return answer(read_only_token());
+    }
     let Some(key) = valid_key(&key).map(str::to_owned) else {
         return answer(reply(
             StatusCode::UNPROCESSABLE_ENTITY,

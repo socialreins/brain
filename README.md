@@ -263,6 +263,11 @@ publish_quota` on publish now); a due post over the limit stays `scheduled` and 
 it frees up. A tick claims at most 50 posts; 8 posts and 8 targets publish at once. A past
 `scheduled_at` means now.
 
+A token created with `"read_only": true` (whole-team or set) only reads: every `POST`, `PUT`,
+`PATCH` or `DELETE` it sends, and every `/mcp` write tool, is `403 {"error":"read_only_token"}`
+before anything runs. `GET /v1/posts/{id}` lists the post's `accounts` (id, provider, handle,
+display name, target id and status), also before it publishes and has targets.
+
 API token writes (`POST`, `PUT`, `PATCH`, `DELETE`) take an optional `Idempotency-Key` header,
 1 to 255 printable ASCII characters (else `422 invalid_idempotency_key`). Keys belong to the
 token's team. A retry with the same key, method, path and body gets the first answer again with
