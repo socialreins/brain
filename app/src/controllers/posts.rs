@@ -190,6 +190,12 @@ pub struct PostInput {
     /// MOV video (`media_required` without one), on X at most 4 JPEG, PNG or WebP images, or one
     /// GIF, or one MP4 or MOV video, on TikTok one MP4 or MOV video or 1 to 35 JPEG or WebP
     /// photos (`media_required` without one).
+    ///
+    /// Each file is probed when the post is saved (its first bytes and size): a type the
+    /// platform does not take is `media_type_not_supported`, a video (or PDF, or GIF on X) next
+    /// to other media where the platform takes it alone `mixed_media`, a file over a limit
+    /// `media_too_large`, each `422 {"error", "platform", "detail"}`. A file no probe could
+    /// answer for is not refused; publishing checks it.
     #[serde(default)]
     pub media: Vec<String>,
     /// Follow-up posts of a thread (at most 25), each a reply to the one before and checked
@@ -216,7 +222,8 @@ pub struct PostInput {
     pub cover: Option<String>,
     /// TikTok's per-post settings, as its Content Sharing Guidelines ask the user to choose
     /// them: the visibility (required, one of the account's `privacy_level_options` from
-    /// `GET /connections/{id}/tiktok`), comments, duets and stitches (all off unless turned on),
+    /// `GET /connections/{id}/tiktok`, checked live on save: `tiktok_privacy_not_offered`
+    /// names the account and carries its options), comments, duets and stitches (all off unless turned on),
     /// the commercial content disclosure and the AI-generated flag. Branded content cannot be
     /// `SELF_ONLY`. Other platforms answer `tiktok_not_supported`; invalid settings answer
     /// `tiktok_privacy_required`, `invalid_tiktok_privacy`, `invalid_tiktok_disclosure`,
@@ -617,6 +624,163 @@ async fn checked(
     set_for(db, a, input.social_set_id).await
 }
 
+/// What `preflight` looks at of a post, from a request or a saved row.
+struct Draft<'a> {
+    platform: &'a str,
+    media: &'a [String],
+    thread: &'a [ThreadPart],
+    cover: Option<&'a str>,
+    tiktok: Option<&'a tiktok::Options>,
+}
+
+impl<'a> From<&'a PostInput> for Draft<'a> {
+    fn from(i: &'a PostInput) -> Self {
+        Self {
+            platform: &i.platform,
+            media: &i.media,
+            thread: &i.thread,
+            cover: post::cover(i.cover.as_deref()),
+            tiktok: i.tiktok.as_ref(),
+        }
+    }
+}
+
+/// Longest the TikTok creator info call may take when a post is saved.
+const CREATOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A `422` refusal from `preflight`: `{"error", "platform", "detail"}`, and `part` for a thread
+/// post.
+fn refused(e: post::Invalid, platform: &str, detail: &str, part: Option<usize>) -> Response {
+    let mut body = serde_json::json!({ "error": e.code(), "platform": platform, "detail": detail });
+    if let Some(n) = part {
+        body["part"] = n.into();
+    }
+    (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
+}
+
+/// The checks that need a call out, so they run outside any transaction, after the request's
+/// own rules passed: each media file and the cover, probed for type and size
+/// (`Media::probe_all`), and a TikTok post's privacy level against what each TikTok account of
+/// `set` is offered now. Only a definite violation answers (`refused`); a probe or TikTok call
+/// that gets no answer passes, and publishing checks again.
+async fn preflight(
+    app: &AppState,
+    a: &Actor,
+    set: Uuid,
+    d: Draft<'_>,
+) -> Result<Option<Response>, DbErr> {
+    let urls: Vec<String> = d
+        .media
+        .iter()
+        .chain(d.thread.iter().flat_map(|p| &p.media))
+        .cloned()
+        .chain(d.cover.map(str::to_owned))
+        .collect();
+    let probed = if urls.is_empty() {
+        HashMap::new()
+    } else {
+        app.media.probe_all(&urls).await
+    };
+    let fact = |u: &str| {
+        probed.get(u).map(|p| post::MediaFact {
+            content_type: p.content_type,
+            size: p.size,
+        })
+    };
+    let facts = |m: &[String]| m.iter().map(|u| fact(u)).collect::<Vec<_>>();
+    if let Err((e, detail)) = post::validate_media_facts(d.platform, &facts(d.media)) {
+        return Ok(Some(refused(e, d.platform, &detail, None)));
+    }
+    for (i, p) in d.thread.iter().enumerate() {
+        if let Err((e, detail)) = post::validate_media_facts(d.platform, &facts(&p.media)) {
+            return Ok(Some(refused(e, d.platform, &detail, Some(i + 1))));
+        }
+    }
+    if let Some(cover) = d.cover {
+        let video = d.media.first().and_then(|u| fact(u));
+        let cover = fact(cover);
+        if let Err((e, detail)) = post::validate_cover_facts(d.platform, cover, video) {
+            return Ok(Some(refused(e, d.platform, &detail, None)));
+        }
+    }
+    let level = d.tiktok.and_then(|t| t.privacy_level.as_deref());
+    match level {
+        Some(level) if d.platform == "tiktok" => tiktok_offered(app, a, set, level).await,
+        _ => Ok(None),
+    }
+}
+
+/// `refused` when a TikTok account of `set` is not offered `level` right now. An account that
+/// cannot post at all (a daily limit), or whose creator info does not come in time, passes.
+async fn tiktok_offered(
+    app: &AppState,
+    a: &Actor,
+    set: Uuid,
+    level: &str,
+) -> Result<Option<Response>, DbErr> {
+    let in_set = Select::select()
+        .column(membership::Column::SocialAccountId)
+        .from(membership::Entity)
+        .and_where(membership::Column::SocialSetId.eq(set))
+        .to_owned();
+    let accounts = social_accounts::Entity::find()
+        .filter(social_accounts::Column::TeamId.eq(a.team.id))
+        .filter(social_accounts::Column::Provider.eq("tiktok"))
+        .filter(social_accounts::Column::Id.in_subquery(in_set))
+        .order_by_asc(social_accounts::Column::Id)
+        .all(&app.db)
+        .await?;
+    for account in accounts {
+        let info = async {
+            let token = super::tiktok::fresh_token(app, &account).await?;
+            app.tiktok.creator_info(&token).await
+        };
+        let Ok(Ok(creator)) = tokio::time::timeout(CREATOR_TIMEOUT, info).await else {
+            continue;
+        };
+        let offered = &creator.privacy_level_options;
+        if creator.can_post && !offered.iter().any(|o| o == level) {
+            let name = account
+                .handle
+                .as_deref()
+                .map(|h| format!("@{h}"))
+                .or_else(|| account.display_name.clone())
+                .unwrap_or_else(|| "the TikTok account".into());
+            let detail = format!(
+                "TikTok does not offer {level} to {name}. It offers {}.",
+                offered.join(", ")
+            );
+            let res = serde_json::json!({
+                "error": post::Invalid::TikTokPrivacyNotOffered.code(),
+                "platform": "tiktok",
+                "detail": detail,
+                "social_account_id": account.id,
+                "privacy_level_options": offered,
+            });
+            return Ok(Some(
+                (StatusCode::UNPROCESSABLE_ENTITY, Json(res)).into_response(),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+/// `checked`, then `preflight`: the full check of a post before a write.
+async fn checked_fully(
+    app: &AppState,
+    a: &Actor,
+    input: &PostInput,
+) -> Result<Result<Uuid, Response>, DbErr> {
+    let set = match checked(&app.db, a, input).await? {
+        Ok(set) => set,
+        Err(res) => return Ok(Err(res)),
+    };
+    Ok(match preflight(app, a, set, input.into()).await? {
+        Some(res) => Err(res),
+        None => Ok(set),
+    })
+}
+
 /// The live set of the team a write names (a set token's own when absent), if the caller may
 /// write to it.
 async fn set_for(
@@ -787,6 +951,9 @@ async fn create(State(app): State<AppState>, a: Actor, Body(input): Body<PostInp
 /// The body of `POST /posts`, shared with the MCP `create-post` tool.
 pub async fn create_post(app: &AppState, a: &Actor, input: PostInput) -> Response {
     let made = async {
+        if let Err(res) = checked_fully(app, a, &input).await? {
+            return Ok(Err(res));
+        }
         let txn = app.db.begin().await?;
         let p = match insert(&txn, a, &input, None).await? {
             Ok(p) => p,
@@ -899,8 +1066,7 @@ pub async fn create_post_group(app: &AppState, a: &Actor, input: PostGroupInput)
             )));
         }
         let group = Uuid::now_v7();
-        let txn = app.db.begin().await?;
-        let mut rows = Vec::with_capacity(platforms.len());
+        let mut inputs = Vec::with_capacity(platforms.len());
         for (i, platform) in (0i32..).zip(platforms) {
             let o = input.overrides.get(&platform);
             let one = PostInput {
@@ -931,7 +1097,17 @@ pub async fn create_post_group(app: &AppState, a: &Actor, input: PostGroupInput)
                 list_id: input.list_id,
                 position: input.position.map(|p| p.saturating_add(i)),
             };
-            match insert(&txn, a, &one, Some(group)).await? {
+            // Every post passes before anything is written, and the calls out stay outside
+            // the transaction.
+            if let Err(res) = checked_fully(app, a, &one).await? {
+                return Ok(Err(naming(res, &one.platform).await));
+            }
+            inputs.push(one);
+        }
+        let txn = app.db.begin().await?;
+        let mut rows = Vec::with_capacity(inputs.len());
+        for one in &inputs {
+            match insert(&txn, a, one, Some(group)).await? {
                 Ok(p) => rows.push(p),
                 Err(res) => return Ok(Err(naming(res, &one.platform).await)),
             }
@@ -1079,7 +1255,7 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) 
         if !editable(&found.status) {
             return Ok(Err(reply(StatusCode::CONFLICT, "not_editable")));
         }
-        let set = match checked(&app.db, a, &input).await? {
+        let set = match checked_fully(app, a, &input).await? {
             Ok(set) => set,
             Err(res) => return Ok(Err(res)),
         };
@@ -1264,6 +1440,38 @@ pub async fn delete_post(app: &AppState, a: &Actor, id: Uuid) -> Response {
     }
 }
 
+/// `preflight` of a saved post before a retry sends it again: a post that can only fail again
+/// (a file over the limit, a TikTok level no longer offered) answers `422` and stays as it is.
+async fn preflight_saved(
+    app: &AppState,
+    a: &Actor,
+    p: &posts::Model,
+) -> Result<Option<Response>, DbErr> {
+    // Only a post with a failed target goes out again; the rest answer as `requeue` says.
+    let failed = post_targets::Entity::find()
+        .filter(post_targets::Column::PostId.eq(p.id))
+        .filter(post_targets::Column::Status.eq("failed"))
+        .count(&app.db)
+        .await?;
+    if failed == 0 {
+        return Ok(None);
+    }
+    let media: Vec<String> = serde_json::from_value(p.media.clone()).unwrap_or_default();
+    let thread: Vec<ThreadPart> = serde_json::from_value(p.thread.clone()).unwrap_or_default();
+    let tiktok: Option<tiktok::Options> = p
+        .tiktok
+        .clone()
+        .and_then(|v| serde_json::from_value(v).ok());
+    let d = Draft {
+        platform: &p.platform,
+        media: &media,
+        thread: &thread,
+        cover: p.cover.as_deref(),
+        tiktok: tiktok.as_ref(),
+    };
+    preflight(app, a, p.social_set_id, d).await
+}
+
 /// Re-queues the retryable targets of the posts `ids` in one transaction and returns the posts
 /// to publish. Retryable: `failed` targets of `published` or `failed` posts (never a
 /// `published` one), those cut off midway through a thread continuing after the parts already out.
@@ -1388,8 +1596,11 @@ async fn retry_post(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>)
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let done = async {
-        if find(&app.db, &a, id).await?.is_none() {
+        let Some(found) = find(&app.db, &a, id).await? else {
             return Ok(not_found());
+        };
+        if let Some(res) = preflight_saved(&app, &a, &found).await? {
+            return Ok(res);
         }
         let (queued, skipped_targets) = match requeue(&app, &a, &[id]).await? {
             Ok(q) => q,
@@ -1429,14 +1640,16 @@ async fn retry_group(
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let done = async {
-        let ids: Vec<Uuid> = group_rows(&app.db, &a, group_id)
-            .await?
-            .iter()
-            .map(|p| p.id)
-            .collect();
-        if ids.is_empty() {
+        let found = group_rows(&app.db, &a, group_id).await?;
+        if found.is_empty() {
             return Ok(not_found());
         }
+        for p in &found {
+            if let Some(res) = preflight_saved(&app, &a, p).await? {
+                return Ok(res);
+            }
+        }
+        let ids: Vec<Uuid> = found.iter().map(|p| p.id).collect();
         let (queued, skipped_targets) = match requeue(&app, &a, &ids).await? {
             Ok(q) => q,
             Err(res) => return Ok(res),

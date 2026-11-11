@@ -82,6 +82,18 @@ pub enum Invalid {
     YouTubeUnsupported,
     /// Not `private`, `unlisted` or `public`.
     InvalidYouTubePrivacy,
+    /// A media file of a type the platform does not take (known from its first bytes).
+    MediaTypeUnsupported,
+    /// A video (or a PDF, or a GIF on X) next to other media where the platform takes it alone.
+    MixedMedia,
+    /// A media file over the platform's size limit.
+    MediaTooLarge,
+    /// A cover image of a type the platform does not take.
+    InvalidCoverType,
+    /// A cover image over the platform's size limit.
+    CoverTooLarge,
+    /// The TikTok account is not offered the chosen privacy level.
+    TikTokPrivacyNotOffered,
 }
 
 impl Invalid {
@@ -109,6 +121,12 @@ impl Invalid {
             Self::TikTokBrandedPrivate => "tiktok_branded_content_private",
             Self::YouTubeUnsupported => "youtube_not_supported",
             Self::InvalidYouTubePrivacy => "invalid_youtube_privacy",
+            Self::MediaTypeUnsupported => "media_type_not_supported",
+            Self::MixedMedia => "mixed_media",
+            Self::MediaTooLarge => "media_too_large",
+            Self::InvalidCoverType => "invalid_cover_type",
+            Self::CoverTooLarge => "cover_too_large",
+            Self::TikTokPrivacyNotOffered => "tiktok_privacy_not_offered",
         }
     }
 }
@@ -285,6 +303,186 @@ pub fn validate_cover(
     }
     if media.len() != 1 {
         return Err(Invalid::CoverNeedsOneVideo);
+    }
+    Ok(())
+}
+
+/// What a probe learned of one media file before publishing: its type from its first bytes,
+/// and its size when the server said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MediaFact<'a> {
+    pub content_type: &'a str,
+    pub size: Option<u64>,
+}
+
+/// The largest file brain stores, whatever the platform.
+pub const MAX_MEDIA_BYTES: u64 = 100_000_000;
+/// Bluesky's limit for one image.
+pub const BLUESKY_MAX_IMAGE_BYTES: u64 = 1_000_000;
+/// X's limits for an image and a GIF (a video is capped by `MAX_MEDIA_BYTES` first).
+pub const X_MAX_IMAGE_BYTES: u64 = 5_000_000;
+pub const X_MAX_GIF_BYTES: u64 = 15_000_000;
+
+const JPEG: &str = "image/jpeg";
+const PNG: &str = "image/png";
+const GIF: &str = "image/gif";
+const WEBP: &str = "image/webp";
+const MP4: &str = "video/mp4";
+const MOV: &str = "video/quicktime";
+const PDF: &str = "application/pdf";
+
+/// The media types each publisher takes, and how to say them.
+fn media_types(platform: &str) -> (&'static [&'static str], &'static str) {
+    match platform {
+        "bluesky" => (
+            &[JPEG, PNG, WEBP, GIF, MP4, MOV],
+            "a JPEG, PNG, WebP or GIF image or an MP4 or MOV video",
+        ),
+        "threads" => (
+            &[JPEG, PNG, MP4, MOV],
+            "a JPEG or PNG image or an MP4 or MOV video",
+        ),
+        "linkedin" => (
+            &[JPEG, PNG, GIF, MP4, PDF],
+            "a JPEG, PNG or GIF image, an MP4 video or a PDF",
+        ),
+        "facebook" => (
+            &[JPEG, PNG, GIF, MP4, MOV],
+            "a JPEG, PNG or GIF image or an MP4 or MOV video",
+        ),
+        // Publishing turns PNG and WebP images into JPEGs for Instagram, and PNG photos for TikTok.
+        "instagram" => (
+            &[JPEG, PNG, WEBP, MP4, MOV],
+            "a JPEG, PNG or WebP image or an MP4 or MOV video",
+        ),
+        "youtube" => (&[MP4, MOV], "an MP4 or MOV video"),
+        "x" => (
+            &[JPEG, PNG, WEBP, GIF, MP4, MOV],
+            "a JPEG, PNG, WebP or GIF image or an MP4 or MOV video",
+        ),
+        "tiktok" => (
+            &[JPEG, PNG, WEBP, MP4, MOV],
+            "a JPEG, PNG or WebP photo or an MP4 or MOV video",
+        ),
+        _ => (&[], ""),
+    }
+}
+
+/// What the platform says when a file that must go alone has company, if it has such a file.
+fn alone(platform: &str, t: &str) -> Option<&'static str> {
+    let video = t.starts_with("video/");
+    match platform {
+        "bluesky" if video => Some("Bluesky takes up to 4 images or one video, not a mix."),
+        "facebook" if video => Some(
+            "Facebook cannot mix a video with other media: post the video on its own as a Reel.",
+        ),
+        "linkedin" if video => {
+            Some("LinkedIn takes one video, or images, but not both or several videos.")
+        }
+        "linkedin" if t == PDF => {
+            Some("A LinkedIn document post takes exactly one PDF and nothing else.")
+        }
+        "x" if video || t == GIF => {
+            Some("X takes up to 4 images, or one GIF, or one video, but not a mix.")
+        }
+        "tiktok" if video => Some("A TikTok post needs one MP4 or MOV video, or photos, not both."),
+        _ => None,
+    }
+}
+
+/// The size limit a file of type `t` has on `platform`, and its name in messages.
+fn size_limit(platform: &str, t: &str) -> (u64, &'static str) {
+    let video = t.starts_with("video/");
+    match platform {
+        "bluesky" if !video => (BLUESKY_MAX_IMAGE_BYTES, "Bluesky's limit"),
+        "x" if t == GIF => (X_MAX_GIF_BYTES, "X's limit for a GIF"),
+        "x" if !video => (X_MAX_IMAGE_BYTES, "X's limit for an image"),
+        _ => (MAX_MEDIA_BYTES, "the largest file SocialReins takes"),
+    }
+}
+
+/// Checks what probes found of a post's media (in order; `None` where a probe got no answer)
+/// against what the platform's publisher takes: the type of each file, files that must go
+/// alone, and sizes. Only a definite violation is an error, with a message for the user: an
+/// unknown file is never refused here, publishing checks it again.
+pub fn validate_media_facts(
+    platform: &str,
+    facts: &[Option<MediaFact>],
+) -> Result<(), (Invalid, String)> {
+    let (types, what) = media_types(platform);
+    for (i, f) in facts.iter().enumerate() {
+        let Some(f) = f else { continue };
+        let n = i + 1;
+        if !types.contains(&f.content_type) {
+            return Err((
+                Invalid::MediaTypeUnsupported,
+                format!("Media {n} is not {what}."),
+            ));
+        }
+        let (max, whose) = size_limit(platform, f.content_type);
+        if f.size.is_some_and(|s| s > max) {
+            let mb = max / 1_000_000;
+            return Err((
+                Invalid::MediaTooLarge,
+                format!("Media {n} is over {mb} MB, {whose}."),
+            ));
+        }
+    }
+    if facts.len() > 1 {
+        if let Some(msg) = facts
+            .iter()
+            .flatten()
+            .find_map(|f| alone(platform, f.content_type))
+        {
+            return Err((Invalid::MixedMedia, msg.to_owned()));
+        }
+    }
+    Ok(())
+}
+
+/// The cover image types and size limit of `platform`, as its API documents: Instagram a JPEG of
+/// 8 MB (publishing turns a PNG or WebP into one), Facebook a JPEG or PNG of 10 MB, YouTube a
+/// JPEG or PNG of 2 MB.
+pub fn cover_limits(platform: &str) -> (&'static [&'static str], u64) {
+    match platform {
+        "instagram" => (&[JPEG, PNG, WEBP], 8_000_000),
+        "facebook" => (&[JPEG, PNG], 10_000_000),
+        "youtube" => (&[JPEG, PNG], 2_000_000),
+        _ => (&[], MAX_MEDIA_BYTES),
+    }
+}
+
+/// Checks what probes found of a post's cover (already through `validate_cover`) and of its one
+/// media item, which must be a video. `None` where a probe got no answer: not refused.
+pub fn validate_cover_facts(
+    platform: &str,
+    cover: Option<MediaFact>,
+    video: Option<MediaFact>,
+) -> Result<(), (Invalid, String)> {
+    if video.is_some_and(|v| !v.content_type.starts_with("video/")) {
+        return Err((
+            Invalid::CoverNeedsOneVideo,
+            "A cover needs a post with exactly one video.".into(),
+        ));
+    }
+    let Some(c) = cover else { return Ok(()) };
+    let (types, max) = cover_limits(platform);
+    if !types.contains(&c.content_type) {
+        let what = if types.contains(&WEBP) {
+            "JPEG, PNG or WebP"
+        } else {
+            "JPEG or PNG"
+        };
+        return Err((
+            Invalid::InvalidCoverType,
+            format!("The cover image is not a {what}."),
+        ));
+    }
+    if c.size.is_some_and(|s| s > max) {
+        return Err((
+            Invalid::CoverTooLarge,
+            format!("The cover image is over {} MB.", max / 1_000_000),
+        ));
     }
     Ok(())
 }
@@ -722,6 +920,97 @@ mod tests {
         for p in ["tiktok", "x", "linkedin", "threads", "bluesky"] {
             assert_eq!(validate_cover(p, c, &one), Err(Invalid::CoverUnsupported));
         }
+    }
+
+    #[test]
+    fn media_facts_are_checked_against_each_publisher() {
+        let f = |t: &'static str, size: u64| {
+            Some(MediaFact {
+                content_type: t,
+                size: Some(size),
+            })
+        };
+        let code = |p: &str, facts: &[Option<MediaFact>]| {
+            validate_media_facts(p, facts).map_err(|(e, _)| e.code())
+        };
+        let (jpg, png, gif, mp4) = (
+            f(JPEG, 500_000),
+            f(PNG, 500_000),
+            f(GIF, 500_000),
+            f(MP4, 50_000_000),
+        );
+        // Unknown files are never refused.
+        assert_eq!(code("tiktok", &[None, None]), Ok(()));
+        assert_eq!(code("tiktok", &[mp4, None]), Err("mixed_media"));
+        assert_eq!(code("tiktok", &[mp4, jpg]), Err("mixed_media"));
+        assert_eq!(code("tiktok", &[jpg, jpg]), Ok(()));
+        // Publishing turns a PNG into a JPEG for TikTok and Instagram.
+        assert_eq!(code("tiktok", &[png]), Ok(()));
+        assert_eq!(code("tiktok", &[gif]), Err("media_type_not_supported"));
+        assert_eq!(
+            code("bluesky", &[f(PNG, 1_000_001)]),
+            Err("media_too_large")
+        );
+        let (_, msg) = validate_media_facts("bluesky", &[jpg, f(JPEG, 2_000_000)]).unwrap_err();
+        assert_eq!(msg, "Media 2 is over 1 MB, Bluesky's limit.");
+        assert_eq!(code("bluesky", &[f(MP4, 90_000_000)]), Ok(()));
+        assert_eq!(code("bluesky", &[mp4, jpg]), Err("mixed_media"));
+        assert_eq!(code("x", &[gif, jpg]), Err("mixed_media"));
+        assert_eq!(code("x", &[f(JPEG, 5_000_001)]), Err("media_too_large"));
+        assert_eq!(code("x", &[f(GIF, 14_000_000)]), Ok(()));
+        assert_eq!(code("threads", &[mp4, jpg, png]), Ok(()));
+        assert_eq!(code("threads", &[gif]), Err("media_type_not_supported"));
+        assert_eq!(code("instagram", &[mp4, jpg]), Ok(()));
+        assert_eq!(code("instagram", &[png, f(WEBP, 1)]), Ok(()));
+        assert_eq!(code("instagram", &[gif]), Err("media_type_not_supported"));
+        assert_eq!(code("facebook", &[mp4, jpg]), Err("mixed_media"));
+        assert_eq!(code("linkedin", &[f(PDF, 1), jpg]), Err("mixed_media"));
+        assert_eq!(code("linkedin", &[f(PDF, 1)]), Ok(()));
+        assert_eq!(
+            code("linkedin", &[f(MOV, 1)]),
+            Err("media_type_not_supported")
+        );
+        assert_eq!(code("youtube", &[jpg]), Err("media_type_not_supported"));
+        assert_eq!(
+            code("youtube", &[f(MOV, 100_000_001)]),
+            Err("media_too_large")
+        );
+        assert_eq!(
+            code("facebook", &[f(PDF, 1)]),
+            Err("media_type_not_supported")
+        );
+    }
+
+    #[test]
+    fn cover_facts_need_a_video_and_the_platform_type_and_size() {
+        let f = |t: &'static str, size| {
+            Some(MediaFact {
+                content_type: t,
+                size,
+            })
+        };
+        let code = |p: &str, c, v| validate_cover_facts(p, c, v).map_err(|(e, _)| e.code());
+        let video = f(MP4, Some(1));
+        assert_eq!(code("instagram", f(JPEG, Some(1)), video), Ok(()));
+        assert_eq!(code("instagram", None, None), Ok(()));
+        assert_eq!(code("instagram", f(PNG, Some(1)), video), Ok(()));
+        assert_eq!(
+            code("instagram", f(GIF, Some(1)), video),
+            Err("invalid_cover_type")
+        );
+        assert_eq!(
+            code("youtube", f(WEBP, Some(1)), video),
+            Err("invalid_cover_type")
+        );
+        assert_eq!(code("facebook", f(PNG, None), video), Ok(()));
+        assert_eq!(
+            code("youtube", f(JPEG, Some(2_000_001)), video),
+            Err("cover_too_large")
+        );
+        assert_eq!(
+            code("youtube", f(JPEG, Some(1)), f(JPEG, Some(1))),
+            Err("cover_needs_one_video")
+        );
     }
 
     #[test]

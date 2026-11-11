@@ -4123,12 +4123,14 @@ mod teams {
                 config.trust_proxy = true;
                 config.bluesky.appview = base.clone();
                 config.bluesky.plc = base.clone();
-                config.bluesky.video = base;
+                config.bluesky.video = base.clone();
                 config.bluesky.allow_insecure_pds = true;
                 let disk = object_store::local::LocalFileSystem::new_with_prefix(media_dir())
                     .unwrap()
                     .with_automatic_cleanup(true);
                 config.media = Media::new(std::sync::Arc::new(disk), true);
+                // Saved media URLs are https: `https://media.test/...` is probed on the mock.
+                config.media.probe_rewrite = Some((PROBED.into(), base));
                 let db = socialreins_brain::connect(&config)
                     .await
                     .expect("database reachable");
@@ -4140,6 +4142,96 @@ mod teams {
             fn input(set: &str, body: &str, at: Option<&str>) -> Value {
                 json!({"social_set_id": set, "platform": "bluesky", "body": body,
                     "media": [], "scheduled_at": at})
+            }
+
+            /// Media URLs under this are probed on the mock when a post is saved.
+            const PROBED: &str = "https://media.test";
+
+            #[tokio::test]
+            #[serial]
+            async fn media_that_can_never_publish_is_refused_when_saved() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let with = |paths: &[&str]| {
+                    let mut v = input(&set, "hi", None);
+                    v["media"] = json!(paths
+                        .iter()
+                        .map(|p| format!("{PROBED}{p}"))
+                        .collect::<Vec<_>>());
+                    v
+                };
+                let count = || {
+                    let db = &db;
+                    async move { posts::Entity::find().count(db).await.unwrap() }
+                };
+                let before = count().await;
+                for (paths, code, detail) in [
+                    (
+                        vec!["/big.png"],
+                        "media_too_large",
+                        "Media 1 is over 1 MB, Bluesky's limit.",
+                    ),
+                    (
+                        vec!["/img.png", "/clip.mp4"],
+                        "mixed_media",
+                        "Bluesky takes up to 4 images or one video, not a mix.",
+                    ),
+                    (
+                        vec!["/doc.pdf"],
+                        "media_type_not_supported",
+                        "Media 1 is not a JPEG, PNG, WebP or GIF image or an MP4 or MOV video.",
+                    ),
+                ] {
+                    let res = create(&s, &cookie, with(&paths)).await;
+                    assert_eq!(res.status_code(), 422, "{paths:?}: {}", res.text());
+                    res.assert_json(
+                        &json!({"error": code, "platform": "bluesky", "detail": detail}),
+                    );
+                }
+                // A thread post's media names its part.
+                let mut threaded = with(&[]);
+                threaded["thread"] =
+                    json!([{"body": "two", "media": [format!("{PROBED}/big.png")]}]);
+                let res = create(&s, &cookie, threaded).await;
+                assert_eq!(res.status_code(), 422, "{}", res.text());
+                assert_eq!(res.json::<Value>()["part"], 1);
+                // Groups answer the same, naming the platform, and save nothing.
+                let mut group = with(&["/big.png"]);
+                group["platforms"] = json!(["bluesky"]);
+                let res = req(&s, Method::POST, "/v1/post-groups", &cookie)
+                    .json(&group)
+                    .await;
+                assert_eq!(res.status_code(), 422, "{}", res.text());
+                assert_eq!(res.json::<Value>()["error"], "media_too_large");
+                assert_eq!(res.json::<Value>()["platform"], "bluesky");
+                assert_eq!(count().await, before);
+
+                // Valid media saves, and so does media no probe could answer for (a page, a
+                // missing file, a host that does not resolve): publishing checks those.
+                for paths in [
+                    vec!["/img.png"],
+                    vec!["/clip.mp4"],
+                    vec!["/page.html"],
+                    vec!["/missing.png", "/img.png"],
+                ] {
+                    let res = create(&s, &cookie, with(&paths)).await;
+                    assert_eq!(res.status_code(), 201, "{paths:?}: {}", res.text());
+                }
+                let mut unknown = input(&set, "hi", None);
+                unknown["media"] = json!(["https://a.example/1.png"]);
+                let res = create(&s, &cookie, unknown).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                // An update is checked too, and leaves the post as it was.
+                let id = id_of(&res);
+                let path = format!("/v1/posts/{id}");
+                let res = req(&s, Method::PUT, &path, &cookie)
+                    .json(&with(&["/big.png"]))
+                    .await;
+                assert_eq!(res.status_code(), 422, "{}", res.text());
+                assert_eq!(res.json::<Value>()["error"], "media_too_large");
+                let p = get_post(&s, &cookie, &id).await;
+                assert_eq!(p["media"], json!(["https://a.example/1.png"]));
             }
 
             async fn create(s: &TestServer, cookie: &str, body: Value) -> axum_test::TestResponse {
@@ -4903,6 +4995,23 @@ mod teams {
                 let p = get_post(&s, &cookie, &id).await;
                 assert_eq!(p["status"], "failed");
                 assert_eq!(p["targets"][0]["error"], publish::RECONNECT);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_retry_of_media_that_can_never_publish_is_refused() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let base = pds_of(&db, &team_id).await;
+                let id = id_of(&create(&s, &cookie, input(&set, "big", Some(&past()))).await);
+                set_media(&db, &base, &id, &["/big.png"]).await;
+                publish::tick(&state).await.unwrap();
+                assert_eq!(get_post(&s, &cookie, &id).await["status"], "failed");
+                let res = req(&s, Method::POST, &format!("/v1/posts/{id}/retry"), &cookie).await;
+                assert_eq!(res.status_code(), 422, "{}", res.text());
+                assert_eq!(res.json::<Value>()["error"], "media_too_large");
+                assert_eq!(get_post(&s, &cookie, &id).await["status"], "failed");
             }
 
             #[tokio::test]
@@ -9655,6 +9764,9 @@ mod teams {
                     base
                 }
 
+                /// Media URLs under this are probed on the TikTok mock when a post is saved.
+                const PROBED_TIKTOK: &str = "https://media.test";
+
                 /// A brain with TikTok set up on the mock, its state, and the mock.
                 async fn on_tiktok(
                     configured: bool,
@@ -9671,6 +9783,7 @@ mod teams {
                         .unwrap()
                         .with_automatic_cleanup(true);
                     config.media = Media::new(std::sync::Arc::new(disk), true);
+                    config.media.probe_rewrite = Some((PROBED_TIKTOK.into(), base.clone()));
                     let db = socialreins_brain::connect(&config)
                         .await
                         .expect("database reachable");
@@ -10304,12 +10417,17 @@ mod teams {
                 #[serial]
                 async fn a_level_the_account_is_not_offered_fails_before_any_init() {
                     let (s, db, state, base, cookie, _, set) = team().await;
-                    PRIVACY.store(1, Ordering::SeqCst);
                     let inits = INITS.lock().unwrap().len();
-                    let ctx = (&db, &state, base.as_str());
-                    let chosen = settings("PUBLIC_TO_EVERYONE");
-                    let p = publish_with(&s, ctx, (&cookie, &set), ("hi", &["/clip.mp4"]), chosen)
-                        .await;
+                    // Offered when saved, no longer when it publishes.
+                    let mut post = tiktok_post(&set, "hi", &["/clip.mp4"]);
+                    post["tiktok"] = settings("PUBLIC_TO_EVERYONE");
+                    let res = create(&s, &cookie, post).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let id = id_of(&res);
+                    set_media(&db, &base, &id, &["/clip.mp4"]).await;
+                    PRIVACY.store(1, Ordering::SeqCst);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
                     assert_eq!(p["status"], "failed", "{p}");
                     let msg = p["targets"][0]["error"].as_str().unwrap();
                     assert!(
@@ -10317,6 +10435,67 @@ mod teams {
                         "{msg}"
                     );
                     assert_eq!(INITS.lock().unwrap().len(), inits);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_level_the_account_is_not_offered_is_refused_when_saved() {
+                    let (s, _, _, _, cookie, _, set) = team().await;
+                    PRIVACY.store(1, Ordering::SeqCst);
+                    let mut post = tiktok_post(&set, "hi", &["/clip.mp4"]);
+                    post["tiktok"] = settings("PUBLIC_TO_EVERYONE");
+                    let want = json!({"error": "tiktok_privacy_not_offered", "platform": "tiktok",
+                        "detail": "TikTok does not offer PUBLIC_TO_EVERYONE to @annlee. It offers SELF_ONLY.",
+                        "privacy_level_options": ["SELF_ONLY"]});
+                    let res = create(&s, &cookie, post.clone()).await;
+                    assert_eq!(res.status_code(), 422, "{}", res.text());
+                    let body = res.json::<Value>();
+                    for k in ["error", "platform", "detail", "privacy_level_options"] {
+                        assert_eq!(body[k], want[k], "{k}");
+                    }
+                    assert!(body["social_account_id"].is_string());
+                    // Groups and updates are checked the same way.
+                    let mut group = post.clone();
+                    group["platforms"] = json!(["tiktok"]);
+                    let res = req(&s, Method::POST, "/v1/post-groups", &cookie)
+                        .json(&group)
+                        .await;
+                    assert_eq!(res.status_code(), 422, "{}", res.text());
+                    assert_eq!(res.json::<Value>()["error"], "tiktok_privacy_not_offered");
+                    post["tiktok"] = settings("SELF_ONLY");
+                    let res = create(&s, &cookie, post.clone()).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let path = format!("/v1/posts/{}", id_of(&res));
+                    post["tiktok"] = settings("FOLLOWER_OF_CREATOR");
+                    let res = req(&s, Method::PUT, &path, &cookie).json(&post).await;
+                    assert_eq!(res.status_code(), 422, "{}", res.text());
+                    // TikTok not answering (a daily limit here) does not block the save.
+                    PRIVACY.store(2, Ordering::SeqCst);
+                    let res = req(&s, Method::PUT, &path, &cookie).json(&post).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_tiktok_video_next_to_a_photo_is_refused_when_saved() {
+                    let (s, _, _, _, cookie, _, set) = team().await;
+                    let mut post = tiktok_post(&set, "hi", &[]);
+                    post["media"] = json!([
+                        format!("{PROBED_TIKTOK}/clip.mp4"),
+                        format!("{PROBED_TIKTOK}/a.jpg")
+                    ]);
+                    post["tiktok"] = settings("SELF_ONLY");
+                    let res = create(&s, &cookie, post.clone()).await;
+                    assert_eq!(res.status_code(), 422, "{}", res.text());
+                    res.assert_json(&json!({"error": "mixed_media", "platform": "tiktok",
+                        "detail": "A TikTok post needs one MP4 or MOV video, or photos, not both."}));
+                    // A PNG photo is fine: publishing turns it into a JPEG.
+                    post["media"] = json!([
+                        format!("{PROBED_TIKTOK}/a.jpg"),
+                        format!("{PROBED_TIKTOK}/img.png")
+                    ]);
+                    let res = create(&s, &cookie, post).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
                 }
 
                 #[tokio::test]
@@ -10410,12 +10589,12 @@ mod teams {
                         .json(&with(json!({})))
                         .await;
                     assert_eq!(res.status_code(), 422);
-                    let mut t = settings("MUTUAL_FOLLOW_FRIENDS");
+                    let mut t = settings("FOLLOWER_OF_CREATOR");
                     t["allow_comment"] = json!(true);
                     let res = req(&s, Method::PUT, &url, &cookie).json(&with(t)).await;
                     assert_eq!(res.status_code(), 200, "{}", res.text());
                     let p = get_post(&s, &cookie, &id).await;
-                    assert_eq!(p["tiktok"]["privacy_level"], "MUTUAL_FOLLOW_FRIENDS");
+                    assert_eq!(p["tiktok"]["privacy_level"], "FOLLOWER_OF_CREATOR");
                     assert_eq!(p["tiktok"]["allow_comment"], true);
                     // An update cannot remove them, and a new post needs them.
                     let res = req(&s, Method::PUT, &url, &cookie)
@@ -10424,7 +10603,7 @@ mod teams {
                     assert_eq!(res.status_code(), 422, "{}", res.text());
                     res.assert_json(&json!({"error": "tiktok_settings_required"}));
                     let kept = get_post(&s, &cookie, &id).await;
-                    assert_eq!(kept["tiktok"]["privacy_level"], "MUTUAL_FOLLOW_FRIENDS");
+                    assert_eq!(kept["tiktok"]["privacy_level"], "FOLLOWER_OF_CREATOR");
                     let res = create(&s, &cookie, tiktok_post(&set, "hi", &["/clip.mp4"])).await;
                     assert_eq!(res.status_code(), 422, "{}", res.text());
                     res.assert_json(&json!({"error": "tiktok_settings_required"}));
