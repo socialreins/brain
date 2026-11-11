@@ -11,6 +11,8 @@ axum = "0.8"
 base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# PNG and WebP to JPEG for Instagram and TikTok, which take JPEG only.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "pool", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
 migration = { path = "migration" }
 # Local disk, S3 and R2 behind one trait; its S3 client takes a custom endpoint, path-style.

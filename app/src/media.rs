@@ -296,6 +296,65 @@ impl Media {
         Ok((key, content_type, size))
     }
 
+    /// `file`, the stored copy of `url`, swapped for its JPEG (`to_jpeg`): the row points at the
+    /// new file and the old one is deleted. `file` as it was when it does not decode or storage
+    /// fails, so the platform's type check refuses it as before.
+    pub async fn as_jpeg(
+        &self,
+        db: &DatabaseConnection,
+        post: Uuid,
+        url: &str,
+        file: Stored,
+    ) -> Stored {
+        let bytes = match self.read(&file.key).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(error = %e, post = %post, "stored media read failed");
+                return file;
+            }
+        };
+        let Ok(Some(jpeg)) = tokio::task::spawn_blocking(move || to_jpeg(&bytes)).await else {
+            tracing::warn!(post = %post, "media image did not convert to JPEG");
+            return file;
+        };
+        let key = format!("posts/{post}/{}", Uuid::now_v7());
+        let size = jpeg.len() as i64;
+        if let Err(e) = self.store.put(&Path::from(key.as_str()), jpeg.into()).await {
+            storage(e);
+            return file;
+        }
+        let swapped = db
+            .execute_raw(sql(
+                "UPDATE post_media SET storage_key = $3, content_type = 'image/jpeg', size = $4 \
+                 WHERE post_id = $1 AND source_url = $2 AND storage_key = $5",
+                vec![
+                    post.into(),
+                    url.into(),
+                    key.clone().into(),
+                    size.into(),
+                    file.key.clone().into(),
+                ],
+            ))
+            .await;
+        match swapped {
+            Ok(r) if r.rows_affected() == 1 => {
+                self.delete(&file.key).await;
+                Stored {
+                    key,
+                    content_type: "image/jpeg".into(),
+                    size,
+                }
+            }
+            other => {
+                if let Err(e) = other {
+                    tracing::warn!(error = %e, post = %post, "post media row failed");
+                }
+                self.delete(&key).await;
+                file
+            }
+        }
+    }
+
     /// The bytes of a stored file.
     pub async fn read(&self, key: &str) -> Result<Vec<u8>, object_store::Error> {
         let got = self.store.get(&Path::from(key)).await?;
@@ -503,9 +562,103 @@ pub fn sniff(head: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Largest image `to_jpeg` decodes, so a small file cannot claim a huge canvas: its copies stay
+/// within a few hundred MB.
+const MAX_PIXELS: u64 = 25_000_000;
+
+/// An image (PNG or WebP) as a JPEG at quality 90, at its own size, any transparency laid on
+/// white; `None` when it does not decode or is over `MAX_PIXELS`.
+pub fn to_jpeg(bytes: &[u8]) -> Option<Vec<u8>> {
+    let reader = || {
+        image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()
+    };
+    let (w, h) = reader()?.into_dimensions().ok()?;
+    if u64::from(w) * u64::from(h) > MAX_PIXELS {
+        return None;
+    }
+    let decoded = reader()?.decode().ok()?;
+    let rgb = if decoded.color().has_alpha() {
+        let mut rgba = decoded.into_rgba8();
+        for p in rgba.pixels_mut() {
+            let a = u16::from(p[3]);
+            for c in &mut p.0[..3] {
+                *c = ((u16::from(*c) * a + 255 * (255 - a)) / 255) as u8;
+            }
+        }
+        image::DynamicImage::ImageRgba8(rgba).into_rgb8()
+    } else {
+        decoded.into_rgb8()
+    };
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
+        .encode_image(&rgb)
+        .ok()?;
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_png_with_transparency_becomes_a_jpeg_on_white() {
+        // Left half see-through, right half opaque red, blocks wide enough for JPEG's 8x8.
+        let png = image::RgbaImage::from_fn(32, 16, |x, _| {
+            if x < 16 {
+                image::Rgba([0, 0, 0, 0])
+            } else {
+                image::Rgba([200, 10, 10, 255])
+            }
+        });
+        let mut bytes = Vec::new();
+        png.write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        assert_eq!(sniff(&bytes), Some("image/png"));
+
+        let jpeg = to_jpeg(&bytes).unwrap();
+        assert_eq!(sniff(&jpeg), Some("image/jpeg"));
+        let back = image::load_from_memory(&jpeg).unwrap().into_rgb8();
+        assert_eq!(back.dimensions(), (32, 16));
+        let near =
+            |got: [u8; 3], want: [u8; 3]| got.iter().zip(want).all(|(g, w)| g.abs_diff(w) < 40);
+        assert!(
+            near(back.get_pixel(4, 8).0, [255, 255, 255]),
+            "transparent is white"
+        );
+        assert!(
+            near(back.get_pixel(28, 8).0, [200, 10, 10]),
+            "opaque keeps its colour"
+        );
+        assert_eq!(to_jpeg(b"\x89PNG\r\n\x1a\n not really"), None);
+
+        // A WebP the same way.
+        let mut webp = Vec::new();
+        png.write_to(
+            &mut std::io::Cursor::new(&mut webp),
+            image::ImageFormat::WebP,
+        )
+        .unwrap();
+        assert_eq!(sniff(&webp), Some("image/webp"));
+        let back = image::load_from_memory(&to_jpeg(&webp).unwrap())
+            .unwrap()
+            .into_rgb8();
+        assert!(near(back.get_pixel(4, 8).0, [255, 255, 255]));
+
+        // A canvas past the decode cap is refused, however small its file.
+        let huge = image::GrayImage::new(5_001, 5_000);
+        let mut bytes = Vec::new();
+        huge.write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        assert_eq!(to_jpeg(&bytes), None);
+    }
 
     #[test]
     fn drive_share_links_become_direct_downloads() {
