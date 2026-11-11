@@ -213,6 +213,24 @@ A tick every minute claims due posts (one instance at a time, advisory lock), cr
 target per account and claims each target once, so nothing posts twice; a publish is never
 retried. A target cut off mid-publish for 15 minutes fails as "unknown, check the account".
 
+**Checks before saving.** `POST /posts`, `PUT /posts/{id}`, `POST /post-groups`, both retries
+and the MCP tools that share them refuse a post that can never publish, before anything is
+stored, with `422 {"error", "platform", "detail"}` (and `part` for a thread post). Each media
+URL and the cover are probed (a ranged GET of the first bytes through the same public-address
+checks as publishing, Drive links included, all within 4 seconds) and typed by their magic bytes:
+`media_type_not_supported` for a type the platform's publisher does not take (a PDF anywhere but
+LinkedIn, a GIF on Instagram, Threads, TikTok or YouTube, a MOV on LinkedIn; a PNG or WebP on
+Instagram and a PNG on TikTok pass, since publishing turns them into JPEGs),
+`mixed_media` for a video next to other media on Bluesky, Facebook, LinkedIn, X or TikTok (a PDF
+on LinkedIn, a GIF on X), `media_too_large` for a Bluesky image over 1 MB, an X image over 5 MB
+or GIF over 15 MB, or any file over 100 MB, `invalid_cover_type` and `cover_too_large` for a
+cover, and `cover_needs_one_video` when the one media item is not a video. A TikTok post's
+`privacy_level` is checked against each TikTok account of the set (creator info, live, 5
+seconds): `tiktok_privacy_not_offered` names the account and carries its
+`privacy_level_options`. A probe or a TikTok call that gets no clear answer (unreachable, slow,
+not 200 or 206, an unknown type, a daily limit) never refuses: publishing checks again. A retry
+checks only a post with a failed target.
+
 **Video cover.** A post with exactly one media item, a video, may carry `cover`, a public https
 link to a JPEG or PNG fetched at publish time like `media` (Google Drive share links included, same
 public-address and magic-byte checks). Only three platforms have an API for it; any other answers

@@ -1352,12 +1352,7 @@ async fn ingest(app: &AppState, post: &posts::Model) -> Media {
 /// The largest cover image stored for `platform`, as its API documents: Instagram 8 MB, Facebook
 /// 10 MB, YouTube 2 MB (the limit YouTube states for thumbnails).
 fn cover_bytes(platform: &str) -> usize {
-    match platform {
-        "instagram" => 8_000_000,
-        "facebook" => 10_000_000,
-        "youtube" => 2_000_000,
-        _ => crate::media::MAX_BYTES,
-    }
+    socialreins_core::post::cover_limits(platform).1 as usize
 }
 
 /// What to tell the user about a cover that could not be stored.

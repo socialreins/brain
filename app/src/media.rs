@@ -39,6 +39,23 @@ pub struct Media {
     allow_private: bool,
     /// `INGEST_DEADLINE`; tests shorten it.
     pub deadline: Duration,
+    /// `PROBE_DEADLINE`; tests shorten it.
+    pub probe_deadline: Duration,
+    /// Tests only: a probe of a URL starting with `.0` asks `.1` instead (a mock on loopback,
+    /// which saved media URLs, always https, cannot name).
+    pub probe_rewrite: Option<(String, String)>,
+}
+
+/// Longest the probes of one post's media may take together when it is saved. A probe not
+/// answered by then is unknown, and an unknown file is checked at publish only.
+pub const PROBE_DEADLINE: Duration = Duration::from_secs(4);
+
+/// What a probe learned of a media URL: its type from its first bytes, and its size when the
+/// server said (`Content-Range` or `Content-Length`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Probed {
+    pub content_type: &'static str,
+    pub size: Option<u64>,
 }
 
 /// Why a file was not stored.
@@ -92,7 +109,89 @@ impl Media {
             client,
             allow_private,
             deadline: INGEST_DEADLINE,
+            probe_deadline: PROBE_DEADLINE,
+            probe_rewrite: None,
         }
+    }
+
+    /// `probe` of every URL, `PARALLEL` at a time, all within `probe_deadline`; only the URLs
+    /// that answered are in the map.
+    pub async fn probe_all(&self, urls: &[String]) -> HashMap<String, Probed> {
+        let mut left: Vec<String> = Vec::new();
+        for url in urls {
+            if !left.contains(url) {
+                left.push(url.clone());
+            }
+        }
+        let until = Instant::now() + self.probe_deadline;
+        let mut found = HashMap::new();
+        let mut running = tokio::task::JoinSet::new();
+        loop {
+            while running.len() < PARALLEL {
+                let Some(url) = left.pop() else { break };
+                let media = self.clone();
+                running.spawn(async move {
+                    let got = tokio::time::timeout_at(until, media.probe(&url)).await;
+                    (url, got.ok().flatten())
+                });
+            }
+            match running.join_next().await {
+                Some(Ok((url, Some(got)))) => {
+                    found.insert(url, got);
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        found
+    }
+
+    /// The type and size of `url` (a Drive share link as its direct download) from a ranged GET
+    /// of its first bytes, through the same `PublicOnly` client and checks as `download`. `None`
+    /// when there is no clear answer: blocked, unreachable, not 200 or 206, or bytes of no type
+    /// brain stores (a sign-in page, say). Nothing is stored.
+    pub async fn probe(&self, url: &str) -> Option<Probed> {
+        let drive = drive_url(url);
+        let mut url = drive.unwrap_or_else(|| url.to_owned());
+        if let Some((from, to)) = self.probe_rewrite.as_ref().filter(|_| self.allow_private) {
+            if let Some(rest) = url.strip_prefix(from.as_str()) {
+                url = format!("{to}{rest}");
+            }
+        }
+        let from = Url::parse(&url).ok()?;
+        if !public_url(&from, self.allow_private) {
+            return None;
+        }
+        let range = format!("bytes=0-{}", SNIFF_LEN - 1);
+        let mut res = self
+            .client
+            .get(from)
+            .header(reqwest::header::RANGE, range)
+            .send()
+            .await
+            .ok()?;
+        let size = match res.status() {
+            // `bytes 0-11/12345`; `*` for an unknown total.
+            StatusCode::PARTIAL_CONTENT => res
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.rsplit('/').next())
+                .and_then(|n| n.parse().ok()),
+            StatusCode::OK => res.content_length(),
+            _ => return None,
+        };
+        let mut head = Vec::new();
+        while head.len() < SNIFF_LEN {
+            match res.chunk().await.ok()? {
+                Some(chunk) => head.extend_from_slice(&chunk),
+                None => break,
+            }
+        }
+        Some(Probed {
+            content_type: sniff(&head)?,
+            size,
+        })
     }
 
     /// `ingest` of every URL, `PARALLEL` at a time, all within `deadline`; a URL not stored by
@@ -760,6 +859,35 @@ mod tests {
             .download(post, &format!("{base}/page"), MAX_BYTES, soon())
             .await;
         assert_eq!(got.unwrap_err(), Fail::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn a_probe_reads_the_type_and_size_and_stores_nothing() {
+        let base = server().await;
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let media = Media::new(store.clone(), true);
+        let want = Probed {
+            content_type: "image/png",
+            size: Some(100_000),
+        };
+        for path in ["/ok.png", "/hop"] {
+            assert_eq!(media.probe(&format!("{base}{path}")).await, Some(want));
+        }
+        assert_eq!(media.probe(&format!("{base}/page")).await, None);
+        assert_eq!(media.probe(&format!("{base}/missing")).await, None);
+        let urls = vec![format!("{base}/ok.png"), format!("{base}/page")];
+        let found = media.probe_all(&urls).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[&urls[0]], want);
+        assert!(store
+            .list_with_delimiter(None)
+            .await
+            .unwrap()
+            .objects
+            .is_empty());
+        // Never a private address outside tests.
+        let strict = Media::new(store, false);
+        assert_eq!(strict.probe("https://127.0.0.1/ok.png").await, None);
     }
 
     #[tokio::test]
