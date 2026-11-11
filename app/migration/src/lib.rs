@@ -28,6 +28,7 @@ mod m20261117_000001_post_fanned_out;
 mod m20261118_000001_magic_link_name;
 mod m20261119_000001_google_login_only;
 mod m20261120_000001_youtube_settings;
+mod m20261121_000001_read_only_tokens;
 
 pub struct Migrator;
 
@@ -63,6 +64,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261118_000001_magic_link_name::Migration),
             Box::new(m20261119_000001_google_login_only::Migration),
             Box::new(m20261120_000001_youtube_settings::Migration),
+            Box::new(m20261121_000001_read_only_tokens::Migration),
             // inject-above (do not remove this comment)
         ]
     }

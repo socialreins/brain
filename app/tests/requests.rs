@@ -14809,6 +14809,100 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
+                async fn read_only_tokens_read_but_never_write() {
+                    let (s, db) = on_mock(120).await;
+                    let (owner, team_id, account) = owner_with_account(&s, &db).await;
+                    let default = default_set(&db, &team_id).await.to_string();
+                    let rw = make_token(&s, &owner, json!({"name": "rw"})).await;
+                    assert_eq!(rw["token"]["read_only"], false);
+                    let rw = rw["secret"].as_str().unwrap().to_owned();
+                    let ro = make_token(&s, &owner, json!({"name": "ro", "read_only": true})).await;
+                    assert_eq!(ro["token"]["read_only"], true);
+                    let ro = ro["secret"].as_str().unwrap().to_owned();
+                    let listed = s.get("/v1/api-tokens").add_header("cookie", &owner).await;
+                    let listed = listed.json::<Value>();
+                    assert_eq!(listed[0]["read_only"], true, "{listed}");
+                    assert_eq!(listed[1]["read_only"], false);
+
+                    // A normal token writes; a scheduled post names the account it goes to.
+                    let mut body = post_body(Some(&default), "scheduled");
+                    body["scheduled_at"] = json!("2099-01-01T00:00:00Z");
+                    body["media"] = json!(["https://example.com/a.jpg"]);
+                    let res = bearer(&s, Method::POST, "/v1/posts", &rw).json(&body).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let id = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                    let path = format!("/v1/posts/{id}");
+                    let res = bearer(&s, Method::GET, &path, &ro).await;
+                    res.assert_status_ok();
+                    let p = res.json::<Value>();
+                    assert_eq!(p["status"], "scheduled");
+                    assert_eq!(p["platform"], "bluesky");
+                    assert_eq!(p["scheduled_at"], "2099-01-01T00:00:00Z");
+                    assert_eq!(p["media"], json!(["https://example.com/a.jpg"]));
+                    assert_eq!(p["first_comment"], Value::Null);
+                    assert_eq!(p["targets"], json!([]));
+                    let accounts = p["accounts"].as_array().unwrap();
+                    assert_eq!(accounts.len(), 1, "{p}");
+                    assert_eq!(accounts[0]["social_account_id"], account.as_str());
+                    assert_eq!(accounts[0]["provider"], "bluesky");
+                    assert!(accounts[0]["handle"].is_string(), "{p}");
+                    assert_eq!(accounts[0]["target_id"], Value::Null);
+                    assert_eq!(accounts[0]["status"], "pending");
+                    bearer(&s, Method::GET, "/v1/posts", &ro)
+                        .await
+                        .assert_status_ok();
+                    bearer(&s, Method::HEAD, &path, &ro)
+                        .await
+                        .assert_status_ok();
+
+                    // Every write is refused before it runs, idempotency key or not.
+                    let set_ro =
+                        json!({"name": "set ro", "social_set_id": default, "read_only": true});
+                    let set_ro = make_token(&s, &owner, set_ro).await;
+                    assert_eq!(set_ro["token"]["read_only"], true);
+                    let set_ro = set_ro["secret"].as_str().unwrap().to_owned();
+                    bearer(&s, Method::GET, &path, &set_ro)
+                        .await
+                        .assert_status_ok();
+                    for secret in [&ro, &set_ro] {
+                        for (method, path) in [
+                            (Method::POST, "/v1/posts".to_owned()),
+                            (Method::PUT, path.clone()),
+                            (Method::DELETE, path.clone()),
+                            (Method::POST, format!("{path}/publish")),
+                            (Method::POST, "/v1/lists".to_owned()),
+                        ] {
+                            let res = bearer(&s, method.clone(), &path, secret).json(&body).await;
+                            assert_eq!(res.status_code(), 403, "{method} {path}");
+                            res.assert_json(&json!({"error": "read_only_token"}));
+                        }
+                        let res = bearer(&s, Method::DELETE, &path, secret)
+                            .add_header("idempotency-key", "k1")
+                            .await;
+                        assert_eq!(res.status_code(), 403);
+                        res.assert_json(&json!({"error": "read_only_token"}));
+                    }
+
+                    // MCP: read tools work, write tools answer the same error.
+                    let (failed, v) = call(&s, &ro, "get-post", json!({"id": id})).await;
+                    assert!(!failed, "{v}");
+                    assert_eq!(v["id"], id.as_str());
+                    for (tool, args) in [
+                        ("delete-post", json!({"id": id})),
+                        ("create-post", body.clone()),
+                    ] {
+                        let (failed, v) = call(&s, &ro, tool, args).await;
+                        assert!(failed, "{tool}");
+                        assert_eq!(v, json!({"error": "read_only_token"}), "{tool}");
+                    }
+                    let p = bearer(&s, Method::GET, &path, &rw).await.json::<Value>();
+                    assert_eq!(p["status"], "scheduled", "nothing changed");
+                    let res = bearer(&s, Method::DELETE, &path, &rw).await;
+                    assert!(res.status_code().is_success(), "{}", res.text());
+                }
+
+                #[tokio::test]
+                #[serial]
                 async fn initialize_lists_the_tools_and_they_match_rest() {
                     let (s, db) = on_mock(120).await;
                     let (owner, team_id, _) = owner_with_account(&s, &db).await;

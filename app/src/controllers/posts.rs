@@ -91,8 +91,27 @@ pub struct Post {
     pub created_at: DateTime<FixedOffset>,
     pub updated_at: DateTime<FixedOffset>,
     pub targets: Vec<Target>,
+    /// The accounts the post goes to, each with its target's status. Targets are created when
+    /// the post publishes, so until then a `draft`, `scheduled` or `queued` post lists the
+    /// accounts of its platform in its set today, with `target_id` null and status `pending`.
+    pub accounts: Vec<PostAccount>,
     /// The lists the post is in, with its position (its "Part N") in each.
     pub lists: Vec<ListRef>,
+}
+
+/// One account a post goes (or went) to.
+#[derive(Serialize, ToSchema)]
+pub struct PostAccount {
+    /// The connection (`GET /connections`); `null` once a target's account was disconnected.
+    pub social_account_id: Option<Uuid>,
+    /// The account's platform, e.g. `facebook`.
+    pub provider: String,
+    pub handle: Option<String>,
+    pub display_name: Option<String>,
+    /// The post's target on this account; `null` until the post publishes.
+    pub target_id: Option<Uuid>,
+    /// The target's status (see `Target`); `pending` before it has one.
+    pub status: String,
 }
 
 /// One account a post went (or is going) to.
@@ -379,7 +398,12 @@ async fn targets_of(
     Ok(map)
 }
 
-fn post_json(p: posts::Model, targets: Vec<Target>, lists: Vec<ListRef>) -> Post {
+fn post_json(
+    p: posts::Model,
+    targets: Vec<Target>,
+    accounts: Vec<PostAccount>,
+    lists: Vec<ListRef>,
+) -> Post {
     Post {
         id: p.id,
         social_set_id: p.social_set_id,
@@ -400,8 +424,94 @@ fn post_json(p: posts::Model, targets: Vec<Target>, lists: Vec<ListRef>) -> Post
         created_at: p.created_at,
         updated_at: p.updated_at,
         targets,
+        accounts,
         lists,
     }
+}
+
+/// The accounts of each post in `rows`: its targets' once fanned out, else the accounts of its
+/// platform in its set, as `publish` would fan it out now (none for a post that ended without).
+async fn accounts_of(
+    db: &impl ConnectionTrait,
+    team: Uuid,
+    rows: &[posts::Model],
+    targets: &HashMap<Uuid, Vec<Target>>,
+) -> Result<HashMap<Uuid, Vec<PostAccount>>, DbErr> {
+    let planned = |p: &posts::Model| {
+        !p.fanned_out && matches!(p.status.as_str(), "draft" | "scheduled" | "queued")
+    };
+    let sets: HashSet<Uuid> = rows
+        .iter()
+        .filter(|p| planned(p))
+        .map(|p| p.social_set_id)
+        .collect();
+    let mut members = if sets.is_empty() {
+        Vec::new()
+    } else {
+        membership::Entity::find()
+            .filter(membership::Column::SocialSetId.is_in(sets))
+            .all(db)
+            .await?
+    };
+    members.sort_by_key(|m| m.social_account_id);
+    let ids: HashSet<Uuid> = members
+        .iter()
+        .map(|m| m.social_account_id)
+        .chain(
+            targets
+                .values()
+                .flatten()
+                .filter_map(|t| t.social_account_id),
+        )
+        .collect();
+    let found = if ids.is_empty() {
+        Vec::new()
+    } else {
+        social_accounts::Entity::find()
+            .filter(social_accounts::Column::Id.is_in(ids))
+            .filter(social_accounts::Column::TeamId.eq(team))
+            .all(db)
+            .await?
+    };
+    let by_id: HashMap<Uuid, social_accounts::Model> =
+        found.into_iter().map(|s| (s.id, s)).collect();
+    let entry = |platform: &str, id: Option<Uuid>, target_id, status: &str| {
+        let s = id.and_then(|i| by_id.get(&i));
+        PostAccount {
+            social_account_id: id,
+            provider: s.map_or(platform, |s| s.provider.as_str()).to_owned(),
+            handle: s.and_then(|s| s.handle.clone()),
+            display_name: s.and_then(|s| s.display_name.clone()),
+            target_id,
+            status: status.to_owned(),
+        }
+    };
+    let mut map = HashMap::new();
+    for p in rows {
+        let list: Vec<PostAccount> = if p.fanned_out {
+            targets
+                .get(&p.id)
+                .into_iter()
+                .flatten()
+                .map(|t| entry(&p.platform, t.social_account_id, Some(t.id), &t.status))
+                .collect()
+        } else if planned(p) {
+            members
+                .iter()
+                .filter(|m| m.social_set_id == p.social_set_id)
+                .filter(|m| {
+                    by_id
+                        .get(&m.social_account_id)
+                        .is_some_and(|s| s.provider == p.platform)
+                })
+                .map(|m| entry(&p.platform, Some(m.social_account_id), None, "pending"))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        map.insert(p.id, list);
+    }
+    Ok(map)
 }
 
 /// The JSON of `rows`, in order, with their targets and lists batched.
@@ -412,13 +522,15 @@ pub(crate) async fn posts_json(
 ) -> Result<Vec<Post>, DbErr> {
     let ids: Vec<Uuid> = rows.iter().map(|p| p.id).collect();
     let mut targets = targets_of(db, &ids).await?;
+    let mut accounts = accounts_of(db, a.team.id, &rows, &targets).await?;
     let mut in_lists = lists_of(db, a, &ids).await?;
     Ok(rows
         .into_iter()
         .map(|p| {
             let t = targets.remove(&p.id).unwrap_or_default();
+            let c = accounts.remove(&p.id).unwrap_or_default();
             let l = in_lists.remove(&p.id).unwrap_or_default();
-            post_json(p, t, l)
+            post_json(p, t, c, l)
         })
         .collect())
 }

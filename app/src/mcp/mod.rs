@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use crate::{
     controllers::{
-        api_tokens::Actor,
+        api_tokens::{read_only_token, Actor},
         connections,
         lists::{self, AddPost, ListInput, Order},
         posts,
@@ -265,6 +265,10 @@ impl ServerHandler for McpServer {
             .ok_or_else(|| ErrorData::internal_error("no caller", None))?;
         let v = Value::Object(request.arguments.unwrap_or_default());
         let name = request.name.as_ref();
+        let writes = specs().into_iter().any(|s| s.0 == name && !s.3);
+        if writes && actor.read_only() {
+            return Ok(to_result(read_only_token()).await.into());
+        }
         match run(&self.app, actor, name, v).await {
             Some(res) => Ok(to_result(res).await.into()),
             None => Err(ErrorData::invalid_params(

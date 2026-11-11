@@ -20,6 +20,8 @@ pub struct Model {
     pub expires_at: Option<DateTimeWithTimeZone>,
     pub revoked_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
+    /// Reads only: `403 read_only_token` on any write.
+    pub read_only: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
