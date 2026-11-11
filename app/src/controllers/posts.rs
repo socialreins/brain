@@ -222,6 +222,7 @@ pub struct PostInput {
 
 #[derive(Deserialize, IntoParams, JsonSchema)]
 pub struct PostQuery {
+    /// The posts of one set; the Default set, which holds every account, gives every set's.
     pub social_set_id: Option<Uuid>,
     /// One of the post statuses.
     pub status: Option<String>,
@@ -598,7 +599,16 @@ pub async fn list_posts(app: &AppState, a: &Actor, q: PostQuery) -> Response {
             .filter(posts::Column::SocialSetId.in_subquery(live_sets()))
             .filter(in_scope(a));
         if let Some(set) = q.social_set_id {
-            sel = sel.filter(posts::Column::SocialSetId.eq(set));
+            // The Default set holds every account, so it lists every set's posts.
+            let default = social_sets::Entity::find_by_id(set)
+                .filter(social_sets::Column::TeamId.eq(a.team.id))
+                .filter(social_sets::Column::IsDefault.eq(true))
+                .count(&app.db)
+                .await?
+                > 0;
+            if !default {
+                sel = sel.filter(posts::Column::SocialSetId.eq(set));
+            }
         }
         if let Some(status) = &q.status {
             sel = sel.filter(posts::Column::Status.eq(status));

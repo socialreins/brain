@@ -14508,8 +14508,24 @@ mod teams {
                     .unwrap()
                     .iter()
                     .all(|p| p["social_set_id"] == clients.as_str()));
+                // The Default set lists every set's posts, still only the token's own for a set token.
                 let q = Box::leak(format!("?social_set_id={default}").into_boxed_str());
-                assert!(list(set.clone(), q).await.as_array().unwrap().is_empty());
+                assert_eq!(list(team.clone(), q).await.as_array().unwrap().len(), 3);
+                assert_eq!(list(set.clone(), q).await.as_array().unwrap().len(), 2);
+                let q = Box::leak(format!("?social_set_id={clients}").into_boxed_str());
+                assert_eq!(list(team.clone(), q).await.as_array().unwrap().len(), 2);
+                // Another team's Default set unlocks nothing.
+                let (_, stranger, _) = user(&s, &db).await;
+                let res = req(&s, Method::GET, &format!("/v1/posts{q}"), &stranger).await;
+                res.assert_json(&json!([]));
+                let res = req(
+                    &s,
+                    Method::GET,
+                    &format!("/v1/posts?social_set_id={default}"),
+                    &stranger,
+                )
+                .await;
+                res.assert_json(&json!([]));
 
                 // Another set's post is missing: get, update, delete, publish.
                 let path = format!("/v1/posts/{outside}");
