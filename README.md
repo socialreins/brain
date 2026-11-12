@@ -433,7 +433,7 @@ pick the channel there; connect again for another. Error codes `youtube_failed`,
 `missing_scopes` (granular consent: the token Google returned lacks one of the three scopes, so
 nothing is saved) besides the Threads ones. The access token lasts an hour and is stored with its expiry; the
 refresh token is sealed in the account's `meta`. Before each publish or take down, a token with
-under two minutes left is renewed and saved first (there is no daily job). A refused refresh
+under 20 minutes left is renewed and saved first, and one that ends during a long upload is renewed once and the upload goes on (there is no daily job). A refused refresh
 token (revoked access) or a refused call (`401`, `insufficientPermissions`) fails the target with
 "Reconnect the channel under Connections".
 

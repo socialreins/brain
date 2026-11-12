@@ -1685,6 +1685,11 @@ async fn send(
     };
     let (limit, extra) = patience(publisher.timeout(), &media);
     let sent = crate::connectors::PATIENCE.scope(extra, sent);
+    // YouTube's token lasts an hour and a large upload many minutes: `upload` may renew it.
+    let refresh = (account.provider == "youtube")
+        .then(|| crate::controllers::youtube::unseal(app, account))
+        .flatten();
+    let sent = youtube::REFRESH.scope(refresh, sent);
     match tokio::time::timeout(limit, sent).await {
         Ok(Ok(remote)) => Ok(remote),
         Ok(Err(PublishError::Reconnect)) => Err(refused(app, publisher, account).await),

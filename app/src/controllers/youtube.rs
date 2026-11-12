@@ -30,8 +30,9 @@ use crate::{
 };
 
 const PROVIDER: &str = "youtube";
-/// An access token with less than this left is renewed before a call.
-const RENEW_WITHIN: Duration = Duration::minutes(2);
+/// An access token with less than this left is renewed before a call: more than the longest
+/// publish (`publish::PUBLISH_LIMIT`), so a video upload starts with a token that outlasts it.
+const RENEW_WITHIN: Duration = Duration::minutes(20);
 
 /// `GET /connections/youtube/redirect`: owners and admins of the current team only.
 async fn start(State(app): State<AppState>, t: Result<InTeam, Reply>) -> Response {
@@ -47,13 +48,13 @@ fn seal(app: &AppState, refresh_token: &str) -> String {
 }
 
 /// The refresh token sealed in an account's `meta`.
-fn unseal(app: &AppState, account: &social_accounts::Model) -> Option<String> {
+pub fn unseal(app: &AppState, account: &social_accounts::Model) -> Option<String> {
     let sealed = account.meta["refresh_token"].as_str()?;
     let bytes = URL_SAFE_NO_PAD.decode(sealed).ok()?;
     String::from_utf8(app.cipher.decrypt(&bytes)?).ok()
 }
 
-/// The access token to call YouTube with: the stored one, or, when it ends within two minutes
+/// The access token to call YouTube with: the stored one, or, when it ends within 20 minutes
 /// (or has no end recorded), a new one from the refresh token, saved before it is used. A
 /// refresh token Google refuses, or none, is `Reconnect`. Two calls renewing at once both get a
 /// working token; the later save finds the row changed and leaves it.

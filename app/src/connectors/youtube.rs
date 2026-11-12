@@ -134,6 +134,12 @@ pub const NO_VIDEO_ID: &str =
 pub const UNCONFIRMED: &str =
     "Upload: YouTube did not confirm the upload. It may have posted, check the channel.";
 
+tokio::task_local! {
+    /// The refresh token of the account the upload in this task is for (`publish::send` sets
+    /// it), so `upload` can renew a token YouTube stops taking midway.
+    pub static REFRESH: Option<String>;
+}
+
 fn failed(msg: impl Into<String>) -> PostError {
     PostError::Failed(msg.into())
 }
@@ -376,8 +382,11 @@ impl YouTube {
     /// answer or a server error is not sent again blindly: the session is asked how far it got
     /// (`Content-Range: bytes */total`) and the upload goes on from there, or ends with the video
     /// if YouTube had it all, so nothing posts twice. After `RESUMES` tries in a row without
-    /// progress it is given up, as `UNCONFIRMED` if the last bytes had gone out. The token goes
-    /// along only to a session URL that passed `upload_allowed`.
+    /// progress it is given up, as `UNCONFIRMED` if the last bytes had gone out. A long upload
+    /// can outlive its token: on the first `401` of a chunk the token is renewed (`REFRESH`) and
+    /// the upload goes on from where the session says it is; only a refused renewal, or a second
+    /// `401`, is `Reconnect`. The token goes along only to a session URL that passed
+    /// `upload_allowed`.
     pub async fn upload(
         &self,
         token: &str,
@@ -409,20 +418,25 @@ impl YouTube {
         if !self.upload_allowed(session) {
             return Err(failed("Upload: YouTube sent an unexpected upload URL."));
         }
-        let put = || {
+        let put = |token: &str| {
             self.client
                 .put(session)
                 .bearer_auth(token)
                 .timeout(CHUNK_TIMEOUT)
         };
+        let ask = |token: &str| {
+            let ask = put(token).header("Content-Range", format!("bytes */{total}"));
+            self.raw(ask.body(Vec::new()), "Upload")
+        };
         // `at`: the bytes YouTube holds. `stalls`: tries in a row that did not add to them.
         let (mut at, mut stalls, mut sent_last) = (0u64, 0u32, false);
+        let (mut token, mut renewed) = (token.to_owned(), false);
         loop {
             let end = (at + self.chunk.max(1)).min(total);
             let bytes = video.range(at..end).await?;
             sent_last |= end == total;
             let range = format!("bytes {at}-{}/{total}", end.saturating_sub(1));
-            let req = put()
+            let req = put(&token)
                 .header("Content-Type", content_type)
                 .header("Content-Range", range)
                 .body(bytes);
@@ -439,6 +453,14 @@ impl YouTube {
                             .ok_or_else(|| failed(NO_VIDEO_ID));
                     }
                     Ok((status, headers, _)) if status.as_u16() == 308 => break held(&headers),
+                    Ok((status, _, _)) if status.as_u16() == 401 && !renewed => {
+                        renewed = true;
+                        let refresh = REFRESH.try_with(Clone::clone).ok().flatten();
+                        let refresh = refresh.ok_or(PostError::Reconnect)?;
+                        token = self.refresh(&refresh).await?.access_token;
+                        answer = ask(&token).await;
+                        continue;
+                    }
                     Ok((status, _, body)) if !status.is_server_error() => {
                         return Err(refusal(status, &body, "Upload"));
                     }
@@ -452,8 +474,7 @@ impl YouTube {
                     });
                 }
                 tokio::time::sleep(self.resume_wait * stalls).await;
-                let ask = put().header("Content-Range", format!("bytes */{total}"));
-                answer = self.raw(ask.body(Vec::new()), "Upload").await;
+                answer = ask(&token).await;
             };
             if held > at && held <= total {
                 stalls = 0;
@@ -620,6 +641,12 @@ mod tests {
         asked: u32,
         fail: Option<(usize, usize)>,
         always_fail: bool,
+        /// The token `t` ends after this many chunk calls: every later call with it is a `401`.
+        expires_after: Option<usize>,
+        /// Tokens the token endpoint handed out.
+        renewals: u32,
+        /// The token endpoint refuses the refresh token.
+        revoked: bool,
     }
 
     async fn session(mock: std::sync::Arc<std::sync::Mutex<Session>>) -> String {
@@ -634,11 +661,16 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let location = format!("{base}/upload/youtube/v3/videos?upload_id=s1");
         let start = move || async move { ([("location", location)], "") };
+        let chunks = mock.clone();
         let put = move |h: HeaderMap, body: Bytes| async move {
-            let mut m = mock.lock().unwrap();
+            let mut m = chunks.lock().unwrap();
             let range = h["content-range"].to_str().unwrap().to_owned();
             let (span, total) = range.trim_start_matches("bytes ").split_once('/').unwrap();
             let total: usize = total.parse().unwrap();
+            let old = h["authorization"] == "Bearer t";
+            if old && m.expires_after.is_some_and(|n| m.chunks.len() >= n) {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
             if span == "*" {
                 assert!(body.is_empty());
                 m.asked += 1;
@@ -671,7 +703,19 @@ mod tests {
             }
             res
         };
-        let app = Router::new().route("/upload/youtube/v3/videos", post(start).put(put));
+        let tokens = mock.clone();
+        let token = move || async move {
+            let mut m = tokens.lock().unwrap();
+            if m.revoked {
+                let refused = Json(json!({"error": "invalid_grant"}));
+                return (StatusCode::BAD_REQUEST, refused).into_response();
+            }
+            m.renewals += 1;
+            Json(json!({"access_token": "t2", "expires_in": 3599})).into_response()
+        };
+        let app = Router::new()
+            .route("/token", post(token))
+            .route("/upload/youtube/v3/videos", post(start).put(put));
         tokio::spawn(async move { axum::serve(listener, app).await });
         base
     }
@@ -696,8 +740,9 @@ mod tests {
             size: len as u64,
         };
         let mock = std::sync::Arc::new(std::sync::Mutex::new(Session::default()));
-        let mut y = YouTube::new(None).unwrap();
+        let mut y = YouTube::new(Some(("id".into(), "secret".into()))).unwrap();
         y.api_url = session(mock.clone()).await;
+        y.token_url = format!("{}/token", y.api_url);
         y.chunk = 256 * 1024;
         y.resume_wait = Duration::ZERO;
         (bytes, video, y, mock)
@@ -728,6 +773,37 @@ mod tests {
         let (last, rest) = m.chunks.split_last().unwrap();
         assert!(rest.iter().all(|(_, len)| *len == KIB_256), "{rest:?}");
         assert!(last.1 <= KIB_256);
+    }
+
+    #[tokio::test]
+    async fn a_token_that_ends_mid_upload_is_renewed_and_the_upload_goes_on() {
+        let (bytes, video, y, mock) = stored_video(4 * KIB_256).await;
+        // The token ends after two chunks; the third is refused with it.
+        mock.lock().unwrap().expires_after = Some(2);
+        let upload = y.upload("t", ("Title", ""), (&video, "video/mp4"), "private");
+        let id = REFRESH.scope(Some("r".into()), upload).await.unwrap();
+        assert_eq!(id, "vid_0123456");
+        {
+            let m = mock.lock().unwrap();
+            assert!(m.got == bytes, "YouTube holds the video, byte for byte");
+            assert_eq!(
+                (m.renewals, m.asked),
+                (1, 1),
+                "renewed once, then asked how far"
+            );
+            // The refused chunk was sent again from the session's offset, nothing twice.
+            assert_eq!(m.chunks.len(), 4);
+        }
+
+        // A refresh token Google refuses, or none at hand, is a reconnect.
+        let (_, video, y, mock) = stored_video(4 * KIB_256).await;
+        mock.lock().unwrap().expires_after = Some(2);
+        mock.lock().unwrap().revoked = true;
+        let upload = y.upload("t", ("Title", ""), (&video, "video/mp4"), "private");
+        let err = REFRESH.scope(Some("r".into()), upload).await.unwrap_err();
+        assert!(matches!(err, PostError::Reconnect));
+        let upload = y.upload("t", ("Title", ""), (&video, "video/mp4"), "private");
+        assert!(matches!(upload.await.unwrap_err(), PostError::Reconnect));
     }
 
     #[tokio::test]
