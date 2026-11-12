@@ -147,6 +147,10 @@ pub enum Fail {
     Blocked,
     /// Google Drive answered with a page, not the file: it is not shared publicly.
     NotShared,
+    /// Google Drive's "too many users have viewed or downloaded this file recently" page.
+    DriveQuota,
+    /// Google Drive kept answering with its "can't scan this file for viruses" page.
+    DriveConfirm,
     Http(u16),
     Unreachable,
     /// Over the cap it was downloaded with (`Media::max_bytes`, or a cover's limit).
@@ -324,25 +328,8 @@ impl Media {
     /// when there is no clear answer: blocked, unreachable, not 200 or 206, or bytes of no type
     /// brain stores (a sign-in page, say). Nothing is stored.
     pub async fn probe(&self, url: &str) -> Option<Probed> {
-        let drive = drive_url(url);
-        let mut url = drive.unwrap_or_else(|| url.to_owned());
-        if let Some((from, to)) = self.probe_rewrite.as_ref().filter(|_| self.allow_private) {
-            if let Some(rest) = url.strip_prefix(from.as_str()) {
-                url = format!("{to}{rest}");
-            }
-        }
-        let from = Url::parse(&url).ok()?;
-        if !public_url(&from, self.allow_private) {
-            return None;
-        }
-        let range = format!("bytes=0-{}", PROBE_LEN - 1);
-        let mut res = self
-            .client
-            .get(from)
-            .header(reqwest::header::RANGE, range)
-            .send()
-            .await
-            .ok()?;
+        let first = Instant::now() + self.probe_deadline;
+        let mut res = self.open(url, true, first).await.ok()?;
         let size = match res.status() {
             // `bytes 0-511/12345`; `*` for an unknown total.
             StatusCode::PARTIAL_CONTENT => res
@@ -531,6 +518,86 @@ impl Media {
         }
     }
 
+    /// Tests only: `url` on the mock that stands in for its host (`probe_rewrite`).
+    fn rewritten(&self, url: &str) -> String {
+        let to = self.probe_rewrite.as_ref().filter(|_| self.allow_private);
+        to.and_then(|(from, to)| Some(format!("{to}{}", url.strip_prefix(from.as_str())?)))
+            .unwrap_or_else(|| url.to_owned())
+    }
+
+    /// The answer to a GET of `url` (a Drive share link as its direct download; only its first
+    /// bytes when `probing`), started by `first`. Drive answers a large file with a page asking
+    /// to confirm the download: that page's form is followed once, to a Drive host only, and
+    /// whatever page Drive sends in place of the file is told apart here (`NotShared`,
+    /// `DriveQuota`, `DriveConfirm`). Every URL asked is public (`public_url`, `PublicOnly`).
+    async fn open(
+        &self,
+        url: &str,
+        probing: bool,
+        first: Instant,
+    ) -> Result<reqwest::Response, Fail> {
+        let drive = drive_url(url);
+        let target = |url: &str| {
+            let url = if drive.is_some() || probing {
+                self.rewritten(url)
+            } else {
+                url.to_owned()
+            };
+            let ok = |u: &Url| public_url(u, self.allow_private);
+            Url::parse(&url).ok().filter(ok).ok_or(Fail::Blocked)
+        };
+        let get = |from: Url| async move {
+            let mut req = self.client.get(from);
+            if probing {
+                req = req.header(reqwest::header::RANGE, format!("bytes=0-{}", PROBE_LEN - 1));
+            }
+            let sent = tokio::time::timeout_at(first, req.send()).await;
+            sent.map_err(|_| Fail::TimedOut)?.map_err(|e| {
+                let fail = if e.is_redirect() || blocked(&e) {
+                    Fail::Blocked
+                } else {
+                    Fail::Unreachable
+                };
+                tracing::warn!(error = %e.without_url(), "media download failed");
+                fail
+            })
+        };
+        let html = |res: &reqwest::Response| {
+            let ty = res
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok());
+            ty.is_some_and(|v| v.to_ascii_lowercase().starts_with("text/html"))
+        };
+        let mut res = get(target(drive.as_deref().unwrap_or(url))?).await?;
+        if drive.is_some() && html(&res) {
+            let status = res.status();
+            let mut page = Vec::new();
+            while page.len() < DRIVE_PAGE_BYTES {
+                let chunk = tokio::time::timeout_at(first, res.chunk()).await;
+                match chunk
+                    .map_err(|_| Fail::TimedOut)?
+                    .map_err(|_| Fail::Unreachable)?
+                {
+                    Some(chunk) => page.extend_from_slice(&chunk),
+                    None => break,
+                }
+            }
+            page.truncate(DRIVE_PAGE_BYTES);
+            match drive_page(&String::from_utf8_lossy(&page)) {
+                Ok(next) => res = get(target(next.as_str())?).await?,
+                Err(Fail::NotShared) if status != StatusCode::OK => {
+                    return Err(Fail::Http(status.as_u16()))
+                }
+                Err(fail) => return Err(fail),
+            }
+            if html(&res) {
+                return Err(Fail::DriveConfirm);
+            }
+        }
+        Ok(res)
+    }
+
     /// Streams `url` (a Drive share link as its direct download) into a new object, part by part
     /// (`PART_BYTES`), and returns its key, type and size. The answer must start within
     /// `deadline`, the file may take `deadline` plus its size at `MIN_SPEED`, never past `until`,
@@ -545,23 +612,11 @@ impl Media {
         until: Instant,
         turn: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
     ) -> Result<(String, &'static str, usize), Fail> {
-        let drive = drive_url(url);
-        let from = Url::parse(drive.as_deref().unwrap_or(url)).map_err(|_| Fail::Blocked)?;
-        if !public_url(&from, self.allow_private) {
-            return Err(Fail::Blocked);
-        }
         let started = Instant::now();
         let first = until.min(started + self.deadline);
-        let sent = tokio::time::timeout_at(first, self.client.get(from).send());
-        let mut res = sent.await.map_err(|_| Fail::TimedOut)?.map_err(|e| {
-            let fail = if e.is_redirect() || blocked(&e) {
-                Fail::Blocked
-            } else {
-                Fail::Unreachable
-            };
-            tracing::warn!(error = %e.without_url(), post = %post, "media download failed");
-            fail
-        })?;
+        let mut res = self.open(url, false, first).await.inspect_err(
+            |fail| tracing::warn!(?fail, post = %post, "media download did not start"),
+        )?;
         if res.status() != StatusCode::OK {
             return Err(Fail::Http(res.status().as_u16()));
         }
@@ -571,11 +626,6 @@ impl Media {
         let expected = res.content_length().unwrap_or(cap as u64);
         let until = until.min(started + self.deadline + Duration::from_secs(expected / MIN_SPEED));
         let stall = self.stall;
-        let html = res
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.to_ascii_lowercase().starts_with("text/html"));
         let read = |e: reqwest::Error| {
             tracing::warn!(error = %e.without_url(), post = %post, "media download failed");
             Fail::Unreachable
@@ -590,14 +640,8 @@ impl Media {
                 None => break,
             }
         }
-        let Some(content_type) = sniff(&head) else {
-            // Drive answers a file it will not hand out with a sign-in or error page.
-            return Err(if drive.is_some() && html {
-                Fail::NotShared
-            } else {
-                Fail::Unsupported
-            });
-        };
+        // A page Drive sent in place of a file never gets here (`open`).
+        let content_type = sniff(&head).ok_or(Fail::Unsupported)?;
         // Only a video is shared in a group, so nothing else keeps the group's other posts waiting.
         if !content_type.starts_with("video/") {
             turn.take();
@@ -941,6 +985,71 @@ pub fn drive_url(url: &str) -> Option<String> {
     (!id.is_empty() && id.chars().all(plain)).then(|| {
         format!("https://drive.usercontent.google.com/download?id={id}&export=download&confirm=t")
     })
+}
+
+/// The most of a Drive page that is read to tell what it is.
+const DRIVE_PAGE_BYTES: usize = 256 * 1024;
+/// Hosts the form of Drive's confirmation page may send the download to.
+const DRIVE_HOSTS: [&str; 3] = [
+    "drive.usercontent.google.com",
+    "drive.google.com",
+    "docs.google.com",
+];
+
+/// The value of attribute `name` in an HTML tag, quoted either way.
+fn attr(tag: &str, name: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        if let Some(at) = tag.find(&format!(" {name}={quote}")) {
+            let value = &tag[at + name.len() + 3..];
+            return Some(value[..value.find(quote)?].replace("&amp;", "&"));
+        }
+    }
+    None
+}
+
+/// What a page Drive sent in place of a file says: the download its "can't scan this file for
+/// viruses" form asks for (the form's action with its hidden fields: `id`, `export`, `confirm`,
+/// `uuid`, `at`), else why there is none.
+fn drive_page(page: &str) -> Result<Url, Fail> {
+    let lower = page.to_ascii_lowercase();
+    if lower.contains("too many users have viewed or downloaded")
+        || lower.contains("quota exceeded")
+    {
+        return Err(Fail::DriveQuota);
+    }
+    let Some(form) = page
+        .split("<form")
+        .skip(1)
+        .find(|f| f.contains("download-form"))
+    else {
+        return Err(if lower.contains("virus") {
+            Fail::DriveConfirm
+        } else {
+            Fail::NotShared
+        });
+    };
+    let form = form.split("</form").next().unwrap_or(form);
+    let mut tags = form.split('<').map(|t| t.split('>').next().unwrap_or(t));
+    let action = tags.next().and_then(|tag| attr(tag, "action"));
+    let mut to = action
+        .and_then(|a| Url::parse(&a).ok())
+        .ok_or(Fail::DriveConfirm)?;
+    let host = to.host_str().unwrap_or_default();
+    if to.scheme() != "https" || !DRIVE_HOSTS.contains(&host) {
+        return Err(Fail::DriveConfirm);
+    }
+    let fields: Vec<(String, String)> = tags
+        .filter(|tag| tag.starts_with("input"))
+        .filter_map(|tag| Some((attr(tag, "name")?, attr(tag, "value").unwrap_or_default())))
+        .collect();
+    if !fields
+        .iter()
+        .any(|(name, value)| name == "id" && !value.is_empty())
+    {
+        return Err(Fail::DriveConfirm);
+    }
+    to.query_pairs_mut().clear().extend_pairs(&fields);
+    Ok(to)
 }
 
 /// The type of a file by its first bytes: JPEG, PNG, GIF, WebP, MP4, MOV or PDF.
@@ -1449,6 +1558,85 @@ mod tests {
             .download(post, &format!("{base}/page"), MAX_BYTES, soon(), &mut None)
             .await;
         assert_eq!(got.unwrap_err(), Fail::Unsupported);
+    }
+
+    /// Stands in for `drive.usercontent.google.com/download`: file `big` comes only once the
+    /// confirmation form's `uuid` and `at` are sent back, `stuck` never does, `evil`'s form
+    /// points off Drive, `quota` is over its download quota and `private` asks to sign in.
+    async fn drive() -> String {
+        use axum::{extract::Query, response::IntoResponse, routing::get, Router};
+        const DRIVE: &str = "https://drive.usercontent.google.com/download";
+        let page = |id: &str, action: &str| {
+            let form = format!(
+                "<!DOCTYPE html><html><head><title>Google Drive - Virus scan warning</title>\
+                 </head><body><p>Google Drive can't scan this file for viruses.</p>\
+                 <form id=\"download-form\" action=\"{action}\" method=\"get\">\
+                 <input type=\"submit\" id=\"uc-download-link\" value=\"Download anyway\"/>\
+                 <input type=\"hidden\" name=\"id\" value=\"{id}\">\
+                 <input type=\"hidden\" name=\"export\" value=\"download\">\
+                 <input type=\"hidden\" name=\"confirm\" value=\"t\">\
+                 <input type=\"hidden\" name=\"uuid\" value=\"u-1&amp;2\">\
+                 <input type=\"hidden\" name=\"at\" value=\"tok\"></form></body></html>"
+            );
+            ([("content-type", "text/html; charset=utf-8")], form).into_response()
+        };
+        let html = |body: &'static str| ([("content-type", "text/html")], body).into_response();
+        let serve = move |Query(q): Query<HashMap<String, String>>| async move {
+            let confirmed = q.get("uuid").is_some_and(|u| u == "u-1&2")
+                && q.get("at").is_some_and(|a| a == "tok")
+                && q.get("export").is_some_and(|e| e == "download");
+            match q.get("id").map(String::as_str) {
+                Some("big") if confirmed => {
+                    let mut video = MP4_HEAD.to_vec();
+                    video.resize(300_000, 7);
+                    ([("content-type", "video/mp4")], video).into_response()
+                }
+                Some(id @ ("big" | "stuck")) => page(id, DRIVE),
+                Some("evil") => page("evil", "https://evil.test/download"),
+                Some("quota") => html(
+                    "<html><title>Google Drive - Quota exceeded</title><body>Sorry, you can't \
+                     view or download this file at this time. Too many users have viewed or \
+                     downloaded this file recently.</body></html>",
+                ),
+                _ => html("<html><body>Sign in to continue to Google Drive</body></html>"),
+            }
+        };
+        let app = Router::new().route("/download", get(serve));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        base
+    }
+
+    #[tokio::test]
+    async fn a_large_drive_file_is_fetched_through_its_confirmation_page() {
+        let mut media = Media::new(Arc::new(object_store::memory::InMemory::new()), true);
+        media.probe_rewrite = Some(("https://drive.usercontent.google.com".into(), drive().await));
+        let link = |id: &str| format!("https://drive.google.com/file/d/{id}/view?usp=sharing");
+        let post = Uuid::now_v7();
+
+        let (key, ty, size) = media
+            .download(post, &link("big"), MAX_BYTES, soon(), &mut None)
+            .await
+            .unwrap();
+        assert_eq!((ty, size), ("video/mp4", 300_000));
+        assert_eq!(media.read(&key).await.unwrap().len(), 300_000);
+        // The save-time probe gets past the page the same way.
+        let probed = media.probe(&link("big")).await.unwrap();
+        assert_eq!(probed.content_type, "video/mp4");
+
+        for (id, why) in [
+            ("quota", Fail::DriveQuota),
+            ("stuck", Fail::DriveConfirm),
+            ("evil", Fail::DriveConfirm),
+            ("private", Fail::NotShared),
+        ] {
+            let got = media
+                .download(post, &link(id), MAX_BYTES, soon(), &mut None)
+                .await;
+            assert_eq!(got.unwrap_err(), why, "{id}");
+            assert_eq!(media.probe(&link(id)).await, None, "{id}");
+        }
     }
 
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};

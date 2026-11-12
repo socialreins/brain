@@ -1430,6 +1430,16 @@ fn media_error(fail: Fail, n: usize, platform: &str, cap: usize) -> String {
             "Image {n} is a Google Drive file that is not shared publicly. Share it with \
              anyone with the link."
         ),
+        Fail::DriveQuota => format!(
+            "Image {n} is a Google Drive file that too many people viewed or downloaded \
+             recently, so Google Drive will not hand it out for now. Try again later, or use \
+             a copy of the file."
+        ),
+        Fail::DriveConfirm => format!(
+            "Image {n} is a Google Drive file too large for Drive to scan for viruses, and \
+             SocialReins could not get past Drive's confirmation page. Try again, or use \
+             another link."
+        ),
         Fail::Http(code) => format!("Image {n} could not be downloaded (HTTP {code})."),
         Fail::Unreachable => format!("Image {n} could not be downloaded."),
         Fail::TooLarge => format!(
