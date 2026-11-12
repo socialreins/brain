@@ -197,7 +197,11 @@ impl Config {
             contact_to,
             admin_emails: admin_emails(var("ADMIN_EMAILS"))?,
             review_login_token: var("REVIEW_LOGIN_TOKEN"),
-            media: Media::new(media_store(var)?, false),
+            media: {
+                let mut media = Media::new(media_store(var)?, false);
+                media.max_bytes = media_max_bytes(var("MEDIA_MAX_BYTES"))?;
+                media
+            },
             threads: Threads::new(var("THREADS_APP_ID").zip(var("THREADS_APP_SECRET")))?,
             linkedin: LinkedIn::new(var("LINKEDIN_CLIENT_ID").zip(var("LINKEDIN_CLIENT_SECRET")))?,
             youtube: YouTube::new(var("GOOGLE_CLIENT_ID").zip(var("GOOGLE_CLIENT_SECRET")))?,
@@ -266,6 +270,19 @@ fn admin_emails(raw: Option<String>) -> Result<Vec<String>, String> {
                 .ok_or_else(|| format!("ADMIN_EMAILS: not an email address: {e}"))
         })
         .collect()
+}
+
+/// `MEDIA_MAX_BYTES`: the largest video stored, in bytes. Default and most: 1 GiB
+/// (`media::MAX_BYTES`), which saving a post checks against whatever this says.
+fn media_max_bytes(value: Option<String>) -> Result<usize, String> {
+    let max = crate::media::MAX_BYTES;
+    match value.map(|v| v.trim().parse::<usize>()) {
+        None => Ok(max),
+        Some(Ok(n)) if (1..=max).contains(&n) => Ok(n),
+        Some(_) => Err(format!(
+            "MEDIA_MAX_BYTES: a number of bytes from 1 to {max}"
+        )),
+    }
 }
 
 /// The media store `Config::media` describes.
@@ -473,6 +490,17 @@ mod tests {
             assert!(with(&partial, &dir).is_err(), "without {}", full[n].0);
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_largest_video_is_a_gib_unless_lowered() {
+        let max = |v: &str| super::media_max_bytes(Some(v.into()));
+        assert_eq!(super::media_max_bytes(None), Ok(1 << 30));
+        assert_eq!(max("300000000"), Ok(300_000_000));
+        assert_eq!(max(" 1073741824 "), Ok(1 << 30));
+        for bad in ["0", "1073741825", "1GB", "-5"] {
+            assert!(max(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

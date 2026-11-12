@@ -317,11 +317,29 @@ pub struct MediaFact<'a> {
     pub animated: bool,
 }
 
-/// The largest file brain stores, whatever the platform.
+/// The largest image or PDF brain stores, whatever the platform: it is read whole to convert or
+/// upload it, so it stays small.
 pub const MAX_MEDIA_BYTES: u64 = 100_000_000;
+/// The largest video brain stores, whatever the platform: 1 GiB. A video is streamed, never
+/// held whole. `MEDIA_MAX_BYTES` can lower it for publishing, not raise it.
+pub const MAX_VIDEO_BYTES: u64 = 1 << 30;
+/// The platforms whose own limit for one video is under `MAX_VIDEO_BYTES`: the platform, its
+/// name and the most bytes it takes. The others document a limit at or over brain's (YouTube,
+/// LinkedIn, TikTok, Threads) or none this code could check (Facebook, Instagram), so brain's
+/// cap is theirs.
+pub const VIDEO_LIMITS: &[(&str, &str, u64)] =
+    &[("bluesky", "Bluesky", 100_000_000), ("x", "X", 512_000_000)];
+
+/// `platform`'s row of `VIDEO_LIMITS`: its name and byte limit.
+pub fn video_limit(platform: &str) -> Option<(&'static str, u64)> {
+    VIDEO_LIMITS
+        .iter()
+        .find(|l| l.0 == platform)
+        .map(|l| (l.1, l.2))
+}
 /// Bluesky's limit for one image.
 pub const BLUESKY_MAX_IMAGE_BYTES: u64 = 1_000_000;
-/// X's limits for an image and a GIF (a video is capped by `MAX_MEDIA_BYTES` first).
+/// X's limits for an image and a GIF (its video limit is in `VIDEO_LIMITS`).
 pub const X_MAX_IMAGE_BYTES: u64 = 5_000_000;
 pub const X_MAX_GIF_BYTES: u64 = 15_000_000;
 
@@ -422,6 +440,9 @@ fn size_limit(platform: &str, t: &str, animated: bool) -> (u64, &'static str) {
             "Bluesky's limit for an animated image",
         ),
         "x" if animated => (X_MAX_IMAGE_BYTES, "X's limit for an animated image"),
+        "bluesky" if t.starts_with("video/") => (100_000_000, "Bluesky's limit for a video"),
+        "x" if t.starts_with("video/") => (512_000_000, "X's limit for a video"),
+        _ if t.starts_with("video/") => (MAX_VIDEO_BYTES, "the largest video SocialReins takes"),
         _ => (MAX_MEDIA_BYTES, "the largest file SocialReins takes"),
     }
 }
@@ -1011,7 +1032,29 @@ mod tests {
         assert_eq!(code("x", &[f(JPEG, 5_000_001)]), Ok(()));
         assert_eq!(code("x", &[f(GIF, 14_000_000)]), Ok(()));
         assert_eq!(code("x", &[f(GIF, 15_000_001)]), Err("media_too_large"));
-        assert_eq!(code("x", &[f(MOV, 100_000_001)]), Err("media_too_large"));
+        // A video has its platform's limit where that is under brain's 1 GiB, else brain's.
+        assert_eq!(code("x", &[f(MOV, 500_000_000)]), Ok(()));
+        assert_eq!(code("x", &[f(MOV, 512_000_001)]), Err("media_too_large"));
+        assert_eq!(video_limit("x"), Some(("X", 512_000_000)));
+        assert_eq!(video_limit("bluesky"), Some(("Bluesky", 100_000_000)));
+        assert_eq!(video_limit("youtube"), None);
+        for platform in ["threads", "instagram", "facebook", "tiktok", "youtube"] {
+            assert_eq!(
+                code(platform, &[f(MP4, MAX_VIDEO_BYTES)]),
+                Ok(()),
+                "{platform}"
+            );
+            assert_eq!(
+                code(platform, &[f(MP4, MAX_VIDEO_BYTES + 1)]),
+                Err("media_too_large"),
+                "{platform}"
+            );
+        }
+        assert_eq!(code("linkedin", &[f(MP4, MAX_VIDEO_BYTES)]), Ok(()));
+        assert_eq!(
+            code("linkedin", &[f(PDF, 100_000_001)]),
+            Err("media_too_large")
+        );
         assert_eq!(image_limit("bluesky"), Some(("Bluesky", 1_000_000, 2000)));
         assert_eq!(image_limit("x").map(|l| l.1), Some(5_000_000));
         assert_eq!(image_limit("threads"), None);
@@ -1028,8 +1071,9 @@ mod tests {
             Err("media_type_not_supported")
         );
         assert_eq!(code("youtube", &[jpg]), Err("media_type_not_supported"));
+        assert_eq!(code("youtube", &[f(MOV, 500_000_000)]), Ok(()));
         assert_eq!(
-            code("youtube", &[f(MOV, 100_000_001)]),
+            code("youtube", &[f(MOV, MAX_VIDEO_BYTES + 1)]),
             Err("media_too_large")
         );
         assert_eq!(

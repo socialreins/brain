@@ -1315,7 +1315,7 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
 type Media = HashMap<String, Result<Stored, Fail>>;
 
 async fn ingest(app: &AppState, post: &posts::Model) -> Media {
-    let cap = crate::media::MAX_BYTES;
+    let cap = app.media.max_bytes;
     let thread: Vec<ThreadPart> = serde_json::from_value(post.thread.clone()).unwrap_or_default();
     let root: Vec<String> = serde_json::from_value(post.media.clone()).unwrap_or_default();
     let urls: Vec<String> = root
@@ -1380,7 +1380,7 @@ fn cover_error(fail: Fail, platform: &str, name: &str) -> String {
             "The cover image is over {} MB, the largest {name} takes.",
             cover_bytes(platform) / 1_000_000
         ),
-        f => media_error(f, 1, platform).replacen("Image 1", "The cover image", 1),
+        f => media_error(f, 1, platform, 0).replacen("Image 1", "The cover image", 1),
     }
 }
 
@@ -1423,7 +1423,7 @@ async fn load_cover(
 }
 
 /// What to tell the user about image `n` that could not be stored.
-fn media_error(fail: Fail, n: usize, platform: &str) -> String {
+fn media_error(fail: Fail, n: usize, platform: &str, cap: usize) -> String {
     match fail {
         Fail::Blocked => format!("Image {n} is not a public https URL."),
         Fail::NotShared => format!(
@@ -1433,8 +1433,12 @@ fn media_error(fail: Fail, n: usize, platform: &str) -> String {
         Fail::Http(code) => format!("Image {n} could not be downloaded (HTTP {code})."),
         Fail::Unreachable => format!("Image {n} could not be downloaded."),
         Fail::TooLarge => format!(
-            "Image {n} is over {} MB, the largest file SocialReins takes.",
-            crate::media::MAX_BYTES / 1_000_000
+            "Image {n} is over {} MB, the largest video SocialReins takes.",
+            cap / 1_000_000
+        ),
+        Fail::TooLargeStill => format!(
+            "Image {n} is over {} MB, the largest image or document SocialReins takes.",
+            crate::media::MAX_STILL_BYTES / 1_000_000
         ),
         Fail::Unsupported if platform == "linkedin" => {
             format!("Image {n} is not a JPEG, PNG or GIF image, an MP4 video or a PDF.")
@@ -1457,7 +1461,7 @@ fn media_problem(
     media: &Media,
     root: &[String],
     thread: &[ThreadPart],
-    platform: &str,
+    (platform, cap): (&str, usize),
 ) -> Option<String> {
     let first = |urls: &[String]| {
         let video = |u: &String| matches!(media.get(u), Some(Ok(s)) if s.content_type.starts_with("video/"));
@@ -1467,11 +1471,22 @@ fn media_problem(
         urls.iter()
             .enumerate()
             .find_map(|(i, u)| match media.get(u) {
-                Some(Err(f)) => Some(media_error(*f, i + 1, platform)),
+                Some(Err(f)) => Some(media_error(*f, i + 1, platform, cap)),
+                // A video over the platform's own limit, where that is under brain's.
+                Some(Ok(s)) if s.content_type.starts_with("video/") => {
+                    let (name, max) = socialreins_core::post::video_limit(platform)?;
+                    (s.size > max as i64).then(|| {
+                        format!(
+                            "Video {} is over {} MB, {name}'s limit for a video.",
+                            i + 1,
+                            max / 1_000_000
+                        )
+                    })
+                }
                 // Only known once stored, and `ingest` shrinks what it can: this is an image
                 // that could not be (a GIF or other animation, one that does not decode, one
                 // over 25 megapixels), or a file that is no image (a PDF).
-                Some(Ok(s)) if !s.content_type.starts_with("video/") => {
+                Some(Ok(s)) => {
                     let (name, max, _) = socialreins_core::post::image_limit(platform)?;
                     let gif = s.content_type == "image/gif";
                     // X takes a larger GIF, and its connector checks that.
@@ -1512,7 +1527,7 @@ async fn load(
     for (i, url) in urls.iter().enumerate() {
         let n = i + 1;
         let Some(Ok(s)) = media.get(url) else {
-            return Err(media_error(Fail::Storage, n, platform));
+            return Err(media_error(Fail::Storage, n, platform, 0));
         };
         let bytes = if by_url {
             Vec::new()
@@ -1521,7 +1536,7 @@ async fn load(
                 Ok(bytes) => bytes,
                 Err(e) => {
                     tracing::warn!(error = %e, "stored media read failed");
-                    return Err(media_error(Fail::Storage, n, platform));
+                    return Err(media_error(Fail::Storage, n, platform, 0));
                 }
             }
         };
@@ -1703,7 +1718,8 @@ async fn publish_target(
     };
     let media: Vec<String> = serde_json::from_value(post.media.clone()).unwrap_or_default();
     let thread: Vec<ThreadPart> = serde_json::from_value(post.thread.clone()).unwrap_or_default();
-    if let Some(msg) = media_problem(stored, &media, &thread, &post.platform) {
+    let limits = (post.platform.as_str(), app.media.max_bytes);
+    if let Some(msg) = media_problem(stored, &media, &thread, limits) {
         return fail_target(db, id, &msg).await;
     }
     let cover = match load_cover(app, publisher, post, (stored, &media)).await {
@@ -2222,7 +2238,7 @@ mod tests {
                 size: 6_000_000,
             };
             let media = Media::from([(url.clone(), Ok(file))]);
-            media_problem(&media, std::slice::from_ref(&url), &[], platform)
+            media_problem(&media, std::slice::from_ref(&url), &[], (platform, 0))
         };
         assert_eq!(
             problem("image/webp", "bluesky").as_deref(),
@@ -2239,6 +2255,25 @@ mod tests {
         // X's connector checks its larger GIF limit, a video has its own, Threads has none.
         assert_eq!(problem("image/gif", "x"), None);
         assert_eq!(problem("video/mp4", "bluesky"), None);
+        let video = |size: i64, platform: &str| {
+            let file = Stored {
+                key: "k".into(),
+                content_type: "video/mp4".into(),
+                size,
+            };
+            let media = Media::from([(url.clone(), Ok(file))]);
+            media_problem(&media, std::slice::from_ref(&url), &[], (platform, 0))
+        };
+        assert_eq!(
+            video(100_000_001, "bluesky").as_deref(),
+            Some("Video 1 is over 100 MB, Bluesky's limit for a video.")
+        );
+        assert_eq!(
+            video(512_000_001, "x").as_deref(),
+            Some("Video 1 is over 512 MB, X's limit for a video.")
+        );
+        assert_eq!(video(512_000_000, "x"), None);
+        assert_eq!(video(1 << 30, "youtube"), None);
         assert_eq!(problem("application/pdf", "threads"), None);
     }
 }

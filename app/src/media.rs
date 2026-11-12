@@ -18,9 +18,12 @@ use uuid::Uuid;
 
 use crate::{connectors::bluesky::PublicOnly, state::AppState, webhooks::public_url};
 
-/// The largest file brain stores, whatever the platform, unless `MEDIA_MAX_BYTES` lowers it
+/// The largest video brain stores, whatever the platform, unless `MEDIA_MAX_BYTES` lowers it
 /// (`Media::max_bytes`): 1 GiB.
-pub const MAX_BYTES: usize = 1 << 30;
+pub const MAX_BYTES: usize = socialreins_core::post::MAX_VIDEO_BYTES as usize;
+/// The largest file that is not a video (an image, a PDF): it is read whole to convert or
+/// upload it, so it keeps the cap every file had before videos were streamed.
+pub const MAX_STILL_BYTES: usize = socialreins_core::post::MAX_MEDIA_BYTES as usize;
 /// Files older than this whose post no longer waits to publish are deleted by the sweep.
 pub const SWEEP_DAYS: i32 = 7;
 const MAX_REDIRECTS: usize = 3;
@@ -58,6 +61,8 @@ pub struct Media {
     pub store: Arc<dyn ObjectStore>,
     client: reqwest::Client,
     allow_private: bool,
+    /// The largest video stored: `MAX_BYTES`, or `MEDIA_MAX_BYTES` when that is lower.
+    pub max_bytes: usize,
     /// `INGEST_DEADLINE`; tests shorten it.
     pub deadline: Duration,
     /// `INGEST_CEILING`; tests shorten it.
@@ -94,7 +99,10 @@ pub enum Fail {
     NotShared,
     Http(u16),
     Unreachable,
+    /// Over the cap it was downloaded with (`Media::max_bytes`, or a cover's limit).
     TooLarge,
+    /// Not a video, and over `MAX_STILL_BYTES`.
+    TooLargeStill,
     /// Not a JPEG, PNG, WebP, GIF, MP4, MOV or PDF.
     Unsupported,
     Storage,
@@ -139,6 +147,7 @@ impl Media {
             store,
             client,
             allow_private,
+            max_bytes: MAX_BYTES,
             deadline: INGEST_DEADLINE,
             ceiling: INGEST_CEILING,
             stall: STALL,
@@ -272,7 +281,8 @@ impl Media {
     }
 
     /// The stored copy of `url` for `post`: the one an earlier try saved, else downloaded now,
-    /// at most `cap` bytes (and never over `MAX_BYTES`), by `until`. A row whose file is gone is
+    /// at most `cap` bytes (and never over `max_bytes`, or `MAX_STILL_BYTES` unless it is a
+    /// video), by `until`. A row whose file is gone is
     /// a miss: it is deleted and the URL downloaded again.
     pub async fn ingest(
         &self,
@@ -307,7 +317,9 @@ impl Media {
                 _ => return Ok(s),
             }
         }
-        let got = self.download(post, url, cap.min(MAX_BYTES), until).await;
+        let got = self
+            .download(post, url, cap.min(self.max_bytes), until)
+            .await;
         let (key, content_type, size) = got?;
         // A run that stored the same URL first wins; this copy is then deleted.
         let saved = db
@@ -403,9 +415,15 @@ impl Media {
                 Fail::Unsupported
             });
         };
+        // Only a video may pass `MAX_STILL_BYTES`: anything else is read whole later.
+        let (cap, over) = if content_type.starts_with("video/") || cap <= MAX_STILL_BYTES {
+            (cap, Fail::TooLarge)
+        } else {
+            (MAX_STILL_BYTES, Fail::TooLargeStill)
+        };
         let mut size = head.len();
-        if size > cap {
-            return Err(Fail::TooLarge);
+        if size > cap || res.content_length().is_some_and(|n| n > cap as u64) {
+            return Err(over);
         }
         let key = format!("posts/{post}/{}", Uuid::now_v7());
         let upload = self
@@ -423,7 +441,7 @@ impl Media {
                 };
                 size += chunk.len();
                 if size > cap {
-                    return Err(Fail::TooLarge);
+                    return Err(over);
                 }
                 // Storage slower than the download holds the download back, not the bytes.
                 file.wait_for_capacity(PARTS_IN_FLIGHT)
@@ -1494,6 +1512,59 @@ mod tests {
             .unwrap_or_default();
         assert!(left.is_empty(), "{left:?}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_a_video_may_be_larger_than_an_image_or_a_pdf() {
+        use axum::{routing::get, Router};
+        // A PNG one byte over the cap of files that are not videos, sized and unsized.
+        let big = || {
+            let mut sent = 0;
+            axum::body::Body::from_stream(stream::poll_fn(move |_| {
+                let chunk = if sent == 0 {
+                    png(65_536)
+                } else {
+                    vec![7; (1 << 20).min(MAX_STILL_BYTES + 1 - sent)]
+                };
+                sent += chunk.len();
+                std::task::Poll::Ready(
+                    (!chunk.is_empty()).then_some(Ok::<_, std::io::Error>(chunk)),
+                )
+            }))
+        };
+        let len = (MAX_STILL_BYTES + 1).to_string();
+        let app = Router::new()
+            .route(
+                "/sized.png",
+                get(move || async move { ([("content-length", len)], big()) }),
+            )
+            .route("/unsized.png", get(move || async move { big() }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let store = Arc::new(Counting::default());
+        let mut media = Media::new(store.clone(), true);
+        for path in ["/sized.png", "/unsized.png"] {
+            let got = media
+                .download(Uuid::now_v7(), &format!("{base}{path}"), MAX_BYTES, soon())
+                .await;
+            assert_eq!(got.unwrap_err(), Fail::TooLargeStill, "{path}");
+        }
+        let stored = store.inner.list_with_delimiter(None).await.unwrap();
+        assert!(stored.objects.is_empty() && stored.common_prefixes.is_empty());
+
+        // `MEDIA_MAX_BYTES` lowers the cap of a video, through `ingest`'s `max_bytes`.
+        media.max_bytes = 1_000_000;
+        let base = video_server(1_000_001, store.sent.clone()).await;
+        let got = media
+            .download(
+                Uuid::now_v7(),
+                &format!("{base}/sized.mp4"),
+                media.max_bytes,
+                soon(),
+            )
+            .await;
+        assert_eq!(got.unwrap_err(), Fail::TooLarge);
     }
 
     #[tokio::test]
