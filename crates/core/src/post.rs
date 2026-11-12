@@ -453,7 +453,7 @@ pub struct MediaFact<'a> {
 /// upload it, so it stays small.
 pub const MAX_MEDIA_BYTES: u64 = 100_000_000;
 /// The largest video brain stores, whatever the platform: 1 GiB. A video is streamed, never
-/// held whole. `MEDIA_MAX_BYTES` can lower it for publishing, not raise it.
+/// held whole. `MEDIA_MAX_BYTES` can lower it, not raise it (`check_media_facts_within`).
 pub const MAX_VIDEO_BYTES: u64 = 1 << 30;
 /// The platforms whose own limit for one video is under `MAX_VIDEO_BYTES`: the platform, its
 /// name and the most bytes it takes. The others document a limit at or over brain's (YouTube,
@@ -601,6 +601,16 @@ pub fn validate_media_facts(
 /// Every problem `validate_media_facts` could answer, in its order: each file's (its type, else
 /// its size), then a mix.
 pub fn check_media_facts(platform: &str, facts: &[Option<MediaFact>]) -> Vec<Problem> {
+    check_media_facts_within(platform, facts, MAX_VIDEO_BYTES)
+}
+
+/// `check_media_facts` where brain's own cap for a video is `cap` (`MEDIA_MAX_BYTES`), which
+/// only ever lowers a video's limit: images and PDFs keep theirs.
+pub fn check_media_facts_within(
+    platform: &str,
+    facts: &[Option<MediaFact>],
+    cap: u64,
+) -> Vec<Problem> {
     let (types, what) = media_types(platform);
     let mut found = Vec::new();
     for (i, f) in facts.iter().enumerate() {
@@ -613,7 +623,10 @@ pub fn check_media_facts(platform: &str, facts: &[Option<MediaFact>]) -> Vec<Pro
             });
             continue;
         }
-        let (max, whose) = size_limit(platform, f.content_type, f.animated);
+        let (mut max, mut whose) = size_limit(platform, f.content_type, f.animated);
+        if f.content_type.starts_with("video/") && cap < max {
+            (max, whose) = (cap, "the largest video SocialReins takes");
+        }
         if let Some(size) = f.size.filter(|s| *s > max) {
             let mb = max / 1_000_000;
             let detail = format!("Media {n} is over {mb} MB, {whose}.");
@@ -1220,6 +1233,14 @@ mod tests {
             (over[0].limit, over[0].actual),
             (Some(MAX_VIDEO_BYTES), Some(MAX_VIDEO_BYTES + 7))
         );
+        // A lower `MEDIA_MAX_BYTES` is the limit of a video on every platform, never an image's.
+        let over = check_media_facts_within("x", &[f(MOV, 50_000_001)], 50_000_000);
+        assert_eq!(
+            (over[0].limit, over[0].actual),
+            (Some(50_000_000), Some(50_000_001))
+        );
+        assert!(check_media_facts_within("x", &[f(PNG, 60_000_000)], 50_000_000).is_empty());
+        assert!(check_media_facts_within("x", &[f(MOV, 50_000_000)], 50_000_000).is_empty());
         assert_eq!(video_limit("x"), Some(("X", 512_000_000)));
         assert_eq!(video_limit("bluesky"), Some(("Bluesky", 100_000_000)));
         assert_eq!(video_limit("youtube"), None);

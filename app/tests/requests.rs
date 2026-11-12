@@ -4152,6 +4152,11 @@ mod teams {
 
             /// A brain on the mock, with its state for driving the publish pipeline directly.
             async fn on_mock() -> (TestServer, DatabaseConnection, AppState) {
+                on_mock_capped(socialreins_brain::media::MAX_BYTES).await
+            }
+
+            /// `on_mock` with `MEDIA_MAX_BYTES` set to `cap`.
+            async fn on_mock_capped(cap: usize) -> (TestServer, DatabaseConnection, AppState) {
                 let base = mock_bluesky().await;
                 let mut config = Config::from_env().expect("test config");
                 config.trust_proxy = true;
@@ -4165,6 +4170,7 @@ mod teams {
                 config.media = Media::new(std::sync::Arc::new(disk), true);
                 // Saved media URLs are https: `https://media.test/...` is probed on the mock.
                 config.media.probe_rewrite = Some((PROBED.into(), base));
+                config.media.max_bytes = cap;
                 let db = socialreins_brain::connect(&config)
                     .await
                     .expect("database reachable");
@@ -4754,6 +4760,29 @@ mod teams {
                 assert_eq!(body["targets"][0]["status"], "deleted");
                 let res = req(&s, Method::DELETE, &path, &cookie).await;
                 res.assert_status_ok();
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_video_over_the_configured_cap_is_refused_when_saved() {
+                // `MEDIA_MAX_BYTES` under the mock's clip, and far under its image.
+                let (s, db, _) = on_mock_capped(50).await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let with = |path: &str| {
+                    let mut v = input(&set, "hi", None);
+                    v["media"] = json!([format!("{PROBED}{path}")]);
+                    v
+                };
+                let res = create(&s, &cookie, with("/clip.mp4")).await;
+                assert_eq!(res.status_code(), 422, "{}", res.text());
+                let body = res.json::<Value>();
+                assert_eq!(body["error"], "media_too_large", "{body}");
+                assert_eq!(body["limit"], 50, "{body}");
+                assert!(body["actual"].as_u64().unwrap() > 50, "{body}");
+                // The cap is a video's only.
+                let res = create(&s, &cookie, with("/img.png")).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
             }
 
             #[tokio::test]

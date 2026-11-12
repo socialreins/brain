@@ -115,7 +115,8 @@ pub struct Media {
     pub store: Arc<dyn ObjectStore>,
     client: reqwest::Client,
     allow_private: bool,
-    /// The largest video stored: `MAX_BYTES`, or `MEDIA_MAX_BYTES` when that is lower.
+    /// The largest video stored: `MAX_BYTES`, or `MEDIA_MAX_BYTES` when that is lower. Only a
+    /// video's cap: an image or a PDF keeps `MAX_STILL_BYTES`.
     pub max_bytes: usize,
     /// `INGEST_DEADLINE`; tests shorten it.
     pub deadline: Duration,
@@ -442,13 +443,13 @@ impl Media {
                 _ => return Ok(s),
             }
         }
-        let cap = cap.min(self.max_bytes);
         let mut turn = None;
         let mut copy = None;
         if let Some(group) = group {
             let wait = tokio::time::timeout_at(until, turn_of(group, url).lock_owned());
             turn = Some(wait.await.map_err(|_| Fail::TimedOut)?);
-            copy = self.copied(db, post, url, cap, until).await;
+            let video_cap = cap.min(self.max_bytes);
+            copy = self.copied(db, post, url, video_cap, until).await;
         }
         let (key, content_type, size) = match copy {
             Some(copy) => copy,
@@ -624,8 +625,15 @@ impl Media {
         if res.status() != StatusCode::OK {
             return Err(Fail::Http(res.status().as_u16()));
         }
-        if res.content_length().is_some_and(|n| n > cap as u64) {
-            return Err(Fail::TooLarge);
+        // `max_bytes` caps a video only, and nothing says yet whether this is one.
+        let video_cap = cap.min(self.max_bytes);
+        let any_cap = video_cap.max(cap.min(MAX_STILL_BYTES));
+        if res.content_length().is_some_and(|n| n > any_cap as u64) {
+            return Err(if any_cap == video_cap {
+                Fail::TooLarge
+            } else {
+                Fail::TooLargeStill
+            });
         }
         let expected = res.content_length().unwrap_or(cap as u64);
         let until = until.min(started + self.deadline + Duration::from_secs(expected / MIN_SPEED));
@@ -651,7 +659,9 @@ impl Media {
             turn.take();
         }
         // Only a video may pass `MAX_STILL_BYTES`: anything else is read whole later.
-        let (cap, over) = if content_type.starts_with("video/") || cap <= MAX_STILL_BYTES {
+        let (cap, over) = if content_type.starts_with("video/") {
+            (video_cap, Fail::TooLarge)
+        } else if cap <= MAX_STILL_BYTES {
             (cap, Fail::TooLarge)
         } else {
             (MAX_STILL_BYTES, Fail::TooLargeStill)
@@ -1993,19 +2003,32 @@ mod tests {
         let stored = store.inner.list_with_delimiter(None).await.unwrap();
         assert!(stored.objects.is_empty() && stored.common_prefixes.is_empty());
 
-        // `MEDIA_MAX_BYTES` lowers the cap of a video, through `ingest`'s `max_bytes`.
-        media.max_bytes = 1_000_000;
-        let base = video_server(1_000_001, store.sent.clone()).await;
+        // `MEDIA_MAX_BYTES` lowers the cap of a video (`max_bytes`), sized or not, and never
+        // an image's: the 100 KB PNG is over it and still stored.
+        media.max_bytes = 50_000;
+        let base = video_server(50_001, store.sent.clone()).await;
+        for path in ["/sized.mp4", "/unsized.mp4"] {
+            let got = media
+                .download(
+                    Uuid::now_v7(),
+                    &format!("{base}{path}"),
+                    MAX_BYTES,
+                    soon(),
+                    &mut None,
+                )
+                .await;
+            assert_eq!(got.unwrap_err(), Fail::TooLarge, "{path}");
+        }
         let got = media
             .download(
                 Uuid::now_v7(),
-                &format!("{base}/sized.mp4"),
-                media.max_bytes,
+                &format!("{}/ok.png", server().await),
+                MAX_BYTES,
                 soon(),
                 &mut None,
             )
             .await;
-        assert_eq!(got.unwrap_err(), Fail::TooLarge);
+        assert_eq!(got.unwrap().2, 100_000);
     }
 
     #[tokio::test]

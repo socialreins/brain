@@ -796,8 +796,9 @@ async fn probe(app: &AppState, urls: &[String]) -> HashMap<String, Probed> {
 }
 
 /// Every problem in what the probes found of the post's media and cover, by its platform's
-/// rules: the post's media, each thread part's, then the cover.
-fn media_problems(d: &Draft<'_>, probed: &HashMap<String, Probed>) -> Vec<Problem> {
+/// rules: the post's media, each thread part's, then the cover. `cap` is the configured
+/// video cap (`Media::max_bytes`), so a video over it is refused here, not at publish.
+fn media_problems(d: &Draft<'_>, probed: &HashMap<String, Probed>, cap: u64) -> Vec<Problem> {
     let fact = |u: &str| {
         probed.get(u).map(|p| post::MediaFact {
             content_type: p.content_type,
@@ -806,9 +807,9 @@ fn media_problems(d: &Draft<'_>, probed: &HashMap<String, Probed>) -> Vec<Proble
         })
     };
     let facts = |m: &[String]| m.iter().map(|u| fact(u)).collect::<Vec<_>>();
-    let mut found = post::check_media_facts(d.platform, &facts(d.media));
+    let mut found = post::check_media_facts_within(d.platform, &facts(d.media), cap);
     for (i, p) in d.thread.iter().enumerate() {
-        let part = post::check_media_facts(d.platform, &facts(&p.media));
+        let part = post::check_media_facts_within(d.platform, &facts(&p.media), cap);
         found.extend(part.into_iter().map(|x| post::Problem {
             part: Some(i + 1),
             ..x
@@ -841,7 +842,8 @@ async fn preflight(
     d: Draft<'_>,
     only: Option<&[Uuid]>,
 ) -> Result<Option<Response>, DbErr> {
-    if let Some(p) = media_problems(&d, &probe(app, &draft_urls(&d)).await).first() {
+    let probed = probe(app, &draft_urls(&d)).await;
+    if let Some(p) = media_problems(&d, &probed, app.media.max_bytes as u64).first() {
         return Ok(Some(refusal(d.platform, p)));
     }
     Ok(match tiktok_level(&d) {
@@ -1176,7 +1178,7 @@ async fn examine(
             continue;
         }
         let cover = has(c, "cover");
-        let mut found = media_problems(&Draft::from(&c.input), &probed);
+        let mut found = media_problems(&Draft::from(&c.input), &probed, app.media.max_bytes as u64);
         found.retain(|p| !(cover && p.field.as_deref() == Some("cover")));
         c.probes = found;
     }

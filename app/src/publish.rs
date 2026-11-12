@@ -1370,7 +1370,8 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
 type Media = HashMap<String, Result<Stored, Fail>>;
 
 async fn ingest(app: &AppState, post: &posts::Model) -> Media {
-    let cap = app.media.max_bytes;
+    // No cap of the post's own: `Media` holds a video to `max_bytes`, anything else to 100 MB.
+    let cap = crate::media::MAX_BYTES;
     let thread: Vec<ThreadPart> = serde_json::from_value(post.thread.clone()).unwrap_or_default();
     let root: Vec<String> = serde_json::from_value(post.media.clone()).unwrap_or_default();
     let urls: Vec<String> = root
