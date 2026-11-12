@@ -9,7 +9,9 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use tokio::time::Instant;
 
-use object_store::{path::Path, ObjectStore, WriteMultipart};
+use object_store::{
+    path::Path, MultipartUpload, ObjectStore, PutPayload, PutResult, UploadPart, WriteMultipart,
+};
 use reqwest::{header::CONTENT_TYPE, StatusCode, Url};
 use sea_orm::{
     ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait, Value,
@@ -76,6 +78,31 @@ fn turn_of(group: Uuid, url: &str) -> Arc<Turn> {
         new
     })
 }
+/// A multipart upload that can still be aborted once `WriteMultipart::finish` has taken it:
+/// `finish` leaves the upload open when its last part fails, and in a bucket the parts sent
+/// before it would stay, and be billed, until a lifecycle rule removed them.
+#[derive(Debug, Clone)]
+struct Upload(Arc<tokio::sync::Mutex<Box<dyn MultipartUpload>>>);
+
+#[async_trait::async_trait]
+impl MultipartUpload for Upload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        // Never held here: `abort` and `complete` run only once no part is being added.
+        match self.0.try_lock() {
+            Ok(mut upload) => upload.put_part(data),
+            Err(_) => Box::pin(async { Err(object_store::Error::NotImplemented) }),
+        }
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        self.0.lock().await.complete().await
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.0.lock().await.abort().await
+    }
+}
+
 const SWEEP_LOCK: i64 = 0x004d_4544_4941_5357;
 
 /// The store and the client that downloads into it.
@@ -591,7 +618,8 @@ impl Media {
             .put_multipart(&Path::from(key.as_str()))
             .await
             .map_err(storage)?;
-        let mut file = WriteMultipart::new_with_chunk_size(upload, PART_BYTES);
+        let mut upload = Upload(Arc::new(tokio::sync::Mutex::new(upload)));
+        let mut file = WriteMultipart::new_with_chunk_size(Box::new(upload.clone()), PART_BYTES);
         file.write(&head);
         let streamed = async {
             loop {
@@ -615,7 +643,13 @@ impl Media {
             .await
             .unwrap_or(Err(Fail::TimedOut));
         match streamed {
-            Ok(()) => file.finish().await.map_err(storage)?,
+            Ok(()) => {
+                if let Err(e) = file.finish().await {
+                    // A second abort after `finish` made its own is refused, which is fine.
+                    let _ = upload.abort().await;
+                    return Err(storage(e));
+                }
+            }
             Err(e) => {
                 let _ = file.abort().await;
                 return Err(e);
@@ -1501,6 +1535,8 @@ mod tests {
         peak: Arc<AtomicUsize>,
         largest: Arc<AtomicUsize>,
         aborted: Arc<AtomicUsize>,
+        /// Not zero: every part fails to store.
+        failing: Arc<AtomicUsize>,
     }
 
     impl std::fmt::Display for Counting {
@@ -1517,6 +1553,7 @@ mod tests {
         peak: Arc<AtomicUsize>,
         largest: Arc<AtomicUsize>,
         aborted: Arc<AtomicUsize>,
+        failing: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -1530,8 +1567,12 @@ mod tests {
                 .saturating_sub(self.done.load(SeqCst));
             self.peak.fetch_max(waiting, SeqCst);
             let (part, done) = (self.inner.put_part(data), self.done.clone());
+            let failing = self.failing.load(SeqCst) != 0;
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_millis(20)).await;
+                if failing {
+                    return Err(object_store::Error::NotImplemented);
+                }
                 part.await?;
                 done.fetch_add(len, SeqCst);
                 Ok(())
@@ -1571,6 +1612,7 @@ mod tests {
                 peak: self.peak.clone(),
                 largest: self.largest.clone(),
                 aborted: self.aborted.clone(),
+                failing: self.failing.clone(),
             }))
         }
 
@@ -1684,6 +1726,34 @@ mod tests {
             .unwrap_or_default();
         assert!(left.is_empty(), "{left:?}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_download_the_store_does_not_take_aborts_its_upload() {
+        // One part, sent only as the upload is finished, and several, the first failing midway:
+        // either way the upload is aborted, so a bucket keeps no parts of it.
+        for (len, path) in [(100_000, "/sized.mp4"), (3 * PART_BYTES, "/unsized.mp4")] {
+            let store = Arc::new(Counting::default());
+            store.failing.store(1, SeqCst);
+            let base = video_server(len, store.sent.clone()).await;
+            let media = Media::new(store.clone(), true);
+            let got = media
+                .download(
+                    Uuid::now_v7(),
+                    &format!("{base}{path}"),
+                    MAX_BYTES,
+                    soon(),
+                    &mut None,
+                )
+                .await;
+            assert_eq!(got.unwrap_err(), Fail::Storage, "{len}");
+            assert!(
+                store.aborted.load(SeqCst) >= 1,
+                "{len}: the upload was aborted"
+            );
+            let stored = store.inner.list_with_delimiter(None).await.unwrap();
+            assert!(stored.objects.is_empty() && stored.common_prefixes.is_empty());
+        }
     }
 
     #[tokio::test]
