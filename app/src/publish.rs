@@ -1346,8 +1346,26 @@ async fn ingest(app: &AppState, post: &posts::Model) -> Media {
             }
         }
     }
+    // A still image over the platform's limit for one is shrunk to fit; one within it keeps its
+    // bytes. A GIF is never re-encoded, nor an animated WebP or PNG (`media::fit` leaves it),
+    // and one that does not fit is refused by `media_problem`.
+    if let Some((_, max, side)) = socialreins_core::post::image_limit(&post.platform) {
+        for (url, got) in found.iter_mut() {
+            if let Ok(file) = got {
+                if STILL.contains(&file.content_type.as_str()) && file.size > max as i64 {
+                    let limits = (max as usize, side);
+                    *file = (app.media)
+                        .fitted(&app.db, (post.id, url), file.clone(), limits)
+                        .await;
+                }
+            }
+        }
+    }
     found
 }
+
+/// The image types `media::fit` shrinks.
+const STILL: [&str; 3] = ["image/jpeg", "image/png", "image/webp"];
 
 /// The largest cover image stored for `platform`, as its API documents: Instagram 8 MB, Facebook
 /// 10 MB, YouTube 2 MB (the limit YouTube states for thumbnails).
@@ -1446,13 +1464,27 @@ fn media_problem(
             .enumerate()
             .find_map(|(i, u)| match media.get(u) {
                 Some(Err(f)) => Some(media_error(*f, i + 1, platform)),
-                // Only known once stored: a Bluesky video may be 100 MB, an image 1 MB.
-                Some(Ok(s))
-                    if platform == "bluesky"
-                        && !s.content_type.starts_with("video/")
-                        && s.size > bluesky::MAX_IMAGE_BYTES as i64 =>
-                {
-                    Some(format!("Image {} is over 1 MB, Bluesky's limit.", i + 1))
+                // Only known once stored, and `ingest` shrinks what it can: this is an image
+                // that could not be (a GIF or other animation, one that does not decode, one
+                // over 25 megapixels), or a file that is no image (a PDF).
+                Some(Ok(s)) if !s.content_type.starts_with("video/") => {
+                    let (name, max, _) = socialreins_core::post::image_limit(platform)?;
+                    let gif = s.content_type == "image/gif";
+                    // X takes a larger GIF, and its connector checks that.
+                    if s.size <= max as i64 || (gif && platform == "x") {
+                        return None;
+                    }
+                    let (n, mb) = (i + 1, max / 1_000_000);
+                    Some(if gif {
+                        format!("Image {n} is a GIF over {mb} MB, {name}'s limit.")
+                    } else if s.content_type.starts_with("image/") {
+                        format!(
+                            "Image {n} is over {mb} MB, {name}'s limit, and could not be made \
+                             smaller."
+                        )
+                    } else {
+                        format!("File {n} is over {mb} MB, {name}'s limit.")
+                    })
                 }
                 _ => None,
             })
@@ -2174,5 +2206,35 @@ mod tests {
             assert!(!outcome_unknown(Some(sure)), "{sure}");
         }
         assert!(!outcome_unknown(None));
+    }
+
+    #[test]
+    fn a_file_over_the_image_limit_is_named_for_what_it_is() {
+        let url = "https://a.example/1".to_owned();
+        let problem = |content_type: &str, platform: &str| {
+            let file = Stored {
+                key: "k".into(),
+                content_type: content_type.into(),
+                size: 6_000_000,
+            };
+            let media = Media::from([(url.clone(), Ok(file))]);
+            media_problem(&media, std::slice::from_ref(&url), &[], platform)
+        };
+        assert_eq!(
+            problem("image/webp", "bluesky").as_deref(),
+            Some("Image 1 is over 1 MB, Bluesky's limit, and could not be made smaller.")
+        );
+        assert_eq!(
+            problem("application/pdf", "x").as_deref(),
+            Some("File 1 is over 5 MB, X's limit.")
+        );
+        assert_eq!(
+            problem("image/gif", "bluesky").as_deref(),
+            Some("Image 1 is a GIF over 1 MB, Bluesky's limit.")
+        );
+        // X's connector checks its larger GIF limit, a video has its own, Threads has none.
+        assert_eq!(problem("image/gif", "x"), None);
+        assert_eq!(problem("video/mp4", "bluesky"), None);
+        assert_eq!(problem("application/pdf", "threads"), None);
     }
 }

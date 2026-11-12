@@ -66,8 +66,8 @@ pub struct Post {
     pub platform: String,
     pub body: String,
     /// Public `https://` image URLs; Google Drive share links work when the file is shared
-    /// with anyone with the link. Downloaded when the post publishes (JPEG, PNG, WebP or GIF, at
-    /// most 1 MB each on Bluesky) and deleted once it settles.
+    /// with anyone with the link. Downloaded when the post publishes (JPEG, PNG, WebP or GIF; a
+    /// still image over 1 MB is shrunk to fit Bluesky, an animated one is not) and deleted once it settles.
     pub media: Vec<String>,
     /// Follow-up posts, each a reply to the one before.
     pub thread: Vec<ThreadPart>,
@@ -184,8 +184,8 @@ pub struct PostInput {
     /// (`Image N is a PDF...`) before posting, and a PDF next to other media fails it too. At most
     /// 100 MB.
     ///
-    /// Public `https://` media URLs: on Bluesky at most 4 images (JPEG, PNG, WebP or GIF, 1 MB
-    /// each), on Threads at most 20 JPEG or PNG images or MP4 or MOV videos, on LinkedIn at most 20 JPEG, PNG or GIF images or one MP4 video, on Facebook at most
+    /// Public `https://` media URLs: on Bluesky at most 4 images (JPEG, PNG, WebP or GIF; a
+    /// GIF at most 1 MB), on Threads at most 20 JPEG or PNG images or MP4 or MOV videos, on LinkedIn at most 20 JPEG, PNG or GIF images or one MP4 video, on Facebook at most
     /// 10 JPEG, PNG or GIF images or one MP4 or MOV video (a Reel), on Instagram 1 to 20 JPEG
     /// images or MP4 or MOV videos (`media_required` without one), on YouTube exactly one MP4 or
     /// MOV video (`media_required` without one), on X at most 4 JPEG, PNG or WebP images, or one
@@ -195,7 +195,8 @@ pub struct PostInput {
     /// Each file is probed when the post is saved (its first bytes and size): a type the
     /// platform does not take is `media_type_not_supported`, a video (or PDF, or GIF on X) next
     /// to other media where the platform takes it alone `mixed_media`, a file over a limit
-    /// `media_too_large`, each `422 {"error", "platform", "detail"}`. A file no probe could
+    /// `media_too_large`, each `422 {"error", "platform", "detail"}`. A JPEG, PNG or WebP over
+    /// Bluesky's 1 MB or X's 5 MB is not refused: publishing re-encodes it as a JPEG that fits (upright, its colour profile kept). An animated WebP or PNG over that limit is refused like a GIF, since it would lose its animation. A file no probe could
     /// answer for is not refused; publishing checks it.
     #[serde(default)]
     pub media: Vec<String>,
@@ -684,6 +685,7 @@ fn media_refusal(d: &Draft<'_>, probed: &HashMap<String, Probed>) -> Option<Resp
         probed.get(u).map(|p| post::MediaFact {
             content_type: p.content_type,
             size: p.size,
+            animated: p.animated,
         })
     };
     let facts = |m: &[String]| m.iter().map(|u| fact(u)).collect::<Vec<_>>();

@@ -29,7 +29,7 @@ const CHUNK: usize = 4_000_000;
 pub const IMAGE_TYPES: [&str; 3] = ["image/jpeg", "image/png", "image/webp"];
 pub const GIF_TYPE: &str = "image/gif";
 pub const VIDEO_TYPES: [&str; 2] = ["video/mp4", "video/quicktime"];
-const MAX_IMAGE_BYTES: usize = 5_000_000;
+const MAX_IMAGE_BYTES: usize = socialreins_core::post::X_MAX_IMAGE_BYTES as usize;
 const MAX_GIF_BYTES: usize = 15_000_000;
 const MAX_VIDEO_BYTES: usize = 512_000_000;
 /// Images a tweet may hold.

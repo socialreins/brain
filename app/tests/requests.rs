@@ -2954,6 +2954,10 @@ mod teams {
                     }),
                 )
                 .route("/big.png", get(|| async { image("image/png", 1_000_001) }))
+                .route("/big.gif", get(|| async { image("image/gif", 1_000_001) }))
+                .route("/noise.png", get(|| async { noise_png() }))
+                .route("/six.png", get(|| async { image("image/png", 6_000_000) }))
+                .route("/moving.webp", get(|| async { moving_webp() }))
                 .route("/page.html", get(|| async { image("text/html", 64) }))
                 .route("/doc.pdf", get(|| async { image("application/pdf", 64) }))
                 .route("/{did}", get(doc))
@@ -3110,10 +3114,40 @@ mod teams {
             let mut bytes = vec![7u8; len];
             if content_type == "image/png" {
                 bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+            } else if content_type == "image/gif" {
+                bytes[..6].copy_from_slice(b"GIF89a");
             } else if content_type == "application/pdf" {
                 bytes[..5].copy_from_slice(b"%PDF-");
             }
             ([("content-type", content_type)], bytes).into_response()
+        }
+
+        /// The head of an animated WebP (the animation flag of its VP8X header), over 1 MB.
+        fn moving_webp() -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let mut bytes = b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\x02\0\0\0".to_vec();
+            bytes.resize(1_000_001, 0);
+            ([("content-type", "image/webp")], bytes).into_response()
+        }
+
+        /// A real 800 x 1000 PNG of noise, over Bluesky's 1 MB, which brain can shrink.
+        fn noise_png() -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let mut seed = 0x9E37_79B9u32;
+            let img = image::RgbImage::from_fn(800, 1000, |_, _| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                image::Rgb(seed.to_be_bytes()[..3].try_into().unwrap())
+            });
+            let mut bytes = Vec::new();
+            img.write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+            assert!(bytes.len() > 2_000_000);
+            ([("content-type", "image/png")], bytes).into_response()
         }
 
         /// A real PNG with transparency, which brain can convert.
@@ -4168,9 +4202,14 @@ mod teams {
                 let before = count().await;
                 for (paths, code, detail) in [
                     (
-                        vec!["/big.png"],
+                        vec!["/big.gif"],
                         "media_too_large",
-                        "Media 1 is over 1 MB, Bluesky's limit.",
+                        "Media 1 is over 1 MB, Bluesky's limit for a GIF.",
+                    ),
+                    (
+                        vec!["/moving.webp"],
+                        "media_too_large",
+                        "Media 1 is over 1 MB, Bluesky's limit for an animated image.",
                     ),
                     (
                         vec!["/img.png", "/clip.mp4"],
@@ -4192,12 +4231,12 @@ mod teams {
                 // A thread post's media names its part.
                 let mut threaded = with(&[]);
                 threaded["thread"] =
-                    json!([{"body": "two", "media": [format!("{PROBED}/big.png")]}]);
+                    json!([{"body": "two", "media": [format!("{PROBED}/big.gif")]}]);
                 let res = create(&s, &cookie, threaded).await;
                 assert_eq!(res.status_code(), 422, "{}", res.text());
                 assert_eq!(res.json::<Value>()["part"], 1);
                 // Groups answer the same, naming the platform, and save nothing.
-                let mut group = with(&["/big.png"]);
+                let mut group = with(&["/big.gif"]);
                 group["platforms"] = json!(["bluesky"]);
                 let res = req(&s, Method::POST, "/v1/post-groups", &cookie)
                     .json(&group)
@@ -4207,10 +4246,13 @@ mod teams {
                 assert_eq!(res.json::<Value>()["platform"], "bluesky");
                 assert_eq!(count().await, before);
 
-                // Valid media saves, and so does media no probe could answer for (a page, a
-                // missing file, a host that does not resolve): publishing checks those.
+                // Valid media saves, a still image over Bluesky's 1 MB among it (publishing
+                // shrinks it), and so does media no probe could answer for (a page, a missing
+                // file, a host that does not resolve): publishing checks those.
                 for paths in [
                     vec!["/img.png"],
+                    vec!["/big.png"],
+                    vec!["/noise.png"],
                     vec!["/clip.mp4"],
                     vec!["/page.html"],
                     vec!["/missing.png", "/img.png"],
@@ -4218,6 +4260,11 @@ mod teams {
                     let res = create(&s, &cookie, with(&paths)).await;
                     assert_eq!(res.status_code(), 201, "{paths:?}: {}", res.text());
                 }
+                // X takes a 6 MB PNG too, over its 5 MB: publishing shrinks it.
+                let mut on_x = with(&["/six.png"]);
+                on_x["platform"] = json!("x");
+                let res = create(&s, &cookie, on_x).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
                 let mut unknown = input(&set, "hi", None);
                 unknown["media"] = json!(["https://a.example/1.png"]);
                 let res = create(&s, &cookie, unknown).await;
@@ -4226,7 +4273,7 @@ mod teams {
                 let id = id_of(&res);
                 let path = format!("/v1/posts/{id}");
                 let res = req(&s, Method::PUT, &path, &cookie)
-                    .json(&with(&["/big.png"]))
+                    .json(&with(&["/big.gif"]))
                     .await;
                 assert_eq!(res.status_code(), 422, "{}", res.text());
                 assert_eq!(res.json::<Value>()["error"], "media_too_large");
@@ -4731,6 +4778,22 @@ mod teams {
                 // The post settled, so its stored copy is gone, row and file.
                 assert_eq!(media_rows(&db, &id).await, 0);
                 assert!(!media_dir().join("posts").join(&id).exists());
+
+                // An image over Bluesky's 1 MB goes up as a JPEG that fits; the small one next
+                // to it keeps its bytes.
+                let id = id_of(&create(&s, &cookie, input(&set, "heavy", Some(&past()))).await);
+                set_media(&db, &base, &id, &["/noise.png", "/img.png"]).await;
+                publish::tick(&state).await.unwrap();
+                let p = get_post(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "published", "{p}");
+                let record = RECORDS.lock().unwrap().last().cloned().unwrap();
+                let images = &record["record"]["embed"]["images"];
+                assert_eq!(images[0]["image"]["mimeType"], "image/jpeg");
+                let size = images[0]["image"]["size"].as_u64().unwrap();
+                assert!((100_000..=900_000).contains(&size), "{size}");
+                assert_eq!(images[1]["image"]["mimeType"], "image/png");
+                assert_eq!(images[1]["image"]["size"], 64);
+                assert!(!media_dir().join("posts").join(&id).exists());
             }
 
             #[tokio::test]
@@ -4931,7 +4994,12 @@ mod teams {
                     (
                         "big",
                         vec!["/big.png"],
-                        "Image 1 is over 1 MB, Bluesky's limit.",
+                        "Image 1 is over 1 MB, Bluesky's limit, and could not be made smaller.",
+                    ),
+                    (
+                        "big gif",
+                        vec!["/big.gif"],
+                        "Image 1 is a GIF over 1 MB, Bluesky's limit.",
                     ),
                     (
                         "mixed",
@@ -5005,7 +5073,7 @@ mod teams {
                 let set = default_set(&db, &team_id).await.to_string();
                 let base = pds_of(&db, &team_id).await;
                 let id = id_of(&create(&s, &cookie, input(&set, "big", Some(&past()))).await);
-                set_media(&db, &base, &id, &["/big.png"]).await;
+                set_media(&db, &base, &id, &["/big.gif"]).await;
                 publish::tick(&state).await.unwrap();
                 assert_eq!(get_post(&s, &cookie, &id).await["status"], "failed");
                 let res = req(&s, Method::POST, &format!("/v1/posts/{id}/retry"), &cookie).await;

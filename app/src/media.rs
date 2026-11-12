@@ -29,6 +29,12 @@ pub const INGEST_DEADLINE: Duration = Duration::from_secs(60);
 const PARALLEL: usize = 4;
 /// Bytes needed to tell every stored type apart.
 const SNIFF_LEN: usize = 12;
+/// Bytes a probe asks for: enough for `animated` to see a WebP's flags, and a PNG's `acTL`
+/// unless a long chunk (a colour profile, say) comes first.
+const PROBE_LEN: usize = 512;
+/// Image conversions (`to_jpeg`, `fit`) running at once in the process, so the decode and resize
+/// buffers of many posts (up to a few hundred MB each) queue instead of piling up.
+static CONVERTING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 const SWEEP_LOCK: i64 = 0x004d_4544_4941_5357;
 
 /// The store and the client that downloads into it.
@@ -56,6 +62,8 @@ pub const PROBE_DEADLINE: Duration = Duration::from_secs(4);
 pub struct Probed {
     pub content_type: &'static str,
     pub size: Option<u64>,
+    /// An animated WebP or PNG, as far as the first bytes show (`animated`).
+    pub animated: bool,
 }
 
 /// Why a file was not stored.
@@ -162,7 +170,7 @@ impl Media {
         if !public_url(&from, self.allow_private) {
             return None;
         }
-        let range = format!("bytes=0-{}", SNIFF_LEN - 1);
+        let range = format!("bytes=0-{}", PROBE_LEN - 1);
         let mut res = self
             .client
             .get(from)
@@ -171,7 +179,7 @@ impl Media {
             .await
             .ok()?;
         let size = match res.status() {
-            // `bytes 0-11/12345`; `*` for an unknown total.
+            // `bytes 0-511/12345`; `*` for an unknown total.
             StatusCode::PARTIAL_CONTENT => res
                 .headers()
                 .get(reqwest::header::CONTENT_RANGE)
@@ -182,7 +190,7 @@ impl Media {
             _ => return None,
         };
         let mut head = Vec::new();
-        while head.len() < SNIFF_LEN {
+        while head.len() < PROBE_LEN {
             match res.chunk().await.ok()? {
                 Some(chunk) => head.extend_from_slice(&chunk),
                 None => break,
@@ -191,6 +199,7 @@ impl Media {
         Some(Probed {
             content_type: sniff(&head)?,
             size,
+            animated: animated(&head),
         })
     }
 
@@ -405,6 +414,41 @@ impl Media {
         url: &str,
         file: Stored,
     ) -> Stored {
+        self.swap(db, post, url, file, to_jpeg).await
+    }
+
+    /// `file`, the stored copy of `url`, swapped for a JPEG of at most `max` bytes (`fit`).
+    /// `file` as it was when it cannot be made to fit, so the size check refuses it.
+    pub async fn fitted(
+        &self,
+        db: &DatabaseConnection,
+        (post, url): (Uuid, &str),
+        file: Stored,
+        (max, side): (usize, u32),
+    ) -> Stored {
+        self.swap(db, post, url, file, move |b| fit(b, max, side))
+            .await
+    }
+
+    /// `file` swapped for the JPEG `convert` makes of its bytes, off the async runtime, at most
+    /// two at a time (`CONVERTING`). The wait for a turn is bounded by the work ahead of it: each
+    /// conversion is CPU only, of at most `MAX_PIXELS` and a fixed number of encodes. No clock
+    /// runs against it: the downloads and their deadline are over, and no target is claimed yet,
+    /// so no publisher timeout or stuck-target time has started. A post that waits so long that a
+    /// tick takes it for stuck is only run again, which is safe: the row swap below is guarded by
+    /// the old key, and each target is claimed once.
+    async fn swap(
+        &self,
+        db: &DatabaseConnection,
+        post: Uuid,
+        url: &str,
+        file: Stored,
+        convert: impl FnOnce(&[u8]) -> Option<Vec<u8>> + Send + 'static,
+    ) -> Stored {
+        // Taken before the bytes are read, so a waiting post holds none.
+        let Ok(turn) = CONVERTING.acquire().await else {
+            return file;
+        };
         let bytes = match self.read(&file.key).await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -412,7 +456,12 @@ impl Media {
                 return file;
             }
         };
-        let Ok(Some(jpeg)) = tokio::task::spawn_blocking(move || to_jpeg(&bytes)).await else {
+        // The turn goes with the work, which runs on even if this future is dropped.
+        let work = move || {
+            let _turn = turn;
+            convert(&bytes)
+        };
+        let Ok(Some(jpeg)) = tokio::task::spawn_blocking(work).await else {
             tracing::warn!(post = %post, "media image did not convert to JPEG");
             return file;
         };
@@ -665,19 +714,54 @@ pub fn sniff(head: &[u8]) -> Option<&'static str> {
 /// within a few hundred MB.
 const MAX_PIXELS: u64 = 25_000_000;
 
-/// An image (PNG or WebP) as a JPEG at quality 90, at its own size, any transparency laid on
-/// white; `None` when it does not decode or is over `MAX_PIXELS`.
-pub fn to_jpeg(bytes: &[u8]) -> Option<Vec<u8>> {
-    let reader = || {
-        image::ImageReader::new(std::io::Cursor::new(bytes))
-            .with_guessed_format()
-            .ok()
-    };
-    let (w, h) = reader()?.into_dimensions().ok()?;
+/// Whether an image is an animated WebP (the animation flag of its `VP8X` header) or an animated
+/// PNG (an `acTL` chunk before the first `IDAT`), as far as `bytes` go: a head cut off before
+/// the answer is `false`. Re-encoding one as a JPEG would keep its first frame only.
+pub fn animated(bytes: &[u8]) -> bool {
+    match sniff(bytes) {
+        Some("image/webp") => {
+            bytes.get(12..16) == Some(b"VP8X") && bytes.get(20).is_some_and(|f| f & 0x02 != 0)
+        }
+        Some("image/png") => {
+            // Chunks follow the 8 byte signature: length, type, data, CRC.
+            let mut at = 8usize;
+            while let Some(chunk) = bytes.get(at..at.saturating_add(8)) {
+                match &chunk[4..] {
+                    b"acTL" => return true,
+                    b"IDAT" => return false,
+                    _ => {}
+                }
+                let len = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                at = at.saturating_add(len as usize).saturating_add(12);
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// An image decoded to RGB at its own size, turned upright by its EXIF orientation (the JPEG
+/// written from it carries none), any transparency laid on white, and its ICC colour profile
+/// when that is an RGB one (a grey or CMYK profile would not match the RGB pixels). `None` when
+/// it does not decode or is over `MAX_PIXELS`.
+fn decode_rgb(bytes: &[u8]) -> Option<(image::RgbImage, Option<Vec<u8>>)> {
+    use image::ImageDecoder;
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_decoder()
+        .ok()?;
+    let (w, h) = decoder.dimensions();
     if u64::from(w) * u64::from(h) > MAX_PIXELS {
         return None;
     }
-    let decoded = reader()?.decode().ok()?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let icc = decoder.icc_profile().ok().flatten();
+    let icc = icc.filter(|p| p.get(16..20) == Some(b"RGB "));
+    let mut decoded = image::DynamicImage::from_decoder(decoder).ok()?;
+    decoded.apply_orientation(orientation);
     let rgb = if decoded.color().has_alpha() {
         let mut rgba = decoded.into_rgba8();
         for p in rgba.pixels_mut() {
@@ -690,11 +774,80 @@ pub fn to_jpeg(bytes: &[u8]) -> Option<Vec<u8>> {
     } else {
         decoded.into_rgb8()
     };
+    Some((rgb, icc))
+}
+
+fn encode_jpeg(rgb: &image::RgbImage, quality: u8, icc: Option<&[u8]>) -> Option<Vec<u8>> {
+    use image::ImageEncoder;
     let mut out = Vec::new();
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
-        .encode_image(&rgb)
-        .ok()?;
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
+    if let Some(icc) = icc {
+        encoder.set_icc_profile(icc.to_vec()).ok()?;
+    }
+    encoder.encode_image(rgb).ok()?;
     Some(out)
+}
+
+/// An image (PNG or WebP) as a JPEG at quality 90, at its own size, upright, any transparency
+/// laid on white, its RGB colour profile kept; `None` when it does not decode or is over
+/// `MAX_PIXELS`. An animated one becomes its first frame.
+pub fn to_jpeg(bytes: &[u8]) -> Option<Vec<u8>> {
+    let (rgb, icc) = decode_rgb(bytes)?;
+    encode_jpeg(&rgb, 90, icc.as_deref())
+}
+
+/// JPEG qualities `fit` tries at the image's own size, best first.
+const FIT_QUALITIES: [u8; 3] = [90, 80, 70];
+/// The quality of a downscaled image, and how many sizes `fit` tries before giving up.
+const FIT_SCALED_QUALITY: u8 = 80;
+const FIT_SCALES: usize = 6;
+
+/// A still image (JPEG, PNG or WebP) as a JPEG of at most `max` bytes with its longest side at
+/// most `side` pixels, upright, any transparency laid on white. Quality drops first
+/// (`FIT_QUALITIES`), then the image is scaled down, its shape kept, never up, at most
+/// `FIT_SCALES` times. It aims at 90% of `max`. `None` when it does not decode, is animated
+/// (`animated`), is over `MAX_PIXELS` or still does not fit.
+pub fn fit(bytes: &[u8], max: usize, side: u32) -> Option<Vec<u8>> {
+    use image::imageops::{resize, FilterType::Lanczos3};
+    if animated(bytes) {
+        return None;
+    }
+    let (full, icc) = decode_rgb(bytes)?;
+    let (w, h) = full.dimensions();
+    let target = max / 10 * 9;
+    // The colour profile is kept unless it would take much of the room itself.
+    let icc = icc.filter(|p| p.len() <= target / 4);
+    let encode_jpeg = |rgb: &image::RgbImage, q: u8| encode_jpeg(rgb, q, icc.as_deref());
+    let sized = |scale: f64| {
+        let to = |v: u32| ((f64::from(v) * scale).round() as u32).max(1);
+        resize(&full, to(w), to(h), Lanczos3)
+    };
+    // The share of its sides the image keeps: all of them unless it is longer than `side`.
+    let mut scale = (f64::from(side) / f64::from(w.max(h))).min(1.0);
+    let mut len = 0;
+    if scale == 1.0 {
+        for q in FIT_QUALITIES {
+            let out = encode_jpeg(&full, q)?;
+            if out.len() <= target {
+                return Some(out);
+            }
+            if q == FIT_SCALED_QUALITY {
+                len = out.len();
+            }
+        }
+    }
+    for _ in 0..FIT_SCALES {
+        if len > 0 {
+            // A JPEG's size follows its pixel count; a little under, so one step usually does.
+            scale *= ((target as f64 / len as f64).sqrt() * 0.95).min(0.9);
+        }
+        let out = encode_jpeg(&sized(scale), FIT_SCALED_QUALITY)?;
+        if out.len() <= target {
+            return Some(out);
+        }
+        len = out.len();
+    }
+    None
 }
 
 #[cfg(test)]
@@ -757,6 +910,189 @@ mod tests {
         )
         .unwrap();
         assert_eq!(to_jpeg(&bytes), None);
+    }
+
+    /// A PNG of noise, which no codec shrinks to nothing, with see-through pixels if `alpha`.
+    fn noise_png(w: u32, h: u32, alpha: bool) -> Vec<u8> {
+        let mut seed = 0x9E37_79B9u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed >> 8) as u8
+        };
+        let mut bytes = Vec::new();
+        let to = &mut std::io::Cursor::new(&mut bytes);
+        if alpha {
+            image::RgbaImage::from_fn(w, h, |x, _| {
+                image::Rgba([next(), next(), next(), if x < w / 2 { 0 } else { 255 }])
+            })
+            .write_to(to, image::ImageFormat::Png)
+        } else {
+            image::RgbImage::from_fn(w, h, |_, _| image::Rgb([next(), next(), next()]))
+                .write_to(to, image::ImageFormat::Png)
+        }
+        .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn an_image_over_the_limit_is_shrunk_to_fit() {
+        // 1080 x 1350 of noise is over 4 MB as a PNG.
+        let png = noise_png(1080, 1350, false);
+        assert!(png.len() > 3_000_000, "{}", png.len());
+        let out = fit(&png, 1_000_000, 2000).unwrap();
+        assert!(out.len() <= 900_000, "{}", out.len());
+        assert_eq!(sniff(&out), Some("image/jpeg"));
+        let (w, h) = image::load_from_memory(&out)
+            .unwrap()
+            .into_rgb8()
+            .dimensions();
+        // Never larger, and the same shape.
+        assert!(w <= 1080 && h <= 1350, "{w} x {h}");
+        assert!(
+            (f64::from(w) / f64::from(h) - 0.8).abs() < 0.01,
+            "{w} x {h}"
+        );
+        // X's limit takes the same image at its own size.
+        let out = fit(&png, 5_000_000, u32::MAX).unwrap();
+        assert!(out.len() <= 4_500_000, "{}", out.len());
+        let back = image::load_from_memory(&out).unwrap();
+        assert_eq!((back.width(), back.height()), (1080, 1350));
+        // What does not decode, a GIF among it (no decoder: it would lose its animation), and
+        // a limit nothing reaches are left alone.
+        assert_eq!(fit(b"GIF89a not really", 1_000_000, 2000), None);
+        assert_eq!(fit(b"\x89PNG\r\n\x1a\n not really", 1_000_000, 2000), None);
+        assert_eq!(fit(&noise_png(64, 64, false), 100, 2000), None);
+    }
+
+    #[test]
+    fn a_very_large_image_is_scaled_down_in_shape() {
+        let png = noise_png(3000, 1500, false);
+        let out = fit(&png, 1_000_000, 2000).unwrap();
+        assert!(out.len() <= 900_000, "{}", out.len());
+        let (w, h) = image::load_from_memory(&out)
+            .unwrap()
+            .into_rgb8()
+            .dimensions();
+        assert!(w <= 2000, "{w} x {h}");
+        assert!(
+            (f64::from(w) / f64::from(h) - 2.0).abs() < 0.01,
+            "{w} x {h}"
+        );
+        // Longer than the side but light: scaled to the side, no further.
+        let mut flat = Vec::new();
+        image::RgbImage::from_pixel(2500, 500, image::Rgb([10, 120, 200]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut flat),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let out = fit(&flat, 1_000_000, 2000).unwrap();
+        let back = image::load_from_memory(&out).unwrap();
+        assert_eq!((back.width(), back.height()), (2000, 400));
+    }
+
+    #[test]
+    fn a_shrunk_image_lays_its_transparency_on_white() {
+        let out = fit(&noise_png(1000, 800, true), 500_000, 2000).unwrap();
+        assert!(out.len() <= 450_000, "{}", out.len());
+        let back = image::load_from_memory(&out).unwrap().into_rgb8();
+        let (w, h) = back.dimensions();
+        let p = back.get_pixel(w / 4, h / 2).0;
+        assert!(p.iter().all(|c| *c > 235), "transparent is white: {p:?}");
+    }
+
+    /// The EXIF block of a camera that held the phone upright: orientation 6, the stored rows
+    /// are turned a quarter clockwise to show.
+    const EXIF_TURNED: &[u8] =
+        b"MM\0\x2a\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0\x06\0\0\0\0\0\0";
+
+    /// 32 x 16, left half red and right half blue, with `EXIF_TURNED` and an ICC profile of
+    /// colour space `space`, as a JPEG or a PNG.
+    fn turned(format: image::ImageFormat, space: &[u8; 4]) -> (Vec<u8>, Vec<u8>) {
+        use image::ImageEncoder;
+        let img = image::RgbImage::from_fn(32, 16, |x, _| {
+            image::Rgb(if x < 16 { [220, 20, 20] } else { [20, 20, 220] })
+        });
+        let mut icc = vec![0u8; 200];
+        icc[16..20].copy_from_slice(space);
+        let mut bytes = Vec::new();
+        if format == image::ImageFormat::Png {
+            let mut e = image::codecs::png::PngEncoder::new(&mut bytes);
+            e.set_exif_metadata(EXIF_TURNED.to_vec()).unwrap();
+            e.set_icc_profile(icc.clone()).unwrap();
+            e.write_image(&img, 32, 16, image::ExtendedColorType::Rgb8)
+        } else {
+            let mut e = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 95);
+            e.set_exif_metadata(EXIF_TURNED.to_vec()).unwrap();
+            e.set_icc_profile(icc.clone()).unwrap();
+            e.write_image(&img, 32, 16, image::ExtendedColorType::Rgb8)
+        }
+        .unwrap();
+        (bytes, icc)
+    }
+
+    #[test]
+    fn a_turned_photo_comes_out_upright_with_its_colour_profile() {
+        use image::ImageDecoder;
+        for format in [image::ImageFormat::Jpeg, image::ImageFormat::Png] {
+            let (bytes, icc) = turned(format, b"RGB ");
+            // Plain decoding ignores the orientation: this is the sideways image.
+            let raw = image::load_from_memory(&bytes).unwrap();
+            assert_eq!((raw.width(), raw.height()), (32, 16));
+            for out in [
+                to_jpeg(&bytes).unwrap(),
+                fit(&bytes, 1_000_000, 2000).unwrap(),
+            ] {
+                let mut d =
+                    image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(&out[..])).unwrap();
+                assert_eq!(d.icc_profile().unwrap(), Some(icc.clone()), "{format:?}");
+                // No orientation is written, so every reader shows these pixels as they are.
+                assert_eq!(d.exif_metadata().unwrap(), None);
+                let back = image::load_from_memory(&out).unwrap().into_rgb8();
+                assert_eq!(back.dimensions(), (16, 32), "{format:?}");
+                let (top, bottom) = (back.get_pixel(8, 6).0, back.get_pixel(8, 26).0);
+                assert!(top[0] > 150 && top[2] < 100, "red on top: {top:?}");
+                assert!(bottom[2] > 150 && bottom[0] < 100, "blue below: {bottom:?}");
+            }
+            // A profile that is not RGB is not carried over to the RGB JPEG.
+            let (bytes, _) = turned(format, b"GRAY");
+            let out = to_jpeg(&bytes).unwrap();
+            let mut d =
+                image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(&out[..])).unwrap();
+            assert_eq!(d.icc_profile().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn an_animated_image_is_told_from_its_bytes_and_never_shrunk() {
+        // An animated WebP: the animation flag of its VP8X header.
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\x02\0\0\0".to_vec();
+        webp.resize(2_000, 0);
+        assert!(animated(&webp));
+        assert_eq!(fit(&webp, 1_000, 2000), None);
+        webp[20] = 0x10;
+        assert!(!animated(&webp), "alpha only");
+        assert!(!animated(&webp[..20]), "cut off before the flags");
+
+        // An animated PNG: an acTL chunk between IHDR and the first IDAT.
+        let png = noise_png(64, 64, false);
+        assert!(!animated(&png));
+        assert!(fit(&png, 1_000_000, 2000).is_some());
+        let mut apng = png[..33].to_vec();
+        apng.extend_from_slice(b"\0\0\0\x08acTL\0\0\0\x02\0\0\0\0\0\0\0\0");
+        apng.extend_from_slice(&png[33..]);
+        assert!(animated(&apng));
+        assert!(animated(&apng[..41]), "the probe's first bytes are enough");
+        assert!(!animated(&apng[..36]));
+        assert_eq!(fit(&apng, 1_000_000, 2000), None);
+        // An acTL after the pixels started is not an animation, and other types never are.
+        let mut late = png.clone();
+        late.extend_from_slice(b"\0\0\0\x08acTL\0\0\0\x02\0\0\0\0\0\0\0\0");
+        assert!(!animated(&late));
+        assert!(!animated(b"GIF89a not really"));
+        assert!(!animated(b""));
     }
 
     #[test]
@@ -869,6 +1205,7 @@ mod tests {
         let want = Probed {
             content_type: "image/png",
             size: Some(100_000),
+            animated: false,
         };
         for path in ["/ok.png", "/hop"] {
             assert_eq!(media.probe(&format!("{base}{path}")).await, Some(want));
