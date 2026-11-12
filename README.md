@@ -27,7 +27,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/health` | `{"status":"ok"}` |
 | GET | `/version` | `{"commit":"<sha>"}`, from `RAILWAY_GIT_COMMIT_SHA`, `dev` locally |
 | GET | `/openapi.json` | OpenAPI document for `/v1` |
-| POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, accounts, posts and lists. Bearer API token only, same scope and per-token limit as `/v1`, bodies up to 64 KiB; `Idempotency-Key` does not apply |
+| POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, accounts, posts and lists. Bearer API token only, same scope and per-token limit as `/v1`, bodies up to 64 KiB; `Idempotency-Key` does not apply. `create-post` and `create-post-group` take `validate_only` (see "Validate only"), which a read-only token may send |
 | POST | `/v1/waitlist` | `{"email":"...","source":"..."}` joins the waitlist and emails a confirmation link |
 | POST | `/v1/waitlist/verify` | `{"token"}` from the emailed link: marks the signup verified, `200 {"status":"verified"}`, else `422 {"error":"invalid_link"}` |
 | GET | `/v1/waitlist/count` | `{"count":n}`: every signup, verified or not, cached for 30 seconds |
@@ -89,9 +89,9 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET, POST | `/v1/social-sets` | The current team's live sets with `account_ids`, Default first (`?deleted=true`: deleted ones still restorable); create one (`{"name"}`, owner, admin) |
 | PATCH, DELETE | `/v1/social-sets/{id}` | Rename (`{"name"}`, the Default set too); delete (sign-in from the last 10 minutes, not the Default set), restorable for 30 days. Owner, admin |
 | POST | `/v1/social-sets/{id}/restore` | Restore a set deleted in the last 30 days, with its accounts (owner, admin) |
-| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&group_id=&from=&to=` on `scheduled_at`; the Default set's id gives every set's posts), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"thread":[{"body","media"}],"first_comment","cover","tiktok","youtube","scheduled_at"}`; any member). `first_comment`: see "First comment" below; `cover`: see "Video cover"; `tiktok`: see "TikTok settings"; `youtube`: see YouTube below. `thread`: up to 25 follow-up posts, each a reply to the one before and checked like the post (`422 {"error","part"}` names a bad one); each part is saved on its target as it goes out, a target whose part fails is `failed` naming it with the parts before it kept, and a takedown deletes the parts last first, then the root |
+| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&group_id=&from=&to=` on `scheduled_at`; the Default set's id gives every set's posts), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"thread":[{"body","media"}],"first_comment","cover","tiktok","youtube","scheduled_at"}`; any member). `first_comment`: see "First comment" below; `cover`: see "Video cover"; `tiktok`: see "TikTok settings"; `youtube`: see YouTube below. `thread`: up to 25 follow-up posts, each a reply to the one before and checked like the post (`422 {"error","part"}` names a bad one); `?validate_only=true` checks without creating (see "Validate only"); each part is saved on its target as it goes out, a target whose part fails is `failed` naming it with the parts before it kept, and a takedown deletes the parts last first, then the root |
 | GET, PUT, DELETE | `/v1/posts/{id}` | One post with its `targets`; replace a `draft` or `scheduled` one; delete (`204` for draft or scheduled, `200` after taking a published one down, `422 takedown_failed` with a `message`, `409` for queued or failed) |
-| POST | `/v1/post-groups` | One post per platform of a set in one call (`{"social_set_id","platforms","body","media","scheduled_at","list_id","position","thread","first_comment","cover","tiktok","youtube","overrides":{"<platform>":{"body","media","thread","first_comment","cover","tiktok","youtube"}}}`; `platforms` defaults to those brain publishes to with a connected account; bodies up to 64 KiB): `201 {"group_id","posts"}`; an invalid post creates nothing and its error names the `platform` |
+| POST | `/v1/post-groups` | One post per platform of a set in one call (`{"social_set_id","platforms","body","media","scheduled_at","list_id","position","thread","first_comment","cover","tiktok","youtube","overrides":{"<platform>":{"body","media","thread","first_comment","cover","tiktok","youtube"}}}`; `platforms` defaults to those brain publishes to with a connected account; bodies up to 64 KiB): `201 {"group_id","posts","skipped"}`; an invalid post creates nothing and its error names the `platform`, unless `"on_invalid":"skip"` (see "Validate only"). `?validate_only=true` checks without creating |
 | POST | `/v1/posts/{id}/publish` | Publish a draft or scheduled post now: `202` with the post `queued`; poll it for the result |
 | GET, POST | `/v1/lists` | Post lists (ordered groups such as a series), or create one (`{"name","social_set_id"}`; no set means team-wide, or the token's own set for a set token) |
 | GET, PATCH, DELETE | `/v1/lists/{id}` | One list with its `items` (`post_id`, 1-based `position`, `post`); rename (`{"name"}`); delete (posts stay) |
@@ -228,7 +228,8 @@ retried. A target cut off mid-publish for 15 minutes fails as "unknown, check th
 
 **Checks before saving.** `POST /posts`, `PUT /posts/{id}`, `POST /post-groups`, both retries
 and the MCP tools that share them refuse a post that can never publish, before anything is
-stored, with `422 {"error", "platform", "detail"}` (and `part` for a thread post). Each media
+stored, with `422 {"error", "platform", "field"}` and, where the check knows them, `part` (the
+1-based thread part), `limit`, `actual` and `detail`. Each media
 URL and the cover are probed (a ranged GET of the first bytes through the same public-address
 checks as publishing, Drive links included, all within 4 seconds) and typed by their magic bytes:
 `media_type_not_supported` for a type the platform's publisher does not take (a PDF anywhere but
@@ -243,6 +244,42 @@ seconds): `tiktok_privacy_not_offered` names the account and carries its
 `privacy_level_options`. A probe or a TikTok call that gets no clear answer (unreachable, slow,
 not 200 or 206, an unknown type, a daily limit) never refuses: publishing checks again. A retry
 checks only a post with a failed target.
+
+**Validate only.** `POST /v1/posts?validate_only=true` and `POST /v1/post-groups?validate_only=true`
+take the create's body, run the create's own checks through the same code, create nothing (no
+post, no list entry, no idempotency record, no webhook) and answer `200`:
+
+```json
+{"ok": false,
+ "platforms": [
+  {"platform": "bluesky", "account_ids": ["..."], "ok": false, "problems": [
+    {"code": "too_long", "field": "body", "limit": 300, "actual": 412, "detail": "..."},
+    {"code": "too_many_images", "field": "media", "limit": 4, "actual": 7, "detail": "..."}]},
+  {"platform": "facebook", "account_ids": ["..."], "ok": true, "problems": []}],
+ "problems": []}
+```
+
+Every problem of every platform is listed, not only the first, in the order a create checks
+them. `code` is the `error` a create answers. `field` is `platform`, `body`, `media`, `thread`,
+`first_comment`, `cover`, `tiktok` or `youtube`; `part` is the 1-based thread part and absent
+for the post itself; a key the check does not know is left out. `limit` and `actual` come with
+`too_long` (in the platform's own unit, which `detail` names), `too_many_images` (media items),
+`too_many_parts`, `first_comment_too_long`, `media_too_large` and `cover_too_large` (bytes);
+other codes have none. `account_ids` are the set's accounts of that platform (none is not a
+problem, as for a create). The top `problems` holds what is wrong with the request as a whole,
+in the same shape: `invalid_set` and `no_accounts` (both leave `platforms` empty),
+`invalid_override`, `too_many_posts` and a list's `not_found`, `invalid_position` or
+`invalid_set`. `ok` is whether the same request without the flag would create every post. A
+body that cannot be read is still `422 invalid_body`, and a flag other than `true` or `false`
+`422 invalid_query`. A read-only token may send it (and is still refused the create), a set
+token stays in its set, and an `Idempotency-Key` is ignored.
+
+**Skip instead of refuse.** `POST /v1/post-groups` takes `"on_invalid": "refuse"` (the default:
+one invalid post creates nothing) or `"skip"`: invalid platforms are left out, the rest are
+created, and the `201` lists them in `skipped`, each `{"platform","account_ids","ok":false,
+"problems":[...]}` as above (`skipped` is `[]` when nothing was left out). When every platform is
+invalid, and for a problem of the request as a whole, `skip` answers the same `422` as `refuse`.
+An idempotent replay answers the same body, `skipped` included.
 
 **Video cover.** A post with exactly one media item, a video, may carry `cover`, a public https
 link to a JPEG or PNG fetched at publish time like `media` (Google Drive share links included, same
@@ -296,7 +333,7 @@ it frees up. A tick claims at most 50 posts; 8 posts and 8 targets publish at on
 
 A token created with `"read_only": true` (whole-team or set) only reads: every `POST`, `PUT`,
 `PATCH` or `DELETE` it sends, and every `/mcp` write tool, is `403 {"error":"read_only_token"}`
-before anything runs. `GET /v1/posts/{id}` lists the post's `accounts` (id, provider, handle,
+before anything runs, except a create with `validate_only`, which writes nothing. `GET /v1/posts/{id}` lists the post's `accounts` (id, provider, handle,
 display name, target id and status), also before it publishes and has targets.
 
 API token writes (`POST`, `PUT`, `PATCH`, `DELETE`) take an optional `Idempotency-Key` header,
