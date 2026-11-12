@@ -335,7 +335,7 @@ pub struct Problem {
     #[serde(alias = "error")]
     pub code: String,
     /// The request field it is in: `platform`, `body`, `media`, `thread`, `first_comment`,
-    /// `cover`, `tiktok`, `youtube`, `social_set_id` or `overrides`.
+    /// `cover`, `tiktok` or `youtube`. A problem of the request as a whole has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
     /// The 1-based thread part it is in; absent for the post itself.
@@ -1472,9 +1472,9 @@ pub async fn create_post_group(
             if !validate_only {
                 return Ok(reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_override"));
             }
+            // No `field`, as the create's own `422` has none.
             problems.push(Problem {
                 code: "invalid_override".into(),
-                field: Some("overrides".into()),
                 ..Default::default()
             });
         }
