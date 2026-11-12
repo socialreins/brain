@@ -459,7 +459,9 @@ impl X {
     /// Waits until X has processed the media; no `processing_info` means it is ready.
     async fn processed(&self, id: &str, token: &str, first: &Value) -> Result<(), PostError> {
         let mut info = first.clone();
-        for _ in 0..POLLS {
+        // X names each wait itself (at most `MAX_WAIT_SECS`), so a large video gets three more
+        // checks for each one another platform gets.
+        for _ in 0..POLLS + 3 * super::extra_polls() {
             match info["state"].as_str() {
                 None | Some("succeeded") => return Ok(()),
                 Some("failed") => {

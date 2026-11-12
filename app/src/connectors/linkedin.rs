@@ -491,7 +491,9 @@ impl LinkedIn {
             "{kind}/{}",
             encoded(urn).ok_or_else(|| failed(format!("Upload: bad {what} id.")))?
         );
-        for i in 1..=POLLS {
+        // A large video gets more checks (`extra_polls`), each after the longest wait.
+        let polls = POLLS + super::extra_polls();
+        for i in 1..=polls {
             let req = self.rest(Method::GET, &path, token);
             let (_, body) = self.send(req, "Status").await?;
             match body["status"].as_str() {
@@ -505,8 +507,8 @@ impl LinkedIn {
                 }
                 _ => {}
             }
-            if i < POLLS {
-                tokio::time::sleep(self.poll_every * i).await;
+            if i < polls {
+                tokio::time::sleep(self.poll_every * i.min(POLLS)).await;
             }
         }
         Err(failed(format!(

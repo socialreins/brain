@@ -462,7 +462,9 @@ impl Meta {
             .header("authorization", format!("OAuth {token}"))
             .header("file_url", url);
         self.send(upload, None, None, "Upload").await?;
-        for i in 1..=POLLS {
+        // A large video gets more checks (`extra_polls`), each after the longest wait.
+        let polls = POLLS + super::extra_polls();
+        for i in 1..=polls {
             let got = self
                 .get(&video, token, &[("fields", "status")], "Status")
                 .await?;
@@ -490,8 +492,8 @@ impl Meta {
                 self.post(&path, token, &form, "Publish").await?;
                 return Ok(video);
             }
-            if i < POLLS {
-                tokio::time::sleep(self.poll_every * i).await;
+            if i < polls {
+                tokio::time::sleep(self.poll_every * i.min(POLLS)).await;
             }
         }
         Err(failed(
@@ -632,6 +634,8 @@ impl Meta {
         polls: u32,
     ) -> Result<(), PostError> {
         let mut left: Vec<&String> = containers.iter().collect();
+        // A large video gets more checks (`extra_polls`), each after the longest wait.
+        let (base, polls) = (polls, polls + super::extra_polls());
         for i in 1..=polls {
             let mut still = Vec::new();
             for c in left {
@@ -654,7 +658,7 @@ impl Meta {
                 return Ok(());
             }
             if i < polls {
-                tokio::time::sleep(self.poll_every * i).await;
+                tokio::time::sleep(self.poll_every * i.min(base)).await;
             }
         }
         Err(failed(

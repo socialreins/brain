@@ -1673,13 +1673,33 @@ async fn send(
             }
         }
     };
-    match tokio::time::timeout(publisher.timeout(), sent).await {
+    let (limit, extra) = patience(publisher.timeout(), &media);
+    let sent = crate::connectors::PATIENCE.scope(extra, sent);
+    match tokio::time::timeout(limit, sent).await {
         Ok(Ok(remote)) => Ok(remote),
         Ok(Err(PublishError::Reconnect)) => Err(refused(app, publisher, account).await),
         Ok(Err(PublishError::Denied)) => Err(denied(publisher)),
         Ok(Err(PublishError::Failed(msg))) => Err(msg),
         Err(_) => Err(TIMED_OUT.to_owned()),
     }
+}
+
+/// How long a publish of `media` may take, and the processing checks its platform's poll adds
+/// (`connectors::extra_polls`). Nothing changes for a post without a large video: `base` and
+/// none. Videos add the time their bytes take at `media::MIN_SPEED` (brain's upload, or the
+/// platform's download from brain) and one check, about 50 seconds, per 100 MB, at most 10. The
+/// limit stays a minute under `STUCK_MINUTES`, after which the target counts as cut off.
+fn patience(base: Duration, media: &[Attachment]) -> (Duration, u32) {
+    let videos = media
+        .iter()
+        .filter(|a| a.content_type.starts_with("video/"));
+    let bytes: u64 = videos.map(|a| a.bytes.len()).sum();
+    let extra = (bytes / 100_000_000).min(10) as u32;
+    let limit = base + Duration::from_secs(bytes / crate::media::MIN_SPEED + 50 * u64::from(extra));
+    (
+        limit.min(Duration::from_secs((STUCK_MINUTES as u64 - 1) * 60)),
+        extra,
+    )
 }
 
 async fn publish_target(
@@ -2203,6 +2223,32 @@ async fn delete_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_large_video_gets_more_time_and_a_small_file_none() {
+        let file = |content_type: &str, size: u64| Attachment {
+            bytes: crate::media::Blob::Stored {
+                store: Arc::new(object_store::memory::InMemory::new()),
+                key: "posts/p/f".into(),
+                size,
+            },
+            content_type: content_type.into(),
+            url: String::new(),
+        };
+        let base = Duration::from_secs(420);
+        let limit = |files: &[Attachment]| patience(base, files);
+        assert_eq!(limit(&[]), (base, 0));
+        assert_eq!(limit(&[file("image/jpeg", 90_000_000)]), (base, 0));
+        // 20 MB: ten seconds for the bytes, no more checks.
+        let small = limit(&[file("video/mp4", 20_000_000)]);
+        assert_eq!(small, (base + Duration::from_secs(10), 0));
+        // 300 MB: 150 s for the bytes and three checks of 50 s.
+        let large = limit(&[file("video/mp4", 300_000_000)]);
+        assert_eq!(large, (base + Duration::from_secs(300), 3));
+        // 1 GiB: bounded under the time a target counts as cut off.
+        let huge = limit(&[file("video/quicktime", 1 << 30)]);
+        assert_eq!(huge, (Duration::from_secs(14 * 60), 10));
+    }
 
     #[test]
     fn every_failure_that_may_have_posted_is_left_to_the_caller() {
