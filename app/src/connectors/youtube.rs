@@ -24,8 +24,16 @@ const SCOPES: &str = "https://www.googleapis.com/auth/youtube.upload \
 const DEFAULT_EXPIRES_IN: i64 = 3600;
 /// Longest one post (session, upload of the bytes) may take.
 pub const PUBLISH_TIMEOUT: Duration = Duration::from_secs(480);
-/// The upload of the bytes itself, longer than the other calls' timeout.
-const UPLOAD_TIMEOUT: Duration = Duration::from_secs(420);
+/// Bytes of a video sent per call: a multiple of 256 KiB, as resumable uploads need. One chunk is
+/// held at a time, however large the video.
+pub const CHUNK: u64 = 8 * 1024 * 1024;
+/// Longest one chunk may take, longer than the other calls' timeout.
+const CHUNK_TIMEOUT: Duration = Duration::from_secs(120);
+/// Times in a row an upload may fail to move on (no answer, a server error, a chunk YouTube did
+/// not take) before it is given up.
+const RESUMES: u32 = 4;
+/// The wait before asking how far a failed upload got, times the tries so far.
+const RESUME_WAIT: Duration = Duration::from_secs(2);
 /// Wait before a first comment on a video just uploaded.
 const COMMENT_WAIT: Duration = Duration::from_secs(10);
 pub const VIDEO_TYPES: [&str; 2] = ["video/mp4", "video/quicktime"];
@@ -66,6 +74,9 @@ pub struct YouTube {
     /// How long a first comment waits after the upload, since YouTube may refuse one on a video
     /// it is still processing. Tests set it to zero.
     pub comment_wait: Duration,
+    /// `CHUNK` and `RESUME_WAIT`; tests shorten them.
+    pub chunk: u64,
+    pub resume_wait: Duration,
     client: reqwest::Client,
 }
 
@@ -109,7 +120,7 @@ struct TokenAnswer {
     scope: Option<String>,
 }
 
-/// The video to post: its bytes (shared, not copied, when sent) and type.
+/// A cover image to set: its bytes (shared, not copied, when sent) and type.
 pub struct File<'a> {
     pub bytes: bytes::Bytes,
     pub content_type: &'a str,
@@ -119,6 +130,9 @@ pub struct File<'a> {
 /// (`publish::outcome_unknown`).
 pub const NO_VIDEO_ID: &str =
     "Upload: YouTube sent no video id. It may have posted, check the channel.";
+/// An upload whose last bytes went out but that YouTube never confirmed, the same way.
+pub const UNCONFIRMED: &str =
+    "Upload: YouTube did not confirm the upload. It may have posted, check the channel.";
 
 fn failed(msg: impl Into<String>) -> PostError {
     PostError::Failed(msg.into())
@@ -166,6 +180,17 @@ fn refusal(status: StatusCode, body: &Value, step: &str) -> PostError {
     }
 }
 
+/// The bytes a resumable session holds, from the `Range: bytes=0-N` of its `308`: `N + 1`, and
+/// none when the header is missing.
+fn held(headers: &HeaderMap) -> u64 {
+    headers
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit('-').next())
+        .and_then(|n| n.trim().parse::<u64>().ok())
+        .map_or(0, |n| n.saturating_add(1))
+}
+
 /// A video id is 11 URL-safe characters; anything else never reaches a URL.
 pub fn video_id(id: &str) -> bool {
     !id.is_empty()
@@ -195,6 +220,8 @@ impl YouTube {
             token_url: TOKEN_URL.into(),
             api_url: API_URL.into(),
             comment_wait: COMMENT_WAIT,
+            chunk: CHUNK,
+            resume_wait: RESUME_WAIT,
             client,
         })
     }
@@ -343,16 +370,22 @@ impl YouTube {
     }
 
     /// Uploads `video` titled `title`, with `privacy` as its `privacyStatus`, and returns its id.
-    /// A resumable session (`uploadType=resumable`), then one `PUT` of all the bytes; never
-    /// resumed or retried, since a retry could post twice. The token goes along only to a session URL that
-    /// passed `upload_allowed`.
+    /// A resumable session (`uploadType=resumable`), then the bytes a `chunk` at a time, each
+    /// read from the store by its range and sent with its `Content-Range`. YouTube answers `308`
+    /// with the bytes it holds until the last chunk, which answers the video. A chunk that got no
+    /// answer or a server error is not sent again blindly: the session is asked how far it got
+    /// (`Content-Range: bytes */total`) and the upload goes on from there, or ends with the video
+    /// if YouTube had it all, so nothing posts twice. After `RESUMES` tries in a row without
+    /// progress it is given up, as `UNCONFIRMED` if the last bytes had gone out. The token goes
+    /// along only to a session URL that passed `upload_allowed`.
     pub async fn upload(
         &self,
         token: &str,
         (title, description): (&str, &str),
-        video: &File<'_>,
+        (video, content_type): (&crate::media::Blob, &str),
         privacy: &str,
     ) -> Result<String, PostError> {
+        let total = video.len();
         let meta = json!({
             "snippet": {"title": title, "description": description},
             "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": false},
@@ -365,8 +398,8 @@ impl YouTube {
             .client
             .request(Method::POST, start)
             .bearer_auth(token)
-            .header("X-Upload-Content-Length", video.bytes.len())
-            .header("X-Upload-Content-Type", video.content_type)
+            .header("X-Upload-Content-Length", total)
+            .header("X-Upload-Content-Type", content_type)
             .json(&meta);
         let (headers, _) = self.send(req, "Upload").await?;
         let session = headers
@@ -376,19 +409,65 @@ impl YouTube {
         if !self.upload_allowed(session) {
             return Err(failed("Upload: YouTube sent an unexpected upload URL."));
         }
-        let req = self
-            .client
-            .put(session)
-            .bearer_auth(token)
-            .header("Content-Type", video.content_type)
-            .timeout(UPLOAD_TIMEOUT)
-            .body(video.bytes.clone());
-        let (_, body) = self.send(req, "Upload").await?;
-        body["id"]
-            .as_str()
-            .filter(|id| video_id(id))
-            .map(str::to_owned)
-            .ok_or_else(|| failed(NO_VIDEO_ID))
+        let put = || {
+            self.client
+                .put(session)
+                .bearer_auth(token)
+                .timeout(CHUNK_TIMEOUT)
+        };
+        // `at`: the bytes YouTube holds. `stalls`: tries in a row that did not add to them.
+        let (mut at, mut stalls, mut sent_last) = (0u64, 0u32, false);
+        loop {
+            let end = (at + self.chunk.max(1)).min(total);
+            let bytes = video.range(at..end).await?;
+            sent_last |= end == total;
+            let range = format!("bytes {at}-{}/{total}", end.saturating_sub(1));
+            let req = put()
+                .header("Content-Type", content_type)
+                .header("Content-Range", range)
+                .body(bytes);
+            let mut answer = self.raw(req, "Upload").await;
+            // Until YouTube says how far the upload is: the chunk's own answer, else a status
+            // query after each failure.
+            let held = loop {
+                match answer {
+                    Ok((status, _, body)) if status.is_success() => {
+                        return body["id"]
+                            .as_str()
+                            .filter(|id| video_id(id))
+                            .map(str::to_owned)
+                            .ok_or_else(|| failed(NO_VIDEO_ID));
+                    }
+                    Ok((status, headers, _)) if status.as_u16() == 308 => break held(&headers),
+                    Ok((status, _, body)) if !status.is_server_error() => {
+                        return Err(refusal(status, &body, "Upload"));
+                    }
+                    _ => {}
+                }
+                stalls += 1;
+                if stalls > RESUMES {
+                    return Err(match sent_last {
+                        true => failed(UNCONFIRMED),
+                        false => failed("Upload: YouTube stopped taking the video. Try again."),
+                    });
+                }
+                tokio::time::sleep(self.resume_wait * stalls).await;
+                let ask = put().header("Content-Range", format!("bytes */{total}"));
+                answer = self.raw(ask.body(Vec::new()), "Upload").await;
+            };
+            if held > at && held <= total {
+                stalls = 0;
+            } else {
+                // No progress (or an answer that makes no sense): counted, so it cannot loop.
+                stalls += 1;
+                if stalls > RESUMES {
+                    return Err(failed(
+                        "Upload: YouTube stopped taking the video. Try again.",
+                    ));
+                }
+            }
+            at = held.min(total);
+        }
     }
 
     /// Comments `text` on video `id` of `channel` as the channel (`commentThreads.insert`, scope
@@ -528,6 +607,167 @@ mod tests {
         ] {
             assert!(!y.upload_allowed(bad), "{bad}");
         }
+    }
+
+    /// A resumable session as YouTube runs one: the bytes it holds, every chunk it was sent
+    /// (first byte, length), how often it was asked how far it is, and which chunk call (from 1)
+    /// it fails with a `503`: `keep` bytes of that chunk are stored first, as when a connection
+    /// drops midway (all of them: the upload finished and only the answer was lost).
+    #[derive(Default)]
+    struct Session {
+        got: Vec<u8>,
+        chunks: Vec<(u64, usize)>,
+        asked: u32,
+        fail: Option<(usize, usize)>,
+        always_fail: bool,
+    }
+
+    async fn session(mock: std::sync::Arc<std::sync::Mutex<Session>>) -> String {
+        use axum::{
+            body::Bytes,
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::post,
+            Json, Router,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let location = format!("{base}/upload/youtube/v3/videos?upload_id=s1");
+        let start = move || async move { ([("location", location)], "") };
+        let put = move |h: HeaderMap, body: Bytes| async move {
+            let mut m = mock.lock().unwrap();
+            let range = h["content-range"].to_str().unwrap().to_owned();
+            let (span, total) = range.trim_start_matches("bytes ").split_once('/').unwrap();
+            let total: usize = total.parse().unwrap();
+            if span == "*" {
+                assert!(body.is_empty());
+                m.asked += 1;
+                if m.always_fail {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+            } else {
+                let first: u64 = span.split('-').next().unwrap().parse().unwrap();
+                m.chunks.push((first, body.len()));
+                if first as usize != m.got.len() {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+                let fail = m.fail.filter(|(call, _)| *call == m.chunks.len());
+                let keep = fail.map_or(body.len(), |(_, keep)| keep.min(body.len()));
+                m.got.extend_from_slice(&body[..keep]);
+                if fail.is_some() || m.always_fail {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+            }
+            if m.got.len() == total {
+                return Json(json!({"id": "vid_0123456"})).into_response();
+            }
+            let held = match m.got.len() {
+                0 => String::new(),
+                n => format!("bytes=0-{}", n - 1),
+            };
+            let mut res = StatusCode::PERMANENT_REDIRECT.into_response();
+            if !held.is_empty() {
+                res.headers_mut().insert("range", held.parse().unwrap());
+            }
+            res
+        };
+        let app = Router::new().route("/upload/youtube/v3/videos", post(start).put(put));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        base
+    }
+
+    /// A stored video of `len` bytes, a YouTube on a new mock session, and the session.
+    async fn stored_video(
+        len: usize,
+    ) -> (
+        Vec<u8>,
+        crate::media::Blob,
+        YouTube,
+        std::sync::Arc<std::sync::Mutex<Session>>,
+    ) {
+        use object_store::ObjectStore;
+        let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let path = object_store::path::Path::from("posts/p/v");
+        store.put(&path, bytes.clone().into()).await.unwrap();
+        let video = crate::media::Blob::Stored {
+            store,
+            key: "posts/p/v".into(),
+            size: len as u64,
+        };
+        let mock = std::sync::Arc::new(std::sync::Mutex::new(Session::default()));
+        let mut y = YouTube::new(None).unwrap();
+        y.api_url = session(mock.clone()).await;
+        y.chunk = 256 * 1024;
+        y.resume_wait = Duration::ZERO;
+        (bytes, video, y, mock)
+    }
+
+    const KIB_256: usize = 256 * 1024;
+
+    #[tokio::test]
+    async fn a_video_uploads_in_chunks_and_resumes_after_a_failed_one() {
+        // Five whole chunks and a short last one.
+        let (bytes, video, y, mock) = stored_video(5 * KIB_256 + 1000).await;
+        // The second chunk fails after YouTube stored 100,000 bytes of it.
+        mock.lock().unwrap().fail = Some((2, 100_000));
+        let id = y
+            .upload("t", ("Title", ""), (&video, "video/mp4"), "private")
+            .await
+            .unwrap();
+        assert_eq!(id, "vid_0123456");
+        let m = mock.lock().unwrap();
+        assert!(m.got == bytes, "YouTube holds the video, byte for byte");
+        assert_eq!(m.asked, 1, "asked once how far the upload got");
+        // The upload went on from the byte after the last one stored, not from the chunk's start.
+        let resumed = (KIB_256 + 100_000) as u64;
+        assert_eq!(m.chunks[1], (KIB_256 as u64, KIB_256));
+        assert_eq!(m.chunks[2], (resumed, KIB_256));
+        assert_eq!(m.chunks.len(), 6);
+        // Never more than a chunk in one call, each a multiple of 256 KiB but the last.
+        let (last, rest) = m.chunks.split_last().unwrap();
+        assert!(rest.iter().all(|(_, len)| *len == KIB_256), "{rest:?}");
+        assert!(last.1 <= KIB_256);
+    }
+
+    #[tokio::test]
+    async fn an_upload_whose_last_answer_was_lost_is_not_sent_again() {
+        let (bytes, video, y, mock) = stored_video(2 * KIB_256 + 7).await;
+        // YouTube stored the whole last chunk, and the answer never came.
+        mock.lock().unwrap().fail = Some((3, usize::MAX));
+        let id = y
+            .upload("t", ("Title", ""), (&video, "video/quicktime"), "public")
+            .await
+            .unwrap();
+        assert_eq!(id, "vid_0123456", "the status query answered the video");
+        let m = mock.lock().unwrap();
+        assert!(m.got == bytes);
+        assert_eq!((m.chunks.len(), m.asked), (3, 1));
+    }
+
+    #[tokio::test]
+    async fn an_upload_youtube_stops_taking_is_given_up() {
+        let (_, video, y, mock) = stored_video(3 * KIB_256).await;
+        mock.lock().unwrap().always_fail = true;
+        let err = y
+            .upload("t", ("Title", ""), (&video, "video/mp4"), "private")
+            .await
+            .unwrap_err();
+        // The last bytes never went out, so nothing can have posted.
+        let PostError::Failed(msg) = err else {
+            panic!("not a failure")
+        };
+        assert_eq!(msg, "Upload: YouTube stopped taking the video. Try again.");
+        assert_eq!(mock.lock().unwrap().asked, RESUMES);
+
+        // A one-chunk video: its last bytes did go out, so it may have posted.
+        let (_, video, y, mock) = stored_video(1000).await;
+        mock.lock().unwrap().always_fail = true;
+        let err = y
+            .upload("t", ("Title", ""), (&video, "video/mp4"), "private")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PostError::Failed(m) if m == UNCONFIRMED));
     }
 
     #[test]

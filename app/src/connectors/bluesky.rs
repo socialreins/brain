@@ -15,6 +15,8 @@ use reqwest::{StatusCode, Url};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 
+use crate::media::Blob;
+
 /// Where handles are resolved and profiles read, and where `did:plc` documents live.
 #[derive(Clone)]
 pub struct Bluesky {
@@ -452,6 +454,35 @@ fn boxes<'a>(data: &'a [u8], name: &[u8; 4]) -> Vec<&'a [u8]> {
     found
 }
 
+/// The largest `moov` box read to learn a video's shape; a longer one leaves the shape unsaid.
+const MOOV_MAX: u64 = 16 * 1024 * 1024;
+/// Bluesky's limit for one video.
+const MAX_VIDEO_BYTES: u64 = 100_000_000;
+
+/// The `moov` box of an MP4 or MOV, as the box list `mp4_size` reads, found by reading only the
+/// header of each box before it (it often sits after the video data), so a stored video is not
+/// read whole. `None` when there is none, the boxes are malformed, or it is over `MOOV_MAX`.
+async fn moov(video: &Blob) -> Option<bytes::Bytes> {
+    let mut at = 0u64;
+    for _ in 0..64 {
+        let head = video.range(at..at.checked_add(16)?).await.ok()?;
+        let size = match u32::from_be_bytes(head.get(..4)?.try_into().ok()?) {
+            0 => video.len() - at,
+            1 => u64::from_be_bytes(head.get(8..16)?.try_into().ok()?),
+            n => u64::from(n),
+        };
+        let end = at.checked_add(size).filter(|_| size >= 8)?;
+        if head.get(4..8)? == b"moov" {
+            return match size <= MOOV_MAX {
+                true => video.range(at..end).await.ok(),
+                false => None,
+            };
+        }
+        at = end;
+    }
+    None
+}
+
 /// The display size of an MP4 or MOV's first video track, for the player's shape in the feed.
 fn mp4_size(data: &[u8]) -> Option<(u32, u32)> {
     let word = |t: &[u8], at: usize| -> Option<u32> {
@@ -547,7 +578,7 @@ impl Bluesky {
         &self,
         c: &Creds<'_>,
         text: &str,
-        media: &[(&[u8], &str)],
+        media: &[(&Blob, &str)],
         reply: Option<(Ref<'_>, Ref<'_>)>,
     ) -> Result<(String, String), PostError> {
         self.with_session(c, |s| self.create_post(s, c.did, text, media, reply))
@@ -559,7 +590,7 @@ impl Bluesky {
         s: Live,
         did: &str,
         text: &str,
-        media: &[(&[u8], &str)],
+        media: &[(&Blob, &str)],
         reply: Option<(Ref<'_>, Ref<'_>)>,
     ) -> Result<(String, String), PostError> {
         let (pds, jwt) = (&s.pds, &s.jwt);
@@ -583,7 +614,7 @@ impl Bluesky {
                         pds,
                         jwt,
                         "com.atproto.repo.uploadBlob",
-                        bytes.to_vec().into(),
+                        bytes.held().into(),
                         mime,
                     )
                     .await?;
@@ -612,13 +643,17 @@ impl Bluesky {
 
     /// Uploads a video to Bluesky's video service, waits until it is processed and returns the
     /// post embed. The service takes a short-lived token the PDS signs for it, never the session.
+    /// The video is one request body, streamed from the store with its `Content-Length`.
     async fn video_embed(
         &self,
         s: &Live,
         did: &str,
-        bytes: &[u8],
+        bytes: &Blob,
         mime: &str,
     ) -> Result<Value, PostError> {
+        if bytes.len() > MAX_VIDEO_BYTES {
+            return Err(failed("The video is over 100 MB, Bluesky's limit."));
+        }
         let host = Url::parse(&s.pds)
             .ok()
             .and_then(|u| u.host_str().map(str::to_owned))
@@ -661,8 +696,9 @@ impl Bluesky {
             .bearer_auth(token)
             .query(&[("did", did), ("name", "video.mp4")])
             .header(reqwest::header::CONTENT_TYPE, mime)
+            .header(reqwest::header::CONTENT_LENGTH, bytes.len())
             .timeout(VIDEO_UPLOAD_TIMEOUT)
-            .body(bytes.to_vec())
+            .body(bytes.body().await?)
             .send()
             .await
             .map_err(unreachable)?;
@@ -688,7 +724,8 @@ impl Bluesky {
             }));
         };
         let mut embed = serde_json::json!({ "$type": "app.bsky.embed.video", "video": blob });
-        if let Some((width, height)) = mp4_size(bytes) {
+        let moov = moov(bytes).await.unwrap_or_default();
+        if let Some((width, height)) = mp4_size(&moov) {
             embed["aspectRatio"] = serde_json::json!({ "width": width, "height": height });
         }
         Ok(embed)
@@ -1410,6 +1447,35 @@ mod tests {
         let mut file = wrap(b"ftyp", b"mp42\0\0\0\0".to_vec());
         file.extend(wrap(b"moov", wrap(b"trak", wrap(b"tkhd", tkhd))));
         file
+    }
+
+    #[tokio::test]
+    async fn the_moov_box_is_found_without_reading_the_video_data() {
+        // `ftyp`, 3 MB of video data, then `moov`, as a phone writes it: in memory or stored.
+        let small = mp4(1080, 1920, 0x10000);
+        let (ftyp, tail) = small.split_at(16);
+        let mut mdat = (3_000_008u32).to_be_bytes().to_vec();
+        mdat.extend_from_slice(b"mdat");
+        mdat.resize(3_000_008, 7);
+        let file = [ftyp, &mdat, tail].concat();
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let path = object_store::path::Path::from("posts/p/v");
+        object_store::ObjectStore::put(&*store, &path, file.clone().into())
+            .await
+            .unwrap();
+        let stored = Blob::Stored {
+            store,
+            key: "posts/p/v".into(),
+            size: file.len() as u64,
+        };
+        for video in [Blob::Held(file.clone().into()), stored] {
+            let moov = moov(&video).await.unwrap();
+            assert_eq!(&moov[..], tail);
+            assert_eq!(mp4_size(&moov), Some((1080, 1920)));
+        }
+        assert!(moov(&Blob::Held(mdat.into())).await.is_none());
+        assert!(moov(&Blob::default()).await.is_none());
+        assert!(moov(&Blob::Held(vec![0u8; 64].into())).await.is_none());
     }
 
     #[test]

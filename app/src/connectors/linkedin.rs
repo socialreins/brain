@@ -69,9 +69,9 @@ struct TokenAnswer {
     refresh_token: Option<String>,
 }
 
-/// One file to post: its bytes and type.
+/// One file to post: its bytes (a video's are read from the store a part at a time) and type.
 pub struct File<'a> {
-    pub bytes: &'a [u8],
+    pub bytes: &'a crate::media::Blob,
     pub content_type: &'a str,
 }
 
@@ -297,7 +297,9 @@ impl LinkedIn {
             ));
         }
         let content = if pdfs == 1 {
-            let id = self.upload_document(&author, token, media[0].bytes).await?;
+            let id = self
+                .upload_document(&author, token, media[0].bytes.held())
+                .await?;
             Some(json!({"media": {"id": id, "title": document_title(text)}}))
         } else if videos == 1 {
             let id = self.upload_video(&author, token, media[0].bytes).await?;
@@ -378,7 +380,7 @@ impl LinkedIn {
         &self,
         url: &str,
         token: Option<&str>,
-        bytes: &[u8],
+        bytes: bytes::Bytes,
         content_type: &str,
     ) -> Result<String, PostError> {
         if !self.upload_allowed(url) {
@@ -388,7 +390,7 @@ impl LinkedIn {
             .client
             .put(url)
             .header("Content-Type", content_type)
-            .body(bytes.to_vec());
+            .body(bytes);
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
@@ -412,18 +414,18 @@ impl LinkedIn {
         else {
             return Err(failed("Upload: LinkedIn sent no image upload URL."));
         };
-        self.put(url, Some(token), file.bytes, file.content_type)
+        self.put(url, Some(token), file.bytes.held(), file.content_type)
             .await?;
         Ok(image.to_owned())
     }
 
-    /// Uploads a video in the parts LinkedIn asks for, finalizes it and waits until LinkedIn has
-    /// processed it.
+    /// Uploads a video in the parts LinkedIn asks for, each read from the store by its range,
+    /// finalizes it and waits until LinkedIn has processed it.
     async fn upload_video(
         &self,
         owner: &str,
         token: &str,
-        bytes: &[u8],
+        bytes: &crate::media::Blob,
     ) -> Result<String, PostError> {
         let request = json!({"initializeUploadRequest": {
             "owner": owner, "fileSizeBytes": bytes.len(),
@@ -437,14 +439,13 @@ impl LinkedIn {
         };
         let mut etags = Vec::new();
         for part in parts {
-            let first = part["firstByte"].as_u64().unwrap_or(0) as usize;
-            let last = part["lastByte"].as_u64().unwrap_or(0) as usize;
-            let (Some(url), Some(chunk)) = (
-                part["uploadUrl"].as_str(),
-                bytes.get(first..=last.min(bytes.len().saturating_sub(1))),
-            ) else {
+            let first = part["firstByte"].as_u64().unwrap_or(0);
+            let last = part["lastByte"].as_u64().unwrap_or(0);
+            let end = last.saturating_add(1).min(bytes.len());
+            let Some(url) = part["uploadUrl"].as_str().filter(|_| first < end) else {
                 return Err(failed("Upload: LinkedIn sent a bad video upload plan."));
             };
+            let chunk = bytes.range(first..end).await?;
             // The docs upload video parts without the token.
             etags.push(
                 self.put(url, None, chunk, "application/octet-stream")
@@ -470,7 +471,7 @@ impl LinkedIn {
         &self,
         owner: &str,
         token: &str,
-        bytes: &[u8],
+        bytes: bytes::Bytes,
     ) -> Result<String, PostError> {
         let request = json!({"initializeUploadRequest": {"owner": owner}});
         let value = self.initialize("documents", token, request).await?;

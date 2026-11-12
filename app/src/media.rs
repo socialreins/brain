@@ -16,7 +16,11 @@ use sea_orm::{
 };
 use uuid::Uuid;
 
-use crate::{connectors::bluesky::PublicOnly, state::AppState, webhooks::public_url};
+use crate::{
+    connectors::bluesky::{PostError, PublicOnly},
+    state::AppState,
+    webhooks::public_url,
+};
 
 /// The largest video brain stores, whatever the platform, unless `MEDIA_MAX_BYTES` lowers it
 /// (`Media::max_bytes`): 1 GiB.
@@ -121,7 +125,88 @@ pub struct Stored {
     pub size: i64,
 }
 
+/// A file's bytes for a publisher: held in memory (an image, a cover, a PDF, each at most
+/// `MAX_STILL_BYTES`), or left in the store and read a range at a time (a video, and any file a
+/// platform fetches by its link), so a video is never held whole however large it is.
+#[derive(Clone)]
+pub enum Blob {
+    Held(bytes::Bytes),
+    Stored {
+        store: Arc<dyn ObjectStore>,
+        key: String,
+        size: u64,
+    },
+}
+
+impl Default for Blob {
+    fn default() -> Self {
+        Blob::Held(bytes::Bytes::new())
+    }
+}
+
+impl Blob {
+    pub fn len(&self) -> u64 {
+        match self {
+            Blob::Held(bytes) => bytes.len() as u64,
+            Blob::Stored { size, .. } => *size,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The bytes held in memory: none of a stored file's, which `range` and `body` read.
+    pub fn held(&self) -> bytes::Bytes {
+        match self {
+            Blob::Held(bytes) => bytes.clone(),
+            Blob::Stored { .. } => bytes::Bytes::new(),
+        }
+    }
+
+    fn unread(e: object_store::Error) -> PostError {
+        tracing::warn!(error = %e, "stored media read failed");
+        PostError::Failed("The stored file could not be read. Try again.".into())
+    }
+
+    /// Bytes `range` of the file, cut off at its end: one ranged read of the store.
+    pub async fn range(&self, range: std::ops::Range<u64>) -> Result<bytes::Bytes, PostError> {
+        let range = range.start.min(self.len())..range.end.min(self.len());
+        match self {
+            Blob::Held(bytes) => Ok(bytes.slice(range.start as usize..range.end as usize)),
+            Blob::Stored { .. } if range.is_empty() => Ok(bytes::Bytes::new()),
+            Blob::Stored { store, key, .. } => store
+                .get_range(&Path::from(key.as_str()), range)
+                .await
+                .map_err(Self::unread),
+        }
+    }
+
+    /// The whole file as a request body, streamed from the store as it is sent. Its length is
+    /// `len`, which the caller sends as `Content-Length`.
+    pub async fn body(&self) -> Result<reqwest::Body, PostError> {
+        match self {
+            Blob::Held(bytes) => Ok(bytes.clone().into()),
+            Blob::Stored { store, key, .. } => {
+                let got = store.get(&Path::from(key.as_str())).await;
+                Ok(reqwest::Body::wrap_stream(
+                    got.map_err(Self::unread)?.into_stream(),
+                ))
+            }
+        }
+    }
+}
+
 impl Media {
+    /// The stored file `file` as a `Blob` that reads it from the store.
+    pub fn blob(&self, file: &Stored) -> Blob {
+        Blob::Stored {
+            store: self.store.clone(),
+            key: file.key.clone(),
+            size: file.size.max(0) as u64,
+        }
+    }
+
     /// `allow_private` (tests only, never read from the environment) also downloads over plain
     /// http from private address literals. Names still resolve to public addresses only.
     pub fn new(store: Arc<dyn ObjectStore>, allow_private: bool) -> Self {

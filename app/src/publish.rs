@@ -51,10 +51,11 @@ pub struct Remote {
     pub url: Option<String>,
 }
 
-/// One stored image or video: its bytes (empty for a publisher that fetches by URL), type, and
-/// the unguessable brain URL that serves it while the post publishes (`media::link`).
+/// One stored image or video: its bytes, type, and the unguessable brain URL that serves it
+/// while the post publishes (`media::link`). An image, cover or PDF is held in memory; a video,
+/// and anything for a publisher that fetches by URL, stays in the store (`media::Blob`).
 pub struct Attachment {
-    pub bytes: bytes::Bytes,
+    pub bytes: crate::media::Blob,
     pub content_type: String,
     pub url: String,
 }
@@ -199,9 +200,9 @@ impl Publisher for Bluesky {
         media: &[Attachment],
         reply: Option<(&Remote, &Remote)>,
     ) -> Result<Remote, PublishError> {
-        let media: Vec<(&[u8], &str)> = media
+        let media: Vec<(&crate::media::Blob, &str)> = media
             .iter()
-            .map(|a| (&a.bytes[..], a.content_type.as_str()))
+            .map(|a| (&a.bytes, a.content_type.as_str()))
             .collect();
         let reply = reply.map(|(p, r)| {
             (
@@ -500,15 +501,11 @@ impl Publisher for YouTube {
                 "The file is not an MP4 or MOV video.".into(),
             ));
         }
-        let file = youtube::File {
-            bytes: video.bytes.clone(),
-            content_type: &video.content_type,
-        };
         let id = self
             .upload(
                 secret,
                 socialreins_core::post::youtube_text(body),
-                &file,
+                (&video.bytes, &video.content_type),
                 options.privacy(),
             )
             .await?;
@@ -558,7 +555,7 @@ impl Publisher for YouTube {
         cover: &Attachment,
     ) -> Result<(), PublishError> {
         let file = youtube::File {
-            bytes: cover.bytes.clone(),
+            bytes: cover.bytes.held(),
             content_type: &cover.content_type,
         };
         self.set_thumbnail(secret, remote_id, &file).await
@@ -737,7 +734,8 @@ impl Publisher for Facebook {
         remote_id: &str,
         cover: &Attachment,
     ) -> Result<(), PublishError> {
-        let file = (&cover.bytes[..], cover.content_type.as_str());
+        let held = cover.bytes.held();
+        let file = (&held[..], cover.content_type.as_str());
         self.0.set_thumbnail(secret, remote_id, file).await
     }
 
@@ -1516,7 +1514,8 @@ fn media_problem(
     })
 }
 
-/// Each URL's stored file: its type and brain link, and its bytes unless `by_url`.
+/// Each URL's stored file: its type and brain link, and its bytes, read into memory unless it
+/// is a video or the platform fetches it `by_url`.
 async fn load(
     app: &AppState,
     media: &Media,
@@ -1529,11 +1528,11 @@ async fn load(
         let Some(Ok(s)) = media.get(url) else {
             return Err(media_error(Fail::Storage, n, platform, 0));
         };
-        let bytes = if by_url {
-            Vec::new()
+        let bytes = if by_url || s.content_type.starts_with("video/") {
+            app.media.blob(s)
         } else {
             match app.media.read(&s.key).await {
-                Ok(bytes) => bytes,
+                Ok(bytes) => crate::media::Blob::Held(bytes.into()),
                 Err(e) => {
                     tracing::warn!(error = %e, "stored media read failed");
                     return Err(media_error(Fail::Storage, n, platform, 0));
@@ -1541,7 +1540,7 @@ async fn load(
             }
         };
         files.push(Attachment {
-            bytes: bytes.into(),
+            bytes,
             content_type: s.content_type.clone(),
             url: crate::media::link(app, s),
         });
@@ -2213,6 +2212,7 @@ mod tests {
             unsaved_part(2, 3),
             tiktok::NOT_DONE.to_owned(),
             youtube::NO_VIDEO_ID.to_owned(),
+            youtube::UNCONFIRMED.to_owned(),
         ];
         for m in &maybe {
             assert!(outcome_unknown(Some(m)), "{m}");
