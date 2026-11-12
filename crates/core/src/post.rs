@@ -469,6 +469,10 @@ pub fn video_limit(platform: &str) -> Option<(&'static str, u64)> {
         .find(|l| l.0 == platform)
         .map(|l| (l.1, l.2))
 }
+/// The most bytes `platform` takes for one video: its own limit, else brain's.
+fn video_bytes(platform: &str) -> u64 {
+    video_limit(platform).map_or(MAX_VIDEO_BYTES, |l| l.1)
+}
 /// Bluesky's limit for one image.
 pub const BLUESKY_MAX_IMAGE_BYTES: u64 = 1_000_000;
 /// X's limits for an image and a GIF (its video limit is in `VIDEO_LIMITS`).
@@ -572,8 +576,10 @@ fn size_limit(platform: &str, t: &str, animated: bool) -> (u64, &'static str) {
             "Bluesky's limit for an animated image",
         ),
         "x" if animated => (X_MAX_IMAGE_BYTES, "X's limit for an animated image"),
-        "bluesky" if t.starts_with("video/") => (100_000_000, "Bluesky's limit for a video"),
-        "x" if t.starts_with("video/") => (512_000_000, "X's limit for a video"),
+        "bluesky" if t.starts_with("video/") => {
+            (video_bytes(platform), "Bluesky's limit for a video")
+        }
+        "x" if t.starts_with("video/") => (video_bytes(platform), "X's limit for a video"),
         _ if t.starts_with("video/") => (MAX_VIDEO_BYTES, "the largest video SocialReins takes"),
         _ => (MAX_MEDIA_BYTES, "the largest file SocialReins takes"),
     }
@@ -1202,6 +1208,18 @@ mod tests {
         // A video has its platform's limit where that is under brain's 1 GiB, else brain's.
         assert_eq!(code("x", &[f(MOV, 500_000_000)]), Ok(()));
         assert_eq!(code("x", &[f(MOV, 512_000_001)]), Err("media_too_large"));
+        // An over-limit video says the limit and the size, as every size problem does.
+        let over = check_media_facts("x", &[f(MOV, 512_000_001)]);
+        assert_eq!(over.len(), 1);
+        assert_eq!(
+            (over[0].limit, over[0].actual),
+            (Some(512_000_000), Some(512_000_001))
+        );
+        let over = check_media_facts("youtube", &[f(MP4, MAX_VIDEO_BYTES + 7)]);
+        assert_eq!(
+            (over[0].limit, over[0].actual),
+            (Some(MAX_VIDEO_BYTES), Some(MAX_VIDEO_BYTES + 7))
+        );
         assert_eq!(video_limit("x"), Some(("X", 512_000_000)));
         assert_eq!(video_limit("bluesky"), Some(("Bluesky", 100_000_000)));
         assert_eq!(video_limit("youtube"), None);
