@@ -1275,13 +1275,40 @@ fn validation(platforms: Vec<PlatformReport>, problems: Vec<Problem>) -> Respons
     .into_response()
 }
 
+/// The body of a create route, and whether it carries a `validate_only` key (any value).
+/// The flag is a query parameter here and an argument of the MCP tools, so a body that has it
+/// is refused: ignoring it would create for real what the caller only meant to check.
+#[derive(Deserialize)]
+struct Creating<T> {
+    #[serde(flatten)]
+    input: T,
+    #[serde(default, deserialize_with = "present")]
+    validate_only: bool,
+}
+
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(d).map(|_| true)
+}
+
+/// `422` for `validate_only` in the body of a create.
+fn flag_in_body() -> Response {
+    let body = serde_json::json!({
+        "error": "validate_only_in_body",
+        "field": "validate_only",
+        "detail": "validate_only is a query parameter: send it as ?validate_only=true, not in the body.",
+    });
+    (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
+}
+
 /// Creates a post; `scheduled` with `scheduled_at` (a past time means now), else `draft`. At
 /// most 2000 per team. A `422` says what is wrong: `{"error", "platform", "field"}` and, where
 /// the check knows them, `part` (the 1-based thread part), `limit`, `actual` and `detail`.
 ///
-/// With `?validate_only=true` nothing is created: the same checks run through the same code and
+/// With `?validate_only=true` no post, media or idempotency record is created (a connected
+/// TikTok account's token may be renewed): the same checks run through the same code and
 /// the answer is `200` with a `Validation` naming every problem, not only the first. A
-/// read-only token may call it, and an `Idempotency-Key` is ignored.
+/// read-only token may call it, and an `Idempotency-Key` is ignored. The flag is read from the
+/// query only: `validate_only` in the body is `422 validate_only_in_body` and creates nothing.
 #[utoipa::path(post, path = "/posts", tag = "posts",
     security(("session" = []), ("api_token" = [])), request_body = PostInput,
     params(ValidateOnly, ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
@@ -1292,10 +1319,11 @@ async fn create(
     State(app): State<AppState>,
     a: Actor,
     uri: Uri,
-    Body(input): Body<PostInput>,
+    Body(body): Body<Creating<PostInput>>,
 ) -> Response {
     match validate_only(&uri) {
-        Some(only) => create_post(&app, &a, input, only).await,
+        Some(_) if body.validate_only => flag_in_body(),
+        Some(only) => create_post(&app, &a, body.input, only).await,
         None => reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query"),
     }
 }
@@ -1410,9 +1438,11 @@ async fn insert(
 /// "actual":412,"detail":"..."}`. With `on_invalid: "skip"` an invalid platform is left out
 /// instead and listed in `skipped`, unless every platform is invalid.
 ///
-/// With `?validate_only=true` nothing is created: the same checks run through the same code and
+/// With `?validate_only=true` no post, group, media or idempotency record is created (a
+/// connected TikTok account's token may be renewed): the same checks run through the same code and
 /// the answer is `200` with a `Validation` naming every problem of every platform. A read-only
-/// token may call it, and an `Idempotency-Key` is ignored.
+/// token may call it, and an `Idempotency-Key` is ignored. The flag is read from the query only:
+/// `validate_only` in the body is `422 validate_only_in_body` and creates nothing.
 #[utoipa::path(post, path = "/post-groups", tag = "posts",
     security(("session" = []), ("api_token" = [])), request_body = PostGroupInput,
     params(ValidateOnly, ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
@@ -1423,10 +1453,11 @@ async fn create_group(
     State(app): State<AppState>,
     a: Actor,
     uri: Uri,
-    Body(input): Body<PostGroupInput>,
+    Body(body): Body<Creating<PostGroupInput>>,
 ) -> Response {
     match validate_only(&uri) {
-        Some(only) => create_post_group(&app, &a, input, only).await,
+        Some(_) if body.validate_only => flag_in_body(),
+        Some(only) => create_post_group(&app, &a, body.input, only).await,
         None => reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query"),
     }
 }

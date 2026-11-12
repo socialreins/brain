@@ -6587,6 +6587,24 @@ mod teams {
                     .await;
                 assert_eq!(res.status_code(), 422);
                 res.assert_json(&json!({"error": "invalid_query"}));
+
+                // The flag in the body (where the MCP tools take it) is refused, never ignored:
+                // ignoring it would create for real. Any value, with or without the query flag.
+                for path in [
+                    "/v1/posts",
+                    "/v1/post-groups",
+                    "/v1/posts?validate_only=true",
+                ] {
+                    for flag in [json!(true), json!(false), Value::Null] {
+                        let mut body = input(&set, "hi", None);
+                        body["validate_only"] = flag;
+                        let res = req(&s, Method::POST, path, &cookie).json(&body).await;
+                        assert_eq!(res.status_code(), 422, "{path}: {}", res.text());
+                        res.assert_json(&json!({"error": "validate_only_in_body",
+                            "field": "validate_only",
+                            "detail": "validate_only is a query parameter: send it as ?validate_only=true, not in the body."}));
+                    }
+                }
                 assert_eq!(count().await, before);
             }
 

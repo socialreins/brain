@@ -246,8 +246,9 @@ not 200 or 206, an unknown type, a daily limit) never refuses: publishing checks
 checks only a post with a failed target.
 
 **Validate only.** `POST /v1/posts?validate_only=true` and `POST /v1/post-groups?validate_only=true`
-take the create's body, run the create's own checks through the same code, create nothing (no
-post, no list entry, no idempotency record, no webhook) and answer `200`:
+take the create's body, run the create's own checks through the same code, create no post, post
+group, list entry, media, idempotency record or webhook, and answer `200` (the TikTok privacy
+check may renew and save a connected TikTok account's token, as on any save):
 
 ```json
 {"ok": false,
@@ -271,7 +272,9 @@ in the same shape: `invalid_set` and `no_accounts` (both leave `platforms` empty
 `invalid_override`, `too_many_posts` and a list's `not_found`, `invalid_position` or
 `invalid_set`. `ok` is whether the same request without the flag would create every post. A
 body that cannot be read is still `422 invalid_body`, and a flag other than `true` or `false`
-`422 invalid_query`. A read-only token may send it (and is still refused the create), a set
+`422 invalid_query`. The flag is read from the query only: a body with a `validate_only` key
+(what the MCP tools take) is `422 validate_only_in_body` on both routes, whatever its value,
+and creates nothing. A read-only token may send it (and is still refused the create), a set
 token stays in its set, and an `Idempotency-Key` is ignored.
 
 **Skip instead of refuse.** `POST /v1/post-groups` takes `"on_invalid": "refuse"` (the default:
@@ -279,7 +282,8 @@ one invalid post creates nothing) or `"skip"`: invalid platforms are left out, t
 created, and the `201` lists them in `skipped`, each `{"platform","account_ids","ok":false,
 "problems":[...]}` as above (`skipped` is `[]` when nothing was left out). When every platform is
 invalid, and for a problem of the request as a whole, `skip` answers the same `422` as `refuse`.
-An idempotent replay answers the same body, `skipped` included.
+An idempotent replay answers the same body, `skipped` included. A response stored for replay
+before this version replays as it was stored, without `skipped`.
 
 **Video cover.** A post with exactly one media item, a video, may carry `cover`, a public https
 link to a JPEG or PNG fetched at publish time like `media` (Google Drive share links included, same
@@ -333,7 +337,7 @@ it frees up. A tick claims at most 50 posts; 8 posts and 8 targets publish at on
 
 A token created with `"read_only": true` (whole-team or set) only reads: every `POST`, `PUT`,
 `PATCH` or `DELETE` it sends, and every `/mcp` write tool, is `403 {"error":"read_only_token"}`
-before anything runs, except a create with `validate_only`, which writes nothing. `GET /v1/posts/{id}` lists the post's `accounts` (id, provider, handle,
+before anything runs, except a create with `validate_only`, which creates nothing. `GET /v1/posts/{id}` lists the post's `accounts` (id, provider, handle,
 display name, target id and status), also before it publishes and has targets.
 
 API token writes (`POST`, `PUT`, `PATCH`, `DELETE`) take an optional `Idempotency-Key` header,
