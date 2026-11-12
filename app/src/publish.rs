@@ -869,8 +869,42 @@ pub fn publisher<'a>(app: &'a AppState, platform: &str) -> Option<&'a dyn Publis
 /// Due posts claimed per tick; the rest wait for the next one.
 const CLAIM_BATCH: i64 = 50;
 /// Posts publishing at once, and targets publishing at once, across the process.
-static POST_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(8));
+const POSTS_AT_ONCE: usize = 8;
+static POST_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(POSTS_AT_ONCE));
 static TARGET_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(8));
+/// How long a stopping process (`stop`) waits for the posts it is publishing before it exits
+/// (`drain`). Keep it under the grace the platform gives between SIGTERM and the kill (on
+/// Railway `RAILWAY_DEPLOYMENT_DRAINING_SECONDS`, which has to be set above this to matter).
+pub const DRAIN: Duration = Duration::from_secs(25);
+static STOPPED: std::sync::OnceLock<tokio::time::Instant> = std::sync::OnceLock::new();
+
+/// The process is about to exit (SIGTERM): no round claims a post any more (`begin`), and a post
+/// still waiting for a slot is not started but handed back (`release`). Posts already
+/// publishing go on.
+pub fn stop() {
+    let _ = STOPPED.set(tokio::time::Instant::now());
+    POST_SLOTS.close();
+}
+
+/// After `stop`: waits until no post is publishing or handing itself back, at most `DRAIN`
+/// from the stop. A post still publishing then is cut off as by a crash (`recover_stuck`).
+pub async fn drain() {
+    let until = STOPPED
+        .get()
+        .copied()
+        .unwrap_or_else(tokio::time::Instant::now)
+        + DRAIN;
+    let idle = async {
+        while POST_SLOTS.available_permits() < POSTS_AT_ONCE
+            || in_flight(|flying| !flying.is_empty())
+        {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
+    if tokio::time::timeout_at(until, idle).await.is_err() {
+        tracing::warn!("stopped with posts still publishing");
+    }
+}
 /// Posts a team publishes a day, scheduled or published now (`rate_limit::daily_reserve`).
 pub const PUBLISHES_PER_DAY: i64 = 100;
 const OVER_QUOTA: &str = "This team reached its limit of 100 published posts a day. It stays \
@@ -1019,8 +1053,10 @@ impl Drop for Flight {
 /// process still has in flight, and never picks up as left behind a post it is itself running;
 /// `POST_SLOTS` and `TARGET_SLOTS` bound what runs at once as before. Should another instance
 /// take a post for left behind and run it too, each target is still claimed by one of them
-/// (`claim_target`) and published by that one alone. A process that stops abandons its posts:
-/// their targets fail as cut off (`recover_stuck`) and the rest is picked up as left behind.
+/// (`claim_target`) and published by that one alone. A process that stops (`stop`) claims no
+/// more, hands back the posts it has not started and waits `DRAIN` for the rest; what it still
+/// abandons, or all of it when it is killed: the targets fail as cut off (`recover_stuck`) and
+/// the rest is picked up as left behind.
 pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, DbErr> {
     let lock = app.db.begin().await?;
     let row = lock
@@ -1033,7 +1069,7 @@ pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, D
         Some(r) => r.try_get("", "ok")?,
         None => false,
     };
-    if !locked {
+    if !locked || POST_SLOTS.is_closed() {
         return Ok(Vec::new());
     }
     // One failing step is logged and the tick goes on; per-post work never aborts it.
@@ -1163,6 +1199,20 @@ async fn unclaim(db: &DatabaseConnection, id: Uuid, error: Option<&str>) -> Resu
     db.execute_raw(stmt).await.map(|_| ())
 }
 
+/// Hands a post the stopping process claimed and never started back to `scheduled`, so the next
+/// process claims it at once and not as left behind `STUCK_MINUTES` later. Only a post a round
+/// claimed and nothing touched: one with its quota reserved (publish now, or underway) or any
+/// target (a retry, or underway) stays `queued`.
+async fn release(db: &DatabaseConnection, id: Uuid) -> Result<(), DbErr> {
+    let stmt = sql(
+        "UPDATE posts SET status = 'scheduled', updated_at = now() \
+         WHERE id = $1 AND status = 'queued' AND NOT quota_reserved AND NOT fanned_out \
+         AND NOT EXISTS (SELECT 1 FROM post_targets t WHERE t.post_id = posts.id)",
+        vec![id.into()],
+    );
+    db.execute_raw(stmt).await.map(|_| ())
+}
+
 /// Targets cut off mid-publish become `failed` and are never sent again; their posts settle.
 pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
     // Cut off after the platform took it (the remote id is saved first): it is live, so it is
@@ -1271,10 +1321,10 @@ async fn fail_post(db: &DatabaseConnection, id: Uuid, msg: &str) -> Result<(), D
 /// Publishes a `queued` post: one target per account of its platform in its set, each
 /// published at most once, then the post settles.
 pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
-    let Ok(_slot) = POST_SLOTS.acquire().await else {
-        return Ok(());
-    };
     let db = &app.db;
+    let Ok(_slot) = POST_SLOTS.acquire().await else {
+        return release(db, id).await;
+    };
     let Some(post) = posts::Entity::find_by_id(id).one(db).await? else {
         return Ok(());
     };

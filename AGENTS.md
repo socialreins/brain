@@ -46,7 +46,7 @@ cargo run -p socialreins-brain
   rest after 7 days; a storage error is only logged. Cleanup lists `posts/<post id>/` in the
   store, so it also catches files no row names. Local disk assumes one brain instance: run
   more than one replica only with the `S3_*` bucket.
-- `app/src/publish.rs`: the scheduler's round is `publish::begin`: under the advisory lock it claims due posts, starts each as its own task and lets the lock go without waiting (`tick` waits, for tests), so a large video never delays posts due after it. `IN_FLIGHT` keeps a round from taking a post the process still runs, `POST_SLOTS` and `TARGET_SLOTS` bound what runs at once, and `STUCK_MINUTES` is derived from `media::INGEST_CEILING` and `PUBLISH_LIMIT`.
+- `app/src/publish.rs`: the scheduler's round is `publish::begin`: under the advisory lock it claims due posts, starts each as its own task and lets the lock go without waiting (`tick` waits, for tests), so a large video never delays posts due after it. `IN_FLIGHT` keeps a round from taking a post the process still runs, `POST_SLOTS` and `TARGET_SLOTS` bound what runs at once, and `STUCK_MINUTES` is derived from `media::INGEST_CEILING` and `PUBLISH_LIMIT`. On SIGTERM (`bin/main.rs`) `publish::stop` ends claiming and hands posts not yet started back to `scheduled` (`release`), and `publish::drain` waits up to `DRAIN` (25 seconds) for the ones publishing; Railway kills at once unless `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` is set (30 or more).
 - `app/src/publish.rs`: a post's `first_comment` (Facebook, Instagram, LinkedIn, YouTube) goes out
   once, after its target is saved as `published`: `post_targets.comment_status` is claimed
   (`posting`) before the call and never reset, so it is never retried; a failure only sets

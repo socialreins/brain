@@ -1,6 +1,8 @@
 use std::process::ExitCode;
 
-use socialreins_brain::{config::Config, connect, controllers, scheduler, state::AppState};
+use socialreins_brain::{
+    config::Config, connect, controllers, publish, scheduler, state::AppState,
+};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -39,10 +41,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
     .with_graceful_shutdown(shutdown())
     .await?;
+    publish::drain().await;
     Ok(())
 }
 
-/// Ctrl-C locally, SIGTERM on Railway: stop accepting, finish in-flight requests.
+/// Ctrl-C locally, SIGTERM on Railway: stop accepting, finish in-flight requests, and stop
+/// claiming posts (`publish::stop`); `run` then waits for the ones publishing (`publish::drain`).
 async fn shutdown() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -57,4 +61,5 @@ async fn shutdown() {
     #[cfg(not(unix))]
     let term = std::future::pending::<()>();
     tokio::select! { () = ctrl_c => {}, () = term => {} }
+    publish::stop();
 }
