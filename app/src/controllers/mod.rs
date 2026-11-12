@@ -56,6 +56,8 @@ use crate::{config::Config, mcp, state::AppState};
 pub(crate) const MAX_BODY_BYTES: usize = 4096;
 /// Passkey bodies carry an attestation or assertion, which can run past 4 KiB.
 const MAX_PASSKEY_BODY_BYTES: usize = 16 * 1024;
+/// 50 sign-up domains can pass 4 KiB.
+const MAX_ADMIN_BODY_BYTES: usize = 16 * 1024;
 const MAX_AUTOMATION_BODY_BYTES: usize = 32 * 1024;
 /// A contact message of 5000 characters can pass 4 KiB.
 const MAX_CONTACT_BODY_BYTES: usize = 32 * 1024;
@@ -78,8 +80,7 @@ fn api() -> OpenApiRouter<AppState> {
     doc.info.license = None;
     OpenApiRouter::with_openapi(doc)
         .merge(waitlist::api())
-        // 50 sign-up domains can pass 4 KiB.
-        .merge(admin::api().layer(DefaultBodyLimit::max(MAX_PASSKEY_BODY_BYTES)))
+        .merge(admin::api().layer(DefaultBodyLimit::max(MAX_ADMIN_BODY_BYTES)))
         .merge(contact::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
         .merge(teams::api())
         .merge(api_tokens::api())

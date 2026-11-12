@@ -31,6 +31,13 @@ cargo run -p socialreins-brain
   out after the reply, at most hourly per email, 20 a day per IP and 500 a day overall
   (`rate_limit::daily_reserve`). `GET /v1/waitlist/count` is cached 30 seconds, and `GET /v1/admin/waitlist` is for `ADMIN_EMAILS` (`config.rs`) with a
   session cookie only.
+- `app/src/controllers/admin.rs`: the admin console, `/v1/admin/*` (totals, users, teams, waitlist
+  approve and delete, sign-up rules). Every handler takes the `Admin` extractor (`ADMIN_EMAILS`,
+  session cookie only) and changing ones `FromWeb`; never return post bodies, tokens or
+  credentials from it. Sign-up rules are read in one place, `auth::signup_rules`: the
+  `signup_settings` row once an admin saved one, else `REGISTRATION_DISABLED` and
+  `SIGNUP_DOMAINS`. `OWNER_EMAIL`, invited emails and approved waitlist emails
+  (`waitlist_signups.approved_at`) pass in every mode. Its tests each run on their own database.
 - `app/src/media.rs`: post media. Publishing downloads each URL (Drive share links rewritten)
   once into local disk (`MEDIA_DIR`) or an S3-compatible bucket (`S3_*`, `config.rs`), saved in
   `post_media`, and the publisher reads the stored bytes (LinkedIn, YouTube, X and Bluesky upload them themselves; a PDF is LinkedIn's document post only, any other platform's target fails it in `publish::send`), or (Threads, Facebook, Instagram and TikTok,

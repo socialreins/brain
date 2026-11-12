@@ -190,6 +190,8 @@ pub struct AdminUsers {
     pub users: Vec<AdminUser>,
 }
 
+// shortcut: ILIKE '%q%' scans the table (here and in TEAMS), add a trigram index once there are
+// tens of thousands of rows.
 const USERS: &str = "SELECT u.id, u.email, u.name, u.created_at, \
     (SELECT max(s.created_at) FROM sessions s WHERE s.user_id = u.id) AS last_sign_in_at, \
     COALESCE((SELECT jsonb_agg(jsonb_build_object('id', t.id, 'name', t.name, 'role', m.role) \

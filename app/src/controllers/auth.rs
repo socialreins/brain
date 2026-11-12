@@ -254,7 +254,9 @@ pub(crate) async fn signup_rules(app: &AppState) -> Result<SignupRules, DbErr> {
         let domains: serde_json::Value = row.try_get("", "domains")?;
         return Ok(SignupRules {
             mode: row.try_get("", "mode")?,
-            domains: serde_json::from_value(domains).unwrap_or_default(),
+            // An unreadable list is an error, never an empty (open) one.
+            domains: serde_json::from_value(domains)
+                .map_err(|e| DbErr::Custom(format!("signup_settings.domains: {e}")))?,
             saved: true,
         });
     }
@@ -278,8 +280,9 @@ pub(crate) async fn signup_rules(app: &AppState) -> Result<SignupRules, DbErr> {
 async fn sign_up(app: &AppState, email: &str) -> Result<SignUp, DbErr> {
     let rules = signup_rules(app).await?;
     // Domain entries have no `@` and email entries do, so one equality test serves both.
+    // Only `closed` may have no list: `domains` with none admits nobody.
     let domain_ok = rules.mode == "open"
-        || rules.domains.is_empty()
+        || (rules.mode == "closed" && rules.domains.is_empty())
         || email
             .rsplit_once('@')
             .is_some_and(|(_, d)| rules.domains.iter().any(|a| a == d || a == email));
