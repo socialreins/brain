@@ -6,7 +6,7 @@
 //! statement (`webhooks::with_event`). Media is downloaded into brain's storage before any
 //! target is claimed (`media.rs`) and deleted once the post settles.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, LazyLock},
     time::Duration,
 };
@@ -982,9 +982,37 @@ async fn ids(db: &impl ConnectionTrait, stmt: Statement, col: &str) -> Result<Ve
     rows.iter().map(|r| r.try_get("", col)).collect()
 }
 
+/// Posts a round of this process started that have not finished: at most `CLAIM_BATCH`.
+static IN_FLIGHT: std::sync::Mutex<Option<HashSet<Uuid>>> = std::sync::Mutex::new(None);
+
+fn in_flight<T>(with: impl FnOnce(&mut HashSet<Uuid>) -> T) -> T {
+    let mut flying = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    with(flying.get_or_insert_with(HashSet::new))
+}
+
+/// A post in `IN_FLIGHT` until this is dropped, however its task ends.
+struct Flight(Uuid);
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        in_flight(|flying| flying.remove(&self.0));
+    }
+}
+
 /// One publishing round: fail cut-off targets, claim due posts, pick up posts left `queued`,
-/// publish them all and wait. Skips while another instance holds the lock.
-pub async fn tick(app: &AppState) -> Result<(), DbErr> {
+/// and start each as its own task, which are returned and not waited for: the lock is let go
+/// once the posts are claimed, so a slow post (a large video takes up to `STUCK_MINUTES`) never
+/// keeps the next round from claiming the posts that came due after it. Skips while another
+/// instance holds the lock.
+///
+/// A post still goes out once. Claiming is one `UPDATE` from `scheduled` to `queued` under the
+/// lock, so one round takes a post; a round claims no more than `CLAIM_BATCH` less what this
+/// process still has in flight, and never picks up as left behind a post it is itself running;
+/// `POST_SLOTS` and `TARGET_SLOTS` bound what runs at once as before. Should another instance
+/// take a post for left behind and run it too, each target is still claimed by one of them
+/// (`claim_target`) and published by that one alone. A process that stops abandons its posts:
+/// their targets fail as cut off (`recover_stuck`) and the rest is picked up as left behind.
+pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, DbErr> {
     let lock = app.db.begin().await?;
     let row = lock
         .query_one_raw(sql(
@@ -997,14 +1025,20 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
         None => false,
     };
     if !locked {
-        return Ok(());
+        return Ok(Vec::new());
     }
     // One failing step is logged and the tick goes on; per-post work never aborts it.
     if let Err(e) = recover_stuck(&app.db).await {
         tracing::warn!(error = %e, "stuck target recovery failed");
     }
+    let flying = in_flight(|flying| flying.clone());
+    let room = (CLAIM_BATCH - flying.len() as i64).max(0);
     // The quota is reserved per post in `publish_post`, together with marking it reserved.
-    let mut due: Vec<Uuid> = claim_due(&app.db).await?.into_iter().map(|c| c.0).collect();
+    let mut due: Vec<Uuid> = claim(&app.db, room)
+        .await?
+        .into_iter()
+        .map(|c| c.0)
+        .collect();
     // Posts left `queued` by a crash between claim and settle: fan-out and claims are
     // idempotent, so running them again only finishes the job.
     let stmt = sql(
@@ -1012,27 +1046,41 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
          AND updated_at < now() - make_interval(mins => $1) LIMIT $2",
         vec![(STUCK_MINUTES as i32).into(), CLAIM_BATCH.into()],
     );
-    due.extend(ids(&app.db, stmt, "id").await?);
-    let runs: Vec<_> = due
+    let left = ids(&app.db, stmt, "id").await?;
+    due.extend(left.into_iter().filter(|id| !flying.contains(id)));
+    let runs = due
         .into_iter()
+        .filter(|id| in_flight(|flying| flying.insert(*id)))
         .map(|id| {
-            let app = app.clone();
+            let (app, flight) = (app.clone(), Flight(id));
             tokio::spawn(async move {
+                let _flight = flight;
                 if let Err(e) = publish_post(&app, id).await {
                     tracing::error!(error = %e, post = %id, "publish failed");
                 }
             })
         })
         .collect();
-    for run in runs {
+    lock.commit().await?;
+    Ok(runs)
+}
+
+/// `begin`, then waits for the posts it started: what tests and one-off runs want.
+pub async fn tick(app: &AppState) -> Result<(), DbErr> {
+    for run in begin(app).await? {
         let _ = run.await;
     }
-    lock.commit().await
+    Ok(())
 }
 
 /// Claims up to 50 due `scheduled` posts, oldest first, `scheduled` to `queued`: only posts of
 /// a live set, of a team under its daily publish cap. Returns `(post, team)`.
 pub async fn claim_due(db: &DatabaseConnection) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
+    claim(db, CLAIM_BATCH).await
+}
+
+/// `claim_due` of at most `limit` posts.
+async fn claim(db: &DatabaseConnection, limit: i64) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
     // A CTE runs once; a LIMIT inside `IN (...)` may be re-run and claim more.
     let stmt = sql(
         "WITH due AS ( \
@@ -1048,7 +1096,7 @@ pub async fn claim_due(db: &DatabaseConnection) -> Result<Vec<(Uuid, Uuid)>, DbE
          UPDATE posts p SET status = 'queued', updated_at = now() FROM due \
          WHERE p.id = due.id AND p.status = 'scheduled' \
          RETURNING p.id, p.team_id",
-        vec![PUBLISHES_PER_DAY.into(), CLAIM_BATCH.into()],
+        vec![PUBLISHES_PER_DAY.into(), limit.into()],
     );
     let rows = db.query_all_raw(stmt).await?;
     rows.iter()

@@ -4784,6 +4784,38 @@ mod teams {
 
             #[tokio::test]
             #[serial]
+            async fn a_slow_post_does_not_delay_one_due_after_it() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let base = pds_of(&db, &team_id).await;
+                // Its image takes 5 seconds to download.
+                let slow = id_of(&create(&s, &cookie, input(&set, "slow", Some(&past()))).await);
+                set_media(&db, &base, &slow, &["/slow.png"]).await;
+                let first = publish::begin(&state).await.unwrap();
+                // Due only now, with the slow one underway: the next round takes it at once.
+                let quick = id_of(&create(&s, &cookie, input(&set, "quick", Some(&past()))).await);
+                let started = std::time::Instant::now();
+                for run in publish::begin(&state).await.unwrap() {
+                    run.await.unwrap();
+                }
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(3),
+                    "the round did not wait for the slow post"
+                );
+                assert_eq!(get_post(&s, &cookie, &quick).await["status"], "published");
+                assert_eq!(get_post(&s, &cookie, &slow).await["status"], "queued");
+                // The slow one was not taken twice, and goes out once.
+                let before = RECORDS.lock().unwrap().len();
+                for run in first {
+                    run.await.unwrap();
+                }
+                assert_eq!(get_post(&s, &cookie, &slow).await["status"], "published");
+                assert_eq!(RECORDS.lock().unwrap().len(), before + 1);
+            }
+
+            #[tokio::test]
+            #[serial]
             async fn the_tick_publishes_due_posts_with_images() {
                 let (s, db, state) = on_mock().await;
                 let (cookie, team_id, _) = owner_with_account(&s, &db).await;
@@ -6315,7 +6347,7 @@ mod teams {
                 let (_, team_id, _) = owner_with_account(&s, &db).await;
                 let set = default_set(&db, &team_id).await.to_string();
                 let bucket = publish::quota_bucket(team_id.parse().unwrap());
-                // Left `queued` 20 minutes ago with no reservation recorded.
+                // Left `queued` long ago with no reservation recorded.
                 let stale = |id: uuid::Uuid| posts::ActiveModel {
                     id: Set(id),
                     updated_at: Set(
@@ -6474,7 +6506,7 @@ mod teams {
                 assert_eq!(p.error.as_deref(), Some("A disconnected account: Boom."));
                 assert!(p.published_at.is_some());
 
-                // A target cut off mid-publish 20 minutes ago fails and is never resent.
+                // A target cut off mid-publish long ago fails and is never resent.
                 let stuck = queued_post(&db, &team_id, &set).await;
                 target(
                     &db,
@@ -8356,7 +8388,8 @@ mod teams {
                         .await
                         .unwrap()
                         .unwrap();
-                    let old = (Utc::now() - Duration::minutes(30)).fixed_offset();
+                    let old =
+                        (Utc::now() - Duration::minutes(publish::STUCK_MINUTES + 5)).fixed_offset();
                     let calls = COMMENTS.lock().unwrap().len();
 
                     // Cut off during the comment call: it may have posted.
@@ -9930,7 +9963,9 @@ mod teams {
                     let cut = post_targets::ActiveModel {
                         id: Set(target.id),
                         status: Set("publishing".into()),
-                        updated_at: Set((Utc::now() - Duration::minutes(30)).fixed_offset()),
+                        updated_at: Set((Utc::now()
+                            - Duration::minutes(publish::STUCK_MINUTES + 5))
+                        .fixed_offset()),
                         ..Default::default()
                     };
                     post_targets::Entity::update(cut).exec(&db).await.unwrap();
@@ -10120,7 +10155,7 @@ mod teams {
                     assert_eq!(p["status"], "published", "{p}");
                     assert_eq!(REFRESHES.load(Ordering::SeqCst), refreshes);
 
-                    // Within two minutes: renewed first, saved, and the new token is the one sent.
+                    // Under 20 minutes left: renewed first, saved, and the new token is the one sent.
                     set_token(&db, account, "dead", 90).await;
                     let puts = PUTS.lock().unwrap().len();
                     let p = publish_clip(&s, ctx, (&cookie, &set), "b").await;

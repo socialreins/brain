@@ -88,7 +88,8 @@ pub fn spawn(app: AppState) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            if let Err(e) = publish::tick(&app).await {
+            // Not waited for: a post that takes many minutes must not delay the next round.
+            if let Err(e) = publish::begin(&app).await {
                 tracing::warn!(error = %e, "publish tick failed");
             }
         }
