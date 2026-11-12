@@ -18,6 +18,8 @@ pub struct Model {
     pub verify_token_hash: Option<String>,
     /// When the latest confirmation email was sent, for the resend throttle.
     pub verify_sent_at: Option<DateTimeWithTimeZone>,
+    /// When an admin approved the email: it may sign up whatever the sign-up rules say.
+    pub approved_at: Option<DateTimeWithTimeZone>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

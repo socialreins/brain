@@ -238,22 +238,21 @@ fn signup_domains(raw: Option<String>) -> Result<Vec<String>, String> {
     if domains.is_empty() {
         return Err("SIGNUP_DOMAINS: no domain given".into());
     }
-    domains
-        .into_iter()
-        .map(|d| {
-            if d.contains('@') {
-                return socialreins_core::email::normalize(&d).ok_or_else(|| {
-                    "SIGNUP_DOMAINS: an entry with @ is not an email address".into()
-                });
-            }
-            let plain =
-                !d.chars().any(char::is_whitespace) && d.split('.').all(|label| !label.is_empty());
-            if !plain {
-                return Err(format!("SIGNUP_DOMAINS: not a plain domain: {d}"));
-            }
-            Ok(d)
-        })
-        .collect()
+    domains.iter().map(|d| signup_entry(d)).collect()
+}
+
+/// One trimmed, lowercased `SIGNUP_DOMAINS` entry, checked: a plain domain or, with an `@`, an
+/// email address. Also checks the entries saved from the admin console.
+pub(crate) fn signup_entry(d: &str) -> Result<String, String> {
+    if d.contains('@') {
+        return socialreins_core::email::normalize(d)
+            .ok_or_else(|| "SIGNUP_DOMAINS: an entry with @ is not an email address".into());
+    }
+    let plain = !d.chars().any(char::is_whitespace) && d.split('.').all(|label| !label.is_empty());
+    if !plain {
+        return Err(format!("SIGNUP_DOMAINS: not a plain domain: {d}"));
+    }
+    Ok(d.to_owned())
 }
 
 /// `ADMIN_EMAILS`: each address normalized like `OWNER_EMAIL`; blank entries are skipped.

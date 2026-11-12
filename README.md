@@ -31,7 +31,13 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | POST | `/v1/waitlist` | `{"email":"...","source":"..."}` joins the waitlist and emails a confirmation link |
 | POST | `/v1/waitlist/verify` | `{"token"}` from the emailed link: marks the signup verified, `200 {"status":"verified"}`, else `422 {"error":"invalid_link"}` |
 | GET | `/v1/waitlist/count` | `{"count":n}`: every signup, verified or not, cached for 30 seconds |
-| GET | `/v1/admin/waitlist` | `ADMIN_EMAILS` only, session cookie: `{"total","verified","signups":[{"id","email","source","created_at","verified_at"}]}`, newest first, at most 1000 (`?verified=true\|false` filters the list) |
+| GET | `/v1/admin/waitlist` | `ADMIN_EMAILS` only, session cookie: `{"total","verified","signups":[{"id","email","source","created_at","verified_at","approved_at"}]}`, newest first, at most 1000 (`?verified=true\|false` and `?q=` (part of the email, any case) filter the list) |
+| GET | `/v1/admin/overview` | Admin console (every `/v1/admin/*` route: `ADMIN_EMAILS` only, session cookie). Totals: `{"users","new_users_7d","teams","accounts":{"total","by_provider":{"bluesky":n}},"posts":{"scheduled","published","failed",...},"waitlist":{"total","verified","approved"}}` |
+| GET | `/v1/admin/users` | `?q=` (part of the email or name, any case), `?limit=` (1 to 200, default 50), `?offset=`: `{"total","users":[{"id","email","name","is_admin","created_at","last_sign_in_at","teams":[{"id","name","role"}]}]}`, newest first. `last_sign_in_at` is the start of the newest session still stored, else `null` |
+| GET | `/v1/admin/teams` | `?q=` (part of the name, any case), `?limit=`, `?offset=`: `{"total","teams":[{"id","name","created_at","members","accounts","posts","owner_email"}]}`, newest first; `posts` leaves out deleted ones |
+| POST | `/v1/admin/waitlist/{id}/approve` | Approves a signup: its email may sign up whatever the sign-up rules say and is mailed a link to `WEB_URL/signup`. `{"signup":{...},"mail":"sent"\|"failed"\|"already_approved"}`; a second call sends nothing, a failed mail keeps the approval. `404 not_found` |
+| DELETE | `/v1/admin/waitlist/{id}` | Removes a signup (and its approval, if it has not signed up yet), `204`. `404 not_found` |
+| GET, PUT | `/v1/admin/settings/signup` | The sign-up rules: `{"mode":"open"\|"closed"\|"domains","domains":[...],"source":"env"\|"saved"}`. `PUT {"mode","domains"}` saves them (sign-in from the last 10 minutes, else `403 reauth_required`): at most 50 domains or email addresses, trimmed, lowercased, deduplicated, at least one for `domains` (`422 invalid_mode`, `invalid_domains`) |
 | POST | `/v1/contact` | `{"name","email","message"}` mails `CONTACT_TO`, `202 {}` |
 | POST | `/auth/link` | `{"email":"...","name":"..."}` emails a sign-in link, `202 {"status":"sent"}`. `name` is optional, 1 to 80 characters (else `422 invalid_name`), and only names an account this link creates. With `"login_only":true`, an email without an account is sent a pointer to sign up instead of a link |
 | GET | `/auth/magic/{token}` | The emailed link: a page with a sign-in button, does not use the link |
@@ -116,7 +122,9 @@ first post sets `verified_at`, later ones answer the same `200`, and a missing, 
 unknown token gets `422 invalid_link`. A resend replaces the token. It shares the waitlist's
 10 requests a minute per IP. Only the token's SHA-256 hash is stored. `GET /v1/waitlist/count` is public. `GET /v1/admin/waitlist` needs a session cookie
 (not an API token) of a user in `ADMIN_EMAILS`: `401 unauthorized` signed out, `403 forbidden`
-otherwise.
+otherwise. So does every other `/v1/admin/*` route (the admin console); the ones that change
+something also need an `Origin` in `CORS_ORIGINS`. None of them returns post bodies, tokens or
+credentials.
 
 `POST /v1/contact` (on when `CONTACT_TO` is set, else `503 {"error":"contact_unavailable"}`)
 takes a name of 1 to 100 characters on one line, an email and a message of 1 to 5000
@@ -142,7 +150,12 @@ hashes of link and session tokens are stored. `POST /auth/link` and `POST /auth/
 
 Sign-up rules: an existing account always signs in. A new account needs its whole address or
 its domain in `SIGNUP_DOMAINS` (anyone when unset) and open registration (`REGISTRATION_DISABLED`
-off); `OWNER_EMAIL` and invited emails are always admitted. Anyone else who tries to sign up
+off); `OWNER_EMAIL`, invited emails and waitlist emails an admin approved
+(`POST /v1/admin/waitlist/{id}/approve`) are always admitted. Once an admin saves rules with
+`PUT /v1/admin/settings/signup` they replace `REGISTRATION_DISABLED` and `SIGNUP_DOMAINS` (mode
+`open`: anyone, `closed`: nobody new, `domains`: the listed domains and addresses) without a
+restart, and the same three exemptions hold; a server where nothing was saved follows the two
+variables as before. Anyone else who tries to sign up
 goes on the waitlist instead. By email link (not `login_only`): the same `202`, and after the
 reply the address joins the waitlist (source `signup`) with the waitlist's own confirmation
 email, which starts "Sign-ups are closed for now. We've added you to the waitlist and will email
@@ -607,8 +620,8 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `WEB_URL` | no | `http://localhost:3000`. Public URL of the web app: sign-in redirects there |
 | `PASSKEY_RP_ID` | no | The host of `PASSKEY_RP_ORIGIN`. WebAuthn relying party id: the domain web and brain share, e.g. `socialreins.com` |
 | `PASSKEY_RP_ORIGIN` | no | The origin of `WEB_URL`. Where the browser runs the passkey ceremonies |
-| `REGISTRATION_DISABLED` | no | `false`. `true` closes sign-up: only `OWNER_EMAIL` and invited emails can sign up (with no `OWNER_EMAIL`, the first account to sign up, then invited emails); existing users still sign in |
-| `SIGNUP_DOMAINS` | no | Comma-separated email domains and email addresses, e.g. `harun.dev,socialreins.com,jane@example.com` (trimmed, any case). When set, a new account's email domain must be one of the domains exactly (a subdomain does not count) or its whole address one of the emails; `OWNER_EMAIL` and invited emails are exempt, existing users still sign in, and anyone else who signs up goes on the waitlist (see sign-up rules). An entry with an `@` must be a valid email address, any other must be a plain domain, else startup fails. Unset or blank: anyone |
+| `REGISTRATION_DISABLED` | no | `false`. `true` closes sign-up: only `OWNER_EMAIL` and invited emails can sign up (with no `OWNER_EMAIL`, the first account to sign up, then invited emails); existing users still sign in. Replaced by rules saved in the admin console (see sign-up rules) |
+| `SIGNUP_DOMAINS` | no | Comma-separated email domains and email addresses, e.g. `harun.dev,socialreins.com,jane@example.com` (trimmed, any case). When set, a new account's email domain must be one of the domains exactly (a subdomain does not count) or its whole address one of the emails; `OWNER_EMAIL` and invited emails are exempt, existing users still sign in, and anyone else who signs up goes on the waitlist (see sign-up rules). An entry with an `@` must be a valid email address, any other must be a plain domain, else startup fails. Unset or blank: anyone. Replaced by rules saved in the admin console (see sign-up rules) |
 | `OWNER_EMAIL` | no | With `REGISTRATION_DISABLED=true`, the one new email allowed to sign up besides invited ones, any case. Recommended for personal installs: otherwise whoever signs up first owns the install |
 | `RESEND_API_KEY` | no | Send mail through the Resend HTTPS API (works where outbound SMTP is blocked, like Railway) |
 | `SMTP_URL` | no | Send mail through any SMTP server, e.g. `smtps://user:pass@smtp.example.com`. Used when `RESEND_API_KEY` is unset |
@@ -626,7 +639,7 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET` | no | Connect TikTok accounts (redirect URI `{BRAIN_URL}/connect/tiktok/callback`) |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | no | Both or neither. Turn on Google sign-in (OAuth client of type Web application, redirect URI `{BRAIN_URL}/auth/google/callback`). They also turn on connecting YouTube channels (add the redirect URI `{BRAIN_URL}/connect/youtube/callback` to the same client) |
 | `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | no | Both or neither. Turn on a Cloudflare Turnstile captcha: `POST /auth/link` and `/v1/contact` then need a `turnstile_token`. Off when unset |
-| `ADMIN_EMAILS` | no | Comma-separated emails, any case, whose signed-in users may read `GET /v1/admin/waitlist` (and get `is_admin: true` from `/auth/me`). None when unset |
+| `ADMIN_EMAILS` | no | Comma-separated emails, any case, whose signed-in users may use the admin console, `/v1/admin/*` (and get `is_admin: true` from `/auth/me`). None when unset |
 | `REVIEW_LOGIN_TOKEN` | no | Turns on `GET /review-login/{token}`, a sign-in to a demo account for Meta App Review. Unset (the default) the route is a `404`. Remove it after the review: see [App Review login](#app-review-login) |
 | `MEDIA_DIR` | no | `./media` (`/var/lib/brain/media` in the image). Where post media is kept while a post publishes, when no bucket is set. Files go once the post settles, so an ephemeral disk is fine. Assumes a single brain instance: with more than one replica, use the `S3_*` bucket |
 | `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | no | All or none. Keep post media in an S3-compatible bucket instead of `MEDIA_DIR`, path-style. Cloudflare R2: `S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com`; AWS S3: `https://s3.<region>.amazonaws.com` with `S3_REGION` |

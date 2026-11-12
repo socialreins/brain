@@ -1,7 +1,8 @@
 //! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, the documented `/v1` API
-//! (waitlist, contact, teams, API tokens, webhooks, connections, social sets, posts, lists, inboxes,
+//! (waitlist, the admin console, contact, teams, API tokens, webhooks, connections, social sets, posts, lists, inboxes,
 //! automations), `/webhooks/meta` (Facebook and Instagram deliveries), `/mcp` (see `crate::mcp`), the Threads and Meta connect pages and
 //! `/media/{name}` (stored post files for platforms that download them).
+pub mod admin;
 pub mod api_tokens;
 pub mod auth;
 pub mod automations;
@@ -55,6 +56,8 @@ use crate::{config::Config, mcp, state::AppState};
 pub(crate) const MAX_BODY_BYTES: usize = 4096;
 /// Passkey bodies carry an attestation or assertion, which can run past 4 KiB.
 const MAX_PASSKEY_BODY_BYTES: usize = 16 * 1024;
+/// 50 sign-up domains can pass 4 KiB.
+const MAX_ADMIN_BODY_BYTES: usize = 16 * 1024;
 const MAX_AUTOMATION_BODY_BYTES: usize = 32 * 1024;
 /// A contact message of 5000 characters can pass 4 KiB.
 const MAX_CONTACT_BODY_BYTES: usize = 32 * 1024;
@@ -77,6 +80,7 @@ fn api() -> OpenApiRouter<AppState> {
     doc.info.license = None;
     OpenApiRouter::with_openapi(doc)
         .merge(waitlist::api())
+        .merge(admin::api().layer(DefaultBodyLimit::max(MAX_ADMIN_BODY_BYTES)))
         .merge(contact::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
         .merge(teams::api())
         .merge(api_tokens::api())
