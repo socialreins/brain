@@ -405,6 +405,31 @@ impl Media {
         url: &str,
         file: Stored,
     ) -> Stored {
+        self.swap(db, post, url, file, to_jpeg).await
+    }
+
+    /// `file`, the stored copy of `url`, swapped for a JPEG of at most `max` bytes (`fit`).
+    /// `file` as it was when it cannot be made to fit, so the size check refuses it.
+    pub async fn fitted(
+        &self,
+        db: &DatabaseConnection,
+        (post, url): (Uuid, &str),
+        file: Stored,
+        (max, side): (usize, u32),
+    ) -> Stored {
+        self.swap(db, post, url, file, move |b| fit(b, max, side))
+            .await
+    }
+
+    /// `file` swapped for the JPEG `convert` makes of its bytes, off the async runtime.
+    async fn swap(
+        &self,
+        db: &DatabaseConnection,
+        post: Uuid,
+        url: &str,
+        file: Stored,
+        convert: impl FnOnce(&[u8]) -> Option<Vec<u8>> + Send + 'static,
+    ) -> Stored {
         let bytes = match self.read(&file.key).await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -412,7 +437,7 @@ impl Media {
                 return file;
             }
         };
-        let Ok(Some(jpeg)) = tokio::task::spawn_blocking(move || to_jpeg(&bytes)).await else {
+        let Ok(Some(jpeg)) = tokio::task::spawn_blocking(move || convert(&bytes)).await else {
             tracing::warn!(post = %post, "media image did not convert to JPEG");
             return file;
         };
@@ -665,9 +690,9 @@ pub fn sniff(head: &[u8]) -> Option<&'static str> {
 /// within a few hundred MB.
 const MAX_PIXELS: u64 = 25_000_000;
 
-/// An image (PNG or WebP) as a JPEG at quality 90, at its own size, any transparency laid on
-/// white; `None` when it does not decode or is over `MAX_PIXELS`.
-pub fn to_jpeg(bytes: &[u8]) -> Option<Vec<u8>> {
+/// An image decoded to RGB at its own size, any transparency laid on white; `None` when it does
+/// not decode or is over `MAX_PIXELS`.
+fn decode_rgb(bytes: &[u8]) -> Option<image::RgbImage> {
     let reader = || {
         image::ImageReader::new(std::io::Cursor::new(bytes))
             .with_guessed_format()
@@ -678,7 +703,7 @@ pub fn to_jpeg(bytes: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let decoded = reader()?.decode().ok()?;
-    let rgb = if decoded.color().has_alpha() {
+    Some(if decoded.color().has_alpha() {
         let mut rgba = decoded.into_rgba8();
         for p in rgba.pixels_mut() {
             let a = u16::from(p[3]);
@@ -689,12 +714,68 @@ pub fn to_jpeg(bytes: &[u8]) -> Option<Vec<u8>> {
         image::DynamicImage::ImageRgba8(rgba).into_rgb8()
     } else {
         decoded.into_rgb8()
-    };
+    })
+}
+
+fn encode_jpeg(rgb: &image::RgbImage, quality: u8) -> Option<Vec<u8>> {
     let mut out = Vec::new();
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
-        .encode_image(&rgb)
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+        .encode_image(rgb)
         .ok()?;
     Some(out)
+}
+
+/// An image (PNG or WebP) as a JPEG at quality 90, at its own size, any transparency laid on
+/// white; `None` when it does not decode or is over `MAX_PIXELS`.
+pub fn to_jpeg(bytes: &[u8]) -> Option<Vec<u8>> {
+    encode_jpeg(&decode_rgb(bytes)?, 90)
+}
+
+/// JPEG qualities `fit` tries at the image's own size, best first.
+const FIT_QUALITIES: [u8; 3] = [90, 80, 70];
+/// The quality of a downscaled image, and how many sizes `fit` tries before giving up.
+const FIT_SCALED_QUALITY: u8 = 80;
+const FIT_SCALES: usize = 6;
+
+/// A still image (JPEG, PNG or WebP) as a JPEG of at most `max` bytes with its longest side at
+/// most `side` pixels, any transparency laid on white. Quality drops first (`FIT_QUALITIES`),
+/// then the image is scaled down, its shape kept, never up, at most `FIT_SCALES` times. It aims
+/// at 90% of `max`. `None` when it does not decode, is over `MAX_PIXELS` or still does not fit.
+pub fn fit(bytes: &[u8], max: usize, side: u32) -> Option<Vec<u8>> {
+    use image::imageops::{resize, FilterType::Lanczos3};
+    let full = decode_rgb(bytes)?;
+    let (w, h) = full.dimensions();
+    let target = max / 10 * 9;
+    let sized = |scale: f64| {
+        let to = |v: u32| ((f64::from(v) * scale).round() as u32).max(1);
+        resize(&full, to(w), to(h), Lanczos3)
+    };
+    // The share of its sides the image keeps: all of them unless it is longer than `side`.
+    let mut scale = (f64::from(side) / f64::from(w.max(h))).min(1.0);
+    let mut len = 0;
+    if scale == 1.0 {
+        for q in FIT_QUALITIES {
+            let out = encode_jpeg(&full, q)?;
+            if out.len() <= target {
+                return Some(out);
+            }
+            if q == FIT_SCALED_QUALITY {
+                len = out.len();
+            }
+        }
+    }
+    for _ in 0..FIT_SCALES {
+        if len > 0 {
+            // A JPEG's size follows its pixel count; a little under, so one step usually does.
+            scale *= ((target as f64 / len as f64).sqrt() * 0.95).min(0.9);
+        }
+        let out = encode_jpeg(&sized(scale), FIT_SCALED_QUALITY)?;
+        if out.len() <= target {
+            return Some(out);
+        }
+        len = out.len();
+    }
+    None
 }
 
 #[cfg(test)]
@@ -757,6 +838,97 @@ mod tests {
         )
         .unwrap();
         assert_eq!(to_jpeg(&bytes), None);
+    }
+
+    /// A PNG of noise, which no codec shrinks to nothing, with see-through pixels if `alpha`.
+    fn noise_png(w: u32, h: u32, alpha: bool) -> Vec<u8> {
+        let mut seed = 0x9E37_79B9u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed >> 8) as u8
+        };
+        let mut bytes = Vec::new();
+        let to = &mut std::io::Cursor::new(&mut bytes);
+        if alpha {
+            image::RgbaImage::from_fn(w, h, |x, _| {
+                image::Rgba([next(), next(), next(), if x < w / 2 { 0 } else { 255 }])
+            })
+            .write_to(to, image::ImageFormat::Png)
+        } else {
+            image::RgbImage::from_fn(w, h, |_, _| image::Rgb([next(), next(), next()]))
+                .write_to(to, image::ImageFormat::Png)
+        }
+        .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn an_image_over_the_limit_is_shrunk_to_fit() {
+        // 1080 x 1350 of noise is over 4 MB as a PNG.
+        let png = noise_png(1080, 1350, false);
+        assert!(png.len() > 3_000_000, "{}", png.len());
+        let out = fit(&png, 1_000_000, 2000).unwrap();
+        assert!(out.len() <= 900_000, "{}", out.len());
+        assert_eq!(sniff(&out), Some("image/jpeg"));
+        let (w, h) = image::load_from_memory(&out)
+            .unwrap()
+            .into_rgb8()
+            .dimensions();
+        // Never larger, and the same shape.
+        assert!(w <= 1080 && h <= 1350, "{w} x {h}");
+        assert!(
+            (f64::from(w) / f64::from(h) - 0.8).abs() < 0.01,
+            "{w} x {h}"
+        );
+        // X's limit takes the same image at its own size.
+        let out = fit(&png, 5_000_000, u32::MAX).unwrap();
+        assert!(out.len() <= 4_500_000, "{}", out.len());
+        let back = image::load_from_memory(&out).unwrap();
+        assert_eq!((back.width(), back.height()), (1080, 1350));
+        // What does not decode, a GIF among it (no decoder: it would lose its animation), and
+        // a limit nothing reaches are left alone.
+        assert_eq!(fit(b"GIF89a not really", 1_000_000, 2000), None);
+        assert_eq!(fit(b"\x89PNG\r\n\x1a\n not really", 1_000_000, 2000), None);
+        assert_eq!(fit(&noise_png(64, 64, false), 100, 2000), None);
+    }
+
+    #[test]
+    fn a_very_large_image_is_scaled_down_in_shape() {
+        let png = noise_png(3000, 1500, false);
+        let out = fit(&png, 1_000_000, 2000).unwrap();
+        assert!(out.len() <= 900_000, "{}", out.len());
+        let (w, h) = image::load_from_memory(&out)
+            .unwrap()
+            .into_rgb8()
+            .dimensions();
+        assert!(w <= 2000, "{w} x {h}");
+        assert!(
+            (f64::from(w) / f64::from(h) - 2.0).abs() < 0.01,
+            "{w} x {h}"
+        );
+        // Longer than the side but light: scaled to the side, no further.
+        let mut flat = Vec::new();
+        image::RgbImage::from_pixel(2500, 500, image::Rgb([10, 120, 200]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut flat),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let out = fit(&flat, 1_000_000, 2000).unwrap();
+        let back = image::load_from_memory(&out).unwrap();
+        assert_eq!((back.width(), back.height()), (2000, 400));
+    }
+
+    #[test]
+    fn a_shrunk_image_lays_its_transparency_on_white() {
+        let out = fit(&noise_png(1000, 800, true), 500_000, 2000).unwrap();
+        assert!(out.len() <= 450_000, "{}", out.len());
+        let back = image::load_from_memory(&out).unwrap().into_rgb8();
+        let (w, h) = back.dimensions();
+        let p = back.get_pixel(w / 4, h / 2).0;
+        assert!(p.iter().all(|c| *c > 235), "transparent is white: {p:?}");
     }
 
     #[test]

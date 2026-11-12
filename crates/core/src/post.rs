@@ -323,6 +323,23 @@ pub const BLUESKY_MAX_IMAGE_BYTES: u64 = 1_000_000;
 pub const X_MAX_IMAGE_BYTES: u64 = 5_000_000;
 pub const X_MAX_GIF_BYTES: u64 = 15_000_000;
 
+/// The platforms with a limit for one still image (JPEG, PNG or WebP): the platform, its name,
+/// the most bytes it takes and the longest side in pixels a shrunk image keeps. Publishing
+/// shrinks an image over the byte limit to fit, so saving a post does not refuse it. A GIF is
+/// never re-encoded (it would lose its animation), so its limit still refuses it.
+pub const IMAGE_LIMITS: &[(&str, &str, u64, u32)] = &[
+    ("bluesky", "Bluesky", BLUESKY_MAX_IMAGE_BYTES, 2000),
+    ("x", "X", X_MAX_IMAGE_BYTES, u32::MAX),
+];
+
+/// `platform`'s row of `IMAGE_LIMITS`: its name, byte limit and longest side.
+pub fn image_limit(platform: &str) -> Option<(&'static str, u64, u32)> {
+    IMAGE_LIMITS
+        .iter()
+        .find(|l| l.0 == platform)
+        .map(|l| (l.1, l.2, l.3))
+}
+
 const JPEG: &str = "image/jpeg";
 const PNG: &str = "image/png";
 const GIF: &str = "image/gif";
@@ -390,13 +407,13 @@ fn alone(platform: &str, t: &str) -> Option<&'static str> {
     }
 }
 
-/// The size limit a file of type `t` has on `platform`, and its name in messages.
+/// The size limit a file of type `t` has on `platform` when a post is saved, and its name in
+/// messages. A still image has only brain's own cap here: publishing shrinks it to the
+/// platform's limit (`IMAGE_LIMITS`).
 fn size_limit(platform: &str, t: &str) -> (u64, &'static str) {
-    let video = t.starts_with("video/");
     match platform {
-        "bluesky" if !video => (BLUESKY_MAX_IMAGE_BYTES, "Bluesky's limit"),
+        "bluesky" if t == GIF => (BLUESKY_MAX_IMAGE_BYTES, "Bluesky's limit for a GIF"),
         "x" if t == GIF => (X_MAX_GIF_BYTES, "X's limit for a GIF"),
-        "x" if !video => (X_MAX_IMAGE_BYTES, "X's limit for an image"),
         _ => (MAX_MEDIA_BYTES, "the largest file SocialReins takes"),
     }
 }
@@ -947,17 +964,31 @@ mod tests {
         // Publishing turns a PNG into a JPEG for TikTok and Instagram.
         assert_eq!(code("tiktok", &[png]), Ok(()));
         assert_eq!(code("tiktok", &[gif]), Err("media_type_not_supported"));
+        // A still image over the platform's limit is shrunk when it publishes, a GIF is not.
+        assert_eq!(code("bluesky", &[f(PNG, 3_000_000)]), Ok(()));
+        assert_eq!(code("bluesky", &[jpg, f(JPEG, 2_000_000)]), Ok(()));
+        assert_eq!(code("bluesky", &[f(WEBP, 99_000_000)]), Ok(()));
         assert_eq!(
-            code("bluesky", &[f(PNG, 1_000_001)]),
+            code("bluesky", &[f(PNG, 100_000_001)]),
             Err("media_too_large")
         );
-        let (_, msg) = validate_media_facts("bluesky", &[jpg, f(JPEG, 2_000_000)]).unwrap_err();
-        assert_eq!(msg, "Media 2 is over 1 MB, Bluesky's limit.");
+        let (_, msg) = validate_media_facts("bluesky", &[jpg, f(GIF, 1_000_001)]).unwrap_err();
+        assert_eq!(msg, "Media 2 is over 1 MB, Bluesky's limit for a GIF.");
         assert_eq!(code("bluesky", &[f(MP4, 90_000_000)]), Ok(()));
+        assert_eq!(
+            code("bluesky", &[f(MP4, 100_000_001)]),
+            Err("media_too_large")
+        );
         assert_eq!(code("bluesky", &[mp4, jpg]), Err("mixed_media"));
         assert_eq!(code("x", &[gif, jpg]), Err("mixed_media"));
-        assert_eq!(code("x", &[f(JPEG, 5_000_001)]), Err("media_too_large"));
+        assert_eq!(code("x", &[f(PNG, 6_000_000)]), Ok(()));
+        assert_eq!(code("x", &[f(JPEG, 5_000_001)]), Ok(()));
         assert_eq!(code("x", &[f(GIF, 14_000_000)]), Ok(()));
+        assert_eq!(code("x", &[f(GIF, 15_000_001)]), Err("media_too_large"));
+        assert_eq!(code("x", &[f(MOV, 100_000_001)]), Err("media_too_large"));
+        assert_eq!(image_limit("bluesky"), Some(("Bluesky", 1_000_000, 2000)));
+        assert_eq!(image_limit("x").map(|l| l.1), Some(5_000_000));
+        assert_eq!(image_limit("threads"), None);
         assert_eq!(code("threads", &[mp4, jpg, png]), Ok(()));
         assert_eq!(code("threads", &[gif]), Err("media_type_not_supported"));
         assert_eq!(code("instagram", &[mp4, jpg]), Ok(()));
