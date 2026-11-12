@@ -637,12 +637,10 @@ impl Media {
         // `max_bytes` caps a video only, and nothing says yet whether this is one.
         let video_cap = cap.min(self.max_bytes);
         let any_cap = video_cap.max(cap.min(MAX_STILL_BYTES));
-        if res.content_length().is_some_and(|n| n > any_cap as u64) {
-            return Err(if any_cap == video_cap {
-                Fail::TooLarge
-            } else {
-                Fail::TooLargeStill
-            });
+        // Over a video's cap but under a still's (`MEDIA_MAX_BYTES` set low), which message
+        // fits depends on the type: the check after the first bytes says.
+        if any_cap == video_cap && res.content_length().is_some_and(|n| n > any_cap as u64) {
+            return Err(Fail::TooLarge);
         }
         // The time a download has: its size at `MIN_SPEED` on top of `deadline`. Size unsaid, it
         // is the bytes that came so far, so a download earns its time only as it arrives at a
@@ -1086,17 +1084,20 @@ fn attr(tag: &str, name: &str) -> Option<String> {
 /// `uuid`, `at`), else why there is none.
 fn drive_page(page: &str) -> Result<Url, Fail> {
     let lower = page.to_ascii_lowercase();
-    if lower.contains("too many users have viewed or downloaded")
-        || lower.contains("quota exceeded")
-    {
-        return Err(Fail::DriveQuota);
-    }
     let Some(form) = page
         .split("<form")
         .skip(1)
         .find(|f| f.contains("download-form"))
     else {
-        return Err(if lower.contains("virus") {
+        // The quota page by its title or its exact sentence, and only without the form: the
+        // confirmation page shows the file's name, which may say anything.
+        let title = lower.split("<title>").nth(1).unwrap_or_default();
+        let title = title.split("</title>").next().unwrap_or_default();
+        let quota = title.contains("quota exceeded")
+            || lower.contains("too many users have viewed or downloaded this file recently");
+        return Err(if quota {
+            Fail::DriveQuota
+        } else if lower.contains("virus") {
             Fail::DriveConfirm
         } else {
             Fail::NotShared
@@ -1737,6 +1738,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_drive_file_named_like_the_quota_page_is_still_confirmed() {
+        let named = |form: &str| {
+            format!(
+                "<html><head><title>Google Drive - Virus scan warning</title></head><body>\
+                 <a href=\"/open?id=f1\">Quota exceeded.mp4</a> (1.2G) is too large for Google \
+                 Drive to scan for viruses.{form}</body></html>"
+            )
+        };
+        let form = "<form id=\"download-form\" method=\"get\" \
+                    action=\"https://drive.usercontent.google.com/download\">\
+                    <input type=\"hidden\" name=\"id\" value=\"f1\"></form>";
+        let to = drive_page(&named(form)).unwrap();
+        assert_eq!(to.query(), Some("id=f1"));
+        // Without the form it is a page that cannot be got past, not a quota.
+        assert_eq!(drive_page(&named("")).unwrap_err(), Fail::DriveConfirm);
+    }
+
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
     use futures_util::{stream, StreamExt};
@@ -2103,6 +2122,13 @@ mod tests {
                 .await;
             assert_eq!(got.unwrap_err(), Fail::TooLarge, "{path}");
         }
+        // A video over the cap of a still too is refused as a video, not as an image.
+        let base = video_server(MAX_STILL_BYTES + 1, store.sent.clone()).await;
+        let url = format!("{base}/sized.mp4");
+        let got = media
+            .download(Uuid::now_v7(), &url, MAX_BYTES, soon(), &mut None)
+            .await;
+        assert_eq!(got.unwrap_err(), Fail::TooLarge);
         let got = media
             .download(
                 Uuid::now_v7(),
