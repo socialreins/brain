@@ -118,6 +118,8 @@ pub struct Media {
     /// The largest video stored: `MAX_BYTES`, or `MEDIA_MAX_BYTES` when that is lower. Only a
     /// video's cap: an image or a PDF keeps `MAX_STILL_BYTES`.
     pub max_bytes: usize,
+    /// The store's directory when it is local disk (`MEDIA_DIR`), for `sweep_temp`.
+    pub dir: Option<std::path::PathBuf>,
     /// `INGEST_DEADLINE`; tests shorten it.
     pub deadline: Duration,
     /// `INGEST_CEILING`; tests shorten it.
@@ -288,6 +290,7 @@ impl Media {
             client,
             allow_private,
             max_bytes: MAX_BYTES,
+            dir: None,
             deadline: INGEST_DEADLINE,
             ceiling: INGEST_CEILING,
             stall: STALL,
@@ -921,9 +924,50 @@ pub async fn sweep(app: &AppState) -> Result<u64, DbErr> {
     if !locked {
         return Ok(0);
     }
-    let gone = app.media.release(&app.db, None, SWEEP_DAYS).await?;
+    let mut gone = app.media.release(&app.db, None, SWEEP_DAYS).await?;
+    if let Some(dir) = app.media.dir.clone() {
+        let swept = tokio::task::spawn_blocking(move || sweep_temp(&dir, TEMP_AGE));
+        gone += swept.await.unwrap_or(0);
+    }
     lock.commit().await?;
     Ok(gone)
+}
+
+/// A temp file on local disk this old belongs to no download still running: several times
+/// `INGEST_CEILING`.
+const TEMP_AGE: Duration = Duration::from_secs(3600);
+
+/// Deletes the temp files under `dir` older than `older`, and returns how many went. The local
+/// store writes a file as `<key>#<n>` and renames it when done, so a process killed
+/// mid-download leaves one (up to `MAX_BYTES`) that no listing shows and `release` never sees.
+/// In a bucket the same leftovers are parts of a multipart upload, which its lifecycle rule
+/// aborts (README).
+fn sweep_temp(dir: &std::path::Path, older: Duration) -> u64 {
+    let mut gone = 0;
+    let Ok(posts) = std::fs::read_dir(dir.join("posts")) else {
+        return 0;
+    };
+    for post in posts.flatten() {
+        let Ok(files) = std::fs::read_dir(post.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let name = file.file_name();
+            let digits = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+            let temp = name
+                .to_string_lossy()
+                .rsplit_once('#')
+                .is_some_and(|n| digits(n.1));
+            let age = file.metadata().and_then(|m| m.modified()).ok();
+            let old = age
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|a| a >= older);
+            if temp && old && std::fs::remove_file(file.path()).is_ok() {
+                gone += 1;
+            }
+        }
+    }
+    gone
 }
 
 /// The unguessable brain URL of a stored file, for platforms that download media themselves
@@ -1500,6 +1544,30 @@ mod tests {
         ] {
             assert_eq!(drive_url(other), None, "{other}");
         }
+    }
+
+    #[test]
+    fn old_temp_files_on_disk_are_swept() {
+        let dir = std::env::temp_dir().join(format!("media-temp-{}", Uuid::now_v7()));
+        let post = dir.join("posts").join(Uuid::now_v7().to_string());
+        std::fs::create_dir_all(&post).unwrap();
+        let long_ago = std::time::SystemTime::now() - 2 * TEMP_AGE;
+        // A download cut off long ago, one still running, and a stored file as old as the first.
+        for (name, old) in [("a#1", true), ("b#12", false), ("c", true), ("d#x", true)] {
+            let file = std::fs::File::create(post.join(name)).unwrap();
+            if old {
+                file.set_modified(long_ago).unwrap();
+            }
+        }
+        assert_eq!(sweep_temp(&dir, TEMP_AGE), 1);
+        let mut left: Vec<_> = std::fs::read_dir(&post)
+            .unwrap()
+            .map(|f| f.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["b#12", "c", "d#x"]);
+        assert_eq!(sweep_temp(&dir.join("none"), TEMP_AGE), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -200,6 +200,7 @@ impl Config {
             media: {
                 let mut media = Media::new(media_store(var)?, false);
                 media.max_bytes = media_max_bytes(var("MEDIA_MAX_BYTES"))?;
+                media.dir = var("S3_BUCKET").is_none().then(|| media_dir(var).into());
                 media
             },
             threads: Threads::new(var("THREADS_APP_ID").zip(var("THREADS_APP_SECRET")))?,
@@ -285,6 +286,11 @@ fn media_max_bytes(value: Option<String>) -> Result<usize, String> {
     }
 }
 
+/// `MEDIA_DIR`: where media is kept when no bucket is set.
+fn media_dir(var: impl Fn(&str) -> Option<String>) -> String {
+    var("MEDIA_DIR").unwrap_or_else(|| "./media".into())
+}
+
 /// The media store `Config::media` describes.
 fn media_store(var: impl Fn(&str) -> Option<String>) -> Result<Arc<dyn ObjectStore>, String> {
     let s3 = [
@@ -317,7 +323,7 @@ fn media_store(var: impl Fn(&str) -> Option<String>) -> Result<Arc<dyn ObjectSto
             Ok(Arc::new(s3))
         }
         [None, None, None, None] => {
-            let dir = var("MEDIA_DIR").unwrap_or_else(|| "./media".into());
+            let dir = media_dir(&var);
             std::fs::create_dir_all(&dir).map_err(|e| format!("MEDIA_DIR: {e}"))?;
             let local =
                 LocalFileSystem::new_with_prefix(&dir).map_err(|e| format!("MEDIA_DIR: {e}"))?;
