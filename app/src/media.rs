@@ -57,6 +57,25 @@ const PROBE_LEN: usize = 512;
 /// Image conversions (`to_jpeg`, `fit`) running at once in the process, so the decode and resize
 /// buffers of many posts (up to a few hundred MB each) queue instead of piling up.
 static CONVERTING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+/// One turn per post group and media URL (`Media::ingest`): posts of a group publish at once,
+/// and the first to take the turn downloads a video the others then copy in the store.
+// shortcut: turns are per process, so two brain instances may each download a group's video;
+// take a Postgres advisory lock instead if replicas ever publish the same group.
+type Turn = tokio::sync::Mutex<()>;
+static TURNS: std::sync::Mutex<Option<HashMap<(Uuid, String), std::sync::Weak<Turn>>>> =
+    std::sync::Mutex::new(None);
+
+fn turn_of(group: Uuid, url: &str) -> Arc<Turn> {
+    let mut turns = TURNS.lock().unwrap_or_else(|e| e.into_inner());
+    let turns = turns.get_or_insert_with(HashMap::new);
+    turns.retain(|_, t| t.strong_count() > 0);
+    let slot = turns.entry((group, url.to_owned())).or_default();
+    slot.upgrade().unwrap_or_else(|| {
+        let new = Arc::<Turn>::default();
+        *slot = Arc::downgrade(&new);
+        new
+    })
+}
 const SWEEP_LOCK: i64 = 0x004d_4544_4941_5357;
 
 /// The store and the client that downloads into it.
@@ -327,7 +346,7 @@ impl Media {
     pub async fn ingest_all(
         &self,
         db: &DatabaseConnection,
-        post: Uuid,
+        (post, group): (Uuid, Option<Uuid>),
         urls: &[String],
         cap: usize,
     ) -> HashMap<String, Result<Stored, Fail>> {
@@ -346,7 +365,7 @@ impl Media {
                 let Some(url) = left.pop() else { break };
                 let (media, db) = (self.clone(), db.clone());
                 running.spawn(async move {
-                    let got = media.ingest(&db, post, &url, cap, until).await;
+                    let got = media.ingest(&db, (post, group), &url, cap, until).await;
                     (url, got)
                 });
             }
@@ -368,11 +387,14 @@ impl Media {
     /// The stored copy of `url` for `post`: the one an earlier try saved, else downloaded now,
     /// at most `cap` bytes (and never over `max_bytes`, or `MAX_STILL_BYTES` unless it is a
     /// video), by `until`. A row whose file is gone is
-    /// a miss: it is deleted and the URL downloaded again.
+    /// a miss: it is deleted and the URL downloaded again. A video another post of `group` (the
+    /// post's `group_id`) already stored from the same URL is copied in the store instead
+    /// (`copied`), so a group downloads it once; each post still owns, and later deletes, its own
+    /// file. Posts of a group take turns per URL, only until a file is known not to be a video.
     pub async fn ingest(
         &self,
         db: &DatabaseConnection,
-        post: Uuid,
+        (post, group): (Uuid, Option<Uuid>),
         url: &str,
         cap: usize,
         until: Instant,
@@ -402,10 +424,21 @@ impl Media {
                 _ => return Ok(s),
             }
         }
-        let got = self
-            .download(post, url, cap.min(self.max_bytes), until)
-            .await;
-        let (key, content_type, size) = got?;
+        let cap = cap.min(self.max_bytes);
+        let mut turn = None;
+        let mut copy = None;
+        if let Some(group) = group {
+            let wait = tokio::time::timeout_at(until, turn_of(group, url).lock_owned());
+            turn = Some(wait.await.map_err(|_| Fail::TimedOut)?);
+            copy = self.copied(db, post, url, cap, until).await;
+        }
+        let (key, content_type, size) = match copy {
+            Some(copy) => copy,
+            None => {
+                let got = self.download(post, url, cap, until, &mut turn).await;
+                got.map(|(key, content_type, size)| (key, content_type.to_owned(), size))?
+            }
+        };
         // A run that stored the same URL first wins; this copy is then deleted.
         let saved = db
             .query_one_raw(sql(
@@ -431,7 +464,44 @@ impl Media {
         if kept.as_ref().map_or(true, |s| s.key != key) {
             self.delete(&key).await;
         }
+        drop(turn);
         kept
+    }
+
+    /// A copy for `post`, made inside the store (no bytes pass through brain), of the video at
+    /// most `cap` bytes that another post of its group stored from `url`: its key, type and size.
+    /// `None` when there is none or the copy fails (the other post settled and its file went),
+    /// and the caller downloads.
+    async fn copied(
+        &self,
+        db: &DatabaseConnection,
+        post: Uuid,
+        url: &str,
+        cap: usize,
+        until: Instant,
+    ) -> Option<(String, String, usize)> {
+        let stmt = sql(
+            "SELECT m.storage_key, m.content_type, m.size FROM posts me \
+             JOIN posts p ON p.team_id = me.team_id AND p.group_id = me.group_id AND p.id <> me.id \
+             JOIN post_media m ON m.post_id = p.id \
+             WHERE me.id = $1 AND m.source_url = $2 AND m.content_type LIKE 'video/%' \
+             AND m.size <= $3 ORDER BY m.created_at DESC LIMIT 1",
+            vec![post.into(), url.into(), (cap as i64).into()],
+        );
+        let from = stored(&db.query_one_raw(stmt).await.ok()??).ok()?;
+        let key = format!("posts/{post}/{}", Uuid::now_v7());
+        let (source, to) = (Path::from(from.key.as_str()), Path::from(key.as_str()));
+        let copy = self.store.copy(&source, &to);
+        match tokio::time::timeout_at(until, copy).await {
+            Ok(Ok(())) => Some((key, from.content_type, from.size.max(0) as usize)),
+            failed => {
+                if let Ok(Err(e)) = failed {
+                    tracing::info!(error = %e, post = %post, "group media copy failed");
+                }
+                self.delete(&key).await;
+                None
+            }
+        }
     }
 
     /// Streams `url` (a Drive share link as its direct download) into a new object, part by part
@@ -446,6 +516,7 @@ impl Media {
         url: &str,
         cap: usize,
         until: Instant,
+        turn: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
     ) -> Result<(String, &'static str, usize), Fail> {
         let drive = drive_url(url);
         let from = Url::parse(drive.as_deref().unwrap_or(url)).map_err(|_| Fail::Blocked)?;
@@ -500,6 +571,10 @@ impl Media {
                 Fail::Unsupported
             });
         };
+        // Only a video is shared in a group, so nothing else keeps the group's other posts waiting.
+        if !content_type.starts_with("video/") {
+            turn.take();
+        }
         // Only a video may pass `MAX_STILL_BYTES`: anything else is read whole later.
         let (cap, over) = if content_type.starts_with("video/") || cap <= MAX_STILL_BYTES {
             (cap, Fail::TooLarge)
@@ -1325,7 +1400,7 @@ mod tests {
         let post = Uuid::now_v7();
         for path in ["/ok.png", "/hop"] {
             let (key, ty, size) = media
-                .download(post, &format!("{base}{path}"), MAX_BYTES, soon())
+                .download(post, &format!("{base}{path}"), MAX_BYTES, soon(), &mut None)
                 .await
                 .unwrap();
             assert_eq!((ty, size), ("image/png", 100_000));
@@ -1333,11 +1408,11 @@ mod tests {
             assert_eq!(media.read(&key).await.unwrap(), png(100_000));
         }
         let got = media
-            .download(post, &format!("{base}/ok.png"), 99_999, soon())
+            .download(post, &format!("{base}/ok.png"), 99_999, soon(), &mut None)
             .await;
         assert_eq!(got.unwrap_err(), Fail::TooLarge);
         let got = media
-            .download(post, &format!("{base}/page"), MAX_BYTES, soon())
+            .download(post, &format!("{base}/page"), MAX_BYTES, soon(), &mut None)
             .await;
         assert_eq!(got.unwrap_err(), Fail::Unsupported);
     }
@@ -1546,7 +1621,13 @@ mod tests {
             let base = video_server(len, store.sent.clone()).await;
             let media = Media::new(store.clone(), true);
             let (key, ty, size) = media
-                .download(Uuid::now_v7(), &format!("{base}{path}"), MAX_BYTES, soon())
+                .download(
+                    Uuid::now_v7(),
+                    &format!("{base}{path}"),
+                    MAX_BYTES,
+                    soon(),
+                    &mut None,
+                )
                 .await
                 .unwrap();
             assert_eq!((ty, size), ("video/mp4", len), "{path}");
@@ -1568,7 +1649,13 @@ mod tests {
         let post = Uuid::now_v7();
         // Its size said up front: refused on the headers, nothing stored or even started.
         let got = media
-            .download(post, &format!("{base}/sized.mp4"), len - 1, soon())
+            .download(
+                post,
+                &format!("{base}/sized.mp4"),
+                len - 1,
+                soon(),
+                &mut None,
+            )
             .await;
         assert_eq!(got.unwrap_err(), Fail::TooLarge);
         assert_eq!(store.largest.load(SeqCst), 0, "no part was written");
@@ -1584,7 +1671,7 @@ mod tests {
         for media in [&media, &on_disk] {
             store.sent.store(0, SeqCst);
             let got = media
-                .download(post, &format!("{base}/unsized.mp4"), cap, soon())
+                .download(post, &format!("{base}/unsized.mp4"), cap, soon(), &mut None)
                 .await;
             assert_eq!(got.unwrap_err(), Fail::TooLarge);
             assert!(store.sent.load(SeqCst) < len, "the download stopped early");
@@ -1631,7 +1718,13 @@ mod tests {
         let mut media = Media::new(store.clone(), true);
         for path in ["/sized.png", "/unsized.png"] {
             let got = media
-                .download(Uuid::now_v7(), &format!("{base}{path}"), MAX_BYTES, soon())
+                .download(
+                    Uuid::now_v7(),
+                    &format!("{base}{path}"),
+                    MAX_BYTES,
+                    soon(),
+                    &mut None,
+                )
                 .await;
             assert_eq!(got.unwrap_err(), Fail::TooLargeStill, "{path}");
         }
@@ -1647,6 +1740,7 @@ mod tests {
                 &format!("{base}/sized.mp4"),
                 media.max_bytes,
                 soon(),
+                &mut None,
             )
             .await;
         assert_eq!(got.unwrap_err(), Fail::TooLarge);
@@ -1665,6 +1759,7 @@ mod tests {
                 &format!("{base}/stall.mp4"),
                 MAX_BYTES,
                 soon(),
+                &mut None,
             )
             .await;
         assert_eq!(got.unwrap_err(), Fail::Stalled);
@@ -1680,6 +1775,7 @@ mod tests {
                 &format!("{base}/slow.mp4"),
                 2_000_000,
                 soon(),
+                &mut None,
             )
             .await;
         assert_eq!(got.unwrap_err(), Fail::TimedOut);
@@ -1698,6 +1794,7 @@ mod tests {
                 &format!("{base}/slow.mp4"),
                 MAX_BYTES,
                 until,
+                &mut None,
             )
             .await;
         assert_eq!(got.unwrap_err(), Fail::TimedOut);
@@ -1753,7 +1850,7 @@ mod tests {
         ] {
             assert_eq!(
                 media
-                    .download(post, &url, MAX_BYTES, soon())
+                    .download(post, &url, MAX_BYTES, soon(), &mut None)
                     .await
                     .unwrap_err(),
                 Fail::Blocked,

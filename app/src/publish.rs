@@ -1323,8 +1323,10 @@ async fn ingest(app: &AppState, post: &posts::Model) -> Media {
     let cover: Vec<String> = post.cover.clone().into_iter().collect();
     let cover_cap = cover_bytes(&post.platform);
     let (mut found, covers) = tokio::join!(
-        app.media.ingest_all(&app.db, post.id, &urls, cap),
-        app.media.ingest_all(&app.db, post.id, &cover, cover_cap),
+        app.media
+            .ingest_all(&app.db, (post.id, post.group_id), &urls, cap),
+        app.media
+            .ingest_all(&app.db, (post.id, None), &cover, cover_cap),
     );
     // A cover that is also a media link keeps the media's result, and then fails its type check.
     for (url, got) in covers {

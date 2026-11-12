@@ -4891,7 +4891,7 @@ mod teams {
                     let id: uuid::Uuid = id.parse().unwrap();
                     async move {
                         media
-                            .ingest(&db, id, &url, 1_000_000, soon())
+                            .ingest(&db, (id, None), &url, 1_000_000, soon())
                             .await
                             .unwrap()
                     }
@@ -4976,6 +4976,103 @@ mod teams {
                 assert_eq!(res.status_code(), 204);
                 assert_eq!(media_rows(&db, draft).await, 0);
                 assert!(state.media.read(&draft_orphan).await.is_err());
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_groups_video_is_downloaded_once_and_each_post_keeps_its_copy() {
+                use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                // A server that counts how often the video (3 MB, made here) is asked for.
+                static HITS: AtomicUsize = AtomicUsize::new(0);
+                HITS.store(0, SeqCst);
+                let mut clip = b"\0\0\0\x18ftypisom".to_vec();
+                clip.resize(3_000_000, 7);
+                let serve = move || {
+                    let clip = clip.clone();
+                    async move {
+                        HITS.fetch_add(1, SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        clip
+                    }
+                };
+                let app = axum::Router::new().route("/clip.mp4", axum::routing::get(serve));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}/clip.mp4", listener.local_addr().unwrap());
+                tokio::spawn(async move { axum::serve(listener, app).await });
+
+                // Two posts of one group and one that is in none, all with the same video.
+                let group = uuid::Uuid::now_v7();
+                let mut ids = Vec::new();
+                for grouped in [true, true, false] {
+                    let id = id_of(&create(&s, &cookie, input(&set, "clip", Some(&past()))).await);
+                    let row = posts::ActiveModel {
+                        id: Set(id.parse().unwrap()),
+                        group_id: Set(grouped.then_some(group)),
+                        ..Default::default()
+                    };
+                    posts::Entity::update(row).exec(&db).await.unwrap();
+                    ids.push(id);
+                }
+                let ingest = |id: &str, group: Option<uuid::Uuid>| {
+                    let (media, db, url) = (state.media.clone(), db.clone(), url.clone());
+                    let id: uuid::Uuid = id.parse().unwrap();
+                    let until = tokio::time::Instant::now() + media::INGEST_DEADLINE;
+                    async move {
+                        let got = media.ingest(&db, (id, group), &url, 10_000_000, until);
+                        got.await.unwrap()
+                    }
+                };
+                // Both at once, as a tick runs them: one downloads, the other copies in the store.
+                let (a, b) =
+                    tokio::join!(ingest(&ids[0], Some(group)), ingest(&ids[1], Some(group)));
+                assert_eq!(HITS.load(SeqCst), 1, "one download for the group");
+                assert_ne!(a.key, b.key);
+                assert!(
+                    a.key.starts_with(&format!("posts/{}/", ids[0])),
+                    "{}",
+                    a.key
+                );
+                assert!(
+                    b.key.starts_with(&format!("posts/{}/", ids[1])),
+                    "{}",
+                    b.key
+                );
+                assert_eq!((a.size, b.size), (3_000_000, 3_000_000));
+                assert_eq!(b.content_type, "video/mp4");
+                // A post outside the group downloads its own.
+                ingest(&ids[2], None).await;
+                assert_eq!(HITS.load(SeqCst), 2);
+
+                // The first post settles: its file goes, the other post's stays until it settles.
+                let settle = |id: &str| {
+                    let row = posts::ActiveModel {
+                        id: Set(id.parse().unwrap()),
+                        status: Set("published".into()),
+                        ..Default::default()
+                    };
+                    let (db, media, id) = (db.clone(), state.media.clone(), id.parse().unwrap());
+                    async move {
+                        posts::Entity::update(row).exec(&db).await.unwrap();
+                        media.release_post(&db, id).await;
+                    }
+                };
+                settle(&ids[0]).await;
+                assert!(state.media.read(&a.key).await.is_err());
+                assert_eq!(state.media.read(&b.key).await.unwrap().len(), 3_000_000);
+                // A retry of the settled post finds the group's copy and still downloads nothing.
+                let again = ingest(&ids[0], Some(group)).await;
+                assert_eq!(HITS.load(SeqCst), 2);
+                assert_eq!(state.media.read(&again.key).await.unwrap().len(), 3_000_000);
+                settle(&ids[1]).await;
+                assert!(state.media.read(&b.key).await.is_err());
+                assert_eq!(state.media.read(&again.key).await.unwrap().len(), 3_000_000);
+                settle(&ids[0]).await;
+                assert!(state.media.read(&again.key).await.is_err());
+                assert!(!media_dir().join("posts").join(&ids[0]).exists());
+                assert!(!media_dir().join("posts").join(&ids[1]).exists());
             }
 
             #[tokio::test]
@@ -7032,7 +7129,7 @@ mod teams {
                     let url = format!("{base}/img.png");
                     let stored = state
                         .media
-                        .ingest(&db, post, &url, 1_000_000, until)
+                        .ingest(&db, (post, None), &url, 1_000_000, until)
                         .await
                         .unwrap();
                     let link = media::link(&state, &stored);
