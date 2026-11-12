@@ -62,8 +62,8 @@ static CONVERTING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2)
 // shortcut: turns are per process, so two brain instances may each download a group's video;
 // take a Postgres advisory lock instead if replicas ever publish the same group.
 type Turn = tokio::sync::Mutex<()>;
-static TURNS: std::sync::Mutex<Option<HashMap<(Uuid, String), std::sync::Weak<Turn>>>> =
-    std::sync::Mutex::new(None);
+type Turns = HashMap<(Uuid, String), std::sync::Weak<Turn>>;
+static TURNS: std::sync::Mutex<Option<Turns>> = std::sync::Mutex::new(None);
 
 fn turn_of(group: Uuid, url: &str) -> Arc<Turn> {
     let mut turns = TURNS.lock().unwrap_or_else(|e| e.into_inner());
