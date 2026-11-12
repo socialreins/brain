@@ -367,8 +367,6 @@ impl Bluesky {
     }
 }
 
-/// Bluesky's limit for one image blob.
-pub const MAX_IMAGE_BYTES: usize = 1_000_000;
 const IMAGE_TYPES: [&str; 4] = ["image/jpeg", "image/png", "image/webp", "image/gif"];
 const POST_COLLECTION: &str = "app.bsky.feed.post";
 const VIDEO_SERVICE: &str = "https://video.bsky.app";

@@ -213,7 +213,7 @@ it keeps its account links, hidden, so a restore within 30 days brings them back
 job in brain hard-deletes sets deleted over 30 days ago, one instance at a time (advisory lock).
 
 Posts go to every account of their platform in their social set; Bluesky (300 graphemes, 4
-images of at most 1 MB from public https URLs, links become facets) and Threads (500
+images from public https URLs, a still image over 1 MB shrunk to fit, links become facets) and Threads (500
 characters, up to 20 JPEG or PNG images or MP4 or MOV videos as a carousel), LinkedIn (3000
 characters, up to 20 JPEG, PNG or GIF images, one MP4 video or one PDF as a document, no threads), Facebook (63206
 characters, up to 10 JPEG, PNG or GIF images or one MP4 or MOV video) and Instagram (2200
@@ -235,8 +235,8 @@ checks as publishing, Drive links included, all within 4 seconds) and typed by t
 LinkedIn, a GIF on Instagram, Threads, TikTok or YouTube, a MOV on LinkedIn; a PNG or WebP on
 Instagram and a PNG on TikTok pass, since publishing turns them into JPEGs),
 `mixed_media` for a video next to other media on Bluesky, Facebook, LinkedIn, X or TikTok (a PDF
-on LinkedIn, a GIF on X), `media_too_large` for a Bluesky image over 1 MB, an X image over 5 MB
-or GIF over 15 MB, or any file over 100 MB, `invalid_cover_type` and `cover_too_large` for a
+on LinkedIn, a GIF on X), `media_too_large` for a GIF over 1 MB on Bluesky or 15 MB on X, or any file over 100 MB (a
+still image over Bluesky's 1 MB or X's 5 MB passes, since publishing shrinks it), `invalid_cover_type` and `cover_too_large` for a
 cover, and `cover_needs_one_video` when the one media item is not a video. A TikTok post's
 `privacy_level` is checked against each TikTok account of the set (creator info, live, 5
 seconds): `tiktok_privacy_not_offered` names the account and carries its
@@ -498,7 +498,7 @@ conservative: a bare domain counts as a link even where X would not, so a post m
 `POST /2/media/upload/initialize` (`media_type`, `total_bytes`, `media_category` `tweet_image`,
 `tweet_gif` or `tweet_video`), one `POST .../{id}/append` per 4 MB chunk (multipart, `segment_index`
 and `media`), `POST .../{id}/finalize`, and `GET /2/media/upload?command=STATUS` until a video is
-processed; images are at most 5 MB, a GIF 15 MB, a video 100 MB (brain's own cap). Then
+processed; images are at most 5 MB (a larger still image is shrunk first), a GIF 15 MB, a video 100 MB (brain's own cap). Then
 `POST /2/tweets` with `text`, `media.media_ids` and, for a thread part, `reply.in_reply_to_tweet_id`
 set to the part before it. Each tweet id is saved the moment X answers, before the next part is
 sent; a part that fails keeps the ones before it up, and nothing is retried. The permalink is
@@ -670,9 +670,14 @@ A post's `media` are URLs: public `https://` links or Google Drive share links
 (`/file/d/<id>/view`, `open?id=`, `uc?id=`; the file must be shared with anyone with the link).
 Nothing is fetched when a post is saved. When it publishes, brain downloads each URL once into
 its storage (`MEDIA_DIR` or the `S3_*` bucket): names must resolve to public addresses, at most 3
-redirects, each to a public https URL, 4 at a time and all within a minute, streamed with a cap of 100 MB a file (1 MB for Bluesky)
+redirects, each to a public https URL, 4 at a time and all within a minute, streamed with a cap of 100 MB a file
 and typed by its first bytes (JPEG, PNG, WebP, GIF, MP4, MOV, PDF; only LinkedIn
-takes a PDF). Platforms are then served from the stored copy (Threads, Facebook and Instagram fetch
+takes a PDF). A still image (JPEG, PNG or WebP) over the platform's limit for one image (Bluesky
+1 MB, X 5 MB; `post::IMAGE_LIMITS`) is re-encoded as a JPEG that fits: quality 90, 80, then 70 at
+its own size, then scaled down at quality 80, its shape kept (Bluesky: longest side at most 2000
+px), transparency on white. One within the limit keeps its bytes. A GIF is never re-encoded, and
+an image that cannot be shrunk (a GIF, one that does not decode or is over 25 megapixels) fails
+its target with the reason. Platforms are then served from the stored copy (Threads, Facebook and Instagram fetch
 it from its `/media/` link), and a URL that fails fails its
 target naming the image, before anything goes out. A post's files are deleted once it settles
 (published, failed or deleted); an hourly sweep deletes any left a week later whose post no
