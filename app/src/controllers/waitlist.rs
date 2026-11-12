@@ -436,7 +436,9 @@ async fn admin_list(
         }
         if let Some(q) = q.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
             // Stored emails are lowercase, so lowercasing `q` makes the match case-insensitive.
-            list = list.filter(Column::Email.like(like(&q.to_lowercase())));
+            // Cut at 200 characters, the cap the other admin lists put on `q`.
+            let q: String = q.to_lowercase().chars().take(200).collect();
+            list = list.filter(Column::Email.like(like(&q)));
         }
         let rows = list
             .order_by_desc(Column::CreatedAt)
