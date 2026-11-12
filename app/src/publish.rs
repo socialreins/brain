@@ -982,7 +982,8 @@ async fn ids(db: &impl ConnectionTrait, stmt: Statement, col: &str) -> Result<Ve
     rows.iter().map(|r| r.try_get("", col)).collect()
 }
 
-/// Posts a round of this process started that have not finished: at most `CLAIM_BATCH`.
+/// Posts a round of this process started that have not finished. Claims stop at `CLAIM_BATCH`
+/// of them; posts picked up as left behind come on top, up to `CLAIM_BATCH` a round.
 static IN_FLIGHT: std::sync::Mutex<Option<HashSet<Uuid>>> = std::sync::Mutex::new(None);
 
 fn in_flight<T>(with: impl FnOnce(&mut HashSet<Uuid>) -> T) -> T {
@@ -992,6 +993,14 @@ fn in_flight<T>(with: impl FnOnce(&mut HashSet<Uuid>) -> T) -> T {
 
 /// A post in `IN_FLIGHT` until this is dropped, however its task ends.
 struct Flight(Uuid);
+
+/// Marks `id` as in flight until the result is dropped: for tests of a round that meets a post
+/// whose task has not ended.
+#[doc(hidden)]
+pub fn hold(id: Uuid) -> impl Drop {
+    in_flight(|flying| flying.insert(id));
+    Flight(id)
+}
 
 impl Drop for Flight {
     fn drop(&mut self) {
@@ -1031,14 +1040,7 @@ pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, D
     if let Err(e) = recover_stuck(&app.db).await {
         tracing::warn!(error = %e, "stuck target recovery failed");
     }
-    let flying = in_flight(|flying| flying.clone());
-    let room = (CLAIM_BATCH - flying.len() as i64).max(0);
-    // The quota is reserved per post in `publish_post`, together with marking it reserved.
-    let mut due: Vec<Uuid> = claim(&app.db, room)
-        .await?
-        .into_iter()
-        .map(|c| c.0)
-        .collect();
+    let room = (CLAIM_BATCH - in_flight(|flying| flying.len()) as i64).max(0);
     // Posts left `queued` by a crash between claim and settle: fan-out and claims are
     // idempotent, so running them again only finishes the job.
     let stmt = sql(
@@ -1047,12 +1049,26 @@ pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, D
         vec![(STUCK_MINUTES as i32).into(), CLAIM_BATCH.into()],
     );
     let left = ids(&app.db, stmt, "id").await?;
-    due.extend(left.into_iter().filter(|id| !flying.contains(id)));
-    let runs = due
+    // The quota is reserved per post in `publish_post`, together with marking it reserved.
+    let mut flights = Vec::new();
+    for (id, _) in claim(&app.db, room).await? {
+        if in_flight(|flying| flying.insert(id)) {
+            flights.push(Flight(id));
+        // Put back by a task that has not ended yet and claimed again here: nothing would run
+        // it, so it goes back to `scheduled` for the next round, never left `queued`.
+        } else if let Err(e) = unclaim(&app.db, id, None).await {
+            tracing::warn!(error = %e, post = %id, "returning a claimed post failed");
+        }
+    }
+    // Never picked up as left behind while this process still runs it.
+    let left = left
         .into_iter()
-        .filter(|id| in_flight(|flying| flying.insert(*id)))
-        .map(|id| {
-            let (app, flight) = (app.clone(), Flight(id));
+        .filter(|id| in_flight(|flying| flying.insert(*id)));
+    flights.extend(left.map(Flight));
+    let runs = flights
+        .into_iter()
+        .map(|flight| {
+            let (app, id) = (app.clone(), flight.0);
             tokio::spawn(async move {
                 let _flight = flight;
                 if let Err(e) = publish_post(&app, id).await {

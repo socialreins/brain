@@ -4845,6 +4845,22 @@ mod teams {
 
             #[tokio::test]
             #[serial]
+            async fn a_post_claimed_while_its_task_ends_is_not_left_queued() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let id = id_of(&create(&s, &cookie, input(&set, "again", Some(&past()))).await);
+                // A task that put it back to `scheduled` has not ended yet.
+                let ending = publish::hold(id.parse().unwrap());
+                assert!(publish::begin(&state).await.unwrap().is_empty());
+                assert_eq!(get_post(&s, &cookie, &id).await["status"], "scheduled");
+                drop(ending);
+                publish::tick(&state).await.unwrap();
+                assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+            }
+
+            #[tokio::test]
+            #[serial]
             async fn the_tick_publishes_due_posts_with_images() {
                 let (s, db, state) = on_mock().await;
                 let (cookie, team_id, _) = owner_with_account(&s, &db).await;
