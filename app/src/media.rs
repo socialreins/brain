@@ -213,11 +213,17 @@ impl Blob {
         self.len() == 0
     }
 
-    /// The bytes held in memory: none of a stored file's, which `range` and `body` read.
-    pub fn held(&self) -> bytes::Bytes {
+    /// The bytes held in memory. A stored file has none (`range` and `body` read it), so asking
+    /// for them is a failure, never an empty upload.
+    pub fn held(&self) -> Result<bytes::Bytes, PostError> {
         match self {
-            Blob::Held(bytes) => bytes.clone(),
-            Blob::Stored { .. } => bytes::Bytes::new(),
+            Blob::Held(bytes) => Ok(bytes.clone()),
+            Blob::Stored { key, .. } => {
+                tracing::error!(key, "a stored file was asked for whole");
+                Err(PostError::Failed(
+                    "The file could not be read. Try again.".into(),
+                ))
+            }
         }
     }
 

@@ -614,7 +614,7 @@ impl Bluesky {
                         pds,
                         jwt,
                         "com.atproto.repo.uploadBlob",
-                        bytes.held().into(),
+                        bytes.held()?.into(),
                         mime,
                     )
                     .await?;

@@ -555,7 +555,7 @@ impl Publisher for YouTube {
         cover: &Attachment,
     ) -> Result<(), PublishError> {
         let file = youtube::File {
-            bytes: cover.bytes.held(),
+            bytes: cover.bytes.held()?,
             content_type: &cover.content_type,
         };
         self.set_thumbnail(secret, remote_id, &file).await
@@ -734,7 +734,7 @@ impl Publisher for Facebook {
         remote_id: &str,
         cover: &Attachment,
     ) -> Result<(), PublishError> {
-        let held = cover.bytes.held();
+        let held = cover.bytes.held()?;
         let file = (&held[..], cover.content_type.as_str());
         self.0.set_thumbnail(secret, remote_id, file).await
     }

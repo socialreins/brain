@@ -298,7 +298,7 @@ impl LinkedIn {
         }
         let content = if pdfs == 1 {
             let id = self
-                .upload_document(&author, token, media[0].bytes.held())
+                .upload_document(&author, token, media[0].bytes.held()?)
                 .await?;
             Some(json!({"media": {"id": id, "title": document_title(text)}}))
         } else if videos == 1 {
@@ -414,7 +414,7 @@ impl LinkedIn {
         else {
             return Err(failed("Upload: LinkedIn sent no image upload URL."));
         };
-        self.put(url, Some(token), file.bytes.held(), file.content_type)
+        self.put(url, Some(token), file.bytes.held()?, file.content_type)
             .await?;
         Ok(image.to_owned())
     }
