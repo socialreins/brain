@@ -40,6 +40,7 @@ path = "src/bin/main.rs"
 
 [dev-dependencies]
 axum-test = "17"
+futures-util = "0.3"
 serial_test = "3.1.1"
 webauthn-authenticator-rs = { version = "0.5.5", features = ["softpasskey"] }
 

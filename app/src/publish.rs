@@ -1442,8 +1442,12 @@ fn media_error(fail: Fail, n: usize, platform: &str) -> String {
         Fail::Unsupported => format!("Image {n} is not a JPEG, PNG, WebP or GIF."),
         Fail::Storage => format!("Image {n} could not be stored. Try again."),
         Fail::TimedOut => format!(
-            "Image {n} did not download in time: the post's media took over a minute. Use \
-             faster or smaller links."
+            "Image {n} did not download in time: it came slower than 2 MB a second, or the \
+             post's media took over 12 minutes together. Use a faster link."
+        ),
+        Fail::Stalled => format!(
+            "Image {n} stopped downloading: its server sent nothing for 30 seconds. Try again, \
+             or use another link."
         ),
     }
 }
