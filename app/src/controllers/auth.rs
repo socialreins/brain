@@ -237,18 +237,56 @@ enum SignUp {
     Refused,
 }
 
-/// Open registration admits anyone whose domain or exact address is in `SIGNUP_DOMAINS` (anyone
-/// when it is empty). Closed (`REGISTRATION_DISABLED`) admits only, with no `OWNER_EMAIL`, whoever of
-/// those signs up first. `OWNER_EMAIL` and invited emails are always admitted.
+/// The sign-up rules in force: `mode` is `open`, `closed` or `domains`.
+pub(crate) struct SignupRules {
+    pub mode: String,
+    pub domains: Vec<String>,
+    /// From `signup_settings` (the admin console), not from the env.
+    pub saved: bool,
+}
+
+/// The rules saved from the admin console, else `REGISTRATION_DISABLED` and `SIGNUP_DOMAINS`.
+/// The one place the sign-up gate and the admin console read them.
+pub(crate) async fn signup_rules(app: &AppState) -> Result<SignupRules, DbErr> {
+    let sql = "SELECT mode, domains FROM signup_settings";
+    let stmt = Statement::from_string(DbBackend::Postgres, sql);
+    if let Some(row) = app.db.query_one_raw(stmt).await? {
+        let domains: serde_json::Value = row.try_get("", "domains")?;
+        return Ok(SignupRules {
+            mode: row.try_get("", "mode")?,
+            domains: serde_json::from_value(domains).unwrap_or_default(),
+            saved: true,
+        });
+    }
+    let mode = if app.registration_disabled {
+        "closed"
+    } else if app.signup_domains.is_empty() {
+        "open"
+    } else {
+        "domains"
+    };
+    Ok(SignupRules {
+        mode: mode.into(),
+        domains: app.signup_domains.clone(),
+        saved: false,
+    })
+}
+
+/// Mode `domains` admits anyone whose domain or exact address is listed, `open` anyone. `closed`
+/// admits only, with no `OWNER_EMAIL`, whoever signs up first (from a listed domain, when any is
+/// listed). `OWNER_EMAIL`, invited emails and approved waitlist emails are always admitted.
 async fn sign_up(app: &AppState, email: &str) -> Result<SignUp, DbErr> {
+    let rules = signup_rules(app).await?;
     // Domain entries have no `@` and email entries do, so one equality test serves both.
-    let domain_ok = app.signup_domains.is_empty()
+    let domain_ok = rules.mode == "open"
+        || rules.domains.is_empty()
         || email
             .rsplit_once('@')
-            .is_some_and(|(_, d)| app.signup_domains.iter().any(|a| a == d || a == email));
-    if (domain_ok && !app.registration_disabled)
+            .is_some_and(|(_, d)| rules.domains.iter().any(|a| a == d || a == email));
+    if (domain_ok && rules.mode != "closed")
         || app.owner_email.as_deref() == Some(email)
         || teams::invited(&app.db, email).await?
+        || waitlist::approved(app, email).await?
     {
         return Ok(SignUp::Allowed);
     }

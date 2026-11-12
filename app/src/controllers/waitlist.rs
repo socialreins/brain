@@ -1,6 +1,6 @@
 //! The socialreins.com waitlist: `POST /v1/waitlist` joins and emails a confirmation link to the
 //! web app, which posts its token to `POST /v1/waitlist/verify`, `GET /v1/waitlist/count` counts every signup, and
-//! `GET /v1/admin/waitlist` lists them for `ADMIN_EMAILS`.
+//! `GET /v1/admin/waitlist` lists them for `ADMIN_EMAILS` (approve and delete: `admin.rs`).
 use std::time::{Duration as StdDuration, Instant};
 
 use axum::{
@@ -339,6 +339,8 @@ async fn count(State(app): State<AppState>) -> Response {
 pub struct AdminQuery {
     /// Only verified (`true`) or unverified (`false`) signups; both when absent.
     pub verified: Option<bool>,
+    /// Only signups whose email contains this, in any case.
+    pub q: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -348,6 +350,41 @@ pub struct AdminSignup {
     pub source: Option<String>,
     pub created_at: DateTime<FixedOffset>,
     pub verified_at: Option<DateTime<FixedOffset>>,
+    /// When an admin approved the email for sign-up.
+    pub approved_at: Option<DateTime<FixedOffset>>,
+}
+
+impl From<waitlist_signups::Model> for AdminSignup {
+    fn from(r: waitlist_signups::Model) -> Self {
+        Self {
+            id: r.id,
+            email: r.email,
+            source: r.source,
+            created_at: r.created_at,
+            verified_at: r.verified_at,
+            approved_at: r.approved_at,
+        }
+    }
+}
+
+/// `%q%` for `LIKE`, with the wildcards in `q` escaped.
+pub(crate) fn like(q: &str) -> String {
+    let escaped = q
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
+/// An admin approved `email` on the waitlist, so it may sign up whatever the sign-up rules say.
+pub(crate) async fn approved(app: &AppState, email: &str) -> Result<bool, sea_orm::DbErr> {
+    use waitlist_signups::Column;
+    let found = waitlist_signups::Entity::find()
+        .filter(Column::Email.eq(email))
+        .filter(Column::ApprovedAt.is_not_null())
+        .count(&app.db)
+        .await?;
+    Ok(found > 0)
 }
 
 #[derive(Serialize, ToSchema)]
@@ -397,6 +434,10 @@ async fn admin_list(
                 Column::VerifiedAt.is_null()
             });
         }
+        if let Some(q) = q.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+            // Stored emails are lowercase, so lowercasing `q` makes the match case-insensitive.
+            list = list.filter(Column::Email.like(like(&q.to_lowercase())));
+        }
         let rows = list
             .order_by_desc(Column::CreatedAt)
             .order_by_desc(Column::Id)
@@ -409,16 +450,7 @@ async fn admin_list(
         Ok(found) => found,
         Err(e) => return internal(e, "admin waitlist"),
     };
-    let signups = rows
-        .into_iter()
-        .map(|r| AdminSignup {
-            id: r.id,
-            email: r.email,
-            source: r.source,
-            created_at: r.created_at,
-            verified_at: r.verified_at,
-        })
-        .collect();
+    let signups = rows.into_iter().map(AdminSignup::from).collect();
     Json(AdminWaitlist {
         total,
         verified,

@@ -1,7 +1,8 @@
 //! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, the documented `/v1` API
-//! (waitlist, contact, teams, API tokens, webhooks, connections, social sets, posts, lists, inboxes,
+//! (waitlist, the admin console, contact, teams, API tokens, webhooks, connections, social sets, posts, lists, inboxes,
 //! automations), `/webhooks/meta` (Facebook and Instagram deliveries), `/mcp` (see `crate::mcp`), the Threads and Meta connect pages and
 //! `/media/{name}` (stored post files for platforms that download them).
+pub mod admin;
 pub mod api_tokens;
 pub mod auth;
 pub mod automations;
@@ -77,6 +78,8 @@ fn api() -> OpenApiRouter<AppState> {
     doc.info.license = None;
     OpenApiRouter::with_openapi(doc)
         .merge(waitlist::api())
+        // 50 sign-up domains can pass 4 KiB.
+        .merge(admin::api().layer(DefaultBodyLimit::max(MAX_PASSKEY_BODY_BYTES)))
         .merge(contact::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
         .merge(teams::api())
         .merge(api_tokens::api())
