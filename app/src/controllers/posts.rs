@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use axum::{
     body::to_bytes,
     extract::{rejection::QueryRejection, Path, Query, State},
-    http::StatusCode,
+    http::{StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
@@ -29,7 +29,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use super::{
-    api_tokens::Actor,
+    api_tokens::{validate_only, Actor, ValidateOnly},
     auth::{internal, Body},
     connections::live_sets,
     idempotency::IDEMPOTENCY,
@@ -308,6 +308,109 @@ pub struct PostGroupInput {
     /// Per-platform body or media; a platform outside the group is `422 invalid_override`.
     #[serde(default)]
     pub overrides: BTreeMap<String, Override>,
+    /// What an invalid post does to the group: `refuse` (the default) creates nothing, `skip`
+    /// leaves that platform out, creates the rest and lists it in `skipped`. When every
+    /// platform is invalid, and for a problem of the group itself (`invalid_set`,
+    /// `no_accounts`, `invalid_override`, the list, the post cap), `skip` refuses like `refuse`.
+    #[serde(default)]
+    pub on_invalid: OnInvalid,
+}
+
+/// `PostGroupInput.on_invalid`.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize, ToSchema, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum OnInvalid {
+    #[default]
+    Refuse,
+    Skip,
+}
+
+/// One thing wrong with a post: an entry of a validate-only report or of `skipped`, and (with
+/// `code` named `error`, next to `platform`) the `422` of a create. A field the check does not
+/// know is left out.
+#[derive(Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct Problem {
+    /// The error code, the one a create's `422` carries as `error`.
+    #[serde(alias = "error")]
+    pub code: String,
+    /// The request field it is in: `platform`, `body`, `media`, `thread`, `first_comment`,
+    /// `cover`, `tiktok`, `youtube`, `social_set_id` or `overrides`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    /// The 1-based thread part it is in; absent for the post itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part: Option<usize>,
+    /// The most the platform takes, in the platform's own unit, which `detail` names:
+    /// `too_long` (Bluesky graphemes or bytes, X weighted characters, TikTok UTF-16 code units,
+    /// YouTube title characters or description bytes, else characters), `too_many_images`
+    /// (media items), `too_many_parts` (thread parts), `first_comment_too_long` (characters),
+    /// `media_too_large` and `cover_too_large` (bytes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    /// What the post has, in the same unit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual: Option<u64>,
+    /// A sentence for a person.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// `tiktok_privacy_not_offered`: the account that is not offered the level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub social_account_id: Option<Uuid>,
+    /// `tiktok_privacy_not_offered`: the levels that account is offered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub privacy_level_options: Option<Vec<String>>,
+}
+
+impl From<post::Problem> for Problem {
+    fn from(p: post::Problem) -> Self {
+        Self {
+            code: p.invalid.code().into(),
+            field: Some(p.invalid.field().into()),
+            part: p.part,
+            limit: p.limit,
+            actual: p.actual,
+            detail: p.detail,
+            ..Default::default()
+        }
+    }
+}
+
+/// One platform's post in a validate-only report, or a platform `on_invalid: "skip"` left out.
+#[derive(Serialize, ToSchema)]
+pub struct PlatformReport {
+    pub platform: String,
+    /// The accounts of the platform in the set, which the post would go to. None is not a
+    /// problem here, as a create does not refuse it either: the post would fail when it publishes.
+    pub account_ids: Vec<Uuid>,
+    pub ok: bool,
+    /// Everything wrong with this platform's post, in the order a create checks: the first is
+    /// the one a create answers.
+    pub problems: Vec<Problem>,
+}
+
+/// The answer of a create with `?validate_only=true`: what the create would refuse, with
+/// nothing created.
+#[derive(Serialize, ToSchema)]
+pub struct Validation {
+    /// Whether the same request without `validate_only` would create every post.
+    pub ok: bool,
+    /// One entry per platform of the group (one for `POST /posts`), in order.
+    pub platforms: Vec<PlatformReport>,
+    /// Problems of the request as a whole (`invalid_set`, `no_accounts`, `invalid_override`,
+    /// `too_many_posts`, a list's `not_found`, `invalid_position` or `invalid_set`). An
+    /// `invalid_set` or `no_accounts` leaves `platforms` empty: there is nothing to check
+    /// against.
+    pub problems: Vec<Problem>,
+}
+
+/// `201` of `POST /post-groups`.
+#[derive(Serialize, ToSchema)]
+pub struct CreatedGroup {
+    #[serde(flatten)]
+    pub group: PostGroup,
+    /// The platforms `on_invalid: "skip"` left out, each with its problems; empty otherwise.
+    pub skipped: Vec<PlatformReport>,
 }
 
 /// One platform's own body, media, thread or first comment in a post group.
@@ -570,6 +673,72 @@ pub(crate) async fn find(
     sel.filter(in_scope(a)).one(db).await
 }
 
+/// The `422` of a problem: `{"error", "platform"}` and what the check knew of `field`, `part`,
+/// `limit`, `actual` and `detail`.
+fn refusal(platform: &str, p: &Problem) -> Response {
+    let mut v = serde_json::json!(p);
+    if let Some(o) = v.as_object_mut() {
+        if let Some(code) = o.remove("code") {
+            o.insert("error".into(), code);
+        }
+        o.insert("platform".into(), platform.into());
+    }
+    (StatusCode::UNPROCESSABLE_ENTITY, Json(v)).into_response()
+}
+
+/// A refusal as a problem: its `error` as the `code`, with what else it says.
+async fn as_problem(res: Response) -> Problem {
+    let body = to_bytes(res.into_body(), usize::MAX).await.ok();
+    body.and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| Problem {
+            code: "internal".into(),
+            ..Default::default()
+        })
+}
+
+/// Every problem of a post that its own rules find (`socialreins_core::post`, no calls), in the
+/// order a save checks them: the first is what a save answers.
+fn rule_problems(input: &PostInput) -> Vec<Problem> {
+    let platform = input.platform.as_str();
+    let mut found = post::check(platform, &input.body, &input.media);
+    let unknown = |p: &post::Problem| p.invalid == post::Invalid::UnsupportedPlatform;
+    if !found.first().is_some_and(unknown) {
+        let parts: Vec<(&str, &[String])> = input
+            .thread
+            .iter()
+            .map(|p| (p.body.as_str(), p.media.as_slice()))
+            .collect();
+        found.extend(post::check_thread(platform, &parts));
+        let comment = post::first_comment(input.first_comment.as_deref());
+        found.extend(post::check_first_comment(platform, comment));
+        let cover = post::cover(input.cover.as_deref());
+        let covered = post::validate_cover(platform, cover, &input.media);
+        found.extend(covered.err().map(post::Problem::from));
+        let choice = input.tiktok.as_ref().map(|t| post::TikTokChoice {
+            privacy_level: t.privacy_level.as_deref(),
+            commercial_content: t.commercial_content,
+            your_brand: t.your_brand,
+            branded_content: t.branded_content,
+        });
+        let tiktok = post::validate_tiktok(platform, choice);
+        found.extend(tiktok.err().map(post::Problem::from));
+        let privacy = input.youtube.as_ref().map(|y| y.privacy.as_deref());
+        let youtube = post::validate_youtube(platform, privacy);
+        found.extend(youtube.err().map(post::Problem::from));
+    }
+    let mut found: Vec<Problem> = found.into_iter().map(Problem::from).collect();
+    // The visibility has no default: brain never posts at the most public level unasked. (Rows
+    // saved before this still publish with the auto-picked level, and stay readable.)
+    if platform == "tiktok" && input.tiktok.is_none() {
+        found.push(Problem {
+            code: "tiktok_settings_required".into(),
+            field: Some("tiktok".into()),
+            ..Default::default()
+        });
+    }
+    found
+}
+
 /// Checks a post body for saving: platform rules, then a live set of the team the caller may
 /// write to. Answers that set's id.
 async fn checked(
@@ -577,51 +746,8 @@ async fn checked(
     a: &Actor,
     input: &PostInput,
 ) -> Result<Result<Uuid, Response>, DbErr> {
-    if let Err(e) = post::validate(&input.platform, &input.body, &input.media) {
-        return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, e.code())));
-    }
-    let parts: Vec<(&str, &[String])> = input
-        .thread
-        .iter()
-        .map(|p| (p.body.as_str(), p.media.as_slice()))
-        .collect();
-    if let Err((e, part)) = post::validate_thread(&input.platform, &parts) {
-        let mut body = serde_json::json!({ "error": e.code() });
-        if let Some(n) = part {
-            body["part"] = n.into();
-        }
-        return Ok(Err(
-            (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
-        ));
-    }
-    let comment = post::first_comment(input.first_comment.as_deref());
-    if let Err(e) = post::validate_first_comment(&input.platform, comment) {
-        return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, e.code())));
-    }
-    let cover = post::cover(input.cover.as_deref());
-    if let Err(e) = post::validate_cover(&input.platform, cover, &input.media) {
-        return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, e.code())));
-    }
-    let choice = input.tiktok.as_ref().map(|t| post::TikTokChoice {
-        privacy_level: t.privacy_level.as_deref(),
-        commercial_content: t.commercial_content,
-        your_brand: t.your_brand,
-        branded_content: t.branded_content,
-    });
-    if let Err(e) = post::validate_tiktok(&input.platform, choice) {
-        return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, e.code())));
-    }
-    let privacy = input.youtube.as_ref().map(|y| y.privacy.as_deref());
-    if let Err(e) = post::validate_youtube(&input.platform, privacy) {
-        return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, e.code())));
-    }
-    // The visibility has no default: brain never posts at the most public level unasked. (Rows
-    // saved before this still publish with the auto-picked level, and stay readable.)
-    if input.platform == "tiktok" && input.tiktok.is_none() {
-        return Ok(Err(reply(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "tiktok_settings_required",
-        )));
+    if let Some(p) = rule_problems(input).first() {
+        return Ok(Err(refusal(&input.platform, p)));
     }
     set_for(db, a, input.social_set_id).await
 }
@@ -650,16 +776,6 @@ impl<'a> From<&'a PostInput> for Draft<'a> {
 /// Longest the TikTok creator info call may take when a post is saved.
 const CREATOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// A `422` refusal from `preflight`: `{"error", "platform", "detail"}`, and `part` for a thread
-/// post.
-fn refused(e: post::Invalid, platform: &str, detail: &str, part: Option<usize>) -> Response {
-    let mut body = serde_json::json!({ "error": e.code(), "platform": platform, "detail": detail });
-    if let Some(n) = part {
-        body["part"] = n.into();
-    }
-    (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
-}
-
 /// Every URL `preflight` probes for a post: its media, its thread's and its cover.
 fn draft_urls(d: &Draft<'_>) -> Vec<String> {
     d.media
@@ -679,8 +795,9 @@ async fn probe(app: &AppState, urls: &[String]) -> HashMap<String, Probed> {
     }
 }
 
-/// `refused` when what the probes found of the post's media or cover breaks its platform's rules.
-fn media_refusal(d: &Draft<'_>, probed: &HashMap<String, Probed>) -> Option<Response> {
+/// Every problem in what the probes found of the post's media and cover, by its platform's
+/// rules: the post's media, each thread part's, then the cover.
+fn media_problems(d: &Draft<'_>, probed: &HashMap<String, Probed>) -> Vec<Problem> {
     let fact = |u: &str| {
         probed.get(u).map(|p| post::MediaFact {
             content_type: p.content_type,
@@ -689,19 +806,19 @@ fn media_refusal(d: &Draft<'_>, probed: &HashMap<String, Probed>) -> Option<Resp
         })
     };
     let facts = |m: &[String]| m.iter().map(|u| fact(u)).collect::<Vec<_>>();
-    if let Err((e, detail)) = post::validate_media_facts(d.platform, &facts(d.media)) {
-        return Some(refused(e, d.platform, &detail, None));
-    }
+    let mut found = post::check_media_facts(d.platform, &facts(d.media));
     for (i, p) in d.thread.iter().enumerate() {
-        if let Err((e, detail)) = post::validate_media_facts(d.platform, &facts(&p.media)) {
-            return Some(refused(e, d.platform, &detail, Some(i + 1)));
-        }
+        let part = post::check_media_facts(d.platform, &facts(&p.media));
+        found.extend(part.into_iter().map(|x| post::Problem {
+            part: Some(i + 1),
+            ..x
+        }));
     }
-    let cover = d.cover?;
-    let video = d.media.first().and_then(|u| fact(u));
-    post::validate_cover_facts(d.platform, fact(cover), video)
-        .err()
-        .map(|(e, detail)| refused(e, d.platform, &detail, None))
+    if let Some(cover) = d.cover {
+        let video = d.media.first().and_then(|u| fact(u));
+        found.extend(post::check_cover_facts(d.platform, fact(cover), video));
+    }
+    found.into_iter().map(Problem::from).collect()
 }
 
 /// The TikTok level `preflight` checks: a TikTok post's chosen one.
@@ -715,7 +832,7 @@ fn tiktok_level<'a>(d: &Draft<'a>) -> Option<&'a str> {
 /// own rules passed: each media file and the cover, probed for type and size
 /// (`Media::probe_all`), and a TikTok post's privacy level against what the TikTok accounts of
 /// `set` are offered now (only the accounts in `only` when given: a retry's failed ones). Only a
-/// definite violation answers (`refused`); a probe or TikTok call that gets no answer passes,
+/// definite violation answers (`refusal`); a probe or TikTok call that gets no answer passes,
 /// and publishing checks again.
 async fn preflight(
     app: &AppState,
@@ -724,16 +841,18 @@ async fn preflight(
     d: Draft<'_>,
     only: Option<&[Uuid]>,
 ) -> Result<Option<Response>, DbErr> {
-    if let Some(res) = media_refusal(&d, &probe(app, &draft_urls(&d)).await) {
-        return Ok(Some(res));
+    if let Some(p) = media_problems(&d, &probe(app, &draft_urls(&d)).await).first() {
+        return Ok(Some(refusal(d.platform, p)));
     }
-    match tiktok_level(&d) {
-        Some(level) => tiktok_offered(app, a, set, level, only).await,
-        None => Ok(None),
-    }
+    Ok(match tiktok_level(&d) {
+        Some(level) => tiktok_offered(app, a, set, level, only)
+            .await?
+            .map(|p| refusal("tiktok", &p)),
+        None => None,
+    })
 }
 
-/// `refused` when a TikTok account of `set` (of `only`, when given) is not offered `level` right
+/// The problem when a TikTok account of `set` (of `only`, when given) is not offered `level` right
 /// now, naming the first. One level goes to every account of the set and the editor offers only
 /// the levels all of them have, so one account without it already makes the post fail there.
 /// An account that cannot post at all (a daily limit), or whose creator info does not come in
@@ -745,7 +864,7 @@ async fn tiktok_offered(
     set: Uuid,
     level: &str,
     only: Option<&[Uuid]>,
-) -> Result<Option<Response>, DbErr> {
+) -> Result<Option<Problem>, DbErr> {
     let in_set = Select::select()
         .column(membership::Column::SocialAccountId)
         .from(membership::Entity)
@@ -789,16 +908,12 @@ async fn tiktok_offered(
                 "TikTok does not offer {level} to {name}. It offers {}.",
                 offered.join(", ")
             );
-            let res = serde_json::json!({
-                "error": post::Invalid::TikTokPrivacyNotOffered.code(),
-                "platform": "tiktok",
-                "detail": detail,
-                "social_account_id": account.id,
-                "privacy_level_options": offered,
-            });
-            return Ok(Some(
-                (StatusCode::UNPROCESSABLE_ENTITY, Json(res)).into_response(),
-            ));
+            return Ok(Some(Problem {
+                detail: Some(detail),
+                social_account_id: Some(account.id),
+                privacy_level_options: Some(offered.clone()),
+                ..post::Problem::from(post::Invalid::TikTokPrivacyNotOffered).into()
+            }));
         }
     }
     Ok(None)
@@ -976,36 +1091,265 @@ pub async fn get_post(app: &AppState, a: &Actor, id: Uuid) -> Response {
     }
 }
 
-/// Creates a post; `scheduled` with `scheduled_at` (a past time means now), else `draft`. At
-/// most 2000 per team.
-#[utoipa::path(post, path = "/posts", tag = "posts",
-    security(("session" = []), ("api_token" = [])), request_body = PostInput,
-    params(("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
-    responses((status = 201, body = Post), (status = 401, body = Error),
-        (status = 403, body = Error), (status = 409, body = Error), (status = 422, body = Error)))]
-async fn create(State(app): State<AppState>, a: Actor, Body(input): Body<PostInput>) -> Response {
-    create_post(&app, &a, input).await
+/// What the checks of a create found of one post, by phase: its own rules, what the probes say
+/// of its media and cover, and (TikTok) what the account is offered.
+struct Check {
+    input: PostInput,
+    rules: Vec<Problem>,
+    probes: Vec<Problem>,
+    account: Option<Problem>,
 }
 
-/// The body of `POST /posts`, shared with the MCP `create-post` tool.
-pub async fn create_post(app: &AppState, a: &Actor, input: PostInput) -> Response {
-    let made = async {
-        if let Err(res) = checked_fully(app, a, &input).await? {
-            return Ok(Err(res));
+impl Check {
+    fn ok(&self) -> bool {
+        self.rules.is_empty() && self.probes.is_empty() && self.account.is_none()
+    }
+
+    /// This post's entry of a report; `accounts` are the set's, as `accounts_in` lists them.
+    fn report(&self, accounts: &[(String, Uuid)]) -> PlatformReport {
+        let problems: Vec<Problem> = self
+            .rules
+            .iter()
+            .chain(&self.probes)
+            .chain(&self.account)
+            .cloned()
+            .collect();
+        PlatformReport {
+            platform: self.input.platform.clone(),
+            account_ids: accounts
+                .iter()
+                .filter(|(provider, _)| *provider == self.input.platform)
+                .map(|(_, id)| *id)
+                .collect(),
+            ok: problems.is_empty(),
+            problems,
         }
-        let txn = app.db.begin().await?;
-        let p = match insert(&txn, a, &input, None).await? {
-            Ok(p) => p,
+    }
+}
+
+/// Runs every check of a create on `inputs` (the posts of one group, or one post), all of `set`:
+/// each post's rules, then every media URL and cover probed once for all, then the TikTok level
+/// asked once. A create that refuses stops after the first phase that found a problem, so it
+/// calls out for nothing it will not save; with `all` every phase runs for every post (a
+/// validate-only report, `on_invalid: "skip"`), where a later phase leaves out what an earlier
+/// one already settled: no probe for a platform brain does not know or of a URL that is not
+/// `https`, no cover facts for a cover its rules refused, no TikTok call for refused settings.
+async fn examine(
+    app: &AppState,
+    a: &Actor,
+    set: Uuid,
+    inputs: Vec<PostInput>,
+    all: bool,
+) -> Result<Vec<Check>, DbErr> {
+    let mut checks: Vec<Check> = inputs
+        .into_iter()
+        .map(|input| Check {
+            rules: rule_problems(&input),
+            probes: Vec::new(),
+            account: None,
+            input,
+        })
+        .collect();
+    let failed = |checks: &[Check]| checks.iter().any(|c| !c.ok());
+    if !all && failed(&checks) {
+        return Ok(checks);
+    }
+    let has = |c: &Check, field: &str| c.rules.iter().any(|p| p.field.as_deref() == Some(field));
+    let mut urls: Vec<String> = checks
+        .iter()
+        .filter(|c| !has(c, "platform"))
+        .flat_map(|c| draft_urls(&Draft::from(&c.input)))
+        .filter(|u| post::https_url(u))
+        .collect();
+    urls.sort();
+    urls.dedup();
+    let probed = probe(app, &urls).await;
+    for c in &mut checks {
+        if has(c, "platform") {
+            continue;
+        }
+        let cover = has(c, "cover");
+        let mut found = media_problems(&Draft::from(&c.input), &probed);
+        found.retain(|p| !(cover && p.field.as_deref() == Some("cover")));
+        c.probes = found;
+    }
+    if !all && failed(&checks) {
+        return Ok(checks);
+    }
+    for c in &mut checks {
+        let level = tiktok_level(&Draft::from(&c.input)).map(str::to_owned);
+        if let Some(level) = level.filter(|_| !has(c, "tiktok")) {
+            c.account = tiktok_offered(app, a, set, &level, None).await?;
+        }
+    }
+    Ok(checks)
+}
+
+/// The `422` a create answers for what `examine` found: the first problem of the first phase
+/// that has one, posts in order.
+fn first_refusal(checks: &[Check]) -> Option<Response> {
+    let of = |pick: fn(&Check) -> Option<&Problem>| {
+        checks
+            .iter()
+            .find_map(|c| pick(c).map(|p| refusal(&c.input.platform, p)))
+    };
+    of(|c| c.rules.first())
+        .or_else(|| of(|c| c.probes.first()))
+        .or_else(|| of(|c| c.account.as_ref()))
+}
+
+/// The provider and id of the team's accounts in `set`.
+async fn accounts_in(
+    db: &impl ConnectionTrait,
+    team: Uuid,
+    set: Uuid,
+) -> Result<Vec<(String, Uuid)>, DbErr> {
+    let in_set = Select::select()
+        .column(membership::Column::SocialAccountId)
+        .from(membership::Entity)
+        .and_where(membership::Column::SocialSetId.eq(set))
+        .to_owned();
+    social_accounts::Entity::find()
+        .select_only()
+        .column(social_accounts::Column::Provider)
+        .column(social_accounts::Column::Id)
+        .filter(social_accounts::Column::TeamId.eq(team))
+        .filter(social_accounts::Column::Id.in_subquery(in_set))
+        .order_by_asc(social_accounts::Column::Id)
+        .into_tuple()
+        .all(db)
+        .await
+}
+
+/// `insert` for each of `inputs`, in order; a group's refusal names its platform. The caller
+/// commits.
+async fn insert_all(
+    txn: &DatabaseTransaction,
+    a: &Actor,
+    inputs: &[&PostInput],
+    group: Option<Uuid>,
+) -> Result<Result<Vec<posts::Model>, Response>, DbErr> {
+    let mut rows = Vec::with_capacity(inputs.len());
+    for one in inputs {
+        match insert(txn, a, one, group).await? {
+            Ok(p) => rows.push(p),
+            Err(res) if group.is_some() => return Ok(Err(naming(res, &one.platform).await)),
             Err(res) => return Ok(Err(res)),
+        }
+    }
+    Ok(Ok(rows))
+}
+
+/// The validate-only answer for what `examine` found (with `all`). The posts that passed go
+/// through `insert_all` in a transaction that is rolled back, so the post cap and the list are
+/// checked by the create's own code and nothing is kept.
+async fn report(
+    app: &AppState,
+    a: &Actor,
+    set: Uuid,
+    checks: &[Check],
+    group: Option<Uuid>,
+    mut problems: Vec<Problem>,
+) -> Result<Response, DbErr> {
+    let valid: Vec<&PostInput> = checks.iter().filter(|c| c.ok()).map(|c| &c.input).collect();
+    if !valid.is_empty() {
+        let txn = app.db.begin().await?;
+        if let Err(res) = insert_all(&txn, a, &valid, group).await? {
+            problems.push(as_problem(res).await);
+        }
+        txn.rollback().await?;
+    }
+    let accounts = accounts_in(&app.db, a.team.id, set).await?;
+    let platforms: Vec<PlatformReport> = checks.iter().map(|c| c.report(&accounts)).collect();
+    Ok(validation(platforms, problems))
+}
+
+/// `200` with the validate-only report.
+fn validation(platforms: Vec<PlatformReport>, problems: Vec<Problem>) -> Response {
+    let ok = problems.is_empty() && platforms.iter().all(|p| p.ok);
+    Json(Validation {
+        ok,
+        platforms,
+        problems,
+    })
+    .into_response()
+}
+
+/// Creates a post; `scheduled` with `scheduled_at` (a past time means now), else `draft`. At
+/// most 2000 per team. A `422` says what is wrong: `{"error", "platform", "field"}` and, where
+/// the check knows them, `part` (the 1-based thread part), `limit`, `actual` and `detail`.
+///
+/// With `?validate_only=true` nothing is created: the same checks run through the same code and
+/// the answer is `200` with a `Validation` naming every problem, not only the first. A
+/// read-only token may call it, and an `Idempotency-Key` is ignored.
+#[utoipa::path(post, path = "/posts", tag = "posts",
+    security(("session" = []), ("api_token" = [])), request_body = PostInput,
+    params(ValidateOnly, ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    responses((status = 201, body = Post), (status = 200, body = Validation),
+        (status = 401, body = Error), (status = 403, body = Error), (status = 409, body = Error),
+        (status = 422, body = Problem)))]
+async fn create(
+    State(app): State<AppState>,
+    a: Actor,
+    uri: Uri,
+    Body(input): Body<PostInput>,
+) -> Response {
+    match validate_only(&uri) {
+        Some(only) => create_post(&app, &a, input, only).await,
+        None => reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query"),
+    }
+}
+
+/// The body of `POST /posts`, shared with the MCP `create-post` tool. With `validate_only`
+/// nothing is created and the answer is the report.
+pub async fn create_post(
+    app: &AppState,
+    a: &Actor,
+    input: PostInput,
+    validate_only: bool,
+) -> Response {
+    let made = async {
+        // A post's own rules answer before its set does, as they always did.
+        let rules = rule_problems(&input);
+        if let (false, Some(p)) = (validate_only, rules.first()) {
+            return Ok(refusal(&input.platform, p));
+        }
+        let set = match set_for(&app.db, a, input.social_set_id).await? {
+            Ok(set) => set,
+            // Without a set there is no account to ask and no file worth probing.
+            Err(res) if validate_only => {
+                let (probes, account) = (Vec::new(), None);
+                let check = Check {
+                    input,
+                    rules,
+                    probes,
+                    account,
+                };
+                return Ok(validation(
+                    vec![check.report(&[])],
+                    vec![as_problem(res).await],
+                ));
+            }
+            Err(res) => return Ok(res),
+        };
+        let checks = examine(app, a, set, vec![input], validate_only).await?;
+        if validate_only {
+            return report(app, a, set, &checks, None, Vec::new()).await;
+        }
+        if let Some(res) = first_refusal(&checks) {
+            return Ok(res);
+        }
+        let inputs: Vec<&PostInput> = checks.iter().map(|c| &c.input).collect();
+        let txn = app.db.begin().await?;
+        let rows = match insert_all(&txn, a, &inputs, None).await? {
+            Ok(rows) => rows,
+            Err(res) => return Ok(res),
         };
         txn.commit().await?;
-        one_json(&app.db, a, p).await.map(Ok)
+        let mut one = posts_json(&app.db, a, rows).await?;
+        Ok::<_, DbErr>((StatusCode::CREATED, Json(one.remove(0))).into_response())
     };
-    match made.await {
-        Ok(Ok(p)) => (StatusCode::CREATED, Json(p)).into_response(),
-        Ok(Err(res)) => res,
-        Err(e) => internal(e, "post insert"),
-    }
+    made.await.unwrap_or_else(|e| internal(e, "post insert"))
 }
 
 /// Checks and inserts one new post in `txn`, then puts it in its list. Every create runs this:
@@ -1062,27 +1406,52 @@ async fn insert(
 
 /// Creates one post per platform of a set in one transaction, tied by a new `group_id`; each is
 /// checked as in `POST /posts`. Any failure creates nothing and answers that post's error with
-/// `"platform"` added, e.g. `422 {"error":"too_long","platform":"bluesky"}`.
+/// its `platform`, e.g. `422 {"error":"too_long","platform":"bluesky","field":"body","limit":300,
+/// "actual":412,"detail":"..."}`. With `on_invalid: "skip"` an invalid platform is left out
+/// instead and listed in `skipped`, unless every platform is invalid.
+///
+/// With `?validate_only=true` nothing is created: the same checks run through the same code and
+/// the answer is `200` with a `Validation` naming every problem of every platform. A read-only
+/// token may call it, and an `Idempotency-Key` is ignored.
 #[utoipa::path(post, path = "/post-groups", tag = "posts",
     security(("session" = []), ("api_token" = [])), request_body = PostGroupInput,
-    params(("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
-    responses((status = 201, body = PostGroup), (status = 401, body = Error),
-        (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
-        (status = 422, body = Error)))]
+    params(ValidateOnly, ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    responses((status = 201, body = CreatedGroup), (status = 200, body = Validation),
+        (status = 401, body = Error), (status = 403, body = Error), (status = 404, body = Error),
+        (status = 409, body = Error), (status = 422, body = Problem)))]
 async fn create_group(
     State(app): State<AppState>,
     a: Actor,
+    uri: Uri,
     Body(input): Body<PostGroupInput>,
 ) -> Response {
-    create_post_group(&app, &a, input).await
+    match validate_only(&uri) {
+        Some(only) => create_post_group(&app, &a, input, only).await,
+        None => reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query"),
+    }
 }
 
-/// The body of `POST /post-groups`, shared with the MCP `create-post-group` tool.
-pub async fn create_post_group(app: &AppState, a: &Actor, input: PostGroupInput) -> Response {
+/// The body of `POST /post-groups`, shared with the MCP `create-post-group` tool. With
+/// `validate_only` nothing is created and the answer is the report.
+pub async fn create_post_group(
+    app: &AppState,
+    a: &Actor,
+    input: PostGroupInput,
+    validate_only: bool,
+) -> Response {
     let made = async {
+        // Without the set or a platform there is nothing to check a post against, so these two
+        // end a validate-only report too.
+        let stop = |res: Response| async move {
+            if validate_only {
+                validation(Vec::new(), vec![as_problem(res).await])
+            } else {
+                res
+            }
+        };
         let set = match set_for(&app.db, a, input.social_set_id).await? {
             Ok(set) => set,
-            Err(res) => return Ok(Err(res)),
+            Err(res) => return Ok(stop(res).await),
         };
         let mut platforms = match &input.platforms {
             Some(p) => p.clone(),
@@ -1096,85 +1465,90 @@ pub async fn create_post_group(app: &AppState, a: &Actor, input: PostGroupInput)
         let mut seen = HashSet::new();
         platforms.retain(|p| seen.insert(p.clone()));
         if platforms.is_empty() {
-            return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, "no_accounts")));
+            return Ok(stop(reply(StatusCode::UNPROCESSABLE_ENTITY, "no_accounts")).await);
         }
+        let mut problems = Vec::new();
         if input.overrides.keys().any(|p| !platforms.contains(p)) {
-            return Ok(Err(reply(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid_override",
-            )));
+            if !validate_only {
+                return Ok(reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_override"));
+            }
+            problems.push(Problem {
+                code: "invalid_override".into(),
+                field: Some("overrides".into()),
+                ..Default::default()
+            });
+        }
+        let inputs = platforms
+            .into_iter()
+            .map(|platform| {
+                let o = input.overrides.get(&platform);
+                PostInput {
+                    social_set_id: Some(set),
+                    body: o
+                        .and_then(|o| o.body.clone())
+                        .unwrap_or_else(|| input.body.clone()),
+                    media: o
+                        .and_then(|o| o.media.clone())
+                        .unwrap_or_else(|| input.media.clone()),
+                    thread: o
+                        .and_then(|o| o.thread.clone())
+                        .unwrap_or_else(|| input.thread.clone()),
+                    first_comment: o
+                        .and_then(|o| o.first_comment.clone())
+                        .or_else(|| input.first_comment.clone()),
+                    cover: o
+                        .and_then(|o| o.cover.clone())
+                        .or_else(|| input.cover.clone()),
+                    tiktok: o
+                        .and_then(|o| o.tiktok.clone())
+                        .or_else(|| input.tiktok.clone().filter(|_| platform == "tiktok")),
+                    youtube: o
+                        .and_then(|o| o.youtube.clone())
+                        .or_else(|| input.youtube.clone().filter(|_| platform == "youtube")),
+                    platform,
+                    scheduled_at: input.scheduled_at,
+                    list_id: input.list_id,
+                    position: input.position,
+                }
+            })
+            .collect();
+        // Every post passes its own rules before anything is called, and every call is made
+        // before anything is written, outside the transaction.
+        let skip = input.on_invalid == OnInvalid::Skip;
+        let mut checks = examine(app, a, set, inputs, validate_only || skip).await?;
+        // The posts that are created follow each other in the list, whatever is left out.
+        for (i, c) in (0i32..).zip(checks.iter_mut().filter(|c| c.ok())) {
+            c.input.position = c.input.position.map(|p| p.saturating_add(i));
         }
         let group = Uuid::now_v7();
-        let mut inputs = Vec::with_capacity(platforms.len());
-        for (i, platform) in (0i32..).zip(platforms) {
-            let o = input.overrides.get(&platform);
-            let one = PostInput {
-                social_set_id: Some(set),
-                body: o
-                    .and_then(|o| o.body.clone())
-                    .unwrap_or_else(|| input.body.clone()),
-                media: o
-                    .and_then(|o| o.media.clone())
-                    .unwrap_or_else(|| input.media.clone()),
-                thread: o
-                    .and_then(|o| o.thread.clone())
-                    .unwrap_or_else(|| input.thread.clone()),
-                first_comment: o
-                    .and_then(|o| o.first_comment.clone())
-                    .or_else(|| input.first_comment.clone()),
-                cover: o
-                    .and_then(|o| o.cover.clone())
-                    .or_else(|| input.cover.clone()),
-                tiktok: o
-                    .and_then(|o| o.tiktok.clone())
-                    .or_else(|| input.tiktok.clone().filter(|_| platform == "tiktok")),
-                youtube: o
-                    .and_then(|o| o.youtube.clone())
-                    .or_else(|| input.youtube.clone().filter(|_| platform == "youtube")),
-                platform,
-                scheduled_at: input.scheduled_at,
-                list_id: input.list_id,
-                position: input.position.map(|p| p.saturating_add(i)),
-            };
-            // Every post passes its own rules before anything is called or written.
-            if let Err(res) = checked(&app.db, a, &one).await? {
-                return Ok(Err(naming(res, &one.platform).await));
-            }
-            inputs.push(one);
+        if validate_only {
+            return report(app, a, set, &checks, Some(group), problems).await;
         }
-        // Then `preflight` for the whole group, outside the transaction: every URL probed once,
-        // and the TikTok level asked once.
-        let drafts: Vec<Draft> = inputs.iter().map(Draft::from).collect();
-        let mut urls: Vec<String> = drafts.iter().flat_map(draft_urls).collect();
-        urls.sort();
-        urls.dedup();
-        let probed = probe(app, &urls).await;
-        for d in &drafts {
-            if let Some(res) = media_refusal(d, &probed) {
-                return Ok(Err(res));
-            }
-        }
-        if let Some(level) = drafts.iter().find_map(tiktok_level) {
-            if let Some(res) = tiktok_offered(app, a, set, level, None).await? {
-                return Ok(Err(res));
+        let valid: Vec<&PostInput> = checks.iter().filter(|c| c.ok()).map(|c| &c.input).collect();
+        if valid.is_empty() || !skip {
+            if let Some(res) = first_refusal(&checks) {
+                return Ok(res);
             }
         }
         let txn = app.db.begin().await?;
-        let mut rows = Vec::with_capacity(inputs.len());
-        for one in &inputs {
-            match insert(&txn, a, one, Some(group)).await? {
-                Ok(p) => rows.push(p),
-                Err(res) => return Ok(Err(naming(res, &one.platform).await)),
-            }
-        }
+        let rows = match insert_all(&txn, a, &valid, Some(group)).await? {
+            Ok(rows) => rows,
+            Err(res) => return Ok(res),
+        };
         txn.commit().await?;
-        group_json(&app.db, a, group, rows).await.map(Ok)
+        let skipped = if valid.len() < checks.len() {
+            let accounts = accounts_in(&app.db, a.team.id, set).await?;
+            let left_out = checks.iter().filter(|c| !c.ok());
+            left_out.map(|c| c.report(&accounts)).collect()
+        } else {
+            Vec::new()
+        };
+        let group = group_json(&app.db, a, group, rows).await?;
+        let body = CreatedGroup { group, skipped };
+        Ok::<_, DbErr>((StatusCode::CREATED, Json(body)).into_response())
     };
-    match made.await {
-        Ok(Ok(g)) => (StatusCode::CREATED, Json(g)).into_response(),
-        Ok(Err(res)) => res,
-        Err(e) => internal(e, "post group insert"),
-    }
+    made.await
+        .unwrap_or_else(|e| internal(e, "post group insert"))
 }
 
 /// The group's posts with their targets, and how many targets it will have in all.

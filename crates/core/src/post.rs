@@ -176,8 +176,8 @@ pub struct Problem {
     pub detail: Option<String>,
 }
 
-impl Problem {
-    fn new(invalid: Invalid) -> Self {
+impl From<Invalid> for Problem {
+    fn from(invalid: Invalid) -> Self {
         Self {
             invalid,
             part: None,
@@ -185,6 +185,12 @@ impl Problem {
             actual: None,
             detail: None,
         }
+    }
+}
+
+impl Problem {
+    fn new(invalid: Invalid) -> Self {
+        invalid.into()
     }
 
     fn over(invalid: Invalid, limit: u64, actual: u64, detail: String) -> Self {
