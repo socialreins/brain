@@ -5345,7 +5345,9 @@ mod teams {
                     social_account_id: Set(Some(account)),
                     status: Set("publishing".into()),
                     remote_id: Set(Some(uri)),
-                    updated_at: Set((Utc::now() - Duration::minutes(20)).fixed_offset()),
+                    updated_at: Set(
+                        (Utc::now() - Duration::minutes(publish::STUCK_MINUTES + 5)).fixed_offset()
+                    ),
                     ..Default::default()
                 };
                 post_targets::Entity::insert(row)
@@ -5787,7 +5789,9 @@ mod teams {
                     id: Set(target),
                     status: Set("publishing".into()),
                     error: Set(None),
-                    updated_at: Set((Utc::now() - Duration::minutes(20)).fixed_offset()),
+                    updated_at: Set(
+                        (Utc::now() - Duration::minutes(publish::STUCK_MINUTES + 5)).fixed_offset()
+                    ),
                     ..Default::default()
                 };
                 post_targets::Entity::update(cut).exec(&db).await.unwrap();
@@ -6034,7 +6038,9 @@ mod teams {
                         json!([{"remote_id": format!("at://{did}/app.bsky.feed.post/r3a"),
                         "cid": "c"}]),
                     ),
-                    updated_at: Set((Utc::now() - Duration::minutes(20)).fixed_offset()),
+                    updated_at: Set(
+                        (Utc::now() - Duration::minutes(publish::STUCK_MINUTES + 5)).fixed_offset()
+                    ),
                     ..Default::default()
                 };
                 post_targets::Entity::insert(row)
@@ -6312,7 +6318,9 @@ mod teams {
                 // Left `queued` 20 minutes ago with no reservation recorded.
                 let stale = |id: uuid::Uuid| posts::ActiveModel {
                     id: Set(id),
-                    updated_at: Set((Utc::now() - Duration::minutes(20)).fixed_offset()),
+                    updated_at: Set(
+                        (Utc::now() - Duration::minutes(publish::STUCK_MINUTES + 5)).fixed_offset()
+                    ),
                     ..Default::default()
                 };
                 let first = queued_post(&db, &team_id, &set).await;
@@ -6473,7 +6481,7 @@ mod teams {
                     stuck,
                     Some(account),
                     "publishing",
-                    Utc::now() - Duration::minutes(20),
+                    Utc::now() - Duration::minutes(publish::STUCK_MINUTES + 5),
                 )
                 .await;
                 let fresh = queued_post(&db, &team_id, &set).await;

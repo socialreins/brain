@@ -224,7 +224,7 @@ video or 1 to 35 JPEG or WebP photos, `media_required` without one, no threads) 
 Saving with `scheduled_at` makes a post `scheduled`, else `draft`; only those two can change.
 A tick every minute claims due posts (one instance at a time, advisory lock), creates one
 target per account and claims each target once, so nothing posts twice; a publish is never
-retried. A target cut off mid-publish for 15 minutes fails as "unknown, check the account".
+retried. A target cut off mid-publish for 31 minutes (longer than the slowest healthy post: 12 minutes of downloads, 14 of publishing, and a margin) fails as "unknown, check the account".
 
 **Checks before saving.** `POST /posts`, `PUT /posts/{id}`, `POST /post-groups`, both retries
 and the MCP tools that share them refuse a post that can never publish, before anything is

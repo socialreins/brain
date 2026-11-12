@@ -884,8 +884,17 @@ pub fn quota_bucket(team_id: Uuid) -> String {
 /// Longest one post (or thread part) may take to publish or delete, unless its publisher says
 /// otherwise (`Publisher::timeout`).
 const TARGET_TIMEOUT: Duration = Duration::from_secs(120);
-/// A target `publishing` this long was cut off (crash, restart) and may have posted.
-const STUCK_MINUTES: i64 = 15;
+/// Longest one target's publish may take, however large its video (`patience`).
+pub const PUBLISH_LIMIT: Duration = Duration::from_secs(14 * 60);
+/// What may pass around a post's downloads and its publish without it being cut off: its
+/// credentials, cover and image conversions.
+const STUCK_MARGIN: Duration = Duration::from_secs(5 * 60);
+/// A target `publishing`, or a post `queued`, this long was cut off (crash, restart) and may
+/// have posted: longer than a healthy post can take, its downloads (`media::INGEST_CEILING`)
+/// then its publish (`PUBLISH_LIMIT`), plus `STUCK_MARGIN`. 31 minutes.
+pub const STUCK_MINUTES: i64 =
+    ((crate::media::INGEST_CEILING.as_secs() + PUBLISH_LIMIT.as_secs() + STUCK_MARGIN.as_secs())
+        / 60) as i64;
 const PUBLISH_LOCK: i64 = 0x0050_5542_4c49_5348;
 
 pub const RECONNECT: &str =
@@ -1703,7 +1712,8 @@ async fn send(
 /// (`connectors::extra_polls`). Nothing changes for a post without a large video: `base` and
 /// none. Videos add the time their bytes take at `media::MIN_SPEED` (brain's upload, or the
 /// platform's download from brain) and one check, about 50 seconds, per 100 MB, at most 10. The
-/// limit stays a minute under `STUCK_MINUTES`, after which the target counts as cut off.
+/// limit is `PUBLISH_LIMIT` at most, which `STUCK_MINUTES` is derived from, so a slow publish
+/// is never taken for one cut off.
 fn patience(base: Duration, media: &[Attachment]) -> (Duration, u32) {
     let videos = media
         .iter()
@@ -1711,10 +1721,7 @@ fn patience(base: Duration, media: &[Attachment]) -> (Duration, u32) {
     let bytes: u64 = videos.map(|a| a.bytes.len()).sum();
     let extra = (bytes / 100_000_000).min(10) as u32;
     let limit = base + Duration::from_secs(bytes / crate::media::MIN_SPEED + 50 * u64::from(extra));
-    (
-        limit.min(Duration::from_secs((STUCK_MINUTES as u64 - 1) * 60)),
-        extra,
-    )
+    (limit.min(PUBLISH_LIMIT), extra)
 }
 
 async fn publish_target(
