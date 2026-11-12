@@ -1132,8 +1132,9 @@ impl Check {
 /// asked once. A create that refuses stops after the first phase that found a problem, so it
 /// calls out for nothing it will not save; with `all` every phase runs for every post (a
 /// validate-only report, `on_invalid: "skip"`), where a later phase leaves out what an earlier
-/// one already settled: no probe for a platform brain does not know or of a URL that is not
-/// `https`, no cover facts for a cover its rules refused, no TikTok call for refused settings.
+/// one already settled: no probe for a platform brain does not know, for a post with too many
+/// media items or thread parts, or of a URL that is not `https`, no cover facts for a cover its
+/// rules refused, no TikTok call for refused settings.
 async fn examine(
     app: &AppState,
     a: &Actor,
@@ -1155,9 +1156,15 @@ async fn examine(
         return Ok(checks);
     }
     let has = |c: &Check, field: &str| c.rules.iter().any(|p| p.field.as_deref() == Some(field));
+    // A post over its platform's media or part count is refused whatever its files are, so
+    // none of them is fetched for it.
+    let unprobed = |c: &Check| {
+        let over = |p: &Problem| matches!(p.code.as_str(), "too_many_images" | "too_many_parts");
+        has(c, "platform") || c.rules.iter().any(over)
+    };
     let mut urls: Vec<String> = checks
         .iter()
-        .filter(|c| !has(c, "platform"))
+        .filter(|c| !unprobed(c))
         .flat_map(|c| draft_urls(&Draft::from(&c.input)))
         .filter(|u| post::https_url(u))
         .collect();
@@ -1165,7 +1172,7 @@ async fn examine(
     urls.dedup();
     let probed = probe(app, &urls).await;
     for c in &mut checks {
-        if has(c, "platform") {
+        if unprobed(c) {
             continue;
         }
         let cover = has(c, "cover");
@@ -1240,9 +1247,11 @@ async fn insert_all(
     Ok(Ok(rows))
 }
 
-/// The validate-only answer for what `examine` found (with `all`). The posts that passed go
-/// through `insert_all` in a transaction that is rolled back, so the post cap and the list are
-/// checked by the create's own code and nothing is kept.
+/// The validate-only answer for what `examine` found (with `all`). Every post goes through
+/// `store` in a transaction that is rolled back, so the post cap and the list are checked by
+/// the create's own code and nothing is kept; the first such problem is reported, as a create
+/// answers it. A post that failed its checks is stored blank (`stand_in`), so the cap and the
+/// list are reported for it too. No team row lock: nothing here is kept to race for the cap.
 async fn report(
     app: &AppState,
     a: &Actor,
@@ -1251,14 +1260,16 @@ async fn report(
     group: Option<Uuid>,
     mut problems: Vec<Problem>,
 ) -> Result<Response, DbErr> {
-    let valid: Vec<&PostInput> = checks.iter().filter(|c| c.ok()).map(|c| &c.input).collect();
-    if !valid.is_empty() {
-        let txn = app.db.begin().await?;
-        if let Err(res) = insert_all(&txn, a, &valid, group).await? {
+    let txn = app.db.begin().await?;
+    for c in checks {
+        let blank = (!c.ok()).then(|| stand_in(&c.input));
+        let input = blank.as_ref().unwrap_or(&c.input);
+        if let Err(res) = store(&txn, a, set, input, group).await? {
             problems.push(as_problem(res).await);
+            break;
         }
-        txn.rollback().await?;
     }
+    txn.rollback().await?;
     let accounts = accounts_in(&app.db, a.team.id, set).await?;
     let platforms: Vec<PlatformReport> = checks.iter().map(|c| c.report(&accounts)).collect();
     Ok(validation(platforms, problems))
@@ -1397,6 +1408,36 @@ async fn insert(
         .lock_exclusive()
         .one(txn)
         .await?;
+    store(txn, a, set, input, group_id).await
+}
+
+/// `input` with nothing of the post itself, for `report`: a row the table takes whatever was
+/// wrong with the post, with the time, list and position the cap and list checks read.
+fn stand_in(input: &PostInput) -> PostInput {
+    PostInput {
+        social_set_id: input.social_set_id,
+        platform: "bluesky".into(),
+        body: String::new(),
+        media: Vec::new(),
+        thread: Vec::new(),
+        first_comment: None,
+        cover: None,
+        tiktok: None,
+        youtube: None,
+        scheduled_at: input.scheduled_at,
+        list_id: input.list_id,
+        position: input.position,
+    }
+}
+
+/// The part of `insert` after its checks: the post cap, the row in `set`, then its list.
+async fn store(
+    txn: &DatabaseTransaction,
+    a: &Actor,
+    set: Uuid,
+    input: &PostInput,
+    group_id: Option<Uuid>,
+) -> Result<Result<posts::Model, Response>, DbErr> {
     let live = posts::Entity::find()
         .filter(posts::Column::TeamId.eq(a.team.id))
         .filter(posts::Column::Status.ne("deleted"))
