@@ -302,6 +302,16 @@ fn media_store(var: impl Fn(&str) -> Option<String>) -> Result<Arc<dyn ObjectSto
                 .with_region(var("S3_REGION").unwrap_or_else(|| "auto".into()))
                 .with_access_key_id(key_id)
                 .with_secret_access_key(secret)
+                // object_store's defaults (30 s a request, retries within 180 s) end a read
+                // of a large video early: a request, and its retries, may take what the
+                // largest file takes at the slowest speed a download may have.
+                .with_client_options(
+                    object_store::ClientOptions::new().with_timeout(crate::media::STORE_TIMEOUT),
+                )
+                .with_retry(object_store::RetryConfig {
+                    retry_timeout: crate::media::STORE_TIMEOUT,
+                    ..Default::default()
+                })
                 .build()
                 .map_err(|e| format!("S3_BUCKET: {e}"))?;
             Ok(Arc::new(s3))

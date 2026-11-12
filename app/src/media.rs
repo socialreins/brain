@@ -42,6 +42,10 @@ pub const MIN_SPEED: u64 = 2_000_000;
 /// Longest all of a post's downloads may take together, whatever their sizes, so slow servers
 /// cannot hold a publish slot. Under `publish::STUCK_MINUTES`.
 pub const INGEST_CEILING: Duration = Duration::from_secs(12 * 60);
+/// Longest one request to an S3 bucket may take, retries included (`config::media_store`): a
+/// read, or a copy, of the largest file at `MIN_SPEED`, about 10 minutes.
+pub const STORE_TIMEOUT: Duration =
+    Duration::from_secs(INGEST_DEADLINE.as_secs() + MAX_BYTES as u64 / MIN_SPEED);
 /// A download that sends nothing for this long has stalled and fails at once.
 pub const STALL: Duration = Duration::from_secs(30);
 /// Bytes buffered before a part goes to storage (S3's and R2's smallest part), and parts being
