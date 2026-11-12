@@ -1,7 +1,7 @@
 //! Media storage. A post's media URLs (Google Drive share links too) are downloaded once, at
 //! publish time, into brain's own storage: local disk at `MEDIA_DIR`, or an S3-compatible bucket
-//! (`config.rs`). Each file is streamed with a size cap and typed by its magic bytes, and the
-//! publisher reads it from there. Storage is temporary: a post's files are deleted once it
+//! (`config.rs`). Each file is streamed with a size cap and typed by its magic bytes, never held
+//! whole in memory (`PART_BYTES`, `PARTS_IN_FLIGHT`), and the publisher reads it from there. Storage is temporary: a post's files are deleted once it
 //! settles, and an hourly sweep deletes what is left. Downloads resolve names through
 //! `PublicOnly` and follow at most 3 redirects, each to a public https URL.
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -9,22 +9,50 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use tokio::time::Instant;
 
-use object_store::{path::Path, ObjectStore, WriteMultipart};
+use object_store::{
+    path::Path, MultipartUpload, ObjectStore, PutPayload, PutResult, UploadPart, WriteMultipart,
+};
 use reqwest::{header::CONTENT_TYPE, StatusCode, Url};
 use sea_orm::{
     ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait, Value,
 };
 use uuid::Uuid;
 
-use crate::{connectors::bluesky::PublicOnly, state::AppState, webhooks::public_url};
+use crate::{
+    connectors::bluesky::{PostError, PublicOnly},
+    state::AppState,
+    webhooks::public_url,
+};
 
-/// The largest file brain stores, whatever the platform.
-pub const MAX_BYTES: usize = 100_000_000;
+/// The largest video brain stores, whatever the platform, unless `MEDIA_MAX_BYTES` lowers it
+/// (`Media::max_bytes`): 1 GiB.
+pub const MAX_BYTES: usize = socialreins_core::post::MAX_VIDEO_BYTES as usize;
+/// The largest file that is not a video (an image, a PDF): it is read whole to convert or
+/// upload it, so it keeps the cap every file had before videos were streamed.
+pub const MAX_STILL_BYTES: usize = socialreins_core::post::MAX_MEDIA_BYTES as usize;
 /// Files older than this whose post no longer waits to publish are deleted by the sweep.
 pub const SWEEP_DAYS: i32 = 7;
 const MAX_REDIRECTS: usize = 3;
-/// Longest all of a post's downloads may take together, so a slow server cannot hold a tick.
+/// A download's base time: its answer must start within it, and the whole file may take it plus
+/// its size at `MIN_SPEED` (the size the server said, else the bytes that came so far), so 60 s
+/// for a small image and about 3.5 minutes for 300 MB.
 pub const INGEST_DEADLINE: Duration = Duration::from_secs(60);
+/// The slowest download that still finishes in time, in bytes a second.
+pub const MIN_SPEED: u64 = 2_000_000;
+/// Longest all of a post's downloads may take together, whatever their sizes, so slow servers
+/// cannot hold a publish slot. `publish::STUCK_MINUTES` is derived from it.
+pub const INGEST_CEILING: Duration = Duration::from_secs(12 * 60);
+/// Longest one request to an S3 bucket may take, retries included (`config::media_store`): a
+/// read, or a copy, of the largest file at `MIN_SPEED`, about 10 minutes.
+pub const STORE_TIMEOUT: Duration =
+    Duration::from_secs(INGEST_DEADLINE.as_secs() + MAX_BYTES as u64 / MIN_SPEED);
+/// A download that sends nothing for this long has stalled and fails at once.
+pub const STALL: Duration = Duration::from_secs(30);
+/// Bytes buffered before a part goes to storage (S3's and R2's smallest part), and parts being
+/// written at once: a download holds at most `PART_BYTES * (PARTS_IN_FLIGHT + 1)`, about 15 MB,
+/// however large the file.
+pub const PART_BYTES: usize = 5 * 1024 * 1024;
+pub const PARTS_IN_FLIGHT: usize = 2;
 /// Downloads of one post running at once.
 const PARALLEL: usize = 4;
 /// Bytes needed to tell every stored type apart.
@@ -35,6 +63,50 @@ const PROBE_LEN: usize = 512;
 /// Image conversions (`to_jpeg`, `fit`) running at once in the process, so the decode and resize
 /// buffers of many posts (up to a few hundred MB each) queue instead of piling up.
 static CONVERTING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+/// One turn per post group and media URL (`Media::ingest`): posts of a group publish at once,
+/// and the first to take the turn downloads a video the others then copy in the store.
+// shortcut: turns are per process, so two brain instances may each download a group's video;
+// take a Postgres advisory lock instead if replicas ever publish the same group.
+type Turn = tokio::sync::Mutex<()>;
+type Turns = HashMap<(Uuid, String), std::sync::Weak<Turn>>;
+static TURNS: std::sync::Mutex<Option<Turns>> = std::sync::Mutex::new(None);
+
+fn turn_of(group: Uuid, url: &str) -> Arc<Turn> {
+    let mut turns = TURNS.lock().unwrap_or_else(|e| e.into_inner());
+    let turns = turns.get_or_insert_with(HashMap::new);
+    turns.retain(|_, t| t.strong_count() > 0);
+    let slot = turns.entry((group, url.to_owned())).or_default();
+    slot.upgrade().unwrap_or_else(|| {
+        let new = Arc::<Turn>::default();
+        *slot = Arc::downgrade(&new);
+        new
+    })
+}
+/// A multipart upload that can still be aborted once `WriteMultipart::finish` has taken it:
+/// `finish` leaves the upload open when its last part fails, and in a bucket the parts sent
+/// before it would stay, and be billed, until a lifecycle rule removed them.
+#[derive(Debug, Clone)]
+struct Upload(Arc<tokio::sync::Mutex<Box<dyn MultipartUpload>>>);
+
+#[async_trait::async_trait]
+impl MultipartUpload for Upload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        // Never held here: `abort` and `complete` run only once no part is being added.
+        match self.0.try_lock() {
+            Ok(mut upload) => upload.put_part(data),
+            Err(_) => Box::pin(async { Err(object_store::Error::NotImplemented) }),
+        }
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        self.0.lock().await.complete().await
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.0.lock().await.abort().await
+    }
+}
+
 const SWEEP_LOCK: i64 = 0x004d_4544_4941_5357;
 
 /// The store and the client that downloads into it.
@@ -43,8 +115,17 @@ pub struct Media {
     pub store: Arc<dyn ObjectStore>,
     client: reqwest::Client,
     allow_private: bool,
+    /// The largest video stored: `MAX_BYTES`, or `MEDIA_MAX_BYTES` when that is lower. Only a
+    /// video's cap: an image or a PDF keeps `MAX_STILL_BYTES`.
+    pub max_bytes: usize,
+    /// The store's directory when it is local disk (`MEDIA_DIR`), for `sweep_temp`.
+    pub dir: Option<std::path::PathBuf>,
     /// `INGEST_DEADLINE`; tests shorten it.
     pub deadline: Duration,
+    /// `INGEST_CEILING`; tests shorten it.
+    pub ceiling: Duration,
+    /// `STALL`; tests shorten it.
+    pub stall: Duration,
     /// `PROBE_DEADLINE`; tests shorten it.
     pub probe_deadline: Duration,
     /// Tests only: a probe of a URL starting with `.0` asks `.1` instead (a mock on loopback,
@@ -73,14 +154,24 @@ pub enum Fail {
     Blocked,
     /// Google Drive answered with a page, not the file: it is not shared publicly.
     NotShared,
+    /// Google Drive's "too many users have viewed or downloaded this file recently" page.
+    DriveQuota,
+    /// Google Drive kept answering with its "can't scan this file for viruses" page.
+    DriveConfirm,
     Http(u16),
     Unreachable,
+    /// Over the cap it was downloaded with (`Media::max_bytes`, or a cover's limit).
     TooLarge,
+    /// Not a video, and over `MAX_STILL_BYTES`.
+    TooLargeStill,
     /// Not a JPEG, PNG, WebP, GIF, MP4, MOV or PDF.
     Unsupported,
     Storage,
-    /// The post's downloads ran past `INGEST_DEADLINE` before this one was stored.
+    /// The download ran past its deadline (`INGEST_DEADLINE` plus its size at `MIN_SPEED`), or
+    /// the post's downloads past `INGEST_CEILING`, before this one was stored.
     TimedOut,
+    /// The server sent nothing for `STALL`.
+    Stalled,
 }
 
 /// A stored file.
@@ -91,7 +182,94 @@ pub struct Stored {
     pub size: i64,
 }
 
+/// A file's bytes for a publisher: held in memory (an image, a cover, a PDF, each at most
+/// `MAX_STILL_BYTES`), or left in the store and read a range at a time (a video, and any file a
+/// platform fetches by its link), so a video is never held whole however large it is.
+#[derive(Clone)]
+pub enum Blob {
+    Held(bytes::Bytes),
+    Stored {
+        store: Arc<dyn ObjectStore>,
+        key: String,
+        size: u64,
+    },
+}
+
+impl Default for Blob {
+    fn default() -> Self {
+        Blob::Held(bytes::Bytes::new())
+    }
+}
+
+impl Blob {
+    pub fn len(&self) -> u64 {
+        match self {
+            Blob::Held(bytes) => bytes.len() as u64,
+            Blob::Stored { size, .. } => *size,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The bytes held in memory. A stored file has none (`range` and `body` read it), so asking
+    /// for them is a failure, never an empty upload.
+    pub fn held(&self) -> Result<bytes::Bytes, PostError> {
+        match self {
+            Blob::Held(bytes) => Ok(bytes.clone()),
+            Blob::Stored { key, .. } => {
+                tracing::error!(key, "a stored file was asked for whole");
+                Err(PostError::Failed(
+                    "The file could not be read. Try again.".into(),
+                ))
+            }
+        }
+    }
+
+    fn unread(e: object_store::Error) -> PostError {
+        tracing::warn!(error = %e, "stored media read failed");
+        PostError::Failed("The stored file could not be read. Try again.".into())
+    }
+
+    /// Bytes `range` of the file, cut off at its end: one ranged read of the store.
+    pub async fn range(&self, range: std::ops::Range<u64>) -> Result<bytes::Bytes, PostError> {
+        let range = range.start.min(self.len())..range.end.min(self.len());
+        match self {
+            Blob::Held(bytes) => Ok(bytes.slice(range.start as usize..range.end as usize)),
+            Blob::Stored { .. } if range.is_empty() => Ok(bytes::Bytes::new()),
+            Blob::Stored { store, key, .. } => store
+                .get_range(&Path::from(key.as_str()), range)
+                .await
+                .map_err(Self::unread),
+        }
+    }
+
+    /// The whole file as a request body, streamed from the store as it is sent. Its length is
+    /// `len`, which the caller sends as `Content-Length`.
+    pub async fn body(&self) -> Result<reqwest::Body, PostError> {
+        match self {
+            Blob::Held(bytes) => Ok(bytes.clone().into()),
+            Blob::Stored { store, key, .. } => {
+                let got = store.get(&Path::from(key.as_str())).await;
+                Ok(reqwest::Body::wrap_stream(
+                    got.map_err(Self::unread)?.into_stream(),
+                ))
+            }
+        }
+    }
+}
+
 impl Media {
+    /// The stored file `file` as a `Blob` that reads it from the store.
+    pub fn blob(&self, file: &Stored) -> Blob {
+        Blob::Stored {
+            store: self.store.clone(),
+            key: file.key.clone(),
+            size: file.size.max(0) as u64,
+        }
+    }
+
     /// `allow_private` (tests only, never read from the environment) also downloads over plain
     /// http from private address literals. Names still resolve to public addresses only.
     pub fn new(store: Arc<dyn ObjectStore>, allow_private: bool) -> Self {
@@ -106,7 +284,8 @@ impl Media {
         });
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(120))
+            // No total timeout: a large file takes as long as its size allows (`download`).
+            .read_timeout(STALL)
             .redirect(redirects)
             .dns_resolver(Arc::new(PublicOnly))
             .user_agent("SocialReins")
@@ -116,7 +295,11 @@ impl Media {
             store,
             client,
             allow_private,
+            max_bytes: MAX_BYTES,
+            dir: None,
             deadline: INGEST_DEADLINE,
+            ceiling: INGEST_CEILING,
+            stall: STALL,
             probe_deadline: PROBE_DEADLINE,
             probe_rewrite: None,
         }
@@ -159,25 +342,8 @@ impl Media {
     /// when there is no clear answer: blocked, unreachable, not 200 or 206, or bytes of no type
     /// brain stores (a sign-in page, say). Nothing is stored.
     pub async fn probe(&self, url: &str) -> Option<Probed> {
-        let drive = drive_url(url);
-        let mut url = drive.unwrap_or_else(|| url.to_owned());
-        if let Some((from, to)) = self.probe_rewrite.as_ref().filter(|_| self.allow_private) {
-            if let Some(rest) = url.strip_prefix(from.as_str()) {
-                url = format!("{to}{rest}");
-            }
-        }
-        let from = Url::parse(&url).ok()?;
-        if !public_url(&from, self.allow_private) {
-            return None;
-        }
-        let range = format!("bytes=0-{}", PROBE_LEN - 1);
-        let mut res = self
-            .client
-            .get(from)
-            .header(reqwest::header::RANGE, range)
-            .send()
-            .await
-            .ok()?;
+        let first = Instant::now() + self.probe_deadline;
+        let mut res = self.open(url, true, first).await.ok()?;
         let size = match res.status() {
             // `bytes 0-511/12345`; `*` for an unknown total.
             StatusCode::PARTIAL_CONTENT => res
@@ -203,12 +369,12 @@ impl Media {
         })
     }
 
-    /// `ingest` of every URL, `PARALLEL` at a time, all within `deadline`; a URL not stored by
-    /// then is `TimedOut`, its upload aborted.
+    /// `ingest` of every URL, `PARALLEL` at a time, each within its own deadline (`download`) and
+    /// all within `ceiling`; a URL not stored by then is `TimedOut`, its upload aborted.
     pub async fn ingest_all(
         &self,
         db: &DatabaseConnection,
-        post: Uuid,
+        (post, group): (Uuid, Option<Uuid>),
         urls: &[String],
         cap: usize,
     ) -> HashMap<String, Result<Stored, Fail>> {
@@ -219,7 +385,7 @@ impl Media {
             }
         }
         left.reverse();
-        let until = Instant::now() + self.deadline;
+        let until = Instant::now() + self.ceiling;
         let mut found = HashMap::new();
         let mut running = tokio::task::JoinSet::new();
         loop {
@@ -227,7 +393,7 @@ impl Media {
                 let Some(url) = left.pop() else { break };
                 let (media, db) = (self.clone(), db.clone());
                 running.spawn(async move {
-                    let got = media.ingest(&db, post, &url, cap, until).await;
+                    let got = media.ingest(&db, (post, group), &url, cap, until).await;
                     (url, got)
                 });
             }
@@ -247,12 +413,16 @@ impl Media {
     }
 
     /// The stored copy of `url` for `post`: the one an earlier try saved, else downloaded now,
-    /// at most `cap` bytes (and never over `MAX_BYTES`), by `until`. A row whose file is gone is
-    /// a miss: it is deleted and the URL downloaded again.
+    /// at most `cap` bytes (and never over `max_bytes`, or `MAX_STILL_BYTES` unless it is a
+    /// video), by `until`. A row whose file is gone is
+    /// a miss: it is deleted and the URL downloaded again. A video another post of `group` (the
+    /// post's `group_id`) already stored from the same URL is copied in the store instead
+    /// (`copied`), so a group downloads it once; each post still owns, and later deletes, its own
+    /// file. Posts of a group take turns per URL, only until a file is known not to be a video.
     pub async fn ingest(
         &self,
         db: &DatabaseConnection,
-        post: Uuid,
+        (post, group): (Uuid, Option<Uuid>),
         url: &str,
         cap: usize,
         until: Instant,
@@ -282,8 +452,21 @@ impl Media {
                 _ => return Ok(s),
             }
         }
-        let got = self.download(post, url, cap.min(MAX_BYTES), until).await;
-        let (key, content_type, size) = got?;
+        let mut turn = None;
+        let mut copy = None;
+        if let Some(group) = group {
+            let wait = tokio::time::timeout_at(until, turn_of(group, url).lock_owned());
+            turn = Some(wait.await.map_err(|_| Fail::TimedOut)?);
+            let video_cap = cap.min(self.max_bytes);
+            copy = self.copied(db, post, url, video_cap, until).await;
+        }
+        let (key, content_type, size) = match copy {
+            Some(copy) => copy,
+            None => {
+                let got = self.download(post, url, cap, until, &mut turn).await;
+                got.map(|(key, content_type, size)| (key, content_type.to_owned(), size))?
+            }
+        };
         // A run that stored the same URL first wins; this copy is then deleted.
         let saved = db
             .query_one_raw(sql(
@@ -309,67 +492,197 @@ impl Media {
         if kept.as_ref().map_or(true, |s| s.key != key) {
             self.delete(&key).await;
         }
+        drop(turn);
         kept
     }
 
-    /// Streams `url` (a Drive share link as its direct download) into a new object; returns its
-    /// key, type and size.
+    /// A copy for `post`, made inside the store (no bytes pass through brain), of the video at
+    /// most `cap` bytes that another post of its group stored from `url`: its key, type and size.
+    /// `None` when there is none or the copy fails (the other post settled and its file went),
+    /// and the caller downloads.
+    async fn copied(
+        &self,
+        db: &DatabaseConnection,
+        post: Uuid,
+        url: &str,
+        cap: usize,
+        until: Instant,
+    ) -> Option<(String, String, usize)> {
+        let stmt = sql(
+            "SELECT m.storage_key, m.content_type, m.size FROM posts me \
+             JOIN posts p ON p.team_id = me.team_id AND p.group_id = me.group_id AND p.id <> me.id \
+             JOIN post_media m ON m.post_id = p.id \
+             WHERE me.id = $1 AND m.source_url = $2 AND m.content_type LIKE 'video/%' \
+             AND m.size <= $3 ORDER BY m.created_at DESC LIMIT 1",
+            vec![post.into(), url.into(), (cap as i64).into()],
+        );
+        let from = stored(&db.query_one_raw(stmt).await.ok()??).ok()?;
+        let key = format!("posts/{post}/{}", Uuid::now_v7());
+        let (source, to) = (Path::from(from.key.as_str()), Path::from(key.as_str()));
+        let copy = self.store.copy(&source, &to);
+        match tokio::time::timeout_at(until, copy).await {
+            Ok(Ok(())) => Some((key, from.content_type, from.size.max(0) as usize)),
+            failed => {
+                if let Ok(Err(e)) = failed {
+                    tracing::info!(error = %e, post = %post, "group media copy failed");
+                }
+                self.delete(&key).await;
+                None
+            }
+        }
+    }
+
+    /// Tests only: `url` on the mock that stands in for its host (`probe_rewrite`).
+    fn rewritten(&self, url: &str) -> String {
+        let to = self.probe_rewrite.as_ref().filter(|_| self.allow_private);
+        to.and_then(|(from, to)| Some(format!("{to}{}", url.strip_prefix(from.as_str())?)))
+            .unwrap_or_else(|| url.to_owned())
+    }
+
+    /// The answer to a GET of `url` (a Drive share link as its direct download; only its first
+    /// bytes when `probing`), started by `first`. Drive answers a large file with a page asking
+    /// to confirm the download: that page's form is followed once, to a Drive host only, and
+    /// whatever page Drive sends in place of the file is told apart here (`NotShared`,
+    /// `DriveQuota`, `DriveConfirm`). Every URL asked is public (`public_url`, `PublicOnly`).
+    async fn open(
+        &self,
+        url: &str,
+        probing: bool,
+        first: Instant,
+    ) -> Result<reqwest::Response, Fail> {
+        let drive = drive_url(url);
+        let target = |url: &str| {
+            let url = if drive.is_some() || probing {
+                self.rewritten(url)
+            } else {
+                url.to_owned()
+            };
+            let ok = |u: &Url| public_url(u, self.allow_private);
+            Url::parse(&url).ok().filter(ok).ok_or(Fail::Blocked)
+        };
+        let get = |from: Url| async move {
+            let mut req = self.client.get(from);
+            if probing {
+                req = req.header(reqwest::header::RANGE, format!("bytes=0-{}", PROBE_LEN - 1));
+            }
+            let sent = tokio::time::timeout_at(first, req.send()).await;
+            sent.map_err(|_| Fail::TimedOut)?.map_err(|e| {
+                let fail = if e.is_redirect() || blocked(&e) {
+                    Fail::Blocked
+                } else {
+                    Fail::Unreachable
+                };
+                tracing::warn!(error = %e.without_url(), "media download failed");
+                fail
+            })
+        };
+        let html = |res: &reqwest::Response| {
+            let ty = res
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok());
+            ty.is_some_and(|v| v.to_ascii_lowercase().starts_with("text/html"))
+        };
+        let mut res = get(target(drive.as_deref().unwrap_or(url))?).await?;
+        if drive.is_some() && html(&res) {
+            let status = res.status();
+            let mut page = Vec::new();
+            while page.len() < DRIVE_PAGE_BYTES {
+                let chunk = tokio::time::timeout_at(first, res.chunk()).await;
+                match chunk
+                    .map_err(|_| Fail::TimedOut)?
+                    .map_err(|_| Fail::Unreachable)?
+                {
+                    Some(chunk) => page.extend_from_slice(&chunk),
+                    None => break,
+                }
+            }
+            page.truncate(DRIVE_PAGE_BYTES);
+            match drive_page(&String::from_utf8_lossy(&page)) {
+                Ok(next) => res = get(target(next.as_str())?).await?,
+                Err(Fail::NotShared) if status != StatusCode::OK => {
+                    return Err(Fail::Http(status.as_u16()))
+                }
+                Err(fail) => return Err(fail),
+            }
+            if html(&res) {
+                return Err(Fail::DriveConfirm);
+            }
+        }
+        Ok(res)
+    }
+
+    /// Streams `url` (a Drive share link as its direct download) into a new object, part by part
+    /// (`PART_BYTES`), and returns its key, type and size. The answer must start within
+    /// `deadline`, the file may take `deadline` plus its size at `MIN_SPEED`, never past `until`,
+    /// and a server silent for `stall` fails at once. A file over `cap` is refused by its
+    /// `Content-Length` before a byte is read, else the moment the bytes pass it; whatever stops
+    /// a download, its partial upload is aborted, so nothing stays in the store.
     async fn download(
         &self,
         post: Uuid,
         url: &str,
         cap: usize,
         until: Instant,
+        turn: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
     ) -> Result<(String, &'static str, usize), Fail> {
-        let drive = drive_url(url);
-        let from = Url::parse(drive.as_deref().unwrap_or(url)).map_err(|_| Fail::Blocked)?;
-        if !public_url(&from, self.allow_private) {
-            return Err(Fail::Blocked);
-        }
-        let sent = tokio::time::timeout_at(until, self.client.get(from).send());
-        let mut res = sent.await.map_err(|_| Fail::TimedOut)?.map_err(|e| {
-            let fail = if e.is_redirect() || blocked(&e) {
-                Fail::Blocked
-            } else {
-                Fail::Unreachable
-            };
-            tracing::warn!(error = %e.without_url(), post = %post, "media download failed");
-            fail
-        })?;
+        let started = Instant::now();
+        let first = until.min(started + self.deadline);
+        let mut res = self.open(url, false, first).await.inspect_err(
+            |fail| tracing::warn!(?fail, post = %post, "media download did not start"),
+        )?;
         if res.status() != StatusCode::OK {
             return Err(Fail::Http(res.status().as_u16()));
         }
-        if res.content_length().is_some_and(|n| n > cap as u64) {
+        // `max_bytes` caps a video only, and nothing says yet whether this is one.
+        let video_cap = cap.min(self.max_bytes);
+        let any_cap = video_cap.max(cap.min(MAX_STILL_BYTES));
+        // Over a video's cap but under a still's (`MEDIA_MAX_BYTES` set low), which message
+        // fits depends on the type: the check after the first bytes says.
+        if any_cap == video_cap && res.content_length().is_some_and(|n| n > any_cap as u64) {
             return Err(Fail::TooLarge);
         }
-        let html = res
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.to_ascii_lowercase().starts_with("text/html"));
+        // The time a download has: its size at `MIN_SPEED` on top of `deadline`. Size unsaid, it
+        // is the bytes that came so far, so a download earns its time only as it arrives at a
+        // healthy rate, and a small file of unknown size gets no more than a sized one.
+        let (known, ceiling, deadline) = (res.content_length(), until, self.deadline);
+        let by = move |got: usize| {
+            let size = known.unwrap_or(got as u64);
+            ceiling.min(started + deadline + Duration::from_secs(size / MIN_SPEED))
+        };
+        let stall = self.stall;
         let read = |e: reqwest::Error| {
             tracing::warn!(error = %e.without_url(), post = %post, "media download failed");
             Fail::Unreachable
         };
+        // Only the first bytes are kept to tell the type; the rest goes straight to storage.
         let mut head = Vec::new();
         while head.len() < SNIFF_LEN {
-            let chunk = tokio::time::timeout_at(until, res.chunk()).await;
-            match chunk.map_err(|_| Fail::TimedOut)?.map_err(read)? {
+            let chunk = tokio::time::timeout(stall, res.chunk());
+            let chunk = tokio::time::timeout_at(by(head.len()), chunk);
+            let chunk = chunk.await.map_err(|_| Fail::TimedOut)?;
+            match chunk.map_err(|_| Fail::Stalled)?.map_err(read)? {
                 Some(chunk) => head.extend_from_slice(&chunk),
                 None => break,
             }
         }
-        let Some(content_type) = sniff(&head) else {
-            // Drive answers a file it will not hand out with a sign-in or error page.
-            return Err(if drive.is_some() && html {
-                Fail::NotShared
-            } else {
-                Fail::Unsupported
-            });
+        // A page Drive sent in place of a file never gets here (`open`).
+        let content_type = sniff(&head).ok_or(Fail::Unsupported)?;
+        // Only a video is shared in a group, so nothing else keeps the group's other posts waiting.
+        if !content_type.starts_with("video/") {
+            turn.take();
+        }
+        // Only a video may pass `MAX_STILL_BYTES`: anything else is read whole later.
+        let (cap, over) = if content_type.starts_with("video/") {
+            (video_cap, Fail::TooLarge)
+        } else if cap <= MAX_STILL_BYTES {
+            (cap, Fail::TooLarge)
+        } else {
+            (MAX_STILL_BYTES, Fail::TooLargeStill)
         };
         let mut size = head.len();
-        if size > cap {
-            return Err(Fail::TooLarge);
+        if size > cap || res.content_length().is_some_and(|n| n > cap as u64) {
+            return Err(over);
         }
         let key = format!("posts/{post}/{}", Uuid::now_v7());
         let upload = self
@@ -377,25 +690,41 @@ impl Media {
             .put_multipart(&Path::from(key.as_str()))
             .await
             .map_err(storage)?;
-        let mut file = WriteMultipart::new(upload);
+        let mut upload = Upload(Arc::new(tokio::sync::Mutex::new(upload)));
+        let mut file = WriteMultipart::new_with_chunk_size(Box::new(upload.clone()), PART_BYTES);
         file.write(&head);
+        // Past the deadline the upload is aborted, so no partial file stays behind.
         let streamed = async {
-            while let Some(chunk) = res.chunk().await.map_err(read)? {
+            loop {
+                let step = async {
+                    let chunk = tokio::time::timeout(stall, res.chunk()).await;
+                    let chunk = chunk.map_err(|_| Fail::Stalled)?.map_err(read)?;
+                    // Storage slower than the download holds the download back, not the bytes.
+                    file.wait_for_capacity(PARTS_IN_FLIGHT)
+                        .await
+                        .map_err(storage)?;
+                    Ok(chunk)
+                };
+                let step = tokio::time::timeout_at(by(size), step).await;
+                let Some(chunk) = step.unwrap_or(Err(Fail::TimedOut))? else {
+                    return Ok(());
+                };
                 size += chunk.len();
                 if size > cap {
-                    return Err(Fail::TooLarge);
+                    return Err(over);
                 }
-                file.wait_for_capacity(4).await.map_err(storage)?;
                 file.write(&chunk);
             }
-            Ok(())
         };
-        // Past the deadline the upload is aborted, so no partial file stays behind.
-        let streamed = tokio::time::timeout_at(until, streamed)
-            .await
-            .unwrap_or(Err(Fail::TimedOut));
+        let streamed: Result<(), Fail> = streamed.await;
         match streamed {
-            Ok(()) => file.finish().await.map_err(storage)?,
+            Ok(()) => {
+                if let Err(e) = file.finish().await {
+                    // A second abort after `finish` made its own is refused, which is fine.
+                    let _ = upload.abort().await;
+                    return Err(storage(e));
+                }
+            }
             Err(e) => {
                 let _ = file.abort().await;
                 return Err(e);
@@ -609,9 +938,50 @@ pub async fn sweep(app: &AppState) -> Result<u64, DbErr> {
     if !locked {
         return Ok(0);
     }
-    let gone = app.media.release(&app.db, None, SWEEP_DAYS).await?;
+    let mut gone = app.media.release(&app.db, None, SWEEP_DAYS).await?;
+    if let Some(dir) = app.media.dir.clone() {
+        let swept = tokio::task::spawn_blocking(move || sweep_temp(&dir, TEMP_AGE));
+        gone += swept.await.unwrap_or(0);
+    }
     lock.commit().await?;
     Ok(gone)
+}
+
+/// A temp file on local disk this old belongs to no download still running: several times
+/// `INGEST_CEILING`.
+const TEMP_AGE: Duration = Duration::from_secs(3600);
+
+/// Deletes the temp files under `dir` older than `older`, and returns how many went. The local
+/// store writes a file as `<key>#<n>` and renames it when done, so a process killed
+/// mid-download leaves one (up to `MAX_BYTES`) that no listing shows and `release` never sees.
+/// In a bucket the same leftovers are parts of a multipart upload, which its lifecycle rule
+/// aborts (README).
+fn sweep_temp(dir: &std::path::Path, older: Duration) -> u64 {
+    let mut gone = 0;
+    let Ok(posts) = std::fs::read_dir(dir.join("posts")) else {
+        return 0;
+    };
+    for post in posts.flatten() {
+        let Ok(files) = std::fs::read_dir(post.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let name = file.file_name();
+            let digits = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+            let temp = name
+                .to_string_lossy()
+                .rsplit_once('#')
+                .is_some_and(|n| digits(n.1));
+            let age = file.metadata().and_then(|m| m.modified()).ok();
+            let old = age
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|a| a >= older);
+            if temp && old && std::fs::remove_file(file.path()).is_ok() {
+                gone += 1;
+            }
+        }
+    }
+    gone
 }
 
 /// The unguessable brain URL of a stored file, for platforms that download media themselves
@@ -687,6 +1057,74 @@ pub fn drive_url(url: &str) -> Option<String> {
     (!id.is_empty() && id.chars().all(plain)).then(|| {
         format!("https://drive.usercontent.google.com/download?id={id}&export=download&confirm=t")
     })
+}
+
+/// The most of a Drive page that is read to tell what it is.
+const DRIVE_PAGE_BYTES: usize = 256 * 1024;
+/// Hosts the form of Drive's confirmation page may send the download to.
+const DRIVE_HOSTS: [&str; 3] = [
+    "drive.usercontent.google.com",
+    "drive.google.com",
+    "docs.google.com",
+];
+
+/// The value of attribute `name` in an HTML tag, quoted either way.
+fn attr(tag: &str, name: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        if let Some(at) = tag.find(&format!(" {name}={quote}")) {
+            let value = &tag[at + name.len() + 3..];
+            return Some(value[..value.find(quote)?].replace("&amp;", "&"));
+        }
+    }
+    None
+}
+
+/// What a page Drive sent in place of a file says: the download its "can't scan this file for
+/// viruses" form asks for (the form's action with its hidden fields: `id`, `export`, `confirm`,
+/// `uuid`, `at`), else why there is none.
+fn drive_page(page: &str) -> Result<Url, Fail> {
+    let lower = page.to_ascii_lowercase();
+    let Some(form) = page
+        .split("<form")
+        .skip(1)
+        .find(|f| f.contains("download-form"))
+    else {
+        // The quota page by its title or its exact sentence, and only without the form: the
+        // confirmation page shows the file's name, which may say anything.
+        let title = lower.split("<title>").nth(1).unwrap_or_default();
+        let title = title.split("</title>").next().unwrap_or_default();
+        let quota = title.contains("quota exceeded")
+            || lower.contains("too many users have viewed or downloaded this file recently");
+        return Err(if quota {
+            Fail::DriveQuota
+        } else if lower.contains("virus") {
+            Fail::DriveConfirm
+        } else {
+            Fail::NotShared
+        });
+    };
+    let form = form.split("</form").next().unwrap_or(form);
+    let mut tags = form.split('<').map(|t| t.split('>').next().unwrap_or(t));
+    let action = tags.next().and_then(|tag| attr(tag, "action"));
+    let mut to = action
+        .and_then(|a| Url::parse(&a).ok())
+        .ok_or(Fail::DriveConfirm)?;
+    let host = to.host_str().unwrap_or_default();
+    if to.scheme() != "https" || !DRIVE_HOSTS.contains(&host) {
+        return Err(Fail::DriveConfirm);
+    }
+    let fields: Vec<(String, String)> = tags
+        .filter(|tag| tag.starts_with("input"))
+        .filter_map(|tag| Some((attr(tag, "name")?, attr(tag, "value").unwrap_or_default())))
+        .collect();
+    if !fields
+        .iter()
+        .any(|(name, value)| name == "id" && !value.is_empty())
+    {
+        return Err(Fail::DriveConfirm);
+    }
+    to.query_pairs_mut().clear().extend_pairs(&fields);
+    Ok(to)
 }
 
 /// The type of a file by its first bytes: JPEG, PNG, GIF, WebP, MP4, MOV or PDF.
@@ -1126,6 +1564,30 @@ mod tests {
     }
 
     #[test]
+    fn old_temp_files_on_disk_are_swept() {
+        let dir = std::env::temp_dir().join(format!("media-temp-{}", Uuid::now_v7()));
+        let post = dir.join("posts").join(Uuid::now_v7().to_string());
+        std::fs::create_dir_all(&post).unwrap();
+        let long_ago = std::time::SystemTime::now() - 2 * TEMP_AGE;
+        // A download cut off long ago, one still running, and a stored file as old as the first.
+        for (name, old) in [("a#1", true), ("b#12", false), ("c", true), ("d#x", true)] {
+            let file = std::fs::File::create(post.join(name)).unwrap();
+            if old {
+                file.set_modified(long_ago).unwrap();
+            }
+        }
+        assert_eq!(sweep_temp(&dir, TEMP_AGE), 1);
+        let mut left: Vec<_> = std::fs::read_dir(&post)
+            .unwrap()
+            .map(|f| f.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["b#12", "c", "d#x"]);
+        assert_eq!(sweep_temp(&dir.join("none"), TEMP_AGE), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn types_come_from_magic_bytes() {
         let cases: [(&[u8], Option<&str>); 10] = [
             (b"\xFF\xD8\xFF\xE0\0\x10JFIF\0\x01", Some("image/jpeg")),
@@ -1180,7 +1642,7 @@ mod tests {
         let post = Uuid::now_v7();
         for path in ["/ok.png", "/hop"] {
             let (key, ty, size) = media
-                .download(post, &format!("{base}{path}"), MAX_BYTES, soon())
+                .download(post, &format!("{base}{path}"), MAX_BYTES, soon(), &mut None)
                 .await
                 .unwrap();
             assert_eq!((ty, size), ("image/png", 100_000));
@@ -1188,13 +1650,554 @@ mod tests {
             assert_eq!(media.read(&key).await.unwrap(), png(100_000));
         }
         let got = media
-            .download(post, &format!("{base}/ok.png"), 99_999, soon())
+            .download(post, &format!("{base}/ok.png"), 99_999, soon(), &mut None)
             .await;
         assert_eq!(got.unwrap_err(), Fail::TooLarge);
         let got = media
-            .download(post, &format!("{base}/page"), MAX_BYTES, soon())
+            .download(post, &format!("{base}/page"), MAX_BYTES, soon(), &mut None)
             .await;
         assert_eq!(got.unwrap_err(), Fail::Unsupported);
+    }
+
+    /// Stands in for `drive.usercontent.google.com/download`: file `big` comes only once the
+    /// confirmation form's `uuid` and `at` are sent back, `stuck` never does, `evil`'s form
+    /// points off Drive, `quota` is over its download quota and `private` asks to sign in.
+    async fn drive() -> String {
+        use axum::{extract::Query, response::IntoResponse, routing::get, Router};
+        const DRIVE: &str = "https://drive.usercontent.google.com/download";
+        let page = |id: &str, action: &str| {
+            let form = format!(
+                "<!DOCTYPE html><html><head><title>Google Drive - Virus scan warning</title>\
+                 </head><body><p>Google Drive can't scan this file for viruses.</p>\
+                 <form id=\"download-form\" action=\"{action}\" method=\"get\">\
+                 <input type=\"submit\" id=\"uc-download-link\" value=\"Download anyway\"/>\
+                 <input type=\"hidden\" name=\"id\" value=\"{id}\">\
+                 <input type=\"hidden\" name=\"export\" value=\"download\">\
+                 <input type=\"hidden\" name=\"confirm\" value=\"t\">\
+                 <input type=\"hidden\" name=\"uuid\" value=\"u-1&amp;2\">\
+                 <input type=\"hidden\" name=\"at\" value=\"tok\"></form></body></html>"
+            );
+            ([("content-type", "text/html; charset=utf-8")], form).into_response()
+        };
+        let html = |body: &'static str| ([("content-type", "text/html")], body).into_response();
+        let serve = move |Query(q): Query<HashMap<String, String>>| async move {
+            let confirmed = q.get("uuid").is_some_and(|u| u == "u-1&2")
+                && q.get("at").is_some_and(|a| a == "tok")
+                && q.get("export").is_some_and(|e| e == "download");
+            match q.get("id").map(String::as_str) {
+                Some("big") if confirmed => {
+                    let mut video = MP4_HEAD.to_vec();
+                    video.resize(300_000, 7);
+                    ([("content-type", "video/mp4")], video).into_response()
+                }
+                Some(id @ ("big" | "stuck")) => page(id, DRIVE),
+                Some("evil") => page("evil", "https://evil.test/download"),
+                Some("quota") => html(
+                    "<html><title>Google Drive - Quota exceeded</title><body>Sorry, you can't \
+                     view or download this file at this time. Too many users have viewed or \
+                     downloaded this file recently.</body></html>",
+                ),
+                _ => html("<html><body>Sign in to continue to Google Drive</body></html>"),
+            }
+        };
+        let app = Router::new().route("/download", get(serve));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        base
+    }
+
+    #[tokio::test]
+    async fn a_large_drive_file_is_fetched_through_its_confirmation_page() {
+        let mut media = Media::new(Arc::new(object_store::memory::InMemory::new()), true);
+        media.probe_rewrite = Some(("https://drive.usercontent.google.com".into(), drive().await));
+        let link = |id: &str| format!("https://drive.google.com/file/d/{id}/view?usp=sharing");
+        let post = Uuid::now_v7();
+
+        let (key, ty, size) = media
+            .download(post, &link("big"), MAX_BYTES, soon(), &mut None)
+            .await
+            .unwrap();
+        assert_eq!((ty, size), ("video/mp4", 300_000));
+        assert_eq!(media.read(&key).await.unwrap().len(), 300_000);
+        // The save-time probe gets past the page the same way.
+        let probed = media.probe(&link("big")).await.unwrap();
+        assert_eq!(probed.content_type, "video/mp4");
+
+        for (id, why) in [
+            ("quota", Fail::DriveQuota),
+            ("stuck", Fail::DriveConfirm),
+            ("evil", Fail::DriveConfirm),
+            ("private", Fail::NotShared),
+        ] {
+            let got = media
+                .download(post, &link(id), MAX_BYTES, soon(), &mut None)
+                .await;
+            assert_eq!(got.unwrap_err(), why, "{id}");
+            assert_eq!(media.probe(&link(id)).await, None, "{id}");
+        }
+    }
+
+    #[test]
+    fn a_drive_file_named_like_the_quota_page_is_still_confirmed() {
+        let named = |form: &str| {
+            format!(
+                "<html><head><title>Google Drive - Virus scan warning</title></head><body>\
+                 <a href=\"/open?id=f1\">Quota exceeded.mp4</a> (1.2G) is too large for Google \
+                 Drive to scan for viruses.{form}</body></html>"
+            )
+        };
+        let form = "<form id=\"download-form\" method=\"get\" \
+                    action=\"https://drive.usercontent.google.com/download\">\
+                    <input type=\"hidden\" name=\"id\" value=\"f1\"></form>";
+        let to = drive_page(&named(form)).unwrap();
+        assert_eq!(to.query(), Some("id=f1"));
+        // Without the form it is a page that cannot be got past, not a quota.
+        assert_eq!(drive_page(&named("")).unwrap_err(), Fail::DriveConfirm);
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    use futures_util::{stream, StreamExt};
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, UploadPart,
+    };
+
+    const MP4_HEAD: &[u8] = b"\0\0\0\x18ftypmp42\0\0\0\0";
+
+    /// `len` bytes of video made as they are sent, 64 KiB at a time, counted in `sent`.
+    fn video_stream(len: usize, sent: Arc<AtomicUsize>) -> axum::body::Body {
+        let chunks = stream::unfold(0usize, move |at| {
+            let sent = sent.clone();
+            async move {
+                let n = (len - at).min(65_536);
+                let mut chunk = vec![7u8; n];
+                if at == 0 {
+                    chunk[..MP4_HEAD.len()].copy_from_slice(MP4_HEAD);
+                }
+                sent.fetch_add(n, SeqCst);
+                (n > 0).then(|| (Ok::<_, std::io::Error>(chunk), at + n))
+            }
+        });
+        axum::body::Body::from_stream(chunks)
+    }
+
+    /// Serves `/sized.mp4` (`len` bytes with a `Content-Length`), `/unsized.mp4` (the same,
+    /// length unsaid), `/stall.mp4` (a first chunk, then nothing) and `/slow.mp4` (a few bytes
+    /// every 20 ms, without end). `sent` counts the bytes the server made.
+    async fn video_server(len: usize, sent: Arc<AtomicUsize>) -> String {
+        use axum::{body::Body, routing::get, Router};
+        let (a, b) = (sent.clone(), sent);
+        let app = Router::new()
+            .route(
+                "/sized.mp4",
+                get(move || {
+                    let body = video_stream(len, a.clone());
+                    async move { ([("content-length", len.to_string())], body) }
+                }),
+            )
+            .route(
+                "/unsized.mp4",
+                get(move || {
+                    let body = video_stream(len, b.clone());
+                    async move { body }
+                }),
+            )
+            .route(
+                "/stall.mp4",
+                get(|| async {
+                    let first = stream::once(async { Ok::<_, std::io::Error>(vec![7u8; 100_000]) });
+                    let mut head = MP4_HEAD.to_vec();
+                    head.resize(1000, 7);
+                    let head = stream::once(async move { Ok(head) });
+                    Body::from_stream(head.chain(first).chain(stream::pending()))
+                }),
+            )
+            .route(
+                "/slow.mp4",
+                get(|| async {
+                    Body::from_stream(stream::unfold((), |()| async {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Some((Ok::<_, std::io::Error>(MP4_HEAD.to_vec()), ()))
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        base
+    }
+
+    /// A store that counts: the bytes whose part is written (`done`), the most bytes that were
+    /// sent by the server but not yet written when a part arrived (`peak`), the largest part,
+    /// and the uploads aborted. Parts are written slowly, so the download has to wait for them.
+    #[derive(Debug, Default)]
+    struct Counting {
+        inner: object_store::memory::InMemory,
+        sent: Arc<AtomicUsize>,
+        done: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        largest: Arc<AtomicUsize>,
+        aborted: Arc<AtomicUsize>,
+        /// Not zero: every part fails to store.
+        failing: Arc<AtomicUsize>,
+    }
+
+    impl std::fmt::Display for Counting {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Counting")
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingUpload {
+        inner: Box<dyn MultipartUpload>,
+        sent: Arc<AtomicUsize>,
+        done: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        largest: Arc<AtomicUsize>,
+        aborted: Arc<AtomicUsize>,
+        failing: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl MultipartUpload for CountingUpload {
+        fn put_part(&mut self, data: PutPayload) -> UploadPart {
+            let len = data.content_length();
+            self.largest.fetch_max(len, SeqCst);
+            let waiting = self
+                .sent
+                .load(SeqCst)
+                .saturating_sub(self.done.load(SeqCst));
+            self.peak.fetch_max(waiting, SeqCst);
+            let (part, done) = (self.inner.put_part(data), self.done.clone());
+            let failing = self.failing.load(SeqCst) != 0;
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if failing {
+                    return Err(object_store::Error::NotImplemented);
+                }
+                part.await?;
+                done.fetch_add(len, SeqCst);
+                Ok(())
+            })
+        }
+
+        async fn complete(&mut self) -> object_store::Result<PutResult> {
+            self.inner.complete().await
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.aborted.fetch_add(1, SeqCst);
+            self.inner.abort().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for Counting {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            Ok(Box::new(CountingUpload {
+                inner: self.inner.put_multipart_opts(location, opts).await?,
+                sent: self.sent.clone(),
+                done: self.done.clone(),
+                peak: self.peak.clone(),
+                largest: self.largest.clone(),
+                aborted: self.aborted.clone(),
+                failing: self.failing.clone(),
+            }))
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// The most a download may hold: its parts, plus what sits in socket and HTTP buffers.
+    const HELD: usize = PART_BYTES * (PARTS_IN_FLIGHT + 1) + 8 * 1024 * 1024;
+
+    #[tokio::test]
+    async fn a_large_video_streams_into_the_store_in_bounded_parts() {
+        // Three times what a download may hold, so holding it whole would show.
+        let len = 3 * HELD + 12_345;
+        for path in ["/sized.mp4", "/unsized.mp4"] {
+            let store = Arc::new(Counting::default());
+            let base = video_server(len, store.sent.clone()).await;
+            let media = Media::new(store.clone(), true);
+            let (key, ty, size) = media
+                .download(
+                    Uuid::now_v7(),
+                    &format!("{base}{path}"),
+                    MAX_BYTES,
+                    soon(),
+                    &mut None,
+                )
+                .await
+                .unwrap();
+            assert_eq!((ty, size), ("video/mp4", len), "{path}");
+            let meta = store.inner.head(&Path::from(key)).await.unwrap();
+            assert_eq!(meta.size, len as u64);
+            assert_eq!(store.done.load(SeqCst), len);
+            assert_eq!(store.largest.load(SeqCst), PART_BYTES, "{path}");
+            let peak = store.peak.load(SeqCst);
+            assert!(peak <= HELD, "{path}: {peak} bytes waited for the store");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_over_the_cap_is_refused_before_or_while_it_downloads() {
+        let len = 40_000_000;
+        let store = Arc::new(Counting::default());
+        let base = video_server(len, store.sent.clone()).await;
+        let media = Media::new(store.clone(), true);
+        let post = Uuid::now_v7();
+        // Its size said up front: refused on the headers, nothing stored or even started.
+        let got = media
+            .download(
+                post,
+                &format!("{base}/sized.mp4"),
+                len - 1,
+                soon(),
+                &mut None,
+            )
+            .await;
+        assert_eq!(got.unwrap_err(), Fail::TooLarge);
+        assert_eq!(store.largest.load(SeqCst), 0, "no part was written");
+        assert!(store.sent.load(SeqCst) < len, "the file was not downloaded");
+
+        // Its size unsaid: stopped the moment the bytes pass the cap, on disk as in a bucket,
+        // and the partial file is gone.
+        let dir = std::env::temp_dir().join(format!("media-cap-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let disk = object_store::local::LocalFileSystem::new_with_prefix(&dir).unwrap();
+        let on_disk = Media::new(Arc::new(disk), true);
+        let cap = 12_000_000;
+        for media in [&media, &on_disk] {
+            store.sent.store(0, SeqCst);
+            let got = media
+                .download(post, &format!("{base}/unsized.mp4"), cap, soon(), &mut None)
+                .await;
+            assert_eq!(got.unwrap_err(), Fail::TooLarge);
+            assert!(store.sent.load(SeqCst) < len, "the download stopped early");
+        }
+        assert_eq!(store.aborted.load(SeqCst), 1, "the upload was aborted");
+        let stored = store.inner.list_with_delimiter(None).await.unwrap();
+        assert!(stored.objects.is_empty() && stored.common_prefixes.is_empty());
+        let left: Vec<_> = std::fs::read_dir(dir.join("posts").join(post.to_string()))
+            .map(|d| d.flatten().map(|f| f.path()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "{left:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_download_the_store_does_not_take_aborts_its_upload() {
+        // One part, sent only as the upload is finished, and several, the first failing midway:
+        // either way the upload is aborted, so a bucket keeps no parts of it.
+        for (len, path) in [(100_000, "/sized.mp4"), (3 * PART_BYTES, "/unsized.mp4")] {
+            let store = Arc::new(Counting::default());
+            store.failing.store(1, SeqCst);
+            let base = video_server(len, store.sent.clone()).await;
+            let media = Media::new(store.clone(), true);
+            let got = media
+                .download(
+                    Uuid::now_v7(),
+                    &format!("{base}{path}"),
+                    MAX_BYTES,
+                    soon(),
+                    &mut None,
+                )
+                .await;
+            assert_eq!(got.unwrap_err(), Fail::Storage, "{len}");
+            assert!(
+                store.aborted.load(SeqCst) >= 1,
+                "{len}: the upload was aborted"
+            );
+            let stored = store.inner.list_with_delimiter(None).await.unwrap();
+            assert!(stored.objects.is_empty() && stored.common_prefixes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_video_may_be_larger_than_an_image_or_a_pdf() {
+        use axum::{routing::get, Router};
+        // A PNG one byte over the cap of files that are not videos, sized and unsized.
+        let big = || {
+            let mut sent = 0;
+            axum::body::Body::from_stream(stream::poll_fn(move |_| {
+                let chunk = if sent == 0 {
+                    png(65_536)
+                } else {
+                    vec![7; (1 << 20).min(MAX_STILL_BYTES + 1 - sent)]
+                };
+                sent += chunk.len();
+                std::task::Poll::Ready(
+                    (!chunk.is_empty()).then_some(Ok::<_, std::io::Error>(chunk)),
+                )
+            }))
+        };
+        let len = (MAX_STILL_BYTES + 1).to_string();
+        let app = Router::new()
+            .route(
+                "/sized.png",
+                get(move || async move { ([("content-length", len)], big()) }),
+            )
+            .route("/unsized.png", get(move || async move { big() }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let store = Arc::new(Counting::default());
+        let mut media = Media::new(store.clone(), true);
+        for path in ["/sized.png", "/unsized.png"] {
+            let got = media
+                .download(
+                    Uuid::now_v7(),
+                    &format!("{base}{path}"),
+                    MAX_BYTES,
+                    soon(),
+                    &mut None,
+                )
+                .await;
+            assert_eq!(got.unwrap_err(), Fail::TooLargeStill, "{path}");
+        }
+        let stored = store.inner.list_with_delimiter(None).await.unwrap();
+        assert!(stored.objects.is_empty() && stored.common_prefixes.is_empty());
+
+        // `MEDIA_MAX_BYTES` lowers the cap of a video (`max_bytes`), sized or not, and never
+        // an image's: the 100 KB PNG is over it and still stored.
+        media.max_bytes = 50_000;
+        let base = video_server(50_001, store.sent.clone()).await;
+        for path in ["/sized.mp4", "/unsized.mp4"] {
+            let got = media
+                .download(
+                    Uuid::now_v7(),
+                    &format!("{base}{path}"),
+                    MAX_BYTES,
+                    soon(),
+                    &mut None,
+                )
+                .await;
+            assert_eq!(got.unwrap_err(), Fail::TooLarge, "{path}");
+        }
+        // A video over the cap of a still too is refused as a video, not as an image.
+        let base = video_server(MAX_STILL_BYTES + 1, store.sent.clone()).await;
+        let url = format!("{base}/sized.mp4");
+        let got = media
+            .download(Uuid::now_v7(), &url, MAX_BYTES, soon(), &mut None)
+            .await;
+        assert_eq!(got.unwrap_err(), Fail::TooLarge);
+        let got = media
+            .download(
+                Uuid::now_v7(),
+                &format!("{}/ok.png", server().await),
+                MAX_BYTES,
+                soon(),
+                &mut None,
+            )
+            .await;
+        assert_eq!(got.unwrap().2, 100_000);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_or_too_slow_download_fails_fast_and_stores_nothing() {
+        let store = Arc::new(Counting::default());
+        let base = video_server(0, store.sent.clone()).await;
+        let mut media = Media::new(store.clone(), true);
+        media.stall = Duration::from_millis(300);
+        let started = Instant::now();
+        let got = media
+            .download(
+                Uuid::now_v7(),
+                &format!("{base}/stall.mp4"),
+                MAX_BYTES,
+                soon(),
+                &mut None,
+            )
+            .await;
+        assert_eq!(got.unwrap_err(), Fail::Stalled);
+        assert!(started.elapsed() < Duration::from_secs(3), "failed fast");
+
+        // Bytes keep coming, but slower than `MIN_SPEED`, and their size is unsaid: only bytes
+        // that came earn more time, so the base deadline ends it however large the cap is.
+        media.deadline = Duration::from_millis(300);
+        let started = Instant::now();
+        let got = media
+            .download(
+                Uuid::now_v7(),
+                &format!("{base}/slow.mp4"),
+                MAX_BYTES,
+                soon(),
+                &mut None,
+            )
+            .await;
+        assert_eq!(got.unwrap_err(), Fail::TimedOut);
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(300) && took < Duration::from_secs(3),
+            "{took:?}"
+        );
+        // The post's ceiling ends a download whatever its size.
+        media.ceiling = Duration::from_millis(200);
+        let until = Instant::now() + media.ceiling;
+        let started = Instant::now();
+        let got = media
+            .download(
+                Uuid::now_v7(),
+                &format!("{base}/slow.mp4"),
+                MAX_BYTES,
+                until,
+                &mut None,
+            )
+            .await;
+        assert_eq!(got.unwrap_err(), Fail::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        assert_eq!(store.aborted.load(SeqCst), 3, "each upload was aborted");
+        let stored = store.inner.list_with_delimiter(None).await.unwrap();
+        assert!(stored.objects.is_empty() && stored.common_prefixes.is_empty());
     }
 
     #[tokio::test]
@@ -1242,7 +2245,7 @@ mod tests {
         ] {
             assert_eq!(
                 media
-                    .download(post, &url, MAX_BYTES, soon())
+                    .download(post, &url, MAX_BYTES, soon(), &mut None)
                     .await
                     .unwrap_err(),
                 Fail::Blocked,

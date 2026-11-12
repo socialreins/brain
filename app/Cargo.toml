@@ -17,7 +17,8 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "s
 migration = { path = "migration" }
 # Local disk, S3 and R2 behind one trait; its S3 client takes a custom endpoint, path-style.
 object_store = { version = "0.12", features = ["aws"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# `stream`: a stored video goes out as a streamed request body, never held whole.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 rmcp = { version = "3.7", default-features = false, features = ["server", "transport-streamable-http-server"] }
 sea-orm = { version = "2.0", default-features = false, features = ["macros", "with-uuid", "with-chrono", "with-json", "runtime-tokio-rustls", "sqlx-postgres"] }
 schemars = { version = "1", features = ["chrono04", "uuid1"] }
@@ -40,6 +41,7 @@ path = "src/bin/main.rs"
 
 [dev-dependencies]
 axum-test = "17"
+futures-util = "0.3"
 serial_test = "3.1.1"
 webauthn-authenticator-rs = { version = "0.5.5", features = ["softpasskey"] }
 

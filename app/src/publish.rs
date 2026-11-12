@@ -6,7 +6,7 @@
 //! statement (`webhooks::with_event`). Media is downloaded into brain's storage before any
 //! target is claimed (`media.rs`) and deleted once the post settles.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, LazyLock},
     time::Duration,
 };
@@ -51,10 +51,11 @@ pub struct Remote {
     pub url: Option<String>,
 }
 
-/// One stored image or video: its bytes (empty for a publisher that fetches by URL), type, and
-/// the unguessable brain URL that serves it while the post publishes (`media::link`).
+/// One stored image or video: its bytes, type, and the unguessable brain URL that serves it
+/// while the post publishes (`media::link`). An image, cover or PDF is held in memory; a video,
+/// and anything for a publisher that fetches by URL, stays in the store (`media::Blob`).
 pub struct Attachment {
-    pub bytes: bytes::Bytes,
+    pub bytes: crate::media::Blob,
     pub content_type: String,
     pub url: String,
 }
@@ -199,9 +200,9 @@ impl Publisher for Bluesky {
         media: &[Attachment],
         reply: Option<(&Remote, &Remote)>,
     ) -> Result<Remote, PublishError> {
-        let media: Vec<(&[u8], &str)> = media
+        let media: Vec<(&crate::media::Blob, &str)> = media
             .iter()
-            .map(|a| (&a.bytes[..], a.content_type.as_str()))
+            .map(|a| (&a.bytes, a.content_type.as_str()))
             .collect();
         let reply = reply.map(|(p, r)| {
             (
@@ -500,15 +501,11 @@ impl Publisher for YouTube {
                 "The file is not an MP4 or MOV video.".into(),
             ));
         }
-        let file = youtube::File {
-            bytes: video.bytes.clone(),
-            content_type: &video.content_type,
-        };
         let id = self
             .upload(
                 secret,
                 socialreins_core::post::youtube_text(body),
-                &file,
+                (&video.bytes, &video.content_type),
                 options.privacy(),
             )
             .await?;
@@ -558,7 +555,7 @@ impl Publisher for YouTube {
         cover: &Attachment,
     ) -> Result<(), PublishError> {
         let file = youtube::File {
-            bytes: cover.bytes.clone(),
+            bytes: cover.bytes.held()?,
             content_type: &cover.content_type,
         };
         self.set_thumbnail(secret, remote_id, &file).await
@@ -737,7 +734,8 @@ impl Publisher for Facebook {
         remote_id: &str,
         cover: &Attachment,
     ) -> Result<(), PublishError> {
-        let file = (&cover.bytes[..], cover.content_type.as_str());
+        let held = cover.bytes.held()?;
+        let file = (&held[..], cover.content_type.as_str());
         self.0.set_thumbnail(secret, remote_id, file).await
     }
 
@@ -871,8 +869,42 @@ pub fn publisher<'a>(app: &'a AppState, platform: &str) -> Option<&'a dyn Publis
 /// Due posts claimed per tick; the rest wait for the next one.
 const CLAIM_BATCH: i64 = 50;
 /// Posts publishing at once, and targets publishing at once, across the process.
-static POST_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(8));
+const POSTS_AT_ONCE: usize = 8;
+static POST_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(POSTS_AT_ONCE));
 static TARGET_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(8));
+/// How long a stopping process (`stop`) waits for the posts it is publishing before it exits
+/// (`drain`). Keep it under the grace the platform gives between SIGTERM and the kill (on
+/// Railway `RAILWAY_DEPLOYMENT_DRAINING_SECONDS`, which has to be set above this to matter).
+pub const DRAIN: Duration = Duration::from_secs(25);
+static STOPPED: std::sync::OnceLock<tokio::time::Instant> = std::sync::OnceLock::new();
+
+/// The process is about to exit (SIGTERM): no round claims a post any more (`begin`), and a post
+/// still waiting for a slot is not started but handed back (`release`). Posts already
+/// publishing go on.
+pub fn stop() {
+    let _ = STOPPED.set(tokio::time::Instant::now());
+    POST_SLOTS.close();
+}
+
+/// After `stop`: waits until no post is publishing or handing itself back, at most `DRAIN`
+/// from the stop. A post still publishing then is cut off as by a crash (`recover_stuck`).
+pub async fn drain() {
+    let until = STOPPED
+        .get()
+        .copied()
+        .unwrap_or_else(tokio::time::Instant::now)
+        + DRAIN;
+    let idle = async {
+        while POST_SLOTS.available_permits() < POSTS_AT_ONCE
+            || in_flight(|flying| !flying.is_empty())
+        {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    };
+    if tokio::time::timeout_at(until, idle).await.is_err() {
+        tracing::warn!("stopped with posts still publishing");
+    }
+}
 /// Posts a team publishes a day, scheduled or published now (`rate_limit::daily_reserve`).
 pub const PUBLISHES_PER_DAY: i64 = 100;
 const OVER_QUOTA: &str = "This team reached its limit of 100 published posts a day. It stays \
@@ -886,8 +918,17 @@ pub fn quota_bucket(team_id: Uuid) -> String {
 /// Longest one post (or thread part) may take to publish or delete, unless its publisher says
 /// otherwise (`Publisher::timeout`).
 const TARGET_TIMEOUT: Duration = Duration::from_secs(120);
-/// A target `publishing` this long was cut off (crash, restart) and may have posted.
-const STUCK_MINUTES: i64 = 15;
+/// Longest one target's publish may take, however large its video (`patience`).
+pub const PUBLISH_LIMIT: Duration = Duration::from_secs(14 * 60);
+/// What may pass around a post's downloads and its publish without it being cut off: its
+/// credentials, cover and image conversions.
+const STUCK_MARGIN: Duration = Duration::from_secs(5 * 60);
+/// A target `publishing`, or a post `queued`, this long was cut off (crash, restart) and may
+/// have posted: longer than a healthy post can take, its downloads (`media::INGEST_CEILING`)
+/// then its publish (`PUBLISH_LIMIT`), plus `STUCK_MARGIN`. 31 minutes.
+pub const STUCK_MINUTES: i64 =
+    ((crate::media::INGEST_CEILING.as_secs() + PUBLISH_LIMIT.as_secs() + STUCK_MARGIN.as_secs())
+        / 60) as i64;
 const PUBLISH_LOCK: i64 = 0x0050_5542_4c49_5348;
 
 pub const RECONNECT: &str =
@@ -975,9 +1016,48 @@ async fn ids(db: &impl ConnectionTrait, stmt: Statement, col: &str) -> Result<Ve
     rows.iter().map(|r| r.try_get("", col)).collect()
 }
 
+/// Posts a round of this process started that have not finished. Claims stop at `CLAIM_BATCH`
+/// of them; posts picked up as left behind come on top, up to `CLAIM_BATCH` a round.
+static IN_FLIGHT: std::sync::Mutex<Option<HashSet<Uuid>>> = std::sync::Mutex::new(None);
+
+fn in_flight<T>(with: impl FnOnce(&mut HashSet<Uuid>) -> T) -> T {
+    let mut flying = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    with(flying.get_or_insert_with(HashSet::new))
+}
+
+/// A post in `IN_FLIGHT` until this is dropped, however its task ends.
+struct Flight(Uuid);
+
+/// Marks `id` as in flight until the result is dropped: for tests of a round that meets a post
+/// whose task has not ended.
+#[doc(hidden)]
+pub fn hold(id: Uuid) -> impl Drop {
+    in_flight(|flying| flying.insert(id));
+    Flight(id)
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        in_flight(|flying| flying.remove(&self.0));
+    }
+}
+
 /// One publishing round: fail cut-off targets, claim due posts, pick up posts left `queued`,
-/// publish them all and wait. Skips while another instance holds the lock.
-pub async fn tick(app: &AppState) -> Result<(), DbErr> {
+/// and start each as its own task, which are returned and not waited for: the lock is let go
+/// once the posts are claimed, so a slow post (a large video takes up to `STUCK_MINUTES`) never
+/// keeps the next round from claiming the posts that came due after it. Skips while another
+/// instance holds the lock.
+///
+/// A post still goes out once. Claiming is one `UPDATE` from `scheduled` to `queued` under the
+/// lock, so one round takes a post; a round claims no more than `CLAIM_BATCH` less what this
+/// process still has in flight, and never picks up as left behind a post it is itself running;
+/// `POST_SLOTS` and `TARGET_SLOTS` bound what runs at once as before. Should another instance
+/// take a post for left behind and run it too, each target is still claimed by one of them
+/// (`claim_target`) and published by that one alone. A process that stops (`stop`) claims no
+/// more, hands back the posts it has not started and waits `DRAIN` for the rest; what it still
+/// abandons, or all of it when it is killed: the targets fail as cut off (`recover_stuck`) and
+/// the rest is picked up as left behind.
+pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, DbErr> {
     let lock = app.db.begin().await?;
     let row = lock
         .query_one_raw(sql(
@@ -989,15 +1069,14 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
         Some(r) => r.try_get("", "ok")?,
         None => false,
     };
-    if !locked {
-        return Ok(());
+    if !locked || POST_SLOTS.is_closed() {
+        return Ok(Vec::new());
     }
     // One failing step is logged and the tick goes on; per-post work never aborts it.
     if let Err(e) = recover_stuck(&app.db).await {
         tracing::warn!(error = %e, "stuck target recovery failed");
     }
-    // The quota is reserved per post in `publish_post`, together with marking it reserved.
-    let mut due: Vec<Uuid> = claim_due(&app.db).await?.into_iter().map(|c| c.0).collect();
+    let room = (CLAIM_BATCH - in_flight(|flying| flying.len()) as i64).max(0);
     // Posts left `queued` by a crash between claim and settle: fan-out and claims are
     // idempotent, so running them again only finishes the job.
     let stmt = sql(
@@ -1005,27 +1084,55 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
          AND updated_at < now() - make_interval(mins => $1) LIMIT $2",
         vec![(STUCK_MINUTES as i32).into(), CLAIM_BATCH.into()],
     );
-    due.extend(ids(&app.db, stmt, "id").await?);
-    let runs: Vec<_> = due
+    let left = ids(&app.db, stmt, "id").await?;
+    // The quota is reserved per post in `publish_post`, together with marking it reserved.
+    let mut flights = Vec::new();
+    for (id, _) in claim(&app.db, room).await? {
+        if in_flight(|flying| flying.insert(id)) {
+            flights.push(Flight(id));
+        // Put back by a task that has not ended yet and claimed again here: nothing would run
+        // it, so it goes back to `scheduled` for the next round, never left `queued`.
+        } else if let Err(e) = unclaim(&app.db, id, None).await {
+            tracing::warn!(error = %e, post = %id, "returning a claimed post failed");
+        }
+    }
+    // Never picked up as left behind while this process still runs it.
+    let left = left
         .into_iter()
-        .map(|id| {
-            let app = app.clone();
+        .filter(|id| in_flight(|flying| flying.insert(*id)));
+    flights.extend(left.map(Flight));
+    let runs = flights
+        .into_iter()
+        .map(|flight| {
+            let (app, id) = (app.clone(), flight.0);
             tokio::spawn(async move {
+                let _flight = flight;
                 if let Err(e) = publish_post(&app, id).await {
                     tracing::error!(error = %e, post = %id, "publish failed");
                 }
             })
         })
         .collect();
-    for run in runs {
+    lock.commit().await?;
+    Ok(runs)
+}
+
+/// `begin`, then waits for the posts it started: what tests and one-off runs want.
+pub async fn tick(app: &AppState) -> Result<(), DbErr> {
+    for run in begin(app).await? {
         let _ = run.await;
     }
-    lock.commit().await
+    Ok(())
 }
 
 /// Claims up to 50 due `scheduled` posts, oldest first, `scheduled` to `queued`: only posts of
 /// a live set, of a team under its daily publish cap. Returns `(post, team)`.
 pub async fn claim_due(db: &DatabaseConnection) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
+    claim(db, CLAIM_BATCH).await
+}
+
+/// `claim_due` of at most `limit` posts.
+async fn claim(db: &DatabaseConnection, limit: i64) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
     // A CTE runs once; a LIMIT inside `IN (...)` may be re-run and claim more.
     let stmt = sql(
         "WITH due AS ( \
@@ -1041,7 +1148,7 @@ pub async fn claim_due(db: &DatabaseConnection) -> Result<Vec<(Uuid, Uuid)>, DbE
          UPDATE posts p SET status = 'queued', updated_at = now() FROM due \
          WHERE p.id = due.id AND p.status = 'scheduled' \
          RETURNING p.id, p.team_id",
-        vec![PUBLISHES_PER_DAY.into(), CLAIM_BATCH.into()],
+        vec![PUBLISHES_PER_DAY.into(), limit.into()],
     );
     let rows = db.query_all_raw(stmt).await?;
     rows.iter()
@@ -1088,6 +1195,20 @@ async fn unclaim(db: &DatabaseConnection, id: Uuid, error: Option<&str>) -> Resu
          quota_reserved = false, updated_at = now() \
          WHERE id = $1 AND status = 'queued'",
         vec![id.into(), error.map(str::to_owned).into()],
+    );
+    db.execute_raw(stmt).await.map(|_| ())
+}
+
+/// Hands a post the stopping process claimed and never started back to `scheduled`, so the next
+/// process claims it at once and not as left behind `STUCK_MINUTES` later. Only a post a round
+/// claimed and nothing touched: one with its quota reserved (publish now, or underway) or any
+/// target (a retry, or underway) stays `queued`.
+async fn release(db: &DatabaseConnection, id: Uuid) -> Result<(), DbErr> {
+    let stmt = sql(
+        "UPDATE posts SET status = 'scheduled', updated_at = now() \
+         WHERE id = $1 AND status = 'queued' AND NOT quota_reserved AND NOT fanned_out \
+         AND NOT EXISTS (SELECT 1 FROM post_targets t WHERE t.post_id = posts.id)",
+        vec![id.into()],
     );
     db.execute_raw(stmt).await.map(|_| ())
 }
@@ -1200,10 +1321,10 @@ async fn fail_post(db: &DatabaseConnection, id: Uuid, msg: &str) -> Result<(), D
 /// Publishes a `queued` post: one target per account of its platform in its set, each
 /// published at most once, then the post settles.
 pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
-    let Ok(_slot) = POST_SLOTS.acquire().await else {
-        return Ok(());
-    };
     let db = &app.db;
+    let Ok(_slot) = POST_SLOTS.acquire().await else {
+        return release(db, id).await;
+    };
     let Some(post) = posts::Entity::find_by_id(id).one(db).await? else {
         return Ok(());
     };
@@ -1315,6 +1436,7 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
 type Media = HashMap<String, Result<Stored, Fail>>;
 
 async fn ingest(app: &AppState, post: &posts::Model) -> Media {
+    // No cap of the post's own: `Media` holds a video to `max_bytes`, anything else to 100 MB.
     let cap = crate::media::MAX_BYTES;
     let thread: Vec<ThreadPart> = serde_json::from_value(post.thread.clone()).unwrap_or_default();
     let root: Vec<String> = serde_json::from_value(post.media.clone()).unwrap_or_default();
@@ -1325,8 +1447,10 @@ async fn ingest(app: &AppState, post: &posts::Model) -> Media {
     let cover: Vec<String> = post.cover.clone().into_iter().collect();
     let cover_cap = cover_bytes(&post.platform);
     let (mut found, covers) = tokio::join!(
-        app.media.ingest_all(&app.db, post.id, &urls, cap),
-        app.media.ingest_all(&app.db, post.id, &cover, cover_cap),
+        app.media
+            .ingest_all(&app.db, (post.id, post.group_id), &urls, cap),
+        app.media
+            .ingest_all(&app.db, (post.id, None), &cover, cover_cap),
     );
     // A cover that is also a media link keeps the media's result, and then fails its type check.
     for (url, got) in covers {
@@ -1380,7 +1504,7 @@ fn cover_error(fail: Fail, platform: &str, name: &str) -> String {
             "The cover image is over {} MB, the largest {name} takes.",
             cover_bytes(platform) / 1_000_000
         ),
-        f => media_error(f, 1, platform).replacen("Image 1", "The cover image", 1),
+        f => media_error(f, 1, platform, 0).replacen("Image 1", "The cover image", 1),
     }
 }
 
@@ -1423,18 +1547,32 @@ async fn load_cover(
 }
 
 /// What to tell the user about image `n` that could not be stored.
-fn media_error(fail: Fail, n: usize, platform: &str) -> String {
+fn media_error(fail: Fail, n: usize, platform: &str, cap: usize) -> String {
     match fail {
         Fail::Blocked => format!("Image {n} is not a public https URL."),
         Fail::NotShared => format!(
             "Image {n} is a Google Drive file that is not shared publicly. Share it with \
              anyone with the link."
         ),
+        Fail::DriveQuota => format!(
+            "Image {n} is a Google Drive file that too many people viewed or downloaded \
+             recently, so Google Drive will not hand it out for now. Try again later, or use \
+             a copy of the file."
+        ),
+        Fail::DriveConfirm => format!(
+            "Image {n} is a Google Drive file too large for Drive to scan for viruses, and \
+             SocialReins could not get past Drive's confirmation page. Try again, or use \
+             another link."
+        ),
         Fail::Http(code) => format!("Image {n} could not be downloaded (HTTP {code})."),
         Fail::Unreachable => format!("Image {n} could not be downloaded."),
         Fail::TooLarge => format!(
-            "Image {n} is over {} MB, the largest file SocialReins takes.",
-            crate::media::MAX_BYTES / 1_000_000
+            "Image {n} is over {} MB, the largest video SocialReins takes.",
+            cap / 1_000_000
+        ),
+        Fail::TooLargeStill => format!(
+            "Image {n} is over {} MB, the largest image or document SocialReins takes.",
+            crate::media::MAX_STILL_BYTES / 1_000_000
         ),
         Fail::Unsupported if platform == "linkedin" => {
             format!("Image {n} is not a JPEG, PNG or GIF image, an MP4 video or a PDF.")
@@ -1442,8 +1580,12 @@ fn media_error(fail: Fail, n: usize, platform: &str) -> String {
         Fail::Unsupported => format!("Image {n} is not a JPEG, PNG, WebP or GIF."),
         Fail::Storage => format!("Image {n} could not be stored. Try again."),
         Fail::TimedOut => format!(
-            "Image {n} did not download in time: the post's media took over a minute. Use \
-             faster or smaller links."
+            "Image {n} did not download in time: it came slower than 2 MB a second, or the \
+             post's media took over 12 minutes together. Use a faster link."
+        ),
+        Fail::Stalled => format!(
+            "Image {n} stopped downloading: its server sent nothing for 30 seconds. Try again, \
+             or use another link."
         ),
     }
 }
@@ -1453,7 +1595,7 @@ fn media_problem(
     media: &Media,
     root: &[String],
     thread: &[ThreadPart],
-    platform: &str,
+    (platform, cap): (&str, usize),
 ) -> Option<String> {
     let first = |urls: &[String]| {
         let video = |u: &String| matches!(media.get(u), Some(Ok(s)) if s.content_type.starts_with("video/"));
@@ -1463,11 +1605,22 @@ fn media_problem(
         urls.iter()
             .enumerate()
             .find_map(|(i, u)| match media.get(u) {
-                Some(Err(f)) => Some(media_error(*f, i + 1, platform)),
+                Some(Err(f)) => Some(media_error(*f, i + 1, platform, cap)),
+                // A video over the platform's own limit, where that is under brain's.
+                Some(Ok(s)) if s.content_type.starts_with("video/") => {
+                    let (name, max) = socialreins_core::post::video_limit(platform)?;
+                    (s.size > max as i64).then(|| {
+                        format!(
+                            "Video {} is over {} MB, {name}'s limit for a video.",
+                            i + 1,
+                            max / 1_000_000
+                        )
+                    })
+                }
                 // Only known once stored, and `ingest` shrinks what it can: this is an image
                 // that could not be (a GIF or other animation, one that does not decode, one
                 // over 25 megapixels), or a file that is no image (a PDF).
-                Some(Ok(s)) if !s.content_type.starts_with("video/") => {
+                Some(Ok(s)) => {
                     let (name, max, _) = socialreins_core::post::image_limit(platform)?;
                     let gif = s.content_type == "image/gif";
                     // X takes a larger GIF, and its connector checks that.
@@ -1497,7 +1650,8 @@ fn media_problem(
     })
 }
 
-/// Each URL's stored file: its type and brain link, and its bytes unless `by_url`.
+/// Each URL's stored file: its type and brain link, and its bytes, read into memory unless it
+/// is a video or the platform fetches it `by_url`.
 async fn load(
     app: &AppState,
     media: &Media,
@@ -1508,21 +1662,21 @@ async fn load(
     for (i, url) in urls.iter().enumerate() {
         let n = i + 1;
         let Some(Ok(s)) = media.get(url) else {
-            return Err(media_error(Fail::Storage, n, platform));
+            return Err(media_error(Fail::Storage, n, platform, 0));
         };
-        let bytes = if by_url {
-            Vec::new()
+        let bytes = if by_url || s.content_type.starts_with("video/") {
+            app.media.blob(s)
         } else {
             match app.media.read(&s.key).await {
-                Ok(bytes) => bytes,
+                Ok(bytes) => crate::media::Blob::Held(bytes.into()),
                 Err(e) => {
                     tracing::warn!(error = %e, "stored media read failed");
-                    return Err(media_error(Fail::Storage, n, platform));
+                    return Err(media_error(Fail::Storage, n, platform, 0));
                 }
             }
         };
         files.push(Attachment {
-            bytes: bytes.into(),
+            bytes,
             content_type: s.content_type.clone(),
             url: crate::media::link(app, s),
         });
@@ -1653,13 +1807,36 @@ async fn send(
             }
         }
     };
-    match tokio::time::timeout(publisher.timeout(), sent).await {
+    let (limit, extra) = patience(publisher.timeout(), &media);
+    let sent = crate::connectors::PATIENCE.scope(extra, sent);
+    // YouTube's token lasts an hour and a large upload many minutes: `upload` may renew it.
+    let refresh = (account.provider == "youtube")
+        .then(|| crate::controllers::youtube::unseal(app, account))
+        .flatten();
+    let sent = youtube::REFRESH.scope(refresh, sent);
+    match tokio::time::timeout(limit, sent).await {
         Ok(Ok(remote)) => Ok(remote),
         Ok(Err(PublishError::Reconnect)) => Err(refused(app, publisher, account).await),
         Ok(Err(PublishError::Denied)) => Err(denied(publisher)),
         Ok(Err(PublishError::Failed(msg))) => Err(msg),
         Err(_) => Err(TIMED_OUT.to_owned()),
     }
+}
+
+/// How long a publish of `media` may take, and the processing checks its platform's poll adds
+/// (`connectors::extra_polls`). Nothing changes for a post without a large video: `base` and
+/// none. Videos add the time their bytes take at `media::MIN_SPEED` (brain's upload, or the
+/// platform's download from brain) and one check, about 50 seconds, per 100 MB, at most 10. The
+/// limit is `PUBLISH_LIMIT` at most, which `STUCK_MINUTES` is derived from, so a slow publish
+/// is never taken for one cut off.
+fn patience(base: Duration, media: &[Attachment]) -> (Duration, u32) {
+    let videos = media
+        .iter()
+        .filter(|a| a.content_type.starts_with("video/"));
+    let bytes: u64 = videos.map(|a| a.bytes.len()).sum();
+    let extra = (bytes / 100_000_000).min(10) as u32;
+    let limit = base + Duration::from_secs(bytes / crate::media::MIN_SPEED + 50 * u64::from(extra));
+    (limit.min(PUBLISH_LIMIT), extra)
 }
 
 async fn publish_target(
@@ -1699,7 +1876,8 @@ async fn publish_target(
     };
     let media: Vec<String> = serde_json::from_value(post.media.clone()).unwrap_or_default();
     let thread: Vec<ThreadPart> = serde_json::from_value(post.thread.clone()).unwrap_or_default();
-    if let Some(msg) = media_problem(stored, &media, &thread, &post.platform) {
+    let limits = (post.platform.as_str(), app.media.max_bytes);
+    if let Some(msg) = media_problem(stored, &media, &thread, limits) {
         return fail_target(db, id, &msg).await;
     }
     let cover = match load_cover(app, publisher, post, (stored, &media)).await {
@@ -2184,6 +2362,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_large_video_gets_more_time_and_a_small_file_none() {
+        let file = |content_type: &str, size: u64| Attachment {
+            bytes: crate::media::Blob::Stored {
+                store: Arc::new(object_store::memory::InMemory::new()),
+                key: "posts/p/f".into(),
+                size,
+            },
+            content_type: content_type.into(),
+            url: String::new(),
+        };
+        let base = Duration::from_secs(420);
+        let limit = |files: &[Attachment]| patience(base, files);
+        assert_eq!(limit(&[]), (base, 0));
+        assert_eq!(limit(&[file("image/jpeg", 90_000_000)]), (base, 0));
+        // 20 MB: ten seconds for the bytes, no more checks.
+        let small = limit(&[file("video/mp4", 20_000_000)]);
+        assert_eq!(small, (base + Duration::from_secs(10), 0));
+        // 300 MB: 150 s for the bytes and three checks of 50 s.
+        let large = limit(&[file("video/mp4", 300_000_000)]);
+        assert_eq!(large, (base + Duration::from_secs(300), 3));
+        // 1 GiB: bounded under the time a target counts as cut off.
+        let huge = limit(&[file("video/quicktime", 1 << 30)]);
+        assert_eq!(huge, (Duration::from_secs(14 * 60), 10));
+    }
+
+    #[test]
     fn every_failure_that_may_have_posted_is_left_to_the_caller() {
         let maybe = [
             TIMED_OUT.to_owned(),
@@ -2193,6 +2397,7 @@ mod tests {
             unsaved_part(2, 3),
             tiktok::NOT_DONE.to_owned(),
             youtube::NO_VIDEO_ID.to_owned(),
+            youtube::UNCONFIRMED.to_owned(),
         ];
         for m in &maybe {
             assert!(outcome_unknown(Some(m)), "{m}");
@@ -2218,7 +2423,7 @@ mod tests {
                 size: 6_000_000,
             };
             let media = Media::from([(url.clone(), Ok(file))]);
-            media_problem(&media, std::slice::from_ref(&url), &[], platform)
+            media_problem(&media, std::slice::from_ref(&url), &[], (platform, 0))
         };
         assert_eq!(
             problem("image/webp", "bluesky").as_deref(),
@@ -2235,6 +2440,25 @@ mod tests {
         // X's connector checks its larger GIF limit, a video has its own, Threads has none.
         assert_eq!(problem("image/gif", "x"), None);
         assert_eq!(problem("video/mp4", "bluesky"), None);
+        let video = |size: i64, platform: &str| {
+            let file = Stored {
+                key: "k".into(),
+                content_type: "video/mp4".into(),
+                size,
+            };
+            let media = Media::from([(url.clone(), Ok(file))]);
+            media_problem(&media, std::slice::from_ref(&url), &[], (platform, 0))
+        };
+        assert_eq!(
+            video(100_000_001, "bluesky").as_deref(),
+            Some("Video 1 is over 100 MB, Bluesky's limit for a video.")
+        );
+        assert_eq!(
+            video(512_000_001, "x").as_deref(),
+            Some("Video 1 is over 512 MB, X's limit for a video.")
+        );
+        assert_eq!(video(512_000_000, "x"), None);
+        assert_eq!(video(1 << 30, "youtube"), None);
         assert_eq!(problem("application/pdf", "threads"), None);
     }
 }

@@ -197,7 +197,12 @@ impl Config {
             contact_to,
             admin_emails: admin_emails(var("ADMIN_EMAILS"))?,
             review_login_token: var("REVIEW_LOGIN_TOKEN"),
-            media: Media::new(media_store(var)?, false),
+            media: {
+                let mut media = Media::new(media_store(var)?, false);
+                media.max_bytes = media_max_bytes(var("MEDIA_MAX_BYTES"))?;
+                media.dir = var("S3_BUCKET").is_none().then(|| media_dir(var).into());
+                media
+            },
             threads: Threads::new(var("THREADS_APP_ID").zip(var("THREADS_APP_SECRET")))?,
             linkedin: LinkedIn::new(var("LINKEDIN_CLIENT_ID").zip(var("LINKEDIN_CLIENT_SECRET")))?,
             youtube: YouTube::new(var("GOOGLE_CLIENT_ID").zip(var("GOOGLE_CLIENT_SECRET")))?,
@@ -268,6 +273,24 @@ fn admin_emails(raw: Option<String>) -> Result<Vec<String>, String> {
         .collect()
 }
 
+/// `MEDIA_MAX_BYTES`: the largest video stored, in bytes. Default and most: 1 GiB
+/// (`media::MAX_BYTES`), which saving a post checks against whatever this says.
+fn media_max_bytes(value: Option<String>) -> Result<usize, String> {
+    let max = crate::media::MAX_BYTES;
+    match value.map(|v| v.trim().parse::<usize>()) {
+        None => Ok(max),
+        Some(Ok(n)) if (1..=max).contains(&n) => Ok(n),
+        Some(_) => Err(format!(
+            "MEDIA_MAX_BYTES: a number of bytes from 1 to {max}"
+        )),
+    }
+}
+
+/// `MEDIA_DIR`: where media is kept when no bucket is set.
+fn media_dir(var: impl Fn(&str) -> Option<String>) -> String {
+    var("MEDIA_DIR").unwrap_or_else(|| "./media".into())
+}
+
 /// The media store `Config::media` describes.
 fn media_store(var: impl Fn(&str) -> Option<String>) -> Result<Arc<dyn ObjectStore>, String> {
     let s3 = [
@@ -285,12 +308,22 @@ fn media_store(var: impl Fn(&str) -> Option<String>) -> Result<Arc<dyn ObjectSto
                 .with_region(var("S3_REGION").unwrap_or_else(|| "auto".into()))
                 .with_access_key_id(key_id)
                 .with_secret_access_key(secret)
+                // object_store's defaults (30 s a request, retries within 180 s) end a read
+                // of a large video early: a request, and its retries, may take what the
+                // largest file takes at the slowest speed a download may have.
+                .with_client_options(
+                    object_store::ClientOptions::new().with_timeout(crate::media::STORE_TIMEOUT),
+                )
+                .with_retry(object_store::RetryConfig {
+                    retry_timeout: crate::media::STORE_TIMEOUT,
+                    ..Default::default()
+                })
                 .build()
                 .map_err(|e| format!("S3_BUCKET: {e}"))?;
             Ok(Arc::new(s3))
         }
         [None, None, None, None] => {
-            let dir = var("MEDIA_DIR").unwrap_or_else(|| "./media".into());
+            let dir = media_dir(&var);
             std::fs::create_dir_all(&dir).map_err(|e| format!("MEDIA_DIR: {e}"))?;
             let local =
                 LocalFileSystem::new_with_prefix(&dir).map_err(|e| format!("MEDIA_DIR: {e}"))?;
@@ -473,6 +506,17 @@ mod tests {
             assert!(with(&partial, &dir).is_err(), "without {}", full[n].0);
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_largest_video_is_a_gib_unless_lowered() {
+        let max = |v: &str| super::media_max_bytes(Some(v.into()));
+        assert_eq!(super::media_max_bytes(None), Ok(1 << 30));
+        assert_eq!(max("300000000"), Ok(300_000_000));
+        assert_eq!(max(" 1073741824 "), Ok(1 << 30));
+        for bad in ["0", "1073741825", "1GB", "-5"] {
+            assert!(max(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

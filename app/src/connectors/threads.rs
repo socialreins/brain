@@ -352,10 +352,12 @@ impl Threads {
         id_of(&made).ok_or_else(|| failed("Create: Threads sent no id."))
     }
 
-    /// Polls containers until all are `FINISHED`, within one shared bound.
+    /// Polls containers until all are `FINISHED`, within one shared bound, longer for a large
+    /// video (`extra_polls`).
     async fn finished(&self, token: &str, containers: &[String]) -> Result<(), PostError> {
         let mut left: Vec<&String> = containers.iter().collect();
-        for i in 1..=POLLS {
+        let polls = POLLS + super::extra_polls();
+        for i in 1..=polls {
             let mut still = Vec::new();
             for c in left {
                 let fields = [("fields", "status,error_message")];
@@ -385,8 +387,8 @@ impl Threads {
             if left.is_empty() {
                 return Ok(());
             }
-            if i < POLLS {
-                tokio::time::sleep(self.poll_every * i).await;
+            if i < polls {
+                tokio::time::sleep(self.poll_every * i.min(POLLS)).await;
             }
         }
         Err(failed(

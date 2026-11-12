@@ -224,7 +224,7 @@ video or 1 to 35 JPEG or WebP photos, `media_required` without one, no threads) 
 Saving with `scheduled_at` makes a post `scheduled`, else `draft`; only those two can change.
 A tick every minute claims due posts (one instance at a time, advisory lock), creates one
 target per account and claims each target once, so nothing posts twice; a publish is never
-retried. A target cut off mid-publish for 15 minutes fails as "unknown, check the account".
+retried. A target cut off mid-publish for 31 minutes (longer than the slowest healthy post: 12 minutes of downloads, 14 of publishing, and a margin) fails as "unknown, check the account".
 
 **Checks before saving.** `POST /posts`, `PUT /posts/{id}`, `POST /post-groups`, both retries
 and the MCP tools that share them refuse a post that can never publish, before anything is
@@ -236,7 +236,7 @@ checks as publishing, Drive links included, all within 4 seconds) and typed by t
 LinkedIn, a GIF on Instagram, Threads, TikTok or YouTube, a MOV on LinkedIn; a PNG or WebP on
 Instagram and a PNG on TikTok pass, since publishing turns them into JPEGs),
 `mixed_media` for a video next to other media on Bluesky, Facebook, LinkedIn, X or TikTok (a PDF
-on LinkedIn, a GIF on X), `media_too_large` for a GIF over 1 MB on Bluesky or 15 MB on X, an animated WebP or PNG over Bluesky's 1 MB or X's 5 MB, or any file over 100 MB (a
+on LinkedIn, a GIF on X), `media_too_large` for a GIF over 1 MB on Bluesky or 15 MB on X, an animated WebP or PNG over Bluesky's 1 MB or X's 5 MB, a video over 1 GiB (100 MB on Bluesky, 512 MB on X), or any other file over 100 MB (a
 still image over Bluesky's 1 MB or X's 5 MB passes, since publishing shrinks it), `invalid_cover_type` and `cover_too_large` for a
 cover, and `cover_needs_one_video` when the one media item is not a video. A TikTok post's
 `privacy_level` is checked against each TikTok account of the set (creator info, live, 5
@@ -433,7 +433,7 @@ pick the channel there; connect again for another. Error codes `youtube_failed`,
 `missing_scopes` (granular consent: the token Google returned lacks one of the three scopes, so
 nothing is saved) besides the Threads ones. The access token lasts an hour and is stored with its expiry; the
 refresh token is sealed in the account's `meta`. Before each publish or take down, a token with
-under two minutes left is renewed and saved first (there is no daily job). A refused refresh
+under 20 minutes left is renewed and saved first, and one that ends during a long upload is renewed once and the upload goes on (there is no daily job). A refused refresh
 token (revoked access) or a refused call (`401`, `insufficientPermissions`) fails the target with
 "Reconnect the channel under Connections".
 
@@ -442,12 +442,12 @@ A YouTube post is one MP4 or MOV video (no threads; `media_required` without one
 characters, required: `empty_post` without one) and the rest the description (at most 5000
 bytes); `too_long` over either, and `invalid_text` for a `<` or `>`, which YouTube refuses. Shorts
 are just vertical videos up to three minutes, so there is no separate call. brain downloads the
-video into its storage (100 MB at most) and uploads the bytes itself: `POST
+video into its storage (1 GiB at most) and uploads the bytes itself: `POST
 /upload/youtube/v3/videos?uploadType=resumable&part=snippet,status` with the metadata
-(`privacyStatus` from the post's settings, `selfDeclaredMadeForKids` `false`), then one `PUT` of the bytes to the
-session URL from the `Location` header. brain sends the token only to a session URL that is https
+(`privacyStatus` from the post's settings, `selfDeclaredMadeForKids` `false`), then the bytes to the
+session URL from the `Location` header, 8 MiB a `PUT` with its `Content-Range`, each read from storage as it goes (`308` until the last, which answers the video). brain sends the token only to a session URL that is https
 on `googleapis.com`. The video id is saved the moment YouTube answers, before anything else; the
-permalink is `https://www.youtube.com/watch?v={id}`; nothing is retried or resumed. A YouTube
+permalink is `https://www.youtube.com/watch?v={id}`; no chunk is sent again blindly: after one with no answer or a `5xx`, brain asks the session how far it got (`Content-Range: bytes */total`) and goes on from there, at most 4 times in a row without progress, so nothing posts twice. A YouTube
 post may carry `youtube`: `{"privacy"}` (saved as `posts.youtube`, returned on the post), the
 video's visibility: `private`, `unlisted` or `public`. Without `youtube`, or without `privacy`,
 the video is `private`. Another value is `422 invalid_youtube_privacy`, and other platforms answer
@@ -541,7 +541,7 @@ conservative: a bare domain counts as a link even where X would not, so a post m
 `POST /2/media/upload/initialize` (`media_type`, `total_bytes`, `media_category` `tweet_image`,
 `tweet_gif` or `tweet_video`), one `POST .../{id}/append` per 4 MB chunk (multipart, `segment_index`
 and `media`), `POST .../{id}/finalize`, and `GET /2/media/upload?command=STATUS` until a video is
-processed; images are at most 5 MB (a larger still image is shrunk first), a GIF 15 MB, a video 100 MB (brain's own cap). Then
+processed; images are at most 5 MB (a larger still image is shrunk first), a GIF 15 MB, a video 512 MB, each chunk read from storage as it goes. Then
 `POST /2/tweets` with `text`, `media.media_ids` and, for a thread part, `reply.in_reply_to_tweet_id`
 set to the part before it. Each tweet id is saved the moment X answers, before the next part is
 sent; a part that fails keeps the ones before it up, and nothing is retried. The permalink is
@@ -684,9 +684,10 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | no | Both or neither. Turn on a Cloudflare Turnstile captcha: `POST /auth/link` and `/v1/contact` then need a `turnstile_token`. Off when unset |
 | `ADMIN_EMAILS` | no | Comma-separated emails, any case, whose signed-in users may use the admin console, `/v1/admin/*` (and get `is_admin: true` from `/auth/me`). None when unset |
 | `REVIEW_LOGIN_TOKEN` | no | Turns on `GET /review-login/{token}`, a sign-in to a demo account for Meta App Review. Unset (the default) the route is a `404`. Remove it after the review: see [App Review login](#app-review-login) |
-| `MEDIA_DIR` | no | `./media` (`/var/lib/brain/media` in the image). Where post media is kept while a post publishes, when no bucket is set. Files go once the post settles, so an ephemeral disk is fine. Assumes a single brain instance: with more than one replica, use the `S3_*` bucket |
-| `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | no | All or none. Keep post media in an S3-compatible bucket instead of `MEDIA_DIR`, path-style. Cloudflare R2: `S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com`; AWS S3: `https://s3.<region>.amazonaws.com` with `S3_REGION` |
+| `MEDIA_DIR` | no | `./media` (`/var/lib/brain/media` in the image). Where post media is kept while a post publishes, when no bucket is set. Files go once the post settles, so an ephemeral disk is fine. A download cut off by a restart leaves a temp file, which the hourly sweep removes once it is an hour old. Assumes a single brain instance: with more than one replica, use the `S3_*` bucket |
+| `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | no | All or none. Keep post media in an S3-compatible bucket instead of `MEDIA_DIR`, path-style. Cloudflare R2: `S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com`; AWS S3: `https://s3.<region>.amazonaws.com` with `S3_REGION`. Files are written as multipart uploads, which brain aborts when a download fails; give the bucket a lifecycle rule that aborts incomplete multipart uploads after a day (R2 does so after 7 days by default) for the ones a restart cuts off |
 | `S3_REGION` | no | `auto` (what R2 wants) |
+| `MEDIA_MAX_BYTES` | no | `1073741824` (1 GiB), which is also the most. The largest video a post may carry, in bytes. Videos are streamed to and from storage, so this is disk or bucket space, not memory. It caps videos only, whatever its value: images and PDFs stay at 100 MB. A video over it is refused when the post is saved (`422 media_too_large` with `limit` and `actual`) where its server says its size, else when it publishes |
 | `CONTACT_TO` | no | Turn on `POST /v1/contact`, which mails each message to this address (Reply-To: the sender). Off when unset |
 
 ## App Review login
@@ -713,16 +714,26 @@ A post's `media` are URLs: public `https://` links or Google Drive share links
 (`/file/d/<id>/view`, `open?id=`, `uc?id=`; the file must be shared with anyone with the link).
 Nothing is fetched when a post is saved. When it publishes, brain downloads each URL once into
 its storage (`MEDIA_DIR` or the `S3_*` bucket): names must resolve to public addresses, at most 3
-redirects, each to a public https URL, 4 at a time and all within a minute, streamed with a cap of 100 MB a file
-and typed by its first bytes (JPEG, PNG, WebP, GIF, MP4, MOV, PDF; only LinkedIn
+redirects, each to a public https URL, 4 at a time, streamed to storage in 5 MB parts (a download
+holds about 15 MB however large the file) and typed by its first bytes. A video may be up to 1 GiB
+(`MEDIA_MAX_BYTES` lowers it; Bluesky takes 100 MB and X 512 MB), any other file 100 MB; a file
+over its cap is refused by its `Content-Length`, else the moment its bytes pass it, and nothing of
+it stays stored. Each download has 60 seconds plus its size at 2 MB a second (about 3.5 minutes
+for 300 MB; when its server does not say its size, the size is the bytes that came so far, so a slow one ends early), all of a post's 12 minutes together, and a server silent for 30 seconds fails at
+once. Posts of one group that carry the same video download it once: the others copy it inside
+the storage (per brain instance). Types are JPEG, PNG, WebP, GIF, MP4, MOV and PDF (only LinkedIn
 takes a PDF). A still image (JPEG, PNG or WebP) over the platform's limit for one image (Bluesky
 1 MB, X 5 MB; `post::IMAGE_LIMITS`) is re-encoded as a JPEG that fits: quality 90, 80, then 70 at
 its own size, then scaled down at quality 80, its shape kept (Bluesky: longest side at most 2000
 px), transparency on white, turned upright by its EXIF orientation, its RGB colour profile kept.
 One within the limit keeps its bytes. A GIF is never re-encoded, nor an animated WebP or PNG, and
 an image that cannot be shrunk (those, one that does not decode or is over 25 megapixels) fails
-its target with the reason. Platforms are then served from the stored copy (Threads, Facebook and Instagram fetch
-it from its `/media/` link), and a URL that fails fails its
+its target with the reason. Platforms are then served from the stored copy: LinkedIn, YouTube, X and Bluesky get a video read
+from storage a part at a time, and Threads, Facebook, Instagram and TikTok fetch it from its
+`/media/` link, which streams it and honours `Range` (`206` with `Content-Range`, `416` past the
+end). A publish with a video gets more time: its platform's limit plus the bytes at 2 MB a second
+and 50 seconds per 100 MB, 14 minutes at most, and the platform's processing poll one more check
+per 100 MB. A URL that fails fails its
 target naming the image, before anything goes out. A post's files are deleted once it settles
 (published, failed or deleted); an hourly sweep deletes any left a week later whose post no
 longer waits to publish, whether or not a row still names it. Local-disk storage assumes one

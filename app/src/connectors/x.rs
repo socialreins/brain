@@ -92,9 +92,9 @@ struct TokenAnswer {
     scope: Option<String>,
 }
 
-/// One file to post: its bytes and type.
+/// One file to post: its bytes (a video's are read from the store a chunk at a time) and type.
 pub struct File<'a> {
-    pub bytes: &'a [u8],
+    pub bytes: &'a crate::media::Blob,
     pub content_type: &'a str,
 }
 
@@ -415,7 +415,8 @@ impl X {
                 ))
             }
         };
-        if file.bytes.len() > max {
+        let len = file.bytes.len();
+        if len > max as u64 {
             let mb = max / 1_000_000;
             return Err(failed(format!(
                 "Upload: the file is over {mb} MB, X's limit."
@@ -423,7 +424,7 @@ impl X {
         }
         let init = json!({
             "media_type": file.content_type,
-            "total_bytes": file.bytes.len(),
+            "total_bytes": len,
             "media_category": category,
         });
         let req = self
@@ -433,9 +434,11 @@ impl X {
         let Some(id) = answer["data"]["id"].as_str().and_then(plain_id) else {
             return Err(failed("Upload: X sent no media id."));
         };
-        for (i, chunk) in file.bytes.chunks(CHUNK).enumerate() {
+        // One chunk is held at a time, read from the store by its range.
+        for (i, at) in (0..len).step_by(CHUNK).enumerate() {
+            let chunk = file.bytes.range(at..at + CHUNK as u64).await?;
             let (content_type, body) =
-                multipart(("segment_index", &i.to_string()), ("media", chunk));
+                multipart(("segment_index", &i.to_string()), ("media", &chunk));
             let req = self
                 .api(Method::POST, &format!("/2/media/upload/{id}/append"), token)
                 .header("Content-Type", content_type)
@@ -456,7 +459,9 @@ impl X {
     /// Waits until X has processed the media; no `processing_info` means it is ready.
     async fn processed(&self, id: &str, token: &str, first: &Value) -> Result<(), PostError> {
         let mut info = first.clone();
-        for _ in 0..POLLS {
+        // X names each wait itself (at most `MAX_WAIT_SECS`), so a large video gets three more
+        // checks for each one another platform gets.
+        for _ in 0..POLLS + 3 * super::extra_polls() {
             match info["state"].as_str() {
                 None | Some("succeeded") => return Ok(()),
                 Some("failed") => {

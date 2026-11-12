@@ -4152,6 +4152,11 @@ mod teams {
 
             /// A brain on the mock, with its state for driving the publish pipeline directly.
             async fn on_mock() -> (TestServer, DatabaseConnection, AppState) {
+                on_mock_capped(socialreins_brain::media::MAX_BYTES).await
+            }
+
+            /// `on_mock` with `MEDIA_MAX_BYTES` set to `cap`.
+            async fn on_mock_capped(cap: usize) -> (TestServer, DatabaseConnection, AppState) {
                 let base = mock_bluesky().await;
                 let mut config = Config::from_env().expect("test config");
                 config.trust_proxy = true;
@@ -4165,6 +4170,7 @@ mod teams {
                 config.media = Media::new(std::sync::Arc::new(disk), true);
                 // Saved media URLs are https: `https://media.test/...` is probed on the mock.
                 config.media.probe_rewrite = Some((PROBED.into(), base));
+                config.media.max_bytes = cap;
                 let db = socialreins_brain::connect(&config)
                     .await
                     .expect("database reachable");
@@ -4758,6 +4764,29 @@ mod teams {
 
             #[tokio::test]
             #[serial]
+            async fn a_video_over_the_configured_cap_is_refused_when_saved() {
+                // `MEDIA_MAX_BYTES` under the mock's clip, and far under its image.
+                let (s, db, _) = on_mock_capped(50).await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let with = |path: &str| {
+                    let mut v = input(&set, "hi", None);
+                    v["media"] = json!([format!("{PROBED}{path}")]);
+                    v
+                };
+                let res = create(&s, &cookie, with("/clip.mp4")).await;
+                assert_eq!(res.status_code(), 422, "{}", res.text());
+                let body = res.json::<Value>();
+                assert_eq!(body["error"], "media_too_large", "{body}");
+                assert_eq!(body["limit"], 50, "{body}");
+                assert!(body["actual"].as_u64().unwrap() > 50, "{body}");
+                // The cap is a video's only.
+                let res = create(&s, &cookie, with("/img.png")).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+            }
+
+            #[tokio::test]
+            #[serial]
             async fn the_tick_publishes_a_bluesky_video() {
                 let (s, db, state) = on_mock().await;
                 let (cookie, team_id, _) = owner_with_account(&s, &db).await;
@@ -4778,6 +4807,54 @@ mod teams {
                 VIDEO_KNOWN.store(true, std::sync::atomic::Ordering::SeqCst);
                 let id = id_of(&create(&s, &cookie, input(&set, "again", Some(&past()))).await);
                 set_media(&db, &base, &id, &["/clip.mp4"]).await;
+                publish::tick(&state).await.unwrap();
+                assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_slow_post_does_not_delay_one_due_after_it() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let base = pds_of(&db, &team_id).await;
+                // Its image takes 5 seconds to download.
+                let slow = id_of(&create(&s, &cookie, input(&set, "slow", Some(&past()))).await);
+                set_media(&db, &base, &slow, &["/slow.png"]).await;
+                let first = publish::begin(&state).await.unwrap();
+                // Due only now, with the slow one underway: the next round takes it at once.
+                let quick = id_of(&create(&s, &cookie, input(&set, "quick", Some(&past()))).await);
+                let started = std::time::Instant::now();
+                for run in publish::begin(&state).await.unwrap() {
+                    run.await.unwrap();
+                }
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(3),
+                    "the round did not wait for the slow post"
+                );
+                assert_eq!(get_post(&s, &cookie, &quick).await["status"], "published");
+                assert_eq!(get_post(&s, &cookie, &slow).await["status"], "queued");
+                // The slow one was not taken twice, and goes out once.
+                let before = RECORDS.lock().unwrap().len();
+                for run in first {
+                    run.await.unwrap();
+                }
+                assert_eq!(get_post(&s, &cookie, &slow).await["status"], "published");
+                assert_eq!(RECORDS.lock().unwrap().len(), before + 1);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_post_claimed_while_its_task_ends_is_not_left_queued() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let id = id_of(&create(&s, &cookie, input(&set, "again", Some(&past()))).await);
+                // A task that put it back to `scheduled` has not ended yet.
+                let ending = publish::hold(id.parse().unwrap());
+                assert!(publish::begin(&state).await.unwrap().is_empty());
+                assert_eq!(get_post(&s, &cookie, &id).await["status"], "scheduled");
+                drop(ending);
                 publish::tick(&state).await.unwrap();
                 assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
             }
@@ -4921,7 +4998,7 @@ mod teams {
                     let id: uuid::Uuid = id.parse().unwrap();
                     async move {
                         media
-                            .ingest(&db, id, &url, 1_000_000, soon())
+                            .ingest(&db, (id, None), &url, 1_000_000, soon())
                             .await
                             .unwrap()
                     }
@@ -5006,6 +5083,103 @@ mod teams {
                 assert_eq!(res.status_code(), 204);
                 assert_eq!(media_rows(&db, draft).await, 0);
                 assert!(state.media.read(&draft_orphan).await.is_err());
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_groups_video_is_downloaded_once_and_each_post_keeps_its_copy() {
+                use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                // A server that counts how often the video (3 MB, made here) is asked for.
+                static HITS: AtomicUsize = AtomicUsize::new(0);
+                HITS.store(0, SeqCst);
+                let mut clip = b"\0\0\0\x18ftypisom".to_vec();
+                clip.resize(3_000_000, 7);
+                let serve = move || {
+                    let clip = clip.clone();
+                    async move {
+                        HITS.fetch_add(1, SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        clip
+                    }
+                };
+                let app = axum::Router::new().route("/clip.mp4", axum::routing::get(serve));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}/clip.mp4", listener.local_addr().unwrap());
+                tokio::spawn(async move { axum::serve(listener, app).await });
+
+                // Two posts of one group and one that is in none, all with the same video.
+                let group = uuid::Uuid::now_v7();
+                let mut ids = Vec::new();
+                for grouped in [true, true, false] {
+                    let id = id_of(&create(&s, &cookie, input(&set, "clip", Some(&past()))).await);
+                    let row = posts::ActiveModel {
+                        id: Set(id.parse().unwrap()),
+                        group_id: Set(grouped.then_some(group)),
+                        ..Default::default()
+                    };
+                    posts::Entity::update(row).exec(&db).await.unwrap();
+                    ids.push(id);
+                }
+                let ingest = |id: &str, group: Option<uuid::Uuid>| {
+                    let (media, db, url) = (state.media.clone(), db.clone(), url.clone());
+                    let id: uuid::Uuid = id.parse().unwrap();
+                    let until = tokio::time::Instant::now() + media::INGEST_DEADLINE;
+                    async move {
+                        let got = media.ingest(&db, (id, group), &url, 10_000_000, until);
+                        got.await.unwrap()
+                    }
+                };
+                // Both at once, as a tick runs them: one downloads, the other copies in the store.
+                let (a, b) =
+                    tokio::join!(ingest(&ids[0], Some(group)), ingest(&ids[1], Some(group)));
+                assert_eq!(HITS.load(SeqCst), 1, "one download for the group");
+                assert_ne!(a.key, b.key);
+                assert!(
+                    a.key.starts_with(&format!("posts/{}/", ids[0])),
+                    "{}",
+                    a.key
+                );
+                assert!(
+                    b.key.starts_with(&format!("posts/{}/", ids[1])),
+                    "{}",
+                    b.key
+                );
+                assert_eq!((a.size, b.size), (3_000_000, 3_000_000));
+                assert_eq!(b.content_type, "video/mp4");
+                // A post outside the group downloads its own.
+                ingest(&ids[2], None).await;
+                assert_eq!(HITS.load(SeqCst), 2);
+
+                // The first post settles: its file goes, the other post's stays until it settles.
+                let settle = |id: &str| {
+                    let row = posts::ActiveModel {
+                        id: Set(id.parse().unwrap()),
+                        status: Set("published".into()),
+                        ..Default::default()
+                    };
+                    let (db, media, id) = (db.clone(), state.media.clone(), id.parse().unwrap());
+                    async move {
+                        posts::Entity::update(row).exec(&db).await.unwrap();
+                        media.release_post(&db, id).await;
+                    }
+                };
+                settle(&ids[0]).await;
+                assert!(state.media.read(&a.key).await.is_err());
+                assert_eq!(state.media.read(&b.key).await.unwrap().len(), 3_000_000);
+                // A retry of the settled post finds the group's copy and still downloads nothing.
+                let again = ingest(&ids[0], Some(group)).await;
+                assert_eq!(HITS.load(SeqCst), 2);
+                assert_eq!(state.media.read(&again.key).await.unwrap().len(), 3_000_000);
+                settle(&ids[1]).await;
+                assert!(state.media.read(&b.key).await.is_err());
+                assert_eq!(state.media.read(&again.key).await.unwrap().len(), 3_000_000);
+                settle(&ids[0]).await;
+                assert!(state.media.read(&again.key).await.is_err());
+                assert!(!media_dir().join("posts").join(&ids[0]).exists());
+                assert!(!media_dir().join("posts").join(&ids[1]).exists());
             }
 
             #[tokio::test]
@@ -5248,7 +5422,9 @@ mod teams {
                     social_account_id: Set(Some(account)),
                     status: Set("publishing".into()),
                     remote_id: Set(Some(uri)),
-                    updated_at: Set((Utc::now() - Duration::minutes(20)).fixed_offset()),
+                    updated_at: Set(
+                        (Utc::now() - Duration::minutes(publish::STUCK_MINUTES + 5)).fixed_offset()
+                    ),
                     ..Default::default()
                 };
                 post_targets::Entity::insert(row)
@@ -5690,7 +5866,9 @@ mod teams {
                     id: Set(target),
                     status: Set("publishing".into()),
                     error: Set(None),
-                    updated_at: Set((Utc::now() - Duration::minutes(20)).fixed_offset()),
+                    updated_at: Set(
+                        (Utc::now() - Duration::minutes(publish::STUCK_MINUTES + 5)).fixed_offset()
+                    ),
                     ..Default::default()
                 };
                 post_targets::Entity::update(cut).exec(&db).await.unwrap();
@@ -5937,7 +6115,9 @@ mod teams {
                         json!([{"remote_id": format!("at://{did}/app.bsky.feed.post/r3a"),
                         "cid": "c"}]),
                     ),
-                    updated_at: Set((Utc::now() - Duration::minutes(20)).fixed_offset()),
+                    updated_at: Set(
+                        (Utc::now() - Duration::minutes(publish::STUCK_MINUTES + 5)).fixed_offset()
+                    ),
                     ..Default::default()
                 };
                 post_targets::Entity::insert(row)
@@ -6212,10 +6392,12 @@ mod teams {
                 let (_, team_id, _) = owner_with_account(&s, &db).await;
                 let set = default_set(&db, &team_id).await.to_string();
                 let bucket = publish::quota_bucket(team_id.parse().unwrap());
-                // Left `queued` 20 minutes ago with no reservation recorded.
+                // Left `queued` long ago with no reservation recorded.
                 let stale = |id: uuid::Uuid| posts::ActiveModel {
                     id: Set(id),
-                    updated_at: Set((Utc::now() - Duration::minutes(20)).fixed_offset()),
+                    updated_at: Set(
+                        (Utc::now() - Duration::minutes(publish::STUCK_MINUTES + 5)).fixed_offset()
+                    ),
                     ..Default::default()
                 };
                 let first = queued_post(&db, &team_id, &set).await;
@@ -6369,14 +6551,14 @@ mod teams {
                 assert_eq!(p.error.as_deref(), Some("A disconnected account: Boom."));
                 assert!(p.published_at.is_some());
 
-                // A target cut off mid-publish 20 minutes ago fails and is never resent.
+                // A target cut off mid-publish long ago fails and is never resent.
                 let stuck = queued_post(&db, &team_id, &set).await;
                 target(
                     &db,
                     stuck,
                     Some(account),
                     "publishing",
-                    Utc::now() - Duration::minutes(20),
+                    Utc::now() - Duration::minutes(publish::STUCK_MINUTES + 5),
                 )
                 .await;
                 let fresh = queued_post(&db, &team_id, &set).await;
@@ -7469,7 +7651,7 @@ mod teams {
                     let url = format!("{base}/img.png");
                     let stored = state
                         .media
-                        .ingest(&db, post, &url, 1_000_000, until)
+                        .ingest(&db, (post, None), &url, 1_000_000, until)
                         .await
                         .unwrap();
                     let link = media::link(&state, &stored);
@@ -7478,6 +7660,36 @@ mod teams {
                     res.assert_status_ok();
                     assert_eq!(res.header("content-type"), "image/png");
                     assert_eq!(res.header("cache-control"), "no-store");
+                    assert_eq!(res.as_bytes().len(), 64);
+                    assert_eq!(res.header("accept-ranges"), "bytes");
+                    assert_eq!(res.header("content-length"), "64");
+                    let whole = res.as_bytes().to_vec();
+                    // Ranges, as video pullers ask: the first bytes, the middle, the end, a
+                    // suffix, and one past the end.
+                    for (asked, want, said) in [
+                        ("bytes=0-7", 0..8, "bytes 0-7/64"),
+                        ("bytes=10-19", 10..20, "bytes 10-19/64"),
+                        ("bytes=60-", 60..64, "bytes 60-63/64"),
+                        ("bytes=-5", 59..64, "bytes 59-63/64"),
+                        ("bytes=50-999", 50..64, "bytes 50-63/64"),
+                    ] {
+                        let res = s.get(&path).add_header("range", asked).await;
+                        assert_eq!(res.status_code(), 206, "{asked}");
+                        assert_eq!(res.header("content-range"), said);
+                        assert_eq!(res.header("content-type"), "image/png");
+                        assert_eq!(res.header("accept-ranges"), "bytes");
+                        assert_eq!(res.header("content-length"), want.len().to_string());
+                        assert_eq!(res.as_bytes().to_vec(), whole[want].to_vec(), "{asked}");
+                    }
+                    for asked in ["bytes=64-", "bytes=100-200", "bytes=-0"] {
+                        let res = s.get(&path).add_header("range", asked).await;
+                        assert_eq!(res.status_code(), 416, "{asked}");
+                        assert_eq!(res.header("content-range"), "bytes */64");
+                        assert!(res.as_bytes().is_empty());
+                    }
+                    // Several ranges are not served apart: the whole file goes.
+                    let res = s.get(&path).add_header("range", "bytes=0-1,5-6").await;
+                    res.assert_status_ok();
                     assert_eq!(res.as_bytes().len(), 64);
                     // Only brain's own sealed post keys open anything.
                     assert_eq!(s.get("/media/nonsense.png").await.status_code(), 404);
@@ -8221,7 +8433,8 @@ mod teams {
                         .await
                         .unwrap()
                         .unwrap();
-                    let old = (Utc::now() - Duration::minutes(30)).fixed_offset();
+                    let old =
+                        (Utc::now() - Duration::minutes(publish::STUCK_MINUTES + 5)).fixed_offset();
                     let calls = COMMENTS.lock().unwrap().len();
 
                     // Cut off during the comment call: it may have posted.
@@ -9795,7 +10008,9 @@ mod teams {
                     let cut = post_targets::ActiveModel {
                         id: Set(target.id),
                         status: Set("publishing".into()),
-                        updated_at: Set((Utc::now() - Duration::minutes(30)).fixed_offset()),
+                        updated_at: Set((Utc::now()
+                            - Duration::minutes(publish::STUCK_MINUTES + 5))
+                        .fixed_offset()),
                         ..Default::default()
                     };
                     post_targets::Entity::update(cut).exec(&db).await.unwrap();
@@ -9985,7 +10200,7 @@ mod teams {
                     assert_eq!(p["status"], "published", "{p}");
                     assert_eq!(REFRESHES.load(Ordering::SeqCst), refreshes);
 
-                    // Within two minutes: renewed first, saved, and the new token is the one sent.
+                    // Under 20 minutes left: renewed first, saved, and the new token is the one sent.
                     set_token(&db, account, "dead", 90).await;
                     let puts = PUTS.lock().unwrap().len();
                     let p = publish_clip(&s, ctx, (&cookie, &set), "b").await;
