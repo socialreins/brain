@@ -7042,6 +7042,36 @@ mod teams {
                     assert_eq!(res.header("content-type"), "image/png");
                     assert_eq!(res.header("cache-control"), "no-store");
                     assert_eq!(res.as_bytes().len(), 64);
+                    assert_eq!(res.header("accept-ranges"), "bytes");
+                    assert_eq!(res.header("content-length"), "64");
+                    let whole = res.as_bytes().to_vec();
+                    // Ranges, as video pullers ask: the first bytes, the middle, the end, a
+                    // suffix, and one past the end.
+                    for (asked, want, said) in [
+                        ("bytes=0-7", 0..8, "bytes 0-7/64"),
+                        ("bytes=10-19", 10..20, "bytes 10-19/64"),
+                        ("bytes=60-", 60..64, "bytes 60-63/64"),
+                        ("bytes=-5", 59..64, "bytes 59-63/64"),
+                        ("bytes=50-999", 50..64, "bytes 50-63/64"),
+                    ] {
+                        let res = s.get(&path).add_header("range", asked).await;
+                        assert_eq!(res.status_code(), 206, "{asked}");
+                        assert_eq!(res.header("content-range"), said);
+                        assert_eq!(res.header("content-type"), "image/png");
+                        assert_eq!(res.header("accept-ranges"), "bytes");
+                        assert_eq!(res.header("content-length"), want.len().to_string());
+                        assert_eq!(res.as_bytes().to_vec(), whole[want].to_vec(), "{asked}");
+                    }
+                    for asked in ["bytes=64-", "bytes=100-200", "bytes=-0"] {
+                        let res = s.get(&path).add_header("range", asked).await;
+                        assert_eq!(res.status_code(), 416, "{asked}");
+                        assert_eq!(res.header("content-range"), "bytes */64");
+                        assert!(res.as_bytes().is_empty());
+                    }
+                    // Several ranges are not served apart: the whole file goes.
+                    let res = s.get(&path).add_header("range", "bytes=0-1,5-6").await;
+                    res.assert_status_ok();
+                    assert_eq!(res.as_bytes().len(), 64);
                     // Only brain's own sealed post keys open anything.
                     assert_eq!(s.get("/media/nonsense.png").await.status_code(), 404);
                     let token = path.trim_start_matches("/media/");
