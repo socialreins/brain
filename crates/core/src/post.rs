@@ -313,6 +313,8 @@ pub fn validate_cover(
 pub struct MediaFact<'a> {
     pub content_type: &'a str,
     pub size: Option<u64>,
+    /// An animated WebP or PNG, where the first bytes showed it.
+    pub animated: bool,
 }
 
 /// The largest file brain stores, whatever the platform.
@@ -326,7 +328,8 @@ pub const X_MAX_GIF_BYTES: u64 = 15_000_000;
 /// The platforms with a limit for one still image (JPEG, PNG or WebP): the platform, its name,
 /// the most bytes it takes and the longest side in pixels a shrunk image keeps. Publishing
 /// shrinks an image over the byte limit to fit, so saving a post does not refuse it. A GIF is
-/// never re-encoded (it would lose its animation), so its limit still refuses it.
+/// never re-encoded (it would lose its animation), so its limit still refuses it, and so is an
+/// animated WebP or PNG.
 pub const IMAGE_LIMITS: &[(&str, &str, u64, u32)] = &[
     ("bluesky", "Bluesky", BLUESKY_MAX_IMAGE_BYTES, 2000),
     ("x", "X", X_MAX_IMAGE_BYTES, u32::MAX),
@@ -409,11 +412,16 @@ fn alone(platform: &str, t: &str) -> Option<&'static str> {
 
 /// The size limit a file of type `t` has on `platform` when a post is saved, and its name in
 /// messages. A still image has only brain's own cap here: publishing shrinks it to the
-/// platform's limit (`IMAGE_LIMITS`).
-fn size_limit(platform: &str, t: &str) -> (u64, &'static str) {
+/// platform's limit (`IMAGE_LIMITS`). An animated one is never shrunk, so that limit holds.
+fn size_limit(platform: &str, t: &str, animated: bool) -> (u64, &'static str) {
     match platform {
         "bluesky" if t == GIF => (BLUESKY_MAX_IMAGE_BYTES, "Bluesky's limit for a GIF"),
         "x" if t == GIF => (X_MAX_GIF_BYTES, "X's limit for a GIF"),
+        "bluesky" if animated => (
+            BLUESKY_MAX_IMAGE_BYTES,
+            "Bluesky's limit for an animated image",
+        ),
+        "x" if animated => (X_MAX_IMAGE_BYTES, "X's limit for an animated image"),
         _ => (MAX_MEDIA_BYTES, "the largest file SocialReins takes"),
     }
 }
@@ -436,7 +444,7 @@ pub fn validate_media_facts(
                 format!("Media {n} is not {what}."),
             ));
         }
-        let (max, whose) = size_limit(platform, f.content_type);
+        let (max, whose) = size_limit(platform, f.content_type, f.animated);
         if f.size.is_some_and(|s| s > max) {
             let mb = max / 1_000_000;
             return Err((
@@ -945,6 +953,7 @@ mod tests {
             Some(MediaFact {
                 content_type: t,
                 size: Some(size),
+                animated: false,
             })
         };
         let code = |p: &str, facts: &[Option<MediaFact>]| {
@@ -974,6 +983,23 @@ mod tests {
         );
         let (_, msg) = validate_media_facts("bluesky", &[jpg, f(GIF, 1_000_001)]).unwrap_err();
         assert_eq!(msg, "Media 2 is over 1 MB, Bluesky's limit for a GIF.");
+        // Nor is an animated WebP or PNG, which would lose its animation; a small one passes.
+        let moving = |t: &'static str, size: u64| {
+            Some(MediaFact {
+                content_type: t,
+                size: Some(size),
+                animated: true,
+            })
+        };
+        let (_, msg) = validate_media_facts("bluesky", &[moving(WEBP, 1_000_001)]).unwrap_err();
+        assert_eq!(
+            msg,
+            "Media 1 is over 1 MB, Bluesky's limit for an animated image."
+        );
+        assert_eq!(code("bluesky", &[moving(PNG, 900_000)]), Ok(()));
+        assert_eq!(code("x", &[moving(PNG, 5_000_000)]), Ok(()));
+        assert_eq!(code("x", &[moving(PNG, 5_000_001)]), Err("media_too_large"));
+        assert_eq!(code("threads", &[moving(PNG, 50_000_000)]), Ok(()));
         assert_eq!(code("bluesky", &[f(MP4, 90_000_000)]), Ok(()));
         assert_eq!(
             code("bluesky", &[f(MP4, 100_000_001)]),
@@ -1018,6 +1044,7 @@ mod tests {
             Some(MediaFact {
                 content_type: t,
                 size,
+                animated: false,
             })
         };
         let code = |p: &str, c, v| validate_cover_facts(p, c, v).map_err(|(e, _)| e.code());

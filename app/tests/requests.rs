@@ -2956,6 +2956,8 @@ mod teams {
                 .route("/big.png", get(|| async { image("image/png", 1_000_001) }))
                 .route("/big.gif", get(|| async { image("image/gif", 1_000_001) }))
                 .route("/noise.png", get(|| async { noise_png() }))
+                .route("/six.png", get(|| async { image("image/png", 6_000_000) }))
+                .route("/moving.webp", get(|| async { moving_webp() }))
                 .route("/page.html", get(|| async { image("text/html", 64) }))
                 .route("/doc.pdf", get(|| async { image("application/pdf", 64) }))
                 .route("/{did}", get(doc))
@@ -3118,6 +3120,14 @@ mod teams {
                 bytes[..5].copy_from_slice(b"%PDF-");
             }
             ([("content-type", content_type)], bytes).into_response()
+        }
+
+        /// The head of an animated WebP (the animation flag of its VP8X header), over 1 MB.
+        fn moving_webp() -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let mut bytes = b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\x02\0\0\0".to_vec();
+            bytes.resize(1_000_001, 0);
+            ([("content-type", "image/webp")], bytes).into_response()
         }
 
         /// A real 800 x 1000 PNG of noise, over Bluesky's 1 MB, which brain can shrink.
@@ -4197,6 +4207,11 @@ mod teams {
                         "Media 1 is over 1 MB, Bluesky's limit for a GIF.",
                     ),
                     (
+                        vec!["/moving.webp"],
+                        "media_too_large",
+                        "Media 1 is over 1 MB, Bluesky's limit for an animated image.",
+                    ),
+                    (
                         vec!["/img.png", "/clip.mp4"],
                         "mixed_media",
                         "Bluesky takes up to 4 images or one video, not a mix.",
@@ -4245,6 +4260,11 @@ mod teams {
                     let res = create(&s, &cookie, with(&paths)).await;
                     assert_eq!(res.status_code(), 201, "{paths:?}: {}", res.text());
                 }
+                // X takes a 6 MB PNG too, over its 5 MB: publishing shrinks it.
+                let mut on_x = with(&["/six.png"]);
+                on_x["platform"] = json!("x");
+                let res = create(&s, &cookie, on_x).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
                 let mut unknown = input(&set, "hi", None);
                 unknown["media"] = json!(["https://a.example/1.png"]);
                 let res = create(&s, &cookie, unknown).await;

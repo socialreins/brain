@@ -235,7 +235,7 @@ checks as publishing, Drive links included, all within 4 seconds) and typed by t
 LinkedIn, a GIF on Instagram, Threads, TikTok or YouTube, a MOV on LinkedIn; a PNG or WebP on
 Instagram and a PNG on TikTok pass, since publishing turns them into JPEGs),
 `mixed_media` for a video next to other media on Bluesky, Facebook, LinkedIn, X or TikTok (a PDF
-on LinkedIn, a GIF on X), `media_too_large` for a GIF over 1 MB on Bluesky or 15 MB on X, or any file over 100 MB (a
+on LinkedIn, a GIF on X), `media_too_large` for a GIF over 1 MB on Bluesky or 15 MB on X, an animated WebP or PNG over Bluesky's 1 MB or X's 5 MB, or any file over 100 MB (a
 still image over Bluesky's 1 MB or X's 5 MB passes, since publishing shrinks it), `invalid_cover_type` and `cover_too_large` for a
 cover, and `cover_needs_one_video` when the one media item is not a video. A TikTok post's
 `privacy_level` is checked against each TikTok account of the set (creator info, live, 5
@@ -675,8 +675,9 @@ and typed by its first bytes (JPEG, PNG, WebP, GIF, MP4, MOV, PDF; only LinkedIn
 takes a PDF). A still image (JPEG, PNG or WebP) over the platform's limit for one image (Bluesky
 1 MB, X 5 MB; `post::IMAGE_LIMITS`) is re-encoded as a JPEG that fits: quality 90, 80, then 70 at
 its own size, then scaled down at quality 80, its shape kept (Bluesky: longest side at most 2000
-px), transparency on white. One within the limit keeps its bytes. A GIF is never re-encoded, and
-an image that cannot be shrunk (a GIF, one that does not decode or is over 25 megapixels) fails
+px), transparency on white, turned upright by its EXIF orientation, its RGB colour profile kept.
+One within the limit keeps its bytes. A GIF is never re-encoded, nor an animated WebP or PNG, and
+an image that cannot be shrunk (those, one that does not decode or is over 25 megapixels) fails
 its target with the reason. Platforms are then served from the stored copy (Threads, Facebook and Instagram fetch
 it from its `/media/` link), and a URL that fails fails its
 target naming the image, before anything goes out. A post's files are deleted once it settles
