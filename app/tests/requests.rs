@@ -720,7 +720,7 @@ mod auth {
         (s, db, name)
     }
 
-    async fn drop_db(db: DatabaseConnection, name: &str) {
+    pub(super) async fn drop_db(db: DatabaseConnection, name: &str) {
         use sea_orm::ConnectionTrait;
         db.close().await.unwrap();
         let admin = sea_orm::Database::connect(Config::from_env().unwrap().database_url)
@@ -17418,6 +17418,669 @@ mod waitlist_confirm {
             ("/waitlist/verify", "post"),
             ("/waitlist/count", "get"),
             ("/admin/waitlist", "get"),
+        ] {
+            assert!(doc["paths"][path][method].is_object(), "{path}");
+        }
+    }
+}
+
+/// The admin console (`/v1/admin/*`). Each test gets its own empty database, so totals are
+/// exact and saved sign-up settings never reach another test.
+mod admin_console {
+    use super::captcha_and_contact::{resend, Seen};
+    use super::*;
+    use axum::http::Method;
+    use axum_test::TestRequest;
+    use chrono::Duration;
+    use sea_orm::{ConnectionTrait, DatabaseConnection};
+    use socialreins_brain::mail::Mailer;
+    use socialreins_core::token;
+
+    const ADMIN: &str = "console-boss@example.com";
+    const WEB: &str = "http://localhost:3000";
+
+    struct Console {
+        s: TestServer,
+        db: DatabaseConnection,
+        seen: Seen,
+        name: String,
+    }
+
+    /// A server over a new empty database, with `ADMIN` in `ADMIN_EMAILS` and mail going to a
+    /// fake Resend.
+    async fn console(edit: impl FnOnce(&mut Config)) -> Console {
+        let mut config = Config::from_env().expect("DATABASE_URL must point at a test Postgres");
+        let name = format!("brain_admin_{}", uuid::Uuid::now_v7().simple());
+        let base = sea_orm::Database::connect(&config.database_url)
+            .await
+            .unwrap();
+        base.execute_unprepared(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap();
+        let url = config.database_url.clone();
+        config.database_url = format!("{}/{name}", &url[..url.rfind('/').unwrap()]);
+        config.admin_emails = vec![ADMIN.into()];
+        // Lets `sign_in` spread over client IPs, so many sign-ins stay under the link limit.
+        config.trust_proxy = true;
+        let (mail, seen) = resend().await;
+        config.mailer = Mailer::resend_at(&mail, "re_test", "brain@example.com").unwrap();
+        edit(&mut config);
+        let db = connect(&config).await.expect("database reachable");
+        let app = controllers::router(AppState::new(db.clone(), &config), &config);
+        Console {
+            s: TestServer::new(app).unwrap(),
+            db,
+            seen,
+            name,
+        }
+    }
+
+    impl Console {
+        /// Uses a sign-in link for `email`: the `sr_session=...` cookie, or `None` when sign-up
+        /// refuses the email.
+        async fn sign_in(&self, email: &str) -> Option<String> {
+            let secret = auth::link(&self.db, email, Duration::minutes(15)).await;
+            let b = token::new().into_bytes();
+            let res = self
+                .s
+                .post("/auth/magic")
+                .add_header("origin", "http://localhost:8080")
+                .add_header("x-forwarded-for", format!("10.{}.{}.{}", b[0], b[1], b[2]))
+                .form(&[("token", secret.as_str())])
+                .await;
+            res.maybe_header("set-cookie")
+                .map(|c| auth::session(c.to_str().unwrap()))
+        }
+
+        async fn admin(&self) -> String {
+            self.sign_in(ADMIN).await.expect("the admin signs up")
+        }
+
+        /// A request from the web app with `cookie`.
+        fn req(&self, method: Method, path: &str, cookie: &str) -> TestRequest {
+            self.s
+                .method(method, path)
+                .add_header("origin", WEB)
+                .add_header("cookie", cookie.to_owned())
+        }
+
+        async fn get(&self, path: &str, cookie: &str) -> Value {
+            let res = self.req(Method::GET, path, cookie).await;
+            res.assert_status_ok();
+            res.json::<Value>()
+        }
+
+        async fn sql(&self, sql: &str) {
+            self.db.execute_unprepared(sql).await.unwrap();
+        }
+
+        /// Puts `email` on the waitlist and returns the signup's id.
+        async fn waitlisted(&self, email: &str) -> String {
+            let res = self
+                .s
+                .post("/v1/waitlist")
+                .add_header("x-forwarded-for", "10.9.9.9")
+                .json(&json!({"email": email}))
+                .await;
+            res.assert_status_ok();
+            let row = waitlist_signups::Entity::find()
+                .filter(waitlist_signups::Column::Email.eq(email))
+                .one(&self.db)
+                .await
+                .unwrap()
+                .unwrap();
+            row.id.to_string()
+        }
+
+        /// The approval emails sent to `email` so far.
+        fn approval_mails(&self, email: &str) -> Vec<Value> {
+            let all = self.seen.lock().unwrap().clone();
+            all.into_iter()
+                .filter(|m| m["to"] == json!([email]))
+                .filter(|m| m["subject"] == "You can now create your SocialReins account")
+                .collect()
+        }
+
+        async fn done(self) {
+            auth::drop_db(self.db, &self.name).await;
+        }
+    }
+
+    fn error_of(res: &axum_test::TestResponse) -> (u16, String) {
+        let code = res.json::<Value>()["error"].as_str().unwrap().to_owned();
+        (res.status_code().as_u16(), code)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_console_needs_an_admin_session() {
+        let c = console(|_| {}).await;
+        let admin = c.admin().await;
+        let user = c.sign_in(&unique_email()).await.unwrap();
+        let made = c
+            .req(Method::POST, "/v1/api-tokens", &admin)
+            .json(&json!({"name": "console"}))
+            .await;
+        assert_eq!(made.status_code(), 201);
+        let bearer = format!(
+            "Bearer {}",
+            made.json::<Value>()["secret"].as_str().unwrap()
+        );
+        let id = c.waitlisted(&unique_email()).await;
+        let routes = [
+            (Method::GET, "/v1/admin/overview".to_owned()),
+            (Method::GET, "/v1/admin/users".to_owned()),
+            (Method::GET, "/v1/admin/teams".to_owned()),
+            (Method::GET, "/v1/admin/waitlist".to_owned()),
+            (Method::POST, format!("/v1/admin/waitlist/{id}/approve")),
+            (Method::DELETE, format!("/v1/admin/waitlist/{id}")),
+            (Method::GET, "/v1/admin/settings/signup".to_owned()),
+            (Method::PUT, "/v1/admin/settings/signup".to_owned()),
+        ];
+        for (method, path) in routes {
+            let call = || {
+                c.s.method(method.clone(), &path)
+                    .add_header("origin", WEB)
+                    .json(&json!({"mode": "open"}))
+            };
+            let what = format!("{method} {path}");
+            let signed_out = call().await;
+            assert_eq!(
+                error_of(&signed_out),
+                (401, "unauthorized".into()),
+                "{what}"
+            );
+            // An API token is not a session, even the admin's own.
+            let token = call().add_header("authorization", bearer.as_str()).await;
+            assert_eq!(error_of(&token), (401, "unauthorized".into()), "{what}");
+            let other = call().add_header("cookie", user.as_str()).await;
+            assert_eq!(error_of(&other), (403, "forbidden".into()), "{what}");
+            if method != Method::GET {
+                let foreign =
+                    c.s.method(method.clone(), &path)
+                        .add_header("origin", "https://evil.example")
+                        .add_header("cookie", admin.as_str())
+                        .json(&json!({"mode": "open"}))
+                        .await;
+                assert_eq!(
+                    error_of(&foreign),
+                    (403, "forbidden_origin".into()),
+                    "{what}"
+                );
+            }
+        }
+        // None of the refused calls changed anything.
+        let list = c.get("/v1/admin/waitlist", &admin).await;
+        assert_eq!(list["total"], 1);
+        assert_eq!(list["signups"][0]["approved_at"], Value::Null);
+        let settings = c.get("/v1/admin/settings/signup", &admin).await;
+        assert_eq!(settings["source"], "env");
+        c.done().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn overview_counts_everything() {
+        let c = console(|_| {}).await;
+        let admin = c.admin().await;
+        let old = unique_email();
+        c.sign_in(&old).await.unwrap();
+        c.sql(&format!(
+            "UPDATE users SET created_at = now() - interval '8 days' WHERE email = '{old}'"
+        ))
+        .await;
+        c.sql(
+            "INSERT INTO social_accounts (id, team_id, provider, external_id, access_token) \
+             SELECT gen_random_uuid(), t.id, p, 'ext', '\\x00' \
+             FROM (SELECT id FROM teams ORDER BY created_at LIMIT 1) t, \
+               unnest(ARRAY['bluesky', 'threads']) p; \
+             INSERT INTO social_accounts (id, team_id, provider, external_id, access_token) \
+             SELECT gen_random_uuid(), id, 'bluesky', 'ext', '\\x00' \
+             FROM teams ORDER BY created_at DESC LIMIT 1; \
+             INSERT INTO posts (id, team_id, social_set_id, platform, status, scheduled_at) \
+             SELECT gen_random_uuid(), s.team_id, s.id, 'bluesky', st, now() \
+             FROM (SELECT id, team_id FROM social_sets LIMIT 1) s, \
+               unnest(ARRAY['scheduled', 'scheduled', 'published', 'draft']) st",
+        )
+        .await;
+        let (yes, no) = (unique_email(), unique_email());
+        let id = c.waitlisted(&yes).await;
+        c.waitlisted(&no).await;
+        c.sql(&format!(
+            "UPDATE waitlist_signups SET verified_at = now() WHERE email = '{yes}'"
+        ))
+        .await;
+        let approve = format!("/v1/admin/waitlist/{id}/approve");
+        c.req(Method::POST, &approve, &admin)
+            .await
+            .assert_status_ok();
+        let overview = c.get("/v1/admin/overview", &admin).await;
+        assert_eq!(
+            overview,
+            json!({
+                "users": 2,
+                "new_users_7d": 1,
+                "teams": 2,
+                "accounts": {"total": 3, "by_provider": {"bluesky": 2, "threads": 1}},
+                "posts": {"draft": 1, "failed": 0, "published": 1, "scheduled": 2},
+                "waitlist": {"total": 2, "verified": 1, "approved": 1},
+            })
+        );
+        c.done().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn users_are_listed_searched_and_paged() {
+        let c = console(|_| {}).await;
+        let admin = c.admin().await;
+        let ann = format!("ann_{}@example.com", uuid::Uuid::now_v7().simple());
+        let bob = format!("bob-{}@example.com", uuid::Uuid::now_v7().simple());
+        let ann_cookie = c.sign_in(&ann).await.unwrap();
+        c.sign_in(&bob).await.unwrap();
+        c.sql(&format!(
+            "UPDATE users SET name = 'Zoe Quill' WHERE email = '{bob}'"
+        ))
+        .await;
+        c.req(Method::POST, "/auth/logout", &ann_cookie).await;
+
+        let all = c.get("/v1/admin/users", &admin).await;
+        assert_eq!(all["total"], 3);
+        let emails = |body: &Value| -> Vec<String> {
+            let rows = body["users"].as_array().unwrap();
+            rows.iter()
+                .map(|r| r["email"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            emails(&all),
+            [bob.as_str(), ann.as_str(), ADMIN],
+            "newest first"
+        );
+        let row = &all["users"][2];
+        let mut keys: Vec<&str> = row
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let expected = [
+            "created_at",
+            "email",
+            "id",
+            "is_admin",
+            "last_sign_in_at",
+            "name",
+            "teams",
+        ];
+        assert_eq!(keys, expected, "nothing private is listed");
+        assert_eq!(row["is_admin"], true);
+        assert!(row["last_sign_in_at"].is_string());
+        let me = c.get("/auth/me", &admin).await;
+        assert_eq!(row["id"], me["id"]);
+        let team = &me["current_team"];
+        assert_eq!(
+            row["teams"],
+            json!([{"id": team["id"], "name": team["name"], "role": "owner"}])
+        );
+        assert_eq!(all["users"][0]["is_admin"], false);
+        assert_eq!(
+            all["users"][1]["last_sign_in_at"],
+            Value::Null,
+            "signed out"
+        );
+
+        let by_email = c.get("/v1/admin/users?q=%20ANN_%20", &admin).await;
+        assert_eq!(
+            (by_email["total"].as_i64(), emails(&by_email)),
+            (Some(1), vec![ann.clone()])
+        );
+        let by_name = c.get("/v1/admin/users?q=zoe%20q", &admin).await;
+        assert_eq!(
+            (by_name["total"].as_i64(), emails(&by_name)),
+            (Some(1), vec![bob.clone()])
+        );
+        // `_` and `%` match themselves, not any character.
+        for none in ["bob_", "%25", "nobody"] {
+            let found = c.get(&format!("/v1/admin/users?q={none}"), &admin).await;
+            assert_eq!(found, json!({"total": 0, "users": []}), "{none}");
+        }
+        let page = c.get("/v1/admin/users?limit=1&offset=1", &admin).await;
+        assert_eq!(
+            (page["total"].as_i64(), emails(&page)),
+            (Some(3), vec![ann.clone()])
+        );
+        let past = c.get("/v1/admin/users?offset=10", &admin).await;
+        assert_eq!(past, json!({"total": 3, "users": []}));
+        let long = "a".repeat(201);
+        for bad in [
+            "limit=0",
+            "limit=201",
+            "limit=x",
+            "offset=-1",
+            &format!("q={long}"),
+        ] {
+            let res = c
+                .req(Method::GET, &format!("/v1/admin/users?{bad}"), &admin)
+                .await;
+            assert_eq!(error_of(&res), (422, "invalid_query".into()), "{bad}");
+        }
+        c.done().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn teams_are_listed_searched_and_paged() {
+        let c = console(|_| {}).await;
+        let admin = c.admin().await;
+        let owner = unique_email();
+        let cookie = c.sign_in(&owner).await.unwrap();
+        let made = c
+            .req(Method::POST, "/v1/teams", &cookie)
+            .json(&json!({"name": "Acme_Rockets"}))
+            .await;
+        assert_eq!(made.status_code(), 201);
+        let acme = made.json::<Value>()["id"].as_str().unwrap().to_owned();
+        c.sql(&format!(
+            "INSERT INTO social_accounts (id, team_id, provider, external_id, access_token) \
+             VALUES (gen_random_uuid(), '{acme}', 'bluesky', 'ext', '\\x00'); \
+             INSERT INTO posts (id, team_id, social_set_id, platform, status) \
+             SELECT gen_random_uuid(), team_id, id, 'bluesky', st FROM social_sets, \
+               unnest(ARRAY['draft', 'published', 'deleted']) st WHERE team_id = '{acme}'"
+        ))
+        .await;
+
+        let all = c.get("/v1/admin/teams", &admin).await;
+        assert_eq!(all["total"], 3);
+        let first = &all["teams"][0];
+        let created_at = first["created_at"].clone();
+        assert!(created_at.is_string());
+        assert_eq!(
+            *first,
+            json!({"id": acme, "name": "Acme_Rockets", "created_at": created_at, "members": 1,
+                "accounts": 1, "posts": 2, "owner_email": owner})
+        );
+        let last = &all["teams"][2];
+        assert_eq!(
+            (&last["owner_email"], &last["accounts"], &last["posts"]),
+            (&json!(ADMIN), &json!(0), &json!(0))
+        );
+        let found = c.get("/v1/admin/teams?q=acme_rock", &admin).await;
+        assert_eq!(found["total"], 1);
+        assert_eq!(found["teams"][0]["id"], acme.as_str());
+        let none = c.get("/v1/admin/teams?q=acme-rock", &admin).await;
+        assert_eq!(none, json!({"total": 0, "teams": []}));
+        let page = c.get("/v1/admin/teams?limit=1&offset=2", &admin).await;
+        assert_eq!(page["total"], 3);
+        assert_eq!(page["teams"], json!([last]));
+        let res = c
+            .req(Method::GET, "/v1/admin/teams?limit=500", &admin)
+            .await;
+        assert_eq!(error_of(&res), (422, "invalid_query".into()));
+        c.done().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn waitlist_search_approve_and_delete() {
+        let c = console(|c| {
+            c.registration_disabled = true;
+            c.owner_email = Some(ADMIN.into());
+        })
+        .await;
+        let admin = c.admin().await;
+        let ann = format!("ann.{}@example.com", uuid::Uuid::now_v7().simple());
+        let bob = format!("bob.{}@example.com", uuid::Uuid::now_v7().simple());
+        let (ann_id, bob_id) = (c.waitlisted(&ann).await, c.waitlisted(&bob).await);
+        assert!(c.sign_in(&ann).await.is_none(), "sign-up is closed");
+
+        let found = c.get("/v1/admin/waitlist?q=ANN.", &admin).await;
+        assert_eq!(found["total"], 2, "totals stay overall");
+        assert_eq!(found["signups"].as_array().unwrap().len(), 1);
+        assert_eq!(found["signups"][0]["email"], ann.as_str());
+        assert_eq!(found["signups"][0]["approved_at"], Value::Null);
+        let none = c.get("/v1/admin/waitlist?q=ann_", &admin).await;
+        assert_eq!(none["signups"], json!([]));
+
+        let approve = |id: &str| {
+            c.req(
+                Method::POST,
+                &format!("/v1/admin/waitlist/{id}/approve"),
+                &admin,
+            )
+        };
+        let res = approve(&ann_id).await;
+        res.assert_status_ok();
+        let body = res.json::<Value>();
+        assert_eq!(body["mail"], "sent");
+        assert_eq!(body["signup"]["id"], ann_id.as_str());
+        assert_eq!(body["signup"]["email"], ann.as_str());
+        let at = body["signup"]["approved_at"].clone();
+        assert!(at.is_string());
+        let sent = c.approval_mails(&ann);
+        assert_eq!(sent.len(), 1);
+        let text = sent[0]["text"].as_str().unwrap();
+        assert!(text.contains(&format!("{WEB}/signup")), "{text}");
+
+        let again = approve(&ann_id).await.json::<Value>();
+        assert_eq!(again["mail"], "already_approved");
+        assert_eq!(
+            again["signup"]["approved_at"], at,
+            "the first approval stays"
+        );
+        assert_eq!(c.approval_mails(&ann).len(), 1, "no second email");
+        let listed = c.get("/v1/admin/waitlist?q=ann.", &admin).await;
+        assert_eq!(listed["signups"][0]["approved_at"], at);
+
+        assert!(c.sign_in(&bob).await.is_none(), "only the approved email");
+        assert!(
+            c.sign_in(&ann).await.is_some(),
+            "approved: signs up while closed"
+        );
+
+        // Deleting an approved signup that has not signed up takes the approval with it.
+        approve(&bob_id).await.assert_status_ok();
+        let delete = |id: &str| c.req(Method::DELETE, &format!("/v1/admin/waitlist/{id}"), &admin);
+        assert_eq!(delete(&bob_id).await.status_code(), 204);
+        assert!(c.sign_in(&bob).await.is_none());
+        let left = c.get("/v1/admin/waitlist", &admin).await;
+        assert_eq!(left["total"], 1);
+        assert_eq!(left["signups"][0]["email"], ann.as_str());
+        let nobody = uuid::Uuid::now_v7().to_string();
+        for res in [
+            delete(&bob_id).await,
+            delete(&nobody).await,
+            approve(&nobody).await,
+        ] {
+            assert_eq!(error_of(&res), (404, "not_found".into()));
+        }
+        c.done().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_approval_mail_keeps_the_approval() {
+        let c = console(|c| {
+            c.signup_domains = vec!["only-this.test".into(), ADMIN.into()];
+            c.mailer =
+                Mailer::resend_at("http://127.0.0.1:9/emails", "k", "a@example.com").unwrap();
+        })
+        .await;
+        let admin = c.admin().await;
+        let email = unique_email();
+        assert!(c.sign_in(&email).await.is_none());
+        let id = c.waitlisted(&email).await;
+        let res = c
+            .req(
+                Method::POST,
+                &format!("/v1/admin/waitlist/{id}/approve"),
+                &admin,
+            )
+            .await;
+        res.assert_status_ok();
+        let body = res.json::<Value>();
+        assert_eq!(body["mail"], "failed");
+        assert!(body["signup"]["approved_at"].is_string());
+        assert!(c.sign_in(&email).await.is_some(), "approved all the same");
+        c.done().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn signup_settings_fall_back_to_the_env_until_saved() {
+        let owner = unique_email();
+        let c = console(|c| {
+            c.signup_domains = vec!["env-only.test".into(), ADMIN.into()];
+            c.owner_email = Some(owner.clone());
+        })
+        .await;
+        let admin = c.admin().await;
+        let path = "/v1/admin/settings/signup";
+        let at = |domain: &str| format!("{}@{domain}", uuid::Uuid::now_v7().simple());
+
+        // Nothing saved: the env rules, as before.
+        let env = c.get(path, &admin).await;
+        assert_eq!(
+            env,
+            json!({"mode": "domains", "domains": ["env-only.test", ADMIN], "source": "env"})
+        );
+        assert!(c.sign_in(&at("env-only.test")).await.is_some());
+        assert!(c.sign_in(&at("saved.test")).await.is_none());
+
+        let put = |body: Value| c.req(Method::PUT, path, &admin).json(&body);
+        let many: Vec<String> = (0..51).map(|i| format!("d{i}.test")).collect();
+        let cases = [
+            (json!({"mode": "nope", "domains": []}), "invalid_mode"),
+            (json!({"mode": "domains"}), "invalid_domains"),
+            (
+                json!({"mode": "domains", "domains": [" "]}),
+                "invalid_domains",
+            ),
+            (
+                json!({"mode": "domains", "domains": ["two words.test"]}),
+                "invalid_domains",
+            ),
+            (
+                json!({"mode": "domains", "domains": ["a..test"]}),
+                "invalid_domains",
+            ),
+            (
+                json!({"mode": "open", "domains": ["not@an@email"]}),
+                "invalid_domains",
+            ),
+            (
+                json!({"mode": "domains", "domains": many}),
+                "invalid_domains",
+            ),
+            (json!({"domains": ["saved.test"]}), "invalid_body"),
+        ];
+        for (body, code) in cases {
+            let res = put(body.clone()).await;
+            assert_eq!(error_of(&res), (422, code.into()), "{body}");
+        }
+        assert_eq!(
+            c.get(path, &admin).await,
+            env,
+            "a refused save changes nothing"
+        );
+
+        // Saving needs a sign-in from the last 10 minutes.
+        c.sql("UPDATE sessions SET created_at = now() - interval '11 minutes'")
+            .await;
+        let stale = put(json!({"mode": "open"})).await;
+        assert_eq!(error_of(&stale), (403, "reauth_required".into()));
+        assert_eq!(c.get(path, &admin).await, env, "reading does not");
+        c.sql("UPDATE sessions SET created_at = now()").await;
+
+        // Saved rules replace the env ones.
+        let jane = at("else.test");
+        let saved = put(json!({"mode": "domains",
+            "domains": [" Saved.Test ", "saved.test", jane.to_uppercase()]}))
+        .await;
+        saved.assert_status_ok();
+        let want = json!({"mode": "domains", "domains": ["saved.test", jane], "source": "saved"});
+        assert_eq!(saved.json::<Value>(), want);
+        assert_eq!(c.get(path, &admin).await, want);
+        assert!(c.sign_in(&at("saved.test")).await.is_some());
+        assert!(c.sign_in(&jane).await.is_some(), "a listed address");
+        assert!(
+            c.sign_in(&at("env-only.test")).await.is_none(),
+            "env no longer applies"
+        );
+        assert!(c.sign_in(&at("else.test")).await.is_none());
+
+        // Closed: nobody new, but the exemptions hold.
+        let closed = put(json!({"mode": "closed", "domains": ["saved.test"]})).await;
+        closed.assert_status_ok();
+        assert_eq!(closed.json::<Value>()["mode"], "closed");
+        assert!(c.sign_in(&at("saved.test")).await.is_none());
+        assert!(c.sign_in(&owner).await.is_some(), "OWNER_EMAIL");
+        let invited = at("invited.test");
+        let invite = c
+            .req(Method::POST, "/v1/team/invitations", &admin)
+            .json(&json!({"email": invited, "role": "member"}))
+            .await;
+        assert_eq!(invite.status_code(), 201);
+        assert!(c.sign_in(&invited).await.is_some(), "an invited email");
+        let approved = at("approved.test");
+        let id = c.waitlisted(&approved).await;
+        c.req(
+            Method::POST,
+            &format!("/v1/admin/waitlist/{id}/approve"),
+            &admin,
+        )
+        .await
+        .assert_status_ok();
+        assert!(
+            c.sign_in(&approved).await.is_some(),
+            "an approved waitlist email"
+        );
+        // The email sign-up form decides the same way: a refused address joins the waitlist.
+        let refused = at("saved.test");
+        c.s.post("/auth/link")
+            .json(&json!({"email": refused}))
+            .await
+            .assert_status(axum::http::StatusCode::ACCEPTED);
+        let mut source = None;
+        for _ in 0..50 {
+            let row = waitlist_signups::Entity::find()
+                .filter(waitlist_signups::Column::Email.eq(refused.as_str()))
+                .one(&c.db)
+                .await
+                .unwrap();
+            if let Some(row) = row {
+                source = row.source;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(source.as_deref(), Some("signup"));
+
+        // Open: anyone, whatever SIGNUP_DOMAINS says.
+        put(json!({"mode": "open"})).await.assert_status_ok();
+        let open = c.get(path, &admin).await;
+        assert_eq!(
+            open,
+            json!({"mode": "open", "domains": [], "source": "saved"})
+        );
+        assert!(c.sign_in(&at("anywhere.test")).await.is_some());
+        c.done().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn openapi_documents_the_console() {
+        let (s, _) = server().await;
+        let doc = s.get("/openapi.json").await.json::<Value>();
+        for (path, method) in [
+            ("/admin/overview", "get"),
+            ("/admin/users", "get"),
+            ("/admin/teams", "get"),
+            ("/admin/waitlist/{id}/approve", "post"),
+            ("/admin/waitlist/{id}", "delete"),
+            ("/admin/settings/signup", "get"),
+            ("/admin/settings/signup", "put"),
         ] {
             assert!(doc["paths"][path][method].is_object(), "{path}");
         }
