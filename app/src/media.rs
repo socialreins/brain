@@ -34,8 +34,8 @@ pub const MAX_STILL_BYTES: usize = socialreins_core::post::MAX_MEDIA_BYTES as us
 pub const SWEEP_DAYS: i32 = 7;
 const MAX_REDIRECTS: usize = 3;
 /// A download's base time: its answer must start within it, and the whole file may take it plus
-/// its size at `MIN_SPEED` (the size the server said, else the cap), so 60 s for a small image
-/// and about 3.5 minutes for 300 MB.
+/// its size at `MIN_SPEED` (the size the server said, else the bytes that came so far), so 60 s
+/// for a small image and about 3.5 minutes for 300 MB.
 pub const INGEST_DEADLINE: Duration = Duration::from_secs(60);
 /// The slowest download that still finishes in time, in bytes a second.
 pub const MIN_SPEED: u64 = 2_000_000;
@@ -644,8 +644,14 @@ impl Media {
                 Fail::TooLargeStill
             });
         }
-        let expected = res.content_length().unwrap_or(cap as u64);
-        let until = until.min(started + self.deadline + Duration::from_secs(expected / MIN_SPEED));
+        // The time a download has: its size at `MIN_SPEED` on top of `deadline`. Size unsaid, it
+        // is the bytes that came so far, so a download earns its time only as it arrives at a
+        // healthy rate, and a small file of unknown size gets no more than a sized one.
+        let (known, ceiling, deadline) = (res.content_length(), until, self.deadline);
+        let by = move |got: usize| {
+            let size = known.unwrap_or(got as u64);
+            ceiling.min(started + deadline + Duration::from_secs(size / MIN_SPEED))
+        };
         let stall = self.stall;
         let read = |e: reqwest::Error| {
             tracing::warn!(error = %e.without_url(), post = %post, "media download failed");
@@ -654,7 +660,8 @@ impl Media {
         // Only the first bytes are kept to tell the type; the rest goes straight to storage.
         let mut head = Vec::new();
         while head.len() < SNIFF_LEN {
-            let chunk = tokio::time::timeout_at(until, tokio::time::timeout(stall, res.chunk()));
+            let chunk = tokio::time::timeout(stall, res.chunk());
+            let chunk = tokio::time::timeout_at(by(head.len()), chunk);
             let chunk = chunk.await.map_err(|_| Fail::TimedOut)?;
             match chunk.map_err(|_| Fail::Stalled)?.map_err(read)? {
                 Some(chunk) => head.extend_from_slice(&chunk),
@@ -688,27 +695,30 @@ impl Media {
         let mut upload = Upload(Arc::new(tokio::sync::Mutex::new(upload)));
         let mut file = WriteMultipart::new_with_chunk_size(Box::new(upload.clone()), PART_BYTES);
         file.write(&head);
+        // Past the deadline the upload is aborted, so no partial file stays behind.
         let streamed = async {
             loop {
-                let chunk = tokio::time::timeout(stall, res.chunk()).await;
-                let Some(chunk) = chunk.map_err(|_| Fail::Stalled)?.map_err(read)? else {
+                let step = async {
+                    let chunk = tokio::time::timeout(stall, res.chunk()).await;
+                    let chunk = chunk.map_err(|_| Fail::Stalled)?.map_err(read)?;
+                    // Storage slower than the download holds the download back, not the bytes.
+                    file.wait_for_capacity(PARTS_IN_FLIGHT)
+                        .await
+                        .map_err(storage)?;
+                    Ok(chunk)
+                };
+                let step = tokio::time::timeout_at(by(size), step).await;
+                let Some(chunk) = step.unwrap_or(Err(Fail::TimedOut))? else {
                     return Ok(());
                 };
                 size += chunk.len();
                 if size > cap {
                     return Err(over);
                 }
-                // Storage slower than the download holds the download back, not the bytes.
-                file.wait_for_capacity(PARTS_IN_FLIGHT)
-                    .await
-                    .map_err(storage)?;
                 file.write(&chunk);
             }
         };
-        // Past the deadline the upload is aborted, so no partial file stays behind.
-        let streamed = tokio::time::timeout_at(until, streamed)
-            .await
-            .unwrap_or(Err(Fail::TimedOut));
+        let streamed: Result<(), Fail> = streamed.await;
         match streamed {
             Ok(()) => {
                 if let Err(e) = file.finish().await {
@@ -2124,15 +2134,15 @@ mod tests {
         assert_eq!(got.unwrap_err(), Fail::Stalled);
         assert!(started.elapsed() < Duration::from_secs(3), "failed fast");
 
-        // Bytes keep coming, but slower than `MIN_SPEED`: the deadline its size allows ends it.
-        // Size unsaid, so that is the cap's: 0.3 s and 2 MB at 2 MB a second.
+        // Bytes keep coming, but slower than `MIN_SPEED`, and their size is unsaid: only bytes
+        // that came earn more time, so the base deadline ends it however large the cap is.
         media.deadline = Duration::from_millis(300);
         let started = Instant::now();
         let got = media
             .download(
                 Uuid::now_v7(),
                 &format!("{base}/slow.mp4"),
-                2_000_000,
+                MAX_BYTES,
                 soon(),
                 &mut None,
             )
@@ -2140,10 +2150,10 @@ mod tests {
         assert_eq!(got.unwrap_err(), Fail::TimedOut);
         let took = started.elapsed();
         assert!(
-            took >= Duration::from_secs(1) && took < Duration::from_secs(4),
+            took >= Duration::from_millis(300) && took < Duration::from_secs(3),
             "{took:?}"
         );
-        // A larger cap allows more time, and the post's ceiling ends it whatever the size.
+        // The post's ceiling ends a download whatever its size.
         media.ceiling = Duration::from_millis(200);
         let until = Instant::now() + media.ceiling;
         let started = Instant::now();

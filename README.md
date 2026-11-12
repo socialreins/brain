@@ -719,7 +719,7 @@ holds about 15 MB however large the file) and typed by its first bytes. A video 
 (`MEDIA_MAX_BYTES` lowers it; Bluesky takes 100 MB and X 512 MB), any other file 100 MB; a file
 over its cap is refused by its `Content-Length`, else the moment its bytes pass it, and nothing of
 it stays stored. Each download has 60 seconds plus its size at 2 MB a second (about 3.5 minutes
-for 300 MB), all of a post's 12 minutes together, and a server silent for 30 seconds fails at
+for 300 MB; when its server does not say its size, the size is the bytes that came so far, so a slow one ends early), all of a post's 12 minutes together, and a server silent for 30 seconds fails at
 once. Posts of one group that carry the same video download it once: the others copy it inside
 the storage (per brain instance). Types are JPEG, PNG, WebP, GIF, MP4, MOV and PDF (only LinkedIn
 takes a PDF). A still image (JPEG, PNG or WebP) over the platform's limit for one image (Bluesky
