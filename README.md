@@ -270,7 +270,9 @@ other codes have none. `account_ids` are the set's accounts of that platform (no
 problem, as for a create). The top `problems` holds what is wrong with the request as a whole,
 in the same shape: `invalid_set` and `no_accounts` (both leave `platforms` empty),
 `invalid_override`, `too_many_posts` and a list's `not_found`, `invalid_position` or
-`invalid_set`. `ok` is whether the same request without the flag would create every post. A
+`invalid_set`. The post cap and the list are checked whether or not the posts themselves are
+valid, and the first such problem is listed. A post with `too_many_images` or `too_many_parts`
+has none of its files fetched, so it lists no media type or size problem. `ok` is whether the same request without the flag would create every post. A
 body that cannot be read is still `422 invalid_body`, and a flag other than `true` or `false`
 `422 invalid_query`. The flag is read from the query only: a body with a `validate_only` key
 (what the MCP tools take) is `422 validate_only_in_body` on both routes, whatever its value,
