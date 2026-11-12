@@ -27,7 +27,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use super::{
-    api_tokens::{bearer_secret, find_live, limited, read_only_token, Actor},
+    api_tokens::{bearer_secret, find_live, limited, read_only_token, validates_only, Actor},
     auth::internal,
     waitlist::{error, Error},
 };
@@ -64,10 +64,11 @@ fn kept(status: StatusCode) -> bool {
 
 /// The `/v1` middleware.
 pub async fn layer(State(app): State<AppState>, req: Request, next: Next) -> Response {
+    // A validate-only create writes nothing, so it takes no key: nothing stored, nothing replayed.
     let writes = matches!(
         *req.method(),
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-    );
+    ) && !validates_only(req.method(), req.uri());
     let headers = req.headers();
     let key = headers
         .get("idempotency-key")

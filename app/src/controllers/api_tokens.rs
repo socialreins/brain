@@ -5,8 +5,8 @@
 //! read_only_token` (the `Actor` extractor, the idempotency layer and the `/mcp` write tools).
 //! `Actor` is the extractor of the few routes that take a token as well as a session.
 use axum::{
-    extract::{FromRequestParts, Path, State},
-    http::{header, request::Parts, HeaderValue, StatusCode},
+    extract::{FromRequestParts, Path, Query, State},
+    http::{header, request::Parts, HeaderValue, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
@@ -20,7 +20,7 @@ use socialreins_core::{
     team::{self, Role},
     token,
 };
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
@@ -171,6 +171,36 @@ impl Actor {
     }
 }
 
+/// `?validate_only=true` on `POST /posts` and `POST /post-groups`.
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ValidateOnly {
+    /// `true`: check the request and create nothing. `200` with a `Validation` listing every
+    /// problem the create would refuse (all of them, per platform), by the create's own code.
+    /// A read-only token may send it; an `Idempotency-Key` is ignored. Anything but `true` or
+    /// `false` is `422 invalid_query`.
+    #[serde(default)]
+    pub validate_only: bool,
+}
+
+/// The `validate_only` of a request's query; `None` when the query cannot be read. The routes,
+/// the `Actor` extractor and the idempotency layer all ask here, so they cannot disagree on
+/// whether a request writes.
+pub fn validate_only(uri: &Uri) -> Option<bool> {
+    let q = Query::<ValidateOnly>::try_from_uri(uri).ok()?;
+    Some(q.0.validate_only)
+}
+
+/// Whether the request is a create that only validates, so it writes nothing: `POST /posts` or
+/// `POST /post-groups` with `?validate_only=true`.
+pub fn validates_only(method: &Method, uri: &Uri) -> bool {
+    let path = uri.path();
+    let path = path.strip_prefix("/v1").unwrap_or(path);
+    method == Method::POST
+        && matches!(path, "/posts" | "/post-groups")
+        && validate_only(uri) == Some(true)
+}
+
 /// The secret of an `Authorization: Bearer sr_...` header; `None` for any other value.
 pub fn bearer_secret(auth: &HeaderValue) -> Option<&str> {
     auth.to_str()
@@ -240,7 +270,8 @@ impl FromRequestParts<AppState> for Actor {
     async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, Response> {
         if let Some(auth) = parts.headers.get(header::AUTHORIZATION) {
             let a = Self::from_bearer(app, Some(auth)).await.map_err(|r| *r)?;
-            if a.read_only() && !parts.method.is_safe() {
+            let writes = !parts.method.is_safe() && !validates_only(&parts.method, &parts.uri);
+            if a.read_only() && writes {
                 return Err(read_only_token());
             }
             return Ok(a);

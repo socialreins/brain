@@ -85,6 +85,25 @@ struct Reorder {
     order: Order,
 }
 
+/// A create tool's arguments: the route's body, and its `?validate_only`.
+#[derive(Deserialize, JsonSchema)]
+struct Create<T> {
+    #[serde(flatten)]
+    input: T,
+    /// `true`: check the request and create nothing; the answer lists every problem the create
+    /// would refuse, per platform. Allowed with a read-only token.
+    #[serde(default)]
+    validate_only: bool,
+}
+
+/// Whether a call of tool `name` writes: every tool not marked read-only, but for a create with
+/// `validate_only: true`, which creates nothing.
+fn writes(name: &str, v: &Value) -> bool {
+    let validates =
+        matches!(name, "create-post" | "create-post-group") && v["validate_only"] == json!(true);
+    !validates && specs().into_iter().any(|s| s.0 == name && !s.3)
+}
+
 /// Name, description, argument schema and read-only hint of each tool.
 fn specs() -> Vec<(&'static str, &'static str, Value, bool)> {
     fn schema<T: JsonSchema>() -> Value {
@@ -95,8 +114,8 @@ fn specs() -> Vec<(&'static str, &'static str, Value, bool)> {
         ("list-social-accounts", "The team's connected social accounts with their set ids. Same as GET /v1/connections.", schema::<NoArgs>(), true),
         ("list-posts", "The team's posts by scheduled_at, filtered by set, status and a from/to window on scheduled_at. Same as GET /v1/posts.", schema::<PostQuery>(), true),
         ("get-post", "One post with its targets. Same as GET /v1/posts/{id}.", schema::<PostId>(), true),
-        ("create-post", "Creates a post: scheduled with scheduled_at, else draft. Same as POST /v1/posts.", schema::<PostInput>(), false),
-        ("create-post-group", "Creates one post per platform of a set (by default every platform with a connected account), with optional per-platform body and media overrides, tied by a group_id; any invalid post creates nothing. Same as POST /v1/post-groups.", schema::<PostGroupInput>(), false),
+        ("create-post", "Creates a post: scheduled with scheduled_at, else draft. With validate_only nothing is created and the answer lists every problem. Same as POST /v1/posts.", schema::<Create<PostInput>>(), false),
+        ("create-post-group", "Creates one post per platform of a set (by default every platform with a connected account), with optional per-platform body and media overrides, tied by a group_id; any invalid post creates nothing, unless on_invalid is skip, which leaves that platform out and lists it in skipped. With validate_only nothing is created and the answer lists every problem of every platform. Same as POST /v1/post-groups.", schema::<Create<PostGroupInput>>(), false),
         ("update-post", "Replaces a draft or scheduled post. Same as PUT /v1/posts/{id}.", schema::<UpdatePost>(), false),
         ("delete-post", "Deletes a draft or scheduled post, or takes a published one down. Same as DELETE /v1/posts/{id}.", schema::<PostId>(), false),
         ("list-lists", "The team's post lists (ordered groups of posts, such as a series), without their posts. Same as GET /v1/lists.", schema::<NoArgs>(), true),
@@ -172,12 +191,12 @@ async fn run(app: &AppState, a: &Actor, name: &str, v: Value) -> Option<Response
             Some(p) => posts::get_post(app, a, p.id).await,
             None => invalid("invalid_body"),
         },
-        "create-post" => match args(v) {
-            Some(p) => posts::create_post(app, a, p).await,
+        "create-post" => match args::<Create<PostInput>>(v) {
+            Some(c) => posts::create_post(app, a, c.input, c.validate_only).await,
             None => invalid("invalid_body"),
         },
-        "create-post-group" => match args(v) {
-            Some(g) => posts::create_post_group(app, a, g).await,
+        "create-post-group" => match args::<Create<PostGroupInput>>(v) {
+            Some(c) => posts::create_post_group(app, a, c.input, c.validate_only).await,
             None => invalid("invalid_body"),
         },
         "update-post" => match args::<UpdatePost>(v) {
@@ -265,8 +284,7 @@ impl ServerHandler for McpServer {
             .ok_or_else(|| ErrorData::internal_error("no caller", None))?;
         let v = Value::Object(request.arguments.unwrap_or_default());
         let name = request.name.as_ref();
-        let writes = specs().into_iter().any(|s| s.0 == name && !s.3);
-        if writes && actor.read_only() {
+        if actor.read_only() && writes(name, &v) {
             return Ok(to_result(read_only_token()).await.into());
         }
         match run(&self.app, actor, name, v).await {

@@ -131,6 +131,83 @@ impl Invalid {
     }
 }
 
+impl Invalid {
+    /// The request field the problem is in.
+    pub fn field(&self) -> &'static str {
+        match self {
+            Self::UnsupportedPlatform => "platform",
+            Self::Empty | Self::TooLong | Self::InvalidText => "body",
+            Self::TooManyImages
+            | Self::InvalidMedia
+            | Self::MediaRequired
+            | Self::MediaTypeUnsupported
+            | Self::MixedMedia
+            | Self::MediaTooLarge => "media",
+            Self::TooManyParts | Self::ThreadUnsupported => "thread",
+            Self::FirstCommentUnsupported | Self::FirstCommentTooLong => "first_comment",
+            Self::CoverUnsupported
+            | Self::InvalidCover
+            | Self::CoverNeedsOneVideo
+            | Self::InvalidCoverType
+            | Self::CoverTooLarge => "cover",
+            Self::TikTokUnsupported
+            | Self::TikTokPrivacyRequired
+            | Self::InvalidTikTokPrivacy
+            | Self::InvalidTikTokDisclosure
+            | Self::TikTokDisclosureIncomplete
+            | Self::TikTokBrandedPrivate
+            | Self::TikTokPrivacyNotOffered => "tiktok",
+            Self::YouTubeUnsupported | Self::InvalidYouTubePrivacy => "youtube",
+        }
+    }
+}
+
+/// One thing wrong with a post, with the numbers the check knew. The `validate*` fns answer the
+/// first of the `check*` fn of the same name, so the two can never disagree.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Problem {
+    pub invalid: Invalid,
+    /// The 1-based thread part the problem is in.
+    pub part: Option<usize>,
+    /// The most the platform takes, in the unit `detail` names.
+    pub limit: Option<u64>,
+    /// What the post has, in the same unit.
+    pub actual: Option<u64>,
+    pub detail: Option<String>,
+}
+
+impl From<Invalid> for Problem {
+    fn from(invalid: Invalid) -> Self {
+        Self {
+            invalid,
+            part: None,
+            limit: None,
+            actual: None,
+            detail: None,
+        }
+    }
+}
+
+impl Problem {
+    fn new(invalid: Invalid) -> Self {
+        invalid.into()
+    }
+
+    fn over(invalid: Invalid, limit: u64, actual: u64, detail: String) -> Self {
+        Self {
+            limit: Some(limit),
+            actual: Some(actual),
+            detail: Some(detail),
+            ..Self::new(invalid)
+        }
+    }
+}
+
+/// The first problem as the error it was before problems were collected.
+fn first<T>(problems: Vec<Problem>, f: impl Fn(Problem) -> T) -> Result<(), T> {
+    problems.into_iter().next().map_or(Ok(()), |p| Err(f(p)))
+}
+
 /// A public `https://` URL: a host, no spaces or control characters, at most 2048 bytes.
 pub fn https_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
@@ -205,52 +282,98 @@ pub fn x_weight(text: &str) -> usize {
 /// Checks a post for `platform` (`bluesky`, `threads`, `linkedin`, `facebook`, `instagram`,
 /// `youtube`, `x` or `tiktok`, the ones that publish today).
 pub fn validate(platform: &str, body: &str, media: &[String]) -> Result<(), Invalid> {
-    let chars = || body.chars().count();
-    let (too_long, max_media) = match platform {
+    first(check(platform, body, media), |p| p.invalid)
+}
+
+/// Every problem `validate` could answer for the post, in its order. A text length comes as
+/// `(actual, limit, unit)` in the platform's own unit.
+pub fn check(platform: &str, body: &str, media: &[String]) -> Vec<Problem> {
+    let chars = |max: usize| vec![(body.chars().count(), max, "characters")];
+    let (lengths, max_media) = match platform {
         "bluesky" => (
-            body.len() > BLUESKY_MAX_BYTES || body.graphemes(true).count() > BLUESKY_MAX_GRAPHEMES,
+            vec![
+                (
+                    body.graphemes(true).count(),
+                    BLUESKY_MAX_GRAPHEMES,
+                    "graphemes",
+                ),
+                (body.len(), BLUESKY_MAX_BYTES, "bytes"),
+            ],
             BLUESKY_MAX_IMAGES,
         ),
         // shortcut: counts characters, while Threads counts an emoji by its UTF-8 bytes, so an
         // emoji-heavy post near 500 may still be refused at publish; count like Threads if it bites.
-        "threads" => (chars() > THREADS_MAX_CHARS, THREADS_MAX_MEDIA),
-        "linkedin" => (chars() > LINKEDIN_MAX_CHARS, LINKEDIN_MAX_MEDIA),
-        "facebook" => (chars() > FACEBOOK_MAX_CHARS, FACEBOOK_MAX_MEDIA),
-        "instagram" => (chars() > INSTAGRAM_MAX_CHARS, INSTAGRAM_MAX_MEDIA),
-        "x" => (x_weight(body) > X_MAX_WEIGHT, X_MAX_MEDIA),
+        "threads" => (chars(THREADS_MAX_CHARS), THREADS_MAX_MEDIA),
+        "linkedin" => (chars(LINKEDIN_MAX_CHARS), LINKEDIN_MAX_MEDIA),
+        "facebook" => (chars(FACEBOOK_MAX_CHARS), FACEBOOK_MAX_MEDIA),
+        "instagram" => (chars(INSTAGRAM_MAX_CHARS), INSTAGRAM_MAX_MEDIA),
+        "x" => (
+            vec![(x_weight(body), X_MAX_WEIGHT, "characters as X counts them")],
+            X_MAX_MEDIA,
+        ),
         // TikTok counts UTF-16 code units, so an emoji is two.
         "tiktok" => (
-            body.encode_utf16().count() > TIKTOK_MAX_CHARS,
+            vec![(
+                body.encode_utf16().count(),
+                TIKTOK_MAX_CHARS,
+                "UTF-16 code units",
+            )],
             TIKTOK_MAX_MEDIA,
         ),
         "youtube" => {
             let (title, description) = youtube_text(body);
-            let too_long = title.chars().count() > YOUTUBE_MAX_TITLE
-                || description.len() > YOUTUBE_MAX_DESCRIPTION;
-            (too_long, 1)
+            let lengths = vec![
+                (
+                    title.chars().count(),
+                    YOUTUBE_MAX_TITLE,
+                    "characters in the title (the first line)",
+                ),
+                (
+                    description.len(),
+                    YOUTUBE_MAX_DESCRIPTION,
+                    "bytes in the description",
+                ),
+            ];
+            (lengths, 1)
         }
-        _ => return Err(Invalid::UnsupportedPlatform),
+        _ => return vec![Problem::new(Invalid::UnsupportedPlatform)],
     };
+    let mut found = Vec::new();
     // A video needs a title, so a YouTube post needs a body even with its video.
     if body.trim().is_empty() && (media.is_empty() || platform == "youtube") {
-        return Err(Invalid::Empty);
+        found.push(Problem::new(Invalid::Empty));
     }
     if matches!(platform, "instagram" | "youtube" | "tiktok") && media.is_empty() {
-        return Err(Invalid::MediaRequired);
+        found.push(Problem::new(Invalid::MediaRequired));
     }
     if platform == "youtube" && body.contains(['<', '>']) {
-        return Err(Invalid::InvalidText);
+        found.push(Problem::new(Invalid::InvalidText));
     }
-    if too_long {
-        return Err(Invalid::TooLong);
+    if let Some((actual, max, unit)) = lengths.into_iter().find(|(n, max, _)| n > max) {
+        let detail = format!("The text is {actual} {unit}; the limit is {max}.");
+        found.push(Problem::over(
+            Invalid::TooLong,
+            max as u64,
+            actual as u64,
+            detail,
+        ));
     }
     if media.len() > max_media {
-        return Err(Invalid::TooManyImages);
+        let detail = format!(
+            "The post has {} media items; the limit is {max_media}.",
+            media.len()
+        );
+        found.push(Problem::over(
+            Invalid::TooManyImages,
+            max_media as u64,
+            media.len() as u64,
+            detail,
+        ));
     }
     if !media.iter().all(|m| https_url(m)) {
-        return Err(Invalid::InvalidMedia);
+        found.push(Problem::new(Invalid::InvalidMedia));
     }
-    Ok(())
+    found
 }
 
 /// The first comment as stored: `None` when absent or blank.
@@ -261,20 +384,29 @@ pub fn first_comment(text: Option<&str>) -> Option<&str> {
 /// Checks a first comment (already through `first_comment`) for `platform`: only Facebook,
 /// Instagram, LinkedIn and YouTube post one.
 pub fn validate_first_comment(platform: &str, text: Option<&str>) -> Result<(), Invalid> {
-    let Some(text) = text else {
-        return Ok(());
-    };
+    check_first_comment(platform, text).map_or(Ok(()), |p| Err(p.invalid))
+}
+
+/// `validate_first_comment`, as a problem.
+pub fn check_first_comment(platform: &str, text: Option<&str>) -> Option<Problem> {
+    let text = text?;
     let max = match platform {
         "facebook" => FACEBOOK_COMMENT_MAX_CHARS,
         "instagram" => INSTAGRAM_COMMENT_MAX_CHARS,
         "linkedin" => LINKEDIN_COMMENT_MAX_CHARS,
         "youtube" => YOUTUBE_COMMENT_MAX_CHARS,
-        _ => return Err(Invalid::FirstCommentUnsupported),
+        _ => return Some(Problem::new(Invalid::FirstCommentUnsupported)),
     };
-    if text.chars().count() > max {
-        return Err(Invalid::FirstCommentTooLong);
-    }
-    Ok(())
+    let actual = text.chars().count();
+    (actual > max).then(|| {
+        let detail = format!("The first comment is {actual} characters; the limit is {max}.");
+        Problem::over(
+            Invalid::FirstCommentTooLong,
+            max as u64,
+            actual as u64,
+            detail,
+        )
+    })
 }
 
 /// The cover image URL as stored: `None` when absent or blank.
@@ -455,23 +587,31 @@ pub fn validate_media_facts(
     platform: &str,
     facts: &[Option<MediaFact>],
 ) -> Result<(), (Invalid, String)> {
+    first(check_media_facts(platform, facts), |p| {
+        (p.invalid, p.detail.unwrap_or_default())
+    })
+}
+
+/// Every problem `validate_media_facts` could answer, in its order: each file's (its type, else
+/// its size), then a mix.
+pub fn check_media_facts(platform: &str, facts: &[Option<MediaFact>]) -> Vec<Problem> {
     let (types, what) = media_types(platform);
+    let mut found = Vec::new();
     for (i, f) in facts.iter().enumerate() {
         let Some(f) = f else { continue };
         let n = i + 1;
         if !types.contains(&f.content_type) {
-            return Err((
-                Invalid::MediaTypeUnsupported,
-                format!("Media {n} is not {what}."),
-            ));
+            found.push(Problem {
+                detail: Some(format!("Media {n} is not {what}.")),
+                ..Problem::new(Invalid::MediaTypeUnsupported)
+            });
+            continue;
         }
         let (max, whose) = size_limit(platform, f.content_type, f.animated);
-        if f.size.is_some_and(|s| s > max) {
+        if let Some(size) = f.size.filter(|s| *s > max) {
             let mb = max / 1_000_000;
-            return Err((
-                Invalid::MediaTooLarge,
-                format!("Media {n} is over {mb} MB, {whose}."),
-            ));
+            let detail = format!("Media {n} is over {mb} MB, {whose}.");
+            found.push(Problem::over(Invalid::MediaTooLarge, max, size, detail));
         }
     }
     if facts.len() > 1 {
@@ -480,10 +620,13 @@ pub fn validate_media_facts(
             .flatten()
             .find_map(|f| alone(platform, f.content_type))
         {
-            return Err((Invalid::MixedMedia, msg.to_owned()));
+            found.push(Problem {
+                detail: Some(msg.to_owned()),
+                ..Problem::new(Invalid::MixedMedia)
+            });
         }
     }
-    Ok(())
+    found
 }
 
 /// The cover image types and size limit of `platform`, as its API documents: Instagram a JPEG of
@@ -505,13 +648,23 @@ pub fn validate_cover_facts(
     cover: Option<MediaFact>,
     video: Option<MediaFact>,
 ) -> Result<(), (Invalid, String)> {
+    check_cover_facts(platform, cover, video)
+        .map_or(Ok(()), |p| Err((p.invalid, p.detail.unwrap_or_default())))
+}
+
+/// `validate_cover_facts`, as a problem.
+pub fn check_cover_facts(
+    platform: &str,
+    cover: Option<MediaFact>,
+    video: Option<MediaFact>,
+) -> Option<Problem> {
     if video.is_some_and(|v| !v.content_type.starts_with("video/")) {
-        return Err((
-            Invalid::CoverNeedsOneVideo,
-            "A cover needs a post with exactly one video.".into(),
-        ));
+        return Some(Problem {
+            detail: Some("A cover needs a post with exactly one video.".into()),
+            ..Problem::new(Invalid::CoverNeedsOneVideo)
+        });
     }
-    let Some(c) = cover else { return Ok(()) };
+    let c = cover?;
     let (types, max) = cover_limits(platform);
     if !types.contains(&c.content_type) {
         let what = if types.contains(&WEBP) {
@@ -519,18 +672,14 @@ pub fn validate_cover_facts(
         } else {
             "JPEG or PNG"
         };
-        return Err((
-            Invalid::InvalidCoverType,
-            format!("The cover image is not a {what}."),
-        ));
+        return Some(Problem {
+            detail: Some(format!("The cover image is not a {what}.")),
+            ..Problem::new(Invalid::InvalidCoverType)
+        });
     }
-    if c.size.is_some_and(|s| s > max) {
-        return Err((
-            Invalid::CoverTooLarge,
-            format!("The cover image is over {} MB.", max / 1_000_000),
-        ));
-    }
-    Ok(())
+    let size = c.size.filter(|s| *s > max)?;
+    let detail = format!("The cover image is over {} MB.", max / 1_000_000);
+    Some(Problem::over(Invalid::CoverTooLarge, max, size, detail))
 }
 
 /// The privacy levels TikTok knows; an account is offered some of them.
@@ -601,19 +750,37 @@ pub fn validate_thread(
     platform: &str,
     parts: &[(&str, &[String])],
 ) -> Result<(), (Invalid, Option<usize>)> {
+    first(check_thread(platform, parts), |p| (p.invalid, p.part))
+}
+
+/// Every problem `validate_thread` could answer, in its order, each part's with its `part`.
+pub fn check_thread(platform: &str, parts: &[(&str, &[String])]) -> Vec<Problem> {
     if parts.is_empty() {
-        return Ok(());
+        return Vec::new();
     }
     if !matches!(platform, "bluesky" | "threads" | "x") {
-        return Err((Invalid::ThreadUnsupported, None));
+        return vec![Problem::new(Invalid::ThreadUnsupported)];
     }
     if parts.len() > MAX_THREAD_PARTS {
-        return Err((Invalid::TooManyParts, None));
+        let detail = format!(
+            "The thread has {} follow-up posts; the limit is {MAX_THREAD_PARTS}.",
+            parts.len()
+        );
+        return vec![Problem::over(
+            Invalid::TooManyParts,
+            MAX_THREAD_PARTS as u64,
+            parts.len() as u64,
+            detail,
+        )];
     }
+    let mut found = Vec::new();
     for (i, (body, media)) in parts.iter().enumerate() {
-        validate(platform, body, media).map_err(|e| (e, Some(i + 1)))?;
+        found.extend(check(platform, body, media).into_iter().map(|p| Problem {
+            part: Some(i + 1),
+            ..p
+        }));
     }
-    Ok(())
+    found
 }
 
 /// A link in a post body: UTF-8 byte offsets `[start, end)` and the URL, as Bluesky's link
