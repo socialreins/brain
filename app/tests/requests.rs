@@ -4200,33 +4200,42 @@ mod teams {
                     async move { posts::Entity::find().count(db).await.unwrap() }
                 };
                 let before = count().await;
-                for (paths, code, detail) in [
+                // Only a size problem has a `limit` and an `actual`.
+                let size = json!({"limit": 1_000_000, "actual": 1_000_001});
+                for (paths, code, detail, more) in [
                     (
                         vec!["/big.gif"],
                         "media_too_large",
                         "Media 1 is over 1 MB, Bluesky's limit for a GIF.",
+                        size.clone(),
                     ),
                     (
                         vec!["/moving.webp"],
                         "media_too_large",
                         "Media 1 is over 1 MB, Bluesky's limit for an animated image.",
+                        size,
                     ),
                     (
                         vec!["/img.png", "/clip.mp4"],
                         "mixed_media",
                         "Bluesky takes up to 4 images or one video, not a mix.",
+                        json!({}),
                     ),
                     (
                         vec!["/doc.pdf"],
                         "media_type_not_supported",
                         "Media 1 is not a JPEG, PNG, WebP or GIF image or an MP4 or MOV video.",
+                        json!({}),
                     ),
                 ] {
                     let res = create(&s, &cookie, with(&paths)).await;
                     assert_eq!(res.status_code(), 422, "{paths:?}: {}", res.text());
-                    res.assert_json(
-                        &json!({"error": code, "platform": "bluesky", "detail": detail}),
-                    );
+                    let mut want = json!({"error": code, "platform": "bluesky", "field": "media",
+                        "detail": detail});
+                    want.as_object_mut()
+                        .unwrap()
+                        .extend(more.as_object().unwrap().clone());
+                    res.assert_json(&want);
                 }
                 // A thread post's media names its part.
                 let mut threaded = with(&[]);
@@ -4397,20 +4406,40 @@ mod teams {
                 too_many["media"] = json!(five);
                 let mut other_platform = input(&set, "x", None);
                 other_platform["platform"] = json!("myspace");
-                for (body, code) in [
-                    (input(&set, &"a".repeat(301), None), "too_long"),
-                    (input(&set, "  ", None), "empty_post"),
-                    (bad_media, "invalid_media"),
-                    (too_many, "too_many_images"),
-                    (other_platform, "unsupported_platform"),
+                for (body, want) in [
+                    (
+                        input(&set, &"a".repeat(301), None),
+                        json!({"error": "too_long", "platform": "bluesky", "field": "body",
+                            "limit": 300, "actual": 301,
+                            "detail": "The text is 301 graphemes; the limit is 300."}),
+                    ),
+                    (
+                        input(&set, "  ", None),
+                        json!({"error": "empty_post", "platform": "bluesky", "field": "body"}),
+                    ),
+                    (
+                        bad_media,
+                        json!({"error": "invalid_media", "platform": "bluesky", "field": "media"}),
+                    ),
+                    (
+                        too_many,
+                        json!({"error": "too_many_images", "platform": "bluesky", "field": "media",
+                            "limit": 4, "actual": 5,
+                            "detail": "The post has 5 media items; the limit is 4."}),
+                    ),
+                    (
+                        other_platform,
+                        json!({"error": "unsupported_platform", "platform": "myspace",
+                            "field": "platform"}),
+                    ),
                     (
                         input(&uuid::Uuid::now_v7().to_string(), "x", None),
-                        "invalid_set",
+                        json!({"error": "invalid_set"}),
                     ),
                 ] {
                     let res = create(&s, &owner, body).await;
-                    assert_eq!(res.status_code(), 422, "{code}");
-                    res.assert_json(&json!({ "error": code }));
+                    assert_eq!(res.status_code(), 422, "{want}");
+                    res.assert_json(&want);
                 }
 
                 let list = |q: String| {
@@ -4576,23 +4605,24 @@ mod teams {
 
                 // One invalid post creates nothing and names its platform.
                 let before = count().await;
-                for (body, code, platform) in [
+                for (body, want) in [
                     (
                         json!({"social_set_id": set, "platforms": ["bluesky", "myspace"],
                             "body": "hi"}),
-                        "unsupported_platform",
-                        "myspace",
+                        json!({"error": "unsupported_platform", "platform": "myspace",
+                            "field": "platform"}),
                     ),
                     (
                         json!({"social_set_id": set, "body": "hi",
                             "overrides": {"bluesky": {"body": "a".repeat(301)}}}),
-                        "too_long",
-                        "bluesky",
+                        json!({"error": "too_long", "platform": "bluesky", "field": "body",
+                            "limit": 300, "actual": 301,
+                            "detail": "The text is 301 graphemes; the limit is 300."}),
                     ),
                 ] {
                     let res = group(body).await;
-                    assert_eq!(res.status_code(), 422, "{code}");
-                    res.assert_json(&json!({"error": code, "platform": platform}));
+                    assert_eq!(res.status_code(), 422, "{want}");
+                    res.assert_json(&want);
                 }
                 // An unknown list fails the post, also named.
                 let res = group(json!({"social_set_id": set, "body": "hi",
@@ -4641,7 +4671,7 @@ mod teams {
                 let res =
                     group(json!({"social_set_id": set, "platforms": ["myspace"], "body": "hi"}))
                         .await;
-                res.assert_json(&json!({"error": "unsupported_platform", "platform": "myspace"}));
+                res.assert_json(&json!({"error": "unsupported_platform", "platform": "myspace", "field": "platform"}));
                 assert_eq!(count().await, before + 1);
 
                 // A group body may run well past the 4 KiB `/v1` limit.
@@ -5270,16 +5300,26 @@ mod teams {
                 for (body, want) in [
                     (
                         thread_input(&set, "root", &many),
-                        json!({"error": "too_many_parts"}),
+                        json!({"error": "too_many_parts", "platform": "bluesky", "field": "thread",
+                            "limit": 25, "actual": 26,
+                            "detail": "The thread has 26 follow-up posts; the limit is 25."}),
                     ),
                     (
                         thread_input(&set, "root", &["ok", &long]),
-                        json!({"error": "too_long", "part": 2}),
+                        json!({"error": "too_long", "platform": "bluesky", "field": "body",
+                            "part": 2, "limit": 300, "actual": 301,
+                            "detail": "The text is 301 graphemes; the limit is 300."}),
                     ),
-                    (five_images, json!({"error": "too_many_images", "part": 2})),
+                    (
+                        five_images,
+                        json!({"error": "too_many_images", "platform": "bluesky", "field": "media",
+                            "part": 2, "limit": 4, "actual": 5,
+                            "detail": "The post has 5 media items; the limit is 4."}),
+                    ),
                     (
                         thread_input(&set, "root", &[" "]),
-                        json!({"error": "empty_post", "part": 1}),
+                        json!({"error": "empty_post", "platform": "bluesky", "field": "body",
+                            "part": 1}),
                     ),
                 ] {
                     let res = create(&s, &cookie, body).await;
@@ -5943,7 +5983,11 @@ mod teams {
                         "thread": [{"body": long}]}))
                     .await;
                 assert_eq!(res.status_code(), 422);
-                res.assert_json(&json!({"error": "too_long", "part": 1, "platform": "bluesky"}));
+                res.assert_json(
+                    &json!({"error": "too_long", "platform": "bluesky", "field": "body", "part": 1,
+                    "limit": 300, "actual": 301,
+                    "detail": "The text is 301 graphemes; the limit is 300."}),
+                );
             }
 
             #[tokio::test]
@@ -5963,7 +6007,10 @@ mod teams {
                 for p in ["bluesky", "threads", "x", "tiktok"] {
                     let res = create(&s, &cookie, with(p, json!("sources"))).await;
                     assert_eq!(res.status_code(), 422, "{p}");
-                    res.assert_json(&json!({"error": "first_comment_not_supported"}));
+                    res.assert_json(
+                        &json!({"error": "first_comment_not_supported", "platform": p,
+                        "field": "first_comment"}),
+                    );
                 }
                 // Their limits, in characters; blank is none.
                 for (p, max) in [("facebook", 8000), ("linkedin", 1250), ("youtube", 10_000)] {
@@ -5973,7 +6020,13 @@ mod teams {
                     let long = with(p, json!("é".repeat(max + 1)));
                     let res = create(&s, &cookie, long).await;
                     assert_eq!(res.status_code(), 422, "{p}");
-                    res.assert_json(&json!({"error": "first_comment_too_long"}));
+                    let detail = format!(
+                        "The first comment is {} characters; the limit is {max}.",
+                        max + 1
+                    );
+                    res.assert_json(&json!({"error": "first_comment_too_long", "platform": p,
+                        "field": "first_comment", "limit": max, "actual": max + 1,
+                        "detail": detail}));
                 }
                 let res = create(&s, &cookie, with("linkedin", json!("  \n"))).await;
                 assert_eq!(res.status_code(), 201);
@@ -6014,8 +6067,7 @@ mod teams {
                     "platforms": ["bluesky", "linkedin"], "first_comment": "sources"}))
                 .await;
                 assert_eq!(res.status_code(), 422);
-                res.assert_json(&json!({"error": "first_comment_not_supported",
-                    "platform": "bluesky"}));
+                res.assert_json(&json!({"error": "first_comment_not_supported", "platform": "bluesky", "field": "first_comment"}));
                 // An empty override leaves it out there; another override replaces it.
                 let res = group(json!({"social_set_id": set, "body": "hi",
                     "platforms": ["bluesky", "linkedin", "facebook"],
@@ -6038,8 +6090,9 @@ mod teams {
                     "overrides": {"linkedin": {"first_comment": "a".repeat(1251)}}}))
                 .await;
                 assert_eq!(res.status_code(), 422);
-                res.assert_json(&json!({"error": "first_comment_too_long",
-                    "platform": "linkedin"}));
+                res.assert_json(&json!({"error": "first_comment_too_long", "platform": "linkedin", "field": "first_comment",
+                    "limit": 1250, "actual": 1251,
+                    "detail": "The first comment is 1251 characters; the limit is 1250."}));
             }
 
             #[tokio::test]
@@ -6061,7 +6114,8 @@ mod teams {
                 for p in ["bluesky", "threads", "x", "tiktok", "linkedin"] {
                     let res = create(&s, &cookie, with(p, clip.clone(), cover.clone())).await;
                     assert_eq!(res.status_code(), 422, "{p}");
-                    res.assert_json(&json!({"error": "cover_not_supported"}));
+                    res.assert_json(&json!({"error": "cover_not_supported", "platform": p,
+                        "field": "cover"}));
                 }
                 for p in ["facebook", "instagram", "youtube"] {
                     let res = create(&s, &cookie, with(p, clip.clone(), cover.clone())).await;
@@ -6071,7 +6125,8 @@ mod teams {
                     let http = json!("http://a.example/cover.jpg");
                     let res = create(&s, &cookie, with(p, clip.clone(), http)).await;
                     assert_eq!(res.status_code(), 422, "{p}");
-                    res.assert_json(&json!({"error": "invalid_cover"}));
+                    res.assert_json(&json!({"error": "invalid_cover", "platform": p,
+                        "field": "cover"}));
                 }
                 // Exactly one media item (YouTube takes one at most, Instagram needs media).
                 let two = json!(["https://a.example/a.mp4", "https://a.example/b.mp4"]);
@@ -6082,7 +6137,8 @@ mod teams {
                 ] {
                     let res = create(&s, &cookie, with(p, media, cover.clone())).await;
                     assert_eq!(res.status_code(), 422, "{p}");
-                    res.assert_json(&json!({"error": "cover_needs_one_video"}));
+                    res.assert_json(&json!({"error": "cover_needs_one_video", "platform": p,
+                        "field": "cover"}));
                 }
                 // Blank is none.
                 let res = create(&s, &cookie, with("facebook", clip.clone(), json!("  "))).await;
@@ -6121,7 +6177,7 @@ mod teams {
                     "platforms": ["tiktok", "youtube"], "cover": "https://a.example/c.jpg"}))
                 .await;
                 assert_eq!(res.status_code(), 422);
-                res.assert_json(&json!({"error": "cover_not_supported", "platform": "tiktok"}));
+                res.assert_json(&json!({"error": "cover_not_supported", "platform": "tiktok", "field": "cover"}));
                 // An empty override leaves it out there; another replaces it.
                 let res = group(json!({"social_set_id": set, "body": "hi", "media": clip,
                     "platforms": ["tiktok", "youtube", "facebook"],
@@ -6453,6 +6509,383 @@ mod teams {
 
             /// Threads: the connect flow, publishing through the Graph API mock, take down and
             /// the daily token refresh, plus the brain links Threads fetches media from.
+            /// Every problem code of a validate-only report: each platform's, then the group's.
+            fn codes(report: &Value) -> Vec<Value> {
+                let of = |v: &Value| v["problems"].as_array().unwrap().clone();
+                let mut all: Vec<Value> = report["platforms"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(of)
+                    .collect();
+                all.extend(of(report));
+                all
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn validate_only_reports_every_problem_and_creates_nothing() {
+                use sea_orm::{ConnectionTrait, DbBackend, Statement};
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, account) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let count = || {
+                    let db = &db;
+                    async move { posts::Entity::find().count(db).await.unwrap() }
+                };
+                let before = count().await;
+                let check = |path: &str, body: Value| {
+                    req(
+                        &s,
+                        Method::POST,
+                        &format!("{path}?validate_only=true"),
+                        &cookie,
+                    )
+                    .json(&body)
+                };
+
+                // Two platforms are wrong at once, one of them twice; the third is fine.
+                let res = check(
+                    "/v1/post-groups",
+                    json!({"social_set_id": set, "body": "a".repeat(301),
+                        "platforms": ["bluesky", "x", "linkedin"],
+                        "overrides": {"bluesky": {"media": vec!["https://a.example/1.png"; 5]}}}),
+                )
+                .await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                let r = res.json::<Value>();
+                assert_eq!(r["ok"], false, "{r}");
+                assert_eq!(r["problems"], json!([]));
+                let ps = r["platforms"].as_array().unwrap();
+                assert_eq!(ps.len(), 3, "{r}");
+                assert_eq!(ps[0]["platform"], "bluesky");
+                assert_eq!(ps[0]["ok"], false);
+                assert_eq!(ps[0]["account_ids"], json!([account]));
+                let found = ps[0]["problems"].as_array().unwrap();
+                assert_eq!(found.len(), 2, "{r}");
+                assert_eq!(found[0]["code"], "too_long");
+                assert_eq!(found[0]["field"], "body");
+                assert_eq!(found[0]["limit"], 300);
+                assert_eq!(found[0]["actual"], 301);
+                assert!(found[0]["detail"].is_string(), "{r}");
+                assert!(found[0].get("part").is_none(), "{r}");
+                assert_eq!(found[1]["code"], "too_many_images");
+                assert_eq!(found[1]["field"], "media");
+                assert_eq!(found[1]["limit"], 4);
+                assert_eq!(found[1]["actual"], 5);
+                assert_eq!(ps[1]["platform"], "x");
+                assert_eq!(ps[1]["account_ids"], json!([]));
+                assert_eq!(ps[1]["problems"][0]["code"], "too_long");
+                assert_eq!(ps[1]["problems"][0]["limit"], 280);
+                assert_eq!(ps[1]["problems"][0]["actual"], 301);
+                assert_eq!(ps[2]["platform"], "linkedin");
+                assert_eq!(ps[2]["ok"], true);
+                assert_eq!(ps[2]["problems"], json!([]));
+
+                // A thread part's problem names the part, next to the post's own.
+                let mut body = thread_input(&set, &"b".repeat(301), &["ok", &"a".repeat(302)]);
+                body["thread"][0]["media"] = json!(vec!["https://a.example/1.png"; 5]);
+                let res = check("/v1/posts", body).await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                let r = res.json::<Value>();
+                let found = r["platforms"][0]["problems"].as_array().unwrap();
+                assert_eq!(found.len(), 3, "{r}");
+                assert!(found[0].get("part").is_none(), "{r}");
+                assert_eq!(found[1]["code"], "too_many_images");
+                assert_eq!(found[1]["part"], 1);
+                assert_eq!(found[2]["code"], "too_long");
+                assert_eq!(found[2]["part"], 2);
+                assert_eq!(found[2]["limit"], 300);
+                assert_eq!(found[2]["actual"], 302);
+
+                // A post over the media count is settled without fetching a file: the PDF,
+                // which a probe would refuse, is never asked for.
+                let mut many = input(&set, "hi", None);
+                many["media"] = json!(vec![format!("{PROBED}/doc.pdf"); 5]);
+                let r = check("/v1/posts", many).await.json::<Value>();
+                let found = r["platforms"][0]["problems"].as_array().unwrap();
+                assert_eq!(found.len(), 1, "{r}");
+                assert_eq!(found[0]["code"], "too_many_images");
+
+                // A good request is ok; a problem of the request itself is the group's.
+                let good = json!({"social_set_id": set, "body": "hi"});
+                let r = check("/v1/post-groups", good).await.json::<Value>();
+                assert_eq!(r["ok"], true, "{r}");
+                assert_eq!(r["platforms"][0]["ok"], true);
+                let r = check("/v1/posts", input(&set, "hi", None))
+                    .await
+                    .json::<Value>();
+                assert_eq!(r["ok"], true, "{r}");
+                let r = check("/v1/post-groups", json!({"body": "hi"}))
+                    .await
+                    .json::<Value>();
+                assert_eq!(r["ok"], false);
+                assert_eq!(r["platforms"], json!([]));
+                assert_eq!(r["problems"][0]["code"], "invalid_set");
+                let r = check(
+                    "/v1/post-groups",
+                    json!({"social_set_id": set, "body": "hi",
+                        "overrides": {"x": {"body": "elsewhere"}}}),
+                )
+                .await
+                .json::<Value>();
+                assert_eq!(r["ok"], false);
+                assert_eq!(r["problems"][0]["code"], "invalid_override");
+                assert_eq!(r["platforms"][0]["ok"], true, "{r}");
+                let r = check(
+                    "/v1/post-groups",
+                    json!({"social_set_id": set, "body": "hi", "list_id": uuid::Uuid::now_v7()}),
+                )
+                .await
+                .json::<Value>();
+                assert_eq!(r["ok"], false);
+                assert_eq!(r["problems"][0]["code"], "not_found", "{r}");
+
+                // The list and the post cap are checked for a post that is itself invalid, and
+                // for a group whose platforms all are.
+                let nowhere = uuid::Uuid::now_v7();
+                let mut long = input(&set, &"a".repeat(301), None);
+                long["list_id"] = json!(nowhere);
+                let all_long = json!({"social_set_id": set, "body": "a".repeat(301),
+                    "platforms": ["bluesky", "x"], "list_id": nowhere});
+                for (path, body) in [("/v1/posts", &long), ("/v1/post-groups", &all_long)] {
+                    let r = check(path, body.clone()).await.json::<Value>();
+                    assert_eq!(r["platforms"][0]["problems"][0]["code"], "too_long", "{r}");
+                    assert_eq!(r["problems"], json!([{"code": "not_found"}]), "{path}: {r}");
+                }
+                let fill = Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "INSERT INTO posts (id, team_id, social_set_id, platform, status) \
+                     SELECT gen_random_uuid(), $1::uuid, $2::uuid, 'bluesky', 'draft' \
+                     FROM generate_series(1, 2000)",
+                    [team_id.clone().into(), set.clone().into()],
+                );
+                db.execute_raw(fill).await.unwrap();
+                let full = count().await;
+                long["list_id"] = Value::Null;
+                for (body, own) in [(input(&set, "hi", None), 0), (long, 1)] {
+                    let r = check("/v1/posts", body).await.json::<Value>();
+                    assert_eq!(r["ok"], false, "{r}");
+                    let found = r["platforms"][0]["problems"].as_array().unwrap();
+                    assert_eq!(found.len(), own, "{r}");
+                    assert_eq!(r["problems"], json!([{"code": "too_many_posts"}]), "{r}");
+                }
+                let r = check("/v1/post-groups", all_long).await.json::<Value>();
+                assert_eq!(r["problems"], json!([{"code": "too_many_posts"}]), "{r}");
+                assert_eq!(count().await, full);
+                let gone = Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "DELETE FROM posts WHERE team_id = $1::uuid",
+                    [team_id.clone().into()],
+                );
+                db.execute_raw(gone).await.unwrap();
+
+                // Anything but true or false is refused, and nothing was ever created.
+                let res = req(&s, Method::POST, "/v1/posts?validate_only=maybe", &cookie)
+                    .json(&input(&set, "hi", None))
+                    .await;
+                assert_eq!(res.status_code(), 422);
+                res.assert_json(&json!({"error": "invalid_query"}));
+
+                // The flag in the body (where the MCP tools take it) is refused, never ignored:
+                // ignoring it would create for real. Any value, with or without the query flag.
+                for path in [
+                    "/v1/posts",
+                    "/v1/post-groups",
+                    "/v1/posts?validate_only=true",
+                ] {
+                    for flag in [json!(true), json!(false), Value::Null] {
+                        let mut body = input(&set, "hi", None);
+                        body["validate_only"] = flag;
+                        let res = req(&s, Method::POST, path, &cookie).json(&body).await;
+                        assert_eq!(res.status_code(), 422, "{path}: {}", res.text());
+                        res.assert_json(&json!({"error": "validate_only_in_body",
+                            "field": "validate_only",
+                            "detail": "validate_only is a query parameter: send it as ?validate_only=true, not in the body."}));
+                    }
+                }
+                assert_eq!(count().await, before);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn validate_only_and_the_create_agree() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let probed = |p: &str| json!([format!("{PROBED}{p}")]);
+                let group = |extra: Value| {
+                    let mut v = json!({"social_set_id": set, "body": "hi"});
+                    v.as_object_mut()
+                        .unwrap()
+                        .extend(extra.as_object().unwrap().clone());
+                    ("/v1/post-groups", v)
+                };
+                let one = |v: Value| ("/v1/posts", v);
+                let mut cover = input(&set, "hi", None);
+                cover["cover"] = json!("https://a.example/c.jpg");
+                let mut comment = input(&set, "hi", None);
+                comment["first_comment"] = json!("sources");
+                let mut tiktok = input(&set, "hi", None);
+                tiktok["platform"] = json!("tiktok");
+                for (path, body) in [
+                    one(input(&set, "fine", None)),
+                    one(input(&set, " ", None)),
+                    one(input(&set, &"a".repeat(301), None)),
+                    one(input(&uuid::Uuid::now_v7().to_string(), "x", None)),
+                    one(thread_input(&set, "root", &["ok", &"a".repeat(301)])),
+                    one(thread_input(&set, "root", &vec!["x"; 26])),
+                    one(cover),
+                    one(comment),
+                    one(tiktok),
+                    group(json!({})),
+                    group(json!({"platforms": ["bluesky", "x"], "body": "a".repeat(290)})),
+                    group(json!({"platforms": ["bluesky", "myspace"]})),
+                    group(json!({"platforms": ["bluesky", "instagram"]})),
+                    group(json!({"platforms": ["linkedin", "bluesky"],
+                        "thread": [{"body": "two"}]})),
+                    group(json!({"media": probed("/big.gif")})),
+                    group(json!({"media": probed("/doc.pdf")})),
+                    group(json!({"overrides": {"x": {"body": "elsewhere"}}})),
+                    group(json!({"list_id": uuid::Uuid::now_v7()})),
+                    group(json!({"social_set_id": uuid::Uuid::now_v7()})),
+                ] {
+                    let res = req(
+                        &s,
+                        Method::POST,
+                        &format!("{path}?validate_only=true"),
+                        &cookie,
+                    )
+                    .json(&body)
+                    .await;
+                    assert_eq!(res.status_code(), 200, "{body}: {}", res.text());
+                    let report = res.json::<Value>();
+                    let res = req(&s, Method::POST, path, &cookie).json(&body).await;
+                    let made = res.json::<Value>();
+                    if res.status_code() == 201 {
+                        assert_eq!(report["ok"], true, "{body}: {report}");
+                        assert!(codes(&report).is_empty(), "{body}: {report}");
+                        continue;
+                    }
+                    // The create's refusal is one of the report's problems, numbers and all.
+                    assert_eq!(report["ok"], false, "{body}: {made}");
+                    let all = codes(&report);
+                    let same = all
+                        .iter()
+                        .find(|p| p["code"] == made["error"] && p.get("part") == made.get("part"))
+                        .unwrap_or_else(|| panic!("{made} is not in {report}"));
+                    for key in ["field", "limit", "actual", "detail"] {
+                        assert_eq!(same.get(key), made.get(key), "{key}: {made} {report}");
+                    }
+                    // And it names the platform whose entry holds that problem.
+                    if let Some(platform) = made.get("platform") {
+                        let entry = report["platforms"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|p| p["platform"] == *platform);
+                        let held = entry.is_some_and(|e| {
+                            let own = e["problems"].as_array().unwrap();
+                            own.iter().any(|p| p["code"] == made["error"])
+                        });
+                        let of_group = report["problems"][0]["code"] == made["error"];
+                        assert!(held || of_group, "{made} {report}");
+                    }
+                }
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn on_invalid_skip_leaves_invalid_platforms_out() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let group =
+                    |body: Value| req(&s, Method::POST, "/v1/post-groups", &cookie).json(&body);
+                let count = || {
+                    let db = &db;
+                    async move { posts::Entity::find().count(db).await.unwrap() }
+                };
+                let before = count().await;
+                // 290 characters fit Bluesky and LinkedIn, not X.
+                let body = |extra: Value| {
+                    let mut v = json!({"social_set_id": set, "body": "a".repeat(290),
+                        "platforms": ["x", "bluesky", "linkedin"]});
+                    v.as_object_mut()
+                        .unwrap()
+                        .extend(extra.as_object().unwrap().clone());
+                    v
+                };
+
+                // The default refuses the whole group, with the richer 422.
+                for extra in [json!({}), json!({"on_invalid": "refuse"})] {
+                    let res = group(body(extra)).await;
+                    assert_eq!(res.status_code(), 422);
+                    let e = res.json::<Value>();
+                    assert_eq!(e["error"], "too_long");
+                    assert_eq!(e["platform"], "x");
+                    assert_eq!(e["field"], "body");
+                    assert_eq!(e["limit"], 280);
+                    assert_eq!(e["actual"], 290);
+                    assert!(e["detail"].is_string(), "{e}");
+                }
+                assert_eq!(count().await, before);
+
+                // Skip creates the rest, one after another in the list, and says what it left out.
+                let list = req(&s, Method::POST, "/v1/lists", &cookie)
+                    .json(&json!({"name": "Series"}))
+                    .await
+                    .json::<Value>()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let res = group(body(json!({"on_invalid": "skip", "list_id": list}))).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let g = res.json::<Value>();
+                let made = g["posts"].as_array().unwrap();
+                assert_eq!(made.len(), 2, "{g}");
+                assert_eq!(made[0]["platform"], "bluesky");
+                assert_eq!(made[0]["lists"][0]["position"], 1);
+                assert_eq!(made[1]["platform"], "linkedin");
+                assert_eq!(made[1]["lists"][0]["position"], 2);
+                let skipped = g["skipped"].as_array().unwrap();
+                assert_eq!(skipped.len(), 1, "{g}");
+                assert_eq!(skipped[0]["platform"], "x");
+                assert_eq!(skipped[0]["ok"], false);
+                assert_eq!(skipped[0]["problems"][0]["code"], "too_long");
+                assert_eq!(skipped[0]["problems"][0]["limit"], 280);
+                assert_eq!(skipped[0]["problems"][0]["actual"], 290);
+                assert_eq!(count().await, before + 2);
+
+                // Nothing invalid: nothing skipped, with or without the field.
+                let res = group(json!({"social_set_id": set, "body": "hi", "on_invalid": "skip"}));
+                assert_eq!(res.await.json::<Value>()["skipped"], json!([]));
+                let res = group(json!({"social_set_id": set, "body": "hi"})).await;
+                assert_eq!(res.json::<Value>()["skipped"], json!([]));
+                let before = count().await;
+
+                // Every platform invalid, or the group itself: refused as without skip.
+                let res = group(json!({"social_set_id": set, "body": "a".repeat(301),
+                    "platforms": ["bluesky", "x"], "on_invalid": "skip"}))
+                .await;
+                assert_eq!(res.status_code(), 422);
+                res.assert_json(
+                    &json!({"error": "too_long", "platform": "bluesky", "field": "body",
+                    "limit": 300, "actual": 301,
+                    "detail": "The text is 301 graphemes; the limit is 300."}),
+                );
+                let res = group(
+                    json!({"social_set_id": set, "body": "hi", "on_invalid": "skip",
+                    "overrides": {"x": {"body": "elsewhere"}}}),
+                )
+                .await;
+                assert_eq!(res.status_code(), 422);
+                res.assert_json(&json!({"error": "invalid_override"}));
+                let res = group(json!({"social_set_id": set, "body": "hi", "on_invalid": "drop"}));
+                assert_eq!(res.await.status_code(), 422);
+                assert_eq!(count().await, before);
+            }
+
             mod threads_api {
                 use super::*;
                 use axum::{
@@ -6944,7 +7377,11 @@ mod teams {
                     let many = vec!["https://a.example/i.png".to_owned(); 21];
                     let res = create(&s, &cookie, threads_post(&set, "x", many, &[])).await;
                     assert_eq!(res.status_code(), 422);
-                    res.assert_json(&json!({"error": "too_many_images"}));
+                    res.assert_json(
+                        &json!({"error": "too_many_images", "platform": "threads", "field": "media",
+                        "limit": 20, "actual": 21,
+                        "detail": "The post has 21 media items; the limit is 20."}),
+                    );
 
                     // A token Threads refuses fails the target with what to do.
                     let account = threads_account(&db, &team_id).await;
@@ -8022,7 +8459,11 @@ mod teams {
                     let (s, db, state, base, cookie, _, set) = team().await;
                     let res = create(&s, &cookie, linkedin_post(&set, &"a".repeat(3001))).await;
                     assert_eq!(res.status_code(), 422);
-                    res.assert_json(&json!({"error": "too_long"}));
+                    res.assert_json(
+                        &json!({"error": "too_long", "platform": "linkedin", "field": "body",
+                        "limit": 3000, "actual": 3001,
+                        "detail": "The text is 3001 characters; the limit is 3000."}),
+                    );
                     let mut exact = linkedin_post(&set, &"a".repeat(3000));
                     exact["scheduled_at"] = Value::Null;
                     assert_eq!(create(&s, &cookie, exact).await.status_code(), 201);
@@ -8030,12 +8471,14 @@ mod teams {
                     many["media"] = json!(vec!["https://a.example/i.png"; 21]);
                     let res = create(&s, &cookie, many).await;
                     assert_eq!(res.status_code(), 422);
-                    res.assert_json(&json!({"error": "too_many_images"}));
+                    res.assert_json(&json!({"error": "too_many_images", "platform": "linkedin", "field": "media",
+                        "limit": 20, "actual": 21,
+                        "detail": "The post has 21 media items; the limit is 20."}));
                     let mut threaded = linkedin_post(&set, "x");
                     threaded["thread"] = json!([{"body": "two"}]);
                     let res = create(&s, &cookie, threaded).await;
                     assert_eq!(res.status_code(), 422);
-                    res.assert_json(&json!({"error": "thread_not_supported"}));
+                    res.assert_json(&json!({"error": "thread_not_supported", "platform": "linkedin", "field": "thread"}));
 
                     // A video next to an image never reaches LinkedIn.
                     let id = id_of(&create(&s, &cookie, linkedin_post(&set, "mix")).await);
@@ -9134,7 +9577,8 @@ mod teams {
                     for bad in ["Public", "hidden", ""] {
                         let res = create(&s, &cookie, with(json!({"privacy": bad}))).await;
                         assert_eq!(res.status_code(), 422, "{bad}: {}", res.text());
-                        res.assert_json(&json!({"error": "invalid_youtube_privacy"}));
+                        res.assert_json(&json!({"error": "invalid_youtube_privacy",
+                            "platform": "youtube", "field": "youtube"}));
                     }
                     // Unknown fields are not ignored.
                     let res = create(&s, &cookie, with(json!({"visibility": "public"}))).await;
@@ -9144,7 +9588,7 @@ mod teams {
                     v["youtube"] = json!({"privacy": "public"});
                     let res = create(&s, &cookie, v).await;
                     assert_eq!(res.status_code(), 422);
-                    res.assert_json(&json!({"error": "youtube_not_supported"}));
+                    res.assert_json(&json!({"error": "youtube_not_supported", "platform": "bluesky", "field": "youtube"}));
 
                     // A replace is checked the same way, and replaces the settings.
                     let ok = create(&s, &cookie, with(json!({"privacy": "unlisted"}))).await;
@@ -9194,15 +9638,13 @@ mod teams {
                     assert_eq!(privacy_of(&g, "youtube")["privacy"], "public");
                     let res = make(json!({"youtube": {"privacy": "secret"}})).await;
                     assert_eq!(res.status_code(), 422);
-                    res.assert_json(&json!({"error": "invalid_youtube_privacy",
-                        "platform": "youtube"}));
+                    res.assert_json(&json!({"error": "invalid_youtube_privacy", "platform": "youtube", "field": "youtube"}));
                     // An override on another platform is refused like TikTok's.
                     let res = make(json!({"overrides": {"bluesky": {"media": [],
                         "youtube": {"privacy": "public"}}}}))
                     .await;
                     assert_eq!(res.status_code(), 422);
-                    res.assert_json(&json!({"error": "youtube_not_supported",
-                        "platform": "bluesky"}));
+                    res.assert_json(&json!({"error": "youtube_not_supported", "platform": "bluesky", "field": "youtube"}));
                 }
 
                 #[tokio::test]
@@ -9415,36 +9857,69 @@ mod teams {
                 #[serial]
                 async fn posts_without_exactly_one_valid_video_are_refused() {
                     let (s, db, state, base, cookie, _, set) = team().await;
-                    let refused = |res: axum_test::TestResponse, code: &str| {
-                        assert_eq!(res.status_code(), 422, "{}", res.text());
-                        res.assert_json(&json!({"error": code}));
-                    };
+                    // `more`: the `limit`, `actual` and `detail` of a check that counts.
+                    let refused =
+                        |res: axum_test::TestResponse, code: &str, field: &str, more: Value| {
+                            assert_eq!(res.status_code(), 422, "{}", res.text());
+                            let mut want =
+                                json!({"error": code, "platform": "youtube", "field": field});
+                            want.as_object_mut()
+                                .unwrap()
+                                .extend(more.as_object().unwrap().clone());
+                            res.assert_json(&want);
+                        };
                     let mut none = youtube_post(&set, "Title");
                     none["media"] = json!([]);
-                    refused(create(&s, &cookie, none).await, "media_required");
+                    refused(
+                        create(&s, &cookie, none).await,
+                        "media_required",
+                        "media",
+                        json!({}),
+                    );
                     let mut two = youtube_post(&set, "Title");
                     two["media"] = json!(["https://a.example/1.mp4", "https://a.example/2.mp4"]);
-                    refused(create(&s, &cookie, two).await, "too_many_images");
+                    refused(
+                        create(&s, &cookie, two).await,
+                        "too_many_images",
+                        "media",
+                        json!({"limit": 1, "actual": 2,
+                            "detail": "The post has 2 media items; the limit is 1."}),
+                    );
                     refused(
                         create(&s, &cookie, youtube_post(&set, &"a".repeat(101))).await,
                         "too_long",
+                        "body",
+                        json!({"limit": 100, "actual": 101,
+                            "detail": "The text is 101 characters in the title (the first line); the limit is 100."}),
                     );
                     let long = format!("Title\n{}", "a".repeat(5001));
                     refused(
                         create(&s, &cookie, youtube_post(&set, &long)).await,
                         "too_long",
+                        "body",
+                        json!({"limit": 5000, "actual": 5001,
+                            "detail": "The text is 5001 bytes in the description; the limit is 5000."}),
                     );
                     refused(
                         create(&s, &cookie, youtube_post(&set, "")).await,
                         "empty_post",
+                        "body",
+                        json!({}),
                     );
                     refused(
                         create(&s, &cookie, youtube_post(&set, "a <b> c")).await,
                         "invalid_text",
+                        "body",
+                        json!({}),
                     );
                     let mut threaded = youtube_post(&set, "Title");
                     threaded["thread"] = json!([{"body": "two"}]);
-                    refused(create(&s, &cookie, threaded).await, "thread_not_supported");
+                    refused(
+                        create(&s, &cookie, threaded).await,
+                        "thread_not_supported",
+                        "thread",
+                        json!({}),
+                    );
                     // The limits themselves pass.
                     let mut exact =
                         youtube_post(&set, &format!("{}\n{}", "a".repeat(100), "b".repeat(5000)));
@@ -10522,6 +10997,26 @@ mod teams {
                         assert_eq!(body[k], want[k], "{k}");
                     }
                     assert!(body["social_account_id"].is_string());
+                    // A validate-only report carries the same problem, on both routes.
+                    let mut group = post.clone();
+                    group["platforms"] = json!(["tiktok"]);
+                    for (path, sent) in [("/v1/posts", &post), ("/v1/post-groups", &group)] {
+                        let only = format!("{path}?validate_only=true");
+                        let res = req(&s, Method::POST, &only, &cookie).json(sent).await;
+                        assert_eq!(res.status_code(), 200, "{path}: {}", res.text());
+                        let r = res.json::<Value>();
+                        assert_eq!(r["ok"], false, "{path}: {r}");
+                        assert_eq!(r["problems"], json!([]), "{path}: {r}");
+                        assert_eq!(r["platforms"][0]["platform"], "tiktok");
+                        assert_eq!(
+                            r["platforms"][0]["problems"],
+                            json!([{"code": "tiktok_privacy_not_offered", "field": "tiktok",
+                                "detail": want["detail"],
+                                "social_account_id": body["social_account_id"],
+                                "privacy_level_options": ["SELF_ONLY"]}]),
+                            "{path}: {r}"
+                        );
+                    }
                     // Groups and updates are checked the same way.
                     let mut group = post.clone();
                     group["platforms"] = json!(["tiktok"]);
@@ -10576,7 +11071,7 @@ mod teams {
                     post["tiktok"] = settings("SELF_ONLY");
                     let res = create(&s, &cookie, post.clone()).await;
                     assert_eq!(res.status_code(), 422, "{}", res.text());
-                    res.assert_json(&json!({"error": "mixed_media", "platform": "tiktok",
+                    res.assert_json(&json!({"error": "mixed_media", "platform": "tiktok", "field": "media",
                         "detail": "A TikTok post needs one MP4 or MOV video, or photos, not both."}));
                     // A PNG photo is fine: publishing turns it into a JPEG.
                     post["media"] = json!([
@@ -10641,7 +11136,9 @@ mod teams {
                         async move {
                             let res = create(s, cookie, body).await;
                             assert_eq!(res.status_code(), 422, "{want}: {}", res.text());
-                            res.assert_json(&json!({"error": want}));
+                            res.assert_json(
+                                &json!({"error": want, "platform": "tiktok", "field": "tiktok"}),
+                            );
                         }
                     };
                     bad(json!({}), "tiktok_privacy_required").await;
@@ -10663,7 +11160,7 @@ mod teams {
                     v["tiktok"] = settings("SELF_ONLY");
                     let res = create(&s, &cookie, v).await;
                     assert_eq!(res.status_code(), 422);
-                    res.assert_json(&json!({"error": "tiktok_not_supported"}));
+                    res.assert_json(&json!({"error": "tiktok_not_supported", "platform": "bluesky", "field": "tiktok"}));
                     let mut t = settings("SELF_ONLY");
                     t["duet"] = json!(true);
                     let res = create(&s, &cookie, with(t)).await;
@@ -10690,12 +11187,12 @@ mod teams {
                         .json(&tiktok_post(&set, "hi", &["/clip.mp4"]))
                         .await;
                     assert_eq!(res.status_code(), 422, "{}", res.text());
-                    res.assert_json(&json!({"error": "tiktok_settings_required"}));
+                    res.assert_json(&json!({"error": "tiktok_settings_required", "platform": "tiktok", "field": "tiktok"}));
                     let kept = get_post(&s, &cookie, &id).await;
                     assert_eq!(kept["tiktok"]["privacy_level"], "FOLLOWER_OF_CREATOR");
                     let res = create(&s, &cookie, tiktok_post(&set, "hi", &["/clip.mp4"])).await;
                     assert_eq!(res.status_code(), 422, "{}", res.text());
-                    res.assert_json(&json!({"error": "tiktok_settings_required"}));
+                    res.assert_json(&json!({"error": "tiktok_settings_required", "platform": "tiktok", "field": "tiktok"}));
                     // Another platform's post may switch to TikTok only with settings.
                     let mut other = input(&set, "hi", None);
                     let res = create(&s, &cookie, other.clone()).await;
@@ -10733,15 +11230,13 @@ mod teams {
                     assert_eq!(level, "FOLLOWER_OF_CREATOR");
                     let res = make(group(json!({"tiktok": {}}))).await;
                     assert_eq!(res.status_code(), 422);
-                    res.assert_json(&json!({"error": "tiktok_privacy_required",
-                        "platform": "tiktok"}));
+                    res.assert_json(&json!({"error": "tiktok_privacy_required", "platform": "tiktok", "field": "tiktok"}));
                     // No settings at all never means the most public level: refused, nothing made.
                     let count = || async { posts::Entity::find().count(&db).await.unwrap() };
                     let before = count().await;
                     let res = make(group(json!({}))).await;
                     assert_eq!(res.status_code(), 422);
-                    res.assert_json(&json!({"error": "tiktok_settings_required",
-                        "platform": "tiktok"}));
+                    res.assert_json(&json!({"error": "tiktok_settings_required", "platform": "tiktok", "field": "tiktok"}));
                     // Also when TikTok is in the group by default (no `platforms`).
                     let mut all = group(json!({}));
                     all.as_object_mut().unwrap().remove("platforms");
@@ -11671,7 +12166,9 @@ mod teams {
                     // 280 weighted characters, links counted as 23.
                     let res = create(&s, &cookie, x_post(&set, &"a".repeat(281))).await;
                     assert_eq!(res.status_code(), 422);
-                    res.assert_json(&json!({"error": "too_long"}));
+                    res.assert_json(&json!({"error": "too_long", "platform": "x", "field": "body",
+                        "limit": 280, "actual": 281,
+                        "detail": "The text is 281 characters as X counts them; the limit is 280."}));
                     let link =
                         format!("{} https://example.com/{}", "a".repeat(256), "b".repeat(90));
                     let mut ok = x_post(&set, &link);
@@ -11681,7 +12178,11 @@ mod teams {
                     many["media"] = json!(vec!["https://a.example/i.png"; 5]);
                     let res = create(&s, &cookie, many).await;
                     assert_eq!(res.status_code(), 422);
-                    res.assert_json(&json!({"error": "too_many_images"}));
+                    res.assert_json(
+                        &json!({"error": "too_many_images", "platform": "x", "field": "media",
+                        "limit": 4, "actual": 5,
+                        "detail": "The post has 5 media items; the limit is 4."}),
+                    );
                     let res =
                         create(&s, &cookie, thread(&set, "x", &["a".repeat(281).as_str()])).await;
                     assert_eq!(res.status_code(), 422);
@@ -12710,7 +13211,7 @@ mod teams {
                     post["thread"] = json!([{"body": "two"}]);
                     let res = create(&s, &cookie, post).await;
                     assert_eq!(res.status_code(), 422);
-                    res.assert_json(&json!({"error": "thread_not_supported"}));
+                    res.assert_json(&json!({"error": "thread_not_supported", "platform": "facebook", "field": "thread"}));
                 }
 
                 #[tokio::test]
@@ -12995,7 +13496,7 @@ mod teams {
 
                     let res = create(&s, &cookie, meta_post(&set, "instagram", "words")).await;
                     assert_eq!(res.status_code(), 422);
-                    res.assert_json(&json!({"error": "media_required"}));
+                    res.assert_json(&json!({"error": "media_required", "platform": "instagram", "field": "media"}));
 
                     let post = meta_post(&set, "instagram", "pic");
                     let (p, calls) = publish_one(ctx, &cookie, post, &["/img.jpg"]).await;
@@ -15219,6 +15720,166 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
+                async fn validate_only_writes_nothing_so_read_only_tokens_may_call_it() {
+                    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+                    let (s, db) = on_mock(120).await;
+                    let (owner, team_id, _) = owner_with_account(&s, &db).await;
+                    let default = default_set(&db, &team_id).await.to_string();
+                    let clients = req(&s, Method::POST, "/v1/social-sets", &owner)
+                        .json(&json!({"name": "Clients"}))
+                        .await
+                        .json::<Value>()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let token = |body: Value| {
+                        let (s, owner) = (&s, &owner);
+                        async move {
+                            let t = make_token(s, owner, body).await;
+                            t["secret"].as_str().unwrap().to_owned()
+                        }
+                    };
+                    let rw = token(json!({"name": "rw"})).await;
+                    let ro = token(json!({"name": "ro", "read_only": true})).await;
+                    let set_ro = token(
+                        json!({"name": "set ro", "social_set_id": clients, "read_only": true}),
+                    )
+                    .await;
+                    let count = || {
+                        let (s, rw) = (&s, &rw);
+                        async move {
+                            let res = bearer(s, Method::GET, "/v1/posts", rw).await;
+                            res.json::<Vec<Value>>().len()
+                        }
+                    };
+                    let post = post_body(Some(&default), "hi");
+                    let group = json!({"social_set_id": default, "body": "a".repeat(301),
+                        "platforms": ["bluesky", "linkedin"]});
+
+                    // A read-only token validates, and is still refused the create.
+                    for (path, body) in [("/v1/posts", &post), ("/v1/post-groups", &group)] {
+                        let only = format!("{path}?validate_only=true");
+                        let res = bearer(&s, Method::POST, &only, &ro).json(body).await;
+                        assert_eq!(res.status_code(), 200, "{path}: {}", res.text());
+                        assert_eq!(res.json::<Value>()["ok"], path == "/v1/posts");
+                        for real in [path.to_owned(), format!("{path}?validate_only=false")] {
+                            let res = bearer(&s, Method::POST, &real, &ro).json(body).await;
+                            assert_eq!(res.status_code(), 403, "{real}");
+                            res.assert_json(&json!({"error": "read_only_token"}));
+                        }
+                    }
+                    // The flag opens no other write.
+                    let res = bearer(&s, Method::POST, "/v1/lists?validate_only=true", &ro)
+                        .json(&json!({"name": "no"}))
+                        .await;
+                    assert_eq!(res.status_code(), 403);
+
+                    // A set token stays in its set: another set answers like a missing one.
+                    let only = "/v1/post-groups?validate_only=true";
+                    let res = bearer(&s, Method::POST, only, &set_ro).json(&group).await;
+                    let r = res.json::<Value>();
+                    assert_eq!(r["ok"], false);
+                    assert_eq!(r["platforms"], json!([]), "{r}");
+                    assert_eq!(r["problems"][0]["code"], "invalid_set");
+                    let own = json!({"social_set_id": clients, "body": "hi",
+                        "platforms": ["bluesky"]});
+                    let res = bearer(&s, Method::POST, only, &set_ro).json(&own).await;
+                    assert_eq!(res.json::<Value>()["ok"], true, "{}", res.text());
+
+                    // An Idempotency-Key is ignored: nothing kept, nothing replayed.
+                    for _ in 0..2 {
+                        let res = bearer(&s, Method::POST, "/v1/posts?validate_only=true", &rw)
+                            .add_header("idempotency-key", "check-1")
+                            .json(&post)
+                            .await;
+                        assert_eq!(res.status_code(), 200);
+                        assert!(res.maybe_header("idempotent-replayed").is_none());
+                    }
+                    assert_eq!(count().await, 0);
+                    let res = bearer(&s, Method::POST, "/v1/posts", &rw)
+                        .add_header("idempotency-key", "check-1")
+                        .json(&post)
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    assert!(res.maybe_header("idempotent-replayed").is_none());
+
+                    // A group too: validate-only keeps no record of the key, so the create
+                    // that follows with the same key is a first call, not a replay.
+                    let fine = json!({"social_set_id": default, "body": "hi",
+                        "platforms": ["bluesky", "linkedin"]});
+                    let kept = || {
+                        let (db, team_id) = (&db, &team_id);
+                        async move {
+                            // By team: the test database outlives a run.
+                            let sql = format!(
+                                "SELECT count(*) AS n FROM idempotency_keys \
+                                 WHERE key = 'group-check-1' AND team_id = '{team_id}'"
+                            );
+                            let stmt = Statement::from_string(DbBackend::Postgres, sql);
+                            let row = db.query_one_raw(stmt).await.unwrap().unwrap();
+                            row.try_get::<i64>("", "n").unwrap()
+                        }
+                    };
+                    let before = count().await;
+                    for _ in 0..2 {
+                        let res = bearer(&s, Method::POST, only, &rw)
+                            .add_header("idempotency-key", "group-check-1")
+                            .json(&fine)
+                            .await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        assert_eq!(res.json::<Value>()["ok"], true);
+                        assert!(res.maybe_header("idempotent-replayed").is_none());
+                    }
+                    assert_eq!(kept().await, 0);
+                    assert_eq!(count().await, before);
+                    let res = bearer(&s, Method::POST, "/v1/post-groups", &rw)
+                        .add_header("idempotency-key", "group-check-1")
+                        .json(&fine)
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    assert!(res.maybe_header("idempotent-replayed").is_none());
+                    assert_eq!(res.json::<Value>()["posts"].as_array().unwrap().len(), 2);
+                    assert_eq!(kept().await, 1);
+                    assert_eq!(count().await, before + 2);
+
+                    // A skipping create replays with its `skipped`.
+                    let mut skip = group.clone();
+                    skip["body"] = json!("a".repeat(400));
+                    skip["on_invalid"] = json!("skip");
+                    let send = || {
+                        bearer(&s, Method::POST, "/v1/post-groups", &rw)
+                            .add_header("idempotency-key", "skip-1")
+                            .json(&skip)
+                    };
+                    let first = send().await;
+                    assert_eq!(first.status_code(), 201, "{}", first.text());
+                    assert_eq!(first.json::<Value>()["skipped"][0]["platform"], "bluesky");
+                    let again = send().await;
+                    assert_eq!(again.header("idempotent-replayed"), "true");
+                    assert_eq!(again.text(), first.text());
+                    assert_eq!(count().await, before + 3);
+
+                    // MCP: the create tools take validate_only, for a read-only token too.
+                    let mut args = post.clone();
+                    args["validate_only"] = json!(true);
+                    let (failed, v) = call(&s, &ro, "create-post", args.clone()).await;
+                    assert!(!failed, "{v}");
+                    assert_eq!(v["ok"], true);
+                    let mut args = group.clone();
+                    args["validate_only"] = json!(true);
+                    let (failed, v) = call(&s, &ro, "create-post-group", args.clone()).await;
+                    assert!(!failed, "{v}");
+                    assert_eq!(v["ok"], false);
+                    assert_eq!(v["platforms"][0]["problems"][0]["limit"], 300);
+                    args["validate_only"] = json!(false);
+                    let (failed, v) = call(&s, &ro, "create-post-group", args).await;
+                    assert!(failed);
+                    assert_eq!(v, json!({"error": "read_only_token"}));
+                    assert_eq!(count().await, before + 3);
+                }
+
+                #[tokio::test]
+                #[serial]
                 async fn initialize_lists_the_tools_and_they_match_rest() {
                     let (s, db) = on_mock(120).await;
                     let (owner, team_id, _) = owner_with_account(&s, &db).await;
@@ -15310,7 +15971,7 @@ mod teams {
                     ] {
                         let (err, e) = call(&s, secret, "create-post", args).await;
                         assert!(err);
-                        assert_eq!(e, json!({"error": code}));
+                        assert_eq!(e["error"], code, "{e}");
                     }
                     let (err, e) = call(&s, secret, "list-posts", json!({"status": "nope"})).await;
                     assert!(err);
