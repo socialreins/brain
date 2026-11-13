@@ -98,6 +98,25 @@ async fn request_link(
     (StatusCode::ACCEPTED, Json(json!({"status": "sent"}))).into_response()
 }
 
+/// A sign-in link to the signed-in user's own email, for confirming it is still them before an
+/// action that needs a fresh sign-in (`reauth_required`). No body and no captcha: the session
+/// names the email. The same per-IP limit and live-link cap as `POST /auth/link`.
+async fn request_own_link(
+    State(app): State<AppState>,
+    ClientIp(ip): ClientIp,
+    CurrentUser(user, _): CurrentUser,
+) -> Response {
+    if !app.magic_link_limiter.allow(ip) {
+        return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited").into_response();
+    }
+    tokio::spawn(async move {
+        if let Err(e) = send_link(&app, ip, user.email, None, true).await {
+            tracing::error!(error = %e, "own magic link not sent");
+        }
+    });
+    (StatusCode::ACCEPTED, Json(json!({"status": "sent"}))).into_response()
+}
+
 /// Errors carry the failure only, never the email or the token. A sign-up refused to a new email
 /// puts it on the waitlist (source `signup`) under the waitlist's own rules: one confirmation
 /// email at most hourly, within its per-IP and daily caps, none once verified. A refused login
@@ -703,6 +722,7 @@ async fn logout(_: FromWeb, State(app): State<AppState>, headers: HeaderMap) -> 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/auth/link", post(request_link))
+        .route("/auth/link/me", post(request_own_link))
         .route("/auth/magic", post(redeem))
         .route("/auth/magic/{token}", get(confirm_page))
         .route("/auth/me", get(me))

@@ -401,6 +401,31 @@ mod auth {
     }
 
     #[tokio::test]
+    async fn a_signed_in_user_gets_a_link_to_their_own_email_and_it_starts_a_fresh_session() {
+        let (s, db) = server_where(|_| {}).await;
+        let email = unique_email();
+        let (_, cookie) = open(&s, &link(&db, &email, Duration::minutes(15)).await).await;
+        let old = session(&cookie.expect("session cookie"));
+
+        assert_eq!(s.post("/auth/link/me").await.status_code(), 401);
+        assert_eq!(links(&db, &email).await, 0);
+
+        let res = s
+            .post("/auth/link/me")
+            .add_header("cookie", old.clone())
+            .await;
+        assert_eq!(res.status_code(), 202);
+        assert_eq!(links_eventually(&db, &email, 1).await, 1);
+
+        // Opening such a link while signed in gives a new session for the same user.
+        let (_, cookie) = open(&s, &link(&db, &email, Duration::minutes(15)).await).await;
+        let fresh = session(&cookie.expect("fresh session cookie"));
+        assert_ne!(fresh, old);
+        let me = s.get("/auth/me").add_header("cookie", fresh).await;
+        assert_eq!(me.json::<Value>()["email"], email);
+    }
+
+    #[tokio::test]
     #[serial]
     async fn opening_the_link_only_shows_a_button() {
         let (s, db) = server_where(|_| {}).await;
