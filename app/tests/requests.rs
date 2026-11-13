@@ -407,13 +407,20 @@ mod auth {
         let (_, cookie) = open(&s, &link(&db, &email, Duration::minutes(15)).await).await;
         let old = session(&cookie.expect("session cookie"));
 
-        assert_eq!(s.post("/auth/link/me").await.status_code(), 401);
+        let ask = || {
+            s.post("/auth/link/me")
+                .add_header("origin", "http://localhost:3000")
+        };
+        assert_eq!(ask().await.status_code(), 401);
+        // Another site cannot ask with the user's cookie.
+        let foreign = s
+            .post("/auth/link/me")
+            .add_header("origin", "https://evil.example")
+            .add_header("cookie", old.clone());
+        assert_eq!(foreign.await.status_code(), 403);
         assert_eq!(links(&db, &email).await, 0);
 
-        let res = s
-            .post("/auth/link/me")
-            .add_header("cookie", old.clone())
-            .await;
+        let res = ask().add_header("cookie", old.clone()).await;
         assert_eq!(res.status_code(), 202);
         assert_eq!(links_eventually(&db, &email, 1).await, 1);
 

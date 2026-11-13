@@ -104,6 +104,7 @@ async fn request_link(
 async fn request_own_link(
     State(app): State<AppState>,
     ClientIp(ip): ClientIp,
+    _: FromWeb,
     CurrentUser(user, _): CurrentUser,
 ) -> Response {
     if !app.magic_link_limiter.allow(ip) {
