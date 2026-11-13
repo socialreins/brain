@@ -4852,8 +4852,14 @@ mod teams {
                 let id = id_of(&create(&s, &cookie, input(&set, "again", Some(&past()))).await);
                 // A task that put it back to `scheduled` has not ended yet.
                 let ending = publish::hold(id.parse().unwrap());
-                assert!(publish::begin(&state).await.unwrap().is_empty());
-                assert_eq!(get_post(&s, &cookie, &id).await["status"], "scheduled");
+                // The round may start due posts other tests left in the shared database, so it
+                // is waited for, not expected empty: this post ran in none of its tasks.
+                for run in publish::begin(&state).await.unwrap() {
+                    run.await.unwrap();
+                }
+                let p = get_post(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "scheduled", "{p}");
+                assert_eq!(p["targets"], json!([]), "{p}");
                 drop(ending);
                 publish::tick(&state).await.unwrap();
                 assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
@@ -5110,11 +5116,12 @@ mod teams {
                 let url = format!("http://{}/clip.mp4", listener.local_addr().unwrap());
                 tokio::spawn(async move { axum::serve(listener, app).await });
 
-                // Two posts of one group and one that is in none, all with the same video.
+                // Two posts of one group and one that is in none, all with the same video. Drafts:
+                // a due post left behind would be claimed by the next test's round.
                 let group = uuid::Uuid::now_v7();
                 let mut ids = Vec::new();
                 for grouped in [true, true, false] {
-                    let id = id_of(&create(&s, &cookie, input(&set, "clip", Some(&past()))).await);
+                    let id = id_of(&create(&s, &cookie, input(&set, "clip", None)).await);
                     let row = posts::ActiveModel {
                         id: Set(id.parse().unwrap()),
                         group_id: Set(grouped.then_some(group)),
