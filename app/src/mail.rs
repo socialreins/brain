@@ -196,10 +196,12 @@ fn html(subject: &str, text: &str) -> String {
                 _ => "Open link",
             };
             let url = escape(line);
+            // The colour and padding sit on the cell: Outlook ignores them on a link.
             body.push_str(&format!(
-                "<p style=\"margin:24px 0 8px\"><a href=\"{url}\" style=\"display:inline-block;\
-                 background:{INK};color:#ffffff;font-weight:700;text-decoration:none;\
-                 padding:12px 22px;border-radius:999px\">{}</a></p>\
+                "<table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" \
+                 style=\"margin:24px 0 8px\"><tr><td bgcolor=\"{INK}\" style=\"background:{INK};\
+                 border-radius:999px;padding:12px 22px\"><a href=\"{url}\" style=\"color:#ffffff;\
+                 font-weight:700;text-decoration:none\">{}</a></td></tr></table>\
                  <p style=\"margin:0 0 20px;font-size:13px;line-height:1.5;color:{SOFT}\">Or copy \
                  this link: <a href=\"{url}\" style=\"color:{SIGNAL};word-break:break-all\">{url}</a></p>",
                 escape(label)
@@ -216,7 +218,8 @@ fn html(subject: &str, text: &str) -> String {
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-         <meta name=\"color-scheme\" content=\"light\"><title>{title}</title></head>\
+         <meta name=\"color-scheme\" content=\"light\">\
+         <meta name=\"supported-color-schemes\" content=\"light\"><title>{title}</title></head>\
          <body style=\"margin:0;padding:0;background:#faf8f6\">\
          <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" \
          style=\"background:#faf8f6\"><tr><td align=\"center\" style=\"padding:32px 16px\">\
