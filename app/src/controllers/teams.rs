@@ -753,8 +753,8 @@ async fn send_invitation(app: &AppState, t: &InTeam, email: String, role: Role) 
     // Names are user input: quoted and made inert so they cannot pass as links, and kept out
     // of the subject.
     let text = format!(
-        "{} invited you to join the team \"{}\" on SocialReins as {}.\n\nOpen this link to \
-         accept:\n\n{url}\n\nIt expires in {INVITATION_DAYS} days. If you did not expect it, \
+        "{} invited you to join the team \"{}\" on SocialReins as {}.\n\nAccept the \
+         invitation:\n\n{url}\n\nIt expires in {INVITATION_DAYS} days. If you did not expect it, \
          ignore this email.\n",
         team::inert(&t.current.0.name),
         team::inert(&t.team.name),

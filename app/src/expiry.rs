@@ -218,7 +218,7 @@ async fn tell_admins(
         ),
     };
     let text = format!(
-        "{lead}\n\nOpen Connections and choose Reconnect:\n\n{}/app/connections\n",
+        "{lead}\n\nOn the Connections page, choose Reconnect.\n\nOpen Connections:\n\n{}/app/connections\n",
         app.web_url
     );
     let mut sent = false;

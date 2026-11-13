@@ -166,7 +166,7 @@ async fn send_link(
     };
     let url = format!("{}/auth/magic/{secret}", app.brain_url);
     let text = format!(
-        "Open this link to sign in to SocialReins:\n\n{url}\n\nIt works once and expires in \
+        "Here is your sign-in link for SocialReins.\n\nSign in to SocialReins:\n\n{url}\n\nIt works once and expires in \
          {LINK_MINUTES} minutes. If you did not ask for it, ignore this email.\n"
     );
     app.mailer
@@ -190,7 +190,7 @@ async fn send_no_account_notice(app: &AppState, email: &str) -> Result<(), Strin
     }
     let text = format!(
         "Someone tried to log in to SocialReins with this email, but it has no account yet.\n\n\
-         To create one, sign up here:\n\n{}/signup\n\nIf this was not you, ignore this email.\n",
+         Create an account:\n\n{}/signup\n\nIf this was not you, ignore this email.\n",
         app.web_url
     );
     app.mailer

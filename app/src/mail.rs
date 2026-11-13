@@ -1,7 +1,10 @@
 //! Outgoing mail: Resend, any SMTP server, or the log (`MAIL_LOG=true`, single-user self-host).
 use std::time::Duration;
 
-use lettre::{message::Mailbox, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use lettre::{
+    message::{Mailbox, MultiPart},
+    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
+};
 
 const RESEND_API: &str = "https://api.resend.com/emails";
 
@@ -53,17 +56,31 @@ impl Mailer {
     }
 
     /// Errors name the failure kind and status code only, never the recipient, body or key.
+    /// The plain text is also sent as a branded HTML version (`html`), for mail we write.
     pub async fn send(&self, to: &str, subject: &str, body: String) -> Result<(), String> {
-        self.send_reply_to(to, None, subject, body).await
+        let page = html(subject, &body);
+        self.deliver(to, None, subject, body, Some(page)).await
     }
 
-    /// `send` with a `Reply-To` address, e.g. the sender of a contact form message.
+    /// Plain text only, with a `Reply-To` address: a contact form message, whose text a
+    /// stranger wrote.
     pub async fn send_reply_to(
         &self,
         to: &str,
         reply_to: Option<&str>,
         subject: &str,
         body: String,
+    ) -> Result<(), String> {
+        self.deliver(to, reply_to, subject, body, None).await
+    }
+
+    async fn deliver(
+        &self,
+        to: &str,
+        reply_to: Option<&str>,
+        subject: &str,
+        body: String,
+        html: Option<String>,
     ) -> Result<(), String> {
         let (transport, from) = match self {
             Self::Log => {
@@ -91,6 +108,9 @@ impl Mailer {
                 });
                 if let Some(r) = reply_to {
                     mail["reply_to"] = r.into();
+                }
+                if let Some(page) = html {
+                    mail["html"] = page.into();
                 }
                 let res = client
                     .post(endpoint)
@@ -122,7 +142,11 @@ impl Mailer {
         if let Some(r) = reply_to {
             message = message.reply_to(r.parse().map_err(|_| "reply-to is not a mailbox")?);
         }
-        let message = message.body(body).map_err(|_| "message did not build")?;
+        let message = match html {
+            Some(page) => message.multipart(MultiPart::alternative_plain_html(body, page)),
+            None => message.body(body),
+        }
+        .map_err(|_| "message did not build")?;
         transport.send(message).await.map(|_| ()).map_err(|e| {
             let kind = if e.is_permanent() {
                 "permanent"
@@ -139,6 +163,80 @@ impl Mailer {
             format!("smtp {kind} {code}").trim_end().to_owned()
         })
     }
+}
+
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The HTML version of a plain-text mail: the subject as a heading, each paragraph, and every
+/// line that is only a link as a button. A line ending in `:` right before a link is the
+/// button's label ("Confirm my email:"). Everything is escaped; only `http(s)` links are linked.
+/// Tables and inline styles, because mail clients ignore most CSS.
+fn html(subject: &str, text: &str) -> String {
+    const INK: &str = "#121212";
+    const SOFT: &str = "#57534e";
+    const SIGNAL: &str = "#c2330a";
+    let is_link = |l: &str| {
+        (l.starts_with("https://") || l.starts_with("http://")) && !l.contains(char::is_whitespace)
+    };
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let mut body = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if is_link(line) {
+            let label = match i.checked_sub(1).map(|p| lines[p]) {
+                Some(prev) if prev.ends_with(':') && !is_link(prev) => prev.trim_end_matches(':'),
+                _ => "Open link",
+            };
+            let url = escape(line);
+            // The colour and padding sit on the cell: Outlook ignores them on a link.
+            body.push_str(&format!(
+                "<table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" \
+                 style=\"margin:24px 0 8px\"><tr><td bgcolor=\"{INK}\" style=\"background:{INK};\
+                 border-radius:999px;padding:12px 22px\"><a href=\"{url}\" style=\"color:#ffffff;\
+                 font-weight:700;text-decoration:none\">{}</a></td></tr></table>\
+                 <p style=\"margin:0 0 20px;font-size:13px;line-height:1.5;color:{SOFT}\">Or copy \
+                 this link: <a href=\"{url}\" style=\"color:{SIGNAL};word-break:break-all\">{url}</a></p>",
+                escape(label)
+            ));
+        } else if line.ends_with(':') && lines.get(i + 1).is_some_and(|n| is_link(n)) {
+            // Shown on the button instead.
+        } else {
+            body.push_str(&format!(
+                "<p style=\"margin:0 0 16px\">{}</p>",
+                escape(line)
+            ));
+        }
+    }
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <meta name=\"color-scheme\" content=\"light\">\
+         <meta name=\"supported-color-schemes\" content=\"light\"><title>{title}</title></head>\
+         <body style=\"margin:0;padding:0;background:#faf8f6\">\
+         <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" \
+         style=\"background:#faf8f6\"><tr><td align=\"center\" style=\"padding:32px 16px\">\
+         <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" \
+         style=\"max-width:560px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,\
+         Helvetica,Arial,sans-serif;color:{INK}\">\
+         <tr><td style=\"padding:0 4px 16px;font-size:20px;font-weight:800;letter-spacing:-0.02em\">\
+         <span style=\"color:{SIGNAL}\">&#9679;</span> SocialReins</td></tr>\
+         <tr><td style=\"background:#ffffff;border:1px solid #e7e5e4;border-radius:16px;\
+         padding:32px 28px;font-size:16px;line-height:1.55\">\
+         <h1 style=\"margin:0 0 20px;font-size:24px;line-height:1.25;font-weight:800;\
+         letter-spacing:-0.02em\">{title}</h1>{body}</td></tr>\
+         <tr><td style=\"padding:16px 4px 0;font-size:13px;line-height:1.5;color:{SOFT}\">\
+         SocialReins, the open-source social media manager.</td></tr>\
+         </table></td></tr></table></body></html>",
+        title = escape(subject)
+    )
 }
 
 fn parse_from(from: &str) -> Result<Mailbox, String> {
@@ -189,9 +287,43 @@ mod tests {
             .unwrap();
         let (auth, body) = seen.lock().unwrap().pop().unwrap();
         assert_eq!(auth.as_deref(), Some("Bearer re_test"));
-        let want = json!({"from": "Brain <login@example.com>", "to": ["a@example.com"],
-            "subject": "Hi", "text": "Body"});
-        assert_eq!(body, want);
+        assert_eq!(body["from"], "Brain <login@example.com>");
+        assert_eq!(body["to"], json!(["a@example.com"]));
+        assert_eq!(body["subject"], "Hi");
+        assert_eq!(body["text"], "Body");
+        assert!(body["html"]
+            .as_str()
+            .unwrap()
+            .contains("<p style=\"margin:0 0 16px\">Body</p>"));
+    }
+
+    #[test]
+    fn html_turns_a_labelled_link_into_a_button_and_escapes_everything() {
+        let text =
+            "Thanks, <b>Ann & co</b>.\n\nConfirm my email:\nhttps://x.test/v?token=a&b=\"c\"\n\n\
+                    Not a link: javascript:alert(1)\nhttps://x.test/plain\n";
+        let page = super::html("Hi <you>", text);
+        assert!(page.contains("<h1 style=") && page.contains(">Hi &lt;you&gt;</h1>"));
+        assert!(page.contains("Thanks, &lt;b&gt;Ann &amp; co&lt;/b&gt;."));
+        // The label moves onto the button and is not repeated as a paragraph.
+        let href = "href=\"https://x.test/v?token=a&amp;b=&quot;c&quot;\"";
+        assert_eq!(page.matches(href).count(), 2);
+        assert!(page.contains(">Confirm my email</a>"));
+        assert!(!page.contains("Confirm my email:"));
+        // A line that is not an http(s) link stays text; a bare link gets a default label.
+        assert!(page.contains("<p style=\"margin:0 0 16px\">Not a link: javascript:alert(1)</p>"));
+        assert!(!page.contains("href=\"javascript"));
+        assert!(page.contains(">Open link</a>"));
+    }
+
+    #[tokio::test]
+    async fn a_contact_message_stays_plain_text() {
+        let (url, seen) = mock(StatusCode::OK).await;
+        let mailer = Mailer::resend_at(&url, "re_test", "login@example.com").unwrap();
+        let send = mailer.send_reply_to("a@example.com", None, "Hi", "B".into());
+        send.await.unwrap();
+        let (_, body) = seen.lock().unwrap().pop().unwrap();
+        assert!(body.get("html").is_none());
     }
 
     #[tokio::test]

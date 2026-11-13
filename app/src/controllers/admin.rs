@@ -361,7 +361,7 @@ async fn approve(
     let mail = if new {
         let text = format!(
             "Good news: you are off the SocialReins waitlist and can now create your account.\n\n\
-             Sign up here with this email address:\n\n{}/signup\n\n\
+             Use this email address when you sign up.\n\nCreate my account:\n\n{}/signup\n\n\
              If you did not join the waitlist, ignore this email.\n",
             app.web_url
         );
