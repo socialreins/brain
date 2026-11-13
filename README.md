@@ -40,6 +40,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET, PUT | `/v1/admin/settings/signup` | The sign-up rules: `{"mode":"open"\|"closed"\|"domains","domains":[...],"source":"env"\|"saved"}`. `PUT {"mode","domains"}` saves them (sign-in from the last 10 minutes, else `403 reauth_required`): at most 50 domains or email addresses, trimmed, lowercased, deduplicated, at least one for `domains` (`422 invalid_mode`, `invalid_domains`) |
 | POST | `/v1/contact` | `{"name","email","message"}` mails `CONTACT_TO`, `202 {}` |
 | POST | `/auth/link` | `{"email":"...","name":"..."}` emails a sign-in link, `202 {"status":"sent"}`. `name` is optional, 1 to 80 characters (else `422 invalid_name`), and only names an account this link creates. With `"login_only":true`, an email without an account is sent a pointer to sign up instead of a link |
+| POST | `/auth/link/me` | Session cookie. Emails a sign-in link to the signed-in user's own address, `202 {"status":"sent"}`. No body and no captcha; opening the link starts a fresh session, for actions that answer `403 reauth_required` |
 | GET | `/auth/magic/{token}` | The emailed link: a page with a sign-in button, does not use the link |
 | POST | `/auth/magic` | Form field `token`: uses the link, sets the session cookie, redirects to `WEB_URL` |
 | GET | `/auth/me` | The signed-in user with `is_admin` (in `ADMIN_EMAILS`), or `401 {"error":"unauthorized"}` |
