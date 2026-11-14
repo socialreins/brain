@@ -401,6 +401,7 @@ mod auth {
     }
 
     #[tokio::test]
+    #[serial]
     async fn a_signed_in_user_gets_a_link_to_their_own_email_and_it_starts_a_fresh_session() {
         let (s, db) = server_where(|_| {}).await;
         let email = unique_email();
