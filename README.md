@@ -8,7 +8,7 @@ other repos, see the main repo [socialreins/socialreins](https://github.com/soci
 
 brain is the whole backend: sign-in (email link, passkey, Google), teams and invitations,
 connections to Facebook, Instagram, Threads, LinkedIn, Bluesky, X, TikTok and YouTube, and the
-workers that publish, schedule and take down posts. It serves the REST API under `/v1`, the
+workers that publish and schedule posts and take them down where the platform allows it. It serves the REST API under `/v1`, the
 MCP server at `/mcp` for AI assistants, and the waitlist behind the socialreins.com landing
 page. To install it or connect an assistant, start with the
 [docs](https://socialreins.com/docs).
