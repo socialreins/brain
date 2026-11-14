@@ -805,6 +805,38 @@ mod auth {
         (s, db, name)
     }
 
+    /// Two servers starting at the same moment both apply migrations; a fresh database is where
+    /// they collide (Postgres 42710 on `seaql_migrations`) unless `connect` takes its lock.
+    #[tokio::test]
+    #[serial]
+    async fn servers_starting_at_once_do_not_collide_on_migrations() {
+        use sea_orm::ConnectionTrait;
+        let mut config = Config::from_env().unwrap();
+        let name = format!("brain_race_{}", uuid::Uuid::now_v7().simple());
+        let admin = sea_orm::Database::connect(&config.database_url)
+            .await
+            .unwrap();
+        admin
+            .execute_unprepared(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap();
+        let base = &config.database_url;
+        config.database_url = format!("{}/{name}", &base[..base.rfind('/').unwrap()]);
+
+        let starts = (0..6).map(|_| {
+            let config = config.clone();
+            tokio::spawn(async move { connect(&config).await })
+        });
+        let mut last = None;
+        for start in starts.collect::<Vec<_>>() {
+            let db = start.await.unwrap().expect("every start migrates cleanly");
+            if let Some(db) = last.replace(db) {
+                db.close().await.unwrap();
+            }
+        }
+        drop_db(last.unwrap(), &name).await;
+    }
+
     pub(super) async fn drop_db(db: DatabaseConnection, name: &str) {
         use sea_orm::ConnectionTrait;
         db.close().await.unwrap();
