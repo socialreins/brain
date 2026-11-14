@@ -1,7 +1,7 @@
 //! Connect a YouTube channel through the shared OAuth flow (`oauth.rs`):
 //! `GET /connections/youtube/redirect`, then `GET /connect/youtube/callback` (path registered
 //! with Google, fixed) swaps the code for an access token (an hour) and a refresh token, reads the
-//! channel the consent picked and saves it as a `youtube` account in that team's Default set. It
+//! channel the consent picked and saves it as a `youtube` account in that team's default set. It
 //! uses the Google client of sign-in but its own redirect URI, state and cookie, so it never
 //! signs anyone in. The refresh token is kept sealed in `meta`; `fresh_token` renews the access
 //! token whenever a call is about to be made with one near its end.
