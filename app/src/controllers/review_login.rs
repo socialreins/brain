@@ -82,6 +82,27 @@ async fn demo_user(app: &AppState) -> Result<users::Model, sea_orm::DbErr> {
         .ok_or_else(|| sea_orm::DbErr::RecordNotFound("demo user vanished after insert".into()))
 }
 
+/// Run at start when `REVIEW_LOGIN_TOKEN` is unset: with the link switched off, what it handed
+/// out goes too. A session from it lasts 30 days, and a passkey or API token made in one would
+/// last for ever, so removing the variable alone would leave the demo team open to anyone who
+/// once had the link.
+pub async fn close(db: &sea_orm::DatabaseConnection) -> Result<(), sea_orm::DbErr> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    const DEMO: &str = "(SELECT id FROM users WHERE email = $1)";
+    for sql in [
+        format!("DELETE FROM sessions WHERE user_id IN {DEMO}"),
+        format!("DELETE FROM passkeys WHERE user_id IN {DEMO}"),
+        format!(
+            "UPDATE api_tokens SET revoked_at = now() \
+             WHERE revoked_at IS NULL AND created_by IN {DEMO}"
+        ),
+    ] {
+        let stmt = Statement::from_sql_and_values(DbBackend::Postgres, sql, [DEMO_EMAIL.into()]);
+        db.execute_raw(stmt).await?;
+    }
+    Ok(())
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new().route("/review-login/{token}", get(review_login))
 }

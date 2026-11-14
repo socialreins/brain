@@ -110,6 +110,38 @@ async fn right_token_signs_in_as_the_demo_user_and_reuses_it() {
     assert!(sets[0].is_default);
 }
 
+/// Taking `REVIEW_LOGIN_TOKEN` away must end what the link handed out, or anyone who once had
+/// it keeps the demo team through a session, or an API token made in one.
+#[tokio::test]
+#[serial]
+async fn switching_the_link_off_ends_its_sessions_and_tokens() {
+    let (s, db) = enabled().await;
+    let res = s.get(&format!("/review-login/{TOKEN}")).await;
+    let cookie = res.header("set-cookie").to_str().unwrap().to_owned();
+    let cookie = cookie.split(';').next().unwrap().to_owned();
+    let made = s
+        .post("/v1/api-tokens")
+        .add_header("cookie", &cookie)
+        .add_header("origin", "http://localhost:3000")
+        .json(&json!({"name": "kept by a reviewer"}))
+        .await;
+    assert_eq!(made.status_code(), 201, "{}", made.text());
+    let secret = made.json::<Value>()["secret"].as_str().unwrap().to_owned();
+    let with_token = || {
+        s.get("/v1/posts")
+            .add_header("authorization", format!("Bearer {secret}"))
+    };
+    with_token().await.assert_status_ok();
+
+    controllers::review_login::close(&db).await.unwrap();
+
+    assert_eq!(demo_sessions(&db).await, 0);
+    let me = s.get("/auth/me").add_header("cookie", &cookie).await;
+    assert_eq!(me.status_code(), 401);
+    assert_eq!(with_token().await.status_code(), 401);
+    assert!(demo(&db).await.is_some(), "the account and its team stay");
+}
+
 #[tokio::test]
 #[serial]
 async fn refuses_when_the_demo_email_is_an_admin() {

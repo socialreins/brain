@@ -327,6 +327,58 @@ mod auth {
         assert_eq!(bad.status_code(), 422);
     }
 
+    /// Mail to an address with no account goes wherever a stranger points it, so it is capped a
+    /// day; an existing account's own link is not, or the cap would be a way to lock people out.
+    #[tokio::test]
+    #[serial]
+    async fn sign_up_links_have_a_daily_allowance_that_never_blocks_an_account() {
+        use sea_orm::ConnectionTrait;
+        let (s, db) = server_where(|c| c.trust_proxy = true).await;
+        let clear = "DELETE FROM rate_limit_hits WHERE bucket LIKE 'signup:link%'";
+        db.execute_unprepared(clear).await.unwrap();
+        let fill = "INSERT INTO rate_limit_hits (bucket) \
+                    SELECT 'signup:link:ip:203.0.113.60' FROM generate_series(1, 20)";
+        db.execute_unprepared(fill).await.unwrap();
+        let ask = |ip: &'static str, email: String| {
+            s.post("/auth/link")
+                .add_header("x-forwarded-for", ip)
+                .json(&json!({"email": email}))
+        };
+        let known = unique_email();
+        let secret = link(&db, &known, Duration::minutes(5)).await;
+        open(&s, &secret).await;
+        assert!(user(&db, &known).await.is_some());
+
+        let (capped, other) = (unique_email(), unique_email());
+        for (ip, email) in [
+            ("203.0.113.60", capped.clone()),
+            ("203.0.113.60", known.clone()),
+            ("203.0.113.61", other.clone()),
+        ] {
+            assert_eq!(ask(ip, email).await.status_code(), 202, "same answer");
+        }
+        assert_eq!(links_eventually(&db, &other, 1).await, 1, "other IPs go on");
+        assert_eq!(
+            links_eventually(&db, &known, 1).await,
+            1,
+            "an account's own link is never capped"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(links(&db, &capped).await, 0, "the IP used its allowance");
+
+        // Everyone's allowance together: new addresses stop, accounts still sign in.
+        let fill = "INSERT INTO rate_limit_hits (bucket) \
+                    SELECT 'signup:link' FROM generate_series(1, 1000)";
+        db.execute_unprepared(fill).await.unwrap();
+        let late = unique_email();
+        ask("203.0.113.62", late.clone()).await;
+        ask("203.0.113.62", known.clone()).await;
+        assert_eq!(links_eventually(&db, &known, 2).await, 2);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(links(&db, &late).await, 0);
+        db.execute_unprepared(clear).await.unwrap();
+    }
+
     #[tokio::test]
     #[serial]
     async fn a_name_on_the_link_names_only_a_new_account() {
@@ -15317,6 +15369,41 @@ mod teams {
                     .iter()
                     .map(|v| v["id"].as_str().unwrap().to_owned())
                     .collect()
+            }
+
+            /// Only someone who manages the team may hold a token, and they may keep its secret:
+            /// so a token ends when its maker leaves, is removed or becomes a plain member.
+            #[tokio::test]
+            #[serial]
+            async fn a_token_ends_when_its_maker_leaves_or_stops_managing() {
+                let (s, db) = on_mock(120).await;
+                let (_, owner, _) = user(&s, &db).await;
+                let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+                let secret_of = |made: Value| made["secret"].as_str().unwrap().to_owned();
+                let kept = secret_of(make_token(&s, &owner, json!({"name": "owner"})).await);
+                let server = &s;
+                let works = |secret: String| async move {
+                    bearer(server, Method::GET, "/v1/posts", &secret)
+                        .await
+                        .status_code()
+                        .as_u16()
+                };
+                for end in ["demoted", "removed"] {
+                    let (admin, admin_id) = joined(&s, &db, &team_id, "admin").await;
+                    let theirs = secret_of(make_token(&s, &admin, json!({"name": end})).await);
+                    assert_eq!(works(theirs.clone()).await, 200);
+                    let path = format!("/v1/team/members/{admin_id}");
+                    let res = if end == "demoted" {
+                        req(&s, Method::PATCH, &path, &owner)
+                            .json(&json!({"role": "member"}))
+                            .await
+                    } else {
+                        req(&s, Method::DELETE, &path, &owner).await
+                    };
+                    assert!(res.status_code().is_success(), "{end}: {}", res.text());
+                    assert_eq!(works(theirs).await, 401, "{end}");
+                }
+                assert_eq!(works(kept).await, 200, "other people's tokens stay");
             }
 
             #[tokio::test]

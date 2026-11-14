@@ -43,6 +43,10 @@ const MAX_LIVE_LINKS: u64 = 3;
 const MAX_USER_NAME_CHARS: usize = 80;
 /// "No account" emails one address can get a day from login attempts.
 const LOGIN_NOTICES_PER_DAY: i64 = 3;
+/// Sign-in links a day to addresses that have no account yet: from one IP, and from everyone.
+const SIGN_UP_LINKS_PER_IP_PER_DAY: i64 = 20;
+const SIGN_UP_LINKS_PER_DAY: i64 = 1000;
+const SIGN_UP_LINKS_BUCKET: &str = "signup:link";
 
 #[derive(Deserialize)]
 struct LinkRequest {
@@ -151,6 +155,25 @@ async fn send_link(
     }
     if login_only && !known {
         return send_no_account_notice(app, &email).await;
+    }
+    // A link to an address with no account is mail to wherever a stranger points it, so it has a
+    // daily allowance, per IP and overall. An existing account's link is never counted: using
+    // the allowance up cannot keep anyone out.
+    if !known {
+        let mut caps = vec![(SIGN_UP_LINKS_BUCKET.to_owned(), SIGN_UP_LINKS_PER_DAY)];
+        if let Some(ip) = ip {
+            caps.push((
+                format!("{SIGN_UP_LINKS_BUCKET}:ip:{}", rate_limit::bucket(ip)),
+                SIGN_UP_LINKS_PER_IP_PER_DAY,
+            ));
+        }
+        let reserved = rate_limit::daily_reserve(&app.db, &caps)
+            .await
+            .map_err(|e| format!("sign-up link cap: {e}"))?;
+        if reserved.is_none() {
+            tracing::warn!("sign-up link not sent: daily cap reached");
+            return Ok(());
+        }
     }
     let now = Utc::now().fixed_offset();
     magic_links::Entity::delete_many()
