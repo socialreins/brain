@@ -6,8 +6,12 @@ The Rust backend for [SocialReins](https://socialreins.com), a social media mana
 scheduling and publishing posts across platforms. For the project overview, roadmap and the
 other repos, see the main repo [socialreins/socialreins](https://github.com/socialreins/socialreins).
 
-Right now brain serves the waitlist behind the socialreins.com landing page and magic link
-sign-in. Publishing, teams and the MCP server come later.
+brain is the whole backend: sign-in (email link, passkey, Google), teams and invitations,
+connections to Facebook, Instagram, Threads, LinkedIn, Bluesky, X, TikTok and YouTube, and the
+workers that publish, schedule and take down posts. It serves the REST API under `/v1`, the
+MCP server at `/mcp` for AI assistants, and the waitlist behind the socialreins.com landing
+page. To install it or connect an assistant, start with the
+[docs](https://socialreins.com/docs).
 
 ## Stack
 
