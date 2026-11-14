@@ -147,7 +147,13 @@ pub fn router(state: AppState, config: &Config) -> Router {
             Method::PATCH,
             Method::DELETE,
         ])
-        .allow_headers([header::CONTENT_TYPE])
+        // `X-Team`: the web app names the team of each call (`teams::InTeam`).
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::HeaderName::from_static(teams::TEAM_HEADER),
+        ])
+        // The header makes every call preflighted; browsers may reuse the answer for an hour.
+        .max_age(std::time::Duration::from_secs(3600))
         // The web app sends the session cookie on cross-origin calls to `/auth/*`.
         .allow_credentials(true);
     Router::new()

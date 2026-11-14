@@ -47,7 +47,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | POST | `/auth/link/me` | Session cookie. Emails a sign-in link to the signed-in user's own address, `202 {"status":"sent"}`. No body and no captcha; opening the link starts a fresh session, for actions that answer `403 reauth_required` |
 | GET | `/auth/magic/{token}` | The emailed link: a page with a sign-in button, does not use the link |
 | POST | `/auth/magic` | Form field `token`: uses the link, sets the session cookie, redirects to `WEB_URL` |
-| GET | `/auth/me` | The signed-in user with `is_admin` (in `ADMIN_EMAILS`), or `401 {"error":"unauthorized"}` |
+| GET | `/auth/me` | The signed-in user with `current_team` (`{"id","name","code","role"}`) and `is_admin` (in `ADMIN_EMAILS`), or `401 {"error":"unauthorized"}`. When the request names a team (see "Team codes"), that team is returned, and with the `X-Team` header it becomes the current team |
 | PATCH | `/auth/me` | `{"name":"..."}`: trimmed, 1 to 80 characters, no control characters, else `422 {"error":"invalid_name"}`. Replies like `GET /auth/me`. Origin must be in `CORS_ORIGINS` |
 | POST | `/auth/logout` | Deletes the session, `204`. Origin must be in `CORS_ORIGINS` |
 | GET | `/auth/providers` | `{"google":bool,"turnstile_site_key":"..."\|null}`: the optional sign-in methods this install offers, and the Turnstile key when the captcha is on |
@@ -62,7 +62,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | DELETE | `/auth/passkeys/{id}` | Deletes one of the signed-in user's passkeys, `204`, else `404` |
 | POST, GET | `/v1/teams` | Create a team (`{"name"}`, with its Default set; caller owns it and switches to it), or list mine |
 | PUT | `/v1/current-team` | `{"team_id"}`: switch to one of my teams |
-| GET, PATCH, DELETE | `/v1/team` | The current team; rename it (owner, admin); delete it (owner, sign-in from the last 10 minutes) |
+| GET, PATCH, DELETE | `/v1/team` | The current team (`{"id","name","code","role"}`), or the one the request names; rename it (owner, admin); delete it (owner, sign-in from the last 10 minutes) |
 | GET | `/v1/team/members` | The current team's members |
 | PATCH, DELETE | `/v1/team/members/{user_id}` | `{"role"}`: change a role (owner, admin); remove a member, or leave |
 | POST, GET | `/v1/team/invitations` | `{"email","role"}`: invite as `admin` or `member` (owner, admin); list pending |
@@ -195,6 +195,17 @@ Passkeys use WebAuthn through the web app's pages: each `start` keeps the ceremo
 Postgres for 5 minutes and the matching `finish` uses it once. The state-changing endpoints in
 this section only accept requests whose `Origin` (or `Referer`) is one of `CORS_ORIGINS`, else
 `403 {"error":"forbidden_origin"}`.
+
+Team codes: every team has a `code`, 6 characters from `23456789abcdefghjkmnpqrstuvwxyz` (no
+`0`, `o`, `1`, `l`, `i`), unique, given when the team is made and never changed, not even by a
+rename. Teams that existed before the column get theirs from the migration. The web app uses it
+as the team's address (`/t/<code>/home`). It is not a secret and gives no access. A cookie
+request may name the team it acts in: the `X-Team: <code>` header, or `?team=<code>` on a page
+navigation such as `/connections/<provider>/redirect`, in any case. The server checks the
+caller's membership every time, and answers `404 {"error":"not_found"}` both for a team the
+caller is not in and for a code no team has. A request that names no team acts in the user's
+current team (`users.current_team_id`, the team opened last), so older clients keep working.
+API tokens ignore both: a token always acts in its own team.
 
 Teams: every sign-in gives a user with no team a personal team named after the first word of
 their name, owned by them, with its Default social set. The team routes use the session cookie, and the state-changing ones the same origin

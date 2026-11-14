@@ -333,11 +333,7 @@ async fn me(State(app): State<AppState>, a: Actor) -> Response {
         None => None,
     };
     Json(Me {
-        team: Team {
-            id: a.team.id,
-            name: a.team.name.clone(),
-            role: a.role.as_str().into(),
-        },
+        team: super::teams::team_json(&a.team, a.role),
         social_set: set,
         token_name: a.token.map(|t| t.name),
     })

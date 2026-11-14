@@ -7,6 +7,9 @@ pub struct Model {
     pub id: Uuid,
     #[sea_orm(column_type = "Text")]
     pub name: String,
+    /// The team's address in the web app (`/t/<code>/...`): 6 lowercase characters, permanent.
+    #[sea_orm(column_type = "Text", unique)]
+    pub code: String,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }
