@@ -150,7 +150,7 @@ async fn live_count_locked(db: &impl ConnectionTrait, team_id: Uuid) -> Result<u
         .await
 }
 
-/// The current team's live sets, Default first, then oldest first, with their accounts. With
+/// The current team's live sets, the default set first, then oldest first, with their accounts. With
 /// `?deleted=true`, the deleted sets that can still be restored, newest deletion first.
 #[utoipa::path(get, path = "/social-sets", tag = "social-sets", params(ListQuery),
     security(("session" = []), ("api_token" = [])),
