@@ -34,8 +34,8 @@ pub const MAX_STILL_BYTES: usize = socialreins_core::post::MAX_MEDIA_BYTES as us
 pub const SWEEP_DAYS: i32 = 7;
 const MAX_REDIRECTS: usize = 3;
 /// A download's base time: its answer must start within it, and the whole file may take it plus
-/// its size at `MIN_SPEED` (the size the server said, else the bytes that came so far), so 60 s
-/// for a small image and about 3.5 minutes for 300 MB.
+/// the bytes that came so far at `MIN_SPEED`, so 60 s for a small image and about 3.5 minutes for
+/// 300 MB. The size a server claims earns nothing: only bytes that arrived do.
 pub const INGEST_DEADLINE: Duration = Duration::from_secs(60);
 /// The slowest download that still finishes in time, in bytes a second.
 pub const MIN_SPEED: u64 = 2_000_000;
@@ -642,13 +642,12 @@ impl Media {
         if any_cap == video_cap && res.content_length().is_some_and(|n| n > any_cap as u64) {
             return Err(Fail::TooLarge);
         }
-        // The time a download has: its size at `MIN_SPEED` on top of `deadline`. Size unsaid, it
-        // is the bytes that came so far, so a download earns its time only as it arrives at a
-        // healthy rate, and a small file of unknown size gets no more than a sized one.
-        let (known, ceiling, deadline) = (res.content_length(), until, self.deadline);
+        // The time a download has: the bytes that came so far at `MIN_SPEED`, on top of
+        // `deadline`. A `Content-Length` earns nothing, or a server could claim a huge file and
+        // drip it, holding a publish slot that every team shares.
+        let (ceiling, deadline) = (until, self.deadline);
         let by = move |got: usize| {
-            let size = known.unwrap_or(got as u64);
-            ceiling.min(started + deadline + Duration::from_secs(size / MIN_SPEED))
+            ceiling.min(started + deadline + Duration::from_secs(got as u64 / MIN_SPEED))
         };
         let stall = self.stall;
         let read = |e: reqwest::Error| {
@@ -1814,15 +1813,18 @@ mod tests {
                     Body::from_stream(head.chain(first).chain(stream::pending()))
                 }),
             )
+            .route("/slow.mp4", get(|| async { drip() }))
+            // The same drip, claiming to be 1 GiB.
             .route(
-                "/slow.mp4",
-                get(|| async {
-                    Body::from_stream(stream::unfold((), |()| async {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                        Some((Ok::<_, std::io::Error>(MP4_HEAD.to_vec()), ()))
-                    }))
-                }),
+                "/slow-sized.mp4",
+                get(|| async { ([("content-length", (1u64 << 30).to_string())], drip()) }),
             );
+        fn drip() -> Body {
+            Body::from_stream(stream::unfold((), |()| async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Some((Ok::<_, std::io::Error>(MP4_HEAD.to_vec()), ()))
+            }))
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await });
@@ -2160,25 +2162,28 @@ mod tests {
         assert_eq!(got.unwrap_err(), Fail::Stalled);
         assert!(started.elapsed() < Duration::from_secs(3), "failed fast");
 
-        // Bytes keep coming, but slower than `MIN_SPEED`, and their size is unsaid: only bytes
-        // that came earn more time, so the base deadline ends it however large the cap is.
+        // Bytes keep coming, but slower than `MIN_SPEED`: only bytes that came earn more time,
+        // so the base deadline ends it however large the cap is, and whatever size the server
+        // claims (a claimed 1 GiB would otherwise buy minutes of a shared publish slot).
         media.deadline = Duration::from_millis(300);
-        let started = Instant::now();
-        let got = media
-            .download(
-                Uuid::now_v7(),
-                &format!("{base}/slow.mp4"),
-                MAX_BYTES,
-                soon(),
-                &mut None,
-            )
-            .await;
-        assert_eq!(got.unwrap_err(), Fail::TimedOut);
-        let took = started.elapsed();
-        assert!(
-            took >= Duration::from_millis(300) && took < Duration::from_secs(3),
-            "{took:?}"
-        );
+        for path in ["/slow.mp4", "/slow-sized.mp4"] {
+            let started = Instant::now();
+            let got = media
+                .download(
+                    Uuid::now_v7(),
+                    &format!("{base}{path}"),
+                    MAX_BYTES,
+                    soon(),
+                    &mut None,
+                )
+                .await;
+            assert_eq!(got.unwrap_err(), Fail::TimedOut, "{path}");
+            let took = started.elapsed();
+            assert!(
+                took >= Duration::from_millis(300) && took < Duration::from_secs(3),
+                "{path}: {took:?}"
+            );
+        }
         // The post's ceiling ends a download whatever its size.
         media.ceiling = Duration::from_millis(200);
         let until = Instant::now() + media.ceiling;
@@ -2195,7 +2200,7 @@ mod tests {
         assert_eq!(got.unwrap_err(), Fail::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(1));
 
-        assert_eq!(store.aborted.load(SeqCst), 3, "each upload was aborted");
+        assert_eq!(store.aborted.load(SeqCst), 4, "each upload was aborted");
         let stored = store.inner.list_with_delimiter(None).await.unwrap();
         assert!(stored.objects.is_empty() && stored.common_prefixes.is_empty());
     }

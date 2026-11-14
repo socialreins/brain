@@ -155,7 +155,7 @@ fn invitation_json(i: team_invitations::Model) -> Invitation {
     }
 }
 
-async fn membership(
+pub(super) async fn membership(
     db: &impl ConnectionTrait,
     team_id: Uuid,
     user_id: Uuid,
@@ -539,6 +539,14 @@ async fn change_member(
         return Ok(Change::NotFound);
     };
     let (mine, from) = (role_of(&me), role_of(&them));
+    // The App Review demo user stays the owner of a team it owns, whoever asks (see `is_demo`).
+    // In a team it was only invited to, it is a member like any other.
+    if from == Role::Owner
+        && to != Some(Role::Owner)
+        && super::review_login::is_demo(&txn, target).await?
+    {
+        return Ok(Change::Forbidden);
+    }
     let leaving = to.is_none() && actor == target;
     if !leaving && !(mine.manages() && mine.may_change(from, to)) {
         return Ok(Change::Forbidden);
@@ -560,6 +568,16 @@ async fn change_member(
             .filter(team_invitations::Column::InvitedBy.eq(target))
             .exec(&txn)
             .await?;
+        // So does an API token they made: they may still hold its secret, and only someone
+        // who manages the team may hold one.
+        let revoke = "UPDATE api_tokens SET revoked_at = now() \
+                      WHERE team_id = $1 AND created_by = $2 AND revoked_at IS NULL";
+        txn.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            revoke,
+            [team_id.into(), target.into()],
+        ))
+        .await?;
     }
     let done = match to {
         Some(role) => {

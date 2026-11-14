@@ -82,6 +82,60 @@ async fn demo_user(app: &AppState) -> Result<users::Model, sea_orm::DbErr> {
         .ok_or_else(|| sea_orm::DbErr::RecordNotFound("demo user vanished after insert".into()))
 }
 
+/// Whether `user_id` is the demo user. `teams::change_member` refuses to demote or remove it
+/// where it is an owner: someone signed in through the link could otherwise make their own
+/// account an owner and take the demo user out, and `close` would no longer find the team.
+pub async fn is_demo(
+    db: &impl sea_orm::ConnectionTrait,
+    user_id: uuid::Uuid,
+) -> Result<bool, sea_orm::DbErr> {
+    let user = users::Entity::find_by_id(user_id).one(db).await?;
+    Ok(user.is_some_and(|u| u.email == DEMO_EMAIL))
+}
+
+/// Run at start when `REVIEW_LOGIN_TOKEN` is unset: with the link switched off, what it handed
+/// out goes too. A session from it lasts 30 days, and a passkey or API token made in one would
+/// last for ever, so removing the variable alone would leave the demo team open to anyone who
+/// once had the link.
+pub async fn close(db: &sea_orm::DatabaseConnection) -> Result<(), sea_orm::DbErr> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    const DEMO: &str = "(SELECT id FROM users WHERE email = $1)";
+    // Every team the demo user is in, whatever its role there: a token or invitation of theirs
+    // is a way back in whoever made it, since anyone signed in as the demo user could have added
+    // an admin first. The demo user cannot be taken out of a team it owns (`is_demo`), so none
+    // it made is missed.
+    let teams = format!("(SELECT team_id FROM team_user WHERE user_id IN {DEMO})");
+    let bind =
+        |sql: String| Statement::from_sql_and_values(DbBackend::Postgres, sql, [DEMO_EMAIL.into()]);
+    for sql in [
+        format!("DELETE FROM sessions WHERE user_id IN {DEMO}"),
+        format!("DELETE FROM passkeys WHERE user_id IN {DEMO}"),
+        format!(
+            "UPDATE api_tokens SET revoked_at = now() \
+             WHERE revoked_at IS NULL AND (created_by IN {DEMO} OR team_id IN {teams})"
+        ),
+        format!("DELETE FROM team_invitations WHERE invited_by IN {DEMO} OR team_id IN {teams}"),
+    ] {
+        db.execute_raw(bind(sql)).await?;
+    }
+    // Members are left alone: the operator may have joined the demo team to set it up. They
+    // are told, because a member added through the link still has the team.
+    let others = format!(
+        "SELECT count(*) AS n FROM team_user WHERE team_id IN {teams} AND user_id NOT IN {DEMO}"
+    );
+    let n: i64 = match db.query_one_raw(bind(others)).await? {
+        Some(row) => row.try_get("", "n")?,
+        None => 0,
+    };
+    if n > 0 {
+        tracing::warn!(
+            members = n,
+            "review login is off, but the demo team has other members: check its Team page"
+        );
+    }
+    Ok(())
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new().route("/review-login/{token}", get(review_login))
 }
