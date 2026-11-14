@@ -541,7 +541,10 @@ async fn change_member(
     let (mine, from) = (role_of(&me), role_of(&them));
     // The App Review demo user stays the owner of a team it owns, whoever asks (see `is_demo`).
     // In a team it was only invited to, it is a member like any other.
-    if from == Role::Owner && super::review_login::is_demo(&txn, target).await? {
+    if from == Role::Owner
+        && to != Some(Role::Owner)
+        && super::review_login::is_demo(&txn, target).await?
+    {
         return Ok(Change::Forbidden);
     }
     let leaving = to.is_none() && actor == target;

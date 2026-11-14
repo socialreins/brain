@@ -374,10 +374,16 @@ mod auth {
         assert_eq!(counted().await, 1, "only the link to a new address counts");
         // A fourth link for an address already at its 3 live links sends nothing and costs nothing.
         for _ in 0..3 {
-            ask("203.0.113.61", other.clone()).await;
+            assert_eq!(ask("203.0.113.61", other.clone()).await.status_code(), 202);
         }
         assert_eq!(links_eventually(&db, &other, 3).await, 3);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // The refused one reserves, then refunds, after its reply: wait for it to settle.
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if counted().await == 3 {
+                break;
+            }
+        }
         assert_eq!(counted().await, 3, "a refused link gives its place back");
 
         // Everyone's allowance together: new addresses stop, accounts still sign in.

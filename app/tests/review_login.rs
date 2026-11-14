@@ -137,7 +137,7 @@ async fn switching_the_link_off_ends_its_sessions_and_tokens() {
         .post("/v1/team/invitations")
         .add_header("cookie", &cookie)
         .add_header("origin", "http://localhost:3000")
-        .json(&json!({"email": "reviewer-friend@example.com", "role": "admin"}))
+        .json(&json!({"email": format!("{}@example.com", uuid::Uuid::now_v7()), "role": "admin"}))
         .await;
     assert_eq!(invited.status_code(), 201, "{}", invited.text());
     let user_id = demo(&db).await.unwrap().id;
@@ -168,7 +168,7 @@ async fn switching_the_link_off_ends_its_sessions_and_tokens() {
     let made = by_demo("/v1/api-tokens", json!({"name": "second team"})).await;
     assert_eq!(made.status_code(), 201, "{}", made.text());
     let other_secret = made.json::<Value>()["secret"].as_str().unwrap().to_owned();
-    let invite = json!({"email": "second-friend@example.com", "role": "admin"});
+    let invite = json!({"email": format!("{}@example.com", uuid::Uuid::now_v7()), "role": "admin"});
     let invited = by_demo("/v1/team/invitations", invite).await;
     assert_eq!(invited.status_code(), 201, "{}", invited.text());
     let other = uuid::Uuid::now_v7();
@@ -267,9 +267,31 @@ async fn the_demo_user_cannot_be_demoted_or_removed_from_its_team() {
         .unwrap()
         .map(|m| m.role);
     assert_eq!(role.as_deref(), Some("owner"));
-    db.execute_unprepared(&format!("DELETE FROM users WHERE id = '{other}'"))
-        .await
-        .unwrap();
+
+    // In a team it was only invited to, the demo user is a member like any other and may go.
+    let guest = uuid::Uuid::now_v7();
+    db.execute_unprepared(&format!(
+        "INSERT INTO teams (id, name) VALUES ('{guest}', 'Guest'); \
+         INSERT INTO team_user (team_id, user_id, role) VALUES ('{guest}', '{other}', 'owner'); \
+         INSERT INTO team_user (team_id, user_id, role) VALUES ('{guest}', '{demo_id}', 'admin')"
+    ))
+    .await
+    .unwrap();
+    let switched = by_demo(axum::http::Method::PUT, "/v1/current-team".into())
+        .json(&json!({"team_id": guest}))
+        .await;
+    assert!(switched.status_code().is_success(), "{}", switched.text());
+    let left = by_demo(
+        axum::http::Method::DELETE,
+        format!("/v1/team/members/{demo_id}"),
+    )
+    .await;
+    assert_eq!(left.status_code(), 204, "{}", left.text());
+    db.execute_unprepared(&format!(
+        "DELETE FROM teams WHERE id = '{guest}'; DELETE FROM users WHERE id = '{other}'"
+    ))
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

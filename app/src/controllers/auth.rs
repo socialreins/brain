@@ -177,29 +177,36 @@ async fn send_link(
         };
         reserved = ids;
     }
-    let now = Utc::now().fixed_offset();
-    magic_links::Entity::delete_many()
-        .filter(magic_links::Column::ExpiresAt.lt(now))
-        .exec(&app.db)
-        .await
-        .map_err(|e| format!("magic link cleanup: {e}"))?;
-    let Some(secret) = insert_capped_link(app, &email, name)
-        .await
-        .map_err(|e| format!("magic link insert: {e}"))?
-    else {
-        // No mail goes out, so nothing is used up.
+    let sent: Result<bool, String> = async {
+        let now = Utc::now().fixed_offset();
+        magic_links::Entity::delete_many()
+            .filter(magic_links::Column::ExpiresAt.lt(now))
+            .exec(&app.db)
+            .await
+            .map_err(|e| format!("magic link cleanup: {e}"))?;
+        let Some(secret) = insert_capped_link(app, &email, name)
+            .await
+            .map_err(|e| format!("magic link insert: {e}"))?
+        else {
+            return Ok(false);
+        };
+        let url = format!("{}/auth/magic/{secret}", app.brain_url);
+        let text = format!(
+            "Here is your sign-in link for SocialReins.\n\nSign in to SocialReins:\n\n{url}\n\nIt works once and expires in \
+             {LINK_MINUTES} minutes. If you did not ask for it, ignore this email.\n"
+        );
+        app.mailer
+            .send(&email, "Your sign-in link", text)
+            .await
+            .map_err(|e| format!("mail: {e}"))?;
+        Ok(true)
+    }
+    .await;
+    // Only a link that went out uses the allowance up.
+    if !matches!(sent, Ok(true)) {
         rate_limit::daily_refund(&app.db, &reserved).await;
-        return Ok(());
-    };
-    let url = format!("{}/auth/magic/{secret}", app.brain_url);
-    let text = format!(
-        "Here is your sign-in link for SocialReins.\n\nSign in to SocialReins:\n\n{url}\n\nIt works once and expires in \
-         {LINK_MINUTES} minutes. If you did not ask for it, ignore this email.\n"
-    );
-    app.mailer
-        .send(&email, "Your sign-in link", text)
-        .await
-        .map_err(|e| format!("mail: {e}"))
+    }
+    sent.map(|_| ())
 }
 
 /// Tells an email with no account how to create one, at most `LOGIN_NOTICES_PER_DAY` times. The
