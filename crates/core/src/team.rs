@@ -43,6 +43,33 @@ impl Role {
     }
 }
 
+/// The letters of a team code: digits and lowercase letters without the look-alikes `0`, `o`,
+/// `1`, `l` and `i`.
+pub const CODE_ALPHABET: &[u8; 31] = b"23456789abcdefghjkmnpqrstuvwxyz";
+pub const CODE_CHARS: usize = 6;
+
+/// A new random team code. It is an address (`/t/<code>/...`), not a secret, and may clash with
+/// an existing one: the `teams.code` unique index decides, and the caller draws again.
+pub fn code() -> String {
+    let mut out = String::with_capacity(CODE_CHARS);
+    while out.len() < CODE_CHARS {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).expect("the OS random source is available");
+        // 248 is the largest multiple of 31 in a byte; higher bytes would favour some letters.
+        let fair = bytes.iter().filter(|b| **b < 248);
+        out.extend(fair.map(|b| CODE_ALPHABET[usize::from(b % 31)] as char));
+        out.truncate(CODE_CHARS);
+    }
+    out
+}
+
+/// `raw` as a stored team code (lowercase), or `None` when it cannot be one. Codes are matched
+/// in any case.
+pub fn parse_code(raw: &str) -> Option<String> {
+    let code = raw.to_ascii_lowercase();
+    (code.len() == CODE_CHARS && code.bytes().all(|b| CODE_ALPHABET.contains(&b))).then_some(code)
+}
+
 /// A trimmed team or set name of 1 to `MAX_NAME_CHARS` characters, without control characters
 /// (it goes into email subjects).
 pub fn name(raw: &str) -> Option<String> {

@@ -1,11 +1,12 @@
 //! Teams, members and invitations, for the signed-in user (session cookie).
 //!
 //! Every route acts inside the caller's own memberships; a team, member or invitation outside
-//! them is `404 {"error":"not_found"}`. The current team is `users.current_team_id` when the user
-//! still belongs to it, else their oldest membership. A user with no team gets a personal one
-//! with its default set, on sign-in or on first use.
+//! them is `404 {"error":"not_found"}`. A cookie request may name its team by code, in the
+//! `X-Team` header or in `?team=` (see `InTeam`). Without one it acts in the current team:
+//! `users.current_team_id` when the user still belongs to it, else their oldest membership. A
+//! user with no team gets a personal one with its default set, on sign-in or on first use.
 use axum::{
-    extract::{FromRequestParts, Path, State},
+    extract::{FromRequestParts, Path, Query, State},
     http::{request::Parts, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -48,6 +49,9 @@ const INVITES_PER_INVITER: i64 = 50;
 pub struct Team {
     pub id: Uuid,
     pub name: String,
+    /// The team's address in the web app (`/t/<code>/...`): 6 lowercase characters that never
+    /// change. Not a secret; it gives no access.
+    pub code: String,
     /// The caller's role: `owner`, `admin` or `member`.
     pub role: String,
 }
@@ -126,10 +130,11 @@ fn role_of(row: &team_user::Model) -> Role {
     Role::parse(&row.role).unwrap_or(Role::Member)
 }
 
-fn team_json(team: &teams::Model, role: Role) -> Team {
+pub(crate) fn team_json(team: &teams::Model, role: Role) -> Team {
     Team {
         id: team.id,
         name: team.name.clone(),
+        code: team.code.clone(),
         role: role.as_str().into(),
     }
 }
@@ -165,7 +170,11 @@ pub(super) async fn membership(
         .await
 }
 
-async fn set_current(db: &impl ConnectionTrait, user_id: Uuid, team_id: Uuid) -> Result<(), DbErr> {
+pub(crate) async fn set_current(
+    db: &impl ConnectionTrait,
+    user_id: Uuid,
+    team_id: Uuid,
+) -> Result<(), DbErr> {
     let row = users::ActiveModel {
         id: Set(user_id),
         current_team_id: Set(Some(team_id)),
@@ -174,18 +183,33 @@ async fn set_current(db: &impl ConnectionTrait, user_id: Uuid, team_id: Uuid) ->
     users::Entity::update(row).exec(db).await.map(|_| ())
 }
 
+/// Inserts a team under a code from `code`, asking for another while the code is taken (the
+/// unique index decides, so this is safe inside a transaction).
+pub async fn insert_team(
+    db: &impl ConnectionTrait,
+    name: &str,
+    mut code: impl FnMut() -> String,
+) -> Result<teams::Model, DbErr> {
+    // Plain SQL: `ON CONFLICT DO NOTHING` returns no row for a taken code, without failing
+    // the surrounding transaction.
+    let sql = "INSERT INTO teams (id, name, code) VALUES ($1, $2, $3) \
+               ON CONFLICT (code) DO NOTHING RETURNING *";
+    loop {
+        let values = [Uuid::now_v7().into(), name.into(), code().into()];
+        let stmt = Statement::from_sql_and_values(DbBackend::Postgres, sql, values);
+        if let Some(team) = teams::Entity::find().from_raw_sql(stmt).one(db).await? {
+            return Ok(team);
+        }
+    }
+}
+
 /// Makes a team with its default set, `user_id` as owner, and switches the user to it.
 async fn create_team(
     db: &impl ConnectionTrait,
     user_id: Uuid,
     name: &str,
 ) -> Result<teams::Model, DbErr> {
-    let team = teams::ActiveModel {
-        id: Set(Uuid::now_v7()),
-        name: Set(name.to_owned()),
-        ..Default::default()
-    };
-    let team = teams::Entity::insert(team).exec_with_returning(db).await?;
+    let team = insert_team(db, name, team::code).await?;
     let owner = team_user::ActiveModel {
         team_id: Set(team.id),
         user_id: Set(user_id),
@@ -280,7 +304,50 @@ pub(crate) async fn current_team(
         .ok_or_else(|| DbErr::RecordNotFound("no team after ensure_team".into()))
 }
 
-/// The signed-in user inside their current team; `401` without a session.
+/// The header a cookie request names its team in, by code.
+pub const TEAM_HEADER: &str = "x-team";
+
+#[derive(Deserialize)]
+struct NamedTeam {
+    team: Option<String>,
+}
+
+/// The team code the request names: the `X-Team` header, else `?team=` (a page navigation
+/// cannot set a header). The header is only ever sent by the web app, since CORS allows it for
+/// `CORS_ORIGINS` alone. A link can come from anywhere, so the query counts only when the
+/// navigation came from the web app (`FromWeb`: `Origin`, else `Referer`); otherwise it is
+/// ignored and the request acts in the current team, as it did before team codes.
+async fn named_team(parts: &mut Parts, app: &AppState) -> Option<String> {
+    if let Some(value) = parts.headers.get(TEAM_HEADER) {
+        return Some(value.to_str().unwrap_or_default().to_owned());
+    }
+    let code = Query::<NamedTeam>::try_from_uri(&parts.uri).ok()?.0.team?;
+    (FromWeb::from_request_parts(parts, app).await.ok()).map(|_| code)
+}
+
+/// The team with `code` (any case) and the user's role in it; `None` when there is no such
+/// team or the user is not in it, so the two look the same to the caller.
+async fn team_by_code(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+    code: &str,
+) -> Result<Option<(teams::Model, Role)>, DbErr> {
+    let Some(code) = team::parse_code(code) else {
+        return Ok(None);
+    };
+    let found = teams::Entity::find()
+        .filter(teams::Column::Code.eq(code))
+        .one(db)
+        .await?;
+    let Some(found) = found else { return Ok(None) };
+    let row = membership(db, found.id, user_id).await?;
+    Ok(row.map(|row| (found, role_of(&row))))
+}
+
+/// The signed-in user inside a team; `401` without a session. The team is the one the request
+/// names by code (`X-Team` header or `?team=`), checked against the user's memberships: `404
+/// not_found` when they are not in it or it does not exist. A request that names none acts in
+/// the user's current team, so API tokens and older clients are unaffected.
 pub struct InTeam {
     pub current: CurrentUser,
     pub team: teams::Model,
@@ -292,10 +359,17 @@ impl FromRequestParts<AppState> for InTeam {
 
     async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, Reply> {
         let current = CurrentUser::from_request_parts(parts, app).await?;
-        let (team, role) = current_team(&app.db, &current.0).await.map_err(|e| {
-            tracing::error!(error = %e, "current team lookup failed");
+        let failed = |e: DbErr| {
+            tracing::error!(error = %e, "team lookup failed");
             error(StatusCode::INTERNAL_SERVER_ERROR, "internal")
-        })?;
+        };
+        let (team, role) = match named_team(parts, app).await {
+            Some(code) => team_by_code(&app.db, current.0.id, &code)
+                .await
+                .map_err(failed)?
+                .ok_or_else(|| error(StatusCode::NOT_FOUND, "not_found"))?,
+            None => current_team(&app.db, &current.0).await.map_err(failed)?,
+        };
         Ok(Self {
             current,
             team,
@@ -403,7 +477,7 @@ async fn switch(
     }
 }
 
-/// The caller's current team.
+/// The team the request names (see `InTeam`), else the caller's current team.
 #[utoipa::path(get, path = "/team", tag = "teams",
     responses((status = 200, body = Team), (status = 401, body = Error)))]
 async fn show(t: InTeam) -> Response {

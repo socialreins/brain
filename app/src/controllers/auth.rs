@@ -691,15 +691,25 @@ pub(crate) fn user_json(user: &users::Model) -> Json<serde_json::Value> {
     }))
 }
 
-/// The user, plus `current_team` `{id, name, role}` and `is_admin` (in `ADMIN_EMAILS`).
-async fn me(State(app): State<AppState>, CurrentUser(user, _): CurrentUser) -> Response {
-    let (team, role) = match teams::current_team(&app.db, &user).await {
-        Ok(found) => found,
-        Err(e) => return internal(e, "current team lookup"),
-    };
-    let Json(mut body) = user_json(&user);
-    body["current_team"] = json!({"id": team.id, "name": team.name, "role": role.as_str()});
-    body["is_admin"] = super::waitlist::is_admin(&app, &user.email).into();
+/// The user, plus `current_team` `{id, name, code, role}` and `is_admin` (in `ADMIN_EMAILS`).
+/// `current_team` is the team the request names (see `InTeam`). Named in the `X-Team` header,
+/// it also becomes the user's current team, so the web app's old addresses lead to the team
+/// opened last. `?team=` does not switch: another site can send a browser to a link, but only
+/// the web app's origins may send the header.
+async fn me(State(app): State<AppState>, headers: HeaderMap, t: teams::InTeam) -> Response {
+    let user = &t.current.0;
+    if headers.contains_key(teams::TEAM_HEADER) && user.current_team_id != Some(t.team.id) {
+        if let Err(e) = teams::set_current(&app.db, user.id, t.team.id).await {
+            return internal(e, "current team update");
+        }
+    }
+    me_json(&app, user, &t)
+}
+
+fn me_json(app: &AppState, user: &users::Model, t: &teams::InTeam) -> Response {
+    let Json(mut body) = user_json(user);
+    body["current_team"] = json!(teams::team_json(&t.team, t.role));
+    body["is_admin"] = super::waitlist::is_admin(app, &user.email).into();
     Json(body).into_response()
 }
 
@@ -717,9 +727,10 @@ pub struct NewName {
 async fn rename(
     _: FromWeb,
     State(app): State<AppState>,
-    CurrentUser(user, session): CurrentUser,
+    t: teams::InTeam,
     Body(body): Body<NewName>,
 ) -> Response {
+    let user = &t.current.0;
     let Some(name) = team::name_up_to(&body.name, MAX_USER_NAME_CHARS) else {
         return error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name").into_response();
     };
@@ -730,7 +741,7 @@ async fn rename(
         ..Default::default()
     };
     match users::Entity::update(row).exec(&app.db).await {
-        Ok(user) => me(State(app), CurrentUser(user, session)).await,
+        Ok(user) => me_json(&app, &user, &t),
         Err(e) => internal(e, "user rename"),
     }
 }

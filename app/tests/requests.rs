@@ -1926,7 +1926,7 @@ mod teams {
     use chrono::{Duration, Utc};
     use sea_orm::{ActiveValue::Set, DatabaseConnection};
     use socialreins_brain::models::{sessions, social_sets, team_invitations, team_user, users};
-    use socialreins_core::token;
+    use socialreins_core::{team, token};
 
     const WEB: &str = "http://localhost:3000";
 
@@ -2282,7 +2282,7 @@ mod teams {
         ok.assert_status_ok();
         assert_eq!(
             ok.json::<Value>(),
-            json!({"id": team["id"], "name": team["name"], "role": "admin"})
+            json!({"id": team["id"], "name": team["name"], "code": team["code"], "role": "admin"})
         );
         assert_eq!(current(&s, &invited).await["id"], team["id"]);
         assert_eq!(memberships(&db, invited_id).await, 2);
@@ -2390,6 +2390,199 @@ mod teams {
             201,
             "back in their personal team, as owner"
         );
+    }
+
+    fn is_code(code: &Value) -> bool {
+        let code = code.as_str().unwrap();
+        code.len() == 6 && team::parse_code(code).as_deref() == Some(code)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn every_team_reply_carries_its_permanent_code() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, cookie, _) = user(&s, &db).await;
+        let me = s.get("/auth/me").add_header("cookie", &cookie).await;
+        let personal = me.json::<Value>()["current_team"].clone();
+        assert!(is_code(&personal["code"]), "{personal}");
+        assert_eq!(current(&s, &cookie).await["code"], personal["code"]);
+        let made = req(&s, Method::POST, "/v1/teams", &cookie)
+            .json(&json!({"name": "Acme"}))
+            .await
+            .json::<Value>();
+        assert!(is_code(&made["code"]) && made["code"] != personal["code"]);
+        let list = s.get("/v1/teams").add_header("cookie", &cookie).await;
+        let codes: Vec<Value> = (list.json::<Value>().as_array().unwrap().iter())
+            .map(|t| t["code"].clone())
+            .collect();
+        assert_eq!(codes, [personal["code"].clone(), made["code"].clone()]);
+        // A rename keeps the code.
+        let renamed = req(&s, Method::PATCH, "/v1/team", &cookie)
+            .json(&json!({"name": "Acme Co"}))
+            .await
+            .json::<Value>();
+        assert_eq!(renamed["code"], made["code"]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_taken_code_is_drawn_again() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, cookie, _) = user(&s, &db).await;
+        let taken = current(&s, &cookie).await["code"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let free = loop {
+            let code = team::code();
+            if code != taken {
+                break code;
+            }
+        };
+        let mut draws = vec![free.clone(), taken.clone(), taken.clone()];
+        let made = controllers::teams::insert_team(&db, "Clash", || draws.pop().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(made.code, free);
+        assert!(draws.is_empty());
+        socialreins_brain::models::teams::Entity::delete_by_id(made.id)
+            .exec(&db)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_migration_gives_existing_teams_a_code() {
+        use sea_orm::ConnectionTrait;
+        let (s, db) = server_where(|_| {}).await;
+        let (_, cookie, _) = user(&s, &db).await;
+        let team = current(&s, &cookie).await;
+        let id: uuid::Uuid = team["id"].as_str().unwrap().parse().unwrap();
+        // As the table stands in the middle of the migration: the column is there, still empty.
+        db.execute_unprepared(&format!(
+            "ALTER TABLE teams ALTER COLUMN code DROP NOT NULL; \
+             UPDATE teams SET code = NULL WHERE id = '{id}'"
+        ))
+        .await
+        .unwrap();
+        db.execute_unprepared(migration::m20261124_000001_team_code::BACKFILL)
+            .await
+            .unwrap();
+        db.execute_unprepared("ALTER TABLE teams ALTER COLUMN code SET NOT NULL")
+            .await
+            .unwrap();
+        let after = current(&s, &cookie).await;
+        assert!(is_code(&after["code"]), "{after}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_request_names_its_team_by_code() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, cookie, id) = user(&s, &db).await;
+        let (_, stranger, _) = user(&s, &db).await;
+        let personal = current(&s, &cookie).await;
+        let acme = req(&s, Method::POST, "/v1/teams", &cookie)
+            .json(&json!({"name": "Acme"}))
+            .await
+            .json::<Value>();
+        let theirs = current(&s, &stranger).await;
+        let code = |t: &Value| t["code"].as_str().unwrap().to_owned();
+        let named = |path: &str, team: &str| {
+            s.get(path)
+                .add_header("cookie", &cookie)
+                .add_header("x-team", team.to_owned())
+        };
+
+        // Acme is current; the header reaches the personal team without switching, in any case.
+        let res = named("/v1/team", &code(&personal).to_uppercase()).await;
+        res.assert_status_ok();
+        assert_eq!(res.json::<Value>(), personal);
+        assert_eq!(current(&s, &cookie).await["id"], acme["id"]);
+        let sets = named("/v1/social-sets", &code(&personal)).await;
+        let default: uuid::Uuid = sets.json::<Value>()[0]["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let set = social_sets::Entity::find_by_id(default)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(set.team_id.to_string(), personal["id"]);
+        // A page navigation names it in the query instead, which counts only coming from the
+        // web app: a link on another site, or one with no referrer, acts in the current team.
+        let linked = |referer: Option<&str>| {
+            let r = s
+                .get(&format!("/v1/team?team={}", code(&personal)))
+                .add_header("cookie", &cookie);
+            match referer {
+                Some(from) => r.add_header("referer", from.to_owned()),
+                None => r,
+            }
+        };
+        let res = linked(Some("http://localhost:3000/t/x/connections")).await;
+        assert_eq!(res.json::<Value>()["id"], personal["id"]);
+        for elsewhere in [Some("https://evil.example/"), None] {
+            assert_eq!(linked(elsewhere).await.json::<Value>()["id"], acme["id"]);
+        }
+
+        // Someone else's team, a code nobody has, and junk all look the same.
+        let missing = loop {
+            let c = team::code();
+            if ![code(&personal), code(&acme), code(&theirs)].contains(&c) {
+                break c;
+            }
+        };
+        for bad in [code(&theirs), missing, "nope".into(), String::new()] {
+            for path in ["/v1/team", "/auth/me", "/v1/posts"] {
+                let res = named(path, &bad).await;
+                assert_eq!(res.status_code(), 404, "{path} {bad}");
+                res.assert_json(&json!({"error": "not_found"}));
+            }
+        }
+        // A write in a named team still needs the web origin, and lands in that team.
+        let rename = |origin: &str| {
+            s.method(Method::PATCH, "/v1/team")
+                .add_header("origin", origin.to_owned())
+                .add_header("cookie", &cookie)
+                .add_header("x-team", code(&personal))
+                .json(&json!({"name": "Mine"}))
+        };
+        assert_eq!(rename("https://evil.example").await.status_code(), 403);
+        assert_eq!(rename(WEB).await.json::<Value>()["id"], personal["id"]);
+        assert_eq!(current(&s, &cookie).await["name"], "Acme");
+
+        // A link naming a team in the query reads it, and never switches.
+        let me = s
+            .get(&format!("/auth/me?team={}", code(&personal)))
+            .add_header("cookie", &cookie)
+            .add_header("referer", WEB)
+            .await;
+        assert_eq!(me.json::<Value>()["current_team"]["id"], personal["id"]);
+        assert_eq!(current(&s, &cookie).await["id"], acme["id"]);
+
+        // Opening a team's address (`/auth/me` naming it in the header) makes it the current team.
+        let me = named("/auth/me", &code(&personal)).await.json::<Value>();
+        assert_eq!(me["current_team"]["id"], personal["id"]);
+        let row = users::Entity::find_by_id(id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.current_team_id.unwrap().to_string(), personal["id"]);
+
+        // The browser may send the header from the web app.
+        let preflight = s
+            .method(Method::OPTIONS, "/v1/team")
+            .add_header("origin", WEB)
+            .add_header("access-control-request-method", "GET")
+            .add_header("access-control-request-headers", "x-team")
+            .await;
+        let allowed = preflight.header("access-control-allow-headers");
+        assert!(allowed.to_str().unwrap().contains("x-team"));
     }
 
     #[tokio::test]
@@ -7547,6 +7740,43 @@ mod teams {
                         .await
                         .unwrap()
                         .unwrap()
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connect_lands_in_the_team_the_web_app_names() {
+                    let (s, db, _, _) = on_threads(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let personal = current(&s, &cookie).await;
+                    // Acme becomes the current team; the connect is started from the personal one.
+                    req(&s, Method::POST, "/v1/teams", &cookie)
+                        .json(&json!({"name": "Acme"}))
+                        .await;
+                    let start = s
+                        .get(&format!(
+                            "/connections/threads/redirect?team={}",
+                            personal["code"].as_str().unwrap()
+                        ))
+                        .add_header("cookie", &cookie)
+                        .add_header("referer", "http://localhost:3000/t/x/connections")
+                        .await;
+                    let (_, q) = location(&start);
+                    let flow = start
+                        .iter_headers_by_name("set-cookie")
+                        .map(|v| v.to_str().unwrap().to_owned())
+                        .find(|c| c.starts_with("sr_threads="))
+                        .unwrap();
+                    let both = format!("{cookie}; {}", flow.split(';').next().unwrap());
+                    let got = finish(&s, &both, &format!("code=good&state={}", q["state"])).await;
+                    assert_eq!(got, (Some("threads".into()), None));
+                    let mine = s
+                        .get("/v1/connections")
+                        .add_header("cookie", &cookie)
+                        .add_header("x-team", personal["code"].as_str().unwrap().to_owned())
+                        .await
+                        .json::<Value>();
+                    assert_eq!(mine.as_array().unwrap().len(), 1, "{mine}");
+                    assert_eq!(list(&s, &cookie).await.len(), 0, "Acme, the current team");
                 }
 
                 #[tokio::test]
@@ -15608,6 +15838,12 @@ mod teams {
                 assert_eq!(me["team"]["id"], team_id.as_str());
                 assert_eq!(me["team"]["role"], "admin");
                 assert_eq!(me["token_name"], "Content Machine");
+                // A token acts in its own team whatever team the request names.
+                let named = bearer(&s, Method::GET, "/v1/me?team=zzzzzz", &secret)
+                    .add_header("x-team", "zzzzzz")
+                    .add_header("origin", WEB)
+                    .await;
+                assert_eq!(named.json::<Value>()["team"]["id"], team_id.as_str());
                 let used = api_tokens::Entity::find_by_id(id.parse::<uuid::Uuid>().unwrap())
                     .one(&db)
                     .await
