@@ -3,7 +3,7 @@
 //! Every route acts inside the caller's own memberships; a team, member or invitation outside
 //! them is `404 {"error":"not_found"}`. The current team is `users.current_team_id` when the user
 //! still belongs to it, else their oldest membership. A user with no team gets a personal one
-//! with its Default set, on sign-in or on first use.
+//! with its default set, on sign-in or on first use.
 use axum::{
     extract::{FromRequestParts, Path, State},
     http::{request::Parts, StatusCode},
@@ -174,7 +174,7 @@ async fn set_current(db: &impl ConnectionTrait, user_id: Uuid, team_id: Uuid) ->
     users::Entity::update(row).exec(db).await.map(|_| ())
 }
 
-/// Makes a team with its Default set, `user_id` as owner, and switches the user to it.
+/// Makes a team with its default set, `user_id` as owner, and switches the user to it.
 async fn create_team(
     db: &impl ConnectionTrait,
     user_id: Uuid,
@@ -198,7 +198,7 @@ async fn create_team(
     let set = social_sets::ActiveModel {
         id: Set(Uuid::now_v7()),
         team_id: Set(team.id),
-        name: Set("Default".into()),
+        name: Set("All sets".into()),
         is_default: Set(true),
         ..Default::default()
     };
@@ -319,7 +319,7 @@ pub(crate) async fn invited(db: &DatabaseConnection, email: &str) -> Result<bool
     }
 }
 
-/// Creates a team with its Default set; the caller becomes its owner and switches to it. At
+/// Creates a team with its default set; the caller becomes its owner and switches to it. At
 /// most 10 a day per user.
 #[utoipa::path(post, path = "/teams", tag = "teams", request_body = TeamName,
     responses((status = 201, body = Team), (status = 401, body = Error),

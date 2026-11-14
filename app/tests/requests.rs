@@ -2007,7 +2007,7 @@ mod teams {
             .await
             .unwrap();
         assert_eq!(sets.len(), 1);
-        assert!(sets[0].is_default && sets[0].name == "Default");
+        assert!(sets[0].is_default && sets[0].name == "All sets");
         // The partial unique index allows one Default set per team.
         let second = social_sets::ActiveModel {
             id: Set(uuid::Uuid::now_v7()),
@@ -3935,6 +3935,65 @@ mod teams {
                 social_sets::Entity::update(row).exec(db).await.unwrap();
             }
 
+            /// The "All sets" migration renames only a default set still named exactly "Default".
+            #[tokio::test]
+            #[serial]
+            async fn migration_renames_default_sets_named_default() {
+                use sea_orm::ConnectionTrait;
+                let (s, db) = server_where(|_| {}).await;
+                let rename = |cookie: String, id: String, name: &'static str| {
+                    req(&s, Method::PATCH, &format!("/v1/social-sets/{id}"), &cookie)
+                        .json(&json!({ "name": name }))
+                };
+                let default_id = |all: &[Value]| all[0]["id"].as_str().unwrap().to_owned();
+                // An old team: its default set is still named "Default".
+                let (_, old, _) = user(&s, &db).await;
+                let id = default_id(&sets(&s, &old, "").await);
+                rename(old.clone(), id, "Default").await.assert_status_ok();
+                // A team that renamed its default set, and has another set named "Default".
+                let (_, renamed, _) = user(&s, &db).await;
+                let id = default_id(&sets(&s, &renamed, "").await);
+                rename(renamed.clone(), id, "Everything")
+                    .await
+                    .assert_status_ok();
+                assert_eq!(make(&s, &renamed, "Default").await.status_code(), 201);
+                // An old team that already has another live set named "All sets": left alone.
+                let (_, clash, _) = user(&s, &db).await;
+                let id = default_id(&sets(&s, &clash, "").await);
+                rename(clash.clone(), id, "Default")
+                    .await
+                    .assert_status_ok();
+                assert_eq!(make(&s, &clash, "all sets").await.status_code(), 201);
+
+                db.execute_unprepared(migration::m20261123_000001_all_sets_name::UP)
+                    .await
+                    .unwrap();
+
+                let names = |all: Vec<Value>| -> Vec<(String, bool)> {
+                    all.iter()
+                        .map(|s| {
+                            let name = s["name"].as_str().unwrap().to_owned();
+                            (name, s["is_default"].as_bool().unwrap())
+                        })
+                        .collect()
+                };
+                assert_eq!(
+                    names(sets(&s, &old, "").await),
+                    [("All sets".to_owned(), true)]
+                );
+                assert_eq!(
+                    names(sets(&s, &renamed, "").await),
+                    [
+                        ("Everything".to_owned(), true),
+                        ("Default".to_owned(), false)
+                    ]
+                );
+                assert_eq!(
+                    names(sets(&s, &clash, "").await),
+                    [("Default".to_owned(), true), ("all sets".to_owned(), false)]
+                );
+            }
+
             #[tokio::test]
             #[serial]
             async fn create_list_and_rename() {
@@ -3948,11 +4007,11 @@ mod teams {
                 assert_eq!(body["account_count"], 0);
                 let all = sets(&s, &cookie, "").await;
                 let names: Vec<&str> = all.iter().map(|s| s["name"].as_str().unwrap()).collect();
-                assert_eq!(names, ["Default", "Clients"], "Default first");
+                assert_eq!(names, ["All sets", "Clients"], "the default set first");
 
                 for (name, status, code) in [
                     ("CLIENTS", 409, "name_taken"),
-                    ("default", 409, "name_taken"),
+                    ("all SETS", 409, "name_taken"),
                     ("   ", 422, "invalid_name"),
                     (&"x".repeat(61)[..], 422, "invalid_name"),
                 ] {
@@ -3969,7 +4028,7 @@ mod teams {
                 let res = rename(id.into(), "Agency").await;
                 res.assert_status_ok();
                 assert_eq!(res.json::<Value>()["name"], "Agency");
-                assert_eq!(rename(id.into(), "DEFAULT").await.status_code(), 409);
+                assert_eq!(rename(id.into(), "ALL SETS").await.status_code(), 409);
                 // The Default set is pinned, not named: it can be renamed.
                 let default = all[0]["id"].as_str().unwrap().to_owned();
                 let res = rename(default, "Everything").await;

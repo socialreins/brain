@@ -2,7 +2,7 @@
 //! `GET /connections/x/redirect` keeps a fresh verifier sealed with the state (never in the
 //! URL), then `GET /connect/x/callback` (path registered with X, fixed) swaps the code and
 //! verifier for an access token (two hours) and a refresh token, reads the account and saves it
-//! as an `x` account in that team's Default set. The refresh token is kept sealed in `meta`.
+//! as an `x` account in that team's default set. The refresh token is kept sealed in `meta`.
 //!
 //! X refresh tokens are single use, so `fresh_token` renews under a lock on the account row and
 //! saves the new refresh token in the same transaction as the new access token; two calls

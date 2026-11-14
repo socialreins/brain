@@ -1,5 +1,5 @@
 //! Social sets of the current team: groups of connected accounts. Members list them; owners and
-//! admins create, rename, delete and restore them. The Default set holds every account and
+//! admins create, rename, delete and restore them. The default set holds every account and
 //! cannot be deleted; it can be renamed. A deleted set keeps its account links and can be
 //! restored for 30 days, then `scheduler` purges it. The list takes an API token too; a set token
 //! sees only its own set. Deleting a set revokes its set tokens for good.
@@ -42,7 +42,7 @@ const MAX_LIVE_SETS: u64 = 50;
 pub struct SocialSet {
     pub id: Uuid,
     pub name: String,
-    /// The team's pinned Default set: holds every account, cannot be deleted.
+    /// The team's pinned default set: holds every account, cannot be deleted.
     pub is_default: bool,
     pub account_ids: Vec<Uuid>,
     pub account_count: usize,
@@ -239,7 +239,7 @@ async fn create(
     }
 }
 
-/// Renames a live set, the Default set included. Owners and admins.
+/// Renames a live set, the default set included. Owners and admins.
 #[utoipa::path(patch, path = "/social-sets/{id}", tag = "social-sets", request_body = SetName,
     params(("id" = Uuid, Path)),
     responses((status = 200, body = SocialSet), (status = 401, body = Error),
@@ -288,7 +288,7 @@ async fn rename(
 }
 
 /// Deletes a set, restorable for 30 days. Owners and admins, with a sign-in from the last 10
-/// minutes (else `403 reauth_required`). The Default set cannot go (`409 default_set`). Revokes
+/// minutes (else `403 reauth_required`). The default set cannot go (`409 default_set`). Revokes
 /// the API tokens limited to the set; a restore does not bring them back. Any body is ignored.
 #[utoipa::path(delete, path = "/social-sets/{id}", tag = "social-sets",
     params(("id" = Uuid, Path)),

@@ -1,7 +1,7 @@
 //! Connect a Threads profile through the shared OAuth flow (`oauth.rs`):
 //! `GET /connections/threads/redirect`, then `GET /connect/threads/callback` (path registered with
 //! Threads, fixed) swaps the code for a 60-day token, reads the profile and saves it as a
-//! `threads` account in that team's Default set.
+//! `threads` account in that team's default set.
 use axum::{
     extract::{Query, State},
     http::HeaderMap,
