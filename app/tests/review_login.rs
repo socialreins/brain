@@ -270,8 +270,9 @@ async fn the_demo_user_cannot_be_demoted_or_removed_from_its_team() {
 
     // In a team it was only invited to, the demo user is a member like any other and may go.
     let guest = uuid::Uuid::now_v7();
+    let code = socialreins_core::team::code();
     db.execute_unprepared(&format!(
-        "INSERT INTO teams (id, name) VALUES ('{guest}', 'Guest'); \
+        "INSERT INTO teams (id, name, code) VALUES ('{guest}', 'Guest', '{code}'); \
          INSERT INTO team_user (team_id, user_id, role) VALUES ('{guest}', '{other}', 'owner'); \
          INSERT INTO team_user (team_id, user_id, role) VALUES ('{guest}', '{demo_id}', 'admin')"
     ))

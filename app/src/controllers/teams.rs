@@ -313,14 +313,16 @@ struct NamedTeam {
 }
 
 /// The team code the request names: the `X-Team` header, else `?team=` (a page navigation
-/// cannot set a header).
-fn named_team(parts: &Parts) -> Option<String> {
+/// cannot set a header). The header is only ever sent by the web app, since CORS allows it for
+/// `CORS_ORIGINS` alone. A link can come from anywhere, so the query counts only when the
+/// navigation came from the web app (`FromWeb`: `Origin`, else `Referer`); otherwise it is
+/// ignored and the request acts in the current team, as it did before team codes.
+async fn named_team(parts: &mut Parts, app: &AppState) -> Option<String> {
     if let Some(value) = parts.headers.get(TEAM_HEADER) {
         return Some(value.to_str().unwrap_or_default().to_owned());
     }
-    Query::<NamedTeam>::try_from_uri(&parts.uri)
-        .ok()
-        .and_then(|q| q.0.team)
+    let code = Query::<NamedTeam>::try_from_uri(&parts.uri).ok()?.0.team?;
+    (FromWeb::from_request_parts(parts, app).await.ok()).map(|_| code)
 }
 
 /// The team with `code` (any case) and the user's role in it; `None` when there is no such
@@ -361,7 +363,7 @@ impl FromRequestParts<AppState> for InTeam {
             tracing::error!(error = %e, "team lookup failed");
             error(StatusCode::INTERNAL_SERVER_ERROR, "internal")
         };
-        let (team, role) = match named_team(parts) {
+        let (team, role) = match named_team(parts, app).await {
             Some(code) => team_by_code(&app.db, current.0.id, &code)
                 .await
                 .map_err(failed)?

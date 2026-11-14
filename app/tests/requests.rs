@@ -2512,12 +2512,22 @@ mod teams {
             .unwrap()
             .unwrap();
         assert_eq!(set.team_id.to_string(), personal["id"]);
-        // A page navigation names it in the query instead.
-        let res = s
-            .get(&format!("/v1/team?team={}", code(&personal)))
-            .add_header("cookie", &cookie)
-            .await;
+        // A page navigation names it in the query instead, which counts only coming from the
+        // web app: a link on another site, or one with no referrer, acts in the current team.
+        let linked = |referer: Option<&str>| {
+            let r = s
+                .get(&format!("/v1/team?team={}", code(&personal)))
+                .add_header("cookie", &cookie);
+            match referer {
+                Some(from) => r.add_header("referer", from.to_owned()),
+                None => r,
+            }
+        };
+        let res = linked(Some("http://localhost:3000/t/x/connections")).await;
         assert_eq!(res.json::<Value>()["id"], personal["id"]);
+        for elsewhere in [Some("https://evil.example/"), None] {
+            assert_eq!(linked(elsewhere).await.json::<Value>()["id"], acme["id"]);
+        }
 
         // Someone else's team, a code nobody has, and junk all look the same.
         let missing = loop {
@@ -2549,6 +2559,7 @@ mod teams {
         let me = s
             .get(&format!("/auth/me?team={}", code(&personal)))
             .add_header("cookie", &cookie)
+            .add_header("referer", WEB)
             .await;
         assert_eq!(me.json::<Value>()["current_team"]["id"], personal["id"]);
         assert_eq!(current(&s, &cookie).await["id"], acme["id"]);
@@ -7729,6 +7740,43 @@ mod teams {
                         .await
                         .unwrap()
                         .unwrap()
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connect_lands_in_the_team_the_web_app_names() {
+                    let (s, db, _, _) = on_threads(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let personal = current(&s, &cookie).await;
+                    // Acme becomes the current team; the connect is started from the personal one.
+                    req(&s, Method::POST, "/v1/teams", &cookie)
+                        .json(&json!({"name": "Acme"}))
+                        .await;
+                    let start = s
+                        .get(&format!(
+                            "/connections/threads/redirect?team={}",
+                            personal["code"].as_str().unwrap()
+                        ))
+                        .add_header("cookie", &cookie)
+                        .add_header("referer", "http://localhost:3000/t/x/connections")
+                        .await;
+                    let (_, q) = location(&start);
+                    let flow = start
+                        .iter_headers_by_name("set-cookie")
+                        .map(|v| v.to_str().unwrap().to_owned())
+                        .find(|c| c.starts_with("sr_threads="))
+                        .unwrap();
+                    let both = format!("{cookie}; {}", flow.split(';').next().unwrap());
+                    let got = finish(&s, &both, &format!("code=good&state={}", q["state"])).await;
+                    assert_eq!(got, (Some("threads".into()), None));
+                    let mine = s
+                        .get("/v1/connections")
+                        .add_header("cookie", &cookie)
+                        .add_header("x-team", personal["code"].as_str().unwrap().to_owned())
+                        .await
+                        .json::<Value>();
+                    assert_eq!(mine.as_array().unwrap().len(), 1, "{mine}");
+                    assert_eq!(list(&s, &cookie).await.len(), 0, "Acme, the current team");
                 }
 
                 #[tokio::test]
@@ -15790,6 +15838,12 @@ mod teams {
                 assert_eq!(me["team"]["id"], team_id.as_str());
                 assert_eq!(me["team"]["role"], "admin");
                 assert_eq!(me["token_name"], "Content Machine");
+                // A token acts in its own team whatever team the request names.
+                let named = bearer(&s, Method::GET, "/v1/me?team=zzzzzz", &secret)
+                    .add_header("x-team", "zzzzzz")
+                    .add_header("origin", WEB)
+                    .await;
+                assert_eq!(named.json::<Value>()["team"]["id"], team_id.as_str());
                 let used = api_tokens::Entity::find_by_id(id.parse::<uuid::Uuid>().unwrap())
                     .one(&db)
                     .await
