@@ -82,6 +82,17 @@ async fn demo_user(app: &AppState) -> Result<users::Model, sea_orm::DbErr> {
         .ok_or_else(|| sea_orm::DbErr::RecordNotFound("demo user vanished after insert".into()))
 }
 
+/// Whether `user_id` is the demo user. `teams::change_member` refuses to change or remove it:
+/// someone signed in through the link could otherwise make their own account an owner and take
+/// the demo user out, and `close` would no longer find the team.
+pub async fn is_demo(
+    db: &impl sea_orm::ConnectionTrait,
+    user_id: uuid::Uuid,
+) -> Result<bool, sea_orm::DbErr> {
+    let user = users::Entity::find_by_id(user_id).one(db).await?;
+    Ok(user.is_some_and(|u| u.email == DEMO_EMAIL))
+}
+
 /// Run at start when `REVIEW_LOGIN_TOKEN` is unset: with the link switched off, what it handed
 /// out goes too. A session from it lasts 30 days, and a passkey or API token made in one would
 /// last for ever, so removing the variable alone would leave the demo team open to anyone who
@@ -89,10 +100,10 @@ async fn demo_user(app: &AppState) -> Result<users::Model, sea_orm::DbErr> {
 pub async fn close(db: &sea_orm::DatabaseConnection) -> Result<(), sea_orm::DbErr> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     const DEMO: &str = "(SELECT id FROM users WHERE email = $1)";
-    // The teams the demo user owns: a token or invitation of theirs is a way back in whoever
-    // made it, since anyone signed in as the demo user could have added an admin first.
-    let teams =
-        format!("(SELECT team_id FROM team_user WHERE role = 'owner' AND user_id IN {DEMO})");
+    // Every team the demo user is in, whatever its role there: a token or invitation of theirs
+    // is a way back in whoever made it, since anyone signed in as the demo user could have added
+    // an admin first. The demo user cannot be taken out of a team (`is_demo`), so none is missed.
+    let teams = format!("(SELECT team_id FROM team_user WHERE user_id IN {DEMO})");
     let bind =
         |sql: String| Statement::from_sql_and_values(DbBackend::Postgres, sql, [DEMO_EMAIL.into()]);
     for sql in [

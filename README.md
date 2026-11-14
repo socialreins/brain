@@ -151,7 +151,9 @@ whose `Origin` (or `Referer`) is `BRAIN_URL`. One email holds at most 3 unexpire
 creates the account if needed, then a 30-day session in the HttpOnly,
 SameSite=Lax `sr_session` cookie (`Secure` unless `BRAIN_URL` is `http://`). A dead link
 redirects to `WEB_URL/login?error=invalid_link` (or `registration_disabled`). Only SHA-256
-hashes of link and session tokens are stored. `POST /auth/link` and `POST /auth/magic` share 5 requests a minute per IP.
+hashes of link and session tokens are stored. `POST /auth/link` and `POST /auth/magic` share 5 requests a minute per IP. A link to an address with no account also draws from a daily
+allowance, 20 per IP and 1000 overall; past it the answer is the same `202` and no mail goes out. A link to an existing account is
+never counted, so a used-up allowance stops new sign-ups by email for the day and never a sign-in.
 
 Sign-up rules: an existing account always signs in. A new account needs its whole address or
 its domain in `SIGNUP_DOMAINS` (anyone when unset) and open registration (`REGISTRATION_DISABLED`
@@ -344,7 +346,9 @@ it frees up. A tick claims at most 50 posts; 8 posts and 8 targets publish at on
 
 A token created with `"read_only": true` (whole-team or set) only reads: every `POST`, `PUT`,
 `PATCH` or `DELETE` it sends, and every `/mcp` write tool, is `403 {"error":"read_only_token"}`
-before anything runs, except a create with `validate_only`, which creates nothing. `GET /v1/posts/{id}` lists the post's `accounts` (id, provider, handle,
+before anything runs, except a create with `validate_only`, which creates nothing. A token is
+revoked when the member who created it is removed from the team, leaves it, or becomes a plain
+member: only an owner or admin may hold one. `GET /v1/posts/{id}` lists the post's `accounts` (id, provider, handle,
 display name, target id and status), also before it publishes and has targets.
 
 API token writes (`POST`, `PUT`, `PATCH`, `DELETE`) take an optional `Idempotency-Key` header,
@@ -705,13 +709,18 @@ Meta App Review needs a reviewer to sign in without receiving email. To allow it
    default social set, nothing connected) and lands on `{WEB_URL}/app`. The reviewer connects
    their own test accounts from there.
 3. Once the review is over, remove `REVIEW_LOGIN_TOKEN` and redeploy: the route is a `404` again.
-   The demo user and its data stay until you delete them.
+   On every start without the variable brain ends the demo user's sessions, deletes its passkeys,
+   and revokes every API token and deletes every pending invitation of each team the demo user
+   is in, whoever made them. The demo user, its teams and their other members stay until you
+   remove them; brain logs a warning when such a team has other members, so check its Team page.
 
 A wrong token and an unset one both give the same bare `404`, and the token is compared in
 constant time and never logged. The route shares the per-IP sign-in rate limit. The demo user
 signs in even with `REGISTRATION_DISABLED=true`, is never an admin, and brain refuses (with a
 warning in the log) if `review@socialreins.com` is listed in `ADMIN_EMAILS`. Anyone holding the
-link has full use of the demo account, so treat it like a password.
+link has full use of the demo account, so treat it like a password. The demo user's role
+cannot be changed and it cannot leave or be removed from a team (`403 forbidden`), so nobody
+signed in through the link can hand the demo team to another account and out of that cleanup.
 
 ## Media
 

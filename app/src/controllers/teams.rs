@@ -538,6 +538,10 @@ async fn change_member(
     ) else {
         return Ok(Change::NotFound);
     };
+    // The App Review demo user keeps its place and role, whoever asks (see `is_demo`).
+    if super::review_login::is_demo(&txn, target).await? {
+        return Ok(Change::Forbidden);
+    }
     let (mine, from) = (role_of(&me), role_of(&them));
     let leaving = to.is_none() && actor == target;
     if !leaving && !(mine.manages() && mine.may_change(from, to)) {
