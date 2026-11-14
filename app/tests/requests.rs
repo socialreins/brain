@@ -401,6 +401,7 @@ mod auth {
     }
 
     #[tokio::test]
+    #[serial]
     async fn a_signed_in_user_gets_a_link_to_their_own_email_and_it_starts_a_fresh_session() {
         let (s, db) = server_where(|_| {}).await;
         let email = unique_email();
@@ -19068,4 +19069,13 @@ mod admin_console {
             assert!(doc["paths"][path][method].is_object(), "{path}");
         }
     }
+}
+
+/// Every test here shares one database and applies migrations on connect, so two at once race
+/// (Postgres 42710 on `seaql_migrations`). This fails when a test is added without `#[serial]`.
+#[test]
+fn every_async_test_is_serial() {
+    let source = include_str!("requests.rs");
+    let count = |attribute: &str| source.matches(&format!("#[{attribute}]\n")).count();
+    assert_eq!(count("tokio::test"), count("serial"));
 }
