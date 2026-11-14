@@ -89,16 +89,37 @@ async fn demo_user(app: &AppState) -> Result<users::Model, sea_orm::DbErr> {
 pub async fn close(db: &sea_orm::DatabaseConnection) -> Result<(), sea_orm::DbErr> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     const DEMO: &str = "(SELECT id FROM users WHERE email = $1)";
+    // The teams the demo user owns: a token or invitation of theirs is a way back in whoever
+    // made it, since anyone signed in as the demo user could have added an admin first.
+    let teams =
+        format!("(SELECT team_id FROM team_user WHERE role = 'owner' AND user_id IN {DEMO})");
+    let bind =
+        |sql: String| Statement::from_sql_and_values(DbBackend::Postgres, sql, [DEMO_EMAIL.into()]);
     for sql in [
         format!("DELETE FROM sessions WHERE user_id IN {DEMO}"),
         format!("DELETE FROM passkeys WHERE user_id IN {DEMO}"),
         format!(
             "UPDATE api_tokens SET revoked_at = now() \
-             WHERE revoked_at IS NULL AND created_by IN {DEMO}"
+             WHERE revoked_at IS NULL AND (created_by IN {DEMO} OR team_id IN {teams})"
         ),
+        format!("DELETE FROM team_invitations WHERE invited_by IN {DEMO} OR team_id IN {teams}"),
     ] {
-        let stmt = Statement::from_sql_and_values(DbBackend::Postgres, sql, [DEMO_EMAIL.into()]);
-        db.execute_raw(stmt).await?;
+        db.execute_raw(bind(sql)).await?;
+    }
+    // Members are left alone: the operator may have joined the demo team to set it up. They
+    // are told, because a member added through the link still has the team.
+    let others = format!(
+        "SELECT count(*) AS n FROM team_user WHERE team_id IN {teams} AND user_id NOT IN {DEMO}"
+    );
+    let n: i64 = match db.query_one_raw(bind(others)).await? {
+        Some(row) => row.try_get("", "n")?,
+        None => 0,
+    };
+    if n > 0 {
+        tracing::warn!(
+            members = n,
+            "review login is off, but the demo team has other members: check its Team page"
+        );
     }
     Ok(())
 }

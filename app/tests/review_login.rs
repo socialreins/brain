@@ -6,7 +6,7 @@ use serial_test::serial;
 use socialreins_brain::{
     config::Config,
     connect, controllers,
-    models::{sessions, social_sets, team_user, users},
+    models::{sessions, social_sets, team_invitations, team_user, users},
     state::AppState,
 };
 
@@ -132,9 +132,27 @@ async fn switching_the_link_off_ends_its_sessions_and_tokens() {
             .add_header("authorization", format!("Bearer {secret}"))
     };
     with_token().await.assert_status_ok();
+    // An invitation sent from the demo account would let its holder join the team later.
+    let invited = s
+        .post("/v1/team/invitations")
+        .add_header("cookie", &cookie)
+        .add_header("origin", "http://localhost:3000")
+        .json(&json!({"email": "reviewer-friend@example.com", "role": "admin"}))
+        .await;
+    assert_eq!(invited.status_code(), 201, "{}", invited.text());
+    let user_id = demo(&db).await.unwrap().id;
+    let invitations = || async {
+        team_invitations::Entity::find()
+            .filter(team_invitations::Column::InvitedBy.eq(user_id))
+            .count(&db)
+            .await
+            .unwrap()
+    };
+    assert_eq!(invitations().await, 1);
 
     controllers::review_login::close(&db).await.unwrap();
 
+    assert_eq!(invitations().await, 0);
     assert_eq!(demo_sessions(&db).await, 0);
     let me = s.get("/auth/me").add_header("cookie", &cookie).await;
     assert_eq!(me.status_code(), 401);
