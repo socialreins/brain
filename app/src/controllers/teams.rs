@@ -155,7 +155,7 @@ fn invitation_json(i: team_invitations::Model) -> Invitation {
     }
 }
 
-async fn membership(
+pub(super) async fn membership(
     db: &impl ConnectionTrait,
     team_id: Uuid,
     user_id: Uuid,
@@ -538,11 +538,12 @@ async fn change_member(
     ) else {
         return Ok(Change::NotFound);
     };
-    // The App Review demo user keeps its place and role, whoever asks (see `is_demo`).
-    if super::review_login::is_demo(&txn, target).await? {
+    let (mine, from) = (role_of(&me), role_of(&them));
+    // The App Review demo user stays the owner of a team it owns, whoever asks (see `is_demo`).
+    // In a team it was only invited to, it is a member like any other.
+    if from == Role::Owner && super::review_login::is_demo(&txn, target).await? {
         return Ok(Change::Forbidden);
     }
-    let (mine, from) = (role_of(&me), role_of(&them));
     let leaving = to.is_none() && actor == target;
     if !leaving && !(mine.manages() && mine.may_change(from, to)) {
         return Ok(Change::Forbidden);

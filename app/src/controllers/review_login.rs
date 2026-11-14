@@ -82,9 +82,9 @@ async fn demo_user(app: &AppState) -> Result<users::Model, sea_orm::DbErr> {
         .ok_or_else(|| sea_orm::DbErr::RecordNotFound("demo user vanished after insert".into()))
 }
 
-/// Whether `user_id` is the demo user. `teams::change_member` refuses to change or remove it:
-/// someone signed in through the link could otherwise make their own account an owner and take
-/// the demo user out, and `close` would no longer find the team.
+/// Whether `user_id` is the demo user. `teams::change_member` refuses to demote or remove it
+/// where it is an owner: someone signed in through the link could otherwise make their own
+/// account an owner and take the demo user out, and `close` would no longer find the team.
 pub async fn is_demo(
     db: &impl sea_orm::ConnectionTrait,
     user_id: uuid::Uuid,
@@ -102,7 +102,8 @@ pub async fn close(db: &sea_orm::DatabaseConnection) -> Result<(), sea_orm::DbEr
     const DEMO: &str = "(SELECT id FROM users WHERE email = $1)";
     // Every team the demo user is in, whatever its role there: a token or invitation of theirs
     // is a way back in whoever made it, since anyone signed in as the demo user could have added
-    // an admin first. The demo user cannot be taken out of a team (`is_demo`), so none is missed.
+    // an admin first. The demo user cannot be taken out of a team it owns (`is_demo`), so none
+    // it made is missed.
     let teams = format!("(SELECT team_id FROM team_user WHERE user_id IN {DEMO})");
     let bind =
         |sql: String| Statement::from_sql_and_values(DbBackend::Postgres, sql, [DEMO_EMAIL.into()]);

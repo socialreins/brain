@@ -159,6 +159,7 @@ async fn send_link(
     // A link to an address with no account is mail to wherever a stranger points it, so it has a
     // daily allowance, per IP and overall. An existing account's link is never counted: using
     // the allowance up cannot keep anyone out.
+    let mut reserved = Vec::new();
     if !known {
         let mut caps = vec![(SIGN_UP_LINKS_BUCKET.to_owned(), SIGN_UP_LINKS_PER_DAY)];
         if let Some(ip) = ip {
@@ -167,13 +168,14 @@ async fn send_link(
                 SIGN_UP_LINKS_PER_IP_PER_DAY,
             ));
         }
-        let reserved = rate_limit::daily_reserve(&app.db, &caps)
+        let Some(ids) = rate_limit::daily_reserve(&app.db, &caps)
             .await
-            .map_err(|e| format!("sign-up link cap: {e}"))?;
-        if reserved.is_none() {
+            .map_err(|e| format!("sign-up link cap: {e}"))?
+        else {
             tracing::warn!("sign-up link not sent: daily cap reached");
             return Ok(());
-        }
+        };
+        reserved = ids;
     }
     let now = Utc::now().fixed_offset();
     magic_links::Entity::delete_many()
@@ -185,6 +187,8 @@ async fn send_link(
         .await
         .map_err(|e| format!("magic link insert: {e}"))?
     else {
+        // No mail goes out, so nothing is used up.
+        rate_limit::daily_refund(&app.db, &reserved).await;
         return Ok(());
     };
     let url = format!("{}/auth/magic/{secret}", app.brain_url);

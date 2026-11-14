@@ -365,6 +365,20 @@ mod auth {
         );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(links(&db, &capped).await, 0, "the IP used its allowance");
+        let counted = || async {
+            let sql = "SELECT count(*) AS n FROM rate_limit_hits WHERE bucket = 'signup:link'";
+            let stmt = sea_orm::Statement::from_string(sea_orm::DbBackend::Postgres, sql);
+            let row = db.query_one_raw(stmt).await.unwrap().unwrap();
+            row.try_get::<i64>("", "n").unwrap()
+        };
+        assert_eq!(counted().await, 1, "only the link to a new address counts");
+        // A fourth link for an address already at its 3 live links sends nothing and costs nothing.
+        for _ in 0..3 {
+            ask("203.0.113.61", other.clone()).await;
+        }
+        assert_eq!(links_eventually(&db, &other, 3).await, 3);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(counted().await, 3, "a refused link gives its place back");
 
         // Everyone's allowance together: new addresses stop, accounts still sign in.
         let fill = "INSERT INTO rate_limit_hits (bucket) \

@@ -152,7 +152,7 @@ creates the account if needed, then a 30-day session in the HttpOnly,
 SameSite=Lax `sr_session` cookie (`Secure` unless `BRAIN_URL` is `http://`). A dead link
 redirects to `WEB_URL/login?error=invalid_link` (or `registration_disabled`). Only SHA-256
 hashes of link and session tokens are stored. `POST /auth/link` and `POST /auth/magic` share 5 requests a minute per IP. A link to an address with no account also draws from a daily
-allowance, 20 per IP and 1000 overall; past it the answer is the same `202` and no mail goes out. A link to an existing account is
+allowance, 20 per IP and 1000 overall (only links that are sent count); past it the answer is the same `202` and no mail goes out. A link to an existing account is
 never counted, so a used-up allowance stops new sign-ups by email for the day and never a sign-in.
 
 Sign-up rules: an existing account always signs in. A new account needs its whole address or
@@ -713,14 +713,17 @@ Meta App Review needs a reviewer to sign in without receiving email. To allow it
    and revokes every API token and deletes every pending invitation of each team the demo user
    is in, whoever made them. The demo user, its teams and their other members stay until you
    remove them; brain logs a warning when such a team has other members, so check its Team page.
+   The cleanup runs once, at start: a link opened on the old instance while the new one was
+   starting outlives it, so restart brain once more after that deploy is live.
 
 A wrong token and an unset one both give the same bare `404`, and the token is compared in
 constant time and never logged. The route shares the per-IP sign-in rate limit. The demo user
 signs in even with `REGISTRATION_DISABLED=true`, is never an admin, and brain refuses (with a
 warning in the log) if `review@socialreins.com` is listed in `ADMIN_EMAILS`. Anyone holding the
-link has full use of the demo account, so treat it like a password. The demo user's role
-cannot be changed and it cannot leave or be removed from a team (`403 forbidden`), so nobody
-signed in through the link can hand the demo team to another account and out of that cleanup.
+link has full use of the demo account, so treat it like a password. In a team it owns, the demo
+user cannot be demoted, removed or leave (`403 forbidden`), so nobody signed in through the link
+can hand the demo team to another account and out of that cleanup. Keep the demo user out of
+your own teams: the cleanup revokes the tokens and invitations of every team it is in.
 
 ## Media
 
@@ -732,8 +735,8 @@ redirects, each to a public https URL, 4 at a time, streamed to storage in 5 MB 
 holds about 15 MB however large the file) and typed by its first bytes. A video may be up to 1 GiB
 (`MEDIA_MAX_BYTES` lowers it; Bluesky takes 100 MB and X 512 MB), any other file 100 MB; a file
 over its cap is refused by its `Content-Length`, else the moment its bytes pass it, and nothing of
-it stays stored. Each download has 60 seconds plus its size at 2 MB a second (about 3.5 minutes
-for 300 MB; when its server does not say its size, the size is the bytes that came so far, so a slow one ends early), all of a post's 12 minutes together, and a server silent for 30 seconds fails at
+it stays stored. Each download has 60 seconds plus the bytes that came so far at 2 MB a second (about 3.5 minutes
+for 300 MB; the size its server claims earns nothing, so a slow one ends early), all of a post's 12 minutes together, and a server silent for 30 seconds fails at
 once. Posts of one group that carry the same video download it once: the others copy it inside
 the storage (per brain instance). Types are JPEG, PNG, WebP, GIF, MP4, MOV and PDF (only LinkedIn
 takes a PDF). A still image (JPEG, PNG or WebP) over the platform's limit for one image (Bluesky
