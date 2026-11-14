@@ -19070,3 +19070,12 @@ mod admin_console {
         }
     }
 }
+
+/// Every test here shares one database and applies migrations on connect, so two at once race
+/// (Postgres 42710 on `seaql_migrations`). This fails when a test is added without `#[serial]`.
+#[test]
+fn every_async_test_is_serial() {
+    let source = include_str!("requests.rs");
+    let count = |attribute: &str| source.matches(&format!("#[{attribute}]\n")).count();
+    assert_eq!(count("tokio::test"), count("serial"));
+}
