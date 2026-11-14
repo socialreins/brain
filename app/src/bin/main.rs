@@ -21,6 +21,9 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let db = connect(&config).await?;
+    if config.review_login_token.is_none() {
+        controllers::review_login::close(&db).await?;
+    }
     let state = AppState::new(db, &config);
     scheduler::spawn(state.clone());
     let app = controllers::router(state, &config);

@@ -4,7 +4,7 @@
 //! them is `404 {"error":"not_found"}`. A cookie request may name its team by code, in the
 //! `X-Team` header or in `?team=` (see `InTeam`). Without one it acts in the current team:
 //! `users.current_team_id` when the user still belongs to it, else their oldest membership. A
-//! user with no team gets a personal one with its Default set, on sign-in or on first use.
+//! user with no team gets a personal one with its default set, on sign-in or on first use.
 use axum::{
     extract::{FromRequestParts, Path, Query, State},
     http::{request::Parts, StatusCode},
@@ -160,7 +160,7 @@ fn invitation_json(i: team_invitations::Model) -> Invitation {
     }
 }
 
-async fn membership(
+pub(super) async fn membership(
     db: &impl ConnectionTrait,
     team_id: Uuid,
     user_id: Uuid,
@@ -203,7 +203,7 @@ pub async fn insert_team(
     }
 }
 
-/// Makes a team with its Default set, `user_id` as owner, and switches the user to it.
+/// Makes a team with its default set, `user_id` as owner, and switches the user to it.
 async fn create_team(
     db: &impl ConnectionTrait,
     user_id: Uuid,
@@ -222,7 +222,7 @@ async fn create_team(
     let set = social_sets::ActiveModel {
         id: Set(Uuid::now_v7()),
         team_id: Set(team.id),
-        name: Set("Default".into()),
+        name: Set("All sets".into()),
         is_default: Set(true),
         ..Default::default()
     };
@@ -391,7 +391,7 @@ pub(crate) async fn invited(db: &DatabaseConnection, email: &str) -> Result<bool
     }
 }
 
-/// Creates a team with its Default set; the caller becomes its owner and switches to it. At
+/// Creates a team with its default set; the caller becomes its owner and switches to it. At
 /// most 10 a day per user.
 #[utoipa::path(post, path = "/teams", tag = "teams", request_body = TeamName,
     responses((status = 201, body = Team), (status = 401, body = Error),
@@ -611,6 +611,14 @@ async fn change_member(
         return Ok(Change::NotFound);
     };
     let (mine, from) = (role_of(&me), role_of(&them));
+    // The App Review demo user stays the owner of a team it owns, whoever asks (see `is_demo`).
+    // In a team it was only invited to, it is a member like any other.
+    if from == Role::Owner
+        && to != Some(Role::Owner)
+        && super::review_login::is_demo(&txn, target).await?
+    {
+        return Ok(Change::Forbidden);
+    }
     let leaving = to.is_none() && actor == target;
     if !leaving && !(mine.manages() && mine.may_change(from, to)) {
         return Ok(Change::Forbidden);
@@ -632,6 +640,16 @@ async fn change_member(
             .filter(team_invitations::Column::InvitedBy.eq(target))
             .exec(&txn)
             .await?;
+        // So does an API token they made: they may still hold its secret, and only someone
+        // who manages the team may hold one.
+        let revoke = "UPDATE api_tokens SET revoked_at = now() \
+                      WHERE team_id = $1 AND created_by = $2 AND revoked_at IS NULL";
+        txn.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            revoke,
+            [team_id.into(), target.into()],
+        ))
+        .await?;
     }
     let done = match to {
         Some(role) => {

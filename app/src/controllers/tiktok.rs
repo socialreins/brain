@@ -2,7 +2,7 @@
 //! `GET /connections/tiktok/redirect`, then `GET /connect/tiktok/callback` (path registered
 //! with TikTok, fixed) swaps the code for an access token (a day) and a refresh token (a year),
 //! reads the account the consent picked and saves it as a `tiktok` account in that team's
-//! Default set. The refresh token is kept sealed in `meta`; `fresh_token` renews the access
+//! default set. The refresh token is kept sealed in `meta`; `fresh_token` renews the access
 //! token under a lock on the account row whenever a call is about to be made with one near its
 //! end, and saves the refresh token TikTok sends back with it in the same transaction.
 use axum::{

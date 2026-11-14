@@ -427,7 +427,7 @@ async fn choices(State(app): State<AppState>, t: InTeam) -> Response {
 }
 
 /// Connects the picked Pages as Facebook accounts and the picked Instagram accounts, each in the
-/// team's Default set, then drops the pick. Owners and admins. `201` with the saved accounts;
+/// team's default set, then drops the pick. Owners and admins. `201` with the saved accounts;
 /// `404` when the pick is gone, `422 nothing_picked` or `invalid_pick` (an id the login did not
 /// grant).
 #[utoipa::path(post, path = "/connections/meta/pick", tag = "connections", request_body = Picked,

@@ -327,6 +327,78 @@ mod auth {
         assert_eq!(bad.status_code(), 422);
     }
 
+    /// Mail to an address with no account goes wherever a stranger points it, so it is capped a
+    /// day; an existing account's own link is not, or the cap would be a way to lock people out.
+    #[tokio::test]
+    #[serial]
+    async fn sign_up_links_have_a_daily_allowance_that_never_blocks_an_account() {
+        use sea_orm::ConnectionTrait;
+        let (s, db) = server_where(|c| c.trust_proxy = true).await;
+        let clear = "DELETE FROM rate_limit_hits WHERE bucket LIKE 'signup:link%'";
+        db.execute_unprepared(clear).await.unwrap();
+        let fill = "INSERT INTO rate_limit_hits (bucket) \
+                    SELECT 'signup:link:ip:203.0.113.60' FROM generate_series(1, 20)";
+        db.execute_unprepared(fill).await.unwrap();
+        let ask = |ip: &'static str, email: String| {
+            s.post("/auth/link")
+                .add_header("x-forwarded-for", ip)
+                .json(&json!({"email": email}))
+        };
+        let known = unique_email();
+        let secret = link(&db, &known, Duration::minutes(5)).await;
+        open(&s, &secret).await;
+        assert!(user(&db, &known).await.is_some());
+
+        let (capped, other) = (unique_email(), unique_email());
+        for (ip, email) in [
+            ("203.0.113.60", capped.clone()),
+            ("203.0.113.60", known.clone()),
+            ("203.0.113.61", other.clone()),
+        ] {
+            assert_eq!(ask(ip, email).await.status_code(), 202, "same answer");
+        }
+        assert_eq!(links_eventually(&db, &other, 1).await, 1, "other IPs go on");
+        assert_eq!(
+            links_eventually(&db, &known, 1).await,
+            1,
+            "an account's own link is never capped"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(links(&db, &capped).await, 0, "the IP used its allowance");
+        let counted = || async {
+            let sql = "SELECT count(*) AS n FROM rate_limit_hits WHERE bucket = 'signup:link'";
+            let stmt = sea_orm::Statement::from_string(sea_orm::DbBackend::Postgres, sql);
+            let row = db.query_one_raw(stmt).await.unwrap().unwrap();
+            row.try_get::<i64>("", "n").unwrap()
+        };
+        assert_eq!(counted().await, 1, "only the link to a new address counts");
+        // A fourth link for an address already at its 3 live links sends nothing and costs nothing.
+        for _ in 0..3 {
+            assert_eq!(ask("203.0.113.61", other.clone()).await.status_code(), 202);
+        }
+        assert_eq!(links_eventually(&db, &other, 3).await, 3);
+        // The refused one reserves, then refunds, after its reply: wait for it to settle.
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if counted().await == 3 {
+                break;
+            }
+        }
+        assert_eq!(counted().await, 3, "a refused link gives its place back");
+
+        // Everyone's allowance together: new addresses stop, accounts still sign in.
+        let fill = "INSERT INTO rate_limit_hits (bucket) \
+                    SELECT 'signup:link' FROM generate_series(1, 1000)";
+        db.execute_unprepared(fill).await.unwrap();
+        let late = unique_email();
+        ask("203.0.113.62", late.clone()).await;
+        ask("203.0.113.62", known.clone()).await;
+        assert_eq!(links_eventually(&db, &known, 2).await, 2);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(links(&db, &late).await, 0);
+        db.execute_unprepared(clear).await.unwrap();
+    }
+
     #[tokio::test]
     #[serial]
     async fn a_name_on_the_link_names_only_a_new_account() {
@@ -2007,7 +2079,7 @@ mod teams {
             .await
             .unwrap();
         assert_eq!(sets.len(), 1);
-        assert!(sets[0].is_default && sets[0].name == "Default");
+        assert!(sets[0].is_default && sets[0].name == "All sets");
         // The partial unique index allows one Default set per team.
         let second = social_sets::ActiveModel {
             id: Set(uuid::Uuid::now_v7()),
@@ -2394,7 +2466,7 @@ mod teams {
         ))
         .await
         .unwrap();
-        db.execute_unprepared(migration::m20261123_000001_team_code::BACKFILL)
+        db.execute_unprepared(migration::m20261124_000001_team_code::BACKFILL)
             .await
             .unwrap();
         db.execute_unprepared("ALTER TABLE teams ALTER COLUMN code SET NOT NULL")
@@ -4117,6 +4189,65 @@ mod teams {
                 social_sets::Entity::update(row).exec(db).await.unwrap();
             }
 
+            /// The "All sets" migration renames only a default set still named exactly "Default".
+            #[tokio::test]
+            #[serial]
+            async fn migration_renames_default_sets_named_default() {
+                use sea_orm::ConnectionTrait;
+                let (s, db) = server_where(|_| {}).await;
+                let rename = |cookie: String, id: String, name: &'static str| {
+                    req(&s, Method::PATCH, &format!("/v1/social-sets/{id}"), &cookie)
+                        .json(&json!({ "name": name }))
+                };
+                let default_id = |all: &[Value]| all[0]["id"].as_str().unwrap().to_owned();
+                // An old team: its default set is still named "Default".
+                let (_, old, _) = user(&s, &db).await;
+                let id = default_id(&sets(&s, &old, "").await);
+                rename(old.clone(), id, "Default").await.assert_status_ok();
+                // A team that renamed its default set, and has another set named "Default".
+                let (_, renamed, _) = user(&s, &db).await;
+                let id = default_id(&sets(&s, &renamed, "").await);
+                rename(renamed.clone(), id, "Everything")
+                    .await
+                    .assert_status_ok();
+                assert_eq!(make(&s, &renamed, "Default").await.status_code(), 201);
+                // An old team that already has another live set named "All sets": left alone.
+                let (_, clash, _) = user(&s, &db).await;
+                let id = default_id(&sets(&s, &clash, "").await);
+                rename(clash.clone(), id, "Default")
+                    .await
+                    .assert_status_ok();
+                assert_eq!(make(&s, &clash, "all sets").await.status_code(), 201);
+
+                db.execute_unprepared(migration::m20261123_000001_all_sets_name::UP)
+                    .await
+                    .unwrap();
+
+                let names = |all: Vec<Value>| -> Vec<(String, bool)> {
+                    all.iter()
+                        .map(|s| {
+                            let name = s["name"].as_str().unwrap().to_owned();
+                            (name, s["is_default"].as_bool().unwrap())
+                        })
+                        .collect()
+                };
+                assert_eq!(
+                    names(sets(&s, &old, "").await),
+                    [("All sets".to_owned(), true)]
+                );
+                assert_eq!(
+                    names(sets(&s, &renamed, "").await),
+                    [
+                        ("Everything".to_owned(), true),
+                        ("Default".to_owned(), false)
+                    ]
+                );
+                assert_eq!(
+                    names(sets(&s, &clash, "").await),
+                    [("Default".to_owned(), true), ("all sets".to_owned(), false)]
+                );
+            }
+
             #[tokio::test]
             #[serial]
             async fn create_list_and_rename() {
@@ -4130,11 +4261,11 @@ mod teams {
                 assert_eq!(body["account_count"], 0);
                 let all = sets(&s, &cookie, "").await;
                 let names: Vec<&str> = all.iter().map(|s| s["name"].as_str().unwrap()).collect();
-                assert_eq!(names, ["Default", "Clients"], "Default first");
+                assert_eq!(names, ["All sets", "Clients"], "the default set first");
 
                 for (name, status, code) in [
                     ("CLIENTS", 409, "name_taken"),
-                    ("default", 409, "name_taken"),
+                    ("all SETS", 409, "name_taken"),
                     ("   ", 422, "invalid_name"),
                     (&"x".repeat(61)[..], 422, "invalid_name"),
                 ] {
@@ -4151,7 +4282,7 @@ mod teams {
                 let res = rename(id.into(), "Agency").await;
                 res.assert_status_ok();
                 assert_eq!(res.json::<Value>()["name"], "Agency");
-                assert_eq!(rename(id.into(), "DEFAULT").await.status_code(), 409);
+                assert_eq!(rename(id.into(), "ALL SETS").await.status_code(), 409);
                 // The Default set is pinned, not named: it can be renamed.
                 let default = all[0]["id"].as_str().unwrap().to_owned();
                 let res = rename(default, "Everything").await;
@@ -15531,6 +15662,41 @@ mod teams {
                     .iter()
                     .map(|v| v["id"].as_str().unwrap().to_owned())
                     .collect()
+            }
+
+            /// Only someone who manages the team may hold a token, and they may keep its secret:
+            /// so a token ends when its maker leaves, is removed or becomes a plain member.
+            #[tokio::test]
+            #[serial]
+            async fn a_token_ends_when_its_maker_leaves_or_stops_managing() {
+                let (s, db) = on_mock(120).await;
+                let (_, owner, _) = user(&s, &db).await;
+                let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+                let secret_of = |made: Value| made["secret"].as_str().unwrap().to_owned();
+                let kept = secret_of(make_token(&s, &owner, json!({"name": "owner"})).await);
+                let server = &s;
+                let works = |secret: String| async move {
+                    bearer(server, Method::GET, "/v1/posts", &secret)
+                        .await
+                        .status_code()
+                        .as_u16()
+                };
+                for end in ["demoted", "removed"] {
+                    let (admin, admin_id) = joined(&s, &db, &team_id, "admin").await;
+                    let theirs = secret_of(make_token(&s, &admin, json!({"name": end})).await);
+                    assert_eq!(works(theirs.clone()).await, 200);
+                    let path = format!("/v1/team/members/{admin_id}");
+                    let res = if end == "demoted" {
+                        req(&s, Method::PATCH, &path, &owner)
+                            .json(&json!({"role": "member"}))
+                            .await
+                    } else {
+                        req(&s, Method::DELETE, &path, &owner).await
+                    };
+                    assert!(res.status_code().is_success(), "{end}: {}", res.text());
+                    assert_eq!(works(theirs).await, 401, "{end}");
+                }
+                assert_eq!(works(kept).await, 200, "other people's tokens stay");
             }
 
             #[tokio::test]

@@ -8,7 +8,7 @@ pub struct Model {
     pub team_id: Uuid,
     #[sea_orm(column_type = "Text")]
     pub name: String,
-    /// The team's one pinned Default set, which holds every connected account.
+    /// The team's one pinned default set, which holds every connected account.
     pub is_default: bool,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,

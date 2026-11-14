@@ -792,6 +792,8 @@ const CHAT_PROXY: &str = "did:web:api.bsky.chat#bsky_chat";
 /// Ingest reads at most this many notifications, and messages of this many conversations, a
 /// round; a first round reads back at most `inbox::FIRST_DAYS`.
 const MAX_NOTIFICATIONS: usize = 300;
+/// A full round is 3 pages of 100; a few more allow for short pages.
+const MAX_NOTIFICATION_PAGES: usize = 6;
 const MAX_CONVOS: usize = 20;
 
 /// Why an inbox call failed. `code` is stored on automation runs and sent to the API.
@@ -1076,7 +1078,12 @@ impl Bluesky {
         let mut found = Vec::new();
         let mut cursor: Option<String> = None;
         let mut read = 0;
-        while read < MAX_NOTIFICATIONS {
+        // Pages are counted too: a server the account owner runs could answer one item a page
+        // for ever, and the inbox tick waits on every account.
+        for _ in 0..MAX_NOTIFICATION_PAGES {
+            if read >= MAX_NOTIFICATIONS {
+                break;
+            }
             let mut query = vec![
                 ("limit", "100"),
                 ("reasons", "reply"),

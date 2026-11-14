@@ -43,6 +43,10 @@ const MAX_LIVE_LINKS: u64 = 3;
 const MAX_USER_NAME_CHARS: usize = 80;
 /// "No account" emails one address can get a day from login attempts.
 const LOGIN_NOTICES_PER_DAY: i64 = 3;
+/// Sign-in links a day to addresses that have no account yet: from one IP, and from everyone.
+const SIGN_UP_LINKS_PER_IP_PER_DAY: i64 = 20;
+const SIGN_UP_LINKS_PER_DAY: i64 = 1000;
+const SIGN_UP_LINKS_BUCKET: &str = "signup:link";
 
 #[derive(Deserialize)]
 struct LinkRequest {
@@ -152,27 +156,57 @@ async fn send_link(
     if login_only && !known {
         return send_no_account_notice(app, &email).await;
     }
-    let now = Utc::now().fixed_offset();
-    magic_links::Entity::delete_many()
-        .filter(magic_links::Column::ExpiresAt.lt(now))
-        .exec(&app.db)
-        .await
-        .map_err(|e| format!("magic link cleanup: {e}"))?;
-    let Some(secret) = insert_capped_link(app, &email, name)
-        .await
-        .map_err(|e| format!("magic link insert: {e}"))?
-    else {
-        return Ok(());
-    };
-    let url = format!("{}/auth/magic/{secret}", app.brain_url);
-    let text = format!(
-        "Here is your sign-in link for SocialReins.\n\nSign in to SocialReins:\n\n{url}\n\nIt works once and expires in \
-         {LINK_MINUTES} minutes. If you did not ask for it, ignore this email.\n"
-    );
-    app.mailer
-        .send(&email, "Your sign-in link", text)
-        .await
-        .map_err(|e| format!("mail: {e}"))
+    // A link to an address with no account is mail to wherever a stranger points it, so it has a
+    // daily allowance, per IP and overall. An existing account's link is never counted: using
+    // the allowance up cannot keep anyone out.
+    let mut reserved = Vec::new();
+    if !known {
+        let mut caps = vec![(SIGN_UP_LINKS_BUCKET.to_owned(), SIGN_UP_LINKS_PER_DAY)];
+        if let Some(ip) = ip {
+            caps.push((
+                format!("{SIGN_UP_LINKS_BUCKET}:ip:{}", rate_limit::bucket(ip)),
+                SIGN_UP_LINKS_PER_IP_PER_DAY,
+            ));
+        }
+        let Some(ids) = rate_limit::daily_reserve(&app.db, &caps)
+            .await
+            .map_err(|e| format!("sign-up link cap: {e}"))?
+        else {
+            tracing::warn!("sign-up link not sent: daily cap reached");
+            return Ok(());
+        };
+        reserved = ids;
+    }
+    let sent: Result<bool, String> = async {
+        let now = Utc::now().fixed_offset();
+        magic_links::Entity::delete_many()
+            .filter(magic_links::Column::ExpiresAt.lt(now))
+            .exec(&app.db)
+            .await
+            .map_err(|e| format!("magic link cleanup: {e}"))?;
+        let Some(secret) = insert_capped_link(app, &email, name)
+            .await
+            .map_err(|e| format!("magic link insert: {e}"))?
+        else {
+            return Ok(false);
+        };
+        let url = format!("{}/auth/magic/{secret}", app.brain_url);
+        let text = format!(
+            "Here is your sign-in link for SocialReins.\n\nSign in to SocialReins:\n\n{url}\n\nIt works once and expires in \
+             {LINK_MINUTES} minutes. If you did not ask for it, ignore this email.\n"
+        );
+        app.mailer
+            .send(&email, "Your sign-in link", text)
+            .await
+            .map_err(|e| format!("mail: {e}"))?;
+        Ok(true)
+    }
+    .await;
+    // Only a link that went out uses the allowance up.
+    if !matches!(sent, Ok(true)) {
+        rate_limit::daily_refund(&app.db, &reserved).await;
+    }
+    sent.map(|_| ())
 }
 
 /// Tells an email with no account how to create one, at most `LOGIN_NOTICES_PER_DAY` times. The

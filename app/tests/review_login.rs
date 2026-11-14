@@ -6,7 +6,7 @@ use serial_test::serial;
 use socialreins_brain::{
     config::Config,
     connect, controllers,
-    models::{sessions, social_sets, team_user, users},
+    models::{sessions, social_sets, team_invitations, team_user, users},
     state::AppState,
 };
 
@@ -108,6 +108,190 @@ async fn right_token_signs_in_as_the_demo_user_and_reuses_it() {
         .unwrap();
     assert_eq!(sets.len(), 1);
     assert!(sets[0].is_default);
+}
+
+/// Taking `REVIEW_LOGIN_TOKEN` away must end what the link handed out, or anyone who once had
+/// it keeps the demo team through a session, or an API token made in one.
+#[tokio::test]
+#[serial]
+async fn switching_the_link_off_ends_its_sessions_and_tokens() {
+    let (s, db) = enabled().await;
+    let res = s.get(&format!("/review-login/{TOKEN}")).await;
+    let cookie = res.header("set-cookie").to_str().unwrap().to_owned();
+    let cookie = cookie.split(';').next().unwrap().to_owned();
+    let made = s
+        .post("/v1/api-tokens")
+        .add_header("cookie", &cookie)
+        .add_header("origin", "http://localhost:3000")
+        .json(&json!({"name": "kept by a reviewer"}))
+        .await;
+    assert_eq!(made.status_code(), 201, "{}", made.text());
+    let secret = made.json::<Value>()["secret"].as_str().unwrap().to_owned();
+    let with_token = || {
+        s.get("/v1/posts")
+            .add_header("authorization", format!("Bearer {secret}"))
+    };
+    with_token().await.assert_status_ok();
+    // An invitation sent from the demo account would let its holder join the team later.
+    let invited = s
+        .post("/v1/team/invitations")
+        .add_header("cookie", &cookie)
+        .add_header("origin", "http://localhost:3000")
+        .json(&json!({"email": format!("{}@example.com", uuid::Uuid::now_v7()), "role": "admin"}))
+        .await;
+    assert_eq!(invited.status_code(), 201, "{}", invited.text());
+    let user_id = demo(&db).await.unwrap().id;
+    let invitations = || async {
+        team_invitations::Entity::find()
+            .filter(team_invitations::Column::InvitedBy.eq(user_id))
+            .count(&db)
+            .await
+            .unwrap()
+    };
+    assert_eq!(invitations().await, 1);
+
+    // A second team, where the demo user is only an admin and someone else made the token and
+    // the invitation: its role there and who made them must not matter.
+    use sea_orm::ConnectionTrait;
+    db.execute_unprepared("DELETE FROM rate_limit_hits WHERE bucket LIKE 'team:create:%'")
+        .await
+        .unwrap();
+    let by_demo = |path: &str, body: Value| {
+        s.post(path)
+            .add_header("cookie", &cookie)
+            .add_header("origin", "http://localhost:3000")
+            .json(&body)
+    };
+    let second = by_demo("/v1/teams", json!({"name": "Second"})).await;
+    assert_eq!(second.status_code(), 201, "{}", second.text());
+    let second = second.json::<Value>()["id"].as_str().unwrap().to_owned();
+    let made = by_demo("/v1/api-tokens", json!({"name": "second team"})).await;
+    assert_eq!(made.status_code(), 201, "{}", made.text());
+    let other_secret = made.json::<Value>()["secret"].as_str().unwrap().to_owned();
+    let invite = json!({"email": format!("{}@example.com", uuid::Uuid::now_v7()), "role": "admin"});
+    let invited = by_demo("/v1/team/invitations", invite).await;
+    assert_eq!(invited.status_code(), 201, "{}", invited.text());
+    let other = uuid::Uuid::now_v7();
+    db.execute_unprepared(&format!(
+        "INSERT INTO users (id, email, name) VALUES ('{other}', '{other}@example.com', 'Other'); \
+         INSERT INTO team_user (team_id, user_id, role) VALUES ('{second}', '{other}', 'owner'); \
+         UPDATE team_user SET role = 'admin' WHERE team_id = '{second}' AND user_id = '{user_id}'; \
+         UPDATE api_tokens SET created_by = '{other}' WHERE team_id = '{second}'; \
+         UPDATE team_invitations SET invited_by = '{other}' WHERE team_id = '{second}'"
+    ))
+    .await
+    .unwrap();
+    let second_id: uuid::Uuid = second.parse().unwrap();
+    let second_invitations = || async {
+        team_invitations::Entity::find()
+            .filter(team_invitations::Column::TeamId.eq(second_id))
+            .count(&db)
+            .await
+            .unwrap()
+    };
+    assert_eq!(second_invitations().await, 1);
+    let with_other = || {
+        s.get("/v1/posts")
+            .add_header("authorization", format!("Bearer {other_secret}"))
+    };
+    with_other().await.assert_status_ok();
+
+    controllers::review_login::close(&db).await.unwrap();
+
+    assert_eq!(second_invitations().await, 0);
+    assert_eq!(with_other().await.status_code(), 401);
+    db.execute_unprepared(&format!(
+        "DELETE FROM teams WHERE id = '{second}'; DELETE FROM users WHERE id = '{other}'"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(invitations().await, 0);
+    assert_eq!(demo_sessions(&db).await, 0);
+    let me = s.get("/auth/me").add_header("cookie", &cookie).await;
+    assert_eq!(me.status_code(), 401);
+    assert_eq!(with_token().await.status_code(), 401);
+    assert!(demo(&db).await.is_some(), "the account and its team stay");
+}
+
+/// Someone signed in through the link must not be able to hand the demo team to their own
+/// account and take the demo user out of it: `close` finds a team through the demo user.
+#[tokio::test]
+#[serial]
+async fn the_demo_user_cannot_be_demoted_or_removed_from_its_team() {
+    use sea_orm::ConnectionTrait;
+    let (s, db) = enabled().await;
+    let res = s.get(&format!("/review-login/{TOKEN}")).await;
+    let cookie = res.header("set-cookie").to_str().unwrap().to_owned();
+    let cookie = cookie.split(';').next().unwrap().to_owned();
+    let by_demo = |method: axum::http::Method, path: String| {
+        s.method(method, &path)
+            .add_header("cookie", &cookie)
+            .add_header("origin", "http://localhost:3000")
+    };
+    let me = by_demo(axum::http::Method::GET, "/auth/me".into()).await;
+    let team = me.json::<Value>()["current_team"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let demo_id = demo(&db).await.unwrap().id;
+    // The reviewer's own account joins as an admin, and the demo user makes it an owner.
+    let other = uuid::Uuid::now_v7();
+    db.execute_unprepared(&format!(
+        "INSERT INTO users (id, email, name) VALUES ('{other}', '{other}@example.com', 'Other'); \
+         INSERT INTO team_user (team_id, user_id, role) VALUES ('{team}', '{other}', 'admin')"
+    ))
+    .await
+    .unwrap();
+    let promoted = by_demo(
+        axum::http::Method::PATCH,
+        format!("/v1/team/members/{other}"),
+    )
+    .json(&json!({"role": "owner"}))
+    .await;
+    assert_eq!(promoted.status_code(), 200, "{}", promoted.text());
+
+    // With a second owner the last-owner rule no longer protects the demo user: this one does.
+    let path = format!("/v1/team/members/{demo_id}");
+    for role in ["admin", "member"] {
+        let demoted = by_demo(axum::http::Method::PATCH, path.clone())
+            .json(&json!({"role": role}))
+            .await;
+        assert_eq!(demoted.status_code(), 403, "{role}");
+    }
+    let removed = by_demo(axum::http::Method::DELETE, path).await;
+    assert_eq!(removed.status_code(), 403);
+    let role: Option<String> = team_user::Entity::find()
+        .filter(team_user::Column::UserId.eq(demo_id))
+        .one(&db)
+        .await
+        .unwrap()
+        .map(|m| m.role);
+    assert_eq!(role.as_deref(), Some("owner"));
+
+    // In a team it was only invited to, the demo user is a member like any other and may go.
+    let guest = uuid::Uuid::now_v7();
+    db.execute_unprepared(&format!(
+        "INSERT INTO teams (id, name) VALUES ('{guest}', 'Guest'); \
+         INSERT INTO team_user (team_id, user_id, role) VALUES ('{guest}', '{other}', 'owner'); \
+         INSERT INTO team_user (team_id, user_id, role) VALUES ('{guest}', '{demo_id}', 'admin')"
+    ))
+    .await
+    .unwrap();
+    let switched = by_demo(axum::http::Method::PUT, "/v1/current-team".into())
+        .json(&json!({"team_id": guest}))
+        .await;
+    assert!(switched.status_code().is_success(), "{}", switched.text());
+    let left = by_demo(
+        axum::http::Method::DELETE,
+        format!("/v1/team/members/{demo_id}"),
+    )
+    .await;
+    assert_eq!(left.status_code(), 204, "{}", left.text());
+    db.execute_unprepared(&format!(
+        "DELETE FROM teams WHERE id = '{guest}'; DELETE FROM users WHERE id = '{other}'"
+    ))
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

@@ -4,7 +4,7 @@ use sea_orm_migration::prelude::*;
 pub struct Migration;
 
 // team_user.role: owner, admin or member. Invitations store only the token's SHA-256 hex and
-// never grant owner. social_sets is the minimal shape teams need now: one Default set per team,
+// never grant owner. social_sets is the minimal shape teams need now: one default set per team,
 // pinned by the partial unique index; the rest of the sets feature comes later.
 const UP: &str = r#"CREATE TABLE teams (
   id uuid PRIMARY KEY,

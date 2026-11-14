@@ -60,7 +60,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | POST | `/auth/passkeys/login/finish` | `{"challenge_id","credential"}`: sets the session cookie, returns the user |
 | GET | `/auth/passkeys` | The signed-in user's passkeys |
 | DELETE | `/auth/passkeys/{id}` | Deletes one of the signed-in user's passkeys, `204`, else `404` |
-| POST, GET | `/v1/teams` | Create a team (`{"name"}`, with its Default set; caller owns it and switches to it), or list mine |
+| POST, GET | `/v1/teams` | Create a team (`{"name"}`, with its default set, named "All sets"; caller owns it and switches to it), or list mine |
 | PUT | `/v1/current-team` | `{"team_id"}`: switch to one of my teams |
 | GET, PATCH, DELETE | `/v1/team` | The current team (`{"id","name","code","role"}`), or the one the request names; rename it (owner, admin); delete it (owner, sign-in from the last 10 minutes) |
 | GET | `/v1/team/members` | The current team's members |
@@ -72,7 +72,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET, POST | `/v1/invitations/{token}` | Public preview of an invitation; accept it as the signed-in invited email |
 | GET | `/v1/connections` | The current team's connected accounts with their `set_ids`; never tokens |
 | GET | `/v1/connections/providers` | Each provider with `configured`: Bluesky always, the others once their app id and secret are set |
-| POST | `/v1/connections/bluesky` | `{"handle","app_password"}` (owner, admin): checks it on the account's PDS, stores it encrypted, joins the Default set; `201`, or `200` when it replaces the password of an account the team already has |
+| POST | `/v1/connections/bluesky` | `{"handle","app_password"}` (owner, admin): checks it on the account's PDS, stores it encrypted, joins the default set; `201`, or `200` when it replaces the password of an account the team already has |
 | GET | `/connections/threads/redirect` | A page navigation from web (session cookie; owner, admin of the current team): sends the browser to Threads to connect a profile. Lands back on `{WEB_URL}/app/connections` |
 | GET | `/connect/threads/callback` | Where Threads sends the browser back (register `{BRAIN_URL}/connect/threads/callback` in the Threads app); lands on `{WEB_URL}/app/connections?connected=threads` or `?connect_error=<code>&provider=threads` |
 | GET | `/connections/linkedin/redirect` | Like the Threads one: sends the browser to LinkedIn (scopes `openid profile email w_member_social`) to connect a member's profile |
@@ -89,12 +89,12 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/connect/meta/callback` | Where Meta sends the browser back (register `{BRAIN_URL}/connect/meta/callback` in the Meta app); lands on `{WEB_URL}/app/connections?pick=meta` when there is something to pick, `?connected=meta` when not, or `?connect_error=<code>&provider=meta` |
 | GET, POST, DELETE | `/v1/connections/meta/pick` | The caller's pending Meta pick (owner, admin): the Pages and Instagram accounts not connected yet (`{"facebook":[{"id","name","picture_url"}],"instagram":[...]}`, never tokens, `404` when none or over 15 minutes old); `{"facebook":[ids],"instagram":[ids]}` connects them (`201` with the accounts; `422 nothing_picked`, `invalid_pick`); drop it, `204` |
 | GET | `/media/{name}` | A stored post file at an unguessable link, for platforms that download media themselves (Threads, Facebook, Instagram); `404` once the post settles |
-| PUT | `/v1/connections/{id}/sets` | `{"set_ids"}` (owner, admin): the sets of the current team holding the account; must include the Default set |
+| PUT | `/v1/connections/{id}/sets` | `{"set_ids"}` (owner, admin): the sets of the current team holding the account; must include the default set |
 | DELETE | `/v1/connections/{id}` | Disconnect an account (owner, admin), `204` |
-| GET, POST | `/v1/social-sets` | The current team's live sets with `account_ids`, Default first (`?deleted=true`: deleted ones still restorable); create one (`{"name"}`, owner, admin) |
-| PATCH, DELETE | `/v1/social-sets/{id}` | Rename (`{"name"}`, the Default set too); delete (sign-in from the last 10 minutes, not the Default set), restorable for 30 days. Owner, admin |
+| GET, POST | `/v1/social-sets` | The current team's live sets with `account_ids`, the default set first (`?deleted=true`: deleted ones still restorable); create one (`{"name"}`, owner, admin) |
+| PATCH, DELETE | `/v1/social-sets/{id}` | Rename (`{"name"}`, the default set too); delete (sign-in from the last 10 minutes, not the default set), restorable for 30 days. Owner, admin |
 | POST | `/v1/social-sets/{id}/restore` | Restore a set deleted in the last 30 days, with its accounts (owner, admin) |
-| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&group_id=&from=&to=` on `scheduled_at`; the Default set's id gives every set's posts), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"thread":[{"body","media"}],"first_comment","cover","tiktok","youtube","scheduled_at"}`; any member). `first_comment`: see "First comment" below; `cover`: see "Video cover"; `tiktok`: see "TikTok settings"; `youtube`: see YouTube below. `thread`: up to 25 follow-up posts, each a reply to the one before and checked like the post (`422 {"error","part"}` names a bad one); `?validate_only=true` checks without creating (see "Validate only"); each part is saved on its target as it goes out, a target whose part fails is `failed` naming it with the parts before it kept, and a takedown deletes the parts last first, then the root |
+| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&group_id=&from=&to=` on `scheduled_at`; the default set's id gives every set's posts), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"thread":[{"body","media"}],"first_comment","cover","tiktok","youtube","scheduled_at"}`; any member). `first_comment`: see "First comment" below; `cover`: see "Video cover"; `tiktok`: see "TikTok settings"; `youtube`: see YouTube below. `thread`: up to 25 follow-up posts, each a reply to the one before and checked like the post (`422 {"error","part"}` names a bad one); `?validate_only=true` checks without creating (see "Validate only"); each part is saved on its target as it goes out, a target whose part fails is `failed` naming it with the parts before it kept, and a takedown deletes the parts last first, then the root |
 | GET, PUT, DELETE | `/v1/posts/{id}` | One post with its `targets`; replace a `draft` or `scheduled` one; delete (`204` for draft or scheduled, `200` after taking a published one down, `422 takedown_failed` with a `message`, `409` for queued or failed) |
 | POST | `/v1/post-groups` | One post per platform of a set in one call (`{"social_set_id","platforms","body","media","scheduled_at","list_id","position","thread","first_comment","cover","tiktok","youtube","overrides":{"<platform>":{"body","media","thread","first_comment","cover","tiktok","youtube"}}}`; `platforms` defaults to those brain publishes to with a connected account; bodies up to 64 KiB): `201 {"group_id","posts","skipped"}`; an invalid post creates nothing and its error names the `platform`, unless `"on_invalid":"skip"` (see "Validate only"). `?validate_only=true` checks without creating |
 | POST | `/v1/posts/{id}/publish` | Publish a draft or scheduled post now: `202` with the post `queued`; poll it for the result |
@@ -151,7 +151,9 @@ whose `Origin` (or `Referer`) is `BRAIN_URL`. One email holds at most 3 unexpire
 creates the account if needed, then a 30-day session in the HttpOnly,
 SameSite=Lax `sr_session` cookie (`Secure` unless `BRAIN_URL` is `http://`). A dead link
 redirects to `WEB_URL/login?error=invalid_link` (or `registration_disabled`). Only SHA-256
-hashes of link and session tokens are stored. `POST /auth/link` and `POST /auth/magic` share 5 requests a minute per IP.
+hashes of link and session tokens are stored. `POST /auth/link` and `POST /auth/magic` share 5 requests a minute per IP. A link to an address with no account also draws from a daily
+allowance, 20 per IP and 1000 overall (only links that are sent count); past it the answer is the same `202` and no mail goes out. A link to an existing account is
+never counted, so a used-up allowance stops new sign-ups by email for the day and never a sign-in.
 
 Sign-up rules: an existing account always signs in. A new account needs its whole address or
 its domain in `SIGNUP_DOMAINS` (anyone when unset) and open registration (`REGISTRATION_DISABLED`
@@ -223,7 +225,7 @@ invite: when they are removed, leave or drop below admin, theirs are deleted.
 
 Social sets group a team's accounts. Names follow the team name rules and are unique among a
 team's live sets in any case (`409 name_taken`); a team holds at most 50 live sets
-(`409 too_many_sets`). The Default set holds every account; it can be renamed but not deleted
+(`409 too_many_sets`). The default set (`is_default`, named "All sets" on a new team) holds every account; it can be renamed but not deleted
 (`409 default_set`). Deleting a set needs a sign-in from the last 10 minutes;
 it keeps its account links, hidden, so a restore within 30 days brings them back. An hourly
 job in brain hard-deletes sets deleted over 30 days ago, one instance at a time (advisory lock).
@@ -355,7 +357,9 @@ it frees up. A tick claims at most 50 posts; 8 posts and 8 targets publish at on
 
 A token created with `"read_only": true` (whole-team or set) only reads: every `POST`, `PUT`,
 `PATCH` or `DELETE` it sends, and every `/mcp` write tool, is `403 {"error":"read_only_token"}`
-before anything runs, except a create with `validate_only`, which creates nothing. `GET /v1/posts/{id}` lists the post's `accounts` (id, provider, handle,
+before anything runs, except a create with `validate_only`, which creates nothing. A token is
+revoked when the member who created it is removed from the team, leaves it, or becomes a plain
+member: only an owner or admin may hold one. `GET /v1/posts/{id}` lists the post's `accounts` (id, provider, handle,
 display name, target id and status), also before it publishes and has targets.
 
 API token writes (`POST`, `PUT`, `PATCH`, `DELETE`) take an optional `Idempotency-Key` header,
@@ -368,7 +372,7 @@ minutes is taken as crashed and runs again. Sessions ignore the header.
 
 Connections are the current team's social accounts. Members list them; owners and admins connect,
 regroup and disconnect them. Tokens are sealed with `ENCRYPTION_KEY` and never returned. Every
-account sits in the team's Default set, which `PUT /v1/connections/{id}/sets` cannot drop
+account sits in the team's default set, which `PUT /v1/connections/{id}/sets` cannot drop
 (`422 default_set_required`). Bluesky needs no app: brain resolves the handle to a DID
 (`public.api.bsky.app`), the DID to its PDS (`plc.directory` or the domain's `did.json`), then
 opens a session there with the app password, which is sent only to that PDS over https with
@@ -388,7 +392,7 @@ SHA-256, the team and the user) is kept in Postgres for 10 minutes and used once
 holds the state in an HttpOnly cookie scoped to `/connect/threads`, compared in constant time.
 The callback needs the same signed-in user, still an owner or admin of that team, swaps the code
 at `graph.threads.com/oauth/access_token` for a 60-day token (`th_exchange_token`), reads `me`
-(id, username, name, picture) and saves a `threads` account in that team's Default set; a
+(id, username, name, picture) and saves a `threads` account in that team's default set; a
 reconnect updates the same row. It lands on `{WEB_URL}/app/connections?connected=threads`, or
 `?connect_error=` `not_configured`, `unauthorized`, `forbidden`, `rate_limited`, `expired`,
 `cancelled`, `threads_failed` or `internal` with `&provider=threads`, never with details. A daily
@@ -443,7 +447,7 @@ redirect URI `{BRAIN_URL}/connect/youtube/callback`, state and cookie (`sr_youtu
 consent screen and enable the YouTube Data API v3 in the Google Cloud project. The callback swaps
 the code at `oauth2.googleapis.com/token`, needs the refresh token `prompt=consent` brings, reads
 `GET /youtube/v3/channels?part=snippet&mine=true` (id, title, `@handle`, thumbnail) and saves a
-`youtube` account (`external_id` is the channel id) in the team's Default set. Google always shows its
+`youtube` account (`external_id` is the channel id) in the team's default set. Google always shows its
 account chooser (`prompt=select_account consent`), which lists Brand Account channels too, so
 pick the channel there; connect again for another. Error codes `youtube_failed`, `no_channel` (the Google account has no channel) and
 `missing_scopes` (granular consent: the token Google returned lacks one of the three scopes, so
@@ -482,7 +486,7 @@ state and cookie (`sr_tiktok`, scoped to `/connect/tiktok`). The callback swaps 
 `open.tiktokapis.com/v2/oauth/token/`, needs the refresh token and all three scopes (error code
 `missing_scopes` when the user unticks one; `tiktok_failed` besides the Threads codes), reads
 `GET /v2/user/info/` (open id, name, picture) and the account's `@username` from the creator info
-call, and saves a `tiktok` account (`external_id` is the open id) in the team's Default set. The
+call, and saves a `tiktok` account (`external_id` is the open id) in the team's default set. The
 access token lasts a day and is stored with its expiry; the refresh token (a year) is sealed in the
 account's `meta`. Before each publish, a token with under ten minutes left is renewed and saved
 first under a lock on the account row, with the new refresh token saved in the same transaction (there is no daily job). A refused refresh
@@ -532,7 +536,7 @@ the state, sealed with `ENCRYPTION_KEY` like the tokens (the URL carries only it
 challenge). The callback swaps the code and the verifier at `POST api.x.com/2/oauth2/token` with
 the client id and secret in HTTP Basic auth, reads `GET /2/users/me` (id, username, name,
 picture) and saves an `x` account (`external_id` is the user id, `handle` the username) in the
-team's Default set. Error codes `x_failed` and `missing_scopes` (the consent screen let the user
+team's default set. Error codes `x_failed` and `missing_scopes` (the consent screen let the user
 untick a scope, so nothing is saved) besides the Threads ones.
 
 An access token lasts two hours and is stored with its expiry; the refresh token is sealed in the
@@ -716,13 +720,21 @@ Meta App Review needs a reviewer to sign in without receiving email. To allow it
    default social set, nothing connected) and lands on `{WEB_URL}/app`. The reviewer connects
    their own test accounts from there.
 3. Once the review is over, remove `REVIEW_LOGIN_TOKEN` and redeploy: the route is a `404` again.
-   The demo user and its data stay until you delete them.
+   On every start without the variable brain ends the demo user's sessions, deletes its passkeys,
+   and revokes every API token and deletes every pending invitation of each team the demo user
+   is in, whoever made them. The demo user, its teams and their other members stay until you
+   remove them; brain logs a warning when such a team has other members, so check its Team page.
+   The cleanup runs once, at start: a link opened on the old instance while the new one was
+   starting outlives it, so restart brain once more after that deploy is live.
 
 A wrong token and an unset one both give the same bare `404`, and the token is compared in
 constant time and never logged. The route shares the per-IP sign-in rate limit. The demo user
 signs in even with `REGISTRATION_DISABLED=true`, is never an admin, and brain refuses (with a
 warning in the log) if `review@socialreins.com` is listed in `ADMIN_EMAILS`. Anyone holding the
-link has full use of the demo account, so treat it like a password.
+link has full use of the demo account, so treat it like a password. In a team it owns, the demo
+user cannot be demoted, removed or leave (`403 forbidden`), so nobody signed in through the link
+can hand the demo team to another account and out of that cleanup. Keep the demo user out of
+your own teams: the cleanup revokes the tokens and invitations of every team it is in.
 
 ## Media
 
@@ -734,8 +746,8 @@ redirects, each to a public https URL, 4 at a time, streamed to storage in 5 MB 
 holds about 15 MB however large the file) and typed by its first bytes. A video may be up to 1 GiB
 (`MEDIA_MAX_BYTES` lowers it; Bluesky takes 100 MB and X 512 MB), any other file 100 MB; a file
 over its cap is refused by its `Content-Length`, else the moment its bytes pass it, and nothing of
-it stays stored. Each download has 60 seconds plus its size at 2 MB a second (about 3.5 minutes
-for 300 MB; when its server does not say its size, the size is the bytes that came so far, so a slow one ends early), all of a post's 12 minutes together, and a server silent for 30 seconds fails at
+it stays stored. Each download has 60 seconds plus the bytes that came so far at 2 MB a second (about 3.5 minutes
+for 300 MB; the size its server claims earns nothing, so a slow one ends early), all of a post's 12 minutes together, and a server silent for 30 seconds fails at
 once. Posts of one group that carry the same video download it once: the others copy it inside
 the storage (per brain instance). Types are JPEG, PNG, WebP, GIF, MP4, MOV and PDF (only LinkedIn
 takes a PDF). A still image (JPEG, PNG or WebP) over the platform's limit for one image (Bluesky

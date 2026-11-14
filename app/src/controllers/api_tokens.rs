@@ -402,6 +402,12 @@ async fn create(
             .lock_exclusive()
             .one(&txn)
             .await?;
+        // Read again under the lock: a demotion or removal that committed while this waited
+        // revoked the member's tokens, and must not be followed by a new one.
+        let member = super::teams::membership(&txn, t.team.id, t.current.0.id).await?;
+        if !member.is_some_and(|m| Role::parse(&m.role).is_some_and(|r| r.manages())) {
+            return Ok(Err(forbidden()));
+        }
         if let Some(set) = body.social_set_id {
             // Shared lock: a concurrent set delete waits, then revokes this token too.
             let found = social_sets::Entity::find_by_id(set)

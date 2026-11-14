@@ -1,7 +1,7 @@
 //! Connect a LinkedIn profile through the shared OAuth flow (`oauth.rs`):
 //! `GET /connections/linkedin/redirect`, then `GET /connect/linkedin/callback` (path registered
 //! with LinkedIn, fixed) swaps the code for a token (about 60 days), reads the member's OpenID
-//! profile and saves it as a `linkedin` account in that team's Default set. A refresh token, which
+//! profile and saves it as a `linkedin` account in that team's default set. A refresh token, which
 //! only partner apps get, is kept sealed in `meta`; without one the account shows as expired
 //! after its 60 days and the member signs in again.
 use axum::{

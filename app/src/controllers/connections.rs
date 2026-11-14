@@ -1,6 +1,6 @@
 //! Connected social accounts of the current team. Members list them; owners and admins connect,
 //! regroup and disconnect them. Tokens never leave brain: they are sealed at rest and absent from
-//! every response. Every account stays in the team's Default set. OAuth providers connect in
+//! every response. Every account stays in the team's default set. OAuth providers connect in
 //! their own controllers (`threads.rs`, `meta.rs`, `linkedin.rs`, `youtube.rs`, `x.rs`) and save through `save_account`. The list takes an API
 //! token too; a set token sees only its set's accounts, each showing that set alone.
 use std::collections::{HashMap, HashSet};
@@ -72,7 +72,7 @@ pub struct Connection {
     /// `token_expires_at`); `reconnect` when it expired or the platform refused it. Connect the
     /// account again (the provider's connect link) to clear either.
     pub status: Status,
-    /// The social sets holding the account; the team's Default set is always one of them.
+    /// The social sets holding the account; the team's default set is always one of them.
     pub set_ids: Vec<Uuid>,
     pub created_at: DateTime<FixedOffset>,
 }
@@ -95,7 +95,7 @@ pub struct BlueskyLogin {
 
 #[derive(Deserialize, ToSchema)]
 pub struct AccountSets {
-    /// Sets of the current team; must include its Default set.
+    /// Sets of the current team; must include its default set.
     pub set_ids: Vec<Uuid>,
 }
 
@@ -187,7 +187,7 @@ async fn default_set(db: &impl ConnectionTrait, team_id: Uuid) -> Result<Uuid, D
         .one(db)
         .await?
         .map(|s| s.id)
-        .ok_or_else(|| DbErr::RecordNotFound("team has no Default set".into()))
+        .ok_or_else(|| DbErr::RecordNotFound("team has no default set".into()))
 }
 
 /// The current team's connected accounts, oldest first. Never includes tokens.
@@ -401,7 +401,7 @@ async fn connect_bluesky(
 
 /// Saves a newly connected account (`row`, with id `new_id`), or, when the team already holds it,
 /// updates that row's `refresh` columns and keeps its id, sets and creator. Either way the
-/// account is in the team's Default set. Returns whether it is new, and its JSON.
+/// account is in the team's default set. Returns whether it is new, and its JSON.
 pub(crate) async fn save_account(
     db: &DatabaseConnection,
     (team_id, new_id): (Uuid, Uuid),
@@ -435,7 +435,7 @@ pub(crate) async fn save_account(
 }
 
 /// Replaces the sets an account belongs to. Owners and admins. Every id must be a live set of
-/// the current team, and the Default set must stay.
+/// the current team, and the default set must stay.
 #[utoipa::path(put, path = "/connections/{id}/sets", tag = "connections", request_body = AccountSets,
     params(("id" = Uuid, Path)),
     responses((status = 200, body = Connection), (status = 401, body = Error),

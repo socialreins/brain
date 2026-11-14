@@ -110,7 +110,7 @@ fn specs() -> Vec<(&'static str, &'static str, Value, bool)> {
         serde_json::to_value(schemars::schema_for!(T)).unwrap_or_default()
     }
     vec![
-        ("list-social-sets", "The team's live social sets with their account ids, Default first; `deleted: true` lists deleted sets still restorable. A set token sees only its set. Same as GET /v1/social-sets.", schema::<ListQuery>(), true),
+        ("list-social-sets", "The team's live social sets with their account ids, the default set first; `deleted: true` lists deleted sets still restorable. A set token sees only its set. Same as GET /v1/social-sets.", schema::<ListQuery>(), true),
         ("list-social-accounts", "The team's connected social accounts with their set ids. Same as GET /v1/connections.", schema::<NoArgs>(), true),
         ("list-posts", "The team's posts by scheduled_at, filtered by set, status and a from/to window on scheduled_at. Same as GET /v1/posts.", schema::<PostQuery>(), true),
         ("get-post", "One post with its targets. Same as GET /v1/posts/{id}.", schema::<PostId>(), true),

@@ -5,7 +5,7 @@ pub struct Migration;
 
 // One row per connected account, unique per team. access_token is sealed by
 // `socialreins_core::crypto` (never plaintext); meta holds provider extras such as a Bluesky PDS.
-// Every account also sits in its team's Default set; the controllers keep that true.
+// Every account also sits in its team's default set; the controllers keep that true.
 const UP: &str = r#"CREATE TABLE social_accounts (
   id uuid PRIMARY KEY,
   team_id uuid NOT NULL REFERENCES teams (id) ON DELETE CASCADE,

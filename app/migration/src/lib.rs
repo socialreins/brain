@@ -30,7 +30,8 @@ mod m20261119_000001_google_login_only;
 mod m20261120_000001_youtube_settings;
 mod m20261121_000001_read_only_tokens;
 mod m20261122_000001_admin_console;
-pub mod m20261123_000001_team_code;
+pub mod m20261123_000001_all_sets_name;
+pub mod m20261124_000001_team_code;
 
 pub struct Migrator;
 
@@ -68,7 +69,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261120_000001_youtube_settings::Migration),
             Box::new(m20261121_000001_read_only_tokens::Migration),
             Box::new(m20261122_000001_admin_console::Migration),
-            Box::new(m20261123_000001_team_code::Migration),
+            Box::new(m20261123_000001_all_sets_name::Migration),
+            Box::new(m20261124_000001_team_code::Migration),
             // inject-above (do not remove this comment)
         ]
     }

@@ -6,7 +6,8 @@ services:
       POSTGRES_USER: brain
       POSTGRES_PASSWORD: brain
       POSTGRES_DB: socialreins_brain
-    ports: ["${PG_PORT:-5432}:5432"]
+    # This machine only: the password above is a known default.
+    ports: ["127.0.0.1:${PG_PORT:-5432}:5432"]
     volumes: [pg-data:/var/lib/postgresql/data]
 
 volumes:
