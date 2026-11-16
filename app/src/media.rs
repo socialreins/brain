@@ -152,7 +152,7 @@ pub struct Probed {
 pub enum Fail {
     /// Not a public https URL, or it redirected to one that is not.
     Blocked,
-    /// Google Drive answered with a page, not the file: it is not shared publicly.
+    /// Google Drive or Dropbox answered with a page, not the file: it is not shared publicly.
     NotShared,
     /// Google Drive's "too many users have viewed or downloaded this file recently" page.
     DriveQuota,
@@ -610,6 +610,10 @@ impl Media {
             if html(&res) {
                 return Err(Fail::DriveConfirm);
             }
+        }
+        // Dropbox answers a link that is dead or not shared with a page, not the file.
+        if dropbox.is_some() && html(&res) {
+            return Err(Fail::NotShared);
         }
         Ok(res)
     }
@@ -1081,6 +1085,8 @@ pub fn dropbox_url(url: &str) -> Option<String> {
         .clear()
         .extend_pairs(kept)
         .append_pair("dl", "1");
+    // `dropbox.com` only redirects to `www`, which would use one of the few redirects allowed.
+    u.set_host(Some("www.dropbox.com")).ok()?;
     Some(u.into())
 }
 
@@ -1571,7 +1577,7 @@ mod tests {
             ),
             (
                 "https://dropbox.com/scl/fi/abc123/a%20b.png?rlkey=k9&raw=1",
-                "https://dropbox.com/scl/fi/abc123/a%20b.png?rlkey=k9&dl=1",
+                "https://www.dropbox.com/scl/fi/abc123/a%20b.png?rlkey=k9&dl=1",
             ),
             (
                 "https://www.dropbox.com/s/abc123/clip.mp4",
