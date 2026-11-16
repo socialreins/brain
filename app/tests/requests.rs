@@ -14452,6 +14452,46 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
+                async fn a_comment_under_a_reel_finds_its_post() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    let fb = account(&db, &team_id, "facebook", "101").await;
+                    let set = default_set(&db, &team_id).await;
+                    let res = req(&s, Method::POST, "/v1/posts", &cookie)
+                        .json(
+                            &json!({"social_set_id": set, "platform": "facebook", "body": "Reel"}),
+                        )
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let post = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                    // A Reel's target keeps the bare video id; Meta names the post `101_9`.
+                    let stmt = sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Postgres,
+                        "UPDATE posts SET status = 'published', published_at = now() WHERE id = $1; ",
+                        [post.parse::<uuid::Uuid>().unwrap().into()],
+                    );
+                    sea_orm::ConnectionTrait::execute_raw(&db, stmt)
+                        .await
+                        .unwrap();
+                    let stmt = sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Postgres,
+                        "INSERT INTO post_targets (id, post_id, social_account_id, status, remote_id) \
+                         VALUES (gen_random_uuid(), $1, $2, 'published', '9')",
+                        [post.parse::<uuid::Uuid>().unwrap().into(), fb.id.into()],
+                    );
+                    sea_orm::ConnectionTrait::execute_raw(&db, stmt)
+                        .await
+                        .unwrap();
+                    let res = deliver(&s, &page_comment("101_9_7", "details", "777", now())).await;
+                    assert_eq!(res.status_code(), 200);
+                    let items = stored(&db, &team_id).await;
+                    let comment = items.iter().find(|i| i.remote_id == "101_9_7").unwrap();
+                    assert_eq!(comment.post_id.map(|p| p.to_string()), Some(post));
+                }
+
+                #[tokio::test]
+                #[serial]
                 async fn facebook_comments_and_messages_land_in_the_inbox() {
                     let (s, db, _, _) = on_meta(true).await;
                     clean(&db).await;
