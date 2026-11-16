@@ -76,7 +76,8 @@ pub struct AutomationInput {
     /// Default `true`.
     #[serde(default = "yes")]
     pub active: bool,
-    /// Needs a `send_dm` action; at most 300 graphemes; may hold `{name}`.
+    /// Needs a `send_dm` action; at most 300 graphemes; may hold `{name}` and
+    /// `{page}` (not sent, `no_public_page`, when the post has no live page).
     #[serde(default)]
     pub fallback_public_reply: Option<String>,
 }
@@ -93,7 +94,7 @@ pub struct Run {
     /// `running`, `sent`, `failed` or `skipped`.
     pub status: String,
     /// Why not everything was sent: `dm_not_allowed`, `no_dm_access`, `rate_limited`,
-    /// `daily_cap`, `reconnect_required`, `interrupted`, `bluesky_refused`, ...
+    /// `no_public_page`, `daily_cap`, `reconnect_required`, `interrupted`, `bluesky_refused`, ...
     pub reason: Option<String>,
     pub results: Vec<ActionResult>,
     pub created_at: DateTime<FixedOffset>,

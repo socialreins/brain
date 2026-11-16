@@ -127,6 +127,39 @@ async fn page_json(
     })
 }
 
+/// The address of the public page of a post (`{web_url}/p/{code}`), when the public route
+/// serves it now: the page is enabled, the team has public pages on and a post of it is
+/// published in a live set.
+pub async fn address(
+    db: &impl ConnectionTrait,
+    web_url: &str,
+    team_id: Uuid,
+    post_id: Uuid,
+) -> Result<Option<String>, DbErr> {
+    let post = posts::Entity::find_by_id(post_id)
+        .filter(posts::Column::TeamId.eq(team_id))
+        .one(db)
+        .await?;
+    let Some(post) = post else { return Ok(None) };
+    let subject = subject(&post);
+    let page = post_pages::Entity::find()
+        .filter(post_pages::Column::Subject.eq(subject))
+        .filter(post_pages::Column::Enabled.eq(true))
+        .one(db)
+        .await?;
+    let Some(page) = page else { return Ok(None) };
+    let on = teams::Entity::find_by_id(team_id)
+        .filter(teams::Column::PublicPages.eq(true))
+        .one(db)
+        .await?
+        .is_some();
+    if !on || published(db, team_id, subject).await?.is_empty() {
+        return Ok(None);
+    }
+    let base = web_url.trim_end_matches('/');
+    Ok(Some(format!("{base}/p/{}", page.code)))
+}
+
 fn answer(found: Result<Option<Page>, DbErr>, what: &str) -> Response {
     match found {
         Ok(Some(p)) => Json(p).into_response(),

@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     connectors::bluesky::InboxError,
-    controllers::connections::live_sets,
+    controllers::{connections::live_sets, pages},
     inbox::{self, Via},
     models::{automations, inbox_items, social_account_social_set as membership, social_accounts},
     rate_limit::reserve_in,
@@ -28,6 +28,10 @@ pub const RUNS_PER_DAY: i64 = 500;
 const STUCK_MINUTES: i32 = 15;
 /// Longest `{name}` put into a text.
 const MAX_NAME_CHARS: usize = 64;
+/// What `{page}` counts as when a text is checked.
+// shortcut: an address over 100 characters (a `WEB_URL` over 85) can make a checked text too
+// long to send, which fails that action; derive this from `WEB_URL` if one ever is.
+const MAX_PAGE_CHARS: usize = 100;
 
 pub fn quota_bucket(team_id: Uuid) -> String {
     format!("automation:team:{team_id}")
@@ -56,7 +60,11 @@ pub struct Conditions {
     pub first_per_author: bool,
 }
 
-/// What an automation does. Texts may hold `{name}`: the author's display name, else handle.
+/// What an automation does. Texts may hold `{name}`, the commenter's display name ("there"
+/// when it is not plainly a name), and `{page}`, the address of the public page of the post the
+/// comment is under, counted as 100 characters. An action with `{page}` is not sent
+/// (`skipped`, `no_public_page`) when the comment is not under one of the team's posts or that
+/// post has no live page.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
@@ -114,8 +122,12 @@ pub fn validate(
     if actions.is_empty() || kinds.len() != actions.len() {
         return Err("invalid_actions");
     }
-    // Checked with every `{name}` at its longest, so a long name never makes it too long.
-    let longest = |t: &str| t.replace("{name}", &"n".repeat(MAX_NAME_CHARS));
+    // Checked with every `{name}` and `{page}` at its longest, so a long name or address never
+    // makes it too long.
+    let longest = |t: &str| {
+        t.replace("{name}", &"n".repeat(MAX_NAME_CHARS))
+            .replace("{page}", &"p".repeat(MAX_PAGE_CHARS))
+    };
     for a in actions {
         let (via, text) = a.via_text();
         if !inbox::fits(via, &longest(text)) {
@@ -340,7 +352,8 @@ pub struct ActionResult {
     pub kind: String,
     /// `sent`, `failed` or `skipped`.
     pub status: String,
-    /// Why it was not sent, e.g. `dm_not_allowed`, `no_dm_access`, `rate_limited`; on Facebook
+    /// Why it was not sent, e.g. `dm_not_allowed`, `no_dm_access`, `rate_limited`;
+    /// `no_public_page` when its text holds `{page}` and the post has no live page; on Facebook
     /// and Instagram `outside_window` (a private reply works within 7 days of the comment),
     /// `already_replied` (once per comment) and `dm_unavailable`.
     pub reason: Option<String>,
@@ -370,8 +383,27 @@ fn outcome(kind: &str, sent: Result<Result<String, InboxError>, DbErr>) -> Actio
     }
 }
 
+/// `template` with each `{page}` replaced by the page's address; `None` when it holds one and
+/// there is no page.
+fn with_page(template: &str, page: Option<&str>) -> Option<String> {
+    if !template.contains("{page}") {
+        return Some(template.to_owned());
+    }
+    page.map(|p| template.replace("{page}", p))
+}
+
+fn no_page(kind: &str) -> ActionResult {
+    ActionResult {
+        kind: kind.into(),
+        status: "skipped".into(),
+        reason: Some("no_public_page".into()),
+        remote_id: None,
+    }
+}
+
 /// Sends each action once, then the fallback reply when a DM could not go and nothing was
-/// replied publicly.
+/// replied publicly. A text with `{page}` is skipped (`no_public_page`) when the post has no
+/// live page; that is not a refused DM, so it never brings the fallback.
 async fn act(
     app: &AppState,
     account: &social_accounts::Model,
@@ -380,10 +412,30 @@ async fn act(
     actions: &[Action],
 ) -> Vec<ActionResult> {
     let name = item.author_name.as_deref();
+    let fallback = a.fallback_public_reply.as_deref();
+    let wanted = actions
+        .iter()
+        .map(|a| a.via_text().1)
+        .chain(fallback)
+        .any(|t| t.contains("{page}"));
+    let page = match item.post_id {
+        Some(post) if wanted => pages::address(&app.db, &app.web_url, item.team_id, post)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "automation page lookup failed");
+                None
+            }),
+        _ => None,
+    };
     let mut results = Vec::new();
     for action in actions {
         let (via, template) = action.via_text();
-        let (text, filled) = render(template, name);
+        // Filled in before `render`, outside its ranges: the address must become a link.
+        let Some(template) = with_page(template, page.as_deref()) else {
+            results.push(no_page(action.kind()));
+            continue;
+        };
+        let (text, filled) = render(&template, name);
         let sent = inbox::send(app, account, item, via, &text, &filled, None, Some(a.id)).await;
         results.push(outcome(
             action.kind(),
@@ -406,8 +458,12 @@ async fn act(
     let replied = results
         .iter()
         .any(|r| r.kind == "reply_publicly" && r.status == "sent");
-    if let (true, false, Some(f)) = (dm_refused, replied, &a.fallback_public_reply) {
-        let (text, filled) = render(f, name);
+    if let (true, false, Some(f)) = (dm_refused, replied, fallback) {
+        let Some(f) = with_page(f, page.as_deref()) else {
+            results.push(no_page("fallback_public_reply"));
+            return results;
+        };
+        let (text, filled) = render(&f, name);
         let sent = inbox::send(
             app,
             account,
@@ -617,6 +673,27 @@ mod tests {
         assert_eq!(
             validate("comment_received", &mut both, &[dm()], None),
             Err("invalid_conditions")
+        );
+        // `{page}` counts as 100 characters, in actions and in the fallback.
+        let paged = |n: usize| Action::ReplyPublicly {
+            text: format!("{}{{page}}", "a".repeat(n)),
+        };
+        assert_eq!(
+            validate("comment_received", &mut c, &[paged(200)], None),
+            Ok(())
+        );
+        assert_eq!(
+            validate("comment_received", &mut c, &[paged(201)], None),
+            Err("invalid_text")
+        );
+        let f = format!("{}{{page}}", "a".repeat(201));
+        assert_eq!(
+            validate("comment_received", &mut c, &[dm()], Some(&f)),
+            Err("invalid_fallback")
+        );
+        assert_eq!(
+            validate("comment_received", &mut c, &[dm()], Some(&f[1..])),
+            Ok(())
         );
         let unknown = serde_json::json!([{"type": "send_dm", "text": "x", "extra": 1}]);
         assert!(serde_json::from_value::<Vec<Action>>(unknown).is_err());
