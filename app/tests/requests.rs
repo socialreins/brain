@@ -15603,6 +15603,81 @@ mod teams {
                 assert_eq!(res.status_code(), 204);
             }
 
+            /// `{page}` is the address of the live public page of the post the comment is under;
+            /// without one the action is skipped and nothing goes out, the fallback included.
+            #[tokio::test]
+            #[serial]
+            async fn page_placeholders_send_the_address_or_skip() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
+                let set = default_set(&db, &team_id).await;
+                let res = req(&s, Method::POST, "/v1/posts", &cookie)
+                    .json(&json!({"platform": "bluesky", "body": "hello", "social_set_id": set}))
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let post = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                // Published through brain: the target's remote id is what `note` replies to.
+                let published = format!(
+                    "UPDATE posts SET status = 'published', published_at = now() \
+                     WHERE id = '{post}'; \
+                     INSERT INTO post_targets (id, post_id, social_account_id, status, remote_id) \
+                     VALUES (gen_random_uuid(), '{post}', '{account}', 'published', \
+                     'at://{me}/app.bsky.feed.post/root')"
+                );
+                sea_orm::ConnectionTrait::execute_unprepared(&db, &published)
+                    .await
+                    .unwrap();
+                let res = req(&s, Method::PATCH, "/v1/team", &cookie)
+                    .json(&json!({"public_pages": true}))
+                    .await;
+                res.assert_status_ok();
+                let page = |enabled: bool| {
+                    req(&s, Method::PUT, &format!("/v1/posts/{post}/page"), &cookie)
+                        .json(&json!({"enabled": enabled, "details": "links"}))
+                };
+                let saved = page(true).await.json::<Value>();
+                assert_eq!(saved["live"], true, "{saved}");
+                let code = saved["code"].as_str().unwrap();
+
+                let mut body = comment_to_dm();
+                body["conditions"] = json!({"keywords": ["details"]});
+                body["actions"] = json!([{"type": "send_dm", "text": "{name}, details: {page}"}]);
+                let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                    .json(&body)
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let id = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+
+                set_inbox(
+                    &me,
+                    json!({"notifications": [
+                    note("reply", "did:plc:fan1", "d1", "details?", &at(-1), &me)]}),
+                );
+                ingest(&db, &state, &account).await;
+                let got = runs(&s, &cookie, &id).await;
+                assert_eq!(got.len(), 1);
+                assert_eq!(got[0]["status"], "sent", "{got:?}");
+                let sent = SENT.lock().unwrap().clone();
+                let address = format!("{}/p/{code}", state.web_url);
+                let message = &sent.last().unwrap()["message"];
+                assert_eq!(message["text"], format!("Fan d1, details: {address}"));
+                // The address is a link, unlike what `{name}` fills in.
+                assert_eq!(message["facets"][0]["features"][0]["uri"], address);
+
+                // The page goes off: the automation does not run, and leaves no run.
+                page(false).await.assert_status_ok();
+                let records = RECORDS.lock().unwrap().len();
+                set_inbox(
+                    &me,
+                    json!({"notifications": [
+                    note("reply", "did:plc:fan2", "d2", "details?", &at(-2), &me)]}),
+                );
+                ingest(&db, &state, &account).await;
+                assert_eq!(runs(&s, &cookie, &id).await.len(), 1);
+                assert_eq!(SENT.lock().unwrap().len(), sent.len());
+                assert_eq!(RECORDS.lock().unwrap().len(), records);
+            }
+
             #[tokio::test]
             #[serial]
             async fn the_tick_takes_the_lock_and_openapi_documents_the_routes() {
