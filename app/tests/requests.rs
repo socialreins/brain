@@ -16445,6 +16445,19 @@ mod teams {
                     // Drafts never show.
                     assert_eq!(public(&s, &code).await.status_code(), 404);
                     assert_eq!(public(&s, "nosuchcode").await.status_code(), 404);
+                    // Nor does any other status short of published, a taken down post included.
+                    for status in ["scheduled", "queued", "failed", "deleted"] {
+                        sql(
+                            &db,
+                            format!(
+                                "UPDATE posts SET status = '{status}', scheduled_at = now() \
+                                 WHERE id = '{a}'"
+                            ),
+                        )
+                        .await;
+                        assert_eq!(public(&s, &code).await.status_code(), 404, "{status}");
+                        assert_eq!(page(&s, &owner, &a).await["live"], false, "{status}");
+                    }
 
                     // Published: served, and saving still works.
                     publish(&db, &a, &account, "https://bsky.test/a").await;
