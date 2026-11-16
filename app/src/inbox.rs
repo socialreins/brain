@@ -362,14 +362,13 @@ fn clip(text: &str) -> String {
 }
 
 // The post a comment hangs off: our target's remote id is the comment's parent or root. A
-// Facebook comment names its post `<page>_<id>`, but a Reel's target keeps the bare video id,
-// so the part after `_` is tried too (Graph ids are unique, and the account must match).
+// Facebook Reel's target keeps the video id instead, which `meta_inbox` looks up after the 200.
 const INSERT: &str = "INSERT INTO inbox_items (id, team_id, social_account_id, platform, kind, \
     remote_id, remote_cid, parent_remote_id, root_remote_id, root_remote_cid, convo_id, \
     author_id, author_handle, author_name, author_avatar, text, received_at, permalink, post_id) \
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
     (SELECT t.post_id FROM post_targets t WHERE t.social_account_id = $3 \
-     AND t.remote_id IN ($8, $9, NULLIF(split_part($8, '_', 2), ''), NULLIF(split_part($9, '_', 2), '')) LIMIT 1)) \
+     AND t.remote_id IN ($8, $9) LIMIT 1)) \
     ON CONFLICT (social_account_id, remote_id) DO NOTHING RETURNING *";
 
 /// An item to store, from any platform.

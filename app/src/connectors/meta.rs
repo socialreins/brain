@@ -437,7 +437,8 @@ impl Meta {
     }
 
     /// A Reel: start an upload session, have Meta fetch the file, wait for it, then publish.
-    /// Nothing is public before the finish call. Returns the video id.
+    /// Nothing is public before the finish call. Returns the video id, which is not the id
+    /// comments name the post by; the inbox maps one to the other with `attached`.
     async fn reel(
         &self,
         page: &str,
@@ -795,6 +796,27 @@ impl Meta {
             .await
             .ok()?;
         text(&got["permalink"])
+    }
+
+    /// The ids a Facebook post's attachments point at: for a video or Reel post, the video id
+    /// its target keeps (`reel`). Empty on any error, which is logged.
+    pub async fn attached(&self, token: &str, post: &str) -> Vec<String> {
+        if !graph_id(post) {
+            return Vec::new();
+        }
+        let fields = [("fields", "attachments{target{id}}")];
+        match self.get(post, token, &fields, "Attachments").await {
+            Ok(got) => got["attachments"]["data"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|a| text(&a["target"]["id"]))
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = ?e, "post attachments lookup failed");
+                Vec::new()
+            }
+        }
     }
 
     /// Comments `message` on a Facebook post, photo or Reel (`pages_manage_engagement`) or an
