@@ -65,8 +65,8 @@ pub struct Post {
     /// `bluesky`.
     pub platform: String,
     pub body: String,
-    /// Public `https://` image URLs; Google Drive share links work when the file is shared
-    /// with anyone with the link. Downloaded when the post publishes (JPEG, PNG, WebP or GIF; a
+    /// Public `https://` image URLs; Google Drive and Dropbox share links work when the file is
+    /// shared with anyone with the link. Downloaded when the post publishes (JPEG, PNG, WebP or GIF; a
     /// still image over 1 MB is shrunk to fit Bluesky, an animated one is not) and deleted once it settles.
     pub media: Vec<String>,
     /// Follow-up posts, each a reply to the one before.

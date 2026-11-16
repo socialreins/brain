@@ -38,7 +38,7 @@ cargo run -p socialreins-brain
   `signup_settings` row once an admin saved one, else `REGISTRATION_DISABLED` and
   `SIGNUP_DOMAINS`. `OWNER_EMAIL`, invited emails and approved waitlist emails
   (`waitlist_signups.approved_at`) pass in every mode. Its tests each run on their own database.
-- `app/src/media.rs`: post media. Publishing downloads each URL (Drive share links rewritten)
+- `app/src/media.rs`: post media. Publishing downloads each URL (Drive and Dropbox share links rewritten)
   once into local disk (`MEDIA_DIR`) or an S3-compatible bucket (`S3_*`, `config.rs`), saved in
   `post_media`, and the publisher reads the stored bytes (LinkedIn, YouTube, X and Bluesky upload them themselves; a PDF is LinkedIn's document post only, any other platform's target fails it in `publish::send`), or (Threads, Facebook, Instagram and TikTok,
   which download media themselves) gets an unguessable `/media/` link to them (`media::link`, `controllers/media.rs`). Instagram (posts, carousel items, covers) takes JPEG images only and TikTok photos JPEG or WebP, so `publish::ingest` swaps a PNG (and for Instagram a WebP) for a JPEG (`media::to_jpeg`: quality 90, same size, upright by EXIF, RGB colour profile kept, transparency on white); one that does not decode is refused as before. A still image over a platform's limit for one (`post::IMAGE_LIMITS`: Bluesky 1 MB, X 5 MB) is shrunk the same way (`media::fit`: JPEG quality down to 70, then scaled down, a bounded number of tries); a GIF never is, nor an animated WebP or PNG (`media::animated`, which the save-time probe also reads), and `publish::media_problem` refuses what still does not fit. Conversions run two at a time in the process (`media::CONVERTING`). Every download goes through

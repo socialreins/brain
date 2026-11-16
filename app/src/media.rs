@@ -1,4 +1,4 @@
-//! Media storage. A post's media URLs (Google Drive share links too) are downloaded once, at
+//! Media storage. A post's media URLs (Google Drive and Dropbox share links too) are downloaded once, at
 //! publish time, into brain's own storage: local disk at `MEDIA_DIR`, or an S3-compatible bucket
 //! (`config.rs`). Each file is streamed with a size cap and typed by its magic bytes, never held
 //! whole in memory (`PART_BYTES`, `PARTS_IN_FLIGHT`), and the publisher reads it from there. Storage is temporary: a post's files are deleted once it
@@ -583,7 +583,9 @@ impl Media {
                 .and_then(|v| v.to_str().ok());
             ty.is_some_and(|v| v.to_ascii_lowercase().starts_with("text/html"))
         };
-        let mut res = get(target(drive.as_deref().unwrap_or(url))?).await?;
+        let dropbox = dropbox_url(url);
+        let direct = drive.as_deref().or(dropbox.as_deref()).unwrap_or(url);
+        let mut res = get(target(direct)?).await?;
         if drive.is_some() && html(&res) {
             let status = res.status();
             let mut page = Vec::new();
@@ -1058,6 +1060,30 @@ pub fn drive_url(url: &str) -> Option<String> {
     })
 }
 
+/// A Dropbox share link to one file (`/s/<id>/<name>`, `/scl/fi/<id>/<name>`) as its direct
+/// download (`dl=1`, which redirects to the file); `None` for other URLs, folder links too.
+pub fn dropbox_url(url: &str) -> Option<String> {
+    let mut u = Url::parse(url).ok()?;
+    if u.scheme() != "https" || !matches!(u.host_str()?, "www.dropbox.com" | "dropbox.com") {
+        return None;
+    }
+    let segments: Vec<&str> = u.path_segments()?.collect();
+    if !matches!(segments.as_slice(), ["s", _, ..] | ["scl", "fi", _, ..]) {
+        return None;
+    }
+    // Keep the link's own key (`rlkey`, `st`); only how Dropbox answers changes.
+    let kept: Vec<(String, String)> = u
+        .query_pairs()
+        .filter(|(k, _)| k != "dl" && k != "raw")
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    u.query_pairs_mut()
+        .clear()
+        .extend_pairs(kept)
+        .append_pair("dl", "1");
+    Some(u.into())
+}
+
 /// The most of a Drive page that is read to tell what it is.
 const DRIVE_PAGE_BYTES: usize = 256 * 1024;
 /// Hosts the form of Drive's confirmation page may send the download to.
@@ -1530,6 +1556,40 @@ mod tests {
         assert!(!animated(&late));
         assert!(!animated(b"GIF89a not really"));
         assert!(!animated(b""));
+    }
+
+    #[test]
+    fn dropbox_share_links_become_direct_downloads() {
+        for (link, direct) in [
+            (
+                "https://www.dropbox.com/s/abc123/clip.mp4?dl=0",
+                "https://www.dropbox.com/s/abc123/clip.mp4?dl=1",
+            ),
+            (
+                "https://www.dropbox.com/scl/fi/abc123/clip.mp4?rlkey=k9&st=x1&dl=0",
+                "https://www.dropbox.com/scl/fi/abc123/clip.mp4?rlkey=k9&st=x1&dl=1",
+            ),
+            (
+                "https://dropbox.com/scl/fi/abc123/a%20b.png?rlkey=k9&raw=1",
+                "https://dropbox.com/scl/fi/abc123/a%20b.png?rlkey=k9&dl=1",
+            ),
+            (
+                "https://www.dropbox.com/s/abc123/clip.mp4",
+                "https://www.dropbox.com/s/abc123/clip.mp4?dl=1",
+            ),
+        ] {
+            assert_eq!(dropbox_url(link).as_deref(), Some(direct), "{link}");
+        }
+        for other in [
+            "http://www.dropbox.com/s/abc123/clip.mp4?dl=0",
+            "https://www.dropbox.com/scl/fo/abc123/folder?rlkey=k9&dl=0",
+            "https://www.dropbox.com/sh/abc123/folder?dl=0",
+            "https://www.dropbox.com/home",
+            "https://www.dropbox.com.evil.test/s/abc123/clip.mp4?dl=0",
+            "https://example.com/s/abc123/clip.mp4?dl=0",
+        ] {
+            assert_eq!(dropbox_url(other), None, "{other}");
+        }
     }
 
     #[test]
