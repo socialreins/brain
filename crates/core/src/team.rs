@@ -51,14 +51,19 @@ pub const CODE_CHARS: usize = 6;
 /// A new random team code. It is an address (`/t/<code>/...`), not a secret, and may clash with
 /// an existing one: the `teams.code` unique index decides, and the caller draws again.
 pub fn code() -> String {
-    let mut out = String::with_capacity(CODE_CHARS);
-    while out.len() < CODE_CHARS {
+    random_code(CODE_CHARS)
+}
+
+/// `len` random letters of `CODE_ALPHABET` (a team code, a post page code).
+pub fn random_code(len: usize) -> String {
+    let mut out = String::with_capacity(len);
+    while out.len() < len {
         let mut bytes = [0u8; 16];
         getrandom::fill(&mut bytes).expect("the OS random source is available");
         // 248 is the largest multiple of 31 in a byte; higher bytes would favour some letters.
         let fair = bytes.iter().filter(|b| **b < 248);
         out.extend(fair.map(|b| CODE_ALPHABET[usize::from(b % 31)] as char));
-        out.truncate(CODE_CHARS);
+        out.truncate(len);
     }
     out
 }

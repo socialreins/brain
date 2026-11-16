@@ -32,6 +32,7 @@ mod m20261121_000001_read_only_tokens;
 mod m20261122_000001_admin_console;
 pub mod m20261123_000001_all_sets_name;
 pub mod m20261124_000001_team_code;
+mod m20261125_000001_post_pages;
 
 pub struct Migrator;
 
@@ -71,6 +72,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261122_000001_admin_console::Migration),
             Box::new(m20261123_000001_all_sets_name::Migration),
             Box::new(m20261124_000001_team_code::Migration),
+            Box::new(m20261125_000001_post_pages::Migration),
             // inject-above (do not remove this comment)
         ]
     }

@@ -48,6 +48,8 @@ pub struct AppState {
     pub contact_to: Option<String>,
     /// Per-IP limit on `POST /v1/contact`, each of which sends an email.
     pub contact_limiter: Arc<RateLimiter>,
+    /// Per-IP limit on `GET /v1/public/pages/{code}`.
+    pub page_limiter: Arc<RateLimiter>,
     /// `ADMIN_EMAILS`: users who may read `/v1/admin/*`.
     pub admin_emails: Vec<String>,
     /// `REVIEW_LOGIN_TOKEN`: `GET /review-login/{token}`.
@@ -100,6 +102,7 @@ impl AppState {
                 std::time::Duration::from_secs(3600),
                 crate::rate_limit::MAX_KEYS,
             )),
+            page_limiter: Arc::new(RateLimiter::per_minute(120)),
             admin_emails: config.admin_emails.clone(),
             review_login_token: config.review_login_token.clone(),
             waitlist_count: Arc::default(),
