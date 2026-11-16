@@ -15664,7 +15664,7 @@ mod teams {
                 // The address is a link, unlike what `{name}` fills in.
                 assert_eq!(message["facets"][0]["features"][0]["uri"], address);
 
-                // The page goes off: the DM is skipped, and so is the "open your DMs" fallback.
+                // The page goes off: the automation does not run, and leaves no run.
                 page(false).await.assert_status_ok();
                 let records = RECORDS.lock().unwrap().len();
                 set_inbox(
@@ -15673,15 +15673,7 @@ mod teams {
                     note("reply", "did:plc:fan2", "d2", "details?", &at(-2), &me)]}),
                 );
                 ingest(&db, &state, &account).await;
-                let got = runs(&s, &cookie, &id).await;
-                assert_eq!(got.len(), 2);
-                assert_eq!(got[0]["status"], "skipped", "{got:?}");
-                assert_eq!(got[0]["reason"], "no_public_page");
-                assert_eq!(
-                    got[0]["results"],
-                    json!([{"type": "send_dm", "status": "skipped",
-                        "reason": "no_public_page", "remote_id": null}])
-                );
+                assert_eq!(runs(&s, &cookie, &id).await.len(), 1);
                 assert_eq!(SENT.lock().unwrap().len(), sent.len());
                 assert_eq!(RECORDS.lock().unwrap().len(), records);
             }

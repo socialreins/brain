@@ -62,9 +62,9 @@ pub struct Conditions {
 
 /// What an automation does. Texts may hold `{name}`, the commenter's display name ("there"
 /// when it is not plainly a name), and `{page}`, the address of the public page of the post the
-/// comment is under, counted as 100 characters. An action with `{page}` is not sent
-/// (`skipped`, `no_public_page`) when the comment is not under one of the team's posts or that
-/// post has no live page.
+/// comment is under, counted as 100 characters and written with a space (or the start) before
+/// it. An automation whose action holds `{page}` does not run, and records no run, on a comment
+/// that is not under one of the team's posts or whose post has no live page.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
@@ -130,17 +130,36 @@ pub fn validate(
     };
     for a in actions {
         let (via, text) = a.via_text();
-        if !inbox::fits(via, &longest(text)) {
+        if !inbox::fits(via, &longest(text)) || !page_stands_alone(text) {
             return Err("invalid_text");
         }
     }
     if let Some(f) = fallback {
         let dm = actions.iter().any(|a| matches!(a, Action::SendDm { .. }));
-        if !dm || !inbox::fits(Via::Public, &longest(f)) {
+        if !dm || !inbox::fits(Via::Public, &longest(f)) || !page_stands_alone(f) {
             return Err("invalid_fallback");
         }
     }
     Ok(())
+}
+
+/// Whether every `{page}` can become a clean link: at the start or after whitespace or `(`,
+/// and followed by the end, whitespace or closing punctuation the linker leaves out
+/// (`socialreins_core::post::links`). "details:{page}" would send plain text, "{page}]" a
+/// link that includes the bracket.
+fn page_stands_alone(text: &str) -> bool {
+    let mut rest = text;
+    while let Some(at) = rest.find("{page}") {
+        let before = rest[..at].chars().next_back();
+        let after = rest[at + 6..].chars().next();
+        let opens = before.is_none_or(|c| c.is_whitespace() || c == '(');
+        let closes = after.is_none_or(|c| c.is_whitespace() || ".,;:!?)".contains(c));
+        if !opens || !closes {
+            return false;
+        }
+        rest = &rest[at + 6..];
+    }
+    true
 }
 
 /// What conditions look at in a comment.
@@ -302,10 +321,24 @@ pub async fn run(
         if !matches(&cond, &facts) {
             continue;
         }
+        // An action that needs the post's page does not run without one, and leaves no run:
+        // it costs no daily hit, and the author's first comment under a post with a page
+        // still counts as their first.
+        let holds = |t: &str| t.contains("{page}");
+        let needed = actions.iter().any(|x| holds(x.via_text().1));
+        let wanted = needed || a.fallback_public_reply.as_deref().is_some_and(holds);
+        let page = match item.post_id {
+            Some(post) if wanted => pages::address(db, &app.web_url, item.team_id, post).await?,
+            _ => None,
+        };
+        if needed && page.is_none() {
+            tracing::info!(automation = %a.id, item = %item.id, "no public page, not run");
+            continue;
+        }
         let Some(run_id) = claim(db, &a, item).await? else {
             continue;
         };
-        let results = act(app, account, item, &a, &actions).await;
+        let results = act(app, account, item, &a, &actions, page.as_deref()).await;
         finish(db, run_id, results).await?;
     }
     Ok(())
@@ -353,7 +386,7 @@ pub struct ActionResult {
     /// `sent`, `failed` or `skipped`.
     pub status: String,
     /// Why it was not sent, e.g. `dm_not_allowed`, `no_dm_access`, `rate_limited`;
-    /// `no_public_page` when its text holds `{page}` and the post has no live page; on Facebook
+    /// `no_public_page` for a fallback reply holding `{page}` when the post has no live page; on Facebook
     /// and Instagram `outside_window` (a private reply works within 7 days of the comment),
     /// `already_replied` (once per comment) and `dm_unavailable`.
     pub reason: Option<String>,
@@ -402,36 +435,24 @@ fn no_page(kind: &str) -> ActionResult {
 }
 
 /// Sends each action once, then the fallback reply when a DM could not go and nothing was
-/// replied publicly. A text with `{page}` is skipped (`no_public_page`) when the post has no
-/// live page; that is not a refused DM, so it never brings the fallback.
+/// replied publicly. `page` is the address `{page}` stands for; `run` never gets here without
+/// one when an action holds `{page}`, so only a fallback reply can still lack it, and is then
+/// skipped (`no_public_page`).
 async fn act(
     app: &AppState,
     account: &social_accounts::Model,
     item: &inbox_items::Model,
     a: &automations::Model,
     actions: &[Action],
+    page: Option<&str>,
 ) -> Vec<ActionResult> {
     let name = item.author_name.as_deref();
     let fallback = a.fallback_public_reply.as_deref();
-    let wanted = actions
-        .iter()
-        .map(|a| a.via_text().1)
-        .chain(fallback)
-        .any(|t| t.contains("{page}"));
-    let page = match item.post_id {
-        Some(post) if wanted => pages::address(&app.db, &app.web_url, item.team_id, post)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(error = %e, "automation page lookup failed");
-                None
-            }),
-        _ => None,
-    };
     let mut results = Vec::new();
     for action in actions {
         let (via, template) = action.via_text();
         // Filled in before `render`, outside its ranges: the address must become a link.
-        let Some(template) = with_page(template, page.as_deref()) else {
+        let Some(template) = with_page(template, page) else {
             results.push(no_page(action.kind()));
             continue;
         };
@@ -459,7 +480,7 @@ async fn act(
         .iter()
         .any(|r| r.kind == "reply_publicly" && r.status == "sent");
     if let (true, false, Some(f)) = (dm_refused, replied, fallback) {
-        let Some(f) = with_page(f, page.as_deref()) else {
+        let Some(f) = with_page(f, page) else {
             results.push(no_page("fallback_public_reply"));
             return results;
         };
@@ -675,8 +696,9 @@ mod tests {
             Err("invalid_conditions")
         );
         // `{page}` counts as 100 characters, in actions and in the fallback.
+        let paged_text = |t: &str| Action::ReplyPublicly { text: t.into() };
         let paged = |n: usize| Action::ReplyPublicly {
-            text: format!("{}{{page}}", "a".repeat(n)),
+            text: format!("{} {{page}}", "a".repeat(n - 1)),
         };
         assert_eq!(
             validate("comment_received", &mut c, &[paged(200)], None),
@@ -686,7 +708,19 @@ mod tests {
             validate("comment_received", &mut c, &[paged(201)], None),
             Err("invalid_text")
         );
-        let f = format!("{}{{page}}", "a".repeat(201));
+        let f = format!("{} {{page}}", "a".repeat(200));
+        // `{page}` must be able to become a clean link.
+        for (text, ok) in [
+            ("{page}", true),
+            ("See ({page}), {name}. {page}!", true),
+            ("details:{page}", false),
+            ("{page}]", false),
+            ("{page}/{name}", false),
+            ("{page}{page}", false),
+        ] {
+            let got = validate("comment_received", &mut c, &[paged_text(text)], None);
+            assert_eq!(got.is_ok(), ok, "{text}");
+        }
         assert_eq!(
             validate("comment_received", &mut c, &[dm()], Some(&f)),
             Err("invalid_fallback")

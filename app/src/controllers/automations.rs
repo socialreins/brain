@@ -77,7 +77,7 @@ pub struct AutomationInput {
     #[serde(default = "yes")]
     pub active: bool,
     /// Needs a `send_dm` action; at most 300 graphemes; may hold `{name}` and
-    /// `{page}` (not sent, `no_public_page`, when the post has no live page).
+    /// `{page}` (set off by spaces; the automation does not run when the post has no live page).
     #[serde(default)]
     pub fallback_public_reply: Option<String>,
 }
