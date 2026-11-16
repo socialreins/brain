@@ -236,7 +236,7 @@ pub async fn follow_up(app: &AppState, fresh: Vec<(social_accounts::Model, inbox
 async fn enrich_and_run(
     app: &AppState,
     account: &social_accounts::Model,
-    item: inbox_items::Model,
+    mut item: inbox_items::Model,
 ) -> Result<(), DbErr> {
     let instagram = account.provider == "instagram";
     if let Some(token) = inbox::secret(app, account) {
@@ -264,12 +264,48 @@ async fn enrich_and_run(
                 );
                 app.db.execute_raw(stmt).await?;
             }
+        } else if let (false, "comment", None, Some(post)) = (
+            instagram,
+            item.kind.as_str(),
+            item.post_id,
+            &item.root_remote_id,
+        ) {
+            // A Reel's target keeps the video id, not the post id the comment names; only an
+            // account with such a target (no `_`) pays for the lookup.
+            if has_video_target(app, account.id).await? {
+                let ids = app.meta.attached(&token, post).await;
+                if !ids.is_empty() {
+                    let stmt = sql(
+                        "UPDATE inbox_items i SET post_id = t.post_id FROM (SELECT post_id \
+                         FROM post_targets WHERE social_account_id = $2 \
+                         AND remote_id IN (SELECT jsonb_array_elements_text($3)) LIMIT 1) t \
+                         WHERE i.id = $1 RETURNING i.post_id",
+                        vec![item.id.into(), account.id.into(), Value::from(ids).into()],
+                    );
+                    if let Some(r) = app.db.query_one_raw(stmt).await? {
+                        item.post_id = r.try_get("", "post_id")?;
+                    }
+                }
+            }
         }
     }
     if item.kind == "comment" {
         automations::run(app, account, &item).await?;
     }
     Ok(())
+}
+
+/// Whether the account has a target kept by a bare id (a Facebook Reel's video id).
+async fn has_video_target(app: &AppState, account: Uuid) -> Result<bool, DbErr> {
+    let stmt = sql(
+        "SELECT EXISTS (SELECT 1 FROM post_targets WHERE social_account_id = $1 \
+         AND strpos(remote_id, '_') = 0) AS ok",
+        vec![account.into()],
+    );
+    match app.db.query_one_raw(stmt).await? {
+        Some(r) => r.try_get("", "ok"),
+        None => Ok(false),
+    }
 }
 
 /// Whether the person wrote to the account within 24 hours, so a message may go to them.

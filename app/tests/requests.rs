@@ -13416,6 +13416,9 @@ mod teams {
                                 }
                                 Some("permalink") => ok(json!({
                                     "permalink": format!("https://www.instagram.com/p/X{id}/")})),
+                                // A Reel post points at its video.
+                                Some("attachments{target{id}}") => ok(json!({
+                                    "attachments": {"data": [{"target": {"id": "555"}}]}})),
                                 Some("name,profile_pic") => ok(json!({
                                     "name": "Dana Doe", "profile_pic": "https://scontent.example/d.jpg"})),
                                 Some("name,username,profile_pic") => ok(json!({
@@ -14450,44 +14453,102 @@ mod teams {
                     assert_eq!(res.status_code(), 404);
                 }
 
-                #[tokio::test]
-                #[serial]
-                async fn a_comment_under_a_reel_finds_its_post() {
-                    let (s, db, _, _) = on_meta(true).await;
-                    clean(&db).await;
-                    let (cookie, team_id) = owner_connected(&s, &db).await;
-                    let fb = account(&db, &team_id, "facebook", "101").await;
-                    let set = default_set(&db, &team_id).await;
-                    let res = req(&s, Method::POST, "/v1/posts", &cookie)
+                /// A published Facebook post whose target keeps the bare id `video`.
+                async fn reel_post(
+                    s: &TestServer,
+                    db: &DatabaseConnection,
+                    cookie: &str,
+                    team_id: &str,
+                    video: &str,
+                ) -> String {
+                    let fb = account(db, team_id, "facebook", "101").await;
+                    let set = default_set(db, team_id).await;
+                    let res = req(s, Method::POST, "/v1/posts", cookie)
                         .json(
                             &json!({"social_set_id": set, "platform": "facebook", "body": "Reel"}),
                         )
                         .await;
                     assert_eq!(res.status_code(), 201, "{}", res.text());
                     let post = res.json::<Value>()["id"].as_str().unwrap().to_owned();
-                    // A Reel's target keeps the bare video id; Meta names the post `101_9`.
-                    let stmt = sea_orm::Statement::from_sql_and_values(
-                        sea_orm::DbBackend::Postgres,
-                        "UPDATE posts SET status = 'published', published_at = now() WHERE id = $1; ",
-                        [post.parse::<uuid::Uuid>().unwrap().into()],
+                    let published = format!(
+                        "UPDATE posts SET status = 'published', published_at = now() \
+                         WHERE id = '{post}'; \
+                         INSERT INTO post_targets (id, post_id, social_account_id, status, remote_id) \
+                         VALUES (gen_random_uuid(), '{post}', '{}', 'published', '{video}')",
+                        fb.id
                     );
-                    sea_orm::ConnectionTrait::execute_raw(&db, stmt)
+                    sea_orm::ConnectionTrait::execute_unprepared(db, &published)
                         .await
                         .unwrap();
-                    let stmt = sea_orm::Statement::from_sql_and_values(
-                        sea_orm::DbBackend::Postgres,
-                        "INSERT INTO post_targets (id, post_id, social_account_id, status, remote_id) \
-                         VALUES (gen_random_uuid(), $1, $2, 'published', '9')",
-                        [post.parse::<uuid::Uuid>().unwrap().into(), fb.id.into()],
-                    );
-                    sea_orm::ConnectionTrait::execute_raw(&db, stmt)
+                    post
+                }
+
+                /// Meta names a Reel's post `101_9` in a comment, while its target keeps the
+                /// video id: Graph's attachments of `101_9` lead to it, and `{page}` then runs.
+                #[tokio::test]
+                #[serial]
+                async fn a_comment_under_a_reel_finds_its_post_through_its_video() {
+                    let (s, db, state, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    let post = reel_post(&s, &db, &cookie, &team_id, "555").await;
+                    let res = req(&s, Method::PATCH, "/v1/team", &cookie)
+                        .json(&json!({"public_pages": true}))
+                        .await;
+                    res.assert_status_ok();
+                    let saved = req(&s, Method::PUT, &format!("/v1/posts/{post}/page"), &cookie)
+                        .json(&json!({"enabled": true, "details": "links"}))
                         .await
-                        .unwrap();
-                    let res = deliver(&s, &page_comment("101_9_7", "details", "777", now())).await;
+                        .json::<Value>();
+                    assert_eq!(saved["live"], true, "{saved}");
+                    let code = saved["code"].as_str().unwrap().to_owned();
+                    let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                        .json(&json!({
+                            "name": "Details", "trigger": "comment_received",
+                            "conditions": {"keywords": ["details"]},
+                            "actions": [{"type": "send_dm", "text": "details: {page}"}],
+                        }))
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let auto = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+
+                    let when = now() + 5;
+                    let res = deliver(&s, &page_comment("101_9_7", "details", "777", when)).await;
                     assert_eq!(res.status_code(), 200);
+                    let ran = until(|| async {
+                        Some(runs_of(&s, &cookie, &auto).await)
+                            .filter(|r| r.len() == 1 && r[0]["status"] != "running")
+                    })
+                    .await;
+                    assert_eq!(ran[0]["status"], "sent", "{}", ran[0]);
                     let items = stored(&db, &team_id).await;
                     let comment = items.iter().find(|i| i.remote_id == "101_9_7").unwrap();
                     assert_eq!(comment.post_id.map(|p| p.to_string()), Some(post));
+                    let dm = calls_since(0)
+                        .into_iter()
+                        .find(|(path, _)| path == "101/messages")
+                        .unwrap();
+                    let address = format!("{}/p/{code}", state.web_url);
+                    assert_eq!(
+                        dm.1["message"],
+                        json!({"text": format!("details: {address}")}).to_string()
+                    );
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_comment_whose_post_points_elsewhere_stays_without_a_post() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    // Graph says `101_9` points at 555, which is none of ours.
+                    reel_post(&s, &db, &cookie, &team_id, "556").await;
+                    let res = deliver(&s, &page_comment("101_9_7", "details", "777", now())).await;
+                    assert_eq!(res.status_code(), 200);
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    let items = stored(&db, &team_id).await;
+                    let comment = items.iter().find(|i| i.remote_id == "101_9_7").unwrap();
+                    assert_eq!(comment.post_id, None);
                 }
 
                 #[tokio::test]
