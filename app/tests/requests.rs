@@ -2282,7 +2282,8 @@ mod teams {
         ok.assert_status_ok();
         assert_eq!(
             ok.json::<Value>(),
-            json!({"id": team["id"], "name": team["name"], "code": team["code"], "role": "admin"})
+            json!({"id": team["id"], "name": team["name"], "code": team["code"],
+                "public_pages": false, "role": "admin"})
         );
         assert_eq!(current(&s, &invited).await["id"], team["id"]);
         assert_eq!(memberships(&db, invited_id).await, 2);
@@ -16248,6 +16249,270 @@ mod teams {
                 let (err, e) = mcp::call(&s, &team, "create-post-group", args).await;
                 assert!(err);
                 assert_eq!(e, json!({"error": "invalid_override"}));
+            }
+
+            mod pages {
+                use super::*;
+                use sea_orm::ConnectionTrait;
+
+                async fn sql(db: &DatabaseConnection, sql: String) {
+                    db.execute_unprepared(&sql).await.unwrap();
+                }
+
+                async fn new_post(s: &TestServer, cookie: &str, set: &str, body: &str) -> String {
+                    let res = req(s, Method::POST, "/v1/posts", cookie)
+                        .json(&post_body(Some(set), body))
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    res.json::<Value>()["id"].as_str().unwrap().to_owned()
+                }
+
+                fn put_page(
+                    s: &TestServer,
+                    cookie: &str,
+                    id: &str,
+                    enabled: bool,
+                    details: &str,
+                ) -> TestRequest {
+                    req(s, Method::PUT, &format!("/v1/posts/{id}/page"), cookie)
+                        .json(&json!({"enabled": enabled, "details": details}))
+                }
+
+                async fn page(s: &TestServer, cookie: &str, id: &str) -> Value {
+                    let res = s
+                        .get(&format!("/v1/posts/{id}/page"))
+                        .add_header("cookie", cookie)
+                        .await;
+                    res.assert_status_ok();
+                    res.json()
+                }
+
+                async fn public(s: &TestServer, code: &str) -> axum_test::TestResponse {
+                    s.get(&format!("/v1/public/pages/{code}")).await
+                }
+
+                async fn pages_on(s: &TestServer, cookie: &str, on: bool) -> Value {
+                    let res = req(s, Method::PATCH, "/v1/team", cookie)
+                        .json(&json!({"public_pages": on}))
+                        .await;
+                    res.assert_status_ok();
+                    res.json()
+                }
+
+                /// Marks the post published on `account`, with what a public page must not show.
+                async fn publish(db: &DatabaseConnection, post: &str, account: &str, url: &str) {
+                    sql(
+                        db,
+                        format!(
+                            "UPDATE posts SET status = 'published', published_at = now(), \
+                             first_comment = 'secret comment', error = 'secret error' \
+                             WHERE id = '{post}'; \
+                             INSERT INTO post_targets (id, post_id, social_account_id, status, \
+                             remote_id, remote_url, error, comment_error) VALUES \
+                             (gen_random_uuid(), '{post}', '{account}', 'published', 'r', \
+                             '{url}', 'secret error', 'secret error')"
+                        ),
+                    )
+                    .await;
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn the_team_setting_is_off_by_default_and_managers_change_it() {
+                    let (s, db) = on_mock(120).await;
+                    let (_, owner, _) = user(&s, &db).await;
+                    let team = current(&s, &owner).await;
+                    assert_eq!(team["public_pages"], false);
+                    let (member, _) = joined(&s, &db, team["id"].as_str().unwrap(), "member").await;
+                    let res = req(&s, Method::PATCH, "/v1/team", &member)
+                        .json(&json!({"public_pages": true}))
+                        .await;
+                    assert_eq!(res.status_code(), 403);
+                    let changed = pages_on(&s, &owner, true).await;
+                    assert_eq!(changed["public_pages"], true);
+                    assert_eq!(changed["name"], team["name"], "the name stays");
+                    assert_eq!(current(&s, &owner).await["public_pages"], true);
+                    let me = s.get("/auth/me").add_header("cookie", &owner).await;
+                    assert_eq!(me.json::<Value>()["current_team"]["public_pages"], true);
+                    // A rename alone leaves it on.
+                    let res = req(&s, Method::PATCH, "/v1/team", &owner)
+                        .json(&json!({"name": "Renamed"}))
+                        .await;
+                    assert_eq!(res.json::<Value>()["public_pages"], true);
+                    assert_eq!(pages_on(&s, &owner, false).await["public_pages"], false);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_page_is_saved_under_a_stable_code_and_checked() {
+                    let (s, db) = on_mock(120).await;
+                    let (owner, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let id = new_post(&s, &owner, &set, "hello").await;
+                    assert_eq!(
+                        page(&s, &owner, &id).await,
+                        json!({"enabled": false, "details": "", "code": null, "live": false})
+                    );
+
+                    // Enabling needs the team setting; a disabled page saves without it.
+                    let res = put_page(&s, &owner, &id, true, "x").await;
+                    assert_eq!(res.status_code(), 422);
+                    assert_eq!(res.json::<Value>(), json!({"error": "public_pages_off"}));
+                    let res = put_page(&s, &owner, &id, false, &"a".repeat(5001)).await;
+                    assert_eq!(res.status_code(), 422);
+                    assert_eq!(res.json::<Value>(), json!({"error": "details_too_long"}));
+                    let res = put_page(&s, &owner, &id, false, &"é".repeat(5000)).await;
+                    res.assert_status_ok();
+                    let first = res.json::<Value>();
+                    let code = first["code"].as_str().unwrap().to_owned();
+                    assert_eq!(code.len(), 10);
+                    assert!(code
+                        .bytes()
+                        .all(|b| socialreins_core::team::CODE_ALPHABET.contains(&b)));
+                    assert_eq!(first["enabled"], false);
+
+                    pages_on(&s, &owner, true).await;
+                    let res = put_page(&s, &owner, &id, true, "links").await;
+                    res.assert_status_ok();
+                    let saved = json!({"enabled": true, "details": "links", "code": code,
+                        "live": false});
+                    assert_eq!(res.json::<Value>(), saved);
+                    assert_eq!(page(&s, &owner, &id).await, saved);
+
+                    // A read-only token reads the page and cannot save it.
+                    let made = make_token(&s, &owner, json!({"name": "ro", "read_only": true}));
+                    let secret = made.await["secret"].as_str().unwrap().to_owned();
+                    let path = format!("/v1/posts/{id}/page");
+                    let res = bearer(&s, Method::GET, &path, &secret).await;
+                    assert_eq!(res.json::<Value>(), saved);
+                    let res = bearer(&s, Method::PUT, &path, &secret)
+                        .json(&json!({"enabled": false, "details": "no"}))
+                        .await;
+                    assert_eq!(res.status_code(), 403);
+                    assert_eq!(res.json::<Value>(), json!({"error": "read_only_token"}));
+
+                    // Another team sees no such post.
+                    let (_, other, _) = user(&s, &db).await;
+                    let res = s.get(&path).add_header("cookie", &other).await;
+                    assert_eq!(res.status_code(), 404);
+                    let res = put_page(&s, &other, &id, false, "theirs").await;
+                    assert_eq!(res.status_code(), 404);
+                    assert_eq!(page(&s, &owner, &id).await, saved);
+
+                    let doc = s.get("/openapi.json").await.json::<Value>();
+                    assert!(doc["paths"]["/posts/{id}/page"]["get"].is_object());
+                    assert!(doc["paths"]["/posts/{id}/page"]["put"].is_object());
+                    let public = &doc["paths"]["/public/pages/{code}"]["get"];
+                    assert!(public.is_object() && public.get("security").is_none());
+                    let team = &doc["components"]["schemas"];
+                    assert!(team["Team"]["properties"]["public_pages"].is_object());
+                    assert!(team["TeamChange"]["properties"]["public_pages"].is_object());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn the_public_page_shows_published_posts_only_and_no_ids() {
+                    let (s, db) = on_mock(120).await;
+                    let (owner, team_id, account) = owner_with_account(&s, &db).await;
+                    let me = s.get("/auth/me").add_header("cookie", &owner).await;
+                    let user_id = me.json::<Value>()["id"].as_str().unwrap().to_owned();
+                    let set = default_set(&db, &team_id).await.to_string();
+                    pages_on(&s, &owner, true).await;
+                    let name = current(&s, &owner).await["name"].clone();
+
+                    // Two posts of one group: one page, whichever post names it.
+                    let a = new_post(&s, &owner, &set, "first version").await;
+                    let b = new_post(&s, &owner, &set, "unpublished version").await;
+                    let group = uuid::Uuid::now_v7();
+                    sql(
+                        &db,
+                        format!(
+                            "UPDATE posts SET group_id = '{group}' WHERE id IN ('{a}', '{b}'); \
+                             UPDATE posts SET media = '[\"https://m.test/a.png\"]', \
+                             thread = '[{{\"body\": \"part two\", \"media\": []}}]' \
+                             WHERE id = '{a}'"
+                        ),
+                    )
+                    .await;
+                    let res = put_page(&s, &owner, &a, true, "resources").await;
+                    res.assert_status_ok();
+                    let code = res.json::<Value>()["code"].as_str().unwrap().to_owned();
+                    assert_eq!(page(&s, &owner, &b).await["code"], code.as_str());
+                    let res = put_page(&s, &owner, &b, true, "more resources").await;
+                    assert_eq!(res.json::<Value>()["code"], code.as_str());
+                    assert_eq!(page(&s, &owner, &a).await["details"], "more resources");
+
+                    // Drafts never show.
+                    assert_eq!(public(&s, &code).await.status_code(), 404);
+                    assert_eq!(public(&s, "nosuchcode").await.status_code(), 404);
+
+                    // Published: served, and saving still works.
+                    publish(&db, &a, &account, "https://bsky.test/a").await;
+                    assert_eq!(page(&s, &owner, &b).await["live"], true);
+                    let res = put_page(&s, &owner, &a, true, "after publishing").await;
+                    res.assert_status_ok();
+                    let res = public(&s, &code).await;
+                    res.assert_status_ok();
+                    assert_eq!(res.header("cache-control"), "public, max-age=60");
+                    let body = res.json::<Value>();
+                    let published_at = body["published_at"].as_str().unwrap();
+                    assert!(chrono::DateTime::parse_from_rfc3339(published_at).is_ok());
+                    assert_eq!(
+                        body,
+                        json!({"team": name, "body": "first version",
+                            "media": ["https://m.test/a.png"],
+                            "thread": [{"body": "part two", "media": []}],
+                            "details": "after publishing", "published_at": published_at,
+                            "links": [{"platform": "bluesky", "url": "https://bsky.test/a"}]})
+                    );
+                    let text = res.text();
+                    for hidden in [
+                        team_id.as_str(),
+                        &user_id,
+                        &set,
+                        &account,
+                        &a,
+                        &b,
+                        &group.to_string(),
+                        "secret",
+                        "unpublished version",
+                    ] {
+                        assert!(!text.contains(hidden), "{hidden} in {text}");
+                    }
+
+                    // The second version's link joins once it is published.
+                    publish(&db, &b, &account, "https://bsky.test/b").await;
+                    let body = public(&s, &code).await.json::<Value>();
+                    assert_eq!(body["body"], "first version");
+                    assert_eq!(body["links"].as_array().unwrap().len(), 2);
+
+                    // Disabled, or switched off for the team: gone.
+                    put_page(&s, &owner, &a, false, "x")
+                        .await
+                        .assert_status_ok();
+                    assert_eq!(public(&s, &code).await.status_code(), 404);
+                    put_page(&s, &owner, &a, true, "x").await.assert_status_ok();
+                    assert_eq!(public(&s, &code).await.status_code(), 200);
+                    pages_on(&s, &owner, false).await;
+                    assert_eq!(public(&s, &code).await.status_code(), 404);
+                    let now = page(&s, &owner, &a).await;
+                    assert_eq!(
+                        (&now["enabled"], &now["live"]),
+                        (&json!(true), &json!(false))
+                    );
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn the_public_page_is_limited_per_ip() {
+                    let (s, _) = on_mock(120).await;
+                    for _ in 0..120 {
+                        assert_eq!(public(&s, "nosuchcode").await.status_code(), 404);
+                    }
+                    let res = public(&s, "nosuchcode").await;
+                    assert_eq!(res.status_code(), 429);
+                    assert_eq!(res.json::<Value>(), json!({"error": "rate_limited"}));
+                }
             }
 
             mod mcp {

@@ -10,6 +10,8 @@ pub struct Model {
     /// The team's address in the web app (`/t/<code>/...`): 6 lowercase characters, permanent.
     #[sea_orm(column_type = "Text", unique)]
     pub code: String,
+    /// Posts of this team may have a public page (`post_pages`).
+    pub public_pages: bool,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }

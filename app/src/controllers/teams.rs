@@ -52,6 +52,8 @@ pub struct Team {
     /// The team's address in the web app (`/t/<code>/...`): 6 lowercase characters that never
     /// change. Not a secret; it gives no access.
     pub code: String,
+    /// Posts of this team may have a public page (`PUT /posts/{id}/page`).
+    pub public_pages: bool,
     /// The caller's role: `owner`, `admin` or `member`.
     pub role: String,
 }
@@ -96,6 +98,14 @@ pub struct TeamName {
 }
 
 #[derive(Deserialize, ToSchema)]
+pub struct TeamChange {
+    /// 1 to 60 characters after trimming, no control characters. Absent: unchanged.
+    pub name: Option<String>,
+    /// Whether posts may have a public page. Absent: unchanged.
+    pub public_pages: Option<bool>,
+}
+
+#[derive(Deserialize, ToSchema)]
 pub struct SwitchTeam {
     pub team_id: Uuid,
 }
@@ -135,6 +145,7 @@ pub(crate) fn team_json(team: &teams::Model, role: Role) -> Team {
         id: team.id,
         name: team.name.clone(),
         code: team.code.clone(),
+        public_pages: team.public_pages,
         role: role.as_str().into(),
     }
 }
@@ -484,28 +495,34 @@ async fn show(t: InTeam) -> Response {
     Json(team_json(&t.team, t.role)).into_response()
 }
 
-/// Renames the current team. Owners and admins only.
-#[utoipa::path(patch, path = "/team", tag = "teams", request_body = TeamName,
+/// Renames the current team (`name`) or switches its public pages (`public_pages`). Owners and
+/// admins only.
+#[utoipa::path(patch, path = "/team", tag = "teams", request_body = TeamChange,
     responses((status = 200, body = Team), (status = 401, body = Error),
         (status = 403, body = Error), (status = 422, body = Error)))]
 async fn rename(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Body(body): Body<TeamName>,
+    Body(body): Body<TeamChange>,
 ) -> Response {
     if !t.role.manages() {
         return forbidden();
     }
-    let Some(name) = team::name(&body.name) else {
-        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name");
-    };
-    let row = teams::ActiveModel {
+    let mut row = teams::ActiveModel {
         id: Set(t.team.id),
-        name: Set(name),
         updated_at: Set(Utc::now().fixed_offset()),
         ..Default::default()
     };
+    if let Some(name) = &body.name {
+        let Some(name) = team::name(name) else {
+            return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name");
+        };
+        row.name = Set(name);
+    }
+    if let Some(on) = body.public_pages {
+        row.public_pages = Set(on);
+    }
     match teams::Entity::update(row).exec(&app.db).await {
         Ok(team) => Json(team_json(&team, t.role)).into_response(),
         Err(e) => internal(e, "team rename"),

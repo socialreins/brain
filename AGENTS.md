@@ -31,6 +31,12 @@ cargo run -p socialreins-brain
   out after the reply, at most hourly per email, 20 a day per IP and 500 a day overall
   (`rate_limit::daily_reserve`). `GET /v1/waitlist/count` is cached 30 seconds, and `GET /v1/admin/waitlist` is for `ADMIN_EMAILS` (`config.rs`) with a
   session cookie only.
+- `app/src/controllers/pages.rs`: public pages of posts. `teams.public_pages` (`PATCH /v1/team`,
+  owner or admin) switches them on; `post_pages` holds one row per `subject` (the post's
+  `group_id`, else its `id`), so a group has one page under one permanent `code`.
+  `GET /v1/public/pages/{code}` takes no sign-in (`page_limiter`, per IP) and is a `404` until the
+  page is enabled, the team has pages on and a post of the subject is `published`; never return
+  ids, errors, first comments or unpublished versions from it.
 - `app/src/controllers/admin.rs`: the admin console, `/v1/admin/*` (totals, users, teams, waitlist
   approve and delete, sign-up rules). Every handler takes the `Admin` extractor (`ADMIN_EMAILS`,
   session cookie only) and changing ones `FromWeb`; never return post bodies, tokens or

@@ -1,6 +1,6 @@
 //! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, the documented `/v1` API
 //! (waitlist, the admin console, contact, teams, API tokens, webhooks, connections, social sets, posts, lists, inboxes,
-//! automations), `/webhooks/meta` (Facebook and Instagram deliveries), `/mcp` (see `crate::mcp`), the Threads and Meta connect pages and
+//! automations, public post pages), `/webhooks/meta` (Facebook and Instagram deliveries), `/mcp` (see `crate::mcp`), the Threads and Meta connect pages and
 //! `/media/{name}` (stored post files for platforms that download them).
 pub mod admin;
 pub mod api_tokens;
@@ -18,6 +18,7 @@ pub mod media;
 pub mod meta;
 pub mod meta_webhook;
 pub mod oauth;
+pub mod pages;
 pub mod passkeys;
 pub mod posts;
 pub mod review_login;
@@ -91,6 +92,8 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(social_sets::api())
         .merge(posts::api().layer(DefaultBodyLimit::max(MAX_GROUP_BODY_BYTES)))
         .merge(posts::groups_api().layer(DefaultBodyLimit::max(MAX_GROUP_BODY_BYTES)))
+        // 5000 characters of page details can pass 4 KiB.
+        .merge(pages::api().layer(DefaultBodyLimit::max(MAX_GROUP_BODY_BYTES)))
         .merge(idempotency::api())
         .merge(lists::api())
         .merge(inbox::api())
