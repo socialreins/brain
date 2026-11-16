@@ -151,9 +151,11 @@ fn page_stands_alone(text: &str) -> bool {
     let mut rest = text;
     while let Some(at) = rest.find("{page}") {
         let before = rest[..at].chars().next_back();
-        let after = rest[at + 6..].chars().next();
+        // The linker runs to the next whitespace, so all of that must be closing punctuation.
+        let tail = rest[at + 6..].split_whitespace().next().unwrap_or("");
+        let glued = !rest[at + 6..].starts_with(char::is_whitespace);
         let opens = before.is_none_or(|c| c.is_whitespace() || c == '(');
-        let closes = after.is_none_or(|c| c.is_whitespace() || ".,;:!?)".contains(c));
+        let closes = !glued || tail.chars().all(|c| ".,;:!?)".contains(c));
         if !opens || !closes {
             return false;
         }
@@ -717,6 +719,9 @@ mod tests {
             ("{page}]", false),
             ("{page}/{name}", false),
             ("{page}{page}", false),
+            ("{page}.html", false),
+            ("{page},{name}", false),
+            ("{page}). Bye", true),
         ] {
             let got = validate("comment_received", &mut c, &[paged_text(text)], None);
             assert_eq!(got.is_ok(), ok, "{text}");
