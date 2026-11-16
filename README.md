@@ -738,8 +738,9 @@ your own teams: the cleanup revokes the tokens and invitations of every team it 
 
 ## Media
 
-A post's `media` are URLs: public `https://` links or Google Drive share links
-(`/file/d/<id>/view`, `open?id=`, `uc?id=`; the file must be shared with anyone with the link).
+A post's `media` are URLs: public `https://` links, Google Drive share links
+(`/file/d/<id>/view`, `open?id=`, `uc?id=`) or Dropbox share links to one file (`/s/<id>/<name>`,
+`/scl/fi/<id>/<name>`); the file must be shared with anyone with the link.
 Nothing is fetched when a post is saved. When it publishes, brain downloads each URL once into
 its storage (`MEDIA_DIR` or the `S3_*` bucket): names must resolve to public addresses, at most 3
 redirects, each to a public https URL, 4 at a time, streamed to storage in 5 MB parts (a download

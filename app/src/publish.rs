@@ -1551,8 +1551,8 @@ fn media_error(fail: Fail, n: usize, platform: &str, cap: usize) -> String {
     match fail {
         Fail::Blocked => format!("Image {n} is not a public https URL."),
         Fail::NotShared => format!(
-            "Image {n} is a Google Drive file that is not shared publicly. Share it with \
-             anyone with the link."
+            "Image {n} is a Google Drive or Dropbox file that is not shared publicly. Share it \
+             with anyone with the link."
         ),
         Fail::DriveQuota => format!(
             "Image {n} is a Google Drive file that too many people viewed or downloaded \
