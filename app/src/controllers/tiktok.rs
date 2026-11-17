@@ -195,6 +195,9 @@ async fn callback(
     // TikTok gives each developer app its own id (`open_id`) for one person, so the same
     // @username under another app (Sandbox, then Production) is the account already saved: it
     // takes the new id and keeps its row, sets and posts instead of appearing twice.
+    // shortcut: matches the @username saved at the last connect (a rename on TikTok is not seen
+    // until then), outside `save_account`'s transaction and without a lock, so two connects of
+    // one person at the same moment could still add a row; upgrade if either shows up.
     if let Some(username) = &me.username {
         let moved = app
             .db
