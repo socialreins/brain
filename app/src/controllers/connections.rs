@@ -68,11 +68,19 @@ pub struct Connection {
     /// must be connected again. Absent otherwise.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub reconnect: bool,
-    /// X: the account has a paid X plan, so a post may take 25,000 weighted characters instead
-    /// of 280. Learned at connect, or at the next token renewal for an older account. Absent
-    /// otherwise.
+    /// X: the account may post 25,000 weighted characters instead of 280: the user's `plan`
+    /// when set, else what X reported (learned at connect, or at the next token renewal for an
+    /// older account). Absent otherwise.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub long_posts: bool,
+    /// X: whether X itself reported a paid plan (`true` or `false`), whatever the user's `plan`
+    /// says. Absent when X reported nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected_long_posts: Option<bool>,
+    /// X: the user's setting, `free` or `paid`, which decides `long_posts` when present. Absent
+    /// when unset, so what X reported decides.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
     /// `ok`; `expiring` when the token ends within 7 days and nothing renews it (the end is
     /// `token_expires_at`); `reconnect` when it expired or the platform refused it. Connect the
     /// account again (the provider's connect link) to clear either.
@@ -96,6 +104,12 @@ pub struct BlueskyLogin {
     pub handle: String,
     /// An app password from Bluesky settings, never the account password.
     pub app_password: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct AccountPlan {
+    /// `free` (280 characters) or `paid` (25,000), or `null` to go back to what X reported.
+    pub plan: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -171,7 +185,9 @@ fn connection_json(a: social_accounts::Model, set_ids: Vec<Uuid>) -> Connection 
         dm_access: a.dm_access,
         webhook_error: a.meta["webhook_error"].as_str().map(str::to_owned),
         reconnect: a.meta["reconnect"].as_bool() == Some(true),
-        long_posts: a.meta["long_posts"].as_bool() == Some(true),
+        long_posts: super::x::x_long_posts(&a.meta),
+        detected_long_posts: a.meta["long_posts"].as_bool(),
+        plan: a.meta["plan"].as_str().map(str::to_owned),
         set_ids,
         created_at: a.created_at,
     }
@@ -505,6 +521,60 @@ async fn update_sets(
     }
 }
 
+/// Sets which X plan an X account is on, which decides how long its posts may be and beats what
+/// X reported (`null` removes the setting). Owners and admins; `404` for an account of another
+/// team or a network other than X.
+#[utoipa::path(put, path = "/connections/{id}/plan", tag = "connections", request_body = AccountPlan,
+    params(("id" = Uuid, Path)),
+    responses((status = 200, body = Connection), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 404, body = Error), (status = 422, body = Error)))]
+async fn update_plan(
+    _: FromWeb,
+    State(app): State<AppState>,
+    t: InTeam,
+    Path(id): Path<Uuid>,
+    Body(body): Body<AccountPlan>,
+) -> Response {
+    if !t.role.manages() {
+        return forbidden();
+    }
+    if !matches!(body.plan.as_deref(), None | Some("free" | "paid")) {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_plan");
+    }
+    let done = async {
+        let txn = app.db.begin().await?;
+        let acct = social_accounts::Entity::find_by_id(id)
+            .filter(social_accounts::Column::TeamId.eq(t.team.id))
+            .filter(social_accounts::Column::Provider.eq("x"))
+            .lock_exclusive()
+            .one(&txn)
+            .await?;
+        let Some(mut acct) = acct else {
+            return Ok(Err(not_found()));
+        };
+        match &body.plan {
+            Some(plan) => acct.meta["plan"] = plan.clone().into(),
+            None => {
+                acct.meta.as_object_mut().map(|m| m.remove("plan"));
+            }
+        }
+        let row = social_accounts::ActiveModel {
+            id: Set(id),
+            meta: Set(acct.meta.clone()),
+            ..Default::default()
+        };
+        social_accounts::Entity::update(row).exec(&txn).await?;
+        let json = one_json(&txn, acct).await?;
+        txn.commit().await?;
+        Ok::<_, DbErr>(Ok(json))
+    };
+    match done.await {
+        Ok(Ok(json)) => Json(json).into_response(),
+        Ok(Err(res)) => res,
+        Err(e) => internal(e, "connection plan"),
+    }
+}
+
 /// Disconnects an account and deletes its stored token. Owners and admins, with a sign-in from
 /// the last 10 minutes (else `403 reauth_required`).
 #[utoipa::path(delete, path = "/connections/{id}", tag = "connections",
@@ -554,5 +624,6 @@ pub fn api() -> OpenApiRouter<AppState> {
         .routes(routes!(providers))
         .routes(routes!(connect_bluesky))
         .routes(routes!(update_sets))
+        .routes(routes!(update_plan))
         .routes(routes!(disconnect))
 }

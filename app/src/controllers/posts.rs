@@ -937,8 +937,8 @@ async fn set_accounts(
 }
 
 /// The problem when an X post's text, or a thread part's, is over `X_MAX_WEIGHT` and an X account
-/// of `set` (of `only`, when given) has no long posts (`meta.long_posts`, learned from X at
-/// connect or at the next token renewal), naming the first such account; or `set` has none.
+/// of `set` (of `only`, when given) has no long posts (`x::x_long_posts`: the user's plan setting, else what X
+/// reported at connect or at the next token renewal), naming the first such account; or `set` has none.
 async fn x_short(
     app: &AppState,
     a: &Actor,
@@ -960,7 +960,7 @@ async fn x_short(
     }
     let short = accounts
         .iter()
-        .find(|acc| acc.meta["long_posts"].as_bool() != Some(true));
+        .find(|acc| !super::x::x_long_posts(&acc.meta));
     Ok(short.map(|acc| {
         let name = acc
             .handle
