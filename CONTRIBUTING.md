@@ -14,6 +14,7 @@ export ENCRYPTION_KEY=$(openssl rand -base64 32)
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo run -p socialreins-brain     # http://localhost:8080
 ```
 
 Open an issue before anything bigger than a small fix. Every new or changed endpoint needs a request test in `app/tests/`. Security problems go to [SECURITY.md](https://github.com/socialreins/socialreins/blob/main/SECURITY.md), never an issue.
