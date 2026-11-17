@@ -201,6 +201,16 @@ pub async fn fresh_token(
     renew(app, account.id, RENEW_WITHIN).await.map(|r| r.0)
 }
 
+/// Whether an X account (its `meta`) may post long text: the user's `plan` setting (`"paid"` or
+/// `"free"`) when there is one, else what X reported (`long_posts`), else no.
+pub(crate) fn x_long_posts(meta: &serde_json::Value) -> bool {
+    match meta["plan"].as_str() {
+        Some("paid") => true,
+        Some("free") => false,
+        _ => meta["long_posts"].as_bool() == Some(true),
+    }
+}
+
 /// Locks the account row, then renews its token unless it already ends later than `within` from
 /// now (someone else renewed while this waited for the lock). Returns the token and whether X
 /// was called. The new access token and refresh token are saved in the transaction that holds

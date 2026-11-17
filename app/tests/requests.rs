@@ -13099,6 +13099,60 @@ mod teams {
                     assert_eq!(mock.refreshes.load(Ordering::SeqCst), 1);
                 }
 
+                /// Sets the account's X meta as an account saved with `reported` (`None`: X said
+                /// nothing) and the user's `plan` setting (`None`: not set).
+                async fn plan_case(
+                    db: &DatabaseConnection,
+                    id: uuid::Uuid,
+                    old: &str,
+                    reported: Option<bool>,
+                    plan: Option<&str>,
+                ) {
+                    let mut meta = json!({"refresh_token": seal(old)});
+                    if let Some(r) = reported {
+                        meta["long_posts"] = json!(r);
+                    }
+                    if let Some(p) = plan {
+                        meta["plan"] = json!(p);
+                    }
+                    set_meta(db, id, meta).await;
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn an_x_plan_setting_beats_what_x_reported() {
+                    let (s, db, _, _, _, cookie, team_id, set) = team().await;
+                    let row = x_account(&db, &team_id).await;
+                    let old = refresh_of(&row);
+                    // (what X reported, the setting, is 281 characters accepted)
+                    let cases: [(Option<bool>, Option<&str>, bool); 6] = [
+                        (Some(true), Some("free"), false),
+                        (Some(false), Some("paid"), true),
+                        (Some(true), None, true),
+                        (Some(false), None, false),
+                        (None, None, false),
+                        (None, Some("paid"), true),
+                    ];
+                    for (reported, plan, accepted) in cases {
+                        plan_case(&db, row.id, &old, reported, plan).await;
+                        let res = create(&s, &cookie, x_post(&set, &"a".repeat(281))).await;
+                        let want = if accepted { 201 } else { 422 };
+                        assert_eq!(res.status_code(), want, "{reported:?} {plan:?}");
+                        let a = &list(&s, &cookie).await[0];
+                        // A false flag is left out of the JSON.
+                        assert_eq!(a["long_posts"] == true, accepted, "{reported:?} {plan:?}");
+                        assert_eq!(
+                            a["detected_long_posts"] == true,
+                            reported == Some(true),
+                            "{reported:?} {plan:?}"
+                        );
+                        match plan {
+                            Some(p) => assert_eq!(a["plan"], p),
+                            None => assert!(a.get("plan").is_none(), "{a}"),
+                        }
+                    }
+                }
+
                 #[tokio::test]
                 #[serial]
                 async fn a_refresh_without_a_new_refresh_token_keeps_the_current_one() {
