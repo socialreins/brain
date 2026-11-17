@@ -12217,12 +12217,16 @@ mod teams {
                 }
 
                 async fn me(h: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
-                    assert_eq!(q["user.fields"], "profile_image_url,username,name");
+                    assert_eq!(
+                        q["user.fields"],
+                        "profile_image_url,username,name,subscription_type"
+                    );
                     if bearer(&h).is_none() {
                         return dead();
                     }
                     Json(json!({"data": {"id": "2244994945", "username": "ann_lee",
-                        "name": "Ann Lee", "profile_image_url": "https://pbs.example/p.jpg"}}))
+                        "name": "Ann Lee", "profile_image_url": "https://pbs.example/p.jpg",
+                        "subscription_type": "Premium"}}))
                     .into_response()
                 }
 
@@ -12623,6 +12627,7 @@ mod teams {
                     assert_eq!(a["handle"], "ann_lee");
                     assert_eq!(a["display_name"], "Ann Lee");
                     assert_eq!(a["avatar_url"], "https://pbs.example/p.jpg");
+                    assert_eq!(a["long_posts"], true, "a Premium account");
                     let set = default_set(&db, &team_id).await.to_string();
                     assert_eq!(a["set_ids"], json!([set]));
                     let row = x_account(&db, &team_id).await;
@@ -12811,13 +12816,26 @@ mod teams {
                 #[tokio::test]
                 #[serial]
                 async fn limits_and_unsupported_shapes_are_refused() {
-                    let (s, db, state, base, mock, cookie, _, set) = team().await;
-                    // 280 weighted characters, links counted as 23.
+                    let (s, db, state, base, mock, cookie, team_id, set) = team().await;
+                    // A Premium account takes 25,000 weighted characters.
+                    let mut long = x_post(&set, &"a".repeat(25_000));
+                    long["scheduled_at"] = Value::Null;
+                    assert_eq!(create(&s, &cookie, long).await.status_code(), 201);
+                    let res = create(&s, &cookie, x_post(&set, &"a".repeat(25_001))).await;
+                    assert_eq!(res.status_code(), 422);
+                    assert_eq!(res.json::<Value>()["limit"], 25_000);
+                    // Without long posts: 280 weighted characters, links counted as 23.
+                    let account = x_account(&db, &team_id).await;
+                    let sealed = account.meta["refresh_token"].clone();
+                    set_meta(&db, account.id, json!({"refresh_token": sealed})).await;
                     let res = create(&s, &cookie, x_post(&set, &"a".repeat(281))).await;
                     assert_eq!(res.status_code(), 422);
-                    res.assert_json(&json!({"error": "too_long", "platform": "x", "field": "body",
-                        "limit": 280, "actual": 281,
-                        "detail": "The text is 281 characters as X counts them; the limit is 280."}));
+                    res.assert_json(
+                        &json!({"error": "too_long", "platform": "x", "field": "body",
+                        "limit": 280, "actual": 281, "social_account_id": account.id,
+                        "detail": "The text is 281 characters as X counts them; the limit is 280. \
+                            @ann_lee has no X Premium, which allows long posts."}),
+                    );
                     let link =
                         format!("{} https://example.com/{}", "a".repeat(256), "b".repeat(90));
                     let mut ok = x_post(&set, &link);
@@ -13095,6 +13113,15 @@ mod teams {
                     let row = x_account(&db, &team_id).await;
                     assert_eq!(refresh_of(&row), old);
                     assert_eq!(access_of(&row), token);
+                    assert_eq!(row.meta["long_posts"], true, "kept");
+
+                    // An account saved before `long_posts` learns it at its next renewal.
+                    set_meta(&db, row.id, json!({"refresh_token": seal(&old)})).await;
+                    set_token(&db, row.id, "xtok", -5).await;
+                    x::fresh_token(&state, &row).await.unwrap();
+                    let row = x_account(&db, &team_id).await;
+                    assert_eq!(row.meta["long_posts"], true);
+                    assert_eq!(refresh_of(&row), old);
                 }
 
                 #[tokio::test]

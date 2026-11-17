@@ -140,6 +140,7 @@ async fn callback(
     };
     let now = Utc::now().fixed_offset();
     let new_id = Uuid::now_v7();
+    let long_posts = me.long_posts();
     let name = me.name.filter(|n| !n.trim().is_empty());
     let row = social_accounts::ActiveModel {
         id: Set(new_id),
@@ -151,7 +152,10 @@ async fn callback(
         avatar_url: Set(me.profile_image_url),
         access_token: Set(app.cipher.encrypt(token.access_token.as_bytes())),
         token_expires_at: Set(Some(now + Duration::seconds(token.expires_in))),
-        meta: Set(serde_json::json!({ "refresh_token": seal(&app, &refresh) })),
+        meta: Set(serde_json::json!({
+            "refresh_token": seal(&app, &refresh),
+            "long_posts": long_posts,
+        })),
         dm_access: Set(false),
         inbox_error_at: Set(None),
         created_by: Set(Some(user_id)),
@@ -240,7 +244,21 @@ async fn renew(app: &AppState, id: Uuid, within: Duration) -> Result<(String, bo
     match refreshed {
         Ok(token) => {
             let next = token.refresh_token.clone().or(current).unwrap_or_default();
-            let meta = serde_json::json!({ "refresh_token": seal(app, &next) });
+            // An account connected before `long_posts` was kept learns it once here; a plan
+            // change after that shows at the next connect.
+            let long_posts = match meta.get("long_posts") {
+                Some(known) => Some(known.clone()),
+                None => app
+                    .x
+                    .me(&token.access_token)
+                    .await
+                    .ok()
+                    .map(|me| me.long_posts().into()),
+            };
+            let mut meta = serde_json::json!({ "refresh_token": seal(app, &next) });
+            if let Some(long_posts) = long_posts {
+                meta["long_posts"] = long_posts;
+            }
             txn.execute_raw(stmt(
                 "UPDATE social_accounts SET access_token = $2, meta = $4, \
                  token_expires_at = now() + make_interval(secs => $3), updated_at = now() \
