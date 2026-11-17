@@ -141,6 +141,15 @@ async fn callback(
     let now = Utc::now().fixed_offset();
     let new_id = Uuid::now_v7();
     let long_posts = me.long_posts();
+    let plan = kept_plan(&app, team_id, &me.id).await;
+    let mut meta = serde_json::json!({
+        "refresh_token": seal(&app, &refresh),
+        "long_posts": long_posts,
+    });
+    // A reconnect keeps what the user chose.
+    if let Some(plan) = plan {
+        meta["plan"] = plan.into();
+    }
     let name = me.name.filter(|n| !n.trim().is_empty());
     let row = social_accounts::ActiveModel {
         id: Set(new_id),
@@ -152,10 +161,7 @@ async fn callback(
         avatar_url: Set(me.profile_image_url),
         access_token: Set(app.cipher.encrypt(token.access_token.as_bytes())),
         token_expires_at: Set(Some(now + Duration::seconds(token.expires_in))),
-        meta: Set(serde_json::json!({
-            "refresh_token": seal(&app, &refresh),
-            "long_posts": long_posts,
-        })),
+        meta: Set(meta),
         dm_access: Set(false),
         inbox_error_at: Set(None),
         created_by: Set(Some(user_id)),
@@ -199,6 +205,20 @@ pub async fn fresh_token(
     account: &social_accounts::Model,
 ) -> Result<String, PostError> {
     renew(app, account.id, RENEW_WITHIN).await.map(|r| r.0)
+}
+
+/// The `plan` setting of the team's X account `external_id`, when it was connected before.
+async fn kept_plan(app: &AppState, team_id: Uuid, external_id: &str) -> Option<String> {
+    let row = app
+        .db
+        .query_one_raw(stmt(
+            "SELECT meta->>'plan' AS plan FROM social_accounts \
+             WHERE team_id = $1 AND provider = $2 AND external_id = $3",
+            vec![team_id.into(), PROVIDER.into(), external_id.into()],
+        ))
+        .await
+        .ok()??;
+    row.try_get::<Option<String>>("", "plan").ok()?
 }
 
 /// Whether an X account (its `meta`) may post long text: the user's `plan` setting (`"paid"` or
@@ -252,12 +272,16 @@ async fn renew(app: &AppState, id: Uuid, within: Duration) -> Result<(String, bo
         None => Err(PostError::Reconnect),
     };
     let known = meta.get("long_posts").cloned();
+    let meta_plan = meta.get("plan").cloned();
     match refreshed {
         Ok(token) => {
             let next = token.refresh_token.clone().or(current).unwrap_or_default();
             let mut meta = serde_json::json!({ "refresh_token": seal(app, &next) });
             if let Some(long_posts) = known.clone() {
                 meta["long_posts"] = long_posts;
+            }
+            if let Some(plan) = meta_plan {
+                meta["plan"] = plan;
             }
             txn.execute_raw(stmt(
                 "UPDATE social_accounts SET access_token = $2, meta = $4, \

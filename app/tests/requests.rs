@@ -13120,6 +13120,34 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
+                async fn a_reconnect_keeps_the_plan_setting() {
+                    let (s, db, _, _, _, cookie, team_id, _) = team().await;
+                    let row = x_account(&db, &team_id).await;
+                    let old = refresh_of(&row);
+                    plan_case(&db, row.id, &old, Some(true), Some("free")).await;
+                    connect_with(&s, &cookie, "good").await;
+                    let row = x_account(&db, &team_id).await;
+                    assert_eq!(row.meta["plan"], "free", "{}", row.meta);
+                    assert_eq!(row.meta["long_posts"], true, "X's answer is refreshed");
+                    assert_ne!(refresh_of(&row), old, "the new sign-in was saved");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_token_renewal_keeps_the_plan_setting() {
+                    let (_, db, state, _, _, _, team_id, _) = team().await;
+                    let row = x_account(&db, &team_id).await;
+                    let old = refresh_of(&row);
+                    plan_case(&db, row.id, &old, Some(true), Some("paid")).await;
+                    set_token(&db, row.id, "xtok", -5).await;
+                    x::fresh_token(&state, &row).await.unwrap();
+                    let row = x_account(&db, &team_id).await;
+                    assert_eq!(row.meta["plan"], "paid", "{}", row.meta);
+                    assert_eq!(row.meta["long_posts"], true);
+                }
+
+                #[tokio::test]
+                #[serial]
                 async fn an_x_plan_setting_beats_what_x_reported() {
                     let (s, db, _, _, _, cookie, team_id, set) = team().await;
                     let row = x_account(&db, &team_id).await;
