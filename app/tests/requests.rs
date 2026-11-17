@@ -13147,6 +13147,14 @@ mod teams {
                     assert_eq!(row.meta["long_posts"], true);
                 }
 
+                /// Takes a created post out again, so another test's publish does not send it.
+                async fn drop_post(s: &TestServer, cookie: &str, res: &axum_test::TestResponse) {
+                    if res.status_code() == 201 {
+                        let id = id_of(res);
+                        req(s, Method::DELETE, &format!("/v1/posts/{id}"), cookie).await;
+                    }
+                }
+
                 async fn put_plan(
                     s: &TestServer,
                     cookie: &str,
@@ -13174,6 +13182,7 @@ mod teams {
                         assert_eq!(res.json::<Value>()["plan"], plan);
                         let res = create(&s, &cookie, x_post(&set, &"a".repeat(281))).await;
                         assert_eq!(res.status_code() == 201, accepted, "{plan}");
+                        drop_post(&s, &cookie, &res).await;
                     }
                     // Back to X's answer: the mock reports Premium.
                     let res = put_plan(&s, &cookie, &id, Value::Null).await;
@@ -13255,12 +13264,14 @@ mod teams {
                         let res = create(&s, &cookie, x_post(&set, &"a".repeat(281))).await;
                         let want = if accepted { 201 } else { 422 };
                         assert_eq!(res.status_code(), want, "{reported:?} {plan:?}");
+                        drop_post(&s, &cookie, &res).await;
                         let a = &list(&s, &cookie).await[0];
                         // A false flag is left out of the JSON.
                         assert_eq!(a["long_posts"] == true, accepted, "{reported:?} {plan:?}");
+                        // Present when X said anything, false included.
                         assert_eq!(
-                            a["detected_long_posts"] == true,
-                            reported == Some(true),
+                            a.get("detected_long_posts").and_then(Value::as_bool),
+                            reported,
                             "{reported:?} {plan:?}"
                         );
                         match plan {

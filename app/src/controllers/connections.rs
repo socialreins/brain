@@ -73,10 +73,10 @@ pub struct Connection {
     /// older account). Absent otherwise.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub long_posts: bool,
-    /// X: what X itself reported about a paid plan, whatever the user's `plan` says. Absent when
-    /// X did not report one.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub detected_long_posts: bool,
+    /// X: whether X itself reported a paid plan (`true` or `false`), whatever the user's `plan`
+    /// says. Absent when X reported nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected_long_posts: Option<bool>,
     /// X: the user's setting, `free` or `paid`, which decides `long_posts` when present. Absent
     /// when unset, so what X reported decides.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -186,7 +186,7 @@ fn connection_json(a: social_accounts::Model, set_ids: Vec<Uuid>) -> Connection 
         webhook_error: a.meta["webhook_error"].as_str().map(str::to_owned),
         reconnect: a.meta["reconnect"].as_bool() == Some(true),
         long_posts: super::x::x_long_posts(&a.meta),
-        detected_long_posts: a.meta["long_posts"].as_bool() == Some(true),
+        detected_long_posts: a.meta["long_posts"].as_bool(),
         plan: a.meta["plan"].as_str().map(str::to_owned),
         set_ids,
         created_at: a.created_at,
