@@ -192,6 +192,34 @@ async fn callback(
         Ok(found) => found,
         Err(code) => return fail(code),
     };
+    // TikTok gives each developer app its own id (`open_id`) for one person, so the same
+    // @username under another app (Sandbox, then Production) is the account already saved: it
+    // takes the new id and keeps its row, sets and posts instead of appearing twice.
+    // shortcut: matches the @username saved at the last connect (a rename on TikTok is not seen
+    // until then), outside `save_account`'s transaction and without a lock, so two connects of
+    // one person at the same moment could still add a row; upgrade if either shows up.
+    if let Some(username) = &me.username {
+        let moved = app
+            .db
+            .execute_raw(stmt(
+                "UPDATE social_accounts SET external_id = $3 WHERE id = (SELECT id FROM \
+                 social_accounts WHERE team_id = $1 AND provider = $4 AND lower(handle) = \
+                 lower($2) AND external_id <> $3 ORDER BY created_at LIMIT 1) \
+                 AND NOT EXISTS (SELECT 1 FROM social_accounts WHERE team_id = $1 AND \
+                 provider = $4 AND external_id = $3)",
+                vec![
+                    team_id.into(),
+                    username.clone().into(),
+                    me.open_id.clone().into(),
+                    PROVIDER.into(),
+                ],
+            ))
+            .await;
+        if let Err(e) = moved {
+            tracing::error!(error = %e, "tiktok account re-key failed");
+            return fail("internal");
+        }
+    }
     let now = Utc::now().fixed_offset();
     let new_id = Uuid::now_v7();
     let row = social_accounts::ActiveModel {

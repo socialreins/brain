@@ -11200,6 +11200,24 @@ mod teams {
                     let again = list(&s, &cookie).await;
                     assert_eq!(again.len(), 1);
                     assert_eq!(again[0]["id"], a["id"]);
+
+                    // The same @username under another TikTok app (another open_id) is the
+                    // same account: it keeps its row, whatever case the handle was saved in.
+                    sea_orm::ConnectionTrait::execute_unprepared(
+                        &db,
+                        &format!(
+                            "UPDATE social_accounts SET external_id = 'sandbox-openid', \
+                         handle = 'AnnLee' WHERE team_id = '{team_id}' AND provider = 'tiktok'"
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                    connect_with(&s, &cookie, "good").await;
+                    let moved = list(&s, &cookie).await;
+                    assert_eq!(moved.len(), 1, "{moved:?}");
+                    assert_eq!(moved[0]["id"], a["id"]);
+                    assert_eq!(moved[0]["external_id"], "openid1");
+                    assert_eq!(moved[0]["handle"], "annlee");
                 }
 
                 #[tokio::test]
