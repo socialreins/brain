@@ -68,6 +68,11 @@ pub struct Connection {
     /// must be connected again. Absent otherwise.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub reconnect: bool,
+    /// X: the account has a paid X plan, so a post may take 25,000 weighted characters instead
+    /// of 280. Learned at connect, or at the next token renewal for an older account. Absent
+    /// otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub long_posts: bool,
     /// `ok`; `expiring` when the token ends within 7 days and nothing renews it (the end is
     /// `token_expires_at`); `reconnect` when it expired or the platform refused it. Connect the
     /// account again (the provider's connect link) to clear either.
@@ -166,6 +171,7 @@ fn connection_json(a: social_accounts::Model, set_ids: Vec<Uuid>) -> Connection 
         dm_access: a.dm_access,
         webhook_error: a.meta["webhook_error"].as_str().map(str::to_owned),
         reconnect: a.meta["reconnect"].as_bool() == Some(true),
+        long_posts: a.meta["long_posts"].as_bool() == Some(true),
         set_ids,
         created_at: a.created_at,
     }

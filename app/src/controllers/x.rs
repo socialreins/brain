@@ -140,6 +140,7 @@ async fn callback(
     };
     let now = Utc::now().fixed_offset();
     let new_id = Uuid::now_v7();
+    let long_posts = me.long_posts();
     let name = me.name.filter(|n| !n.trim().is_empty());
     let row = social_accounts::ActiveModel {
         id: Set(new_id),
@@ -151,7 +152,10 @@ async fn callback(
         avatar_url: Set(me.profile_image_url),
         access_token: Set(app.cipher.encrypt(token.access_token.as_bytes())),
         token_expires_at: Set(Some(now + Duration::seconds(token.expires_in))),
-        meta: Set(serde_json::json!({ "refresh_token": seal(&app, &refresh) })),
+        meta: Set(serde_json::json!({
+            "refresh_token": seal(&app, &refresh),
+            "long_posts": long_posts,
+        })),
         dm_access: Set(false),
         inbox_error_at: Set(None),
         created_by: Set(Some(user_id)),
@@ -237,10 +241,14 @@ async fn renew(app: &AppState, id: Uuid, within: Duration) -> Result<(String, bo
         Some(old) => app.x.refresh(old).await,
         None => Err(PostError::Reconnect),
     };
+    let known = meta.get("long_posts").cloned();
     match refreshed {
         Ok(token) => {
             let next = token.refresh_token.clone().or(current).unwrap_or_default();
-            let meta = serde_json::json!({ "refresh_token": seal(app, &next) });
+            let mut meta = serde_json::json!({ "refresh_token": seal(app, &next) });
+            if let Some(long_posts) = known.clone() {
+                meta["long_posts"] = long_posts;
+            }
             txn.execute_raw(stmt(
                 "UPDATE social_accounts SET access_token = $2, meta = $4, \
                  token_expires_at = now() + make_interval(secs => $3), updated_at = now() \
@@ -255,6 +263,12 @@ async fn renew(app: &AppState, id: Uuid, within: Duration) -> Result<(String, bo
             .await
             .map_err(db_failed)?;
             txn.commit().await.map_err(db_failed)?;
+            // An account connected before `long_posts` was kept learns it once, after the new
+            // tokens are saved and the row is free, so a slow or cut-off call loses nothing; a
+            // plan change after that shows at the next connect.
+            if known.is_none() {
+                learn_long_posts(app, id, &token.access_token).await;
+            }
             Ok((token.access_token, true))
         }
         Err(PostError::Reconnect) => {
@@ -271,6 +285,25 @@ async fn renew(app: &AppState, id: Uuid, within: Duration) -> Result<(String, bo
         }
         // Dropping the transaction leaves the row as it was.
         Err(e) => Err(e),
+    }
+}
+
+/// Asks X whether the account has a paid plan and keeps it as `meta.long_posts`; a failure leaves
+/// it unknown, for the next renewal to ask again.
+async fn learn_long_posts(app: &AppState, id: Uuid, access_token: &str) {
+    let Ok(me) = app.x.me(access_token).await else {
+        return;
+    };
+    let saved = app
+        .db
+        .execute_raw(stmt(
+            "UPDATE social_accounts SET meta = meta || jsonb_build_object('long_posts', $2::bool) \
+             WHERE id = $1",
+            vec![id.into(), me.long_posts().into()],
+        ))
+        .await;
+    if let Err(e) = saved {
+        tracing::warn!(error = %e, "x long_posts save failed");
     }
 }
 

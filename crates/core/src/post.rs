@@ -29,6 +29,10 @@ pub const TIKTOK_MAX_CHARS: usize = 2200;
 pub const TIKTOK_MAX_MEDIA: usize = 35;
 /// X: 280 weighted characters (`x_weight`), 4 images or one video or GIF.
 pub const X_MAX_WEIGHT: usize = 280;
+/// X for an account with long posts (Premium, Premium+ or Basic): 25,000 weighted characters.
+/// `check` holds every X post to this; `check_x_short` holds one to `X_MAX_WEIGHT` when an
+/// account it goes to has no long posts.
+pub const X_MAX_LONG_WEIGHT: usize = 25_000;
 pub const X_MAX_MEDIA: usize = 4;
 /// First comment limits, in characters. Meta, LinkedIn and Google document none for comments
 /// through their APIs (Google only answers `commentTextTooLong`), so these are the figures the
@@ -308,7 +312,11 @@ pub fn check(platform: &str, body: &str, media: &[String]) -> Vec<Problem> {
         "facebook" => (chars(FACEBOOK_MAX_CHARS), FACEBOOK_MAX_MEDIA),
         "instagram" => (chars(INSTAGRAM_MAX_CHARS), INSTAGRAM_MAX_MEDIA),
         "x" => (
-            vec![(x_weight(body), X_MAX_WEIGHT, "characters as X counts them")],
+            vec![(
+                x_weight(body),
+                X_MAX_LONG_WEIGHT,
+                "characters as X counts them",
+            )],
             X_MAX_MEDIA,
         ),
         // TikTok counts UTF-16 code units, so an emoji is two.
@@ -763,6 +771,21 @@ pub fn validate_youtube(platform: &str, settings: Option<Option<&str>>) -> Resul
     }
 }
 
+/// The first of `bodies` (a post's, then each thread part's) over `X_MAX_WEIGHT`, the limit of an
+/// X account without long posts, with its 1-based part.
+pub fn check_x_short<'a>(bodies: impl IntoIterator<Item = &'a str>) -> Option<Problem> {
+    bodies.into_iter().enumerate().find_map(|(i, body)| {
+        let actual = x_weight(body);
+        let detail = format!(
+            "The text is {actual} characters as X counts them; the limit is {X_MAX_WEIGHT}."
+        );
+        (actual > X_MAX_WEIGHT).then(|| Problem {
+            part: (i > 0).then_some(i),
+            ..Problem::over(Invalid::TooLong, X_MAX_WEIGHT as u64, actual as u64, detail)
+        })
+    })
+}
+
 /// Checks a thread's follow-up parts `(body, media)` for `platform`, each as a post of its own.
 /// A part's error comes with its 1-based number.
 pub fn validate_thread(
@@ -940,14 +963,16 @@ mod tests {
     #[test]
     fn x_limits() {
         let media = |n: usize| vec!["https://a.example/1.png".to_owned(); n];
-        assert_eq!(validate("x", &"a".repeat(280), &[]), Ok(()));
-        assert_eq!(validate("x", &"a".repeat(281), &[]), Err(Invalid::TooLong));
-        // 140 CJK characters weigh 280.
-        assert_eq!(validate("x", &"日".repeat(140), &[]), Ok(()));
-        assert_eq!(validate("x", &"日".repeat(141), &[]), Err(Invalid::TooLong));
-        let link = |n| format!("{} https://example.com/{}", "a".repeat(n), "b".repeat(80));
-        assert_eq!(validate("x", &link(256), &[]), Ok(()));
-        assert_eq!(validate("x", &link(257), &[]), Err(Invalid::TooLong));
+        // Every post is held to the long limit here; `check_x_short` holds it to 280.
+        assert_eq!(validate("x", &"a".repeat(25_000), &[]), Ok(()));
+        assert_eq!(
+            validate("x", &"a".repeat(25_001), &[]),
+            Err(Invalid::TooLong)
+        );
+        assert_eq!(
+            validate("x", &"日".repeat(12_501), &[]),
+            Err(Invalid::TooLong)
+        );
         assert_eq!(validate("x", "x", &media(4)), Ok(()));
         assert_eq!(validate("x", "x", &media(5)), Err(Invalid::TooManyImages));
         assert_eq!(validate("x", "", &media(1)), Ok(()));
@@ -957,9 +982,29 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            validate_thread("x", &[("two", &media(0)[..]), (&"a".repeat(281), &[])]),
+            validate_thread("x", &[("two", &media(0)[..]), (&"a".repeat(25_001), &[])]),
             Err((Invalid::TooLong, Some(2)))
         );
+    }
+
+    #[test]
+    fn x_short_limits() {
+        let short = |bodies: &[&str]| check_x_short(bodies.iter().copied());
+        assert_eq!(short(&[&"a".repeat(280)]), None);
+        let p = short(&[&"a".repeat(281)]).unwrap();
+        assert_eq!(
+            (p.invalid, p.part, p.limit, p.actual),
+            (Invalid::TooLong, None, Some(280), Some(281))
+        );
+        // 140 CJK characters weigh 280.
+        assert_eq!(short(&[&"日".repeat(140)]), None);
+        assert!(short(&[&"日".repeat(141)]).is_some());
+        let link = |n| format!("{} https://example.com/{}", "a".repeat(n), "b".repeat(80));
+        assert_eq!(short(&[&link(256)]), None);
+        assert!(short(&[&link(257)]).is_some());
+        // A thread part: its 1-based number.
+        let p = short(&["one", "two", &"a".repeat(281)]).unwrap();
+        assert_eq!(p.part, Some(2));
     }
 
     #[test]

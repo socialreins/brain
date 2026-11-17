@@ -82,6 +82,18 @@ pub struct Profile {
     pub username: String,
     pub name: Option<String>,
     pub profile_image_url: Option<String>,
+    /// `None`, `Basic`, `Premium` or `PremiumPlus`.
+    pub subscription_type: Option<String>,
+}
+
+impl Profile {
+    /// The account may post long text (25,000 weighted characters): any paid X plan.
+    pub fn long_posts(&self) -> bool {
+        matches!(
+            self.subscription_type.as_deref(),
+            Some("Basic" | "Premium" | "PremiumPlus")
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -349,9 +361,10 @@ impl X {
 
     /// The signed-in account.
     pub async fn me(&self, access_token: &str) -> Result<Profile, PostError> {
-        let req = self
-            .api(Method::GET, "/2/users/me", access_token)
-            .query(&[("user.fields", "profile_image_url,username,name")]);
+        let req = self.api(Method::GET, "/2/users/me", access_token).query(&[(
+            "user.fields",
+            "profile_image_url,username,name,subscription_type",
+        )]);
         let body = self.send(req, "Profile", false).await?;
         let me: Profile = serde_json::from_value(body["data"].clone())
             .map_err(|_| failed("Profile: X did not say who signed in."))?;

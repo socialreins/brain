@@ -172,7 +172,7 @@ pub struct PostInput {
     /// chosen one: to post to one account, give it a set of its own.
     pub platform: String,
     /// At most 300 graphemes on Bluesky, 500 characters on Threads, 3000 on LinkedIn, 63206 on Facebook, 2200 on
-    /// Instagram, 280 on X as X counts them (a link is 23, a CJK character or emoji 2). On YouTube the first line is the video's title (required, at most 100 characters)
+    /// Instagram, 280 on X as X counts them (a link is 23, a CJK character or emoji 2; 25,000 when every X account of the set has a paid X plan, its connection's `long_posts`). On YouTube the first line is the video's title (required, at most 100 characters)
     /// and the rest its description (at most 5000 bytes); neither may hold `<` or `>`
     /// (`invalid_text`). On TikTok at most 2200 characters, the video's caption.
     #[serde(default)]
@@ -755,6 +755,7 @@ async fn checked(
 /// What `preflight` looks at of a post, from a request or a saved row.
 struct Draft<'a> {
     platform: &'a str,
+    body: &'a str,
     media: &'a [String],
     thread: &'a [ThreadPart],
     cover: Option<&'a str>,
@@ -765,6 +766,7 @@ impl<'a> From<&'a PostInput> for Draft<'a> {
     fn from(i: &'a PostInput) -> Self {
         Self {
             platform: &i.platform,
+            body: &i.body,
             media: &i.media,
             thread: &i.thread,
             cover: post::cover(i.cover.as_deref()),
@@ -846,6 +848,9 @@ async fn preflight(
     if let Some(p) = media_problems(&d, &probed, app.media.max_bytes as u64).first() {
         return Ok(Some(refusal(d.platform, p)));
     }
+    if let Some(p) = x_short(app, a, set, &d, only).await? {
+        return Ok(Some(refusal("x", &p)));
+    }
     Ok(match tiktok_level(&d) {
         Some(level) => tiktok_offered(app, a, set, level, only)
             .await?
@@ -867,22 +872,7 @@ async fn tiktok_offered(
     level: &str,
     only: Option<&[Uuid]>,
 ) -> Result<Option<Problem>, DbErr> {
-    let in_set = Select::select()
-        .column(membership::Column::SocialAccountId)
-        .from(membership::Entity)
-        .and_where(membership::Column::SocialSetId.eq(set))
-        .to_owned();
-    let mut sel = social_accounts::Entity::find()
-        .filter(social_accounts::Column::TeamId.eq(a.team.id))
-        .filter(social_accounts::Column::Provider.eq("tiktok"))
-        .filter(social_accounts::Column::Id.in_subquery(in_set));
-    if let Some(ids) = only {
-        sel = sel.filter(social_accounts::Column::Id.is_in(ids.iter().copied()));
-    }
-    let accounts = sel
-        .order_by_asc(social_accounts::Column::Id)
-        .all(&app.db)
-        .await?;
+    let accounts = set_accounts(app, a, set, "tiktok", only).await?;
     let asked: Vec<_> = accounts
         .iter()
         .map(|account| {
@@ -919,6 +909,73 @@ async fn tiktok_offered(
         }
     }
     Ok(None)
+}
+
+/// The team's `provider` accounts in `set` (of `only`, when given), by id.
+async fn set_accounts(
+    app: &AppState,
+    a: &Actor,
+    set: Uuid,
+    provider: &str,
+    only: Option<&[Uuid]>,
+) -> Result<Vec<social_accounts::Model>, DbErr> {
+    let in_set = Select::select()
+        .column(membership::Column::SocialAccountId)
+        .from(membership::Entity)
+        .and_where(membership::Column::SocialSetId.eq(set))
+        .to_owned();
+    let mut sel = social_accounts::Entity::find()
+        .filter(social_accounts::Column::TeamId.eq(a.team.id))
+        .filter(social_accounts::Column::Provider.eq(provider))
+        .filter(social_accounts::Column::Id.in_subquery(in_set));
+    if let Some(ids) = only {
+        sel = sel.filter(social_accounts::Column::Id.is_in(ids.iter().copied()));
+    }
+    sel.order_by_asc(social_accounts::Column::Id)
+        .all(&app.db)
+        .await
+}
+
+/// The problem when an X post's text, or a thread part's, is over `X_MAX_WEIGHT` and an X account
+/// of `set` (of `only`, when given) has no long posts (`meta.long_posts`, learned from X at
+/// connect or at the next token renewal), naming the first such account; or `set` has none.
+async fn x_short(
+    app: &AppState,
+    a: &Actor,
+    set: Uuid,
+    d: &Draft<'_>,
+    only: Option<&[Uuid]>,
+) -> Result<Option<Problem>, DbErr> {
+    if d.platform != "x" {
+        return Ok(None);
+    }
+    let bodies = std::iter::once(d.body).chain(d.thread.iter().map(|p| p.body.as_str()));
+    let Some(over) = post::check_x_short(bodies) else {
+        return Ok(None);
+    };
+    let accounts = set_accounts(app, a, set, "x", only).await?;
+    // Without an X account nothing says long posts are allowed, so 280 holds.
+    if accounts.is_empty() {
+        return Ok(Some(over.into()));
+    }
+    let short = accounts
+        .iter()
+        .find(|acc| acc.meta["long_posts"].as_bool() != Some(true));
+    Ok(short.map(|acc| {
+        let name = acc
+            .handle
+            .as_deref()
+            .map_or("the X account".into(), |h| format!("@{h}"));
+        let detail = over
+            .detail
+            .clone()
+            .map(|d| format!("{d} {name} has no X Premium, which allows long posts."));
+        Problem {
+            detail,
+            social_account_id: Some(acc.id),
+            ..over.into()
+        }
+    }))
 }
 
 /// `checked`, then `preflight`: the full check of a post before a write.
@@ -1189,6 +1246,9 @@ async fn examine(
         let level = tiktok_level(&Draft::from(&c.input)).map(str::to_owned);
         if let Some(level) = level.filter(|_| !has(c, "tiktok")) {
             c.account = tiktok_offered(app, a, set, &level, None).await?;
+        }
+        if c.account.is_none() && !has(c, "body") && !has(c, "thread") {
+            c.account = x_short(app, a, set, &Draft::from(&c.input), None).await?;
         }
     }
     Ok(checks)
@@ -1975,6 +2035,7 @@ async fn preflight_saved(
         .and_then(|v| serde_json::from_value(v).ok());
     let d = Draft {
         platform: &p.platform,
+        body: &p.body,
         media: &media,
         thread: &thread,
         cover: p.cover.as_deref(),
