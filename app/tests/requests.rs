@@ -12910,6 +12910,14 @@ mod teams {
                     let big = "a".repeat(25_000);
                     let res = create(&s, &cookie, thread(&set, &big, &[&big, &big])).await;
                     assert_eq!(res.status_code(), 201, "{}", res.text());
+                    // Taken out again, so a later test's publish does not send it.
+                    let gone = req(
+                        &s,
+                        Method::DELETE,
+                        &format!("/v1/posts/{}", id_of(&res)),
+                        &cookie,
+                    );
+                    gone.await.assert_status(StatusCode::NO_CONTENT);
                 }
 
                 #[tokio::test]
@@ -17271,11 +17279,11 @@ mod teams {
                     assert_eq!(e, json!({"error": "not_found"}));
                 }
 
-                /// Over 64 KiB is 413, with a length header or chunked without one; a post group
+                /// Over 1 MiB is 413, with a length header or chunked without one; a post group
                 /// well past 4 KiB goes through.
                 #[tokio::test]
                 #[serial]
-                async fn mcp_bodies_over_64_kib_are_refused() {
+                async fn mcp_bodies_over_1_mib_are_refused() {
                     use std::io::{Read, Write};
                     let (s, db) = on_mock(120).await;
                     let (_, owner, _) = user(&s, &db).await;
@@ -17297,7 +17305,7 @@ mod teams {
                     assert_eq!(g["posts"][0]["media"], json!(media(1)));
 
                     let big = json!({"name": "create-post",
-                        "arguments": {"body": "a".repeat(70 * 1024)}});
+                        "arguments": {"body": "a".repeat(1100 * 1024)}});
                     let res = rpc(&s, Some(&secret), "tools/call", big.clone()).await;
                     assert_eq!(res.status_code(), 413, "{}", res.text());
 
@@ -18005,7 +18013,7 @@ mod teams {
                     // A body too large to buffer counts too.
                     let (s, db) = on_mock(2).await;
                     let (_, set, cm) = team(&s, &db).await;
-                    let big = post_body(Some(&set), &"x".repeat(65 * 1024));
+                    let big = post_body(Some(&set), &"x".repeat(1100 * 1024));
                     let res = create(&s, &cm, "big", &big).await;
                     assert_eq!(res.status_code(), 413);
                     let body = post_body(Some(&set), "x");
