@@ -90,6 +90,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET, POST, DELETE | `/v1/connections/meta/pick` | The caller's pending Meta pick (owner, admin): the Pages and Instagram accounts not connected yet (`{"facebook":[{"id","name","picture_url"}],"instagram":[...]}`, never tokens, `404` when none or over 15 minutes old); `{"facebook":[ids],"instagram":[ids]}` connects them (`201` with the accounts; `422 nothing_picked`, `invalid_pick`); drop it, `204` |
 | GET | `/media/{name}` | A stored post file at an unguessable link, for platforms that download media themselves (Threads, Facebook, Instagram); `404` once the post settles |
 | PUT | `/v1/connections/{id}/sets` | `{"set_ids"}` (owner, admin): the sets of the current team holding the account; must include the default set |
+| PUT | `/v1/connections/{id}/plan` | `{"plan": "free"\|"paid"\|null}` (owner, admin; X accounts only): which X plan the account is on, which decides if its posts may take 25,000 characters instead of 280 and beats what X reported (`null` removes the setting). The connection shows `long_posts` (the effective answer), `plan` (the setting) and `detected_long_posts` (what X reported) |
 | DELETE | `/v1/connections/{id}` | Disconnect an account (owner, admin), `204` |
 | GET, POST | `/v1/social-sets` | The current team's live sets with `account_ids`, the default set first (`?deleted=true`: deleted ones still restorable); create one (`{"name"}`, owner, admin) |
 | PATCH, DELETE | `/v1/social-sets/{id}` | Rename (`{"name"}`, the default set too); delete (sign-in from the last 10 minutes, not the default set), restorable for 30 days. Owner, admin |
@@ -559,7 +560,10 @@ MOV video, not a mix; threads of up to 25 follow-up posts) goes out with API v2
 (`connectors/x.rs`). Length is counted the X way (`socialreins_core::post::x_weight`): most
 Latin, Greek and Cyrillic characters count 1, CJK and emoji 2, every link 23. The count is
 conservative: a bare domain counts as a link even where X would not, so a post may be refused
-(`too_long`) that X would take, never the reverse. Media is uploaded first with
+(`too_long`) that X would take, never the reverse. A text over 280 is held to an account's plan: the
+user's setting (`PUT /v1/connections/{id}/plan`, kept across reconnects and token renewals) when there
+is one, else the `subscription_type` X reported at connect or at the next renewal; an account with
+neither counts as free. Media is uploaded first with
 `POST /2/media/upload/initialize` (`media_type`, `total_bytes`, `media_category` `tweet_image`,
 `tweet_gif` or `tweet_video`), one `POST .../{id}/append` per 4 MB chunk (multipart, `segment_index`
 and `media`), `POST .../{id}/finalize`, and `GET /2/media/upload?command=STATUS` until a video is

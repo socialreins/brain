@@ -4151,6 +4151,7 @@ mod teams {
                 ("/connections/providers", "get"),
                 ("/connections/bluesky", "post"),
                 ("/connections/{id}/sets", "put"),
+                ("/connections/{id}/plan", "put"),
                 ("/connections/{id}", "delete"),
             ] {
                 assert!(doc["paths"][path][method].is_object(), "{path} {method}");
@@ -13144,6 +13145,94 @@ mod teams {
                     let row = x_account(&db, &team_id).await;
                     assert_eq!(row.meta["plan"], "paid", "{}", row.meta);
                     assert_eq!(row.meta["long_posts"], true);
+                }
+
+                async fn put_plan(
+                    s: &TestServer,
+                    cookie: &str,
+                    id: &str,
+                    plan: Value,
+                ) -> axum_test::TestResponse {
+                    req(
+                        s,
+                        Method::PUT,
+                        &format!("/v1/connections/{id}/plan"),
+                        cookie,
+                    )
+                    .json(&json!({ "plan": plan }))
+                    .await
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn an_owner_sets_the_x_plan_and_null_goes_back_to_what_x_reported() {
+                    let (s, db, _, _, _, cookie, team_id, set) = team().await;
+                    let id = x_account(&db, &team_id).await.id.to_string();
+                    for (plan, accepted) in [(json!("free"), false), (json!("paid"), true)] {
+                        let res = put_plan(&s, &cookie, &id, plan.clone()).await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        assert_eq!(res.json::<Value>()["plan"], plan);
+                        let res = create(&s, &cookie, x_post(&set, &"a".repeat(281))).await;
+                        assert_eq!(res.status_code() == 201, accepted, "{plan}");
+                    }
+                    // Back to X's answer: the mock reports Premium.
+                    let res = put_plan(&s, &cookie, &id, Value::Null).await;
+                    assert_eq!(res.status_code(), 200);
+                    let a = res.json::<Value>();
+                    assert!(a.get("plan").is_none(), "{a}");
+                    assert_eq!(a["long_posts"], true);
+                    assert_eq!(a["detected_long_posts"], true);
+                    assert!(x_account(&db, &team_id).await.meta.get("plan").is_none());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_member_cannot_set_the_x_plan() {
+                    let (s, db, _, _, _, cookie, team_id, _) = team().await;
+                    let id = x_account(&db, &team_id).await.id.to_string();
+                    let (member, _) = joined(&s, &db, &team_id, "member").await;
+                    let res = put_plan(&s, &member, &id, json!("paid")).await;
+                    assert_eq!(res.status_code(), 403);
+                    res.assert_json(&json!({"error": "forbidden"}));
+                    assert!(x_account(&db, &team_id).await.meta.get("plan").is_none());
+                    let _ = cookie;
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn the_x_plan_of_another_team_or_provider_is_not_found() {
+                    let (s, db, _, _, _, cookie, team_id, _) = team().await;
+                    let row = x_account(&db, &team_id).await;
+                    let id = row.id.to_string();
+                    let (_, stranger, _) = user(&s, &db).await;
+                    let res = put_plan(&s, &stranger, &id, json!("paid")).await;
+                    assert_eq!(res.status_code(), 404);
+                    res.assert_json(&json!({"error": "not_found"}));
+                    db.execute_unprepared(&format!(
+                        "UPDATE social_accounts SET provider = 'linkedin' WHERE id = '{id}'"
+                    ))
+                    .await
+                    .unwrap();
+                    let res = put_plan(&s, &cookie, &id, json!("paid")).await;
+                    assert_eq!(res.status_code(), 404);
+                    db.execute_unprepared(&format!(
+                        "UPDATE social_accounts SET provider = 'x' WHERE id = '{id}'"
+                    ))
+                    .await
+                    .unwrap();
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn an_unknown_x_plan_is_refused() {
+                    let (s, db, _, _, _, cookie, team_id, _) = team().await;
+                    let id = x_account(&db, &team_id).await.id.to_string();
+                    for bad in [json!("premium"), json!("")] {
+                        let res = put_plan(&s, &cookie, &id, bad.clone()).await;
+                        assert_eq!(res.status_code(), 422, "{bad}");
+                        res.assert_json(&json!({"error": "invalid_plan"}));
+                    }
+                    assert!(x_account(&db, &team_id).await.meta.get("plan").is_none());
                 }
 
                 #[tokio::test]
