@@ -62,9 +62,9 @@ const MAX_ADMIN_BODY_BYTES: usize = 16 * 1024;
 const MAX_AUTOMATION_BODY_BYTES: usize = 32 * 1024;
 /// A contact message of 5000 characters can pass 4 KiB.
 const MAX_CONTACT_BODY_BYTES: usize = 32 * 1024;
-/// A post group carries a body and media per platform, a post a thread of up to 26 posts;
-/// `/mcp` takes the same.
-pub(crate) const MAX_GROUP_BODY_BYTES: usize = 64 * 1024;
+/// A post group carries a body and media per platform, a post a thread of up to 26 posts, and an
+/// X Premium text runs to 25,000 characters; `/mcp` takes the same.
+pub(crate) const MAX_GROUP_BODY_BYTES: usize = 1024 * 1024;
 
 #[derive(OpenApi)]
 #[openapi(

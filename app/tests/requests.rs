@@ -12906,6 +12906,10 @@ mod teams {
                     let id = id_of(&create(&s, &cookie, x_post(&set, "short")).await);
                     publish::tick(&state).await.unwrap();
                     assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                    // Three long parts are 75 KB: past the old 64 KiB body cap.
+                    let big = "a".repeat(25_000);
+                    let res = create(&s, &cookie, thread(&set, &big, &[&big, &big])).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
                 }
 
                 #[tokio::test]

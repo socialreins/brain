@@ -172,7 +172,7 @@ pub struct PostInput {
     /// chosen one: to post to one account, give it a set of its own.
     pub platform: String,
     /// At most 300 graphemes on Bluesky, 500 characters on Threads, 3000 on LinkedIn, 63206 on Facebook, 2200 on
-    /// Instagram, 280 on X as X counts them (a link is 23, a CJK character or emoji 2). On YouTube the first line is the video's title (required, at most 100 characters)
+    /// Instagram, 280 on X as X counts them, or 25,000 on a Premium account (a longer text fails at publish on a free one; a link is 23, a CJK character or emoji 2). On YouTube the first line is the video's title (required, at most 100 characters)
     /// and the rest its description (at most 5000 bytes); neither may hold `<` or `>`
     /// (`invalid_text`). On TikTok at most 2200 characters, the video's caption.
     #[serde(default)]
