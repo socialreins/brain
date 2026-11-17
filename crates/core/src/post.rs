@@ -27,8 +27,11 @@ pub const YOUTUBE_MAX_DESCRIPTION: usize = 5000;
 /// posts).
 pub const TIKTOK_MAX_CHARS: usize = 2200;
 pub const TIKTOK_MAX_MEDIA: usize = 35;
-/// X: 280 weighted characters (`x_weight`), 4 images or one video or GIF.
+/// X: 280 weighted characters (`x_weight`) on a free account, 25,000 on a Premium one (the
+/// account is only known at publish, so a save allows the larger and the publish refuses a long
+/// text for an account without Premium), 4 images or one video or GIF.
 pub const X_MAX_WEIGHT: usize = 280;
+pub const X_MAX_WEIGHT_PREMIUM: usize = 25_000;
 pub const X_MAX_MEDIA: usize = 4;
 /// First comment limits, in characters. Meta, LinkedIn and Google document none for comments
 /// through their APIs (Google only answers `commentTextTooLong`), so these are the figures the
@@ -308,7 +311,11 @@ pub fn check(platform: &str, body: &str, media: &[String]) -> Vec<Problem> {
         "facebook" => (chars(FACEBOOK_MAX_CHARS), FACEBOOK_MAX_MEDIA),
         "instagram" => (chars(INSTAGRAM_MAX_CHARS), INSTAGRAM_MAX_MEDIA),
         "x" => (
-            vec![(x_weight(body), X_MAX_WEIGHT, "characters as X counts them")],
+            vec![(
+                x_weight(body),
+                X_MAX_WEIGHT_PREMIUM,
+                "characters as X counts them",
+            )],
             X_MAX_MEDIA,
         ),
         // TikTok counts UTF-16 code units, so an emoji is two.
@@ -940,14 +947,20 @@ mod tests {
     #[test]
     fn x_limits() {
         let media = |n: usize| vec!["https://a.example/1.png".to_owned(); n];
-        assert_eq!(validate("x", &"a".repeat(280), &[]), Ok(()));
-        assert_eq!(validate("x", &"a".repeat(281), &[]), Err(Invalid::TooLong));
-        // 140 CJK characters weigh 280.
-        assert_eq!(validate("x", &"日".repeat(140), &[]), Ok(()));
-        assert_eq!(validate("x", &"日".repeat(141), &[]), Err(Invalid::TooLong));
+        assert_eq!(validate("x", &"a".repeat(25_000), &[]), Ok(()));
+        assert_eq!(
+            validate("x", &"a".repeat(25_001), &[]),
+            Err(Invalid::TooLong)
+        );
+        // 12,500 CJK characters weigh 25,000.
+        assert_eq!(validate("x", &"日".repeat(12_500), &[]), Ok(()));
+        assert_eq!(
+            validate("x", &"日".repeat(12_501), &[]),
+            Err(Invalid::TooLong)
+        );
         let link = |n| format!("{} https://example.com/{}", "a".repeat(n), "b".repeat(80));
-        assert_eq!(validate("x", &link(256), &[]), Ok(()));
-        assert_eq!(validate("x", &link(257), &[]), Err(Invalid::TooLong));
+        assert_eq!(validate("x", &link(24_976), &[]), Ok(()));
+        assert_eq!(validate("x", &link(24_977), &[]), Err(Invalid::TooLong));
         assert_eq!(validate("x", "x", &media(4)), Ok(()));
         assert_eq!(validate("x", "x", &media(5)), Err(Invalid::TooManyImages));
         assert_eq!(validate("x", "", &media(1)), Ok(()));
@@ -957,7 +970,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            validate_thread("x", &[("two", &media(0)[..]), (&"a".repeat(281), &[])]),
+            validate_thread("x", &[("two", &media(0)[..]), (&"a".repeat(25_001), &[])]),
             Err((Invalid::TooLong, Some(2)))
         );
     }

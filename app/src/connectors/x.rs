@@ -361,6 +361,19 @@ impl X {
         Ok(me)
     }
 
+    /// Whether the signed-in account has X Premium (`subscription_type` Premium or PremiumPlus),
+    /// which long posts need. Asked on its own, so a failure here never blocks connecting.
+    pub async fn is_premium(&self, access_token: &str) -> Result<bool, PostError> {
+        let req = self
+            .api(Method::GET, "/2/users/me", access_token)
+            .query(&[("user.fields", "subscription_type")]);
+        let body = self.send(req, "Profile", false).await?;
+        Ok(matches!(
+            body["data"]["subscription_type"].as_str(),
+            Some("Premium" | "PremiumPlus")
+        ))
+    }
+
     /// Posts a tweet: text and up to four images, or one GIF, or one video, as a reply to
     /// `reply_to` when given. Returns the tweet's id. Nothing is retried.
     pub async fn publish_post(

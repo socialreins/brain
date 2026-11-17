@@ -239,7 +239,7 @@ characters, up to 20 JPEG, PNG or GIF images, one MP4 video or one PDF as a docu
 characters, up to 10 JPEG, PNG or GIF images or one MP4 or MOV video) and Instagram (2200
 characters, 1 to 20 JPEG images or MP4 or MOV videos, `media_required` without one), YouTube
 (one MP4 or MOV video, a title and a description, no threads), X (280 characters as X counts
-them, up to 4 images or one GIF or one video, threads) and TikTok (2200 characters, one MP4 or MOV
+them, 25,000 with Premium, up to 4 images or one GIF or one video, threads) and TikTok (2200 characters, one MP4 or MOV
 video or 1 to 35 JPEG or WebP photos, `media_required` without one, no threads) publish today.
 Saving with `scheduled_at` makes a post `scheduled`, else `draft`; only those two can change.
 A tick every minute claims due posts (one instance at a time, advisory lock), creates one
@@ -554,12 +554,14 @@ calling X, `GET /v1/connections` shows `reconnect: true`, and connecting it agai
 A network or server error while renewing changes nothing. If the process dies between X's answer
 and the commit, the new refresh token is lost and the account asks for a reconnect.
 
-An X post (280 weighted characters, up to 4 JPEG, PNG or WebP images, or one GIF, or one MP4 or
+An X post (280 weighted characters, or 25,000 when the account has X Premium; up to 4 JPEG, PNG or WebP images, or one GIF, or one MP4 or
 MOV video, not a mix; threads of up to 25 follow-up posts) goes out with API v2
 (`connectors/x.rs`). Length is counted the X way (`socialreins_core::post::x_weight`): most
 Latin, Greek and Cyrillic characters count 1, CJK and emoji 2, every link 23. The count is
 conservative: a bare domain counts as a link even where X would not, so a post may be refused
-(`too_long`) that X would take, never the reverse. Media is uploaded first with
+(`too_long`) that X would take, never the reverse. A save allows up to 25,000; a text over 280
+is checked at publish against the account's `subscription_type` (`Premium` or `PremiumPlus`, one
+extra `GET /2/users/me`), and a target on a free account fails with a clear message. Media is uploaded first with
 `POST /2/media/upload/initialize` (`media_type`, `total_bytes`, `media_category` `tweet_image`,
 `tweet_gif` or `tweet_video`), one `POST .../{id}/append` per 4 MB chunk (multipart, `segment_index`
 and `media`), `POST .../{id}/finalize`, and `GET /2/media/upload?command=STATUS` until a video is

@@ -429,6 +429,15 @@ impl Publisher for X {
                 content_type: t,
             });
         }
+        // A free account takes 280; asked only for a longer text, so most posts cost no call.
+        if socialreins_core::post::x_weight(body) > socialreins_core::post::X_MAX_WEIGHT
+            && !self.is_premium(secret).await?
+        {
+            return Err(PublishError::Failed(format!(
+                "X takes more than {} characters only on a Premium account, and this one is not.",
+                socialreins_core::post::X_MAX_WEIGHT
+            )));
+        }
         let parent = reply.map(|(p, _)| p.id.as_str());
         let id = self.publish_post(secret, body, &files, parent).await?;
         Ok(Remote {

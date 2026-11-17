@@ -7154,9 +7154,8 @@ mod teams {
                 assert_eq!(found[1]["actual"], 5);
                 assert_eq!(ps[1]["platform"], "x");
                 assert_eq!(ps[1]["account_ids"], json!([]));
-                assert_eq!(ps[1]["problems"][0]["code"], "too_long");
-                assert_eq!(ps[1]["problems"][0]["limit"], 280);
-                assert_eq!(ps[1]["problems"][0]["actual"], 301);
+                // X takes 301 (Premium decides at publish).
+                assert_eq!(ps[1]["problems"], json!([]));
                 assert_eq!(ps[2]["platform"], "linkedin");
                 assert_eq!(ps[2]["ok"], true);
                 assert_eq!(ps[2]["problems"], json!([]));
@@ -7318,7 +7317,7 @@ mod teams {
                     one(comment),
                     one(tiktok),
                     group(json!({})),
-                    group(json!({"platforms": ["bluesky", "x"], "body": "a".repeat(290)})),
+                    group(json!({"platforms": ["bluesky", "x"], "body": "a".repeat(301)})),
                     group(json!({"platforms": ["bluesky", "myspace"]})),
                     group(json!({"platforms": ["bluesky", "instagram"]})),
                     group(json!({"platforms": ["linkedin", "bluesky"],
@@ -7386,9 +7385,9 @@ mod teams {
                     async move { posts::Entity::find().count(db).await.unwrap() }
                 };
                 let before = count().await;
-                // 290 characters fit Bluesky and LinkedIn, not X.
+                // 301 characters fit X (Premium) and LinkedIn, not Bluesky.
                 let body = |extra: Value| {
-                    let mut v = json!({"social_set_id": set, "body": "a".repeat(290),
+                    let mut v = json!({"social_set_id": set, "body": "a".repeat(301),
                         "platforms": ["x", "bluesky", "linkedin"]});
                     v.as_object_mut()
                         .unwrap()
@@ -7402,10 +7401,10 @@ mod teams {
                     assert_eq!(res.status_code(), 422);
                     let e = res.json::<Value>();
                     assert_eq!(e["error"], "too_long");
-                    assert_eq!(e["platform"], "x");
+                    assert_eq!(e["platform"], "bluesky");
                     assert_eq!(e["field"], "body");
-                    assert_eq!(e["limit"], 280);
-                    assert_eq!(e["actual"], 290);
+                    assert_eq!(e["limit"], 300);
+                    assert_eq!(e["actual"], 301);
                     assert!(e["detail"].is_string(), "{e}");
                 }
                 assert_eq!(count().await, before);
@@ -7423,17 +7422,17 @@ mod teams {
                 let g = res.json::<Value>();
                 let made = g["posts"].as_array().unwrap();
                 assert_eq!(made.len(), 2, "{g}");
-                assert_eq!(made[0]["platform"], "bluesky");
+                assert_eq!(made[0]["platform"], "x");
                 assert_eq!(made[0]["lists"][0]["position"], 1);
                 assert_eq!(made[1]["platform"], "linkedin");
                 assert_eq!(made[1]["lists"][0]["position"], 2);
                 let skipped = g["skipped"].as_array().unwrap();
                 assert_eq!(skipped.len(), 1, "{g}");
-                assert_eq!(skipped[0]["platform"], "x");
+                assert_eq!(skipped[0]["platform"], "bluesky");
                 assert_eq!(skipped[0]["ok"], false);
                 assert_eq!(skipped[0]["problems"][0]["code"], "too_long");
-                assert_eq!(skipped[0]["problems"][0]["limit"], 280);
-                assert_eq!(skipped[0]["problems"][0]["actual"], 290);
+                assert_eq!(skipped[0]["problems"][0]["limit"], 300);
+                assert_eq!(skipped[0]["problems"][0]["actual"], 301);
                 assert_eq!(count().await, before + 2);
 
                 // Nothing invalid: nothing skipped, with or without the field.
@@ -7444,14 +7443,14 @@ mod teams {
                 let before = count().await;
 
                 // Every platform invalid, or the group itself: refused as without skip.
-                let res = group(json!({"social_set_id": set, "body": "a".repeat(301),
+                let res = group(json!({"social_set_id": set, "body": "a".repeat(25_001),
                     "platforms": ["bluesky", "x"], "on_invalid": "skip"}))
                 .await;
                 assert_eq!(res.status_code(), 422);
                 res.assert_json(
                     &json!({"error": "too_long", "platform": "bluesky", "field": "body",
-                    "limit": 300, "actual": 301,
-                    "detail": "The text is 301 graphemes; the limit is 300."}),
+                    "limit": 300, "actual": 25001,
+                    "detail": "The text is 25001 graphemes; the limit is 300."}),
                 );
                 let res = group(
                     json!({"social_set_id": set, "body": "hi", "on_invalid": "skip",
@@ -12085,6 +12084,8 @@ mod teams {
                     live: Mutex<Vec<String>>,
                     /// 0 as X does, 1 no new refresh token, 2 server error.
                     refresh_mode: AtomicU64,
+                    /// The account has no X Premium: `subscription_type` answers `None`.
+                    free: std::sync::atomic::AtomicBool,
                     refreshes: AtomicU64,
                     /// Each `code_verifier` and the grant it came with.
                     verifiers: Mutex<Vec<String>>,
@@ -12216,11 +12217,25 @@ mod teams {
                     }
                 }
 
-                async fn me(h: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
-                    assert_eq!(q["user.fields"], "profile_image_url,username,name");
+                async fn me(
+                    State(m): Shared,
+                    h: HeaderMap,
+                    Query(q): Query<HashMap<String, String>>,
+                ) -> Response {
                     if bearer(&h).is_none() {
                         return dead();
                     }
+                    if q["user.fields"] == "subscription_type" {
+                        let kind = if m.free.load(Ordering::SeqCst) {
+                            "None"
+                        } else {
+                            "Premium"
+                        };
+                        return Json(json!({"data": {"id": "2244994945", "username": "ann_lee",
+                            "subscription_type": kind}}))
+                        .into_response();
+                    }
+                    assert_eq!(q["user.fields"], "profile_image_url,username,name");
                     Json(json!({"data": {"id": "2244994945", "username": "ann_lee",
                         "name": "Ann Lee", "profile_image_url": "https://pbs.example/p.jpg"}}))
                     .into_response()
@@ -12812,14 +12827,17 @@ mod teams {
                 #[serial]
                 async fn limits_and_unsupported_shapes_are_refused() {
                     let (s, db, state, base, mock, cookie, _, set) = team().await;
-                    // 280 weighted characters, links counted as 23.
-                    let res = create(&s, &cookie, x_post(&set, &"a".repeat(281))).await;
+                    // 25,000 weighted characters (X Premium), links counted as 23.
+                    let res = create(&s, &cookie, x_post(&set, &"a".repeat(25_001))).await;
                     assert_eq!(res.status_code(), 422);
                     res.assert_json(&json!({"error": "too_long", "platform": "x", "field": "body",
-                        "limit": 280, "actual": 281,
-                        "detail": "The text is 281 characters as X counts them; the limit is 280."}));
-                    let link =
-                        format!("{} https://example.com/{}", "a".repeat(256), "b".repeat(90));
+                        "limit": 25000, "actual": 25001,
+                        "detail": "The text is 25001 characters as X counts them; the limit is 25000."}));
+                    let link = format!(
+                        "{} https://example.com/{}",
+                        "a".repeat(24_976),
+                        "b".repeat(90)
+                    );
                     let mut ok = x_post(&set, &link);
                     ok["scheduled_at"] = Value::Null;
                     assert_eq!(create(&s, &cookie, ok).await.status_code(), 201);
@@ -12832,8 +12850,12 @@ mod teams {
                         "limit": 4, "actual": 5,
                         "detail": "The post has 5 media items; the limit is 4."}),
                     );
-                    let res =
-                        create(&s, &cookie, thread(&set, "x", &["a".repeat(281).as_str()])).await;
+                    let res = create(
+                        &s,
+                        &cookie,
+                        thread(&set, "x", &["a".repeat(25_001).as_str()]),
+                    )
+                    .await;
                     assert_eq!(res.status_code(), 422);
                     assert_eq!(res.json::<Value>()["part"], 1);
 
@@ -12851,6 +12873,39 @@ mod teams {
                             .contains("not a mix"));
                         assert_eq!(mock.inits.lock().unwrap().len(), inits);
                     }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_text_over_280_goes_out_for_a_premium_account_only() {
+                    let (s, _, state, _, mock, cookie, _, set) = team().await;
+                    let long = "a".repeat(900);
+                    let before = mock.tweets.lock().unwrap().len();
+                    let id = id_of(&create(&s, &cookie, x_post(&set, &long)).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(mock.tweets.lock().unwrap()[before].1, json!({"text": long}));
+
+                    mock.free.store(true, Ordering::SeqCst);
+                    let before = mock.tweets.lock().unwrap().len();
+                    let id = id_of(&create(&s, &cookie, x_post(&set, &long)).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    assert!(p["targets"][0]["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("only on a Premium account"));
+                    assert_eq!(
+                        mock.tweets.lock().unwrap().len(),
+                        before,
+                        "nothing was posted"
+                    );
+                    // A short text needs no Premium.
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "short")).await);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
                 }
 
                 #[tokio::test]
