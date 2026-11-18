@@ -1,7 +1,8 @@
 //! Automations: a trigger, conditions and actions, stored as typed JSON. Each new inbox item runs
 //! the automations of the trigger its kind stands for (`trigger_of`): `comment_received`,
 //! `mention_received`, `dm_received`, `story_reply` (an Instagram DM replying to a story, which
-//! never runs `dm_received` ones) and `new_follower` (a Bluesky follow). A run row unique per
+//! never runs `dm_received` ones) and `new_follower` (a Bluesky follow, once per follower per
+//! account ever). A run row unique per
 //! (automation, item) is inserted before anything is sent, together with a hit of the team's
 //! daily cap, and a run is never retried, the same rules as publishing.
 use sea_orm::{
@@ -336,6 +337,26 @@ pub async fn run(
         .await?;
     if own.is_some() {
         return Ok(());
+    }
+    // A follower is welcomed once per account ever: an unfollow and a new follow stores a new
+    // item (a new record) but runs nothing.
+    if item.kind == "follow" {
+        let stmt = sql(
+            "SELECT EXISTS (SELECT 1 FROM inbox_items WHERE social_account_id = $1 \
+             AND kind = 'follow' AND author_id = $2 AND id < $3) AS ok",
+            vec![
+                account.id.into(),
+                item.author_id.clone().into(),
+                item.id.into(),
+            ],
+        );
+        let again: bool = match db.query_one_raw(stmt).await? {
+            Some(r) => r.try_get("", "ok")?,
+            None => false,
+        };
+        if again {
+            return Ok(());
+        }
     }
     let in_live = Query::select()
         .column(membership::Column::SocialSetId)

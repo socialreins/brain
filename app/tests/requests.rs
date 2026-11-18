@@ -16219,6 +16219,13 @@ mod teams {
                         .map(|m| m["message"]["text"].as_str().unwrap().to_owned())
                         .collect::<Vec<_>>()
                 };
+                let to_now = |convo: &str| {
+                    SENT.lock().unwrap()[sent_before..]
+                        .iter()
+                        .filter(|m| m["convoId"] == convo)
+                        .map(|m| m["message"]["text"].as_str().unwrap().to_owned())
+                        .collect::<Vec<_>>()
+                };
                 assert_eq!(to("cv1"), ["Welcome DMer!"]);
                 assert_eq!(to("cv2"), ["Welcome Deal Seeker!"]);
                 // The mention got a public reply.
@@ -16239,6 +16246,30 @@ mod teams {
                     to("convo-did:plc:follower"),
                     ["Thanks for the follow Fan f1"]
                 );
+
+                // Unfollow and follow again: a new follow record, stored, but no second welcome.
+                set_inbox(
+                    &me,
+                    json!({"notifications": [follow("did:plc:follower", "f1b", &at(-9), &me)]}),
+                );
+                ingest(&db, &state, &account).await;
+                assert_eq!(runs(&s, &cookie, &follower).await.len(), 2);
+                assert_eq!(
+                    to_now("convo-did:plc:follower"),
+                    ["Thanks for the follow Fan f1"]
+                );
+                let team: uuid::Uuid = current(&s, &cookie).await["id"]
+                    .as_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let follows = inbox_items::Entity::find()
+                    .filter(inbox_items::Column::TeamId.eq(team))
+                    .filter(inbox_items::Column::AuthorId.eq("did:plc:follower"))
+                    .count(&db)
+                    .await
+                    .unwrap();
+                assert_eq!(follows, 2);
 
                 // Stats by status, in the list and on the automation.
                 let res = s
@@ -16277,11 +16308,12 @@ mod teams {
                 assert!(!kinds.contains(&"follow"));
                 let follows = items(&s, &cookie, all_id, "?kind=follow").await;
                 let follows = follows["items"].as_array().unwrap();
-                assert_eq!(follows.len(), 2);
+                assert_eq!(follows.len(), 3);
                 assert!(follows
                     .iter()
                     .all(|f| f["state"] == "done" && f["text"] == ""));
-                assert_eq!(follows[0]["author"]["id"], "did:plc:closedf");
+                assert_eq!(follows[0]["author"]["id"], "did:plc:follower");
+                assert_eq!(follows[1]["author"]["id"], "did:plc:closedf");
 
                 // Open counts per inbox: follows never count.
                 let res = req(&s, Method::POST, "/v1/inboxes", &cookie)
@@ -16335,7 +16367,7 @@ mod teams {
                 assert_eq!(texts(&got), ["is the 50%_off deal on"]);
                 let got = items(&s, &cookie, &dms, "?q=cc").await;
                 assert!(got["items"].as_array().unwrap().is_empty());
-                let got = items(&s, &cookie, all_id, "?q=f1.fan&kind=follow").await;
+                let got = items(&s, &cookie, all_id, "?q=f2.fan&kind=follow").await;
                 assert_eq!(got["items"].as_array().unwrap().len(), 1);
                 let long = "a".repeat(101);
                 for q in ["%20%20", "", long.as_str()] {
