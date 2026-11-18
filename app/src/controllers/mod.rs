@@ -23,6 +23,7 @@ pub mod passkeys;
 pub mod posts;
 pub mod review_login;
 pub mod social_sets;
+pub mod subscribers;
 pub mod teams;
 pub mod threads;
 pub mod tiktok;
@@ -94,6 +95,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(posts::groups_api().layer(DefaultBodyLimit::max(MAX_GROUP_BODY_BYTES)))
         // 5000 characters of page details can pass 4 KiB.
         .merge(pages::api().layer(DefaultBodyLimit::max(MAX_GROUP_BODY_BYTES)))
+        .merge(subscribers::api())
         .merge(idempotency::api())
         .merge(lists::api())
         .merge(inbox::api())

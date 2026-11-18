@@ -15,6 +15,7 @@ pub mod sessions;
 pub mod social_account_social_set;
 pub mod social_accounts;
 pub mod social_sets;
+pub mod subscribers;
 pub mod team_invitations;
 pub mod team_user;
 pub mod teams;

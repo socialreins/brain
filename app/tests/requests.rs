@@ -2283,7 +2283,7 @@ mod teams {
         assert_eq!(
             ok.json::<Value>(),
             json!({"id": team["id"], "name": team["name"], "code": team["code"],
-                "public_pages": false, "role": "admin"})
+                "public_pages": false, "newsletter": false, "role": "admin"})
         );
         assert_eq!(current(&s, &invited).await["id"], team["id"]);
         assert_eq!(memberships(&db, invited_id).await, 2);
@@ -16878,7 +16878,8 @@ mod teams {
                         json!({"team": name, "body": "first version",
                             "media": ["https://m.test/a.png"],
                             "thread": [{"body": "part two", "media": []}],
-                            "details": "after publishing", "published_at": published_at,
+                            "details": "after publishing", "newsletter": false,
+                            "published_at": published_at,
                             "links": [{"platform": "bluesky", "url": "https://bsky.test/a"}]})
                     );
                     let text = res.text();
@@ -16928,6 +16929,297 @@ mod teams {
                     let res = public(&s, "nosuchcode").await;
                     assert_eq!(res.status_code(), 429);
                     assert_eq!(res.json::<Value>(), json!({"error": "rate_limited"}));
+                }
+
+                type Sent = std::sync::Arc<std::sync::Mutex<Vec<Value>>>;
+
+                /// A brain on the mock Bluesky whose mail goes to a fake Resend (`endpoint`
+                /// given) or the one this makes, and what that took.
+                async fn with_mail(
+                    endpoint: Option<String>,
+                ) -> (TestServer, DatabaseConnection, Sent) {
+                    use axum::{routing::post, Json, Router};
+                    let seen = Sent::default();
+                    let log = seen.clone();
+                    let app = Router::new().route(
+                        "/emails",
+                        post(move |Json(body): Json<Value>| async move {
+                            log.lock().unwrap().push(body);
+                            Json(json!({"id": "x"}))
+                        }),
+                    );
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let url = format!("http://{}/emails", listener.local_addr().unwrap());
+                    tokio::spawn(async move { axum::serve(listener, app).await });
+                    let base = mock_bluesky().await;
+                    let mut config = Config::from_env().expect("test config");
+                    config.trust_proxy = true;
+                    config.bluesky.appview = base.clone();
+                    config.bluesky.plc = base;
+                    config.bluesky.allow_insecure_pds = true;
+                    config.mailer = socialreins_brain::mail::Mailer::resend_at(
+                        &endpoint.unwrap_or(url),
+                        "re_test",
+                        "b@example.com",
+                    )
+                    .unwrap();
+                    let db = socialreins_brain::connect(&config).await.unwrap();
+                    let state = AppState::new(db.clone(), &config);
+                    let app = controllers::router(state, &config);
+                    (TestServer::new(app).unwrap(), db, seen)
+                }
+
+                /// The texts mailed to `to` once `n` have arrived (the mail goes out after the
+                /// reply), or what came by then.
+                async fn mails_to(seen: &Sent, to: &str, n: usize) -> Vec<(String, String)> {
+                    for _ in 0..100 {
+                        let got = seen
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|m| m["to"][0] == to)
+                            .map(|m| {
+                                let get = |k: &str| m[k].as_str().unwrap().to_owned();
+                                (get("subject"), get("text"))
+                            })
+                            .collect::<Vec<_>>();
+                        if got.len() >= n {
+                            return got;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    Vec::new()
+                }
+
+                fn token_in(text: &str) -> String {
+                    let at = text.find("token=").unwrap() + 6;
+                    text[at..at + 64].to_owned()
+                }
+
+                async fn newsletter_on(s: &TestServer, cookie: &str, on: bool) -> Value {
+                    let res = req(s, Method::PATCH, "/v1/team", cookie)
+                        .json(&json!({"newsletter": on}))
+                        .await;
+                    res.assert_status_ok();
+                    res.json()
+                }
+
+                fn subscribe(s: &TestServer, code: &str, email: &str, ip: &str) -> TestRequest {
+                    s.post(&format!("/v1/public/pages/{code}/subscribe"))
+                        .add_header("x-forwarded-for", ip)
+                        .json(&json!({"email": email}))
+                }
+
+                async fn subscribers(s: &TestServer, cookie: &str) -> Value {
+                    let res = req(s, Method::GET, "/v1/subscribers", cookie).await;
+                    res.assert_status_ok();
+                    res.json::<Value>()["subscribers"].clone()
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_visitor_subscribes_by_a_confirmed_link_and_managers_read_the_list() {
+                    let (s, db, seen) = with_mail(None).await;
+                    let (owner, team_id, account) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let team = current(&s, &owner).await;
+                    assert_eq!(team["newsletter"], false);
+                    pages_on(&s, &owner, true).await;
+                    let id = new_post(&s, &owner, &set, "hello").await;
+                    let code = put_page(&s, &owner, &id, true, "x").await.json::<Value>()["code"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    publish(&db, &id, &account, "https://bsky.test/a").await;
+                    assert_eq!(public(&s, &code).await.json::<Value>()["newsletter"], false);
+
+                    // Off by default: the form answers 404 and nothing is stored or mailed.
+                    let who = format!("Reader.{}", unique_email());
+                    let res = subscribe(&s, &code, &who, "10.0.0.1").await;
+                    assert_eq!(res.status_code(), 404);
+                    assert_eq!(res.json::<Value>(), json!({"error": "not_found"}));
+                    // Members cannot switch it on.
+                    let (member, _) = joined(&s, &db, &team_id, "member").await;
+                    let res = req(&s, Method::PATCH, "/v1/team", &member)
+                        .json(&json!({"newsletter": true}))
+                        .await;
+                    assert_eq!(res.status_code(), 403);
+                    let on = newsletter_on(&s, &owner, true).await;
+                    // An enabled page whose post is still a draft takes no sign-ups.
+                    let draft = new_post(&s, &owner, &set, "draft").await;
+                    let draft_code = put_page(&s, &owner, &draft, true, "x")
+                        .await
+                        .json::<Value>()["code"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let res = subscribe(&s, &draft_code, &who, "10.0.0.1").await;
+                    assert_eq!(res.status_code(), 404);
+                    assert_eq!(on["newsletter"], true);
+                    assert_eq!(on["public_pages"], true, "the other switch stays");
+                    assert_eq!(public(&s, &code).await.json::<Value>()["newsletter"], true);
+
+                    // A bad email and a missing body are refused.
+                    let res = subscribe(&s, &code, "not an email", "10.0.0.1").await;
+                    assert_eq!(res.json::<Value>(), json!({"error": "invalid_email"}));
+                    let res = s
+                        .post(&format!("/v1/public/pages/{code}/subscribe"))
+                        .add_header("x-forwarded-for", "10.0.0.1")
+                        .text("x")
+                        .await;
+                    assert_eq!(res.status_code(), 415);
+
+                    // Signing up stores it unconfirmed, in lowercase, and mails one link.
+                    let res = subscribe(&s, &code, &who, "10.0.0.1").await;
+                    res.assert_status_ok();
+                    assert_eq!(res.json::<Value>(), json!({"status": "ok"}));
+                    let lower = who.to_lowercase();
+                    let mail = mails_to(&seen, &lower, 1).await;
+                    assert_eq!(mail.len(), 1);
+                    // The mail never carries the team's own text: this is our sender.
+                    assert_eq!(mail[0].0, "Confirm your newsletter subscription");
+                    assert!(!mail[0].1.contains(team["name"].as_str().unwrap()));
+                    assert!(
+                        mail[0].1.contains("/newsletter/verify?token="),
+                        "{}",
+                        mail[0].1
+                    );
+                    let first = token_in(&mail[0].1);
+                    let list = subscribers(&s, &owner).await;
+                    assert_eq!(list.as_array().unwrap().len(), 1);
+                    assert_eq!(list[0]["email"], lower.as_str());
+                    assert_eq!(list[0]["confirmed"], false);
+
+                    // The same email again within the hour is the same reply and no second mail.
+                    subscribe(&s, &code, &lower, "10.0.0.2")
+                        .await
+                        .assert_status_ok();
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    assert_eq!(mails_to(&seen, &lower, 1).await.len(), 1);
+                    assert_eq!(subscribers(&s, &owner).await.as_array().unwrap().len(), 1);
+
+                    // Only a well-formed, known token confirms; opening twice keeps it confirmed.
+                    let verify = |token: &str| {
+                        s.post("/v1/public/newsletter/verify")
+                            .add_header("x-forwarded-for", "10.0.0.3")
+                            .json(&json!({"token": token}))
+                    };
+                    for bad in ["", "abc", &"0".repeat(64)] {
+                        let res = verify(bad).await;
+                        assert_eq!(res.status_code(), 422, "{bad}");
+                        assert_eq!(res.json::<Value>(), json!({"error": "invalid_link"}));
+                    }
+                    for _ in 0..2 {
+                        let res = verify(&first).await;
+                        res.assert_status_ok();
+                        assert_eq!(
+                            res.json::<Value>(),
+                            json!({"status": "verified", "team": team["name"]})
+                        );
+                    }
+                    assert_eq!(subscribers(&s, &owner).await[0]["confirmed"], true);
+                    // A confirmed email is never mailed again.
+                    subscribe(&s, &code, &lower, "10.0.0.4")
+                        .await
+                        .assert_status_ok();
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    assert_eq!(mails_to(&seen, &lower, 1).await.len(), 1);
+
+                    // Members and other teams see nothing; a draft or switched-off page is gone.
+                    let res = req(&s, Method::GET, "/v1/subscribers", &member).await;
+                    assert_eq!(res.status_code(), 403);
+                    let (_, other, _) = user(&s, &db).await;
+                    assert_eq!(subscribers(&s, &other).await, json!([]));
+                    let path = format!("/v1/subscribers/{}", list[0]["id"].as_str().unwrap());
+                    let res = req(&s, Method::DELETE, &path, &other).await;
+                    assert_eq!(res.status_code(), 404);
+                    let res = req(&s, Method::DELETE, &path, &member).await;
+                    assert_eq!(res.status_code(), 403);
+                    pages_on(&s, &owner, false).await;
+                    let res = subscribe(&s, &code, &unique_email(), "10.0.0.5").await;
+                    assert_eq!(res.status_code(), 404);
+                    pages_on(&s, &owner, true).await;
+
+                    // Removing a subscriber lets the person sign up again.
+                    let res = req(&s, Method::DELETE, &path, &owner).await;
+                    assert_eq!(res.status_code(), 204);
+                    assert_eq!(subscribers(&s, &owner).await, json!([]));
+                    let res = req(&s, Method::DELETE, &path, &owner).await;
+                    assert_eq!(res.status_code(), 404);
+                    subscribe(&s, &code, &lower, "10.0.0.6")
+                        .await
+                        .assert_status_ok();
+                    assert_eq!(mails_to(&seen, &lower, 2).await.len(), 2);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_mail_that_failed_does_not_block_the_next_sign_up() {
+                    // Nothing listens at this address, so the confirmation cannot go out.
+                    let down = {
+                        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        format!("http://{}/emails", l.local_addr().unwrap())
+                    };
+                    let (s, db, _) = with_mail(Some(down)).await;
+                    let (owner, team_id, account) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    pages_on(&s, &owner, true).await;
+                    newsletter_on(&s, &owner, true).await;
+                    let id = new_post(&s, &owner, &set, "hello").await;
+                    let code = put_page(&s, &owner, &id, true, "x").await.json::<Value>()["code"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    publish(&db, &id, &account, "https://bsky.test/a").await;
+                    let who = unique_email();
+                    subscribe(&s, &code, &who, "10.0.1.1")
+                        .await
+                        .assert_status_ok();
+                    let count = format!(
+                        "SELECT count(*) AS n FROM subscribers WHERE email = '{who}' \
+                         AND verify_sent_at IS NULL"
+                    );
+                    let mut unclaimed = 0;
+                    for _ in 0..100 {
+                        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+                        let row = db
+                            .query_one_raw(Statement::from_string(
+                                DbBackend::Postgres,
+                                count.clone(),
+                            ))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        unclaimed = row.try_get::<i64>("", "n").unwrap();
+                        if unclaimed == 1 {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    assert_eq!(unclaimed, 1, "the failed send gave the claim back");
+                    // So the next sign-up claims again (a new token), instead of waiting an hour.
+                    let hash = format!(
+                        "SELECT verify_token_hash AS h FROM subscribers WHERE email = '{who}'"
+                    );
+                    let read = || async {
+                        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+                        let stmt = Statement::from_string(DbBackend::Postgres, hash.clone());
+                        let row = db.query_one_raw(stmt).await.unwrap().unwrap();
+                        row.try_get::<String>("", "h").unwrap()
+                    };
+                    let before = read().await;
+                    subscribe(&s, &code, &who, "10.0.1.2")
+                        .await
+                        .assert_status_ok();
+                    let mut changed = false;
+                    for _ in 0..100 {
+                        if read().await != before {
+                            changed = true;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    assert!(changed, "the second sign-up made a new link");
                 }
             }
 
