@@ -40,7 +40,7 @@ cargo run -p socialreins-brain
 - `app/src/controllers/subscribers.rs`: newsletter sign-ups from public pages. `teams.newsletter`
   (`PATCH /v1/team`, owner or admin) puts an email box on live pages; `POST /v1/public/pages/{code}/subscribe`
   stores `subscribers (team_id, email)` unconfirmed and mails a link (once an hour per email, 20 a day per IP,
-  200 per team, 500 overall) to the web app, which posts its token to `POST /v1/public/newsletter/verify`.
+  200 per team, 5000 overall) to the web app, which posts its token to `POST /v1/public/newsletter/verify`.
   Same reply for a known email. `GET /v1/subscribers` and `DELETE /v1/subscribers/{id}` are for owners and
   admins. Mail only confirmed rows; nothing but the confirmation is sent yet.
 - `app/src/controllers/admin.rs`: the admin console, `/v1/admin/*` (totals, users, teams, waitlist

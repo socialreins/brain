@@ -38,7 +38,8 @@ const RESEND_AFTER_HOURS: i64 = 1;
 /// Confirmation emails per rolling 24 hours, since the form has no captcha.
 const CONFIRMATIONS_PER_IP_PER_DAY: i64 = 20;
 const CONFIRMATIONS_PER_TEAM_PER_DAY: i64 = 200;
-const CONFIRMATIONS_PER_DAY: i64 = 500;
+/// A safety valve only: far above what the per-IP and per-team caps let one attacker use up.
+const CONFIRMATIONS_PER_DAY: i64 = 5000;
 const CONFIRMATIONS_BUCKET: &str = "newsletter:confirm";
 /// shortcut: the list stops at the newest 5000 rows, add paging once a team has more.
 const LIST_LIMIT: u64 = 5000;
@@ -77,7 +78,7 @@ fn reply(status: StatusCode, code: &str) -> Response {
 
 /// Subscribes an email to the team of the live public page `code`. The reply is `200 ok` whether
 /// or not the email was known; only a new or unconfirmed one is mailed a link (once an hour, 20 a
-/// day per IP, 200 per team and 500 overall). `404 not_found` unless the page is live and its team
+/// day per IP, 200 per team and 5000 overall). `404 not_found` unless the page is live and its team
 /// has the newsletter on. Shares the waitlist IP limit.
 #[utoipa::path(post, path = "/public/pages/{code}/subscribe", tag = "posts",
     params(("code" = String, Path)), request_body = Subscribe,
@@ -106,17 +107,30 @@ async fn subscribe(
         Ok(_) => return reply(StatusCode::NOT_FOUND, "not_found"),
         Err(e) => return internal(e, "newsletter page read"),
     };
-    let secret = match claim(&app, team.id, &address, &code).await {
-        Ok(secret) => secret,
-        Err(e) => return internal(e, "newsletter subscribe"),
+    // The caps are counted before a row or a token is made, so a flood adds no rows and a blocked
+    // attempt leaves the link already sent working. A claim that sends nothing gives its hit back.
+    let ip_key = ip.map_or_else(|| "unknown".into(), |ip| rate_limit::bucket(ip).to_string());
+    let reserved = match reserve(&app, &ip_key, team.id).await {
+        Ok(Some(ids)) => ids,
+        Ok(None) => {
+            tracing::warn!("newsletter confirmation not sent: daily cap reached");
+            return Json(serde_json::json!({"status": "ok"})).into_response();
+        }
+        Err(e) => return internal(e, "newsletter cap check"),
     };
-    if let Some(secret) = secret {
-        // A failed mail keeps the row and the ok reply; the error carries no email or token.
-        let (team_id, name) = (team.id, team.name);
-        tokio::spawn(async move {
-            send_confirmation(&app, ip, team_id, &name, &address, &secret).await;
-        });
-    }
+    let secret = match claim(&app, team.id, &address, &code).await {
+        Ok(Some(secret)) => secret,
+        Ok(None) => {
+            daily_refund(&app.db, &reserved).await;
+            return Json(serde_json::json!({"status": "ok"})).into_response();
+        }
+        Err(e) => {
+            daily_refund(&app.db, &reserved).await;
+            return internal(e, "newsletter subscribe");
+        }
+    };
+    // A failed mail keeps the row and the ok reply; the error carries no email or token.
+    tokio::spawn(async move { send_confirmation(&app, &reserved, &address, &secret).await });
     Json(serde_json::json!({"status": "ok"})).into_response()
 }
 
@@ -157,18 +171,12 @@ async fn claim(
     Ok(row.map(|_| secret))
 }
 
-/// Mails the link within the daily caps; all are checked before any is counted. Unsent (a cap
-/// reached or mail failed), the claim is undone so the next sign-up of this email may try again;
-/// logs carry no email or token.
-async fn send_confirmation(
+/// Reserves one hit in each daily cap (per IP, per team, overall); `None` when one is reached.
+async fn reserve(
     app: &AppState,
-    ip: Option<std::net::IpAddr>,
+    ip: &str,
     team_id: Uuid,
-    team: &str,
-    address: &str,
-    secret: &str,
-) {
-    let ip = ip.map_or_else(|| "unknown".into(), |ip| rate_limit::bucket(ip).to_string());
+) -> Result<Option<Vec<i64>>, sea_orm::DbErr> {
     let caps = [
         (
             format!("{CONFIRMATIONS_BUCKET}:ip:{ip}"),
@@ -180,26 +188,25 @@ async fn send_confirmation(
         ),
         (CONFIRMATIONS_BUCKET.to_owned(), CONFIRMATIONS_PER_DAY),
     ];
-    let reserved = match daily_reserve(&app.db, &caps).await {
-        Ok(Some(ids)) => ids,
-        Ok(None) => {
-            tracing::warn!("newsletter confirmation not sent: daily cap reached");
-            return unclaim(app, secret).await;
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "newsletter confirmation cap check failed");
-            return unclaim(app, secret).await;
-        }
-    };
+    daily_reserve(&app.db, &caps).await
+}
+
+/// Mails the link. Unsent (mail failed), the hits are given back and the claim is undone, so the
+/// next sign-up of this email may try again; logs carry no email or token. The mail names no
+/// team: the name is the team's own text, and this is our sender.
+async fn send_confirmation(app: &AppState, reserved: &[i64], address: &str, secret: &str) {
     let url = format!("{}/newsletter/verify?token={secret}", app.web_url);
     let text = format!(
-        "Confirm that you want to get the newsletter of {team}:\n{url}\n\n\
+        "Confirm that you want to get a newsletter from a page on SocialReins:\n{url}\n\n\
          If you did not sign up, ignore this email.\n"
     );
-    let subject = format!("Confirm your subscription to {team}");
-    if let Err(e) = app.mailer.send(address, &subject, text).await {
+    if let Err(e) = app
+        .mailer
+        .send(address, "Confirm your newsletter subscription", text)
+        .await
+    {
         tracing::error!(error = %e, "newsletter confirmation not sent");
-        daily_refund(&app.db, &reserved).await;
+        daily_refund(&app.db, reserved).await;
         unclaim(app, secret).await;
     }
 }

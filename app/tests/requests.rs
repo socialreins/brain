@@ -17045,6 +17045,16 @@ mod teams {
                         .await;
                     assert_eq!(res.status_code(), 403);
                     let on = newsletter_on(&s, &owner, true).await;
+                    // An enabled page whose post is still a draft takes no sign-ups.
+                    let draft = new_post(&s, &owner, &set, "draft").await;
+                    let draft_code = put_page(&s, &owner, &draft, true, "x")
+                        .await
+                        .json::<Value>()["code"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let res = subscribe(&s, &draft_code, &who, "10.0.0.1").await;
+                    assert_eq!(res.status_code(), 404);
                     assert_eq!(on["newsletter"], true);
                     assert_eq!(on["public_pages"], true, "the other switch stays");
                     assert_eq!(public(&s, &code).await.json::<Value>()["newsletter"], true);
@@ -17066,11 +17076,9 @@ mod teams {
                     let lower = who.to_lowercase();
                     let mail = mails_to(&seen, &lower, 1).await;
                     assert_eq!(mail.len(), 1);
-                    assert!(
-                        mail[0].0.contains(team["name"].as_str().unwrap()),
-                        "{}",
-                        mail[0].0
-                    );
+                    // The mail never carries the team's own text: this is our sender.
+                    assert_eq!(mail[0].0, "Confirm your newsletter subscription");
+                    assert!(!mail[0].1.contains(team["name"].as_str().unwrap()));
                     assert!(
                         mail[0].1.contains("/newsletter/verify?token="),
                         "{}",
@@ -17189,6 +17197,29 @@ mod teams {
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
                     assert_eq!(unclaimed, 1, "the failed send gave the claim back");
+                    // So the next sign-up claims again (a new token), instead of waiting an hour.
+                    let hash = format!(
+                        "SELECT verify_token_hash AS h FROM subscribers WHERE email = '{who}'"
+                    );
+                    let read = || async {
+                        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+                        let stmt = Statement::from_string(DbBackend::Postgres, hash.clone());
+                        let row = db.query_one_raw(stmt).await.unwrap().unwrap();
+                        row.try_get::<String>("", "h").unwrap()
+                    };
+                    let before = read().await;
+                    subscribe(&s, &code, &who, "10.0.1.2")
+                        .await
+                        .assert_status_ok();
+                    let mut changed = false;
+                    for _ in 0..100 {
+                        if read().await != before {
+                            changed = true;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    assert!(changed, "the second sign-up made a new link");
                 }
             }
 
