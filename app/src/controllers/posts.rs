@@ -34,6 +34,7 @@ use super::{
     connections::live_sets,
     idempotency::IDEMPOTENCY,
     lists::{self, lists_of, ListRef},
+    queue,
     waitlist::{error, Error},
 };
 use crate::{
@@ -242,6 +243,12 @@ pub struct PostInput {
     pub youtube: Option<youtube::Options>,
     /// When to publish. Set: `scheduled`; absent or `null`: `draft`.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
+    /// `true` on a create: schedule the post at the earliest free slot of its set's queue
+    /// (`GET /social-sets/{id}/queue`) instead of `scheduled_at`. With `scheduled_at` it is `422
+    /// queue_with_scheduled_at`, with no slot `422 queue_empty`, on an update `422
+    /// queue_not_supported`.
+    #[serde(default)]
+    pub queue: bool,
     /// A list to put the post in (moving it there when it already is).
     pub list_id: Option<Uuid>,
     /// With `list_id`: the 1-based position; absent appends.
@@ -300,6 +307,9 @@ pub struct PostGroupInput {
     pub youtube: Option<youtube::Options>,
     /// As in `POST /posts`, for every post.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
+    /// As in `POST /posts`: the group takes one slot, every post its time.
+    #[serde(default)]
+    pub queue: bool,
     /// A list to put every post in, in platform order.
     pub list_id: Option<Uuid>,
     /// With `list_id`: the first post's 1-based position, the others right after; absent
@@ -1363,6 +1373,16 @@ fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
     serde::de::IgnoredAny::deserialize(d).map(|_| true)
 }
 
+/// `422` for `queue: true` next to `scheduled_at`.
+fn queue_with_time() -> Response {
+    reply(StatusCode::UNPROCESSABLE_ENTITY, "queue_with_scheduled_at")
+}
+
+/// `422` for `queue: true` on a set whose queue has no slot.
+fn queue_empty() -> Response {
+    reply(StatusCode::UNPROCESSABLE_ENTITY, "queue_empty")
+}
+
 /// `422` for `validate_only` in the body of a create.
 fn flag_in_body() -> Response {
     let body = serde_json::json!({
@@ -1410,6 +1430,10 @@ pub async fn create_post(
     validate_only: bool,
 ) -> Response {
     let made = async {
+        let queued = input.queue;
+        if queued && input.scheduled_at.is_some() {
+            return Ok(queue_with_time());
+        }
         // A post's own rules answer before its set does, as they always did.
         let rules = rule_problems(&input);
         if let (false, Some(p)) = (validate_only, rules.first()) {
@@ -1433,15 +1457,24 @@ pub async fn create_post(
             }
             Err(res) => return Ok(res),
         };
-        let checks = examine(app, a, set, vec![input], validate_only).await?;
+        if queued && !queue::has_slots(&app.db, set).await? {
+            return Ok(queue_empty());
+        }
+        let mut checks = examine(app, a, set, vec![input], validate_only).await?;
         if validate_only {
             return report(app, a, set, &checks, None, Vec::new()).await;
         }
         if let Some(res) = first_refusal(&checks) {
             return Ok(res);
         }
-        let inputs: Vec<&PostInput> = checks.iter().map(|c| &c.input).collect();
         let txn = app.db.begin().await?;
+        if queued {
+            let Some(at) = queue::pick(&txn, set).await? else {
+                return Ok(queue_empty());
+            };
+            checks[0].input.scheduled_at = Some(at.fixed_offset());
+        }
+        let inputs: Vec<&PostInput> = checks.iter().map(|c| &c.input).collect();
         let rows = match insert_all(&txn, a, &inputs, None).await? {
             Ok(rows) => rows,
             Err(res) => return Ok(res),
@@ -1487,6 +1520,7 @@ fn stand_in(input: &PostInput) -> PostInput {
         tiktok: None,
         youtube: None,
         scheduled_at: input.scheduled_at,
+        queue: false,
         list_id: input.list_id,
         position: input.position,
     }
@@ -1583,10 +1617,16 @@ pub async fn create_post_group(
                 res
             }
         };
+        if input.queue && input.scheduled_at.is_some() {
+            return Ok(queue_with_time());
+        }
         let set = match set_for(&app.db, a, input.social_set_id).await? {
             Ok(set) => set,
             Err(res) => return Ok(stop(res).await),
         };
+        if input.queue && !queue::has_slots(&app.db, set).await? {
+            return Ok(queue_empty());
+        }
         let mut platforms = match &input.platforms {
             Some(p) => p.clone(),
             // Only platforms brain publishes to, so an account connected early breaks nothing.
@@ -1641,6 +1681,7 @@ pub async fn create_post_group(
                         .or_else(|| input.youtube.clone().filter(|_| platform == "youtube")),
                     platform,
                     scheduled_at: input.scheduled_at,
+                    queue: false,
                     list_id: input.list_id,
                     position: input.position,
                 }
@@ -1658,13 +1699,21 @@ pub async fn create_post_group(
         if validate_only {
             return report(app, a, set, &checks, Some(group), problems).await;
         }
-        let valid: Vec<&PostInput> = checks.iter().filter(|c| c.ok()).map(|c| &c.input).collect();
-        if valid.is_empty() || !skip {
+        if checks.iter().all(|c| !c.ok()) || !skip {
             if let Some(res) = first_refusal(&checks) {
                 return Ok(res);
             }
         }
         let txn = app.db.begin().await?;
+        if input.queue {
+            let Some(at) = queue::pick(&txn, set).await? else {
+                return Ok(queue_empty());
+            };
+            for c in &mut checks {
+                c.input.scheduled_at = Some(at.fixed_offset());
+            }
+        }
+        let valid: Vec<&PostInput> = checks.iter().filter(|c| c.ok()).map(|c| &c.input).collect();
         let rows = match insert_all(&txn, a, &valid, Some(group)).await? {
             Ok(rows) => rows,
             Err(res) => return Ok(res),
@@ -1811,6 +1860,9 @@ async fn update(
 
 /// The body of `PUT /posts/{id}`, shared with the MCP `update-post` tool.
 pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) -> Response {
+    if input.queue {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "queue_not_supported");
+    }
     let saved = async {
         let Some(found) = find(&app.db, a, id).await? else {
             return Ok(Err(not_found()));

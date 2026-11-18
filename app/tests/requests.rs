@@ -17960,12 +17960,14 @@ mod teams {
                             "delete-post",
                             "get-list",
                             "get-post",
+                            "get-queue",
                             "list-lists",
                             "list-posts",
                             "list-social-accounts",
                             "list-social-sets",
                             "remove-post-from-list",
                             "reorder-list",
+                            "set-queue",
                             "update-post",
                         ]
                     );
@@ -18610,6 +18612,336 @@ mod teams {
                     let (_, all) = super::mcp::call(&s, &team, "list-lists", json!({})).await;
                     let rest = bearer(&s, Method::GET, "/v1/lists", &team).await;
                     assert_eq!(all, rest.json::<Value>());
+                }
+            }
+
+            /// `/v1/social-sets/{id}/queue` and `queue: true` on creates.
+            mod queue {
+                use super::*;
+                use chrono::{DateTime, Datelike, Timelike};
+
+                fn path(set: &str) -> String {
+                    format!("/v1/social-sets/{set}/queue")
+                }
+
+                async fn put(s: &TestServer, cookie: &str, set: &str, body: Value) -> TestResponse {
+                    req(s, Method::PUT, &path(set), cookie).json(&body).await
+                }
+
+                async fn get(s: &TestServer, cookie: &str, set: &str) -> Value {
+                    let res = s.get(&path(set)).add_header("cookie", cookie).await;
+                    res.assert_status_ok();
+                    res.json()
+                }
+
+                /// Every day at `time`, UTC.
+                fn daily(time: &str) -> Value {
+                    let slots: Vec<Value> = (0..7)
+                        .map(|d| json!({"weekday": d, "time": time}))
+                        .collect();
+                    json!({"time_zone": "UTC", "slots": slots})
+                }
+
+                fn queued(set: &str, body: &str) -> Value {
+                    json!({"social_set_id": set, "platform": "bluesky", "body": body,
+                        "queue": true})
+                }
+
+                async fn create(s: &TestServer, cookie: &str, body: Value) -> TestResponse {
+                    req(s, Method::POST, "/v1/posts", cookie).json(&body).await
+                }
+
+                fn time(v: &Value) -> DateTime<Utc> {
+                    v.as_str().unwrap().parse().unwrap()
+                }
+
+                use axum_test::TestResponse;
+
+                #[tokio::test]
+                #[serial]
+                async fn the_schedule_is_validated_and_lists_free_times() {
+                    let (s, db) = on_mock(120).await;
+                    let (_, owner, _) = user(&s, &db).await;
+                    let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let empty = json!({"time_zone": "UTC", "slots": [], "next": []});
+                    assert_eq!(get(&s, &owner, &set).await, empty);
+
+                    let slot = |d: i64, t: &str| json!({"weekday": d, "time": t});
+                    let many: Vec<Value> = (0..51)
+                        .map(|i| slot(i % 7, &format!("{:02}:00", i / 7)))
+                        .collect();
+                    for (body, code) in [
+                        (
+                            json!({"time_zone": "Mars/Base", "slots": []}),
+                            "invalid_time_zone",
+                        ),
+                        (json!({"time_zone": "", "slots": []}), "invalid_time_zone"),
+                        (json!({"slots": [slot(1, "24:00")]}), "invalid_slot"),
+                        (json!({"slots": [slot(1, "9:00")]}), "invalid_slot"),
+                        (json!({"slots": [slot(7, "09:00")]}), "invalid_slot"),
+                        (
+                            json!({"slots": [slot(1, "09:00"), slot(1, "09:00")]}),
+                            "duplicate_slot",
+                        ),
+                        (json!({"slots": many}), "too_many_slots"),
+                    ] {
+                        let res = put(&s, &owner, &set, body.clone()).await;
+                        assert_eq!(res.status_code(), 422, "{body}");
+                        res.assert_json(&json!({"error": code}));
+                    }
+                    let res = put(
+                        &s,
+                        &owner,
+                        &set,
+                        json!({"slots": [{"weekday": -1, "time": "09:00"}]}),
+                    )
+                    .await;
+                    assert_eq!(res.status_code(), 422);
+                    assert_eq!(get(&s, &owner, &set).await, empty);
+                    let res = put(
+                        &s,
+                        &owner,
+                        &uuid::Uuid::now_v7().to_string(),
+                        daily("09:00"),
+                    )
+                    .await;
+                    assert_eq!(res.status_code(), 404);
+
+                    // Mon to Fri at 09:00 and 17:45 in New York, given out of order.
+                    let mut slots = Vec::new();
+                    for d in (1..=5).rev() {
+                        slots.push(slot(d, "17:45"));
+                        slots.push(slot(d, "09:00"));
+                    }
+                    let body = json!({"time_zone": "America/New_York", "slots": slots});
+                    let res = put(&s, &owner, &set, body).await;
+                    res.assert_status_ok();
+                    let q = res.json::<Value>();
+                    assert_eq!(q, get(&s, &owner, &set).await);
+                    assert_eq!(q["time_zone"], "America/New_York");
+                    assert_eq!(q["slots"][0], slot(1, "09:00"));
+                    assert_eq!(q["slots"][1], slot(1, "17:45"));
+                    assert_eq!(q["slots"][9], slot(5, "17:45"));
+                    let next: Vec<DateTime<Utc>> =
+                        q["next"].as_array().unwrap().iter().map(time).collect();
+                    assert_eq!(next.len(), 10);
+                    assert!(next[0] > Utc::now());
+                    assert!(next.windows(2).all(|w| w[0] < w[1]), "{next:?}");
+                    for t in &next {
+                        let local = t.with_timezone(&chrono_tz::America::New_York);
+                        assert!((1..=5).contains(&local.weekday().num_days_from_sunday()));
+                        assert!(matches!((local.hour(), local.minute()), (9, 0) | (17, 45)));
+                    }
+
+                    // An empty list clears the slots and keeps the zone.
+                    let res = put(&s, &owner, &set, json!({"time_zone": "Asia/Dhaka"})).await;
+                    res.assert_json(&json!({"time_zone": "Asia/Dhaka", "slots": [], "next": []}));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn queued_posts_and_groups_take_the_earliest_free_slot() {
+                    let (s, db) = on_mock(120).await;
+                    let (_, owner, _) = user(&s, &db).await;
+                    let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let other = req(&s, Method::POST, "/v1/social-sets", &owner)
+                        .json(&json!({"name": "Other"}))
+                        .await;
+                    let other = other.json::<Value>()["id"].as_str().unwrap().to_owned();
+
+                    // No slot yet.
+                    let res = create(&s, &owner, queued(&set, "a")).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "queue_empty"}));
+                    put(&s, &owner, &set, daily("09:00"))
+                        .await
+                        .assert_status_ok();
+                    let free = get(&s, &owner, &set).await["next"].clone();
+                    let before = time(&free[0]);
+
+                    // With scheduled_at too it is refused.
+                    let mut both = queued(&set, "a");
+                    both["scheduled_at"] = json!("2099-01-01T00:00:00Z");
+                    let res = create(&s, &owner, both).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "queue_with_scheduled_at"}));
+
+                    // The first free slot, as if scheduled_at had been given.
+                    let res = create(&s, &owner, queued(&set, "one")).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let p = res.json::<Value>();
+                    assert_eq!(p["status"], "scheduled");
+                    assert_eq!(time(&p["scheduled_at"]), before);
+
+                    // A post scheduled by hand at the next slot takes it too.
+                    let mut by_hand = queued(&set, "two");
+                    by_hand["queue"] = json!(false);
+                    by_hand["scheduled_at"] = free[1].clone();
+                    assert_eq!(create(&s, &owner, by_hand).await.status_code(), 201);
+                    let next = get(&s, &owner, &set).await["next"].clone();
+                    assert_eq!(next[0], free[2]);
+
+                    // A group takes one slot, every post its time.
+                    let group = json!({"social_set_id": set, "platforms": ["bluesky", "threads"],
+                        "body": "g", "queue": true});
+                    let res = req(&s, Method::POST, "/v1/post-groups", &owner)
+                        .json(&group)
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let posts = res.json::<Value>()["posts"].clone();
+                    assert_eq!(posts.as_array().unwrap().len(), 2);
+                    for p in posts.as_array().unwrap() {
+                        assert_eq!(time(&p["scheduled_at"]), time(&free[2]), "{p}");
+                        assert_eq!(p["status"], "scheduled");
+                    }
+                    assert_eq!(get(&s, &owner, &set).await["next"][0], free[3]);
+                    let mut both = group.clone();
+                    both["scheduled_at"] = json!("2099-01-01T00:00:00Z");
+                    let res = req(&s, Method::POST, "/v1/post-groups", &owner)
+                        .json(&both)
+                        .await;
+                    res.assert_json(&json!({"error": "queue_with_scheduled_at"}));
+                    let mut elsewhere = group.clone();
+                    elsewhere["social_set_id"] = json!(other);
+                    let res = req(&s, Method::POST, "/v1/post-groups", &owner)
+                        .json(&elsewhere)
+                        .await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "queue_empty"}));
+
+                    // A post that is no longer scheduled frees its slot.
+                    let id = p["id"].as_str().unwrap();
+                    let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &owner).await;
+                    assert_eq!(res.status_code(), 204);
+                    assert_eq!(get(&s, &owner, &set).await["next"][0], free[0]);
+
+                    // Updates do not queue.
+                    let one = create(&s, &owner, queued(&set, "again"))
+                        .await
+                        .json::<Value>();
+                    assert_eq!(one["scheduled_at"], free[0]);
+                    let res = req(
+                        &s,
+                        Method::PUT,
+                        &format!("/v1/posts/{}", one["id"].as_str().unwrap()),
+                        &owner,
+                    )
+                    .json(&queued(&set, "edit"))
+                    .await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "queue_not_supported"}));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn concurrent_queue_calls_get_different_slots() {
+                    let (s, db) = on_mock(120).await;
+                    let (_, owner, _) = user(&s, &db).await;
+                    let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+                    let set = default_set(&db, &team_id).await.to_string();
+                    put(&s, &owner, &set, daily("12:30"))
+                        .await
+                        .assert_status_ok();
+                    let free = get(&s, &owner, &set).await["next"].clone();
+                    let (a, b, c, d) = tokio::join!(
+                        create(&s, &owner, queued(&set, "a")),
+                        create(&s, &owner, queued(&set, "b")),
+                        create(&s, &owner, queued(&set, "c")),
+                        create(&s, &owner, queued(&set, "d")),
+                    );
+                    let mut got: Vec<Value> = [a, b, c, d]
+                        .into_iter()
+                        .map(|r| {
+                            assert_eq!(r.status_code(), 201, "{}", r.text());
+                            r.json::<Value>()["scheduled_at"].clone()
+                        })
+                        .collect();
+                    got.sort_by_key(time);
+                    assert_eq!(got, free.as_array().unwrap()[..4]);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn members_and_tokens_use_the_queue_of_their_sets() {
+                    let (s, db) = on_mock(120).await;
+                    let (_, owner, _) = user(&s, &db).await;
+                    let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let other = req(&s, Method::POST, "/v1/social-sets", &owner)
+                        .json(&json!({"name": "Other"}))
+                        .await;
+                    let other = other.json::<Value>()["id"].as_str().unwrap().to_owned();
+
+                    // A plain member reads and replaces it, as members write posts.
+                    let (member, _) = joined(&s, &db, &team_id, "member").await;
+                    put(&s, &member, &set, daily("08:00"))
+                        .await
+                        .assert_status_ok();
+                    assert_eq!(
+                        get(&s, &member, &set).await["slots"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        7
+                    );
+                    let res = create(&s, &member, queued(&set, "m")).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+
+                    // Another team sees no such set; a session write needs the web origin.
+                    let (_, stranger, _) = user(&s, &db).await;
+                    let res = s.get(&path(&set)).add_header("cookie", &stranger).await;
+                    assert_eq!(res.status_code(), 404);
+                    let res = s
+                        .put(&path(&set))
+                        .add_header("cookie", &owner)
+                        .json(&daily("08:00"))
+                        .await;
+                    assert_eq!(res.status_code(), 403);
+
+                    // A read-only token reads, never writes; a set token only its set.
+                    let ro = make_token(&s, &owner, json!({"name": "ro", "read_only": true})).await;
+                    let ro = ro["secret"].as_str().unwrap().to_owned();
+                    let res = bearer(&s, Method::GET, &path(&set), &ro).await;
+                    assert_eq!(res.json::<Value>(), get(&s, &owner, &set).await);
+                    let res = bearer(&s, Method::PUT, &path(&set), &ro)
+                        .json(&daily("07:00"))
+                        .await;
+                    assert_eq!(res.status_code(), 403);
+                    res.assert_json(&json!({"error": "read_only_token"}));
+                    let one =
+                        make_token(&s, &owner, json!({"name": "one", "social_set_id": other}))
+                            .await;
+                    let one = one["secret"].as_str().unwrap().to_owned();
+                    let res = bearer(&s, Method::GET, &path(&set), &one).await;
+                    assert_eq!(res.status_code(), 404);
+                    let res = bearer(&s, Method::PUT, &path(&other), &one)
+                        .json(&daily("07:00"))
+                        .await;
+                    res.assert_status_ok();
+
+                    // MCP tools answer as REST does.
+                    let args = json!({"id": other, "time_zone": "Asia/Dhaka", "slots": [{"weekday": 0, "time": "10:00"}]});
+                    let (err, q) = super::mcp::call(&s, &one, "set-queue", args).await;
+                    assert!(!err, "{q}");
+                    assert_eq!(q["time_zone"], "Asia/Dhaka");
+                    let (_, got) =
+                        super::mcp::call(&s, &one, "get-queue", json!({"id": other})).await;
+                    assert_eq!(got, q);
+                    let rest = bearer(&s, Method::GET, &path(&other), &one).await;
+                    assert_eq!(rest.json::<Value>(), q);
+                    let args = json!({"id": other, "slots": [{"weekday": 0, "time": "10:00"}]});
+                    let (err, _) = super::mcp::call(&s, &ro, "set-queue", args).await;
+                    assert!(err);
+
+                    let doc = s.get("/openapi.json").await.json::<Value>();
+                    for m in ["get", "put"] {
+                        assert!(
+                            doc["paths"]["/social-sets/{id}/queue"][m].is_object(),
+                            "{m}"
+                        );
+                    }
                 }
             }
 

@@ -11,6 +11,7 @@ pub mod post_lists;
 pub mod post_pages;
 pub mod post_targets;
 pub mod posts;
+pub mod queue_schedules;
 pub mod sessions;
 pub mod social_account_social_set;
 pub mod social_accounts;

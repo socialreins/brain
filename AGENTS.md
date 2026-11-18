@@ -75,6 +75,10 @@ cargo run -p socialreins-brain
   on account and remote id, so redeliveries are harmless), names, links and automations run
   after it. Meta replies and DMs go out through `inbox::send` like Bluesky ones, once, never
   retried.
+- `app/src/controllers/queue.rs`: posting queues. `queue_schedules` holds one row per set (an IANA
+  `time_zone`, `slots` as sorted minutes of the week, weekday 0 Sunday). `queue: true` on a create
+  takes `queue::pick` inside the insert's transaction, under a per-set advisory lock held until
+  commit; a slot is free when no `scheduled` post of the set is at that exact time.
 - `app/src/webhooks.rs`: outbound webhooks. Every `post_targets` status change goes through
   `webhooks::with_event`, so its event is queued in the same statement; README documents the
   payload and signature.
