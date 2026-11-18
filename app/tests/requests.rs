@@ -15241,6 +15241,89 @@ mod teams {
                     assert_eq!(fallback.1["message"], "Please check your DMs");
                 }
 
+                /// An Instagram reply to a story is a DM item marked `story_reply`: it runs
+                /// `story_reply` automations and never `dm_received` ones.
+                #[tokio::test]
+                #[serial]
+                async fn story_replies_run_story_automations_not_dm_ones() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    let make = |trigger: &str, text: &str| {
+                        req(&s, Method::POST, "/v1/automations", &cookie).json(&json!({
+                            "name": trigger, "trigger": trigger,
+                            "actions": [{"type": "send_dm", "text": text}],
+                        }))
+                    };
+                    let res = make("story_reply", "Thanks for the story love, {name}").await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let story = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                    let res = make("dm_received", "Welcome").await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let welcome = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                    let settled = |r: &Vec<Value>, n: usize| {
+                        r.len() == n && r.iter().all(|run| run["status"] != "running")
+                    };
+
+                    // A moment ahead, so it comes after the automations were turned on.
+                    let mut payload = ig_message("1784", "ig_story1", "555");
+                    let m = &mut payload["entry"][0]["messaging"][0];
+                    m["timestamp"] = json!((now() + 5) * 1000);
+                    m["message"]["text"] = json!("love this one");
+                    m["message"]["reply_to"] =
+                        json!({"story": {"id": "st9", "url": "https://cdn.example/st9.jpg"}});
+                    let before = calls_since(0).len();
+                    assert_eq!(deliver(&s, &payload).await.status_code(), 200);
+                    let got = until(|| async {
+                        Some(runs_of(&s, &cookie, &story).await).filter(|r| settled(r, 1))
+                    })
+                    .await;
+                    assert_eq!(got[0]["status"], "sent", "{got:?}");
+                    let item = stored(&db, &team_id)
+                        .await
+                        .into_iter()
+                        .find(|i| i.remote_id == "ig_story1")
+                        .unwrap();
+                    assert_eq!(item.kind, "dm");
+                    assert!(item.story_reply);
+                    assert_eq!(item.story_id.as_deref(), Some("st9"));
+                    assert_eq!(
+                        item.story_url.as_deref(),
+                        Some("https://cdn.example/st9.jpg")
+                    );
+                    let sent = calls_since(before)
+                        .into_iter()
+                        .filter(|(path, _)| path == "101/messages")
+                        .collect::<Vec<_>>();
+                    assert_eq!(sent.len(), 1);
+                    assert_eq!(sent[0].1["recipient"], r#"{"id":"555"}"#);
+                    // `{name}` is the sender's name, looked up before the run.
+                    assert_eq!(
+                        sent[0].1["message"],
+                        r#"{"text":"Thanks for the story love, Ivy"}"#
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    assert!(runs_of(&s, &cookie, &welcome).await.is_empty());
+
+                    // The item shows its story; a plain DM runs the DM automation only.
+                    let all = all_inbox_id(&s, &cookie).await;
+                    let listed = inbox_items_of(&s, &cookie, &all).await;
+                    let shown = listed
+                        .iter()
+                        .find(|i| i["remote_id"] == "ig_story1")
+                        .unwrap();
+                    assert_eq!(shown["story_reply"], true);
+                    assert_eq!(shown["story_id"], "st9");
+                    let mut plain = ig_message("1784", "ig_plain1", "555");
+                    plain["entry"][0]["messaging"][0]["timestamp"] = json!((now() + 5) * 1000);
+                    deliver(&s, &plain).await;
+                    until(|| async {
+                        Some(runs_of(&s, &cookie, &welcome).await).filter(|r| settled(r, 1))
+                    })
+                    .await;
+                    assert_eq!(runs_of(&s, &cookie, &story).await.len(), 1);
+                }
+
                 async fn guide_automation(s: &TestServer, cookie: &str) -> String {
                     let res = req(s, Method::POST, "/v1/automations", cookie)
                         .json(&json!({
@@ -16004,6 +16087,271 @@ mod teams {
                 assert_eq!(runs(&s, &cookie, &id).await.len(), 1);
                 assert_eq!(SENT.lock().unwrap().len(), sent.len());
                 assert_eq!(RECORDS.lock().unwrap().len(), records);
+            }
+
+            fn follow(from: &str, rkey: &str, when: &str, me: &str) -> Value {
+                json!({
+                    "uri": format!("at://{from}/app.bsky.graph.follow/{rkey}"),
+                    "cid": format!("cid-{rkey}"),
+                    "reason": "follow",
+                    "author": {"did": from, "handle": format!("{rkey}.fan.test"),
+                        "displayName": format!("Fan {rkey}")},
+                    "record": {"$type": "app.bsky.graph.follow", "subject": me},
+                    "indexedAt": when,
+                })
+            }
+
+            fn dm(id: &str, from: &str, text: &str, when: &str) -> Value {
+                json!({"$type": "chat.bsky.convo.defs#messageView", "id": id, "text": text,
+                    "sender": {"did": from}, "sentAt": when})
+            }
+
+            async fn automation(s: &TestServer, cookie: &str, body: Value) -> String {
+                let res = req(s, Method::POST, "/v1/automations", cookie)
+                    .json(&body)
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                res.json::<Value>()["id"].as_str().unwrap().to_owned()
+            }
+
+            /// `dm_received` (with `first_message`), `mention_received` and `new_follower` run on
+            /// what ingest stores; follows are stored `done` and listed only when asked for.
+            #[tokio::test]
+            #[serial]
+            async fn dms_mentions_and_follows_run_their_own_triggers() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+
+                for (body, code) in [
+                    (
+                        json!({"name": "x", "trigger": "dm_received",
+                            "actions": [{"type": "reply_publicly", "text": "x"}]}),
+                        "invalid_actions",
+                    ),
+                    (
+                        json!({"name": "x", "trigger": "dm_received",
+                            "actions": [{"type": "send_dm", "text": "x"}],
+                            "fallback_public_reply": "y"}),
+                        "invalid_fallback",
+                    ),
+                    (
+                        json!({"name": "x", "trigger": "new_follower",
+                            "conditions": {"keywords": ["x"]},
+                            "actions": [{"type": "send_dm", "text": "x"}]}),
+                        "invalid_conditions",
+                    ),
+                    (
+                        json!({"name": "x", "trigger": "mention_received",
+                            "conditions": {"first_message": true},
+                            "actions": [{"type": "send_dm", "text": "x"}]}),
+                        "invalid_conditions",
+                    ),
+                    (
+                        json!({"name": "x", "trigger": "story_reply",
+                            "actions": [{"type": "send_dm", "text": "see {page}"}]}),
+                        "invalid_text",
+                    ),
+                ] {
+                    let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                        .json(&body)
+                        .await;
+                    assert_eq!(res.status_code(), 422, "{body}");
+                    assert_eq!(res.json::<Value>()["error"], code, "{body}");
+                }
+                let welcome = automation(
+                    &s,
+                    &cookie,
+                    json!({"name": "Welcome", "trigger": "dm_received",
+                        "conditions": {"first_message": true},
+                        "actions": [{"type": "send_dm", "text": "Welcome {name}!"}]}),
+                )
+                .await;
+                let mention = automation(
+                    &s,
+                    &cookie,
+                    json!({"name": "Thanks", "trigger": "mention_received",
+                        "actions": [{"type": "reply_publicly", "text": "Thanks {name}"}]}),
+                )
+                .await;
+                let follower = automation(
+                    &s,
+                    &cookie,
+                    json!({"name": "Hello follower", "trigger": "new_follower",
+                        "actions": [{"type": "send_dm", "text": "Thanks for the follow {name}"}]}),
+                )
+                .await;
+
+                set_inbox(
+                    &me,
+                    json!({
+                        "notifications": [
+                            follow("did:plc:closedf", "f2", &at(-3), &me),
+                            follow("did:plc:follower", "f1", &at(-2), &me),
+                            note("mention", "did:plc:fan2", "m1", "cc @me", &at(-1), &me),
+                        ],
+                        "convos": [
+                            {"id": "cv1", "members": [{"did": me},
+                                {"did": "did:plc:dmer", "handle": "dmer.test", "displayName": "DMer"}],
+                             "lastMessage": {"sentAt": at(-6)}},
+                            {"id": "cv2", "members": [{"did": me},
+                                {"did": "did:plc:deal", "handle": "deal.test", "displayName": "Deal Seeker"}],
+                             "lastMessage": {"sentAt": at(-7)}},
+                        ],
+                        "messages": {
+                            "cv1": [dm("d2", "did:plc:dmer", "500 off?", &at(-6)),
+                                    dm("d1", "did:plc:dmer", "hello there", &at(-5))],
+                            "cv2": [dm("d3", "did:plc:deal", "is the 50%_off deal on", &at(-7))],
+                        },
+                    }),
+                );
+                let sent_before = SENT.lock().unwrap().len();
+                ingest(&db, &state, &account).await;
+                ingest(&db, &state, &account).await;
+
+                // A welcome for each new author's first DM only.
+                let got = runs(&s, &cookie, &welcome).await;
+                assert_eq!(got.len(), 2, "{got:?}");
+                assert!(got.iter().all(|r| r["status"] == "sent"), "{got:?}");
+                let sent = SENT.lock().unwrap()[sent_before..].to_vec();
+                let to = |convo: &str| {
+                    sent.iter()
+                        .filter(|m| m["convoId"] == convo)
+                        .map(|m| m["message"]["text"].as_str().unwrap().to_owned())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(to("cv1"), ["Welcome DMer!"]);
+                assert_eq!(to("cv2"), ["Welcome Deal Seeker!"]);
+                // The mention got a public reply.
+                let got = runs(&s, &cookie, &mention).await;
+                assert_eq!(got.len(), 1);
+                assert_eq!(got[0]["status"], "sent", "{got:?}");
+                let record = RECORDS.lock().unwrap().last().cloned().unwrap();
+                assert_eq!(record["record"]["text"], "Thanks Fan m1");
+                // A follower gets a DM; one who takes none is skipped, with nothing public.
+                let got = runs(&s, &cookie, &follower).await;
+                assert_eq!(got.len(), 2);
+                // Newest first: closedf followed last.
+                assert_eq!(got[0]["status"], "skipped", "{got:?}");
+                assert_eq!(got[0]["reason"], "dm_not_allowed");
+                assert_eq!(got[0]["results"].as_array().unwrap().len(), 1);
+                assert_eq!(got[1]["status"], "sent", "{got:?}");
+                assert_eq!(
+                    to("convo-did:plc:follower"),
+                    ["Thanks for the follow Fan f1"]
+                );
+
+                // Stats by status, in the list and on the automation.
+                let res = s
+                    .get(&format!("/v1/automations/{follower}"))
+                    .add_header("cookie", &cookie)
+                    .await;
+                let stats = res.json::<Value>()["runs"].clone();
+                assert_eq!(stats["sent"], 1, "{stats}");
+                assert_eq!(stats["skipped"], 1);
+                assert_eq!(stats["failed"], 0);
+                assert_eq!(stats["running"], 0);
+                assert_eq!(stats["total"], 2);
+                assert_eq!(stats["count"], 2);
+                assert_eq!(stats["last_at"], got[0]["created_at"]);
+                let res = s.get("/v1/automations").add_header("cookie", &cookie).await;
+                let list = res.json::<Value>();
+                let listed = list
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|a| a["id"] == follower.as_str())
+                    .unwrap();
+                assert_eq!(listed["runs"], stats);
+
+                // Follows are stored done and listed only with kind=follow.
+                let all = all_inbox(&s, &cookie).await;
+                let all_id = all["id"].as_str().unwrap();
+                let page = items(&s, &cookie, all_id, "").await;
+                let kinds: Vec<&str> = page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| i["kind"].as_str().unwrap())
+                    .collect();
+                assert_eq!(kinds.len(), 4, "{kinds:?}");
+                assert!(!kinds.contains(&"follow"));
+                let follows = items(&s, &cookie, all_id, "?kind=follow").await;
+                let follows = follows["items"].as_array().unwrap();
+                assert_eq!(follows.len(), 2);
+                assert!(follows
+                    .iter()
+                    .all(|f| f["state"] == "done" && f["text"] == ""));
+                assert_eq!(follows[0]["author"]["id"], "did:plc:closedf");
+
+                // Open counts per inbox: follows never count.
+                let res = req(&s, Method::POST, "/v1/inboxes", &cookie)
+                    .json(&json!({"name": "DMs", "filters": {"kinds": ["dm"]}}))
+                    .await;
+                assert_eq!(res.status_code(), 201);
+                assert!(res.json::<Value>().get("open_count").is_none());
+                let dms = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                let d1 = page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|i| i["text"] == "hello there")
+                    .unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let res = req(&s, Method::PATCH, &format!("/v1/inbox-items/{d1}"), &cookie)
+                    .json(&json!({"state": "done"}))
+                    .await;
+                res.assert_status_ok();
+                let res = s.get("/v1/inboxes").add_header("cookie", &cookie).await;
+                let counts: Vec<(String, i64)> = res
+                    .json::<Value>()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| {
+                        let id = i["id"].as_str().unwrap().to_owned();
+                        (id, i["open_count"].as_i64().unwrap())
+                    })
+                    .collect();
+                assert_eq!(counts, [(all_id.to_owned(), 3), (dms.clone(), 2)]);
+
+                // Search: text, name or handle, any case; `%` and `_` are literal.
+                let texts = |page: &Value| {
+                    let mut t: Vec<String> = page["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|i| i["text"].as_str().unwrap().to_owned())
+                        .collect();
+                    t.sort();
+                    t
+                };
+                let got = items(&s, &cookie, all_id, "?q=%2050%25_OFF%20").await;
+                assert_eq!(texts(&got), ["is the 50%_off deal on"]);
+                let got = items(&s, &cookie, all_id, "?q=dmer").await;
+                assert_eq!(texts(&got), ["500 off?", "hello there"]);
+                let got = items(&s, &cookie, all_id, "?q=SEEKER").await;
+                assert_eq!(texts(&got), ["is the 50%_off deal on"]);
+                let got = items(&s, &cookie, &dms, "?q=cc").await;
+                assert!(got["items"].as_array().unwrap().is_empty());
+                let got = items(&s, &cookie, all_id, "?q=f1.fan&kind=follow").await;
+                assert_eq!(got["items"].as_array().unwrap().len(), 1);
+                let long = "a".repeat(101);
+                for q in ["%20%20", "", long.as_str()] {
+                    let res = s
+                        .get(&format!("/v1/inboxes/{all_id}/items?q={q}"))
+                        .add_header("cookie", &cookie)
+                        .await;
+                    assert_eq!(res.status_code(), 422, "{q}");
+                }
+                assert_eq!(
+                    items(&s, &cookie, all_id, &format!("?q={}", &long[1..])).await["items"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    0
+                );
             }
 
             #[tokio::test]

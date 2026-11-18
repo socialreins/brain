@@ -106,14 +106,14 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | POST | `/v1/lists/{id}/posts` | Add a post (`{"post_id","position"}`; appends by default, an existing post moves) |
 | DELETE | `/v1/lists/{id}/posts/{post_id}` | Take a post out; later posts move up |
 | PUT | `/v1/lists/{id}/order` | Reorder (`{"post_ids"}`: every post of the list once, else `422 invalid_order`) |
-| GET, POST | `/v1/inboxes` | The team's inboxes, the undeletable "All" first; create one (`{"name","filters":{"social_set_id"\|"account_ids","kinds","platforms","keywords","unanswered"}}`, owner, admin) |
+| GET, POST | `/v1/inboxes` | The team's inboxes, the undeletable "All" first, each with `open_count` (its `open` items, follows left out; in the list only); create one (`{"name","filters":{"social_set_id"\|"account_ids","kinds","platforms","keywords","unanswered"}}`, owner, admin) |
 | PUT, DELETE | `/v1/inboxes/{id}` | Replace name and filters; delete (owner, admin; not "All") |
-| GET | `/v1/inboxes/{id}/items` | `?state=open\|done&cursor=&limit=`: items newest first with their `replies`, and `next_cursor` |
+| GET | `/v1/inboxes/{id}/items` | `?state=open\|done&kind=comment\|mention\|dm\|follow&q=&cursor=&limit=`: items newest first with their `replies`, and `next_cursor`. `q` (1 to 100 characters after trimming) searches the text and the author's name and handle, any case, `%` and `_` literal. `follow` items (new Bluesky followers, stored `done`) are listed only with `kind=follow`. A DM replying to an Instagram story has `story_reply: true` and `story_id`, `story_url` when Meta gave them |
 | GET, PATCH | `/v1/inbox-items/{id}` | One item; `{"state":"open"\|"done"}` (any member) |
 | POST | `/v1/inbox-items/{id}/reply` | `{"text"}` (any member): a public reply to a comment or mention, a DM for a DM; `422 {"error","message"}` when it cannot go (on Facebook and Instagram `meta_reconnect_required`, `meta_failed`, `outside_window`, `dm_unavailable`) |
-| GET, POST | `/v1/automations` | The team's automations; create one (`{"name","trigger":"comment_received","conditions","actions":[{"type":"send_dm"\|"reply_publicly","text"}],"active","fallback_public_reply"}`, owner, admin). Texts may hold `{name}` (the commenter's display name, else "there") and `{page}` (the address of the public page of the post the comment is under, counted as 100 characters); `{page}` needs a space, `(` or the start before it and a space, closing punctuation or the end after it, else `422 invalid_text`; an automation whose action holds `{page}` does not run (no run, no daily hit) on a comment whose post has no live page, and a fallback reply holding it is then `skipped` with `no_public_page` |
-| GET, PUT, DELETE | `/v1/automations/{id}` | One automation; replace it; delete it (owner, admin) |
-| POST | `/v1/automations/{id}/enable`, `/disable` | Switch it on (acts on comments from then on) or off (owner, admin) |
+| GET, POST | `/v1/automations` | The team's automations; each with `runs: {"sent","skipped","failed","running","total","count","last_at"}` (`count` equals `total`); create one (`{"name","trigger","conditions","actions":[{"type":"send_dm"\|"reply_publicly","text"}],"active","fallback_public_reply"}`, owner, admin). Triggers: `comment_received` (conditions `social_set_id`\|`account_ids`, `post_remote_ids`, `keywords`, `first_per_author`; both actions), `mention_received` (scope, `keywords`; both actions), `dm_received` (scope, `keywords`, `first_message`: only the author's first DM ever stored on the account; `send_dm` in the conversation), `story_reply` (an Instagram DM replying to a story, which never runs `dm_received`; scope, `keywords`; `send_dm`) and `new_follower` (a Bluesky follow; scope only; `send_dm`, skipped as `dm_not_allowed` when the follower takes no DMs). A condition or action the trigger does not take is `422 invalid_conditions` or `invalid_actions`; `fallback_public_reply` and `{page}` are for `comment_received` and `mention_received` only (`invalid_fallback`, `invalid_text`). Texts may hold `{name}` (the commenter's display name, else "there") and `{page}` (the address of the public page of the post the comment is under, counted as 100 characters); `{page}` needs a space, `(` or the start before it and a space, closing punctuation or the end after it, else `422 invalid_text`; an automation whose action holds `{page}` does not run (no run, no daily hit) on a comment whose post has no live page, and a fallback reply holding it is then `skipped` with `no_public_page` |
+| GET, PUT, DELETE | `/v1/automations/{id}` | One automation with its `runs` counts; replace it; delete it (owner, admin) |
+| POST | `/v1/automations/{id}/enable`, `/disable` | Switch it on (acts on items from then on) or off (owner, admin) |
 | GET | `/v1/automations/{id}/runs` | Its runs newest first (`?cursor=`): `sent`, `failed` or `skipped` with a `reason` and per-action `results` |
 
 `POST /v1/waitlist` answers `200 {"status":"ok"}` for a new email and for one already on the
@@ -615,8 +615,10 @@ account wrote itself (its id is the entry's, or `is_echo`), and events that are 
 messages. A comment's `parent_remote_id` is the post (or the comment it answers) and
 `root_remote_id` the post, so conditions and web can tell which post; a DM's `convo_id` is the
 sender's id. Names, the Instagram link and automations come after the `200`: a DM sender's
-profile is read once, an Instagram comment's link is the media permalink, and new comments run
-the team's automations. Connecting (and reconnecting) a Page calls `POST {page}/subscribed_apps`
+profile is read once, an Instagram comment's link is the media permalink, and new items run
+the team's automations. An Instagram message with `reply_to.story` is stored as a DM with
+`story_reply` set (and the story's `id` and `url`); it runs `story_reply` automations, not
+`dm_received` ones. Connecting (and reconnecting) a Page calls `POST {page}/subscribed_apps`
 with `subscribed_fields=feed,messages` (`pages_manage_metadata`); a refusal never fails the
 connect, it is logged and kept as `webhook_error` on the connection. Disconnecting the last
 account of a Page (in any team) unsubscribes it, best effort. Replies: a comment gets a public

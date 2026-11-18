@@ -1,7 +1,7 @@
 //! The inbox: comments, mentions and DMs of every connected account. Bluesky has no webhooks,
 //! so a per-minute tick reads each account's notifications and DMs from its saved cursors and
-//! stores new items (Meta posts into the same table from its webhook, `meta_inbox`). New comments then run
-//! the team's automations. Replies, by people or automations, go out through `send`, at most
+//! stores new items (Meta posts into the same table from its webhook, `meta_inbox`). New items then run
+//! the team's automations (`automations::run` picks the trigger from the item's kind). Replies, by people or automations, go out through `send`, at most
 //! once: nothing here retries a send.
 use std::sync::LazyLock;
 
@@ -26,6 +26,7 @@ use crate::{
 
 /// A first read (or one after a long pause) goes back at most this far.
 pub const FIRST_DAYS: i64 = 7;
+/// Kinds an inbox filter takes. `follow` items are left out of item lists unless asked for.
 pub const KINDS: [&str; 3] = ["comment", "mention", "dm"];
 pub const PLATFORMS: [&str; 8] = [
     "facebook",
@@ -112,7 +113,7 @@ impl Filters {
 }
 
 /// `text` for a LIKE pattern, with `\`, `%` and `_` matching themselves.
-fn escape_like(text: &str) -> String {
+pub fn escape_like(text: &str) -> String {
     text.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
@@ -260,8 +261,8 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
     lock.commit().await
 }
 
-/// Reads one account's new notifications and DMs, stores them, moves its cursors and runs
-/// automations on the new comments.
+/// Reads one account's new notifications (follows included) and DMs, stores them, moves its
+/// cursors and runs automations on the new items.
 pub async fn ingest(app: &AppState, account: social_accounts::Model) -> Result<(), DbErr> {
     let Ok(_slot) = ACCOUNT_SLOTS.acquire().await else {
         return Ok(());
@@ -313,7 +314,9 @@ pub async fn ingest(app: &AppState, account: social_accounts::Model) -> Result<(
     let dm_access = match app.bluesky.messages(&c, msince).await {
         Ok((list, newest)) => {
             for m in list.iter().rev() {
-                store_message(db, &account, m).await?;
+                if let Some(item) = store_message(db, &account, m).await? {
+                    fresh.push(item);
+                }
             }
             if let Some(t) = newest {
                 let stmt = sql(
@@ -350,8 +353,8 @@ pub async fn ingest(app: &AppState, account: social_accounts::Model) -> Result<(
         }
     };
     // shortcut: automations run only on items stored in this round, so a crash between the
-    // insert and the run skips them; sweep recent unrun comments if that ever matters.
-    for item in fresh.iter().filter(|i| i.kind == "comment") {
+    // insert and the run skips them; sweep recent unrun items if that ever matters.
+    for item in &fresh {
         automations::run(app, &account, item).await?;
     }
     Ok(())
@@ -365,9 +368,10 @@ fn clip(text: &str) -> String {
 // Facebook Reel's target keeps the video id instead, which `meta_inbox` looks up after the 200.
 const INSERT: &str = "INSERT INTO inbox_items (id, team_id, social_account_id, platform, kind, \
     remote_id, remote_cid, parent_remote_id, root_remote_id, root_remote_cid, convo_id, \
-    author_id, author_handle, author_name, author_avatar, text, received_at, permalink, post_id) \
+    author_id, author_handle, author_name, author_avatar, text, received_at, permalink, \
+    story_reply, story_id, story_url, state, post_id) \
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
-    (SELECT t.post_id FROM post_targets t WHERE t.social_account_id = $3 \
+    $19, $20, $21, $22, (SELECT t.post_id FROM post_targets t WHERE t.social_account_id = $3 \
      AND t.remote_id IN ($8, $9) LIMIT 1)) \
     ON CONFLICT (social_account_id, remote_id) DO NOTHING RETURNING *";
 
@@ -386,6 +390,8 @@ pub struct Fresh {
     pub text: String,
     pub at: DateTime<FixedOffset>,
     pub permalink: Option<String>,
+    /// For a DM replying to a story: the story's id and link, when given.
+    pub story: Option<(Option<String>, Option<String>)>,
 }
 
 /// Stores `f` for `account`; the new item, or `None` when it was already there. The unique key
@@ -414,6 +420,11 @@ pub async fn store(
         clip(&f.text).into(),
         f.at.into(),
         f.permalink.into(),
+        f.story.is_some().into(),
+        f.story.clone().and_then(|s| s.0).into(),
+        f.story.and_then(|s| s.1).into(),
+        // A follow is not work to answer.
+        (if f.kind == "follow" { "done" } else { "open" }).into(),
     ];
     inbox_items::Entity::find()
         .from_raw_sql(sql(INSERT, values))
@@ -438,6 +449,7 @@ async fn store_notification(
         text: n.text.clone(),
         at: n.indexed_at,
         permalink: None,
+        story: None,
     };
     store(db, account, fresh).await
 }
@@ -458,6 +470,7 @@ async fn store_message(
         text: m.text.clone(),
         at: m.sent_at,
         permalink: None,
+        story: None,
     };
     store(db, account, fresh).await
 }

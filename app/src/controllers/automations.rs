@@ -39,9 +39,9 @@ pub struct Automation {
     pub id: Uuid,
     pub name: String,
     pub active: bool,
-    /// When it was last switched on; comments received before that never run it.
+    /// When it was last switched on; items received before that never run it.
     pub activated_at: DateTime<FixedOffset>,
-    /// `comment_received`.
+    /// `comment_received`, `dm_received`, `mention_received`, `new_follower` or `story_reply`.
     pub trigger: String,
     pub conditions: Conditions,
     pub actions: Vec<Action>,
@@ -51,13 +51,19 @@ pub struct Automation {
     pub created_by: Option<Uuid>,
     pub created_at: DateTime<FixedOffset>,
     pub updated_at: DateTime<FixedOffset>,
-    /// How often it ran; only in the list.
+    /// How often it ran, by status; in the list and on `GET /automations/{id}`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runs: Option<RunStats>,
 }
 
-#[derive(Serialize, ToSchema, Default)]
+#[derive(Serialize, ToSchema, Default, Debug, PartialEq, Eq)]
 pub struct RunStats {
+    pub sent: i64,
+    pub skipped: i64,
+    pub failed: i64,
+    pub running: i64,
+    pub total: i64,
+    /// The same as `total`, kept for older clients.
     pub count: i64,
     pub last_at: Option<DateTime<FixedOffset>>,
 }
@@ -67,7 +73,9 @@ pub struct RunStats {
 pub struct AutomationInput {
     /// 1 to 60 characters after trimming.
     pub name: String,
-    /// `comment_received`.
+    /// `comment_received`, `dm_received`, `mention_received`, `new_follower` or `story_reply`
+    /// (see `Conditions` for the conditions each takes). `reply_publicly`, a fallback reply and
+    /// `{page}` are for `comment_received` and `mention_received` only.
     pub trigger: String,
     #[serde(default)]
     pub conditions: Conditions,
@@ -186,7 +194,45 @@ async fn checked(
     Ok(Ok((name, input)))
 }
 
-/// The team's automations, oldest first, each with its run count and last run.
+/// Run counts by status and the last run, per automation of the team (or of `only` that one).
+async fn run_stats(
+    db: &impl ConnectionTrait,
+    team_id: Uuid,
+    only: Option<Uuid>,
+) -> Result<std::collections::HashMap<Uuid, RunStats>, DbErr> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT automation_id, COUNT(*) AS total, \
+             COUNT(*) FILTER (WHERE status = 'sent') AS sent, \
+             COUNT(*) FILTER (WHERE status = 'skipped') AS skipped, \
+             COUNT(*) FILTER (WHERE status = 'failed') AS failed, \
+             COUNT(*) FILTER (WHERE status = 'running') AS running, \
+             MAX(created_at) AS last_at FROM automation_runs \
+             WHERE team_id = $1 AND ($2::uuid IS NULL OR automation_id = $2) \
+             GROUP BY automation_id",
+            [team_id.into(), only.into()],
+        ))
+        .await?;
+    rows.iter()
+        .map(|r| {
+            let id: Uuid = r.try_get("", "automation_id")?;
+            let total = r.try_get("", "total")?;
+            let stats = RunStats {
+                sent: r.try_get("", "sent")?,
+                skipped: r.try_get("", "skipped")?,
+                failed: r.try_get("", "failed")?,
+                running: r.try_get("", "running")?,
+                total,
+                count: total,
+                last_at: r.try_get("", "last_at")?,
+            };
+            Ok((id, stats))
+        })
+        .collect()
+}
+
+/// The team's automations, oldest first, each with its run counts by status and last run.
 #[utoipa::path(get, path = "/automations", tag = "automations",
     responses((status = 200, body = [Automation]), (status = 401, body = Error)))]
 async fn list(State(app): State<AppState>, t: InTeam) -> Response {
@@ -197,24 +243,7 @@ async fn list(State(app): State<AppState>, t: InTeam) -> Response {
             .order_by_asc(automations::Column::Id)
             .all(&app.db)
             .await?;
-        let stats = app
-            .db
-            .query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "SELECT automation_id, COUNT(*) AS count, MAX(created_at) AS last_at \
-                 FROM automation_runs WHERE team_id = $1 GROUP BY automation_id",
-                [t.team.id.into()],
-            ))
-            .await?;
-        let mut stats = stats
-            .iter()
-            .map(|r| {
-                let id: Uuid = r.try_get("", "automation_id")?;
-                let count = r.try_get("", "count")?;
-                let last_at = r.try_get("", "last_at")?;
-                Ok((id, RunStats { count, last_at }))
-            })
-            .collect::<Result<std::collections::HashMap<_, _>, DbErr>>()?;
+        let mut stats = run_stats(&app.db, t.team.id, None).await?;
         Ok::<_, DbErr>(
             rows.into_iter()
                 .map(|a| {
@@ -233,19 +262,29 @@ async fn list(State(app): State<AppState>, t: InTeam) -> Response {
     }
 }
 
-/// One automation.
+/// One automation, with its run counts by status and last run.
 #[utoipa::path(get, path = "/automations/{id}", tag = "automations", params(("id" = Uuid, Path)),
     responses((status = 200, body = Automation), (status = 401, body = Error),
         (status = 404, body = Error)))]
 async fn show(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> Response {
-    match find(&app.db, t.team.id, id).await {
-        Ok(Some(a)) => Json(automation_json(a)).into_response(),
+    let found = async {
+        let Some(a) = find(&app.db, t.team.id, id).await? else {
+            return Ok(None);
+        };
+        let runs = run_stats(&app.db, t.team.id, Some(id)).await?.remove(&id);
+        Ok::<_, DbErr>(Some(Automation {
+            runs: Some(runs.unwrap_or_default()),
+            ..automation_json(a)
+        }))
+    };
+    match found.await {
+        Ok(Some(a)) => Json(a).into_response(),
         Ok(None) => not_found(),
         Err(e) => internal(e, "automation read"),
     }
 }
 
-/// Creates an automation; it acts on comments received from now on. Owners and admins; at
+/// Creates an automation; it acts on items received from now on. Owners and admins; at
 /// most 50 per team. Unknown fields, triggers, condition keys and action types are refused
 /// (`422 invalid_body`, `invalid_trigger`, `invalid_conditions`, `invalid_actions`,
 /// `invalid_text`, `invalid_fallback`).
@@ -385,7 +424,7 @@ async fn set_active(app: &AppState, t: &InTeam, id: Uuid, active: bool) -> Respo
     }
 }
 
-/// Switches an automation on; it acts on comments received from now on. Owners and admins.
+/// Switches an automation on; it acts on items received from now on. Owners and admins.
 #[utoipa::path(post, path = "/automations/{id}/enable", tag = "automations",
     params(("id" = Uuid, Path)),
     responses((status = 200, body = Automation), (status = 401, body = Error),
