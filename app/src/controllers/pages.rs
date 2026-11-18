@@ -71,6 +71,8 @@ pub struct PublicPage {
     pub media: Vec<String>,
     pub thread: Vec<ThreadPart>,
     pub details: String,
+    /// Whether the page offers a newsletter sign-up (`POST /public/pages/{code}/subscribe`).
+    pub newsletter: bool,
     pub published_at: DateTime<FixedOffset>,
     /// Where the post is live: one per published target of the page's published posts.
     pub links: Vec<PageLink>,
@@ -105,6 +107,27 @@ async fn published(
         .order_by_asc(posts::Column::Id)
         .all(db)
         .await
+}
+
+/// The page with `code`, its team and its published posts, when the public route serves it:
+/// the page is enabled, the team has public pages on and a post of it is published.
+pub(super) async fn live(
+    db: &impl ConnectionTrait,
+    code: String,
+) -> Result<Option<(post_pages::Model, teams::Model, Vec<posts::Model>)>, DbErr> {
+    let page = post_pages::Entity::find()
+        .filter(post_pages::Column::Code.eq(code))
+        .filter(post_pages::Column::Enabled.eq(true))
+        .one(db)
+        .await?;
+    let Some(page) = page else { return Ok(None) };
+    let team = teams::Entity::find_by_id(page.team_id)
+        .filter(teams::Column::PublicPages.eq(true))
+        .one(db)
+        .await?;
+    let Some(team) = team else { return Ok(None) };
+    let rows = published(db, team.id, page.subject).await?;
+    Ok((!rows.is_empty()).then_some((page, team, rows)))
 }
 
 async fn page_json(
@@ -257,21 +280,9 @@ async fn public(
     }
     let db = &app.db;
     let found = async {
-        let page = post_pages::Entity::find()
-            .filter(post_pages::Column::Code.eq(code))
-            .filter(post_pages::Column::Enabled.eq(true))
-            .one(db)
-            .await?;
-        let Some(page) = page else { return Ok(None) };
-        let team = teams::Entity::find_by_id(page.team_id)
-            .filter(teams::Column::PublicPages.eq(true))
-            .one(db)
-            .await?;
-        let Some(team) = team else { return Ok(None) };
-        let mut rows = published(db, team.id, page.subject).await?;
-        if rows.is_empty() {
+        let Some((page, team, mut rows)) = live(db, code).await? else {
             return Ok(None);
-        }
+        };
         let targets = post_targets::Entity::find()
             .filter(post_targets::Column::PostId.is_in(rows.iter().map(|p| p.id)))
             .filter(post_targets::Column::Status.eq("published"))
@@ -297,6 +308,7 @@ async fn public(
             media: serde_json::from_value(first.media).unwrap_or_default(),
             thread: serde_json::from_value(first.thread).unwrap_or_default(),
             details: page.details,
+            newsletter: team.newsletter,
             published_at: first.published_at.unwrap_or(first.updated_at),
             links,
         }))

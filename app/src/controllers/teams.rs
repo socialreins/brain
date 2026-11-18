@@ -54,6 +54,8 @@ pub struct Team {
     pub code: String,
     /// Posts of this team may have a public page (`PUT /posts/{id}/page`).
     pub public_pages: bool,
+    /// Public pages offer a newsletter sign-up (`GET /subscribers`).
+    pub newsletter: bool,
     /// The caller's role: `owner`, `admin` or `member`.
     pub role: String,
 }
@@ -103,6 +105,8 @@ pub struct TeamChange {
     pub name: Option<String>,
     /// Whether posts may have a public page. Absent: unchanged.
     pub public_pages: Option<bool>,
+    /// Whether public pages offer a newsletter sign-up. Absent: unchanged.
+    pub newsletter: Option<bool>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -146,6 +150,7 @@ pub(crate) fn team_json(team: &teams::Model, role: Role) -> Team {
         name: team.name.clone(),
         code: team.code.clone(),
         public_pages: team.public_pages,
+        newsletter: team.newsletter,
         role: role.as_str().into(),
     }
 }
@@ -495,8 +500,8 @@ async fn show(t: InTeam) -> Response {
     Json(team_json(&t.team, t.role)).into_response()
 }
 
-/// Renames the current team (`name`) or switches its public pages (`public_pages`). Owners and
-/// admins only.
+/// Renames the current team (`name`) or switches its public pages (`public_pages`) or their
+/// newsletter sign-up (`newsletter`). Owners and admins only.
 #[utoipa::path(patch, path = "/team", tag = "teams", request_body = TeamChange,
     responses((status = 200, body = Team), (status = 401, body = Error),
         (status = 403, body = Error), (status = 422, body = Error)))]
@@ -522,6 +527,9 @@ async fn rename(
     }
     if let Some(on) = body.public_pages {
         row.public_pages = Set(on);
+    }
+    if let Some(on) = body.newsletter {
+        row.newsletter = Set(on);
     }
     match teams::Entity::update(row).exec(&app.db).await {
         Ok(team) => Json(team_json(&team, t.role)).into_response(),

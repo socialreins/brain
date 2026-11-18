@@ -12,6 +12,8 @@ pub struct Model {
     pub code: String,
     /// Posts of this team may have a public page (`post_pages`).
     pub public_pages: bool,
+    /// Public pages offer a newsletter sign-up (`subscribers`).
+    pub newsletter: bool,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }

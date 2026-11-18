@@ -37,6 +37,12 @@ cargo run -p socialreins-brain
   `GET /v1/public/pages/{code}` takes no sign-in (`page_limiter`, per IP) and is a `404` until the
   page is enabled, the team has pages on and a post of the subject is `published`; never return
   ids, errors, first comments or unpublished versions from it.
+- `app/src/controllers/subscribers.rs`: newsletter sign-ups from public pages. `teams.newsletter`
+  (`PATCH /v1/team`, owner or admin) puts an email box on live pages; `POST /v1/public/pages/{code}/subscribe`
+  stores `subscribers (team_id, email)` unconfirmed and mails a link (once an hour per email, 20 a day per IP,
+  200 per team, 500 overall) to the web app, which posts its token to `POST /v1/public/newsletter/verify`.
+  Same reply for a known email. `GET /v1/subscribers` and `DELETE /v1/subscribers/{id}` are for owners and
+  admins. Mail only confirmed rows; nothing but the confirmation is sent yet.
 - `app/src/controllers/admin.rs`: the admin console, `/v1/admin/*` (totals, users, teams, waitlist
   approve and delete, sign-up rules). Every handler takes the `Admin` extractor (`ADMIN_EMAILS`,
   session cookie only) and changing ones `FromWeb`; never return post bodies, tokens or
