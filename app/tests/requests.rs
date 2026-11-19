@@ -2639,14 +2639,42 @@ mod teams {
         assert_eq!(named(&slug).await.status_code(), 404);
         assert_eq!(named(&next).await.json::<Value>()["id"], team["id"]);
 
-        // Cleared with `null`; a released slug is free for another team at once.
+        // Cleared with `null`.
         let res = set_slug(&s, &owner, Value::Null).await;
         res.assert_status_ok();
         assert_eq!(res.json::<Value>()["slug"], Value::Null);
         assert_eq!(named(&next).await.status_code(), 404);
+        // A slug given up is kept from other teams for 30 days; its old team takes it back.
         let (_, other, _) = user(&s, &db).await;
+        for held in [&slug, &next] {
+            let res = set_slug(&s, &other, json!(held)).await;
+            assert_eq!(res.status_code(), 409, "{held}");
+            res.assert_json(&json!({"error": "slug_taken"}));
+        }
+        let res = set_slug(&s, &owner, json!(slug)).await;
+        assert_eq!(res.json::<Value>()["slug"], slug);
+        assert_eq!(named(&slug).await.json::<Value>()["id"], team["id"]);
+        // After the 30 days another team takes it, and the hold becomes theirs when they let go.
+        let aged = format!(
+            "UPDATE team_slug_holds SET released_at = now() - interval '30 days 1 minute' \
+             WHERE slug = '{next}'"
+        );
+        sea_orm::ConnectionTrait::execute_unprepared(&db, &aged)
+            .await
+            .unwrap();
         let res = set_slug(&s, &other, json!(next)).await;
         assert_eq!(res.json::<Value>()["slug"], next);
+        set_slug(&s, &other, Value::Null).await.assert_status_ok();
+        assert_eq!(set_slug(&s, &owner, json!(next)).await.status_code(), 409);
+        // A deleted team's slug is held the same way.
+        let gone = fresh_slug();
+        req(&s, Method::POST, "/v1/teams", &other)
+            .json(&json!({"name": "Short lived"}))
+            .await;
+        set_slug(&s, &other, json!(gone)).await.assert_status_ok();
+        let res = req(&s, Method::DELETE, "/v1/team", &other).await;
+        assert_eq!(res.status_code(), 204);
+        assert_eq!(set_slug(&s, &owner, json!(gone)).await.status_code(), 409);
 
         let doc = s.get("/openapi.json").await.json::<Value>();
         let schemas = &doc["components"]["schemas"];

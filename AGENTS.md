@@ -117,7 +117,8 @@ cargo run -p socialreins-brain
 - Team slugs (`teams.slug`, optional, set with `PATCH /v1/team`): `teams::team_by_code` is the
   one place a request's `X-Team` or `?team=` becomes a team, by `code` or by slug. A slug never
   equals a code (`rename` checks, `insert_team` draws again) and is unique on `lower(slug)`; the
-  code is permanent, the slug may change (5 times a day per team) and is free once given up.
+  code is permanent, the slug may change (5 times a day per team). One given up stops resolving at once and is
+  kept from other teams for 30 days (`team_slug_holds`, written in the same transaction).
 - `app/src/webhooks.rs`: outbound webhooks. Every `post_targets` status change goes through
   `webhooks::with_event`, so its event is queued in the same statement; README documents the
   payload and signature.

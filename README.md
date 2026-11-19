@@ -234,8 +234,10 @@ with `reason` one of `reserved`, `length`, `characters` (checked in that order).
 is another team's slug or any team's code is `409 {"error":"slug_taken"}`, and no new team is
 given a code that is a slug. A team changes its slug (a set or a clear) at most 5 times a day,
 then `429 {"error":"slug_changed_too_often"}`; refused changes and sending the slug it already
-has do not count. A slug a team gives up is free for any team at once, and old links by that
-slug stop working (`404`), so link by code where a link must last. Everything else is keyed by
+has do not count. A slug a team gives up (by changing or clearing it, or when the team is
+deleted) stops naming the team at once: old links by it are `404`, so link by code where a link
+must last. For 30 days after that no other team can take it (`409 slug_taken`), so an old link
+never lands on another team; the team that had it may take it back at any time. Everything else is keyed by
 the team's id: API tokens, posts and connections do not notice a slug change.
 
 Teams: every sign-in gives a user with no team a personal team named after the first word of

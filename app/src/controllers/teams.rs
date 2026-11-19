@@ -45,6 +45,9 @@ const INVITES_PER_EMAIL: i64 = 20;
 const INVITES_PER_TEAM: i64 = 50;
 const INVITES_PER_INVITER: i64 = 50;
 const SLUG_CHANGES_PER_TEAM: i64 = 5;
+/// Keeps slug `$1` for team `$2` alone for 30 days from now (`team_slug_holds`).
+const HOLD: &str = "INSERT INTO team_slug_holds (slug, team_id) VALUES ($1, $2) \
+    ON CONFLICT (slug) DO UPDATE SET team_id = excluded.team_id, released_at = now()";
 
 #[derive(Serialize, ToSchema)]
 pub struct Team {
@@ -529,7 +532,9 @@ async fn show(t: InTeam) -> Response {
 /// its `slug`. Owners and admins only. A bad slug is `422 invalid_slug` with a `reason`
 /// (`length`, `characters` or `reserved`); one that is another team's slug or any team's code is
 /// `409 slug_taken`; a team changes its slug at most 5 times a day (`429
-/// slug_changed_too_often`). A slug given up is free for any team at once.
+/// slug_changed_too_often`). A slug given up (changed, cleared, or its team deleted) stops
+/// naming the team at once and stays `409 slug_taken` for every other team for 30 days; the
+/// team that had it may take it back any time.
 #[utoipa::path(patch, path = "/team", tag = "teams", request_body = TeamChange,
     responses((status = 200, body = Team), (status = 401, body = Error),
         (status = 403, body = Error), (status = 409, body = Error),
@@ -582,11 +587,34 @@ async fn rename(
                     "slug_changed_too_often",
                 )));
             }
-            let sql = "SELECT 1 FROM teams WHERE code = $1 OR (lower(slug) = $1 AND id <> $2)";
-            let values = [slug.clone().into(), t.team.id.into()];
-            let stmt = Statement::from_sql_and_values(DbBackend::Postgres, sql, values);
-            if slug.is_some() && txn.query_one_raw(stmt).await?.is_some() {
-                return Ok(Err((StatusCode::CONFLICT, "slug_taken")));
+            let raw = |sql: &str, values: [sea_orm::Value; 2]| {
+                Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
+            };
+            let id = t.team.id;
+            // Locked, so the slug held back below is the one this change replaces.
+            let before = teams::Entity::find_by_id(id)
+                .lock_exclusive()
+                .one(&txn)
+                .await?;
+            if let Some(new) = &slug {
+                let sql = "SELECT 1 FROM teams WHERE code = $1 OR (lower(slug) = $1 AND id <> $2) \
+                    UNION ALL SELECT 1 FROM team_slug_holds WHERE slug = $1 AND team_id <> $2 \
+                    AND released_at > now() - interval '30 days'";
+                let taken = raw(sql, [new.clone().into(), id.into()]);
+                if txn.query_one_raw(taken).await?.is_some() {
+                    return Ok(Err((StatusCode::CONFLICT, "slug_taken")));
+                }
+                // Its own hold, or one that ran out.
+                let sql = "DELETE FROM team_slug_holds WHERE slug = $1";
+                let free =
+                    Statement::from_sql_and_values(DbBackend::Postgres, sql, [new.clone().into()]);
+                txn.execute_raw(free).await?;
+            }
+            if let Some(old) = before
+                .and_then(|b| b.slug)
+                .filter(|old| Some(old) != slug.as_ref())
+            {
+                txn.execute_raw(raw(HOLD, [old.into(), id.into()])).await?;
             }
             row.slug = Set(slug);
         }
@@ -641,6 +669,12 @@ async fn destroy(_: FromWeb, State(app): State<AppState>, t: InTeam) -> Response
             .await?;
         if teams < 2 {
             return Ok(Some((StatusCode::CONFLICT, "last_team")));
+        }
+        // A deleted team's slug is held back like one it gave up.
+        if let Some(slug) = t.team.slug.clone() {
+            let values = [slug.into(), t.team.id.into()];
+            let hold = Statement::from_sql_and_values(DbBackend::Postgres, HOLD, values);
+            txn.execute_raw(hold).await?;
         }
         // API tokens go with the team through their cascading foreign key.
         teams::Entity::delete_by_id(t.team.id).exec(&txn).await?;
