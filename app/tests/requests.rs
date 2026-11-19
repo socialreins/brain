@@ -7775,6 +7775,7 @@ mod teams {
                     require(&s, &t.owner, true).await;
                     let held = scheduled(&s, &t.member, &t.set, &past()).await;
                     let released = scheduled(&s, &t.member, &t.set, &past()).await;
+                    let rejected = scheduled(&s, &t.member, &t.set, &past()).await;
                     let admins = scheduled(&s, &t.admin, &t.set, &past()).await;
                     let status = |id: String| {
                         let (s, cookie) = (&s, t.member.clone());
@@ -7798,13 +7799,34 @@ mod teams {
                     publish::tick(&state).await.unwrap();
                     assert_eq!(status(held).await, "published");
 
-                    // Switching the requirement off releases what still waits.
+                    // Switching the requirement off releases what is pending, never a rejection.
                     assert_eq!(status(released.clone()).await, "scheduled");
+                    decide(&s, &t.owner, &format!("posts/{rejected}"), "reject")
+                        .await
+                        .assert_status_ok();
                     require(&s, &t.owner, false).await;
                     publish::tick(&state).await.unwrap();
                     let p = get_post(&s, &t.member, &released).await;
                     assert_eq!(p["status"], "published", "{p}");
                     assert_eq!(p["approval"], "pending", "the value stays, unread");
+                    assert_eq!(
+                        status(rejected.clone()).await,
+                        "scheduled",
+                        "still rejected"
+                    );
+                    for cookie in [&t.member, &t.owner] {
+                        let path = format!("/v1/posts/{rejected}/publish");
+                        let res = req(&s, Method::POST, &path, cookie).await;
+                        assert_eq!(res.status_code(), 403, "{}", res.text());
+                        res.assert_json(&json!({"error": "approval_required"}));
+                    }
+                    // An edit with the switch off clears the rejection, and the post goes out.
+                    let res = req(&s, Method::PUT, &format!("/v1/posts/{rejected}"), &t.member)
+                        .json(&input(&t.set, "edited", Some(&past())))
+                        .await;
+                    assert_eq!(res.json::<Value>()["approval"], Value::Null);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(status(rejected).await, "published");
                 }
 
                 #[tokio::test]
@@ -7836,7 +7858,31 @@ mod teams {
                     );
                     // A manager publishes anything, and so does a member once the switch is off.
                     assert_eq!(publish(&t.admin, &draft).await.status_code(), 202);
-                    assert_eq!(settled(&s, &t.admin, &draft).await["status"], "published");
+                    let p = settled(&s, &t.admin, &draft).await;
+                    assert_eq!(p["status"], "published");
+                    assert_eq!(p["approval"], Value::Null, "a draft had none: {p}");
+                    // Publishing a pending post approves it, so no published post is pending.
+                    let waiting = scheduled(&s, &t.member, &t.set, &soon()).await;
+                    let res = publish(&t.admin, &waiting).await;
+                    assert_eq!(res.status_code(), 202, "{}", res.text());
+                    let p = res.json::<Value>();
+                    assert_eq!(p["approval"], "approved", "{p}");
+                    assert_eq!(p["approval_by"], t.admin_id.as_str());
+                    assert!(p["approval_at"].is_string(), "{p}");
+                    assert_eq!(settled(&s, &t.admin, &waiting).await["status"], "published");
+                    let listed = s
+                        .get("/v1/posts?approval=pending")
+                        .add_header("cookie", &t.admin)
+                        .await;
+                    assert_eq!(listed.json::<Value>(), json!([]));
+                    // Nobody publishes a rejected one.
+                    let refused = scheduled(&s, &t.member, &t.set, &soon()).await;
+                    decide(&s, &t.owner, &format!("posts/{refused}"), "reject")
+                        .await
+                        .assert_status_ok();
+                    let res = publish(&t.owner, &refused).await;
+                    assert_eq!(res.status_code(), 403, "{}", res.text());
+                    res.assert_json(&json!({"error": "approval_required"}));
                     let other = scheduled(&s, &t.member, &t.set, &soon()).await;
                     assert_eq!(publish(&t.member, &other).await.status_code(), 403);
                     require(&s, &t.owner, false).await;

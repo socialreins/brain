@@ -93,7 +93,8 @@ pub struct Post {
     /// Ties the posts of one `POST /post-groups` call; `null` for a single post.
     pub group_id: Option<Uuid>,
     /// `pending`, `approved` or `rejected` for a `scheduled` post saved while its team required
-    /// approval, else `null`. A `pending` or `rejected` post is held back while the team does.
+    /// approval, else `null`. A `rejected` post is never published; a `pending` one is held back
+    /// while the team requires approval.
     pub approval: Option<String>,
     /// The note of the last approval or rejection.
     pub approval_note: Option<String>,
@@ -2000,7 +2001,9 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) 
 /// claimed (`queued`) and sent in the background. `202` with the queued post; poll it for the
 /// result. At most 10 publish or take-down calls a minute per user; with scheduled posts, at
 /// most 100 published a day per team (`429 publish_quota`). While the team requires approval, a
-/// member publishes only an `approved` post: anything else is `403 approval_required`.
+/// member publishes only an `approved` post: anything else is `403 approval_required`, as is a
+/// `rejected` post for anyone, whatever the team requires. A manager's or a token's publish of a
+/// `pending` post approves it.
 #[utoipa::path(post, path = "/posts/{id}/publish", tag = "posts",
     security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 202, body = Post), (status = 401, body = Error),
@@ -2014,18 +2017,29 @@ async fn publish_now(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>
         let Some(post) = find(&app.db, &a, id).await? else {
             return Ok(Err(not_found()));
         };
+        // A rejection outlives the switch and binds managers too: approve or edit it first.
         let held = a.team.require_approval && !a.role.manages();
-        if held && post.approval.as_deref() != Some("approved") {
+        let approval = post.approval.as_deref();
+        if approval == Some("rejected") || (held && approval != Some("approved")) {
             return Ok(Err(reply(StatusCode::FORBIDDEN, "approval_required")));
         }
+        // A manager publishing a `pending` post approves it.
+        let manages = a.role.manages();
         // The claim and its hit of the daily cap (shared with scheduled publishes) commit
         // together. `quota_reserved = $2` keeps a stale read from skipping the reserve.
         let claim = Statement::from_sql_and_values(
             DbBackend::Postgres,
             "UPDATE posts p SET status = 'queued', quota_reserved = true, \
-             scheduled_at = now(), updated_at = now() \
+             scheduled_at = now(), updated_at = now(), \
+             approval = CASE WHEN $5 AND p.approval = 'pending' THEN 'approved' \
+                        ELSE p.approval END, \
+             approval_by = CASE WHEN $5 AND p.approval = 'pending' THEN $6 \
+                           ELSE p.approval_by END, \
+             approval_at = CASE WHEN $5 AND p.approval = 'pending' THEN now() \
+                           ELSE p.approval_at END \
              WHERE p.id = $1 AND p.status IN ('draft', 'scheduled') AND p.quota_reserved = $2 \
              AND ($3::uuid IS NULL OR p.social_set_id = $3) \
+             AND p.approval IS DISTINCT FROM 'rejected' \
              AND (NOT $4 OR p.approval = 'approved') \
              AND EXISTS (SELECT 1 FROM social_sets s \
                          WHERE s.id = p.social_set_id AND s.deleted_at IS NULL)",
@@ -2034,6 +2048,8 @@ async fn publish_now(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>
                 post.quota_reserved.into(),
                 a.set_id().into(),
                 held.into(),
+                manages.into(),
+                a.user_id.into(),
             ],
         );
         match publish::reserve_and(&app.db, a.team.id, post.quota_reserved, claim).await? {

@@ -101,7 +101,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET, PUT | `/v1/posts/{id}/page` | The post's public page, one per post or per group: `{"enabled","details","code","live"}` (`code` is `null` before the first save, `live` says whether the public route serves it now). `PUT {"enabled","details"}` saves it whatever the post's status and makes the permanent 10-character `code` the first time: `422 details_too_long` over 5000 characters, `422 public_pages_off` for `enabled: true` while the team has public pages off |
 | GET | `/v1/public/pages/{code}` | Public, no sign-in: `{"team","body","media","thread","details","published_at","links":[{"platform","url"}]}` from the first published post of the page, `links` from every published target. `404` unless the page is enabled, its team has public pages on and a post of it is `published`. `Cache-Control: public, max-age=60`; 120 requests a minute per IP |
 | POST | `/v1/post-groups` | One post per platform of a set in one call (`{"social_set_id","platforms","body","media","scheduled_at","queue","list_id","position","thread","first_comment","cover","tiktok","youtube","overrides":{"<platform>":{"body","media","thread","first_comment","cover","tiktok","youtube"}}}`; `platforms` defaults to those brain publishes to with a connected account; bodies up to 64 KiB): `201 {"group_id","posts","skipped"}`; `"queue": true` puts the whole group at one free slot of the queue; an invalid post creates nothing and its error names the `platform`, unless `"on_invalid":"skip"` (see "Validate only"). `?validate_only=true` checks without creating |
-| POST | `/v1/posts/{id}/publish` | Publish a draft or scheduled post now: `202` with the post `queued`; poll it for the result. `403 approval_required` for a member while the team requires approval, unless the post is `approved` |
+| POST | `/v1/posts/{id}/publish` | Publish a draft or scheduled post now: `202` with the post `queued`; poll it for the result. `403 approval_required` for a member while the team requires approval, unless the post is `approved`, and for anyone when the post is `rejected`. An owner's, admin's or token's publish of a `pending` post approves it |
 | POST | `/v1/posts/{id}/approve`, `/v1/posts/{id}/reject` | Approve or reject a `scheduled` post (optional `{"note"}`, trimmed, at most 500 characters, else `422 invalid_note`): `200` with the post. Owner, admin or a token that is not read-only (`403 forbidden` for a member); `409 not_awaiting_approval` unless the post is `scheduled` with an `approval`. See "Approvals" |
 | POST | `/v1/post-groups/{group_id}/approve`, `/v1/post-groups/{group_id}/reject` | The same for every `scheduled` post of a group that has an `approval`, all or none: `200 {"posts":[...]}` with the posts it changed, `409 not_awaiting_approval` when there is none |
 | GET, POST | `/v1/lists` | Post lists (ordered groups such as a series), or create one (`{"name","social_set_id"}`; no set means team-wide, or the token's own set for a set token) |
@@ -688,11 +688,15 @@ and `approval_at`.
   to `pending`, a manager's leaves it `approved`, and the note is cleared.
 - The scheduler skips a `scheduled` post that is `pending` or `rejected`. Once approved it goes
   out on the next round, even when its time has passed. A member cannot publish one now either
-  (`403 approval_required`).
-- Switching `require_approval` off releases every post still waiting: the scheduler stops
-  reading `approval`, so `pending` and `rejected` posts publish at their time (at once when it
-  has passed), and new saves set `approval: null`. A post scheduled before the switch went on
-  has `approval: null` and is never held.
+  (`403 approval_required`). An owner, admin or token that publishes a `pending` post now
+  approves it by doing so.
+- A rejection is final until someone acts on it: a `rejected` post is never published, by the
+  scheduler or by publish now (`403 approval_required` for anyone), whether or not the team
+  still requires approval. Approve it, or edit it (an edit sets `approval` again as above, so
+  with the switch off it becomes `null` and the post can go out).
+- Switching `require_approval` off releases every `pending` post: they publish at their time
+  (at once when it has passed), and new saves set `approval: null`. `rejected` posts stay held.
+  A post scheduled before the switch went on has `approval: null` and is never held.
 
 ## Local development
 
