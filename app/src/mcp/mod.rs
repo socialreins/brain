@@ -35,6 +35,7 @@ use crate::{
         lists::{self, AddPost, ListInput, Order},
         posts,
         posts::{PostGroupInput, PostInput, PostQuery},
+        queue::{self, QueueInput},
         social_sets::{self, ListQuery},
         waitlist::error,
         MAX_GROUP_BODY_BYTES,
@@ -56,6 +57,20 @@ struct UpdatePost {
 
 #[derive(Deserialize, JsonSchema)]
 struct NoArgs {}
+
+#[derive(Deserialize, JsonSchema)]
+struct SetId {
+    /// The social set.
+    id: Uuid,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SetQueue {
+    /// The social set.
+    id: Uuid,
+    #[serde(flatten)]
+    queue: QueueInput,
+}
 
 #[derive(Deserialize, JsonSchema)]
 struct ListId {
@@ -112,10 +127,12 @@ fn specs() -> Vec<(&'static str, &'static str, Value, bool)> {
     vec![
         ("list-social-sets", "The team's live social sets with their account ids, the default set first; `deleted: true` lists deleted sets still restorable. A set token sees only its set. Same as GET /v1/social-sets.", schema::<ListQuery>(), true),
         ("list-social-accounts", "The team's connected social accounts with their set ids. Same as GET /v1/connections.", schema::<NoArgs>(), true),
+        ("get-queue", "A social set's posting queue: its IANA time_zone, weekly slots (weekday 0 is Sunday, time HH:MM) and the next 10 free slot times. Same as GET /v1/social-sets/{id}/queue.", schema::<SetId>(), true),
+        ("set-queue", "Replaces a social set's posting queue: time_zone (IANA, default UTC) and up to 50 slots. Same as PUT /v1/social-sets/{id}/queue.", schema::<SetQueue>(), false),
         ("list-posts", "The team's posts by scheduled_at, filtered by set, status and a from/to window on scheduled_at. Same as GET /v1/posts.", schema::<PostQuery>(), true),
         ("get-post", "One post with its targets. Same as GET /v1/posts/{id}.", schema::<PostId>(), true),
-        ("create-post", "Creates a post: scheduled with scheduled_at, else draft. With validate_only nothing is created and the answer lists every problem. Same as POST /v1/posts.", schema::<Create<PostInput>>(), false),
-        ("create-post-group", "Creates one post per platform of a set (by default every platform with a connected account), with optional per-platform body and media overrides, tied by a group_id; any invalid post creates nothing, unless on_invalid is skip, which leaves that platform out and lists it in skipped. With validate_only nothing is created and the answer lists every problem of every platform. Same as POST /v1/post-groups.", schema::<Create<PostGroupInput>>(), false),
+        ("create-post", "Creates a post: scheduled with scheduled_at, or at the earliest free slot of the set's queue with queue: true, else draft. With validate_only nothing is created and the answer lists every problem. Same as POST /v1/posts.", schema::<Create<PostInput>>(), false),
+        ("create-post-group", "Creates one post per platform of a set (by default every platform with a connected account), with optional per-platform body and media overrides, tied by a group_id; queue: true schedules the whole group at one free slot of the set's queue; any invalid post creates nothing, unless on_invalid is skip, which leaves that platform out and lists it in skipped. With validate_only nothing is created and the answer lists every problem of every platform. Same as POST /v1/post-groups.", schema::<Create<PostGroupInput>>(), false),
         ("update-post", "Replaces a draft or scheduled post. Same as PUT /v1/posts/{id}.", schema::<UpdatePost>(), false),
         ("delete-post", "Deletes a draft or scheduled post, or takes a published one down. Same as DELETE /v1/posts/{id}.", schema::<PostId>(), false),
         ("list-lists", "The team's post lists (ordered groups of posts, such as a series), without their posts. Same as GET /v1/lists.", schema::<NoArgs>(), true),
@@ -183,6 +200,14 @@ async fn run(app: &AppState, a: &Actor, name: &str, v: Value) -> Option<Response
             None => invalid("invalid_query"),
         },
         "list-social-accounts" => connections::list_connections(app, a).await,
+        "get-queue" => match args::<SetId>(v) {
+            Some(q) => queue::get_queue(app, a, q.id).await,
+            None => invalid("invalid_body"),
+        },
+        "set-queue" => match args::<SetQueue>(v) {
+            Some(q) => queue::set_queue(app, a, q.id, q.queue).await,
+            None => invalid("invalid_body"),
+        },
         "list-posts" => match args(v) {
             Some(q) => posts::list_posts(app, a, q).await,
             None => invalid("invalid_query"),
