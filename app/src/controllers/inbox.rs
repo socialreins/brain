@@ -119,6 +119,8 @@ pub struct Item {
     pub story_id: Option<String>,
     /// The story's media link, as Meta gave it (it expires).
     pub story_url: Option<String>,
+    /// A DM that is a click on a quick reply button (Facebook, Instagram): its payload.
+    pub button_payload: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -238,6 +240,7 @@ async fn items_json(
             story_reply: i.story_reply,
             story_id: i.story_id,
             story_url: i.story_url,
+            button_payload: i.button_payload,
         })
         .collect())
 }

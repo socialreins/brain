@@ -119,13 +119,13 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | PUT, DELETE | `/v1/snippets/{id}` | Replace kind, name and body, checked as on create (`200`); delete (`204`) |
 | GET, POST | `/v1/inboxes` | The team's inboxes, the undeletable "All" first, each with `open_count` (its `open` items, follows left out; in the list only); create one (`{"name","filters":{"social_set_id"\|"account_ids","kinds","platforms","keywords","unanswered"}}`, owner, admin) |
 | PUT, DELETE | `/v1/inboxes/{id}` | Replace name and filters; delete (owner, admin; not "All") |
-| GET | `/v1/inboxes/{id}/items` | `?state=open\|done&kind=comment\|mention\|dm\|follow&q=&cursor=&limit=`: items newest first with their `replies`, and `next_cursor`. `q` (1 to 100 characters after trimming) searches the text and the author's name and handle, any case, `%` and `_` literal. `follow` items (new Bluesky followers, stored `done`) are listed only with `kind=follow`. A DM replying to an Instagram story has `story_reply: true` and `story_id`, `story_url` when Meta gave them |
+| GET | `/v1/inboxes/{id}/items` | `?state=open\|done&kind=comment\|mention\|dm\|follow&q=&cursor=&limit=`: items newest first with their `replies`, and `next_cursor`. `q` (1 to 100 characters after trimming) searches the text and the author's name and handle, any case, `%` and `_` literal. `follow` items (new Bluesky followers, stored `done`) are listed only with `kind=follow`. A DM replying to an Instagram story has `story_reply: true` and `story_id`, `story_url` when Meta gave them; a DM that is a click on a quick reply button has its `button_payload` |
 | GET, PATCH | `/v1/inbox-items/{id}` | One item; `{"state":"open"\|"done"}` (any member) |
 | POST | `/v1/inbox-items/{id}/reply` | `{"text"}` (any member): a public reply to a comment or mention, a DM for a DM; `422 {"error","message"}` when it cannot go (on Facebook and Instagram `meta_reconnect_required`, `meta_failed`, `outside_window`, `dm_unavailable`) |
-| GET, POST | `/v1/automations` | The team's automations; each with `runs: {"sent","skipped","failed","running","total","count","last_at"}` (`count` equals `total`); create one (`{"name","trigger","conditions","actions":[{"type":"send_dm"\|"reply_publicly","text"}],"active","fallback_public_reply"}`, owner, admin). Triggers: `comment_received` (conditions `social_set_id`\|`account_ids`, `post_remote_ids`, `keywords`, `first_per_author`; both actions), `mention_received` (scope, `keywords`; both actions), `dm_received` (scope, `keywords`, `first_message`: only the author's first DM ever stored on the account; `send_dm` in the conversation), `story_reply` (an Instagram DM replying to a story, which never runs `dm_received`; scope, `keywords`; `send_dm`) and `new_follower` (a Bluesky follow, once per follower per account ever: a refollow is stored but runs nothing; scope only; `send_dm`, skipped as `dm_not_allowed` when the follower takes no DMs). A condition or action the trigger does not take is `422 invalid_conditions` or `invalid_actions`; `fallback_public_reply` and `{page}` are for `comment_received` and `mention_received` only (`invalid_fallback`, `invalid_text`). Texts may hold `{name}` (the commenter's display name, else "there") and `{page}` (the address of the public page of the post the comment is under, counted as 100 characters); `{page}` needs a space, `(` or the start before it and a space, closing punctuation or the end after it, else `422 invalid_text`; an automation whose action holds `{page}` does not run (no run, no daily hit) on a comment whose post has no live page, and a fallback reply holding it is then `skipped` with `no_public_page` |
-| GET, PUT, DELETE | `/v1/automations/{id}` | One automation with its `runs` counts; replace it; delete it (owner, admin) |
-| POST | `/v1/automations/{id}/enable`, `/disable` | Switch it on (acts on items from then on) or off (owner, admin) |
-| GET | `/v1/automations/{id}/runs` | Its runs newest first (`?cursor=`): `sent`, `failed` or `skipped` with a `reason` and per-action `results` |
+| GET, POST | `/v1/automations` | The team's automations; each with `runs: {"sent","skipped","failed","running","waiting","total","count","last_at"}` (`count` equals `total`, `waiting` counts runs of a flow at a `wait`) and `steps` (null unless it is a flow, see Automation flows below); create one (`{"name","trigger","conditions","actions":[{"type":"send_dm"\|"reply_publicly","text"}],"active","fallback_public_reply"}`, owner, admin). Triggers: `comment_received` (conditions `social_set_id`\|`account_ids`, `post_remote_ids`, `keywords`, `first_per_author`; both actions), `mention_received` (scope, `keywords`; both actions), `dm_received` (scope, `keywords`, `first_message`: only the author's first DM ever stored on the account; `send_dm` in the conversation), `story_reply` (an Instagram DM replying to a story, which never runs `dm_received`; scope, `keywords`; `send_dm`), `button_clicked` (a click on a quick reply button on Facebook or Instagram, which never runs `dm_received` either; scope and `payloads`, 1 to 20 button payloads, required; `send_dm`) and `new_follower` (a Bluesky follow, once per follower per account ever: a refollow is stored but runs nothing; scope only; `send_dm`, skipped as `dm_not_allowed` when the follower takes no DMs). A condition or action the trigger does not take is `422 invalid_conditions` or `invalid_actions`; `fallback_public_reply` and `{page}` are for `comment_received` and `mention_received` only (`invalid_fallback`, `invalid_text`). Texts may hold `{name}` (the commenter's display name, else "there") and `{page}` (the address of the public page of the post the comment is under, counted as 100 characters); `{page}` needs a space, `(` or the start before it and a space, closing punctuation or the end after it, else `422 invalid_text`; an automation whose action holds `{page}` does not run (no run, no daily hit) on a comment whose post has no live page, and a fallback reply holding it is then `skipped` with `no_public_page` |
+| GET, PUT, DELETE | `/v1/automations/{id}` | One automation with its `runs` counts; replace it; delete it (owner, admin). Changing a flow's steps or deleting it ends its waiting runs |
+| POST | `/v1/automations/{id}/enable`, `/disable` | Switch it on (acts on items from then on) or off, which ends its waiting runs (owner, admin) |
+| GET | `/v1/automations/{id}/runs` | Its runs newest first (`?cursor=`): `sent`, `failed` or `skipped` with a `reason` and per-action `results`, or `running`, or `waiting` for a flow at a `wait`; `step_index` (a flow's step last tried, from 0, null without steps) and `resume_at` (when a `waiting` run goes on, else null) |
 
 `POST /v1/waitlist` answers `200 {"status":"ok"}` for a new email and for one already on the
 list, so it never reveals who signed up. A bad email gets `422 {"error":"invalid_email"}`. Each
@@ -595,6 +595,43 @@ fails it with the reset time from `x-rate-limit-reset` ("resets at 2026-11-04 12
 not retried."), and a `429` of type `usage-capped` says the usage cap is reached. A `403` shows X's
 own reason (for example duplicate content). A `401` is a dead token and asks for a reconnect.
 
+Automation flows: an automation holds either `actions` (all sent at once, as before) or `steps`,
+never both (`422 actions_and_steps`; neither is `invalid_actions`). `steps` is an ordered list
+of 1 to 10 of `{"type":"send_dm","text","buttons":[{"label","payload"}]}`,
+`{"type":"reply_publicly","text"}` and `{"type":"wait","minutes"}` (1 to 10080, 7 days). A flow
+never starts or ends with a `wait`, a step must be one the trigger takes (`reply_publicly` and
+`{page}` for `comment_received` and `mention_received` only), and `fallback_public_reply` is
+for `actions` only (`422 invalid_steps`, `invalid_text`, `invalid_fallback`). `buttons` are
+optional, at most 3, with a `label` of 1 to 20 characters (trimmed) and a `payload` of 1 to 64
+of `a-z`, `0-9`, `_` and `-`. A flow answers with `actions: []`; an automation with actions
+with `steps: null`.
+
+A run goes through the steps in order. At a `wait` it is stored `waiting` with `step_index`
+(the wait) and `resume_at`, and a tick every minute (`automations::tick`, its own advisory lock,
+100 runs a round) takes it up from the next step once that time has come. The first send that
+is skipped or fails (say `dm_not_allowed`, or `outside_window` when the wait outlasted Meta's
+24 hours) ends the run with that status and reason, and the later steps never run; a run whose
+every step went out is `sent`. `results` holds one entry per send tried, in order, and
+`step_index` the last step tried. An item still runs an automation once, and each step is
+claimed before it is sent and never retried: a run cut off mid-send fails as `interrupted`.
+The daily cap of 500 counts each send step, and a step past it ends the run `skipped:
+daily_cap`. Switching a flow off, changing its steps or deleting it ends its waiting runs
+(`skipped: automation_changed`; a delete removes them with the automation); switching it on
+again brings none back. A run also keeps the hash of the steps it started on
+(`automation_runs.steps_hash`) and checks it, and that the flow is on, before every step and
+before it parks, so a run caught mid-flight by a change ends the same way and never sends a
+step of the new list. The tick holds its lock for the claim only, starts the runs it took for
+at most 5 minutes and hands the rest back to `waiting`; a run taken up and never started is
+put back by the stuck-run sweep, not failed. On Facebook and Instagram a comment takes one private reply, so a second
+`send_dm` in a `comment_received` flow ends the run as `already_replied`.
+
+Buttons go out as quick replies on Messenger and Instagram (`title` the label, `payload` the
+payload). A click comes back through the webhook as a DM item with `button_payload`, and runs
+the `button_clicked` automations whose `payloads` hold it (conditions: the scope and
+`payloads`; `send_dm` only), never `dm_received` ones, like a story reply. Bluesky has no
+buttons: the labels follow the text as numbered lines ("1. Label"), and an answer there is an
+ordinary DM, so match it with a `dm_received` automation and `keywords`, not with a button.
+
 Meta (when `META_APP_ID` and `META_APP_SECRET` are set) connects Facebook Pages and the
 Instagram professional accounts linked to them with one Facebook Login, through the same OAuth
 checks as Threads (state cookie `sr_meta` scoped to `/connect/meta`). The dialog is
@@ -644,6 +681,9 @@ the person's last message; Instagram goes through its linked Page). An automatio
 on a comment is Meta's private reply (`recipient.comment_id`): within 7 days of the comment and
 once per comment. Neither is ever retried. Reasons not sent: `outside_window`, `already_replied`,
 `dm_unavailable` (these skip the DM and let the fallback public reply go), `rate_limited`.
+A message with `message.quick_reply.payload` (a click on a quick reply button) is stored as a DM
+with `button_payload` set (at most 200 characters); it runs `button_clicked` automations, not
+`dm_received` ones.
 Permissions: `pages_manage_metadata` (subscribe), `pages_read_user_content` and
 `pages_read_engagement` (comments), `pages_manage_engagement` (Facebook public reply),
 `pages_messaging` (Messenger messages and private replies), `instagram_manage_comments`

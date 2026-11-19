@@ -40,6 +40,7 @@ mod m20261129_000001_media_library;
 mod m20261130_000001_post_approvals;
 mod m20261201_000001_post_repeat;
 mod m20261202_000001_feeds;
+mod m20261203_000001_automation_flows;
 
 pub struct Migrator;
 
@@ -87,6 +88,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261130_000001_post_approvals::Migration),
             Box::new(m20261201_000001_post_repeat::Migration),
             Box::new(m20261202_000001_feeds::Migration),
+            Box::new(m20261203_000001_automation_flows::Migration),
             // inject-above (do not remove this comment)
         ]
     }

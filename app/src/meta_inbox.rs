@@ -4,8 +4,10 @@
 //! into `inbox_items` with the same unique key as Bluesky, so a repeated delivery adds nothing.
 //! `follow_up` then fills in what the webhook leaves out (a sender's name, an Instagram link)
 //! and runs automations on new items. An Instagram reply to a story (`message.reply_to.story`)
-//! is a `dm` with `story_reply` set: it runs `story_reply` automations, not `dm_received` ones. Replies and DMs go out through `send`, once, never
-//! retried.
+//! is a `dm` with `story_reply` set: it runs `story_reply` automations, not `dm_received` ones.
+//! A click on a quick reply button (`message.quick_reply.payload`) is a `dm` with
+//! `button_payload` set: it runs `button_clicked` automations, not `dm_received` ones either.
+//! Replies and DMs go out through `send`, once, never retried.
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 use sea_orm::ColumnTrait;
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, EntityTrait, QueryFilter, Statement};
@@ -18,7 +20,7 @@ use crate::{
         bluesky::{Author, InboxError},
         meta::To,
     },
-    inbox::{self, Fresh, Via},
+    inbox::{self, Button, Fresh, Via},
     models::{inbox_items, social_accounts},
     state::AppState,
 };
@@ -27,6 +29,8 @@ use crate::{
 const PRIVATE_REPLY_DAYS: i64 = 7;
 /// A message to a person works within 24 hours of their last message.
 const MESSAGE_HOURS: i64 = 24;
+/// Longest quick reply payload kept; ours are at most 64.
+const MAX_PAYLOAD_CHARS: usize = 200;
 
 fn sid(v: &Value) -> Option<String> {
     match v {
@@ -60,6 +64,7 @@ fn facebook_comment(v: &Value, entry_time: Option<i64>) -> Option<Fresh> {
         root: (Some(post.clone()), None),
         convo_id: None,
         story: None,
+        button_payload: None,
         author: Author {
             did: sid(&from["id"])?,
             display_name: sid(&from["name"]),
@@ -84,6 +89,7 @@ fn instagram_comment(v: &Value, entry_time: Option<i64>) -> Option<Fresh> {
         root: (Some(media), None),
         convo_id: None,
         story: None,
+        button_payload: None,
         author: Author {
             did: sid(&from["id"])?,
             handle: sid(&from["username"]),
@@ -115,8 +121,14 @@ fn message(m: &Value, entry_time: Option<i64>) -> Option<Fresh> {
     let story = story
         .is_object()
         .then(|| (sid(&story["id"]), sid(&story["url"])));
+    // A click on a quick reply: the payload the button was sent with, cut to what we store.
+    let button_payload = msg["quick_reply"]["payload"]
+        .as_str()
+        .filter(|p| !p.is_empty())
+        .map(|p| p.chars().take(MAX_PAYLOAD_CHARS).collect());
     Some(Fresh {
         story,
+        button_payload,
         kind: "dm",
         remote_id: mid,
         remote_cid: None,
@@ -346,14 +358,20 @@ async fn private_reply_sent(app: &AppState, item: Uuid) -> Result<bool, DbErr> {
 
 /// Sends `text` for `item` from a Facebook or Instagram `account`, once: a public reply under
 /// a comment, a private reply to a comment (a `Dm` for a comment: within 7 days, one per
-/// comment), or a DM to a person who wrote within 24 hours. The inner `Ok` is the sent id.
+/// comment), or a DM to a person who wrote within 24 hours. `buttons` go with a DM as quick
+/// replies. The inner `Ok` is the sent id.
 pub async fn send(
     app: &AppState,
     account: &social_accounts::Model,
     item: &inbox_items::Model,
     via: Via,
     text: &str,
+    buttons: &[Button],
 ) -> Result<Result<String, InboxError>, DbErr> {
+    let quick: Vec<(&str, &str)> = buttons
+        .iter()
+        .map(|b| (b.label.as_str(), b.payload.as_str()))
+        .collect();
     let instagram = account.provider == "instagram";
     // Instagram messages go out through the linked Page, like Facebook ones.
     let page = if instagram {
@@ -378,13 +396,13 @@ pub async fn send(
                 Err(InboxError::Invalid("already_replied"))
             } else {
                 let to = To::Comment(&item.remote_id);
-                app.meta.message(page, &token, to, text).await
+                app.meta.message(page, &token, to, text, &quick).await
             }
         }
         (Via::Dm, "dm") => {
             if in_message_window(app, account.id, &item.author_id).await? {
                 let to = To::Person(&item.author_id);
-                app.meta.message(page, &token, to, text).await
+                app.meta.message(page, &token, to, text, &quick).await
             } else {
                 Err(InboxError::Invalid("outside_window"))
             }

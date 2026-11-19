@@ -16313,6 +16313,146 @@ mod teams {
                     assert_eq!(runs_of(&s, &cookie, &story).await.len(), 1);
                 }
 
+                /// A flow's buttons go out as quick replies on Messenger and Instagram, and a
+                /// click comes back as a DM item carrying the payload: it runs `button_clicked`
+                /// automations and never `dm_received` ones.
+                #[tokio::test]
+                #[serial]
+                async fn buttons_are_quick_replies_and_a_click_runs_its_own_trigger() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    let (server, session) = (&s, &cookie);
+                    let make = |body: Value| async move {
+                        let res = req(server, Method::POST, "/v1/automations", session)
+                            .json(&body)
+                            .await;
+                        assert_eq!(res.status_code(), 201, "{}", res.text());
+                        res.json::<Value>()["id"].as_str().unwrap().to_owned()
+                    };
+                    let menu = make(json!({
+                        "name": "Menu", "trigger": "dm_received",
+                        "conditions": {"keywords": ["menu"]},
+                        "steps": [{"type": "send_dm", "text": "Pick one, {name}", "buttons": [
+                            {"label": "Pricing", "payload": "pricing"},
+                            {"label": "Talk to us", "payload": "human"}]}],
+                    }))
+                    .await;
+                    let pricing = make(json!({
+                        "name": "Pricing", "trigger": "button_clicked",
+                        "conditions": {"payloads": ["pricing"]},
+                        "actions": [{"type": "send_dm", "text": "From 9 a month"}],
+                    }))
+                    .await;
+                    let any_dm = make(json!({
+                        "name": "Any DM", "trigger": "dm_received",
+                        "actions": [{"type": "send_dm", "text": "Got it"}],
+                    }))
+                    .await;
+                    let settled = |r: &Vec<Value>, n: usize| {
+                        r.len() == n && r.iter().all(|run| run["status"] != "running")
+                    };
+                    // A moment ahead, so it comes after the automations were turned on.
+                    let ahead = |mut payload: Value| {
+                        payload["entry"][0]["messaging"][0]["timestamp"] =
+                            json!((now() + 5) * 1000);
+                        payload
+                    };
+                    let quick = json!({"text": "Pick one, Dana Doe", "quick_replies": [
+                        {"content_type": "text", "title": "Pricing", "payload": "pricing"},
+                        {"content_type": "text", "title": "Talk to us", "payload": "human"}]});
+                    let messages = |before: usize| {
+                        calls_since(before)
+                            .into_iter()
+                            .filter(|(path, _)| path == "101/messages")
+                            .map(|(_, form)| {
+                                let said: Value = serde_json::from_str(&form["message"]).unwrap();
+                                (form["recipient"].clone(), said)
+                            })
+                            .collect::<Vec<_>>()
+                    };
+
+                    // Messenger: the buttons ride on the message as quick replies.
+                    let before = calls_since(0).len();
+                    let asked = ahead(page_message("101", "m_menu", "777", "menu"));
+                    assert_eq!(deliver(&s, &asked).await.status_code(), 200);
+                    let got = until(|| async {
+                        Some(runs_of(&s, &cookie, &menu).await).filter(|r| settled(r, 1))
+                    })
+                    .await;
+                    assert_eq!(got[0]["status"], "sent", "{got:?}");
+                    assert_eq!(got[0]["step_index"], 0);
+                    until(|| async {
+                        Some(runs_of(&s, &cookie, &any_dm).await).filter(|r| settled(r, 1))
+                    })
+                    .await;
+                    let sent = messages(before);
+                    let with_buttons = sent.iter().find(|m| m.1 == quick);
+                    assert_eq!(
+                        with_buttons.map(|m| m.0.as_str()),
+                        Some(r#"{"id":"777"}"#),
+                        "{sent:?}"
+                    );
+                    // A message without buttons carries no quick replies.
+                    let plain = sent.iter().find(|m| m.1["text"] == "Got it").unwrap();
+                    assert_eq!(plain.1, json!({"text": "Got it"}));
+
+                    // The click: a DM item with the payload, which runs the button's automation
+                    // and not the ones for DMs.
+                    let before = calls_since(0).len();
+                    let mut click = ahead(page_message("101", "m_click", "777", "Pricing"));
+                    click["entry"][0]["messaging"][0]["message"]["quick_reply"] =
+                        json!({"payload": "pricing"});
+                    assert_eq!(deliver(&s, &click).await.status_code(), 200);
+                    let got = until(|| async {
+                        Some(runs_of(&s, &cookie, &pricing).await).filter(|r| settled(r, 1))
+                    })
+                    .await;
+                    assert_eq!(got[0]["status"], "sent", "{got:?}");
+                    assert!(got[0]["step_index"].is_null());
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    assert_eq!(runs_of(&s, &cookie, &any_dm).await.len(), 1);
+                    assert_eq!(runs_of(&s, &cookie, &menu).await.len(), 1);
+                    let sent = messages(before);
+                    assert_eq!(sent.len(), 1, "{sent:?}");
+                    assert_eq!(sent[0].1, json!({"text": "From 9 a month"}));
+                    let items = stored(&db, &team_id).await;
+                    let item = items.iter().find(|i| i.remote_id == "m_click").unwrap();
+                    assert_eq!(item.kind, "dm");
+                    assert_eq!(item.button_payload.as_deref(), Some("pricing"));
+                    let plain = items.iter().find(|i| i.remote_id == "m_menu").unwrap();
+                    assert_eq!(plain.button_payload, None);
+                    let all = all_inbox_id(&s, &cookie).await;
+                    let listed = inbox_items_of(&s, &cookie, &all).await;
+                    let shown = listed.iter().find(|i| i["remote_id"] == "m_click").unwrap();
+                    assert_eq!(shown["button_payload"], "pricing");
+
+                    // A click on a button no automation names runs nothing.
+                    let mut other = ahead(page_message("101", "m_click2", "777", "Talk to us"));
+                    other["entry"][0]["messaging"][0]["message"]["quick_reply"] =
+                        json!({"payload": "human"});
+                    assert_eq!(deliver(&s, &other).await.status_code(), 200);
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    assert_eq!(runs_of(&s, &cookie, &pricing).await.len(), 1);
+                    assert_eq!(runs_of(&s, &cookie, &any_dm).await.len(), 1);
+
+                    // Instagram: the same quick replies, through the linked Page.
+                    let before = calls_since(0).len();
+                    let mut asked = ahead(ig_message("1784", "ig_menu", "555"));
+                    asked["entry"][0]["messaging"][0]["message"]["text"] = json!("the menu?");
+                    assert_eq!(deliver(&s, &asked).await.status_code(), 200);
+                    until(|| async {
+                        Some(runs_of(&s, &cookie, &menu).await).filter(|r| settled(r, 2))
+                    })
+                    .await;
+                    let sent = messages(before);
+                    let with_buttons = sent.iter().find(|m| m.1["quick_replies"].is_array());
+                    let (to, said) = with_buttons.unwrap();
+                    assert_eq!(to, r#"{"id":"555"}"#);
+                    assert_eq!(said["text"], "Pick one, Ivy");
+                    assert_eq!(said["quick_replies"], quick["quick_replies"]);
+                }
+
                 async fn guide_automation(s: &TestServer, cookie: &str) -> String {
                     let res = req(s, Method::POST, "/v1/automations", cookie)
                         .json(&json!({
@@ -17373,6 +17513,722 @@ mod teams {
                         .len(),
                     0
                 );
+            }
+
+            /// A flow on `dm_received`.
+            fn flow(name: &str, steps: Value) -> Value {
+                json!({"name": name, "trigger": "dm_received", "steps": steps})
+            }
+
+            /// The inbox of `me` holding one DM, "start", from Flo in `convo`, a moment ahead so
+            /// it comes after the automations were made.
+            fn start_dm(me: &str, convo: &str) -> Value {
+                json!({
+                    "convos": [{"id": convo, "members": [{"did": me},
+                        {"did": "did:plc:flo", "handle": "flo.test", "displayName": "Flo"}],
+                        "lastMessage": {"sentAt": at(-6)}}],
+                    "messages": {convo: [dm("start1", "did:plc:flo", "start", &at(-5))]},
+                })
+            }
+
+            fn sent_to(convo: &str) -> Vec<String> {
+                SENT.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|m| m["convoId"] == convo)
+                    .map(|m| m["message"]["text"].as_str().unwrap().to_owned())
+                    .collect()
+            }
+
+            async fn exec(db: &DatabaseConnection, sql: &str) {
+                sea_orm::ConnectionTrait::execute_unprepared(db, sql)
+                    .await
+                    .unwrap();
+            }
+
+            /// Waiting runs other tests left behind go, so a tick takes up only this test's.
+            async fn no_waiting(db: &DatabaseConnection) {
+                exec(db, "DELETE FROM automation_runs WHERE status = 'waiting'").await;
+            }
+
+            /// Time cannot be faked, so the waits are cut short in the database.
+            async fn due(db: &DatabaseConnection) {
+                let sql = "UPDATE automation_runs SET resume_at = now() - interval '1 minute' \
+                           WHERE status = 'waiting'";
+                exec(db, sql).await;
+            }
+
+            async fn stats(s: &TestServer, cookie: &str, id: &str) -> Value {
+                let res = s
+                    .get(&format!("/v1/automations/{id}"))
+                    .add_header("cookie", cookie)
+                    .await;
+                res.assert_status_ok();
+                res.json::<Value>()["runs"].clone()
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn flows_are_checked() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, _, _, _) = owner(&s, &db).await;
+                let dm = |text: &str| json!({"type": "send_dm", "text": text});
+                let wait = |minutes: i64| json!({"type": "wait", "minutes": minutes});
+                let button = |label: &str, payload: &str| {
+                    json!([{"type": "send_dm", "text": "x",
+                        "buttons": [{"label": label, "payload": payload}]}])
+                };
+                let four = json!([{"type": "send_dm", "text": "x", "buttons": [
+                    {"label": "a", "payload": "a"}, {"label": "b", "payload": "b"},
+                    {"label": "c", "payload": "c"}, {"label": "d", "payload": "d"}]}]);
+                let eleven = json!(vec![dm("x"); 11]);
+                let clicked = |conditions: Value, key: &str, list: Value| {
+                    let mut body = json!({"name": "x", "trigger": "button_clicked",
+                        "conditions": conditions});
+                    body[key] = list;
+                    body
+                };
+                let many: Vec<String> = (0..21).map(|i| format!("p{i}")).collect();
+                for (body, code) in [
+                    // Either actions or steps.
+                    (
+                        json!({"name": "x", "trigger": "dm_received",
+                            "actions": [dm("x")], "steps": [dm("x")]}),
+                        "actions_and_steps",
+                    ),
+                    (
+                        json!({"name": "x", "trigger": "dm_received"}),
+                        "invalid_actions",
+                    ),
+                    // 1 to 10 steps, no wait first or last, waits of 1 to 10080 minutes.
+                    (flow("x", json!([])), "invalid_steps"),
+                    (flow("x", eleven), "invalid_steps"),
+                    (flow("x", json!([wait(5), dm("x")])), "invalid_steps"),
+                    (flow("x", json!([dm("x"), wait(5)])), "invalid_steps"),
+                    (flow("x", json!([wait(5)])), "invalid_steps"),
+                    (
+                        flow("x", json!([dm("x"), wait(0), dm("y")])),
+                        "invalid_steps",
+                    ),
+                    (
+                        flow("x", json!([dm("x"), wait(10081), dm("y")])),
+                        "invalid_steps",
+                    ),
+                    (
+                        flow("x", json!([dm("x"), wait(-1), dm("y")])),
+                        "invalid_body",
+                    ),
+                    (flow("x", json!([{"type": "like"}])), "invalid_body"),
+                    (
+                        flow("x", json!([{"type": "wait", "minutes": 5, "text": "x"}])),
+                        "invalid_body",
+                    ),
+                    // A step the trigger does not take, as with actions.
+                    (
+                        flow("x", json!([{"type": "reply_publicly", "text": "x"}])),
+                        "invalid_steps",
+                    ),
+                    (flow("x", json!([dm("see {page}")])), "invalid_text"),
+                    (flow("x", json!([dm(&"a".repeat(1001))])), "invalid_text"),
+                    (flow("x", json!([dm(" ")])), "invalid_text"),
+                    // A fallback reply is for actions only.
+                    (
+                        json!({"name": "x", "trigger": "comment_received", "steps": [dm("x")],
+                            "fallback_public_reply": "y"}),
+                        "invalid_fallback",
+                    ),
+                    // Buttons: at most 3, a label of 1 to 20, a payload of 1 to 64 of a-z0-9_-.
+                    (flow("x", four), "invalid_steps"),
+                    (flow("x", button(&"l".repeat(21), "p")), "invalid_steps"),
+                    (flow("x", button("  ", "p")), "invalid_steps"),
+                    (flow("x", button("Yes", "")), "invalid_steps"),
+                    (flow("x", button("Yes", "Not OK")), "invalid_steps"),
+                    (flow("x", button("Yes", &"p".repeat(65))), "invalid_steps"),
+                    (
+                        flow(
+                            "x",
+                            json!([{"type": "send_dm", "text": "x",
+                            "buttons": [{"label": "Yes", "payload": "yes", "url": "x"}]}]),
+                        ),
+                        "invalid_body",
+                    ),
+                    // A button on a public reply is unknown.
+                    (
+                        json!({"name": "x", "trigger": "comment_received", "steps": [
+                            {"type": "reply_publicly", "text": "x", "buttons": []}]}),
+                        "invalid_body",
+                    ),
+                    // `button_clicked`: payloads required, send_dm only, no keywords.
+                    (
+                        clicked(json!({}), "actions", json!([dm("x")])),
+                        "invalid_conditions",
+                    ),
+                    (
+                        clicked(json!({"payloads": ["Yes"]}), "actions", json!([dm("x")])),
+                        "invalid_conditions",
+                    ),
+                    (
+                        clicked(json!({"payloads": many}), "actions", json!([dm("x")])),
+                        "invalid_conditions",
+                    ),
+                    (
+                        clicked(
+                            json!({"payloads": ["yes"], "keywords": ["x"]}),
+                            "actions",
+                            json!([dm("x")]),
+                        ),
+                        "invalid_conditions",
+                    ),
+                    (
+                        clicked(
+                            json!({"payloads": ["yes"]}),
+                            "actions",
+                            json!([{"type": "reply_publicly", "text": "x"}]),
+                        ),
+                        "invalid_actions",
+                    ),
+                    (
+                        clicked(
+                            json!({"payloads": ["yes"]}),
+                            "steps",
+                            json!([{"type": "reply_publicly", "text": "x"}]),
+                        ),
+                        "invalid_steps",
+                    ),
+                    // Payloads are for `button_clicked` only.
+                    (
+                        json!({"name": "x", "trigger": "dm_received",
+                            "conditions": {"payloads": ["yes"]}, "actions": [dm("x")]}),
+                        "invalid_conditions",
+                    ),
+                ] {
+                    let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                        .json(&body)
+                        .await;
+                    assert_eq!(res.status_code(), 422, "{body}");
+                    assert_eq!(res.json::<Value>()["error"], code, "{body}");
+                }
+
+                // Ten steps with waits between, public replies where the trigger takes them.
+                let steps = json!([
+                    {"type": "reply_publicly", "text": "Sent you a DM, {name}"},
+                    {"type": "send_dm", "text": "Hi {name}", "buttons": [
+                        {"label": " Yes please ", "payload": "yes"},
+                        {"label": "No", "payload": "no-thanks_1"}]},
+                    wait(1), wait(10080), dm("3"), wait(5), dm("4"), wait(5), dm("5"), dm("6"),
+                ]);
+                let body = json!({"name": "Long", "trigger": "comment_received", "steps": steps});
+                let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                    .json(&body)
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let made = res.json::<Value>();
+                assert_eq!(made["actions"], json!([]));
+                assert!(made["fallback_public_reply"].is_null());
+                assert_eq!(made["steps"].as_array().unwrap().len(), 10);
+                // Labels are trimmed; a step without buttons shows none.
+                assert_eq!(
+                    made["steps"][1],
+                    json!({"type": "send_dm", "text": "Hi {name}", "buttons": [
+                        {"label": "Yes please", "payload": "yes"},
+                        {"label": "No", "payload": "no-thanks_1"}]})
+                );
+                assert_eq!(made["steps"][2], json!({"type": "wait", "minutes": 1}));
+                assert_eq!(made["steps"][4], json!({"type": "send_dm", "text": "3"}));
+                let id = made["id"].as_str().unwrap();
+                let res = s
+                    .get(&format!("/v1/automations/{id}"))
+                    .add_header("cookie", &cookie)
+                    .await;
+                assert_eq!(res.json::<Value>()["steps"], made["steps"]);
+
+                // An automation with actions has no steps, and a click trigger its payloads.
+                let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                    .json(&clicked(
+                        json!({"payloads": ["yes", "no", "yes"]}),
+                        "actions",
+                        json!([dm("x")]),
+                    ))
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let made = res.json::<Value>();
+                assert!(made["steps"].is_null());
+                assert_eq!(made["conditions"]["payloads"], json!(["no", "yes"]));
+                // Replacing swaps actions for steps, and back.
+                let id = made["id"].as_str().unwrap();
+                let res = req(&s, Method::PUT, &format!("/v1/automations/{id}"), &cookie)
+                    .json(&clicked(
+                        json!({"payloads": ["yes"]}),
+                        "steps",
+                        json!([dm("x")]),
+                    ))
+                    .await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                let saved = res.json::<Value>();
+                assert_eq!(saved["actions"], json!([]));
+                assert_eq!(saved["steps"], json!([dm("x")]));
+                let res = req(&s, Method::PUT, &format!("/v1/automations/{id}"), &cookie)
+                    .json(&clicked(
+                        json!({"payloads": ["yes"]}),
+                        "actions",
+                        json!([dm("y")]),
+                    ))
+                    .await;
+                let saved = res.json::<Value>();
+                assert!(saved["steps"].is_null(), "{saved}");
+                assert_eq!(saved["actions"], json!([dm("y")]));
+
+                // The contract is in the OpenAPI document.
+                let doc = s.get("/openapi.json").await.json::<Value>();
+                let schemas = &doc["components"]["schemas"];
+                for (schema, field) in [
+                    ("AutomationInput", "steps"),
+                    ("Automation", "steps"),
+                    ("Conditions", "payloads"),
+                    ("Button", "payload"),
+                    ("Run", "step_index"),
+                    ("Run", "resume_at"),
+                    ("RunStats", "waiting"),
+                ] {
+                    let found = &schemas[schema]["properties"][field];
+                    assert!(found.is_object(), "{schema}.{field}");
+                }
+                assert!(schemas["Step"].to_string().contains("minutes"));
+            }
+
+            /// A send, a wait and a send: the run waits at the wait and a tick takes it up once
+            /// its time has come. On Bluesky the buttons are numbered lines after the text.
+            #[tokio::test]
+            #[serial]
+            async fn a_flow_waits_and_goes_on_at_a_later_tick() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                no_waiting(&db).await;
+                let steps = json!([
+                    {"type": "send_dm", "text": "Hi {name}, want the guide?", "buttons": [
+                        {"label": "Yes please", "payload": "yes"},
+                        {"label": "No thanks", "payload": "no"}]},
+                    {"type": "wait", "minutes": 5},
+                    {"type": "send_dm", "text": "Still there, {name}?"},
+                ]);
+                let id = automation(&s, &cookie, flow("Guide", steps)).await;
+                let convo = format!("cv-wait-{me}");
+                set_inbox(&me, start_dm(&me, &convo));
+                ingest(&db, &state, &account).await;
+                ingest(&db, &state, &account).await;
+
+                let first = "Hi Flo, want the guide?\n1. Yes please\n2. No thanks";
+                assert_eq!(sent_to(&convo), [first]);
+                let got = runs(&s, &cookie, &id).await;
+                assert_eq!(got.len(), 1, "{got:?}");
+                assert_eq!(got[0]["status"], "waiting", "{got:?}");
+                assert_eq!(got[0]["step_index"], 1);
+                assert!(got[0]["reason"].is_null());
+                assert_eq!(got[0]["results"].as_array().unwrap().len(), 1);
+                assert_eq!(got[0]["results"][0]["status"], "sent");
+                let at: chrono::DateTime<Utc> =
+                    got[0]["resume_at"].as_str().unwrap().parse().unwrap();
+                let ahead = (at - Utc::now()).num_seconds();
+                assert!((240..=300).contains(&ahead), "{ahead}");
+                let counts = stats(&s, &cookie, &id).await;
+                assert_eq!(counts["waiting"], 1, "{counts}");
+                assert_eq!(counts["running"], 0);
+                assert_eq!(counts["sent"], 0);
+                assert_eq!(counts["total"], 1);
+                let res = s.get("/v1/automations").add_header("cookie", &cookie).await;
+                assert_eq!(res.json::<Value>()[0]["runs"], counts);
+
+                // Not due yet: a tick leaves it, and a stuck-run sweep does too.
+                socialreins_brain::automations::tick(&state).await.unwrap();
+                socialreins_brain::automations::recover_stuck(&db)
+                    .await
+                    .unwrap();
+                exec(
+                    &db,
+                    "UPDATE automation_runs SET updated_at = now() - interval '1 hour' \
+                           WHERE status = 'waiting'",
+                )
+                .await;
+                socialreins_brain::automations::recover_stuck(&db)
+                    .await
+                    .unwrap();
+                assert_eq!(runs(&s, &cookie, &id).await[0]["status"], "waiting");
+                assert_eq!(sent_to(&convo).len(), 1);
+
+                due(&db).await;
+                socialreins_brain::automations::tick(&state).await.unwrap();
+                assert_eq!(sent_to(&convo), [first, "Still there, Flo?"]);
+                let got = runs(&s, &cookie, &id).await;
+                assert_eq!(got[0]["status"], "sent", "{got:?}");
+                assert_eq!(got[0]["step_index"], 2);
+                assert!(got[0]["resume_at"].is_null());
+                let results = got[0]["results"].as_array().unwrap();
+                assert_eq!(results.len(), 2);
+                assert!(results
+                    .iter()
+                    .all(|r| r["type"] == "send_dm" && r["status"] == "sent"));
+                let counts = stats(&s, &cookie, &id).await;
+                assert_eq!(
+                    (&counts["waiting"], &counts["sent"]),
+                    (&json!(0), &json!(1))
+                );
+
+                // Nothing is left to take up.
+                socialreins_brain::automations::tick(&state).await.unwrap();
+                assert_eq!(sent_to(&convo).len(), 2);
+            }
+
+            /// A send that does not go out ends the run with its status and reason: the steps
+            /// after it never run.
+            #[tokio::test]
+            #[serial]
+            async fn a_flow_stops_at_the_first_send_that_does_not_go_out() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                no_waiting(&db).await;
+                let steps = json!([
+                    {"type": "send_dm", "text": "One"},
+                    {"type": "wait", "minutes": 1},
+                    {"type": "send_dm", "text": "BLOCKED two"},
+                    {"type": "wait", "minutes": 1},
+                    {"type": "send_dm", "text": "Three"},
+                ]);
+                let id = automation(&s, &cookie, flow("Stops", steps)).await;
+                let convo = format!("cv-stop-{me}");
+                set_inbox(&me, start_dm(&me, &convo));
+                ingest(&db, &state, &account).await;
+                assert_eq!(runs(&s, &cookie, &id).await[0]["status"], "waiting");
+                due(&db).await;
+                socialreins_brain::automations::tick(&state).await.unwrap();
+
+                let got = runs(&s, &cookie, &id).await;
+                assert_eq!(got[0]["status"], "skipped", "{got:?}");
+                assert_eq!(got[0]["reason"], "dm_not_allowed");
+                assert_eq!(got[0]["step_index"], 2);
+                assert!(got[0]["resume_at"].is_null());
+                let results = got[0]["results"].as_array().unwrap();
+                assert_eq!(results.len(), 2);
+                assert_eq!(results[0]["status"], "sent");
+                assert_eq!(results[1]["status"], "skipped");
+                due(&db).await;
+                socialreins_brain::automations::tick(&state).await.unwrap();
+                assert_eq!(sent_to(&convo), ["One"]);
+                assert_eq!(stats(&s, &cookie, &id).await["skipped"], 1);
+            }
+
+            /// Switching a flow off, changing its steps or deleting it ends its waiting runs.
+            #[tokio::test]
+            #[serial]
+            async fn waiting_runs_end_when_their_flow_is_switched_off_changed_or_deleted() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                no_waiting(&db).await;
+                let steps = |tag: &str| {
+                    json!([
+                        {"type": "send_dm", "text": format!("{tag} first")},
+                        {"type": "wait", "minutes": 30},
+                        {"type": "send_dm", "text": format!("{tag} second")},
+                    ])
+                };
+                let mut ids = Vec::new();
+                for tag in ["off", "edited", "deleted", "renamed"] {
+                    ids.push(automation(&s, &cookie, flow(tag, steps(tag))).await);
+                }
+                let convo = format!("cv-cancel-{me}");
+                set_inbox(&me, start_dm(&me, &convo));
+                ingest(&db, &state, &account).await;
+                assert_eq!(sent_to(&convo).len(), 4);
+                for id in &ids {
+                    assert_eq!(runs(&s, &cookie, id).await[0]["status"], "waiting");
+                }
+                let at = |id: &str| format!("/v1/automations/{id}");
+
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("{}/disable", at(&ids[0])),
+                    &cookie,
+                )
+                .await;
+                res.assert_status_ok();
+                let mut longer = steps("edited");
+                longer[1]["minutes"] = json!(31);
+                let res = req(&s, Method::PUT, &at(&ids[1]), &cookie)
+                    .json(&flow("edited", longer))
+                    .await;
+                res.assert_status_ok();
+                let res = req(&s, Method::DELETE, &at(&ids[2]), &cookie).await;
+                assert_eq!(res.status_code(), 204);
+                // A new name with the same steps changes nothing for its runs.
+                let res = req(&s, Method::PUT, &at(&ids[3]), &cookie)
+                    .json(&flow("still the same", steps("renamed")))
+                    .await;
+                res.assert_status_ok();
+
+                for id in &ids[..2] {
+                    let got = runs(&s, &cookie, id).await;
+                    assert_eq!(got[0]["status"], "skipped", "{got:?}");
+                    assert_eq!(got[0]["reason"], "automation_changed");
+                    assert_eq!(got[0]["step_index"], 1);
+                    assert!(got[0]["resume_at"].is_null());
+                    assert_eq!(stats(&s, &cookie, id).await["waiting"], 0);
+                }
+                assert_eq!(runs(&s, &cookie, &ids[3]).await[0]["status"], "waiting");
+
+                // Switching it on again brings nothing back.
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("{}/enable", at(&ids[0])),
+                    &cookie,
+                )
+                .await;
+                res.assert_status_ok();
+                due(&db).await;
+                socialreins_brain::automations::tick(&state).await.unwrap();
+                let sent = sent_to(&convo);
+                assert_eq!(sent.len(), 5, "{sent:?}");
+                assert_eq!(sent[4], "renamed second");
+                assert_eq!(runs(&s, &cookie, &ids[3]).await[0]["status"], "sent");
+            }
+
+            /// Two rounds at once take a waiting run only once, so its step goes out once.
+            #[tokio::test]
+            #[serial]
+            async fn a_step_runs_once_when_two_rounds_resume_at_once() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                no_waiting(&db).await;
+                let steps = json!([
+                    {"type": "send_dm", "text": "One"},
+                    {"type": "wait", "minutes": 1},
+                    {"type": "send_dm", "text": "Two"},
+                    {"type": "wait", "minutes": 1},
+                    {"type": "send_dm", "text": "Three"},
+                ]);
+                let id = automation(&s, &cookie, flow("Once", steps)).await;
+                let convo = format!("cv-once-{me}");
+                set_inbox(&me, start_dm(&me, &convo));
+                ingest(&db, &state, &account).await;
+                due(&db).await;
+                let (a, b) = tokio::join!(
+                    socialreins_brain::automations::resume_due(
+                        &state,
+                        socialreins_brain::automations::ROUND
+                    ),
+                    socialreins_brain::automations::resume_due(
+                        &state,
+                        socialreins_brain::automations::ROUND
+                    ),
+                );
+                assert_eq!(a.unwrap() + b.unwrap(), 1, "one round took the run");
+                assert_eq!(sent_to(&convo), ["One", "Two"]);
+                let got = runs(&s, &cookie, &id).await;
+                assert_eq!(got[0]["status"], "waiting", "{got:?}");
+                assert_eq!(got[0]["step_index"], 3);
+
+                // A run someone else moved on is left alone: its step was already claimed.
+                due(&db).await;
+                exec(
+                    &db,
+                    "UPDATE automation_runs SET step_index = 4 WHERE status = 'waiting'",
+                )
+                .await;
+                socialreins_brain::automations::resume_due(
+                    &state,
+                    socialreins_brain::automations::ROUND,
+                )
+                .await
+                .unwrap();
+                assert_eq!(sent_to(&convo), ["One", "Two"]);
+            }
+
+            /// A run never goes on with other steps than it started on, or after its flow was
+            /// switched off: not one that waits, and not one a round already took up.
+            #[tokio::test]
+            #[serial]
+            async fn a_run_never_goes_on_after_its_flow_changed() {
+                use socialreins_brain::models::automation_runs;
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                no_waiting(&db).await;
+                let steps = |tag: &str, last: &str| {
+                    json!([
+                        {"type": "send_dm", "text": format!("{tag} first")},
+                        {"type": "wait", "minutes": 30},
+                        {"type": "send_dm", "text": format!("{tag} {last}")},
+                    ])
+                };
+                let mut ids = Vec::new();
+                for tag in ["waits", "taken", "off", "parks"] {
+                    ids.push(automation(&s, &cookie, flow(tag, steps(tag, "second"))).await);
+                }
+                let convo = format!("cv-changed-{me}");
+                set_inbox(&me, start_dm(&me, &convo));
+                ingest(&db, &state, &account).await;
+                assert_eq!(sent_to(&convo).len(), 4);
+                let run_of = |id: &str| {
+                    let id: uuid::Uuid = id.parse().unwrap();
+                    let db = db.clone();
+                    async move {
+                        automation_runs::Entity::find()
+                            .filter(automation_runs::Column::AutomationId.eq(id))
+                            .one(&db)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                    }
+                };
+                assert!(run_of(&ids[0]).await.steps_hash.is_some());
+                // A round took these up (they are `running` at their wait) before the change.
+                let taken = format!(
+                    "UPDATE automation_runs SET status = 'running' WHERE automation_id IN \
+                     ('{}', '{}')",
+                    ids[1], ids[2]
+                );
+                exec(&db, &taken).await;
+                // And this one is mid-flight: its wait is claimed but it has not parked yet.
+                let flying = format!(
+                    "UPDATE automation_runs SET status = 'running', resume_at = NULL \
+                     WHERE automation_id = '{}'",
+                    ids[3]
+                );
+                exec(&db, &flying).await;
+                let at = |id: &str| format!("/v1/automations/{id}");
+                for id in [&ids[0], &ids[1], &ids[3]] {
+                    let res = req(&s, Method::PUT, &at(id), &cookie)
+                        .json(&flow("changed", steps("new", "step")))
+                        .await;
+                    res.assert_status_ok();
+                }
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("{}/disable", at(&ids[2])),
+                    &cookie,
+                )
+                .await;
+                res.assert_status_ok();
+
+                // The round goes on with what it took: nothing is sent.
+                for id in &ids[1..] {
+                    let run = run_of(id).await;
+                    assert_eq!(run.status, "running");
+                    socialreins_brain::automations::resume(&state, &run)
+                        .await
+                        .unwrap();
+                }
+                due(&db).await;
+                socialreins_brain::automations::tick(&state).await.unwrap();
+                assert_eq!(sent_to(&convo).len(), 4, "{:?}", sent_to(&convo));
+                for id in &ids {
+                    let got = runs(&s, &cookie, id).await;
+                    assert_eq!(got[0]["status"], "skipped", "{got:?}");
+                    assert_eq!(got[0]["reason"], "automation_changed");
+                    assert_eq!(got[0]["step_index"], 1);
+                    assert!(got[0]["resume_at"].is_null());
+                }
+
+                // Switched on again with its old steps, the ended run stays ended.
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("{}/enable", at(&ids[2])),
+                    &cookie,
+                )
+                .await;
+                res.assert_status_ok();
+                due(&db).await;
+                socialreins_brain::automations::tick(&state).await.unwrap();
+                assert_eq!(sent_to(&convo).len(), 4);
+            }
+
+            /// A round out of time hands the runs it did not start back, and a sweep for stuck
+            /// runs does the same for ones a dead round left: neither fails or sends them.
+            #[tokio::test]
+            #[serial]
+            async fn runs_a_round_did_not_start_wait_for_the_next() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                no_waiting(&db).await;
+                let steps = json!([
+                    {"type": "send_dm", "text": "One"},
+                    {"type": "wait", "minutes": 1},
+                    {"type": "send_dm", "text": "Two"},
+                ]);
+                let id = automation(&s, &cookie, flow("Queued", steps)).await;
+                let convo = format!("cv-queued-{me}");
+                set_inbox(&me, start_dm(&me, &convo));
+                ingest(&db, &state, &account).await;
+                due(&db).await;
+                let none = std::time::Duration::ZERO;
+                let took = socialreins_brain::automations::resume_due(&state, none).await;
+                assert_eq!(took.unwrap(), 1);
+                let got = runs(&s, &cookie, &id).await;
+                assert_eq!(got[0]["status"], "waiting", "{got:?}");
+                assert!(got[0]["resume_at"].is_string());
+                assert_eq!(sent_to(&convo), ["One"]);
+
+                // Taken up an hour ago by a round that died before starting it.
+                exec(
+                    &db,
+                    "UPDATE automation_runs SET status = 'running', \
+                           updated_at = now() - interval '1 hour' WHERE status = 'waiting'",
+                )
+                .await;
+                socialreins_brain::automations::recover_stuck(&db)
+                    .await
+                    .unwrap();
+                assert_eq!(runs(&s, &cookie, &id).await[0]["status"], "waiting");
+                socialreins_brain::automations::tick(&state).await.unwrap();
+                assert_eq!(sent_to(&convo), ["One", "Two"]);
+                assert_eq!(runs(&s, &cookie, &id).await[0]["status"], "sent");
+            }
+
+            /// Each send of a flow takes a hit of the team's daily cap.
+            #[tokio::test]
+            #[serial]
+            async fn the_daily_cap_counts_each_send_of_a_flow() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
+                no_waiting(&db).await;
+                let steps = json!([
+                    {"type": "send_dm", "text": "One"},
+                    {"type": "send_dm", "text": "Two"},
+                    {"type": "wait", "minutes": 1},
+                    {"type": "send_dm", "text": "Three"},
+                ]);
+                let id = automation(&s, &cookie, flow("Capped", steps)).await;
+                let convo = format!("cv-cap-{me}");
+                set_inbox(&me, start_dm(&me, &convo));
+                ingest(&db, &state, &account).await;
+                assert_eq!(sent_to(&convo), ["One", "Two"]);
+                let bucket = format!("automation:team:{team_id}");
+                let hits = || async {
+                    let stmt = sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Postgres,
+                        "SELECT count(*) AS n FROM rate_limit_hits WHERE bucket = $1",
+                        [bucket.clone().into()],
+                    );
+                    let row = sea_orm::ConnectionTrait::query_one_raw(&db, stmt).await;
+                    row.unwrap().unwrap().try_get::<i64>("", "n").unwrap()
+                };
+                assert_eq!(hits().await, 2, "one per send, none for the wait");
+
+                let fill = format!(
+                    "INSERT INTO rate_limit_hits (bucket) SELECT '{bucket}' \
+                     FROM generate_series(1, 498)"
+                );
+                exec(&db, &fill).await;
+                due(&db).await;
+                socialreins_brain::automations::tick(&state).await.unwrap();
+                let got = runs(&s, &cookie, &id).await;
+                assert_eq!(got[0]["status"], "skipped", "{got:?}");
+                assert_eq!(got[0]["reason"], "daily_cap");
+                assert_eq!(got[0]["step_index"], 3);
+                assert_eq!(got[0]["results"].as_array().unwrap().len(), 2);
+                assert_eq!(sent_to(&convo), ["One", "Two"]);
+                assert_eq!(hits().await, 500);
             }
 
             #[tokio::test]
