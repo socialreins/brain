@@ -11,12 +11,17 @@
 //! waits in order. A flow's run claims each step before it is sent (`claim_step`, which also
 //! takes the send's hit of the daily cap), so a step runs at most once; a `wait` parks the run
 //! as `waiting` and `tick` takes it up again once `resume_at` has come. The first send that
-//! does not go out ends the run.
+//! does not go out ends the run. A run keeps the hash of the steps it started on, and every
+//! claim and park checks it (`UNCHANGED`): once the automation is off, gone or has other
+//! steps, the run ends `skipped: automation_changed` instead of going on.
 use sea_orm::{
     sea_query::Query, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, DbErr,
     EntityTrait, QueryFilter, QueryOrder, Statement, TransactionTrait, Value,
 };
-use std::ops::Range;
+use std::{
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -53,6 +58,15 @@ const MAX_BUTTONS: usize = 3;
 /// Waiting runs one `tick` takes up.
 const RESUME_BATCH: i64 = 100;
 const FLOW_LOCK: i64 = 0x0046_4c4f_5753_5449;
+/// How long one round starts runs it took up; the rest go back to `waiting` for the next
+/// round. Well under `STUCK_MINUTES`, so a run queued behind slow sends is never called stuck.
+pub const ROUND: Duration = Duration::from_secs(300);
+/// Whether run `r` may go on: its automation is on and still has the steps the run started on,
+/// which are also the steps in hand (`$4`). The md5 of jsonb text is the same for equal JSON.
+const UNCHANGED: &str = "r.steps_hash = md5($4::jsonb::text) AND EXISTS (SELECT 1 \
+    FROM automations a WHERE a.id = r.automation_id AND a.active \
+    AND md5(a.steps::text) = r.steps_hash)";
+const CHANGED: &str = "automation_changed";
 /// Longest `{name}` put into a text.
 const MAX_NAME_CHARS: usize = 64;
 /// What `{page}` counts as when a text is checked.
@@ -421,8 +435,17 @@ fn sql(sql: &str, values: Vec<Value>) -> Statement {
 }
 
 /// Runs cut off mid-send fail as `interrupted`; they are never sent again. A `waiting` run is
-/// not one: only `running` ones are looked at.
+/// not one: only `running` ones are looked at, by when their step was last claimed
+/// (`updated_at`). A run a round took up and never started (`resume_at` still set) sent
+/// nothing for its next step, so it goes back to `waiting`.
 pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
+    let stmt = sql(
+        "UPDATE automation_runs SET status = 'waiting', updated_at = now() \
+         WHERE status = 'running' AND resume_at IS NOT NULL \
+         AND updated_at < now() - make_interval(mins => $1)",
+        vec![STUCK_MINUTES.into()],
+    );
+    db.execute_raw(stmt).await?;
     let stmt = sql(
         "UPDATE automation_runs SET status = 'failed', reason = 'interrupted', \
          updated_at = now() WHERE status = 'running' \
@@ -618,7 +641,9 @@ impl Flow<'_> {
         let db = &self.app.db;
         loop {
             let (via, template, buttons): (Via, &str, &[Button]) = match &self.steps[i] {
-                Step::Wait { minutes } => return park(db, run, *minutes, &results).await,
+                Step::Wait { minutes } => {
+                    return park(db, run, self.a, *minutes, &results).await;
+                }
                 Step::SendDm { text, buttons } => (Via::Dm, text, buttons),
                 Step::ReplyPublicly { text } => (Via::Public, text, &[]),
             };
@@ -649,39 +674,49 @@ impl Flow<'_> {
                 return settle(db, run, "sent", None, &results).await;
             };
             let sends = next.sends().is_some();
-            if !claim_step(db, run, self.a.team_id, i, sends, &results).await? {
+            if !claim_step(db, run, self.a, i, sends, &results).await? {
                 return Ok(());
             }
         }
     }
 }
 
-/// Moves a `running` run from step `i - 1` to step `i` and, for a send, takes its hit of the
-/// daily cap, in one transaction. `false` when the run is no longer there to go on (cut off,
-/// or taken by someone else) or the cap is reached (the run then ends `skipped: daily_cap`):
-/// the step must not run.
+/// Moves a `running` run from step `i - 1` to step `i` of `a.steps` and, for a send, takes its
+/// hit of the daily cap, in one transaction. `false` when the step must not run: the run is no
+/// longer there to go on (cut off, or taken by someone else), the automation is off, gone or
+/// has other steps (the run then ends `skipped: automation_changed`), or the cap is reached
+/// (`skipped: daily_cap`).
 async fn claim_step(
     db: &DatabaseConnection,
     run: Uuid,
-    team_id: Uuid,
+    a: &automations::Model,
     i: usize,
     sends: bool,
     results: &[ActionResult],
 ) -> Result<bool, DbErr> {
     let txn = db.begin().await?;
-    let stmt = sql(
-        "UPDATE automation_runs SET step_index = $2, results = $3, updated_at = now() \
-         WHERE id = $1 AND status = 'running' AND step_index = $2 - 1",
-        vec![
-            run.into(),
-            (i as i32).into(),
-            serde_json::json!(results).into(),
-        ],
+    let mut values: Vec<Value> = vec![
+        run.into(),
+        (i as i32).into(),
+        serde_json::json!(results).into(),
+    ];
+    // Still ours to move but not to go on with: it was the automation that changed.
+    let end = "UPDATE automation_runs SET status = 'skipped', reason = 'automation_changed', \
+               results = $3, resume_at = NULL, updated_at = now() \
+               WHERE id = $1 AND status = 'running' AND step_index = $2 - 1";
+    let end = sql(end, values.clone());
+    values.push(a.steps.clone().into());
+    let claim = format!(
+        "UPDATE automation_runs r SET step_index = $2, results = $3, resume_at = NULL, \
+         updated_at = now() WHERE r.id = $1 AND r.status = 'running' \
+         AND r.step_index = $2 - 1 AND {UNCHANGED}"
     );
-    if txn.execute_raw(stmt).await?.rows_affected() != 1 {
+    if txn.execute_raw(sql(&claim, values)).await?.rows_affected() != 1 {
+        txn.execute_raw(end).await?;
+        txn.commit().await?;
         return Ok(false);
     }
-    let cap = [(quota_bucket(team_id), RUNS_PER_DAY)];
+    let cap = [(quota_bucket(a.team_id), RUNS_PER_DAY)];
     if sends && reserve_in(&txn, &cap).await?.is_none() {
         settle(&txn, run, "skipped", Some("daily_cap".into()), results).await?;
         txn.commit().await?;
@@ -691,23 +726,30 @@ async fn claim_step(
     Ok(true)
 }
 
-/// Parks a run at its `wait` step: `waiting` until `minutes` from now.
+/// Parks a run at its `wait` step: `waiting` until `minutes` from now. A run whose automation
+/// changed since the step was claimed ends instead (`cancel_waiting` came before it parked).
 async fn park(
     db: &DatabaseConnection,
     run: Uuid,
+    a: &automations::Model,
     minutes: u32,
     results: &[ActionResult],
 ) -> Result<(), DbErr> {
-    let stmt = sql(
-        "UPDATE automation_runs SET status = 'waiting', results = $3, updated_at = now(), \
-         resume_at = now() + make_interval(mins => $2) WHERE id = $1 AND status = 'running'",
-        vec![
-            run.into(),
-            (minutes as i32).into(),
-            serde_json::json!(results).into(),
-        ],
+    let park = format!(
+        "UPDATE automation_runs r SET status = 'waiting', results = $3, updated_at = now(), \
+         resume_at = now() + make_interval(mins => $2) WHERE r.id = $1 \
+         AND r.status = 'running' AND {UNCHANGED}"
     );
-    db.execute_raw(stmt).await.map(|_| ())
+    let values = vec![
+        run.into(),
+        (minutes as i32).into(),
+        serde_json::json!(results).into(),
+        a.steps.clone().into(),
+    ];
+    if db.execute_raw(sql(&park, values)).await?.rows_affected() == 1 {
+        return Ok(());
+    }
+    settle(db, run, "skipped", Some(CHANGED.into()), results).await
 }
 
 /// Ends a `running` run.
@@ -719,8 +761,8 @@ async fn settle(
     results: &[ActionResult],
 ) -> Result<(), DbErr> {
     let stmt = sql(
-        "UPDATE automation_runs SET status = $2, reason = $3, results = $4, updated_at = now() \
-         WHERE id = $1 AND status = 'running'",
+        "UPDATE automation_runs SET status = $2, reason = $3, results = $4, resume_at = NULL, \
+         updated_at = now() WHERE id = $1 AND status = 'running'",
         vec![
             run.into(),
             status.into(),
@@ -732,7 +774,8 @@ async fn settle(
 }
 
 /// Ends the automation's waiting runs: it was switched off or its steps changed (deleting it
-/// deletes its runs). They are `skipped: automation_changed` and never go on.
+/// deletes its runs). They are `skipped: automation_changed` and never go on. A run that is
+/// `running` just then ends the same way at its next claim or park (`UNCHANGED`).
 pub async fn cancel_waiting(db: &impl ConnectionTrait, automation: Uuid) -> Result<(), DbErr> {
     let stmt = sql(
         "UPDATE automation_runs SET status = 'skipped', reason = 'automation_changed', \
@@ -743,7 +786,7 @@ pub async fn cancel_waiting(db: &impl ConnectionTrait, automation: Uuid) -> Resu
 }
 
 /// One round of flows: takes up the waiting runs that are due. Skips while another instance
-/// holds the lock.
+/// is taking its own. The lock and its transaction last for the claim only, never for a send.
 pub async fn tick(app: &AppState) -> Result<(), DbErr> {
     let lock = app.db.begin().await?;
     let row = lock
@@ -756,39 +799,63 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
         Some(r) => r.try_get("", "ok")?,
         None => false,
     };
-    if locked {
-        resume_due(app).await?;
-    }
-    lock.commit().await
+    let due = if locked {
+        claim_due(&lock).await?
+    } else {
+        Vec::new()
+    };
+    lock.commit().await?;
+    work(app, &due, ROUND).await;
+    Ok(())
 }
 
-/// Claims up to 100 waiting runs whose time has come (`running` again, in one statement, so
-/// two callers never take the same run) and runs each from its next step; how many it took.
-// shortcut: the claimed runs go one after another, so a round of slow sends over 15 minutes
-// would have `recover_stuck` fail the ones not started; run them a few at a time if rounds
-// ever get that long.
-pub async fn resume_due(app: &AppState) -> Result<usize, DbErr> {
+/// Moves up to 100 waiting runs whose time has come to `running`, in one statement, so two
+/// callers never take the same run. `resume_at` stays until the run's next step is claimed:
+/// it marks a run taken up and not started.
+async fn claim_due(db: &impl ConnectionTrait) -> Result<Vec<automation_runs::Model>, DbErr> {
     let stmt = sql(
-        "UPDATE automation_runs SET status = 'running', resume_at = NULL, updated_at = now() \
+        "UPDATE automation_runs SET status = 'running', updated_at = now() \
          WHERE id IN (SELECT id FROM automation_runs WHERE status = 'waiting' \
          AND resume_at <= now() ORDER BY resume_at LIMIT $1 FOR UPDATE SKIP LOCKED) \
          RETURNING *",
         vec![RESUME_BATCH.into()],
     );
-    let due = automation_runs::Entity::find()
+    automation_runs::Entity::find()
         .from_raw_sql(stmt)
-        .all(&app.db)
-        .await?;
-    for run in &due {
-        if let Err(e) = resume(app, run).await {
+        .all(db)
+        .await
+}
+
+/// Goes on with each claimed run, one after another, for `budget`; the runs it did not get
+/// to go back to `waiting` with their `resume_at`, for the next round.
+async fn work(app: &AppState, due: &[automation_runs::Model], budget: Duration) {
+    let started = Instant::now();
+    for run in due {
+        let done = if started.elapsed() < budget {
+            resume(app, run).await
+        } else {
+            let stmt = sql(
+                "UPDATE automation_runs SET status = 'waiting', updated_at = now() \
+                 WHERE id = $1 AND status = 'running' AND resume_at IS NOT NULL",
+                vec![run.id.into()],
+            );
+            app.db.execute_raw(stmt).await.map(|_| ())
+        };
+        if let Err(e) = done {
             tracing::error!(error = %e, run = %run.id, "automation run resume failed");
         }
     }
+}
+
+/// A round without the lock, with `budget` to start the runs it took; how many it took.
+pub async fn resume_due(app: &AppState, budget: Duration) -> Result<usize, DbErr> {
+    let due = claim_due(&app.db).await?;
+    work(app, &due, budget).await;
     Ok(due.len())
 }
 
-/// Goes on with a run `resume_due` claimed, from the step after its wait.
-async fn resume(app: &AppState, run: &automation_runs::Model) -> Result<(), DbErr> {
+/// Goes on with a run a round claimed, from the step after its wait.
+pub async fn resume(app: &AppState, run: &automation_runs::Model) -> Result<(), DbErr> {
     let db = &app.db;
     let results: Vec<ActionResult> =
         serde_json::from_value(run.results.clone()).unwrap_or_default();
@@ -812,28 +879,9 @@ async fn resume(app: &AppState, run: &automation_runs::Model) -> Result<(), DbEr
         .and_then(|s| serde_json::from_value::<Vec<Step>>(s).ok())
         .unwrap_or_default();
     let i = run.step_index.map_or(0, |i| i as usize + 1);
-    // Switching it off or changing its steps ends its waiting runs; this is for one that
-    // parked a moment after.
     let (Some(a), Some(item), Some(account), Some(next)) = (a, item, account, steps.get(i)) else {
-        return settle(
-            db,
-            run.id,
-            "skipped",
-            Some("automation_changed".into()),
-            &results,
-        )
-        .await;
+        return settle(db, run.id, "skipped", Some(CHANGED.into()), &results).await;
     };
-    if !a.active {
-        return settle(
-            db,
-            run.id,
-            "skipped",
-            Some("automation_changed".into()),
-            &results,
-        )
-        .await;
-    }
     let holds = steps
         .iter()
         .any(|s| s.sends().is_some_and(|s| s.1.contains("{page}")));
@@ -841,7 +889,8 @@ async fn resume(app: &AppState, run: &automation_runs::Model) -> Result<(), DbEr
         Some(post) if holds => pages::address(db, &app.web_url, item.team_id, post).await?,
         _ => None,
     };
-    if !claim_step(db, run.id, a.team_id, i, next.sends().is_some(), &results).await? {
+    // Also where a run ends whose automation was switched off or given other steps since.
+    if !claim_step(db, run.id, &a, i, next.sends().is_some(), &results).await? {
         return Ok(());
     }
     let flow = Flow {
@@ -868,7 +917,7 @@ async fn claim(
     let id = Uuid::now_v7();
     let stmt = sql(
         "INSERT INTO automation_runs (id, automation_id, inbox_item_id, team_id, status, \
-         step_index) VALUES ($1, $2, $3, $4, 'running', $5) \
+         step_index, steps_hash) VALUES ($1, $2, $3, $4, 'running', $5, md5($6::jsonb::text)) \
          ON CONFLICT (automation_id, inbox_item_id) DO NOTHING",
         vec![
             id.into(),
@@ -876,6 +925,7 @@ async fn claim(
             item.id.into(),
             a.team_id.into(),
             flow.then_some(0i32).into(),
+            a.steps.clone().into(),
         ],
     );
     if txn.execute_raw(stmt).await?.rows_affected() != 1 {

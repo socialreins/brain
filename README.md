@@ -617,7 +617,12 @@ claimed before it is sent and never retried: a run cut off mid-send fails as `in
 The daily cap of 500 counts each send step, and a step past it ends the run `skipped:
 daily_cap`. Switching a flow off, changing its steps or deleting it ends its waiting runs
 (`skipped: automation_changed`; a delete removes them with the automation); switching it on
-again brings none back. On Facebook and Instagram a comment takes one private reply, so a second
+again brings none back. A run also keeps the hash of the steps it started on
+(`automation_runs.steps_hash`) and checks it, and that the flow is on, before every step and
+before it parks, so a run caught mid-flight by a change ends the same way and never sends a
+step of the new list. The tick holds its lock for the claim only, starts the runs it took for
+at most 5 minutes and hands the rest back to `waiting`; a run taken up and never started is
+put back by the stuck-run sweep, not failed. On Facebook and Instagram a comment takes one private reply, so a second
 `send_dm` in a `comment_received` flow ends the run as `already_replied`.
 
 Buttons go out as quick replies on Messenger and Instagram (`title` the label, `payload` the

@@ -79,7 +79,8 @@ cargo run -p socialreins-brain
   waits). A flow's run claims each step before sending it (`claim_step`, with the send's hit of
   the daily cap), a `wait` parks it as `waiting`, and `automations::tick` (every minute, own
   advisory lock) takes due runs up through `resume_due`, whose one statement moves them back to
-  `running`. Never send a step without claiming it, and never retry one. A quick reply click is
+  `running`. Never send a step without claiming it, and never retry one. Every claim and park
+  checks `UNCHANGED` (the flow is on and has the steps the run started on, `steps_hash`). A quick reply click is
   a `dm` item with `button_payload` (`trigger_of`: `button_clicked`, never `dm_received`).
 - `app/src/controllers/queue.rs`: posting queues. `queue_schedules` holds one row per set (an IANA
   `time_zone`, `slots` as sorted minutes of the week, weekday 0 Sunday). `queue: true` on a create

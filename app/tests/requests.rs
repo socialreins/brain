@@ -18012,8 +18012,14 @@ mod teams {
                 ingest(&db, &state, &account).await;
                 due(&db).await;
                 let (a, b) = tokio::join!(
-                    socialreins_brain::automations::resume_due(&state),
-                    socialreins_brain::automations::resume_due(&state),
+                    socialreins_brain::automations::resume_due(
+                        &state,
+                        socialreins_brain::automations::ROUND
+                    ),
+                    socialreins_brain::automations::resume_due(
+                        &state,
+                        socialreins_brain::automations::ROUND
+                    ),
                 );
                 assert_eq!(a.unwrap() + b.unwrap(), 1, "one round took the run");
                 assert_eq!(sent_to(&convo), ["One", "Two"]);
@@ -18028,10 +18034,155 @@ mod teams {
                     "UPDATE automation_runs SET step_index = 4 WHERE status = 'waiting'",
                 )
                 .await;
-                socialreins_brain::automations::resume_due(&state)
+                socialreins_brain::automations::resume_due(
+                    &state,
+                    socialreins_brain::automations::ROUND,
+                )
+                .await
+                .unwrap();
+                assert_eq!(sent_to(&convo), ["One", "Two"]);
+            }
+
+            /// A run never goes on with other steps than it started on, or after its flow was
+            /// switched off: not one that waits, and not one a round already took up.
+            #[tokio::test]
+            #[serial]
+            async fn a_run_never_goes_on_after_its_flow_changed() {
+                use socialreins_brain::models::automation_runs;
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                no_waiting(&db).await;
+                let steps = |tag: &str, last: &str| {
+                    json!([
+                        {"type": "send_dm", "text": format!("{tag} first")},
+                        {"type": "wait", "minutes": 30},
+                        {"type": "send_dm", "text": format!("{tag} {last}")},
+                    ])
+                };
+                let mut ids = Vec::new();
+                for tag in ["waits", "taken", "off", "parks"] {
+                    ids.push(automation(&s, &cookie, flow(tag, steps(tag, "second"))).await);
+                }
+                let convo = format!("cv-changed-{me}");
+                set_inbox(&me, start_dm(&me, &convo));
+                ingest(&db, &state, &account).await;
+                assert_eq!(sent_to(&convo).len(), 4);
+                let run_of = |id: &str| {
+                    let id: uuid::Uuid = id.parse().unwrap();
+                    let db = db.clone();
+                    async move {
+                        automation_runs::Entity::find()
+                            .filter(automation_runs::Column::AutomationId.eq(id))
+                            .one(&db)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                    }
+                };
+                assert!(run_of(&ids[0]).await.steps_hash.is_some());
+                // A round took these up (they are `running` at their wait) before the change.
+                let taken = format!(
+                    "UPDATE automation_runs SET status = 'running' WHERE automation_id IN \
+                     ('{}', '{}')",
+                    ids[1], ids[2]
+                );
+                exec(&db, &taken).await;
+                // And this one is mid-flight: its wait is claimed but it has not parked yet.
+                let flying = format!(
+                    "UPDATE automation_runs SET status = 'running', resume_at = NULL \
+                     WHERE automation_id = '{}'",
+                    ids[3]
+                );
+                exec(&db, &flying).await;
+                let at = |id: &str| format!("/v1/automations/{id}");
+                for id in [&ids[0], &ids[1], &ids[3]] {
+                    let res = req(&s, Method::PUT, &at(id), &cookie)
+                        .json(&flow("changed", steps("new", "step")))
+                        .await;
+                    res.assert_status_ok();
+                }
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("{}/disable", at(&ids[2])),
+                    &cookie,
+                )
+                .await;
+                res.assert_status_ok();
+
+                // The round goes on with what it took: nothing is sent.
+                for id in &ids[1..] {
+                    let run = run_of(id).await;
+                    assert_eq!(run.status, "running");
+                    socialreins_brain::automations::resume(&state, &run)
+                        .await
+                        .unwrap();
+                }
+                due(&db).await;
+                socialreins_brain::automations::tick(&state).await.unwrap();
+                assert_eq!(sent_to(&convo).len(), 4, "{:?}", sent_to(&convo));
+                for id in &ids {
+                    let got = runs(&s, &cookie, id).await;
+                    assert_eq!(got[0]["status"], "skipped", "{got:?}");
+                    assert_eq!(got[0]["reason"], "automation_changed");
+                    assert_eq!(got[0]["step_index"], 1);
+                    assert!(got[0]["resume_at"].is_null());
+                }
+
+                // Switched on again with its old steps, the ended run stays ended.
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("{}/enable", at(&ids[2])),
+                    &cookie,
+                )
+                .await;
+                res.assert_status_ok();
+                due(&db).await;
+                socialreins_brain::automations::tick(&state).await.unwrap();
+                assert_eq!(sent_to(&convo).len(), 4);
+            }
+
+            /// A round out of time hands the runs it did not start back, and a sweep for stuck
+            /// runs does the same for ones a dead round left: neither fails or sends them.
+            #[tokio::test]
+            #[serial]
+            async fn runs_a_round_did_not_start_wait_for_the_next() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                no_waiting(&db).await;
+                let steps = json!([
+                    {"type": "send_dm", "text": "One"},
+                    {"type": "wait", "minutes": 1},
+                    {"type": "send_dm", "text": "Two"},
+                ]);
+                let id = automation(&s, &cookie, flow("Queued", steps)).await;
+                let convo = format!("cv-queued-{me}");
+                set_inbox(&me, start_dm(&me, &convo));
+                ingest(&db, &state, &account).await;
+                due(&db).await;
+                let none = std::time::Duration::ZERO;
+                let took = socialreins_brain::automations::resume_due(&state, none).await;
+                assert_eq!(took.unwrap(), 1);
+                let got = runs(&s, &cookie, &id).await;
+                assert_eq!(got[0]["status"], "waiting", "{got:?}");
+                assert!(got[0]["resume_at"].is_string());
+                assert_eq!(sent_to(&convo), ["One"]);
+
+                // Taken up an hour ago by a round that died before starting it.
+                exec(
+                    &db,
+                    "UPDATE automation_runs SET status = 'running', \
+                           updated_at = now() - interval '1 hour' WHERE status = 'waiting'",
+                )
+                .await;
+                socialreins_brain::automations::recover_stuck(&db)
                     .await
                     .unwrap();
+                assert_eq!(runs(&s, &cookie, &id).await[0]["status"], "waiting");
+                socialreins_brain::automations::tick(&state).await.unwrap();
                 assert_eq!(sent_to(&convo), ["One", "Two"]);
+                assert_eq!(runs(&s, &cookie, &id).await[0]["status"], "sent");
             }
 
             /// Each send of a flow takes a hit of the team's daily cap.

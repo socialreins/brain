@@ -564,6 +564,7 @@ async fn runs(
         let runs = rows
             .into_iter()
             .map(|r| Run {
+                resume_at: r.resume_at.filter(|_| r.status == "waiting"),
                 id: r.id,
                 automation_id: r.automation_id,
                 inbox_item_id: r.inbox_item_id,
@@ -571,7 +572,6 @@ async fn runs(
                 reason: r.reason,
                 results: serde_json::from_value(r.results).unwrap_or_default(),
                 step_index: r.step_index,
-                resume_at: r.resume_at,
                 created_at: r.created_at,
                 updated_at: r.updated_at,
             })
