@@ -12,8 +12,10 @@ use reqwest::{
     Url,
 };
 use sea_orm::{
-    sea_query::OnConflict, ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait, DbBackend,
-    DbErr, EntityTrait, QueryFilter, QuerySelect, Statement, TransactionTrait, Value,
+    sea_query::{NullOrdering, OnConflict},
+    ActiveValue::Set,
+    ColumnTrait, Condition, ConnectionTrait, DbBackend, DbErr, EntityTrait, Order, QueryFilter,
+    QueryOrder, QuerySelect, Statement, TransactionTrait, Value,
 };
 use serde_json::json;
 use socialreins_core::{post, team::Role, token};
@@ -166,7 +168,7 @@ impl Fetcher {
     /// The items of the feed at `url`, fetched without validators.
     pub async fn items(&self, url: &str) -> Result<Vec<Item>, String> {
         match self.get(url, None, None).await? {
-            Fetched::Body { bytes, .. } => parse(&bytes),
+            Fetched::Body { bytes, .. } => parsed(bytes).await,
             Fetched::NotModified => Err("HTTP 304".into()),
         }
     }
@@ -236,6 +238,39 @@ fn image_of(e: &feed_rs::model::Entry) -> Option<String> {
         .map(|(url, _)| url)
 }
 
+/// What a check fails with when the parser itself broke on a feed.
+pub const UNREADABLE: &str = "The feed could not be read";
+
+/// `work` on the blocking pool; a panic in it is `UNREADABLE`, not the end of the caller's task.
+async fn guarded<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let done = tokio::task::spawn_blocking(work).await;
+    done.unwrap_or_else(|_| Err(UNREADABLE.to_owned()))
+}
+
+/// `parse` off the async threads: a feed is someone else's megabyte of XML, and a parser bug
+/// it sets off must cost one failed check, never the scheduler's feed task.
+pub async fn parsed(bytes: Vec<u8>) -> Result<Vec<Item>, String> {
+    guarded(move || parse(&bytes)).await
+}
+
+/// `href` when it is an absolute `http` or `https` URL: the only links a post may carry, so a
+/// feed cannot put `javascript:`, `data:`, `ftp:` or a relative link in one.
+fn web(href: &str) -> Option<String> {
+    let url = Url::parse(href.trim()).ok()?;
+    matches!(url.scheme(), "http" | "https").then(|| url.to_string())
+}
+
+/// The page among `links` (not a file or the comments), when it is a web link.
+fn page_of(links: &[feed_rs::model::Link]) -> Option<String> {
+    let page = links.iter().find(|l| {
+        let rel = l.rel.as_deref();
+        rel.is_none() || rel == Some("alternate")
+    });
+    page.or(links.first()).and_then(|l| web(&l.href))
+}
+
 /// The items of an RSS or Atom document, in its order, each guid once.
 pub fn parse(bytes: &[u8]) -> Result<Vec<Item>, String> {
     let parser = feed_rs::parser::Builder::new()
@@ -245,19 +280,17 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<Item>, String> {
     let feed = parser
         .parse(bytes)
         .map_err(|_| "not an RSS or Atom feed".to_owned())?;
+    // What an item without a usable link of its own points to.
+    let site = page_of(&feed.links).unwrap_or_default();
     let mut known = HashSet::new();
     let mut items = Vec::new();
     for e in feed.entries {
         let image = image_of(&e);
         let title = e.title.map(|t| plain(&t.content)).unwrap_or_default();
-        // The page of the item, not a link to its file or its comments.
-        let page = e.links.iter().find(|l| {
-            let rel = l.rel.as_deref();
-            rel.is_none() || rel == Some("alternate")
-        });
-        let link = page.or(e.links.first()).map(|l| l.href.clone());
-        let link = link.unwrap_or_default();
-        let guid = [e.id.as_str(), &link, &title]
+        // As written, for the hash alone: what an item is known by is never posted.
+        let raw = e.links.first().map(|l| l.href.as_str()).unwrap_or_default();
+        let link = page_of(&e.links).unwrap_or_else(|| site.clone());
+        let guid = [e.id.as_str(), raw, &title]
             .into_iter()
             .find(|s| !s.is_empty());
         let Some(guid) = guid else {
@@ -539,7 +572,7 @@ pub async fn check(app: &AppState, feed: feeds::Model) -> Result<(), DbErr> {
             last_modified,
         }) => (bytes, etag, last_modified),
     };
-    let items = match parse(&bytes) {
+    let items = match parsed(bytes).await {
         Ok(items) => items,
         Err(reason) => return failed(db, feed.id, &reason).await,
     };
@@ -598,10 +631,20 @@ pub async fn check(app: &AppState, feed: feeds::Model) -> Result<(), DbErr> {
     db.execute_raw(sql(text, values)).await.map(|_| ())
 }
 
-/// One round: every active feed not checked for `EVERY_SECS`. Skips while another instance holds
-/// the lock.
-/// shortcut: one feed at a time, each 10 seconds at most to read; check several at once when
-/// a round nears 15 minutes.
+/// Feeds checked at once in a round.
+const AT_ONCE: usize = 8;
+/// How long a round starts checks for; feeds it did not reach wait for the next tick.
+const ROUND: Duration = Duration::from_secs(5 * 60);
+
+/// One round: the active feeds not checked for `EVERY_SECS`, the longest unchecked first (new
+/// ones before all), `AT_ONCE` at a time, so a slow feed holds up one place and not the round.
+/// No check starts after `ROUND`: what is left is first in the next round. Skips while another
+/// instance holds the lock.
+///
+/// The advisory lock is transaction-level, as in the other ticks, so this one transaction (one
+/// pool connection, idle) stays open for the round, which `ROUND` plus the last checks bounds.
+/// Nothing else waits on a feed with a connection in hand: `check` reads the feed before it
+/// asks the pool for anything, and each write is its own short statement or transaction.
 pub async fn tick(app: &AppState) -> Result<(), DbErr> {
     let lock = app.db.begin().await?;
     let row = lock
@@ -627,17 +670,39 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
                 .add(feeds::Column::LastCheckedAt.is_null())
                 .add(feeds::Column::LastCheckedAt.lte(before)),
         )
+        .order_by_with_nulls(
+            feeds::Column::LastCheckedAt,
+            Order::Asc,
+            NullOrdering::First,
+        )
         .into_tuple()
         .all(&app.db)
         .await?;
+    let until = tokio::time::Instant::now() + ROUND;
+    let mut running = tokio::task::JoinSet::new();
     for id in due {
-        let Some(feed) = claim(&app.db, id, EVERY_SECS, true).await? else {
-            continue;
-        };
-        if let Err(e) = check(app, feed).await {
-            tracing::warn!(error = %e, feed = %id, "feed check failed");
+        if running.len() >= AT_ONCE {
+            running.join_next().await;
         }
+        if tokio::time::Instant::now() >= until {
+            tracing::warn!("feed round out of time, the rest wait for the next");
+            break;
+        }
+        let app = app.clone();
+        running.spawn(async move {
+            let done = async {
+                match claim(&app.db, id, EVERY_SECS, true).await? {
+                    Some(feed) => check(&app, feed).await,
+                    None => Ok(()),
+                }
+            };
+            if let Err(e) = done.await {
+                tracing::warn!(error = %e, feed = %id, "feed check failed");
+            }
+        });
     }
+    // A check that panicked ends its own task only; the others and the round go on.
+    while running.join_next().await.is_some() {}
     lock.commit().await
 }
 
@@ -726,6 +791,64 @@ mod tests {
         );
         assert!(items[0].date.is_some());
         assert!(parse(b"<html><body>no feed</body></html>").is_err());
+    }
+
+    #[test]
+    fn only_absolute_web_links_reach_a_post() {
+        let rss = |site: &str, links: &[&str]| {
+            let items: String = links
+                .iter()
+                .enumerate()
+                .map(|(n, l)| {
+                    format!("<item><guid>g{n}</guid><title>T</title><link>{l}</link></item>")
+                })
+                .collect();
+            format!("<rss version=\"2.0\"><channel><title>B</title><link>{site}</link>{items}</channel></rss>")
+        };
+        let bad = [
+            "javascript:alert(1)",
+            "JavaScript:alert(1)",
+            "data:text/html,hi",
+            "ftp://blog.example/a",
+            "file:///etc/passwd",
+            "/posts/a",
+            "posts/a",
+            "//blog.example/a",
+            "blog.example/a",
+        ];
+        let mut links = bad.to_vec();
+        links.extend(["https://blog.example/a", " http://blog.example/b "]);
+        // A bad link falls back to the feed's site, a good one stays.
+        let items = parse(rss("https://blog.example/", &links).as_bytes()).unwrap();
+        assert_eq!(items.len(), links.len());
+        for (item, link) in items.iter().zip(&bad) {
+            assert_eq!(item.link, "https://blog.example/", "{link}");
+        }
+        assert_eq!(items[bad.len()].link, "https://blog.example/a");
+        assert_eq!(items[bad.len() + 1].link, "http://blog.example/b");
+        // With no web site link either, the item has no link at all.
+        for site in ["javascript:alert(1)", "/home", ""] {
+            let items = parse(rss(site, &bad).as_bytes()).unwrap();
+            assert_eq!(items.len(), bad.len());
+            assert!(items.iter().all(|i| i.link.is_empty()), "{site}");
+            let body = render("{title} {link}", "bluesky", &items[0]);
+            assert_eq!(body, "T ");
+        }
+        // An item is still known by the link it was written with, so each stays its own.
+        let two = parse(rss("", &["/a", "/b"]).as_bytes()).unwrap();
+        assert_ne!(two[0].hash, two[1].hash);
+    }
+
+    #[tokio::test]
+    async fn a_parser_panic_is_a_failed_read_not_a_dead_task() {
+        let broke: Result<(), String> = guarded(|| panic!("parser bug")).await;
+        assert_eq!(broke, Err(UNREADABLE.to_owned()));
+        assert_eq!(guarded(|| Ok(1)).await, Ok(1));
+        assert!(parsed(b"<rss version=\"2.0\"><channel/></rss>".to_vec())
+            .await
+            .is_ok());
+        let not = parsed(b"nope".to_vec()).await;
+        assert_eq!(not.err().as_deref(), Some("not an RSS or Atom feed"));
     }
 
     #[test]

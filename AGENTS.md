@@ -92,7 +92,9 @@ cargo run -p socialreins-brain
   `POST /feeds/{id}/check`) and `check` posts its new items, 5 a check and oldest first, through
   `posts::create_group_guarded`: the guard marks the item seen in the group's transaction, so
   an item never posts twice. A refused item is retried 3 times (`feed_items.failed`), 10 failed
-  reads in a row switch the feed off.
+  reads in a row switch the feed off. A round runs 8 checks at once within `ROUND` (5 minutes);
+  parsing runs in `spawn_blocking` (`parsed`), so a parser panic is a failed check; an item's
+  link is kept only as an absolute http(s) URL (`web`). Never read a feed inside a transaction.
 - Post approvals (`teams.require_approval`, `posts.approval*`): `posts::approval_for` is the one
   place a save decides the value (member `pending`, owner, admin or token `approved`, draft or
   switch off null), `publish::claim` never takes a `rejected` post and skips `pending` only while the team's

@@ -691,10 +691,16 @@ feed posts without anyone looking. A set token sees and writes the feeds of its 
   `422 feed_unreadable` with a short `reason` (`HTTP 404`, `timed out`, `over 1 MB`,
   `not an RSS or Atom feed`, ...). Every item it holds then is marked seen and never posted.
 - The scheduler checks each active feed every 15 minutes (`feeds::tick`, one instance at a time).
+  A round checks 8 feeds at once, the longest unchecked first, and starts no check after 5
+  minutes: feeds it did not reach are first in the next round.
   The read is as careful as a media download: public addresses only (names are resolved by
   brain, so a name pointing at a private address is refused), at most 3 redirects, each checked
   the same way, 10 seconds and 1 MB at most, and `If-None-Match` or `If-Modified-Since` when the
   feed gave an `ETag` or `Last-Modified`.
+- `{link}` is the item's link only when that is an absolute `http` or `https` URL; otherwise
+  the feed's own site link when that is one, else nothing. A `javascript:`, `data:`, `ftp:` or
+  relative link never reaches a post.
+- A feed the parser breaks on is a failed check (`The feed could not be read`), like any other.
 - An item is new when its guid (else its link) was not seen for this feed. A check posts at most
   5 new items, oldest first; the rest wait for the next check. Each becomes one post group of
   the feed's set and platforms: a `draft`, a post at the set's next free `queue` slot (a draft
