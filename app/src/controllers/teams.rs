@@ -650,7 +650,7 @@ async fn destroy(_: FromWeb, State(app): State<AppState>, t: InTeam) -> Response
         let txn = app.db.begin().await?;
         // The team row lock orders this against role changes (see `change_member`), so the
         // owner check below cannot be stale.
-        teams::Entity::find_by_id(t.team.id)
+        let locked = teams::Entity::find_by_id(t.team.id)
             .lock_exclusive()
             .one(&txn)
             .await?;
@@ -670,8 +670,9 @@ async fn destroy(_: FromWeb, State(app): State<AppState>, t: InTeam) -> Response
         if teams < 2 {
             return Ok(Some((StatusCode::CONFLICT, "last_team")));
         }
-        // A deleted team's slug is held back like one it gave up.
-        if let Some(slug) = t.team.slug.clone() {
+        // A deleted team's slug is held back like one it gave up: read under the lock, since a
+        // change may have landed after this request loaded the team.
+        if let Some(slug) = locked.and_then(|team| team.slug) {
             let values = [slug.into(), t.team.id.into()];
             let hold = Statement::from_sql_and_values(DbBackend::Postgres, HOLD, values);
             txn.execute_raw(hold).await?;
