@@ -262,8 +262,12 @@ async fn enrich_and_run(
     if let Some(token) = inbox::secret(app, account) {
         if item.kind == "dm" {
             if let Some(p) = app.meta.profile(instagram, &token, &item.author_id).await {
+                // The contact learns the name with the item.
                 let stmt = sql(
-                    "UPDATE inbox_items SET author_name = COALESCE($2, author_name), \
+                    "WITH c AS (UPDATE contacts SET display_name = COALESCE($2, display_name), \
+                     handle = COALESCE($3, handle), avatar_url = COALESCE($4, avatar_url) \
+                     WHERE id = (SELECT contact_id FROM inbox_items WHERE id = $1)) \
+                     UPDATE inbox_items SET author_name = COALESCE($2, author_name), \
                      author_handle = COALESCE($3, author_handle), \
                      author_avatar = COALESCE($4, author_avatar) WHERE id = $1 RETURNING *",
                     vec![

@@ -14,6 +14,10 @@
 //! does not go out ends the run. A run keeps the hash of the steps it started on, and every
 //! claim and park checks it (`UNCHANGED`): once the automation is off, gone or has other
 //! steps, the run ends `skipped: automation_changed` instead of going on.
+//!
+//! `tag_contact`, an action and a step, sends nothing: it adds a tag to the contact of the
+//! item's author (`inbox::add_tag`) and takes no hit of the daily cap. An automation still needs
+//! a send beside it.
 use sea_orm::{
     sea_query::Query, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, DbErr,
     EntityTrait, QueryFilter, QueryOrder, Statement, TransactionTrait, Value,
@@ -55,6 +59,8 @@ const STUCK_MINUTES: i32 = 15;
 pub const MAX_STEPS: usize = 10;
 pub const MAX_WAIT_MINUTES: u32 = 10_080;
 const MAX_BUTTONS: usize = 3;
+/// Most `tag_contact` actions beside an automation's sends.
+const MAX_TAG_ACTIONS: usize = 3;
 /// Waiting runs one `tick` takes up.
 const RESUME_BATCH: i64 = 100;
 const FLOW_LOCK: i64 = 0x0046_4c4f_5753_5449;
@@ -125,6 +131,22 @@ pub enum Action {
     SendDm { text: String },
     /// A reply under the comment or mention, at most 300 graphemes.
     ReplyPublicly { text: String },
+    /// Adds `tag` (1 to 30 characters, no commas; trimmed and lowercased) to the contact of
+    /// the item's author. Every trigger takes it. It sends nothing and costs no daily hit, and
+    /// does nothing when the contact has the tag or holds 20 already.
+    TagContact {
+        #[serde(deserialize_with = "tidy_tag")]
+        tag: String,
+    },
+}
+
+/// A tag as contacts keep one, trimmed and lowercased; `validate` refuses what is still not one.
+fn tidy_tag<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    String::deserialize(d).map(|t| t.trim().to_lowercase())
+}
+
+fn tag_ok(tag: &str) -> bool {
+    inbox::tag(tag).as_deref() == Some(tag)
 }
 
 impl Action {
@@ -132,13 +154,16 @@ impl Action {
         match self {
             Self::SendDm { .. } => "send_dm",
             Self::ReplyPublicly { .. } => "reply_publicly",
+            Self::TagContact { .. } => "tag_contact",
         }
     }
 
-    fn via_text(&self) -> (Via, &str) {
+    /// How a send goes out and its text; `None` for a `tag_contact`.
+    fn via_text(&self) -> Option<(Via, &str)> {
         match self {
-            Self::SendDm { text } => (Via::Dm, text),
-            Self::ReplyPublicly { text } => (Via::Public, text),
+            Self::SendDm { text } => Some((Via::Dm, text)),
+            Self::ReplyPublicly { text } => Some((Via::Public, text)),
+            Self::TagContact { .. } => None,
         }
     }
 }
@@ -158,6 +183,12 @@ pub enum Step {
     ReplyPublicly { text: String },
     /// The run stops here for 1 to 10080 minutes (7 days). Never the first or last step.
     Wait { minutes: u32 },
+    /// Adds `tag` to the contact of the item's author, as `Action::TagContact` does, and goes
+    /// on whatever came of it. Not a send: a flow needs a send step beside it.
+    TagContact {
+        #[serde(deserialize_with = "tidy_tag")]
+        tag: String,
+    },
 }
 
 impl Step {
@@ -166,15 +197,16 @@ impl Step {
             Self::SendDm { .. } => "send_dm",
             Self::ReplyPublicly { .. } => "reply_publicly",
             Self::Wait { .. } => "wait",
+            Self::TagContact { .. } => "tag_contact",
         }
     }
 
-    /// How a send step goes out, its text and its buttons; `None` for a wait.
+    /// How a send step goes out, its text and its buttons; `None` for a wait or a tag.
     fn sends(&self) -> Option<(Via, &str, &[Button])> {
         match self {
             Self::SendDm { text, buttons } => Some((Via::Dm, text, buttons)),
             Self::ReplyPublicly { text } => Some((Via::Public, text, &[])),
-            Self::Wait { .. } => None,
+            Self::Wait { .. } | Self::TagContact { .. } => None,
         }
     }
 }
@@ -246,7 +278,7 @@ fn longest(t: &str) -> String {
 }
 
 /// Checks a flow's shape, as `validate` checks actions, and trims its button labels: 1 to 10
-/// steps, no wait first or last (so at least one send), each step one the trigger takes.
+/// steps, no wait first or last, at least one send, each step one the trigger takes.
 pub fn validate_steps(
     trigger: &str,
     conditions: &mut Conditions,
@@ -254,7 +286,8 @@ pub fn validate_steps(
 ) -> Result<(), &'static str> {
     check_conditions(trigger, conditions)?;
     let wait = |s: Option<&Step>| matches!(s, Some(Step::Wait { .. }));
-    if steps.is_empty() || steps.len() > MAX_STEPS || wait(steps.first()) || wait(steps.last()) {
+    let sends = steps.iter().any(|s| s.sends().is_some());
+    if !sends || steps.len() > MAX_STEPS || wait(steps.first()) || wait(steps.last()) {
         return Err("invalid_steps");
     }
     for step in steps {
@@ -263,6 +296,7 @@ pub fn validate_steps(
                 return Err("invalid_steps");
             }
             Step::ReplyPublicly { .. } if !public(trigger) => return Err("invalid_steps"),
+            Step::TagContact { tag } if !tag_ok(tag) => return Err("invalid_steps"),
             Step::SendDm { buttons, .. } => {
                 for b in buttons.iter_mut() {
                     b.label = b.label.trim().to_owned();
@@ -310,17 +344,29 @@ pub fn validate(
     if !public && fallback.is_some() {
         return Err("invalid_fallback");
     }
-    if !public && actions.iter().any(|a| a.via_text().1.contains("{page}")) {
+    let sends = || actions.iter().filter_map(Action::via_text);
+    if !public && sends().any(|s| s.1.contains("{page}")) {
         return Err("invalid_text");
     }
-    let mut kinds: Vec<&str> = actions.iter().map(Action::kind).collect();
-    kinds.sort();
-    kinds.dedup();
-    if actions.is_empty() || kinds.len() != actions.len() {
+    // One or two sends, at most one of each type, and up to 3 tags, each once.
+    let mut tags: Vec<&str> = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::TagContact { tag } => Some(tag.as_str()),
+            _ => None,
+        })
+        .collect();
+    let (dms, tagged) = (sends().filter(|s| s.0 == Via::Dm).count(), tags.len());
+    tags.sort();
+    tags.dedup();
+    let sent = actions.len() - tagged;
+    if sent == 0 || dms > 1 || sent - dms > 1 {
         return Err("invalid_actions");
     }
-    for a in actions {
-        let (via, text) = a.via_text();
+    if tagged > MAX_TAG_ACTIONS || tags.len() != tagged || !tags.iter().all(|t| tag_ok(t)) {
+        return Err("invalid_actions");
+    }
+    for (via, text) in sends() {
         if !inbox::fits(via, &longest(text)) || !page_stands_alone(text) {
             return Err("invalid_text");
         }
@@ -584,7 +630,10 @@ pub async fn run(
         let holds = |t: &str| t.contains("{page}");
         let needed = match &steps {
             Some(steps) => steps.iter().any(|x| x.sends().is_some_and(|x| holds(x.1))),
-            None => actions.iter().any(|x| holds(x.via_text().1)),
+            None => actions
+                .iter()
+                .filter_map(Action::via_text)
+                .any(|x| holds(x.1)),
         };
         let wanted = needed || a.fallback_public_reply.as_deref().is_some_and(holds);
         let page = match item.post_id {
@@ -595,7 +644,11 @@ pub async fn run(
             tracing::info!(automation = %a.id, item = %item.id, "no public page, not run");
             continue;
         }
-        let Some(run_id) = claim(db, &a, item, steps.is_some()).await? else {
+        // The hit pays for the first send: a flow that starts on a tag has not sent yet.
+        let sends = steps
+            .as_ref()
+            .is_none_or(|s| s.first().is_some_and(|x| x.sends().is_some()));
+        let Some(run_id) = claim(db, &a, item, steps.is_some(), sends).await? else {
             continue;
         };
         if let Some(steps) = &steps {
@@ -644,6 +697,14 @@ impl Flow<'_> {
                 Step::Wait { minutes } => {
                     return park(db, run, self.a, *minutes, &results).await;
                 }
+                // Whatever came of it, the flow goes on.
+                Step::TagContact { tag } => {
+                    results.push(tag_contact(db, self.item, tag).await);
+                    if !self.step_on(run, &mut i, &results).await? {
+                        return Ok(());
+                    }
+                    continue;
+                }
                 Step::SendDm { text, buttons } => (Via::Dm, text, buttons),
                 Step::ReplyPublicly { text } => (Via::Public, text, &[]),
             };
@@ -669,15 +730,54 @@ impl Flow<'_> {
             if let Some(r) = stopped {
                 return settle(db, run, &r.status, r.reason, &results).await;
             }
-            i += 1;
-            let Some(next) = self.steps.get(i) else {
-                return settle(db, run, "sent", None, &results).await;
-            };
-            let sends = next.sends().is_some();
-            if !claim_step(db, run, self.a, i, sends, &results).await? {
+            if !self.step_on(run, &mut i, &results).await? {
                 return Ok(());
             }
         }
+    }
+
+    /// Moves `i` to the next step and claims it; `false` when the run is over: that was the
+    /// last step (the run ends `sent`), or the step must not run (`claim_step`).
+    async fn step_on(
+        &self,
+        run: Uuid,
+        i: &mut usize,
+        results: &[ActionResult],
+    ) -> Result<bool, DbErr> {
+        let db = &self.app.db;
+        *i += 1;
+        let Some(next) = self.steps.get(*i) else {
+            settle(db, run, "sent", None, results).await?;
+            return Ok(false);
+        };
+        claim_step(db, run, self.a, *i, next.sends().is_some(), results).await
+    }
+}
+
+/// Adds `tag` to the contact of the item's author, as a result: `done` when it was added,
+/// `skipped` when the contact has it already (`already_tagged`) or holds 20 (`tag_limit`).
+async fn tag_contact(
+    db: &DatabaseConnection,
+    item: &inbox_items::Model,
+    tag: &str,
+) -> ActionResult {
+    let added = match item.contact_id {
+        Some(contact) => inbox::add_tag(db, contact, tag).await,
+        None => Ok(Some("no_contact")),
+    };
+    let (status, reason) = match added {
+        Ok(None) => ("done", None),
+        Ok(Some(why)) => ("skipped", Some(why.to_owned())),
+        Err(e) => {
+            tracing::error!(error = %e, item = %item.id, "contact tag failed");
+            ("failed", Some("internal".to_owned()))
+        }
+    };
+    ActionResult {
+        kind: "tag_contact".into(),
+        status: status.into(),
+        reason,
+        remote_id: None,
     }
 }
 
@@ -904,14 +1004,16 @@ pub async fn resume(app: &AppState, run: &automation_runs::Model) -> Result<(), 
     flow.advance(run.id, i, results).await
 }
 
-/// Inserts the run and reserves its hit of the daily cap in one transaction. `None` when the
-/// item already has a run of this automation, or the cap is reached (the run is then stored
-/// `skipped: daily_cap`). A `flow`'s run starts at step 0, a send, which the hit pays for.
+/// Inserts the run and, when it `sends` first, reserves its hit of the daily cap in one
+/// transaction. `None` when the item already has a run of this automation, or the cap is
+/// reached (the run is then stored `skipped: daily_cap`). A `flow`'s run starts at step 0; a
+/// send there is what the hit pays for, and a later one takes its own (`claim_step`).
 async fn claim(
     db: &DatabaseConnection,
     a: &automations::Model,
     item: &inbox_items::Model,
     flow: bool,
+    sends: bool,
 ) -> Result<Option<Uuid>, DbErr> {
     let txn = db.begin().await?;
     let id = Uuid::now_v7();
@@ -932,7 +1034,7 @@ async fn claim(
         return Ok(None);
     }
     let cap = [(quota_bucket(a.team_id), RUNS_PER_DAY)];
-    if reserve_in(&txn, &cap).await?.is_none() {
+    if sends && reserve_in(&txn, &cap).await?.is_none() {
         let stmt = sql(
             "UPDATE automation_runs SET status = 'skipped', reason = 'daily_cap' WHERE id = $1",
             vec![id.into()],
@@ -948,11 +1050,12 @@ async fn claim(
 /// One action's outcome, as stored in a run's `results`.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq, Eq)]
 pub struct ActionResult {
-    /// `send_dm`, `reply_publicly` or `fallback_public_reply`. A flow's run holds one per send
-    /// step tried, in order; waits leave none.
+    /// `send_dm`, `reply_publicly`, `fallback_public_reply` or `tag_contact`. A flow's run
+    /// holds one per send and tag step tried, in order; waits leave none.
     #[serde(rename = "type")]
     pub kind: String,
-    /// `sent`, `failed` or `skipped`.
+    /// `sent`, `failed` or `skipped`; a `tag_contact` is `done` when the tag was added and
+    /// `skipped` (`already_tagged`, `tag_limit`) when there was nothing to add.
     pub status: String,
     /// Why it was not sent, e.g. `dm_not_allowed`, `no_dm_access`, `rate_limited`;
     /// `no_public_page` for a fallback reply holding `{page}` when the post has no live page; on Facebook
@@ -1019,7 +1122,12 @@ async fn act(
     let fallback = a.fallback_public_reply.as_deref();
     let mut results = Vec::new();
     for action in actions {
-        let (via, template) = action.via_text();
+        let Some((via, template)) = action.via_text() else {
+            if let Action::TagContact { tag } = action {
+                results.push(tag_contact(&app.db, item, tag).await);
+            }
+            continue;
+        };
         // Filled in before `render`, outside its ranges: the address must become a link.
         let Some(template) = with_page(template, page) else {
             results.push(no_page(action.kind()));
@@ -1073,17 +1181,19 @@ async fn act(
     results
 }
 
-/// The run's status from its results: `sent` when anything went, else `failed` when anything
-/// failed, else `skipped`; the reason is the first one given.
+/// The run's status from its sends (a `tag_contact` result says nothing of them): `sent` when
+/// anything went, else `failed` when anything failed, else `skipped`; the reason is the first
+/// one given.
 pub fn summary(results: &[ActionResult]) -> (&'static str, Option<String>) {
-    let status = if results.iter().any(|r| r.status == "sent") {
+    let sends = || results.iter().filter(|r| r.kind != "tag_contact");
+    let status = if sends().any(|r| r.status == "sent") {
         "sent"
-    } else if results.iter().any(|r| r.status == "failed") {
+    } else if sends().any(|r| r.status == "failed") {
         "failed"
     } else {
         "skipped"
     };
-    let reason = results.iter().find_map(|r| r.reason.clone());
+    let reason = sends().find_map(|r| r.reason.clone());
     (status, reason)
 }
 
@@ -1381,6 +1491,66 @@ mod tests {
             validate("comment_received", &mut c, &[dm()], Some(&f[1..])),
             Ok(())
         );
+        // Tags ride along with a send: up to 3, each once, written as contacts keep them.
+        let tag = |t: &str| -> Action {
+            serde_json::from_value(serde_json::json!({"type": "tag_contact", "tag": t})).unwrap()
+        };
+        assert_eq!(tag("  VIP "), Action::TagContact { tag: "vip".into() });
+        for t in TRIGGERS {
+            let mut c = Conditions {
+                payloads: vec!["yes".into()],
+                ..Conditions::default()
+            };
+            let c = if t == "button_clicked" {
+                &mut c
+            } else {
+                &mut Conditions::default()
+            };
+            assert_eq!(
+                validate(t, c, &[tag("a"), dm(), tag("b"), tag("c")], None),
+                Ok(()),
+                "{t}"
+            );
+        }
+        for bad in [
+            vec![tag("a")],
+            vec![dm(), tag("a"), tag("a")],
+            vec![dm(), tag("a"), tag("b"), tag("c"), tag("d")],
+            vec![dm(), tag("a,b")],
+            vec![dm(), tag(" ")],
+            vec![dm(), tag(&"a".repeat(31))],
+        ] {
+            assert_eq!(
+                validate("comment_received", &mut c, &bad, None),
+                Err("invalid_actions"),
+                "{bad:?}"
+            );
+        }
+        let mut steps: Vec<Step> = serde_json::from_value(serde_json::json!([
+            {"type": "tag_contact", "tag": " Lead "},
+            {"type": "send_dm", "text": "Hi"},
+            {"type": "wait", "minutes": 5},
+            {"type": "tag_contact", "tag": "waited"}]))
+        .unwrap();
+        assert_eq!(steps[0], Step::TagContact { tag: "lead".into() });
+        assert_eq!(validate_steps("new_follower", &mut c, &mut steps), Ok(()));
+        steps.remove(1);
+        assert_eq!(
+            validate_steps("new_follower", &mut c, &mut steps),
+            Err("invalid_steps"),
+            "a flow needs a send"
+        );
+        let mut bad = vec![
+            Step::TagContact { tag: "a,b".into() },
+            Step::SendDm {
+                text: "x".into(),
+                buttons: vec![],
+            },
+        ];
+        assert_eq!(
+            validate_steps("dm_received", &mut c, &mut bad),
+            Err("invalid_steps")
+        );
         let unknown = serde_json::json!([{"type": "send_dm", "text": "x", "extra": 1}]);
         assert!(serde_json::from_value::<Vec<Action>>(unknown).is_err());
         let wrong = serde_json::json!([{"type": "like"}]);
@@ -1409,5 +1579,11 @@ mod tests {
             r("reply_publicly", "failed", Some("bluesky_refused")),
         ];
         assert_eq!(summary(&broke).0, "failed");
+        // A tag that was added does not make a run whose DM never went `sent`.
+        let tagged = [
+            r("tag_contact", "done", None),
+            r("send_dm", "skipped", Some("no_dm_access")),
+        ];
+        assert_eq!(summary(&tagged), ("skipped", Some("no_dm_access".into())));
     }
 }

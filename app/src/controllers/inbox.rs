@@ -1,5 +1,5 @@
-//! Inboxes and their items, for the current team. Members read inboxes, reply to items and
-//! mark them done; owners and admins create, change and delete inboxes, as with sets. Every
+//! Inboxes and their items, for the current team. Members read inboxes, reply to items,
+//! mark them done and assign them; owners and admins create, change and delete inboxes, as with sets. Every
 //! team has an "All" inbox (made on first list) that cannot be changed or deleted.
 use std::collections::HashMap;
 
@@ -11,8 +11,8 @@ use axum::{
 };
 use chrono::{DateTime, FixedOffset, Utc};
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, DbErr, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait, Value,
+    sea_query::Expr, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, DbErr, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait, Value,
 };
 use serde::{Deserialize, Serialize};
 use socialreins_core::team;
@@ -22,13 +22,13 @@ use uuid::Uuid;
 
 use super::{
     auth::{internal, Body, FromWeb},
-    teams::InTeam,
+    teams::{present, InTeam},
     waitlist::{error, Error},
 };
 use crate::{
     connectors::bluesky::{self, InboxError},
     inbox::{self, filter_sql, Filters, Via},
-    models::{inbox_items, inbox_replies, inboxes, social_accounts, teams},
+    models::{inbox_items, inbox_replies, inboxes, social_accounts, team_user, teams, users},
     state::AppState,
 };
 
@@ -86,6 +86,13 @@ pub struct Reply {
     pub created_at: DateTime<FixedOffset>,
 }
 
+/// The member an item is assigned to.
+#[derive(Serialize, ToSchema)]
+pub struct Assignee {
+    pub id: Uuid,
+    pub name: String,
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct Item {
     pub id: Uuid,
@@ -121,6 +128,12 @@ pub struct Item {
     pub story_url: Option<String>,
     /// A DM that is a click on a quick reply button (Facebook, Instagram): its payload.
     pub button_payload: Option<String>,
+    /// The author's contact (`GET /contacts/{id}`).
+    pub contact_id: Option<Uuid>,
+    /// The contact's tags, by name.
+    pub contact_tags: Vec<String>,
+    /// The member it is assigned to; `null` for nobody.
+    pub assigned_to: Option<Assignee>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -141,6 +154,10 @@ pub struct ItemQuery {
     /// Case-insensitive search in the text and the author's name and handle, 1 to 100
     /// characters after trimming.
     pub q: Option<String>,
+    /// Only items whose author's contact has this tag.
+    pub tag: Option<String>,
+    /// Only items assigned to `me`, to nobody (`none`) or to the member with this user id.
+    pub assigned: Option<String>,
     /// `next_cursor` of the previous page.
     pub cursor: Option<Uuid>,
     /// 1 to 100, default 50.
@@ -157,9 +174,14 @@ pub struct ReplyInput {
 
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct StateInput {
-    /// `open` or `done`.
-    pub state: String,
+pub struct ItemChange {
+    /// `open` or `done`. Absent: unchanged.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// The user id of a member of the team, or `null` for nobody. Absent: unchanged.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Option<Uuid>)]
+    pub assigned_to: Option<Option<Uuid>>,
 }
 
 fn reply(status: StatusCode, code: &str) -> Response {
@@ -190,10 +212,39 @@ fn url_of(remote_id: &str) -> Option<String> {
     bluesky::post_url(remote_id)
 }
 
-async fn items_json(
+/// Each contact's tags, by name.
+pub(super) async fn tags_of(
+    db: &impl ConnectionTrait,
+    contacts: impl IntoIterator<Item = Uuid>,
+) -> Result<HashMap<Uuid, Vec<String>>, DbErr> {
+    let mut values = Vec::new();
+    let p = inbox::placeholders(&mut values, contacts.into_iter().map(Into::into));
+    let mut tags: HashMap<Uuid, Vec<String>> = HashMap::new();
+    if values.is_empty() {
+        return Ok(tags);
+    }
+    let sql =
+        format!("SELECT contact_id, tag FROM contact_tags WHERE contact_id IN ({p}) ORDER BY tag");
+    let stmt = Statement::from_sql_and_values(DbBackend::Postgres, sql, values);
+    for r in db.query_all_raw(stmt).await? {
+        let (id, tag) = (r.try_get("", "contact_id")?, r.try_get("", "tag")?);
+        tags.entry(id).or_default().push(tag);
+    }
+    Ok(tags)
+}
+
+pub(super) async fn items_json(
     db: &impl ConnectionTrait,
     rows: Vec<inbox_items::Model>,
 ) -> Result<Vec<Item>, DbErr> {
+    let tags = tags_of(db, rows.iter().filter_map(|i| i.contact_id)).await?;
+    let names: HashMap<Uuid, String> = users::Entity::find()
+        .filter(users::Column::Id.is_in(rows.iter().filter_map(|i| i.assigned_to)))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|u| (u.id, u.name))
+        .collect();
     let replies = inbox_replies::Entity::find()
         .filter(inbox_replies::Column::InboxItemId.is_in(rows.iter().map(|i| i.id)))
         .order_by_asc(inbox_replies::Column::CreatedAt)
@@ -241,6 +292,15 @@ async fn items_json(
             story_id: i.story_id,
             story_url: i.story_url,
             button_payload: i.button_payload,
+            contact_tags: i
+                .contact_id
+                .and_then(|c| tags.get(&c).cloned())
+                .unwrap_or_default(),
+            contact_id: i.contact_id,
+            assigned_to: i.assigned_to.and_then(|id| {
+                let name = names.get(&id)?.clone();
+                Some(Assignee { id, name })
+            }),
         })
         .collect())
 }
@@ -499,6 +559,10 @@ pub struct Narrow<'a> {
     pub kind: Option<&'a str>,
     /// Searched in the text and the author's name and handle.
     pub q: Option<&'a str>,
+    /// A tag of the author's contact.
+    pub tag: Option<&'a str>,
+    /// Assigned to this member, or (`Some(None)`) to nobody.
+    pub assigned: Option<Option<Uuid>>,
     pub cursor: Option<Uuid>,
 }
 
@@ -509,6 +573,8 @@ pub fn items_sql(team_id: Uuid, filters: &Filters, n: &Narrow<'_>, limit: u64) -
         state,
         kind,
         q,
+        tag,
+        assigned,
         cursor,
     } = *n;
     let mut values: Vec<Value> = vec![team_id.into()];
@@ -530,6 +596,22 @@ pub fn items_sql(team_id: Uuid, filters: &Filters, n: &Narrow<'_>, limit: u64) -
         sql += &format!(
             " AND (i.text ILIKE ${p} OR i.author_name ILIKE ${p} OR i.author_handle ILIKE ${p})"
         );
+    }
+    if let Some(tag) = tag {
+        values.push(tag.to_owned().into());
+        sql += &format!(
+            " AND EXISTS (SELECT 1 FROM contact_tags ct WHERE ct.contact_id = i.contact_id \
+             AND ct.tag = ${})",
+            values.len()
+        );
+    }
+    match assigned {
+        Some(Some(user)) => {
+            values.push(user.into());
+            sql += &format!(" AND i.assigned_to = ${}", values.len());
+        }
+        Some(None) => sql += " AND i.assigned_to IS NULL",
+        None => {}
     }
     if let Some(c) = cursor {
         values.push(c.into());
@@ -572,9 +654,18 @@ async fn items(
         .is_none_or(|k| matches!(k, "comment" | "mention" | "dm" | "follow"));
     let search = q.q.as_deref().map(str::trim);
     let search_ok = search.is_none_or(|s| (1..=100).contains(&s.chars().count()));
-    if !state_ok || !kind_ok || !search_ok || !(1..=MAX_PAGE).contains(&limit) {
+    let tag = q.tag.as_deref().map(inbox::tag);
+    let assigned = q.assigned.as_deref().map(|a| match a {
+        "me" => Some(Some(t.current.0.id)),
+        "none" => Some(None),
+        id => id.parse().ok().map(Some),
+    });
+    let narrow_ok =
+        tag.as_ref().is_none_or(Option::is_some) && assigned.is_none_or(|a| a.is_some());
+    if !state_ok || !kind_ok || !search_ok || !narrow_ok || !(1..=MAX_PAGE).contains(&limit) {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     }
+    let (tag, assigned) = (tag.flatten(), assigned.flatten());
     let found = async {
         let Some(found) = find_inbox(&app.db, t.team.id, id).await? else {
             return Ok(None);
@@ -584,6 +675,8 @@ async fn items(
             state: q.state.as_deref(),
             kind: q.kind.as_deref(),
             q: search,
+            tag: tag.as_deref(),
+            assigned,
             cursor: q.cursor,
         };
         let stmt = items_sql(t.team.id, &filters, &narrow, limit);
@@ -622,40 +715,67 @@ async fn show_item(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>)
     }
 }
 
-/// Marks an item `done`, or `open` again. Every member.
-#[utoipa::path(patch, path = "/inbox-items/{id}", tag = "inbox", request_body = StateInput,
+/// Marks an item `done` or `open` again (`state`), assigns it to a member of the team or to
+/// nobody (`assigned_to`), or both. Every member. `422 invalid_state`, `invalid_assignee` (not
+/// a member of the team), and `invalid_body` when neither field is sent.
+#[utoipa::path(patch, path = "/inbox-items/{id}", tag = "inbox", request_body = ItemChange,
     params(("id" = Uuid, Path)),
     responses((status = 200, body = Item), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 422, body = Error)))]
-async fn set_state(
+async fn change_item(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
     Path(id): Path<Uuid>,
-    Body(input): Body<StateInput>,
+    Body(input): Body<ItemChange>,
 ) -> Response {
-    if input.state != "open" && input.state != "done" {
-        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_state");
+    let unprocessable = |code| reply(StatusCode::UNPROCESSABLE_ENTITY, code);
+    if input.state.is_none() && input.assigned_to.is_none() {
+        return unprocessable("invalid_body");
+    }
+    if input
+        .state
+        .as_deref()
+        .is_some_and(|s| s != "open" && s != "done")
+    {
+        return unprocessable("invalid_state");
     }
     let saved = async {
-        let done = inbox_items::Entity::update_many()
-            .col_expr(inbox_items::Column::State, input.state.clone().into())
+        let txn = app.db.begin().await?;
+        // Held to the commit, so a removal of the member waits and then clears this too.
+        if let Some(Some(user)) = input.assigned_to {
+            let member = team_user::Entity::find_by_id((t.team.id, user))
+                .lock_shared()
+                .one(&txn)
+                .await?;
+            if member.is_none() {
+                return Ok(Err(unprocessable("invalid_assignee")));
+            }
+        }
+        let mut change = inbox_items::Entity::update_many()
             .filter(inbox_items::Column::Id.eq(id))
-            .filter(inbox_items::Column::TeamId.eq(t.team.id))
-            .exec(&app.db)
-            .await?;
+            .filter(inbox_items::Column::TeamId.eq(t.team.id));
+        if let Some(state) = input.state {
+            change = change.col_expr(inbox_items::Column::State, state.into());
+        }
+        if let Some(user) = input.assigned_to {
+            change = change.col_expr(inbox_items::Column::AssignedTo, Expr::value(user));
+        }
+        let done = change.exec(&txn).await?;
+        txn.commit().await?;
         if done.rows_affected == 0 {
-            return Ok(None);
+            return Ok(Ok(None));
         }
-        match find_item(&app.db, t.team.id, id).await? {
-            Some(i) => item_json(&app.db, i).await.map(Some),
-            None => Ok(None),
-        }
+        Ok::<_, DbErr>(Ok(match find_item(&app.db, t.team.id, id).await? {
+            Some(i) => Some(item_json(&app.db, i).await?),
+            None => None,
+        }))
     };
     match saved.await {
-        Ok(Some(i)) => Json(i).into_response(),
-        Ok(None) => not_found(),
-        Err(e) => internal(e, "inbox item state"),
+        Ok(Ok(Some(i))) => Json(i).into_response(),
+        Ok(Ok(None)) => not_found(),
+        Ok(Err(res)) => res,
+        Err(e) => internal(e, "inbox item change"),
     }
 }
 
@@ -758,7 +878,7 @@ pub fn api() -> OpenApiRouter<AppState> {
         .routes(routes!(list, create))
         .routes(routes!(update, destroy))
         .routes(routes!(items))
-        .routes(routes!(show_item, set_state))
+        .routes(routes!(show_item, change_item))
         .routes(routes!(send_reply))
 }
 
@@ -776,8 +896,8 @@ mod tests {
         let n = Narrow {
             state: Some("open"),
             kind: Some("dm"),
-            q: None,
             cursor: Some(Uuid::nil()),
+            ..Narrow::default()
         };
         let stmt = items_sql(team, &f, &n, 50);
         assert_eq!(
@@ -806,6 +926,23 @@ mod tests {
             stmt.values.unwrap().0[1],
             Value::from("%50\\%\\_off%".to_owned())
         );
+        // A contact tag and an assignee each narrow further.
+        let n = Narrow {
+            tag: Some("vip"),
+            assigned: Some(None),
+            ..Narrow::default()
+        };
+        let stmt = items_sql(team, &Filters::default(), &n, 10);
+        assert!(stmt.sql.contains(
+            " AND EXISTS (SELECT 1 FROM contact_tags ct WHERE ct.contact_id = i.contact_id \
+             AND ct.tag = $2) AND i.assigned_to IS NULL ORDER BY"
+        ));
+        let n = Narrow {
+            assigned: Some(Some(Uuid::nil())),
+            ..Narrow::default()
+        };
+        let stmt = items_sql(team, &Filters::default(), &n, 10);
+        assert!(stmt.sql.contains(" AND i.assigned_to = $2 ORDER BY"));
     }
 
     #[test]

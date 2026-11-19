@@ -58,6 +58,10 @@ pub struct Model {
     /// A `dm` that is a click on a quick reply button (Meta): the button's payload.
     #[sea_orm(column_type = "Text", nullable)]
     pub button_payload: Option<String>,
+    /// The author's contact (`contacts`), set when the item is stored.
+    pub contact_id: Option<Uuid>,
+    /// The member the item is assigned to.
+    pub assigned_to: Option<Uuid>,
     pub created_at: DateTimeWithTimeZone,
 }
 

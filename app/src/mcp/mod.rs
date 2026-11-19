@@ -181,8 +181,8 @@ fn specs() -> Vec<(&'static str, &'static str, Value, bool)> {
         ("list-feeds", "The team's RSS and Atom feeds, which post their new items on their own. Same as GET /v1/feeds.", schema::<NoArgs>(), true),
         ("add-feed", "Adds an RSS or Atom feed (https URL) whose new items are posted to the given platforms of a set: mode draft, queue or now; template with {title}, {link} and {summary}. The items it holds now are not posted. Same as POST /v1/feeds.", schema::<FeedInput>(), false),
         ("remove-feed", "Removes a feed; the posts it made stay. Same as DELETE /v1/feeds/{id}.", schema::<FeedId>(), false),
-        ("list-snippets", "The team's saved text snippets by name: kind caption or hashtags, both when absent. Same as GET /v1/snippets.", schema::<SnippetQuery>(), true),
-        ("save-snippet", "Saves a caption or hashtags snippet: creates one, or with id replaces that one. Same as POST /v1/snippets and PUT /v1/snippets/{id}.", schema::<SaveSnippet>(), false),
+        ("list-snippets", "The team's saved text snippets by name: kind caption, hashtags or reply (a saved inbox reply), all when absent. Same as GET /v1/snippets.", schema::<SnippetQuery>(), true),
+        ("save-snippet", "Saves a caption, hashtags or reply snippet: creates one, or with id replaces that one. Same as POST /v1/snippets and PUT /v1/snippets/{id}.", schema::<SaveSnippet>(), false),
         ("delete-snippet", "Deletes a saved snippet. Same as DELETE /v1/snippets/{id}.", schema::<SnippetId>(), false),
     ]
 }

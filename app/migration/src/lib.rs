@@ -42,6 +42,7 @@ mod m20261201_000001_post_repeat;
 mod m20261202_000001_feeds;
 mod m20261203_000001_automation_flows;
 mod m20261204_000001_team_slug;
+pub mod m20261205_000001_contacts;
 
 pub struct Migrator;
 
@@ -91,6 +92,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261202_000001_feeds::Migration),
             Box::new(m20261203_000001_automation_flows::Migration),
             Box::new(m20261204_000001_team_slug::Migration),
+            Box::new(m20261205_000001_contacts::Migration),
             // inject-above (do not remove this comment)
         ]
     }

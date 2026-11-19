@@ -112,6 +112,51 @@ impl Filters {
     }
 }
 
+/// Most tags one contact holds.
+pub const MAX_TAGS: usize = 20;
+
+/// A contact tag, trimmed and lowercased: 1 to 30 characters, no commas or control characters.
+pub fn tag(raw: &str) -> Option<String> {
+    let t = raw.trim().to_lowercase();
+    let ok =
+        (1..=30).contains(&t.chars().count()) && !t.chars().any(|c| c == ',' || c.is_control());
+    ok.then_some(t)
+}
+
+/// Adds `tag` (one `tag` gave) to a contact: `None` when it was added, else why not
+/// (`already_tagged`, `tag_limit`). The contact's row lock keeps adds at once under the cap.
+pub async fn add_tag(
+    db: &DatabaseConnection,
+    contact: Uuid,
+    tag: &str,
+) -> Result<Option<&'static str>, DbErr> {
+    let txn = db.begin().await?;
+    let lock = sql(
+        "SELECT 1 FROM contacts WHERE id = $1 FOR UPDATE",
+        vec![contact.into()],
+    );
+    txn.execute_raw(lock).await?;
+    let values: Vec<Value> = vec![contact.into(), tag.into(), (MAX_TAGS as i64).into()];
+    let add = sql(
+        "INSERT INTO contact_tags (contact_id, tag) SELECT c.id, $2 FROM contacts c \
+         WHERE c.id = $1 AND (SELECT count(*) FROM contact_tags WHERE contact_id = $1) < $3 \
+         ON CONFLICT DO NOTHING",
+        values.clone(),
+    );
+    let added = txn.execute_raw(add).await?.rows_affected() == 1;
+    let has = sql(
+        "SELECT 1 FROM contact_tags WHERE contact_id = $1 AND tag = $2",
+        values[..2].to_vec(),
+    );
+    let has = txn.query_one_raw(has).await?.is_some();
+    txn.commit().await?;
+    Ok(match (added, has) {
+        (true, _) => None,
+        (false, true) => Some("already_tagged"),
+        (false, false) => Some("tag_limit"),
+    })
+}
+
 /// `text` for a LIKE pattern, with `\`, `%` and `_` matching themselves.
 pub fn escape_like(text: &str) -> String {
     text.replace('\\', "\\\\")
@@ -120,7 +165,10 @@ pub fn escape_like(text: &str) -> String {
 }
 
 /// `$n` placeholders for `items`, appended to `values`.
-fn placeholders(values: &mut Vec<Value>, items: impl IntoIterator<Item = Value>) -> String {
+pub(crate) fn placeholders(
+    values: &mut Vec<Value>,
+    items: impl IntoIterator<Item = Value>,
+) -> String {
     let mut out = Vec::new();
     for v in items {
         values.push(v);
@@ -366,13 +414,28 @@ fn clip(text: &str) -> String {
 
 // The post a comment hangs off: our target's remote id is the comment's parent or root. A
 // Facebook Reel's target keeps the video id instead, which `meta_inbox` looks up after the 200.
-const INSERT: &str = "INSERT INTO inbox_items (id, team_id, social_account_id, platform, kind, \
+// The author's contact is upserted in the same statement, so an item never lacks one. The
+// contact keeps the handle, name and avatar of its newest item (`$17`, when it came) that gave
+// one, so an old item read late or delivered again changes none of them; it stores nothing.
+const INSERT: &str = "WITH c AS (INSERT INTO contacts AS k (id, team_id, platform, external_id, \
+    handle, display_name, avatar_url, first_seen_at, last_seen_at) \
+    VALUES ($24, $2, $4, $12, $13, $14, $15, $17, $17) \
+    ON CONFLICT (team_id, platform, external_id) DO UPDATE SET \
+    handle = CASE WHEN $17 < k.last_seen_at THEN COALESCE(k.handle, $13) \
+        ELSE COALESCE($13, k.handle) END, \
+    display_name = CASE WHEN $17 < k.last_seen_at THEN COALESCE(k.display_name, $14) \
+        ELSE COALESCE($14, k.display_name) END, \
+    avatar_url = CASE WHEN $17 < k.last_seen_at THEN COALESCE(k.avatar_url, $15) \
+        ELSE COALESCE($15, k.avatar_url) END, \
+    first_seen_at = LEAST(k.first_seen_at, $17), \
+    last_seen_at = GREATEST(k.last_seen_at, $17) RETURNING id) \
+    INSERT INTO inbox_items (id, team_id, social_account_id, platform, kind, \
     remote_id, remote_cid, parent_remote_id, root_remote_id, root_remote_cid, convo_id, \
     author_id, author_handle, author_name, author_avatar, text, received_at, permalink, \
-    story_reply, story_id, story_url, state, button_payload, post_id) \
+    story_reply, story_id, story_url, state, button_payload, post_id, contact_id) \
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
     $19, $20, $21, $22, $23, (SELECT t.post_id FROM post_targets t WHERE t.social_account_id = $3 \
-     AND t.remote_id IN ($8, $9) LIMIT 1)) \
+     AND t.remote_id IN ($8, $9) LIMIT 1), (SELECT id FROM c)) \
     ON CONFLICT (social_account_id, remote_id) DO NOTHING RETURNING *";
 
 /// An item to store, from any platform.
@@ -419,6 +482,8 @@ pub fn numbered(text: &str, buttons: &[Button]) -> String {
 
 /// Stores `f` for `account`; the new item, or `None` when it was already there. The unique key
 /// is the account and the platform's id, so a repeated read or webhook delivery adds nothing.
+/// Its author's contact (one per team, platform and author id) is made or brought up to date in
+/// the same statement, and the item points at it.
 pub async fn store(
     db: &DatabaseConnection,
     account: &social_accounts::Model,
@@ -449,6 +514,7 @@ pub async fn store(
         // A follow is not work to answer.
         (if f.kind == "follow" { "done" } else { "open" }).into(),
         f.button_payload.into(),
+        Uuid::now_v7().into(),
     ];
     inbox_items::Entity::find()
         .from_raw_sql(sql(INSERT, values))
@@ -744,6 +810,15 @@ mod tests {
         assert!(!fits_on("instagram", Via::Dm, &"a".repeat(1001)));
         assert!(!fits_on("instagram", Via::Dm, " "));
         assert!(!fits_on("bluesky", Via::Public, &"a".repeat(301)));
+    }
+
+    #[test]
+    fn tags_are_trimmed_lowercased_and_checked() {
+        assert_eq!(tag("  VIP Lead "), Some("vip lead".into()));
+        assert_eq!(tag(&"a".repeat(30)), Some("a".repeat(30)));
+        for bad in ["", "  ", "a,b", "a\tb", &"a".repeat(31)] {
+            assert_eq!(tag(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

@@ -127,7 +127,9 @@ pub struct TeamChange {
 }
 
 /// A field that was sent, `null` included (an absent one stays `None` through `default`).
-fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+pub(super) fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> Result<Option<Option<T>>, D::Error> {
     Deserialize::deserialize(d).map(Some)
 }
 
@@ -797,6 +799,16 @@ async fn change_member(
             team_user::Entity::delete_by_id((team_id, target))
                 .exec(&txn)
                 .await?;
+            // Inbox items assigned to them are nobody's again. After the delete: an assignment
+            // made meanwhile holds the membership row, so it is over and seen here.
+            let clear = "UPDATE inbox_items SET assigned_to = NULL \
+                         WHERE team_id = $1 AND assigned_to = $2";
+            txn.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                clear,
+                [team_id.into(), target.into()],
+            ))
+            .await?;
             None
         }
     };
