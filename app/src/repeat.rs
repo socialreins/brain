@@ -1,11 +1,12 @@
 //! Repeating posts. A `scheduled` post may carry a rule (`posts.repeat`); whatever takes it out
 //! of `scheduled` to publish it (the tick's claim, or publish now) calls `spawn` in the same
 //! transaction, which makes the next copy and clears the rule, so a post yields one copy at most.
+//! Each copy is made in a savepoint: one that fails is logged and costs only itself.
 use chrono::{DateTime, Datelike, Duration, FixedOffset, Months, NaiveDate, Utc};
 use schemars::JsonSchema;
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr,
-    EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter,
+    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseTransaction, DbErr,
+    EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -23,7 +24,8 @@ pub struct Repeat {
     pub interval: i32,
     /// `YYYY-MM-DD`: no copy is scheduled after the end of this UTC date. `null`: no end date.
     pub until: Option<String>,
-    /// How many more copies will be made after this post, 1 to 100. `null`: no count limit.
+    /// How many more copies will be made after this post, 1 to 100: the copy carries one less,
+    /// and the copy of a post with 1 carries no rule. `null`: no count limit.
     pub remaining: Option<i32>,
     /// The day of the month a monthly rule aims for, kept by a copy a short month moved
     /// earlier (the 31st, on a copy that landed on February 28). Never read from a request.
@@ -60,11 +62,12 @@ impl Repeat {
     }
 
     /// The copy a post at `from` yields: its time, the first step of the rule after `now`,
-    /// and its rule. `None` when the rule has ended.
-    pub fn next(&self, from: DateTime<Utc>, now: DateTime<Utc>) -> Option<(DateTime<Utc>, Self)> {
-        if self.remaining == Some(1) {
-            return None;
-        }
+    /// and its rule, none for the last copy of a count. `None` when the rule has ended.
+    pub fn next(
+        &self,
+        from: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Option<(DateTime<Utc>, Option<Self>)> {
         let interval = u32::try_from(self.interval).ok()?;
         // The day a monthly rule aims for: the post's, or the one a short month cut it from.
         let clamped = (from + Duration::days(1)).day() == 1;
@@ -89,11 +92,11 @@ impl Repeat {
         if until.is_some_and(|d| at.date_naive() > d) {
             return None;
         }
-        let rule = Self {
+        let rule = (self.remaining != Some(1)).then(|| Self {
             remaining: self.remaining.map(|n| n - 1),
             day: Some(day).filter(|d| *d != at.day()),
             ..self.clone()
-        };
+        });
         Some((at, rule))
     }
 }
@@ -105,7 +108,7 @@ impl Repeat {
 /// The copy is a new `scheduled` post with the source's content and approval, in no list and
 /// with no page. Copies of one group share one new group id, derived from the old one.
 pub async fn spawn(
-    txn: &impl ConnectionTrait,
+    txn: &DatabaseTransaction,
     ids: &[Uuid],
     from: Option<DateTime<FixedOffset>>,
 ) -> Result<(), DbErr> {
@@ -127,43 +130,58 @@ pub async fn spawn(
         .await?;
     let now = Utc::now();
     for p in rows {
-        let rule = p.repeat.clone().map(serde_json::from_value::<Repeat>);
-        let (Some(Ok(rule)), Some(at)) = (rule, from.or(p.scheduled_at)) else {
-            continue;
-        };
-        // TikTok wants a person to confirm every post.
-        let next = rule
-            .next(at.to_utc(), now)
-            .filter(|_| p.platform != "tiktok");
-        let Some((at, rule)) = next else {
-            continue;
-        };
-        let live = posts::Entity::find()
-            .filter(posts::Column::TeamId.eq(p.team_id))
-            .filter(posts::Column::Status.ne("deleted"))
-            .count(txn)
-            .await?;
-        if live >= MAX_POSTS {
-            tracing::warn!(post = %p.id, "team at its post cap: repeat ends");
-            continue;
+        // A savepoint: a copy that fails is undone alone, and the claim goes on without it.
+        let id = p.id;
+        let point = txn.begin().await?;
+        match copy(&point, p, from, now).await {
+            Ok(()) => point.commit().await?,
+            Err(e) => {
+                tracing::warn!(error = %e, post = %id, "repeat copy failed: the series ends");
+                point.rollback().await?;
+            }
         }
-        let copy = posts::ActiveModel {
-            id: Set(Uuid::now_v7()),
-            status: Set("scheduled".into()),
-            scheduled_at: Set(Some(at.fixed_offset())),
-            published_at: Set(None),
-            error: Set(None),
-            quota_reserved: Set(false),
-            fanned_out: Set(false),
-            group_id: Set(p.group_id.map(|g| Uuid::new_v5(&g, b"repeat"))),
-            repeat: Set(Some(rule.stored())),
-            created_at: Set(now.fixed_offset()),
-            updated_at: Set(now.fixed_offset()),
-            ..p.into_active_model().reset_all()
-        };
-        posts::Entity::insert(copy).exec(txn).await?;
     }
     Ok(())
+}
+
+/// The next copy of `p` by its rule, if the rule yields one.
+async fn copy(
+    txn: &DatabaseTransaction,
+    p: posts::Model,
+    from: Option<DateTime<FixedOffset>>,
+    now: DateTime<Utc>,
+) -> Result<(), DbErr> {
+    let rule: Repeat = serde_json::from_value(p.repeat.clone().unwrap_or_default())
+        .map_err(|e| DbErr::Custom(format!("stored repeat rule: {e}")))?;
+    // TikTok wants a person to confirm every post.
+    let next = from.or(p.scheduled_at).filter(|_| p.platform != "tiktok");
+    let Some((at, rule)) = next.and_then(|at| rule.next(at.to_utc(), now)) else {
+        return Ok(());
+    };
+    let live = posts::Entity::find()
+        .filter(posts::Column::TeamId.eq(p.team_id))
+        .filter(posts::Column::Status.ne("deleted"))
+        .count(txn)
+        .await?;
+    if live >= MAX_POSTS {
+        tracing::warn!(post = %p.id, "team at its post cap: repeat ends");
+        return Ok(());
+    }
+    let copy = posts::ActiveModel {
+        id: Set(Uuid::now_v7()),
+        status: Set("scheduled".into()),
+        scheduled_at: Set(Some(at.fixed_offset())),
+        published_at: Set(None),
+        error: Set(None),
+        quota_reserved: Set(false),
+        fanned_out: Set(false),
+        group_id: Set(p.group_id.map(|g| Uuid::new_v5(&g, b"repeat"))),
+        repeat: Set(rule.map(|r| r.stored())),
+        created_at: Set(now.fixed_offset()),
+        updated_at: Set(now.fixed_offset()),
+        ..p.into_active_model().reset_all()
+    };
+    posts::Entity::insert(copy).exec(txn).await.map(|_| ())
 }
 
 #[cfg(test)]
@@ -220,6 +238,7 @@ mod tests {
             .next(at("2027-01-31T08:00:00Z"), at("2027-01-31T08:00:01Z"))
             .unwrap();
         assert_eq!(feb, at("2027-02-28T08:00:00Z"));
+        let kept = kept.unwrap();
         assert_eq!(kept.day, Some(31));
         assert_eq!(kept.stored()["day"], 31);
         let leap = r
@@ -229,7 +248,7 @@ mod tests {
         // The copy on February 28 goes back to the 31st.
         let (mar, kept) = kept.next(feb, feb).unwrap();
         assert_eq!(mar, at("2027-03-31T08:00:00Z"));
-        assert_eq!(kept.day, None);
+        assert_eq!(kept.unwrap().day, None);
         // A post moved to another day follows that day.
         let moved = Repeat {
             day: Some(31),
@@ -248,8 +267,11 @@ mod tests {
         let mut r = rule("day", 1);
         r.remaining = Some(2);
         let (_, copy) = r.next(from, from).unwrap();
+        let copy = copy.unwrap();
         assert_eq!(copy.remaining, Some(1));
-        assert_eq!(copy.next(from, from), None);
+        // The last of the count is still made, with no rule of its own.
+        let last = copy.next(from, from).unwrap();
+        assert_eq!(last, (at("2026-03-11T09:30:00Z"), None));
         let mut r = rule("day", 1);
         r.until = Some("2026-03-11".into());
         assert!(r.next(from, from).is_some(), "the end date itself counts");

@@ -2181,8 +2181,9 @@ pub async fn set_repeat(app: &AppState, a: &Actor, id: Uuid, rule: Option<Repeat
 /// Makes a `scheduled` post repeat: when it is taken to publish (by the scheduler or publish
 /// now), the next copy is scheduled `interval` days, weeks or months later (a month keeps the
 /// day of the month and the time in UTC, or uses the month's last day; a time already past is
-/// skipped), carrying the rule with `remaining` one lower, and this post's rule is cleared. No
-/// copy is made once `remaining` is 1 or the next time is after `until`. The copy has the post's
+/// skipped), carrying the rule with `remaining` one lower, and this post's rule is cleared. A
+/// post with `remaining: 1` yields its last copy, which has no rule, so `remaining: N` makes N
+/// copies in all. No copy is made once the next time is after `until`. The copy has the post's
 /// set, platform, content and `approval`, is in no list and has no public page; copies of one
 /// group share a new `group_id`.
 ///

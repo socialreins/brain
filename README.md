@@ -718,8 +718,10 @@ With both `null` it repeats until the rule is removed.
   shorter (January 31, February 28, March 31). A time already past is skipped, so a post held
   back for a week yields one copy, not seven. Publish now counts from the time the post was
   scheduled at, not from now.
-- The copy carries the rule with `remaining` one lower. No copy is made when `remaining` is 1,
-  when the next time is after the end of `until`, or when the team is at its 2000 posts.
+- The copy carries the rule with `remaining` one lower, and the copy of a post with
+  `remaining: 1` carries no rule: `remaining: N` makes N copies in all. No copy is made when the
+  next time is after the end of `until`, or when the team is at its 2000 posts.
+- A copy that cannot be made is logged and ends the series; the post itself still publishes.
 - Setting or clearing a rule covers the other `scheduled` posts of the post's group and is an
   edit: while the team requires approval, a member's puts those posts back to `pending`.
 - An edit (`PUT /v1/posts/{id}`) keeps the rule, unless it makes the post a draft or a TikTok

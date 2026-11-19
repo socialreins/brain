@@ -8231,7 +8231,7 @@ mod teams {
                         }
                     };
 
-                    // Two more: a copy that has one left, whose own copy is the last.
+                    // `remaining: 3` makes three copies: with 2, with 1, and a last with no rule.
                     let (cookie, _, set) = team(&s, &db).await;
                     let id = scheduled(&s, &cookie, &set).await;
                     let mut rule = daily();
@@ -8249,7 +8249,18 @@ mod teams {
                     at(&db, last["id"].as_str().unwrap(), due).await;
                     publish::tick(&state).await.unwrap();
                     assert!(with_rule(&s, &cookie).await.is_empty());
-                    assert_eq!(count(cookie).await, 3);
+                    assert_eq!(count(cookie.clone()).await, 4);
+                    let path = "/v1/posts?status=scheduled";
+                    let ahead = req(&s, Method::GET, path, &cookie).await;
+                    let mut ahead = ahead.json::<Vec<Value>>();
+                    assert_eq!(ahead.len(), 1, "{ahead:?}");
+                    let last = ahead.remove(0);
+                    assert_eq!(last["repeat"], Value::Null);
+                    assert_eq!(time(&last), due + Duration::days(1));
+                    // The last copy goes out and leaves nothing behind.
+                    at(&db, last["id"].as_str().unwrap(), due).await;
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(count(cookie).await, 4);
 
                     // An end date ahead lets the copy through, one behind does not.
                     let day = |days: i64| (Utc::now() + Duration::days(days)).date_naive();
@@ -8268,6 +8279,55 @@ mod teams {
                             assert_eq!(copy["repeat"], rule);
                         }
                     }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_copy_that_fails_costs_neither_its_post_nor_the_others() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, _, set) = team(&s, &db).await;
+                    // Three posts of one claim: one whose copy the database refuses, one whose
+                    // stored rule is not a rule, and a sound one.
+                    let poison = format!("poison {}", uuid::Uuid::now_v7());
+                    let res = create(&s, &cookie, input(&set, &poison, Some(&soon()))).await;
+                    let refused = id_of(&res);
+                    let garbled = scheduled(&s, &cookie, &set).await;
+                    let sound = scheduled(&s, &cookie, &set).await;
+                    let due = Utc::now().trunc_subsecs(0) - Duration::hours(1);
+                    for id in [&refused, &garbled, &sound] {
+                        repeating(&s, &cookie, id, daily()).await;
+                        at(&db, id, due).await;
+                    }
+                    sql(
+                        &db,
+                        format!(
+                            "UPDATE posts SET repeat = '{{\"every\": 7}}' WHERE id = '{garbled}';
+                             CREATE FUNCTION refuse_copy() RETURNS trigger AS $$ BEGIN \
+                             RAISE EXCEPTION 'no copy'; END $$ LANGUAGE plpgsql;
+                             CREATE TRIGGER refuse_copy BEFORE INSERT ON posts FOR EACH ROW \
+                             WHEN (NEW.body = '{poison}') EXECUTE FUNCTION refuse_copy()"
+                        ),
+                    )
+                    .await;
+                    let ticked = publish::tick(&state).await;
+                    sql(
+                        &db,
+                        "DROP TRIGGER refuse_copy ON posts; DROP FUNCTION refuse_copy()".into(),
+                    )
+                    .await;
+                    ticked.unwrap();
+                    // Every post went out with its rule cleared; only the sound one has a copy.
+                    for id in [&refused, &garbled, &sound] {
+                        let p = get_post(&s, &cookie, id).await;
+                        assert_eq!(p["status"], "published", "{p}");
+                        assert_eq!(p["repeat"], Value::Null, "{p}");
+                    }
+                    let copies = with_rule(&s, &cookie).await;
+                    assert_eq!(copies.len(), 1, "{copies:?}");
+                    assert_eq!(copies[0]["body"], "again");
+                    assert_eq!(time(&copies[0]), due + Duration::days(1));
+                    let all = req(&s, Method::GET, "/v1/posts", &cookie).await;
+                    assert_eq!(all.json::<Vec<Value>>().len(), 4);
                 }
 
                 #[tokio::test]
