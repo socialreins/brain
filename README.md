@@ -31,7 +31,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/health` | `{"status":"ok"}` |
 | GET | `/version` | `{"commit":"<sha>"}`, from `RAILWAY_GIT_COMMIT_SHA`, `dev` locally |
 | GET | `/openapi.json` | OpenAPI document for `/v1` |
-| POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, posting queues, accounts, posts (with `approve-post`, `reject-post`, `set-post-repeat` and `clear-post-repeat`, write tools), lists, the media library (`list-media`, `add-media`), feeds (`list-feeds`, `add-feed`, `remove-feed`) and snippets (`list-snippets`, `save-snippet` creating or, with an `id`, replacing, `delete-snippet`). Bearer API token only, same scope and per-token limit as `/v1`, bodies up to 64 KiB; `Idempotency-Key` does not apply. `create-post` and `create-post-group` take `validate_only` (see "Validate only"), which a read-only token may send |
+| POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, posting queues, accounts, posts (with `approve-post`, `reject-post`, `set-post-repeat` and `clear-post-repeat`, write tools), lists, the media library (`list-media`, `add-media`), feeds (`list-feeds`, `add-feed`, `remove-feed`), analytics (`get-analytics`, a read tool) and snippets (`list-snippets`, `save-snippet` creating or, with an `id`, replacing, `delete-snippet`). Bearer API token only, same scope and per-token limit as `/v1`, bodies up to 64 KiB; `Idempotency-Key` does not apply. `create-post` and `create-post-group` take `validate_only` (see "Validate only"), which a read-only token may send |
 | POST | `/v1/waitlist` | `{"email":"...","source":"..."}` joins the waitlist and emails a confirmation link |
 | POST | `/v1/waitlist/verify` | `{"token"}` from the emailed link: marks the signup verified, `200 {"status":"verified"}`, else `422 {"error":"invalid_link"}` |
 | GET | `/v1/waitlist/count` | `{"count":n}`: every signup, verified or not, cached for 30 seconds |
@@ -102,6 +102,8 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/v1/public/pages/{code}` | Public, no sign-in: `{"team","body","media","thread","details","published_at","links":[{"platform","url"}]}` from the first published post of the page, `links` from every published target. `404` unless the page is enabled, its team has public pages on and a post of it is `published`. `Cache-Control: public, max-age=60`; 120 requests a minute per IP |
 | POST | `/v1/post-groups` | One post per platform of a set in one call (`{"social_set_id","platforms","body","media","scheduled_at","queue","list_id","position","thread","first_comment","cover","tiktok","youtube","overrides":{"<platform>":{"body","media","thread","first_comment","cover","tiktok","youtube"}}}`; `platforms` defaults to those brain publishes to with a connected account; bodies up to 64 KiB): `201 {"group_id","posts","skipped"}`; `"queue": true` puts the whole group at one free slot of the queue; an invalid post creates nothing and its error names the `platform`, unless `"on_invalid":"skip"` (see "Validate only"). `?validate_only=true` checks without creating |
 | POST | `/v1/posts/{id}/publish` | Publish a draft or scheduled post now: `202` with the post `queued`; poll it for the result. `403 approval_required` for a member while the team requires approval, unless the post is `approved`, and for anyone when the post is `rejected`. An owner's, admin's or token's publish of a `pending` post approves it |
+| POST | `/v1/posts/{id}/metrics/refresh` | Read the post's metrics from its platforms now: `200` with the post. At most once a minute per post (`429 refreshed_recently`); a post with nothing to read comes back as it is. Any member or a token that is not read-only. See "Analytics" |
+| GET | `/v1/analytics` | Metrics of the posts published in a range of UTC days (`?social_set_id=&from=YYYY-MM-DD&to=YYYY-MM-DD`, default the last 30 days, at most 366): `{"supported":[..],"totals":{"posts","likes","comments","shares","views"},"by_platform":[{"platform","posts","likes","comments","shares","views","supported"}],"by_day":[{"date","posts","likes","comments","shares","views"}],"top_posts":[..]}`. Any member, read-only tokens too; `422 invalid_range`. See "Analytics" |
 | POST | `/v1/posts/{id}/approve`, `/v1/posts/{id}/reject` | Approve or reject a `scheduled` post (optional `{"note"}`, trimmed, at most 500 characters, else `422 invalid_note`): `200` with the post. Owner, admin or a token that is not read-only (`403 forbidden` for a member); `409 not_awaiting_approval` unless the post is `scheduled` with an `approval`. See "Approvals" |
 | PUT, DELETE | `/v1/posts/{id}/repeat` | Make a `scheduled` post repeat (`{"every":"day"\|"week"\|"month","interval":1..12,"until":"YYYY-MM-DD"\|null,"remaining":1..100\|null}`), or stop it: `200` with the post, the rule in its `repeat`. It covers the other `scheduled` posts of the post's group. Any member; `409 not_scheduled`, `422 repeat_not_supported` for TikTok, `422 {"error":"invalid_repeat","field"}`, `422 too_many_repeats` over 200 posts with a rule per team. See "Repeating posts" |
 | POST | `/v1/post-groups/{group_id}/approve`, `/v1/post-groups/{group_id}/reject` | The same for every `scheduled` post of a group that has an `approval`, all or none: `200 {"posts":[...]}` with the posts it changed, `409 not_awaiting_approval` when there is none |
@@ -777,6 +779,37 @@ feed posts without anyone looking. A set token sees and writes the feeds of its 
   check, 3 times in all, then given up.
 - A check that cannot read or parse the feed sets `last_error`; 10 such checks in a row set
   `active` to `false`. `PUT` with `"active": true` switches it back on.
+
+## Analytics
+
+Brain reads how published posts did from the platforms that say so with the access an account
+already has: Bluesky, Facebook Pages, Instagram and YouTube. Threads, LinkedIn, X and TikTok are
+never called. One latest set of numbers is kept per target (`post_metrics`), no history.
+
+- Every target of a post carries `metrics`: `null` before the first read and on the other
+  platforms, else `{"likes","comments","shares","views","fetched_at"}`. A number the platform
+  does not give is `null`: Bluesky has no views (shares are reposts and quotes together),
+  YouTube no shares, Facebook no views (likes are every reaction), Instagram no shares and no
+  views, and no likes when the account hides them. Of a thread only the root post is counted.
+- The scheduler reads every 15 minutes (`metrics::tick`, one instance at a time): a target
+  published in the last 30 days that was never read, or last tried over an hour ago while the
+  post is under 48 hours old, over 12 hours ago after that. A round takes at most 500 targets,
+  the longest unread first, grouped by account and asked in one call per 25 (Bluesky,
+  `app.bsky.feed.getPosts`) or 50 (YouTube `videos.list?part=statistics`, Graph `/?ids=`), 8
+  accounts at once, and starts no call after 5 minutes.
+- A read that fails keeps the numbers of the one before and waits twice as long per failed try,
+  a day at most. A post the platform no longer has stops being read (its last numbers stay); an
+  account that needs a reconnect is skipped. `fetched_at` is the last try, failed or not.
+- `POST /v1/posts/{id}/metrics/refresh` reads one post now, waiting up to 20 seconds for its
+  platforms, at most once a minute per post.
+- `GET /v1/analytics` sums the `published` posts whose `published_at` falls on the days `from` to
+  `to` (UTC, both included). A missing number counts as 0 and a post on several accounts counts
+  once, with the numbers of all of them. `social_set_id` narrows it to one set (the default set
+  is every set, as with posts); a set token only sees its own set. `by_platform` lists every
+  platform with a post in the range, by name, those without metrics with `"supported": false`
+  and zeros; `by_day` lists every day of the range, oldest first; `top_posts` holds up to 10
+  posts, as `/v1/posts` gives them, by likes, comments and shares together, the most first,
+  without those that have none.
 
 ## Approvals
 

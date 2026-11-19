@@ -9,6 +9,7 @@ pub mod mail;
 pub mod mcp;
 pub mod media;
 pub mod meta_inbox;
+pub mod metrics;
 pub mod models;
 pub mod publish;
 pub mod rate_limit;

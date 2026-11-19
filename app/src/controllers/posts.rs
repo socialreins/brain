@@ -41,9 +41,10 @@ use super::{
 use crate::{
     connectors::{tiktok, youtube},
     media::Probed,
+    metrics,
     models::{
-        post_targets, posts, social_account_social_set as membership, social_accounts, social_sets,
-        teams,
+        post_metrics, post_targets, posts, social_account_social_set as membership,
+        social_accounts, social_sets, teams,
     },
     publish,
     repeat::Repeat,
@@ -161,6 +162,21 @@ pub struct Target {
     pub comment_error: Option<String>,
     /// Why the cover could not be set on the published video; a warning, the post is up.
     pub cover_error: Option<String>,
+    /// The post's counts on the platform, read every hour for two days and twice a day up to
+    /// 30 days; `null` before the first read and on platforms that give none (`GET /analytics`).
+    pub metrics: Option<Metrics>,
+}
+
+/// What the platform counts on a published post (the root post of a thread). A number the
+/// platform does not give, or hides, is `null`.
+#[derive(Serialize, ToSchema)]
+pub struct Metrics {
+    pub likes: Option<i64>,
+    pub comments: Option<i64>,
+    pub shares: Option<i64>,
+    pub views: Option<i64>,
+    /// When the platform was last asked; a failed read keeps the numbers of the one before.
+    pub fetched_at: DateTime<FixedOffset>,
 }
 
 /// One follow-up post of a thread.
@@ -536,8 +552,20 @@ async fn targets_of(
         .order_by_asc(post_targets::Column::Id)
         .all(db)
         .await?;
+    let mut metrics: HashMap<Uuid, post_metrics::Model> = post_metrics::Entity::find()
+        .filter(post_metrics::Column::PostId.is_in(posts.iter().copied()))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|m| (m.target_id, m))
+        .collect();
     let mut map: HashMap<Uuid, Vec<Target>> = HashMap::new();
     for t in rows {
+        let read = metrics.remove(&t.id).filter(|m| {
+            [m.likes, m.comments, m.shares, m.views]
+                .iter()
+                .any(Option::is_some)
+        });
         map.entry(t.post_id).or_default().push(Target {
             id: t.id,
             social_account_id: t.social_account_id,
@@ -551,6 +579,13 @@ async fn targets_of(
             comment_id: t.comment_id,
             comment_error: t.comment_error,
             cover_error: t.cover_error,
+            metrics: read.map(|m| Metrics {
+                likes: m.likes,
+                comments: m.comments,
+                shares: m.shares,
+                views: m.views,
+                fetched_at: m.fetched_at,
+            }),
         });
     }
     Ok(map)
@@ -1131,6 +1166,31 @@ fn status_for(input: &PostInput) -> &'static str {
     }
 }
 
+/// The caller's posts in live sets: those of `set`, or of every set when it is absent or the
+/// default set, which holds every account. A set token still only sees its own set's.
+pub(crate) async fn in_set(
+    db: &impl ConnectionTrait,
+    a: &Actor,
+    set: Option<Uuid>,
+) -> Result<sea_orm::Select<posts::Entity>, DbErr> {
+    let mut sel = posts::Entity::find()
+        .filter(posts::Column::TeamId.eq(a.team.id))
+        .filter(posts::Column::SocialSetId.in_subquery(live_sets()))
+        .filter(in_scope(a));
+    if let Some(set) = set {
+        let default = social_sets::Entity::find_by_id(set)
+            .filter(social_sets::Column::TeamId.eq(a.team.id))
+            .filter(social_sets::Column::IsDefault.eq(true))
+            .count(db)
+            .await?
+            > 0;
+        if !default {
+            sel = sel.filter(posts::Column::SocialSetId.eq(set));
+        }
+    }
+    Ok(sel)
+}
+
 /// The current team's posts, by `scheduled_at` (unscheduled last), at most 2000. For a calendar,
 /// pass `from` and `to`.
 #[utoipa::path(get, path = "/posts", tag = "posts",
@@ -1158,22 +1218,7 @@ pub async fn list_posts(app: &AppState, a: &Actor, q: PostQuery) -> Response {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     }
     let found = async {
-        let mut sel = posts::Entity::find()
-            .filter(posts::Column::TeamId.eq(a.team.id))
-            .filter(posts::Column::SocialSetId.in_subquery(live_sets()))
-            .filter(in_scope(a));
-        if let Some(set) = q.social_set_id {
-            // The default set holds every account, so it lists every set's posts.
-            let default = social_sets::Entity::find_by_id(set)
-                .filter(social_sets::Column::TeamId.eq(a.team.id))
-                .filter(social_sets::Column::IsDefault.eq(true))
-                .count(&app.db)
-                .await?
-                > 0;
-            if !default {
-                sel = sel.filter(posts::Column::SocialSetId.eq(set));
-            }
-        }
+        let mut sel = in_set(&app.db, a, q.social_set_id).await?;
         if let Some(status) = &q.status {
             sel = sel.filter(posts::Column::Status.eq(status));
         }
@@ -2729,8 +2774,41 @@ async fn reject_group(
     decide_group(&app, &a, group_id, false, &body).await
 }
 
+/// How long a refresh waits for the platforms before it answers with what it has.
+const REFRESH_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Reads the post's metrics from its platforms now and returns the post. At most once a minute
+/// per post: `429 refreshed_recently`. A post with nothing to read (not published, a platform
+/// without metrics, an account that needs a reconnect) comes back as it is.
+#[utoipa::path(post, path = "/posts/{id}/metrics/refresh", tag = "posts",
+    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path)),
+    responses((status = 200, body = Post), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 404, body = Error), (status = 429, body = Error)))]
+async fn refresh_metrics(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
+    let done = async {
+        let Some(post) = find(&app.db, &a, id).await? else {
+            return Ok(not_found());
+        };
+        let rows = metrics::of_post(&app.db, id).await?;
+        if !rows.is_empty() && rows.iter().all(|d| d.recent) {
+            return Ok(reply(StatusCode::TOO_MANY_REQUESTS, "refreshed_recently"));
+        }
+        let until = tokio::time::Instant::now() + REFRESH_WAIT;
+        // Cut off at the wait: what was not read by then is read by the next round.
+        let _ = tokio::time::timeout_at(until, metrics::read(&app, rows, until)).await;
+        one_json(&app.db, &a, post)
+            .await
+            .map(|p| Json(p).into_response())
+    };
+    match done.await {
+        Ok(res) => res,
+        Err::<_, DbErr>(e) => internal(e, "metrics refresh"),
+    }
+}
+
 pub fn api() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
+        .routes(routes!(refresh_metrics))
         .routes(routes!(list, create))
         .routes(routes!(show, update, destroy))
         .routes(routes!(publish_now))

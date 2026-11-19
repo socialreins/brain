@@ -182,7 +182,10 @@ pub trait Publisher: Send + Sync {
     }
 }
 
-fn creds<'a>(account: &'a social_accounts::Model, secret: &'a str) -> bluesky::Creds<'a> {
+pub(crate) fn creds<'a>(
+    account: &'a social_accounts::Model,
+    secret: &'a str,
+) -> bluesky::Creds<'a> {
     bluesky::Creds {
         pds: account.meta["pds"].as_str().unwrap_or_default(),
         did: &account.external_id,
@@ -956,7 +959,7 @@ const STUCK: &str = "Unknown, check the account: publishing stopped midway and i
 /// they are renewed first when near their end (`controllers::youtube::fresh_token`,
 /// `controllers::x::fresh_token`, `controllers::tiktok::fresh_token`); the others use the stored secret as it is, and an unreadable one is a
 /// reconnect.
-async fn credential(
+pub(crate) async fn credential(
     app: &AppState,
     account: &social_accounts::Model,
 ) -> Result<String, PublishError> {

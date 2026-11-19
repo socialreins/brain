@@ -101,6 +101,28 @@ enum Refused {
     Graph(reqwest::StatusCode, Value),
 }
 
+/// A call that did not succeed, as a publish words it: `Reconnect` when the token is refused,
+/// else `Failed` with `step` and Meta's reason.
+fn post_error(refused: Refused, step: &str) -> PostError {
+    match refused {
+        Refused::Unreachable => failed(format!("{step}: Meta could not be reached.")),
+        Refused::Graph(_, body) if dead_or_denied(&body).is_some() => {
+            dead_or_denied(&body).unwrap_or(PostError::Reconnect)
+        }
+        Refused::Graph(status, body) => failed(format!("{step}: {}", reason(&body, status))),
+    }
+}
+
+/// Graph says an object asked for does not exist: a `404`, "some of the aliases you requested
+/// do not exist" (803) or "object does not exist" (100 with subcode 33). A plain 100, such as a
+/// field the object does not have, is not that.
+fn missing(status: reqwest::StatusCode, body: &Value) -> bool {
+    let code = body["error"]["code"].as_i64();
+    status == reqwest::StatusCode::NOT_FOUND
+        || code == Some(803)
+        || (code == Some(100) && body["error"]["error_subcode"].as_i64() == Some(33))
+}
+
 /// A reply or message that Meta did not take, as the inbox words it.
 fn inbox_error(refused: Refused) -> InboxError {
     let Refused::Graph(status, body) = refused else {
@@ -265,15 +287,30 @@ impl Meta {
     ) -> Result<Value, PostError> {
         self.raw(req, token, form, step)
             .await
-            .map_err(|refused| match refused {
-                Refused::Unreachable => failed(format!("{step}: Meta could not be reached.")),
-                Refused::Graph(_, body) if dead_or_denied(&body).is_some() => {
-                    dead_or_denied(&body).unwrap_or(PostError::Reconnect)
-                }
-                Refused::Graph(status, body) => {
-                    failed(format!("{step}: {}", reason(&body, status)))
-                }
-            })
+            .map_err(|refused| post_error(refused, step))
+    }
+
+    /// `fields` of each of `ids` (at most 50) in one call, `/?ids=`, keyed by id, with the Page
+    /// token: a Page post's reactions, comments and shares (`pages_read_engagement`) or an
+    /// Instagram media's counts (`instagram_basic`). `None` when Graph says an object is not
+    /// there, which fails the whole call, so the caller asks again one id at a time.
+    pub async fn counts(
+        &self,
+        token: &str,
+        ids: &[&str],
+        fields: &str,
+    ) -> Result<Option<Value>, PostError> {
+        let url = format!("{}/{}/", self.graph_url, self.version);
+        let ids = ids.join(",");
+        let req = self
+            .client
+            .get(url)
+            .query(&[("ids", ids.as_str()), ("fields", fields)]);
+        match self.raw(req, Some(token), None, "Metrics").await {
+            Ok(got) => Ok(Some(got)),
+            Err(Refused::Graph(status, body)) if missing(status, &body) => Ok(None),
+            Err(refused) => Err(post_error(refused, "Metrics")),
+        }
     }
 
     /// One Graph API call on `path` under the version.

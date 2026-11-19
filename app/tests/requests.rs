@@ -20934,6 +20934,7 @@ mod teams {
                             "create-post-group",
                             "delete-post",
                             "delete-snippet",
+                            "get-analytics",
                             "get-list",
                             "get-post",
                             "get-queue",
@@ -23454,6 +23455,853 @@ mod teams {
                     let res = add(&s, &stranger, body).await;
                     res.assert_json(&json!({"error": "invalid_feed", "field": "social_set_id"}));
                     assert_eq!(feed(&s, &owner, &id).await["active"], true, "untouched");
+                }
+            }
+
+            mod analytics {
+                use super::mcp::call;
+                use super::*;
+                use axum::{
+                    extract::RawQuery,
+                    http::{HeaderMap, StatusCode},
+                };
+                use sea_orm::{ConnectionTrait, DbBackend, Statement};
+                use socialreins_brain::metrics;
+                use std::sync::{
+                    atomic::{AtomicBool, Ordering},
+                    Mutex,
+                };
+
+                /// What the fake networks know of each post, by its remote id; a post not here
+                /// is gone.
+                static STATS: Mutex<Option<HashMap<String, Value>>> = Mutex::new(None);
+                /// Every read the fake networks took: (network, the ids asked for).
+                static CALLS: Mutex<Vec<(&'static str, Vec<String>)>> = Mutex::new(Vec::new());
+                /// Every read answers `500`.
+                static DOWN: AtomicBool = AtomicBool::new(false);
+
+                type Answer = (StatusCode, Json<Value>);
+
+                fn put(remote: &str, stats: Value) {
+                    STATS
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(HashMap::new)
+                        .insert(remote.to_owned(), stats);
+                }
+
+                fn known(id: &str) -> Option<Value> {
+                    STATS.lock().unwrap().as_ref()?.get(id).cloned()
+                }
+
+                fn calls(network: &str) -> Vec<Vec<String>> {
+                    let all = CALLS.lock().unwrap();
+                    let of = all.iter().filter(|(n, _)| *n == network);
+                    of.map(|(_, ids)| ids.clone()).collect()
+                }
+
+                /// Logs a read; the refusal when the token is not `token` or the network is down.
+                fn taken(
+                    network: &'static str,
+                    h: &HeaderMap,
+                    token: &str,
+                    ids: &[String],
+                ) -> Option<Answer> {
+                    CALLS.lock().unwrap().push((network, ids.to_vec()));
+                    let bearer = h.get("authorization").and_then(|v| v.to_str().ok());
+                    if bearer != Some(&format!("Bearer {token}")) {
+                        return Some((StatusCode::UNAUTHORIZED, Json(json!({}))));
+                    }
+                    DOWN.load(Ordering::SeqCst).then(|| {
+                        let err = json!({"error": {"message": "Try again later"}});
+                        (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+                    })
+                }
+
+                async fn get_posts(h: HeaderMap, RawQuery(q): RawQuery) -> Answer {
+                    let url = format!("http://x/?{}", q.unwrap_or_default());
+                    let url = reqwest::Url::parse(&url).unwrap();
+                    let pairs = url.query_pairs();
+                    let uris: Vec<String> = pairs
+                        .filter(|(k, _)| k == "uris")
+                        .map(|(_, v)| v.into_owned())
+                        .collect();
+                    if let Some(refused) = taken("bluesky", &h, "h.e.s", &uris) {
+                        return refused;
+                    }
+                    let posts: Vec<Value> = uris
+                        .iter()
+                        .filter_map(|u| {
+                            let mut post = known(u)?;
+                            post["uri"] = json!(u);
+                            Some(post)
+                        })
+                        .collect();
+                    (StatusCode::OK, Json(json!({ "posts": posts })))
+                }
+
+                async fn videos(h: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Answer {
+                    assert_eq!(q["part"], "statistics");
+                    let ids: Vec<String> = q["id"].split(',').map(str::to_owned).collect();
+                    if let Some(refused) = taken("youtube", &h, "yt-token", &ids) {
+                        return refused;
+                    }
+                    let items: Vec<Value> = ids
+                        .iter()
+                        .filter_map(|id| Some(json!({"id": id, "statistics": known(id)?})))
+                        .collect();
+                    (StatusCode::OK, Json(json!({ "items": items })))
+                }
+
+                /// Graph's `/?ids=`: one object that is not there fails the whole call.
+                async fn graph(h: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Answer {
+                    let ids: Vec<String> = q["ids"].split(',').map(str::to_owned).collect();
+                    let network = if q["fields"] == "like_count,comments_count" {
+                        "instagram"
+                    } else {
+                        assert_eq!(
+                            q["fields"],
+                            "reactions.summary(total_count).limit(0),\
+                             comments.summary(total_count).limit(0),shares"
+                        );
+                        "facebook"
+                    };
+                    if let Some(refused) = taken(network, &h, "page-token", &ids) {
+                        return refused;
+                    }
+                    let mut all = serde_json::Map::new();
+                    for id in ids {
+                        let Some(mut one) = known(&id) else {
+                            let msg = format!("Object with ID '{id}' does not exist");
+                            let err = json!({"message": msg, "code": 100, "error_subcode": 33});
+                            return (StatusCode::BAD_REQUEST, Json(json!({ "error": err })));
+                        };
+                        one["id"] = json!(id);
+                        all.insert(id, one);
+                    }
+                    (StatusCode::OK, Json(Value::Object(all)))
+                }
+
+                async fn networks() -> String {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let base = format!("http://{}", listener.local_addr().unwrap());
+                    let session = |Json(b): Json<Value>| async move {
+                        Json(json!({"did": b["identifier"], "accessJwt": "h.e.s"}))
+                    };
+                    let app = Router::new()
+                        .route("/xrpc/com.atproto.server.createSession", post(session))
+                        .route("/xrpc/app.bsky.feed.getPosts", get(get_posts))
+                        .route("/youtube/v3/videos", get(videos))
+                        .route("/{version}/", get(graph));
+                    tokio::spawn(async move { axum::serve(listener, app).await });
+                    base
+                }
+
+                async fn exec(db: &DatabaseConnection, sql: String) {
+                    db.execute_unprepared(&sql).await.unwrap();
+                }
+
+                /// A brain whose Bluesky, YouTube and Meta reads go to the fake networks, and
+                /// their base. Every target other tests left behind is marked `gone`, so a
+                /// round reads only what the test made.
+                async fn on_networks() -> (TestServer, DatabaseConnection, AppState, String) {
+                    let base = networks().await;
+                    CALLS.lock().unwrap().clear();
+                    DOWN.store(false, Ordering::SeqCst);
+                    let mut config = Config::from_env().expect("test config");
+                    config.trust_proxy = true;
+                    config.bluesky.allow_insecure_pds = true;
+                    config.youtube.api_url = base.clone();
+                    config.meta.graph_url = base.clone();
+                    let db = socialreins_brain::connect(&config)
+                        .await
+                        .expect("database reachable");
+                    let quiet = "INSERT INTO post_metrics (target_id, post_id, team_id, platform, \
+                        fetched_at, error) SELECT t.id, p.id, p.team_id, p.platform, now(), 'gone' \
+                        FROM post_targets t JOIN posts p ON p.id = t.post_id \
+                        ON CONFLICT (target_id) DO UPDATE SET error = 'gone'";
+                    exec(&db, quiet.into()).await;
+                    let state = AppState::new(db.clone(), &config);
+                    let app = controllers::router(state.clone(), &config);
+                    (TestServer::new(app).unwrap(), db, state, base)
+                }
+
+                /// An owner: (cookie, team id, default set id).
+                async fn owner(
+                    s: &TestServer,
+                    db: &DatabaseConnection,
+                ) -> (String, String, String) {
+                    let (_, cookie, _) = user(s, db).await;
+                    let team = current(s, &cookie).await["id"].as_str().unwrap().to_owned();
+                    let set = default_set(db, &team).await.to_string();
+                    (cookie, team, set)
+                }
+
+                fn fresh() -> String {
+                    uuid::Uuid::now_v7().simple().to_string()
+                }
+
+                /// A connected account of `provider`, as its connect flow would store it.
+                async fn account(
+                    db: &DatabaseConnection,
+                    team: &str,
+                    provider: &str,
+                    base: &str,
+                ) -> String {
+                    let id = uuid::Uuid::now_v7();
+                    let token: &[u8] = match provider {
+                        "bluesky" => b"app-password",
+                        "youtube" => b"yt-token",
+                        _ => b"page-token",
+                    };
+                    let stmt = Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "INSERT INTO social_accounts (id, team_id, provider, external_id, \
+                         access_token, token_expires_at, meta) VALUES ($1, $2, $3, $4, $5, \
+                         now() + interval '1 day', $6)",
+                        [
+                            id.into(),
+                            team.parse::<uuid::Uuid>().unwrap().into(),
+                            provider.into(),
+                            format!("did:plc:{}", fresh()).into(),
+                            cipher().encrypt(token).into(),
+                            json!({ "pds": base }).into(),
+                        ],
+                    );
+                    db.execute_raw(stmt).await.unwrap();
+                    id.to_string()
+                }
+
+                struct Made {
+                    post: String,
+                    target: String,
+                    remote: String,
+                }
+
+                /// A published post of `platform` in `set` with one target on `account`,
+                /// published at the SQL time `at`.
+                async fn published(
+                    db: &DatabaseConnection,
+                    (team, set): (&str, &str),
+                    account: &str,
+                    platform: &str,
+                    at: &str,
+                ) -> Made {
+                    let (post, target) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+                    let n = &fresh()[20..];
+                    let remote = match platform {
+                        "bluesky" => format!("at://did:plc:me/app.bsky.feed.post/{n}"),
+                        "facebook" => format!("1234_{}", u64::from_str_radix(n, 16).unwrap()),
+                        "instagram" => u64::from_str_radix(n, 16).unwrap().to_string(),
+                        _ => n[..11].to_owned(),
+                    };
+                    let sql = format!(
+                        "INSERT INTO posts (id, team_id, social_set_id, platform, body, status, \
+                         published_at, fanned_out) VALUES ('{post}', '{team}', '{set}', \
+                         '{platform}', 'hello', 'published', {at}, true); \
+                         INSERT INTO post_targets (id, post_id, social_account_id, status, \
+                         remote_id, published_at) VALUES ('{target}', '{post}', '{account}', \
+                         'published', '{remote}', {at})"
+                    );
+                    exec(db, sql).await;
+                    Made {
+                        post: post.to_string(),
+                        target: target.to_string(),
+                        remote,
+                    }
+                }
+
+                fn ago(minutes: i64) -> String {
+                    format!("now() - interval '{minutes} minutes'")
+                }
+
+                /// Stores counts for a target as a read `minutes` ago would have.
+                async fn read_before(
+                    db: &DatabaseConnection,
+                    target: &str,
+                    minutes: i64,
+                    [likes, comments, shares, views]: [&str; 4],
+                ) {
+                    let sql = format!(
+                        "INSERT INTO post_metrics (target_id, post_id, team_id, platform, likes, \
+                         comments, shares, views, fetched_at) SELECT t.id, p.id, p.team_id, \
+                         p.platform, {likes}, {comments}, {shares}, {views}, {} FROM post_targets t \
+                         JOIN posts p ON p.id = t.post_id WHERE t.id = '{target}' \
+                         ON CONFLICT (target_id) DO UPDATE SET fetched_at = excluded.fetched_at",
+                        ago(minutes)
+                    );
+                    exec(db, sql).await;
+                }
+
+                /// A target's row: `{likes, comments, shares, views, error, attempts, ...}`, or
+                /// `null` without one.
+                async fn row(db: &DatabaseConnection, target: &str) -> Value {
+                    let sql = format!(
+                        "SELECT to_jsonb(m) AS j FROM post_metrics m WHERE target_id = '{target}'"
+                    );
+                    let stmt = Statement::from_string(DbBackend::Postgres, sql);
+                    match db.query_one_raw(stmt).await.unwrap() {
+                        Some(r) => r.try_get("", "j").unwrap(),
+                        None => Value::Null,
+                    }
+                }
+
+                async fn read_post(s: &TestServer, cookie: &str, id: &str) -> Value {
+                    let res = s
+                        .get(&format!("/v1/posts/{id}"))
+                        .add_header("cookie", cookie);
+                    res.await.json()
+                }
+
+                /// `[likes, comments, shares, views]` of a post's first target.
+                fn counts(post: &Value) -> Value {
+                    let m = &post["targets"][0]["metrics"];
+                    assert!(m["fetched_at"].is_string(), "{post}");
+                    assert_eq!(m.as_object().unwrap().len(), 5, "{m}");
+                    json!([m["likes"], m["comments"], m["shares"], m["views"]])
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn each_network_maps_its_counts_and_the_others_are_never_called() {
+                    let (s, db, state, base) = on_networks().await;
+                    let (cookie, team, set) = owner(&s, &db).await;
+                    let at = (team.as_str(), set.as_str());
+                    let mut made = HashMap::new();
+                    for platform in [
+                        "bluesky",
+                        "youtube",
+                        "facebook",
+                        "instagram",
+                        "threads",
+                        "linkedin",
+                        "x",
+                        "tiktok",
+                    ] {
+                        let a = account(&db, &team, platform, &base).await;
+                        let one = published(&db, at, &a, platform, &ago(10)).await;
+                        let two = published(&db, at, &a, platform, &ago(10)).await;
+                        made.insert(platform, (one, two));
+                    }
+                    let (b, _) = &made["bluesky"];
+                    put(
+                        &b.remote,
+                        json!({"likeCount": 3, "replyCount": 2, "repostCount": 4, "quoteCount": 1}),
+                    );
+                    let (y, _) = &made["youtube"];
+                    put(
+                        &y.remote,
+                        json!({"viewCount": "1200", "likeCount": "30", "commentCount": "5"}),
+                    );
+                    let (f, shared) = &made["facebook"];
+                    let total = |n: i64| json!({"summary": {"total_count": n}});
+                    put(
+                        &f.remote,
+                        json!({"reactions": total(7), "comments": total(2)}),
+                    );
+                    put(
+                        &shared.remote,
+                        json!({"reactions": total(1), "comments": total(0), "shares": {"count": 3}}),
+                    );
+                    let (i, hidden) = &made["instagram"];
+                    put(&i.remote, json!({"like_count": 9, "comments_count": 1}));
+                    put(&hidden.remote, json!({"comments_count": 4}));
+
+                    // Before the first read a target has no metrics.
+                    assert_eq!(
+                        read_post(&s, &cookie, &b.post).await["targets"][0]["metrics"],
+                        json!(null)
+                    );
+                    metrics::tick(&state).await.unwrap();
+                    let n = Value::Null;
+                    for (made, want) in [
+                        (b, json!([3, 2, 5, n])),
+                        (y, json!([30, 5, n, 1200])),
+                        (f, json!([7, 2, 0, n])),
+                        (shared, json!([1, 0, 3, n])),
+                        (i, json!([9, 1, n, n])),
+                        (hidden, json!([n, 4, n, n])),
+                    ] {
+                        let p = read_post(&s, &cookie, &made.post).await;
+                        assert_eq!(counts(&p), want, "{}", p["platform"]);
+                    }
+                    // One call a network for both of an account's posts.
+                    for network in ["bluesky", "youtube", "facebook", "instagram"] {
+                        let asked = calls(network);
+                        assert_eq!(asked.len(), 1, "{network}: {asked:?}");
+                        assert_eq!(asked[0].len(), 2, "{network}");
+                    }
+                    let asked: Vec<String> = CALLS
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .flat_map(|c| c.1.clone())
+                        .collect();
+                    for platform in ["threads", "linkedin", "x", "tiktok"] {
+                        let (one, two) = &made[platform];
+                        for m in [one, two] {
+                            assert!(!asked.contains(&m.remote), "{platform} was called");
+                            assert_eq!(row(&db, &m.target).await, n, "{platform}");
+                            let p = read_post(&s, &cookie, &m.post).await;
+                            assert_eq!(p["targets"][0]["metrics"], n, "{platform}");
+                        }
+                    }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_round_asks_in_batches_of_what_each_network_takes() {
+                    let (s, db, state, base) = on_networks().await;
+                    let (_, team, set) = owner(&s, &db).await;
+                    for platform in ["bluesky", "youtube", "facebook"] {
+                        let a = account(&db, &team, platform, &base).await;
+                        for _ in 0..60 {
+                            let m = published(&db, (&team, &set), &a, platform, &ago(10)).await;
+                            put(&m.remote, json!({}));
+                        }
+                    }
+                    metrics::tick(&state).await.unwrap();
+                    let sizes = |network: &str| {
+                        let mut sizes: Vec<usize> = calls(network).iter().map(Vec::len).collect();
+                        sizes.sort_unstable();
+                        sizes
+                    };
+                    assert_eq!(sizes("bluesky"), [10, 25, 25]);
+                    assert_eq!(sizes("youtube"), [10, 50]);
+                    assert_eq!(sizes("facebook"), [10, 50]);
+                    // All were just read, so the next round has nothing to ask.
+                    CALLS.lock().unwrap().clear();
+                    metrics::tick(&state).await.unwrap();
+                    assert!(CALLS.lock().unwrap().is_empty());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_target_is_due_by_its_age_and_its_last_read() {
+                    let (s, db, state, base) = on_networks().await;
+                    let (_, team, set) = owner(&s, &db).await;
+                    let a = account(&db, &team, "youtube", &base).await;
+                    let (hour, day) = (60, 24 * 60);
+                    // (published minutes ago, last read minutes ago, due)
+                    let cases = [
+                        (10, None, true),
+                        (10, Some(30), false),
+                        (10, Some(61), true),
+                        (47 * hour, Some(61), true),
+                        (49 * hour, Some(61), false),
+                        (3 * day, Some(11 * hour), false),
+                        (3 * day, Some(13 * hour), true),
+                        (29 * day, None, true),
+                        (31 * day, None, false),
+                        (31 * day, Some(13 * hour), false),
+                    ];
+                    let mut want = Vec::new();
+                    let mut all = Vec::new();
+                    for (published_ago, read_ago, due) in cases {
+                        let at = (team.as_str(), set.as_str());
+                        let m = published(&db, at, &a, "youtube", &ago(published_ago)).await;
+                        if let Some(minutes) = read_ago {
+                            read_before(&db, &m.target, minutes, ["1", "1", "NULL", "1"]).await;
+                        }
+                        put(&m.remote, json!({"viewCount": "2"}));
+                        if due {
+                            want.push(m.remote.clone());
+                        }
+                        all.push(m);
+                    }
+                    // An account that needs a reconnect is skipped, as is a target that failed.
+                    let dead = account(&db, &team, "youtube", &base).await;
+                    let skipped = published(&db, (&team, &set), &dead, "youtube", &ago(10)).await;
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE social_accounts SET meta = meta || '{{\"reconnect\": true}}' \
+                             WHERE id = '{dead}'"
+                        ),
+                    )
+                    .await;
+                    let failed = published(&db, (&team, &set), &a, "youtube", &ago(10)).await;
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE post_targets SET status = 'failed' WHERE id = '{}'",
+                            failed.target
+                        ),
+                    )
+                    .await;
+
+                    metrics::tick(&state).await.unwrap();
+                    let mut asked: Vec<String> = calls("youtube").concat();
+                    asked.sort();
+                    want.sort();
+                    assert_eq!(asked, want);
+                    assert_eq!(row(&db, &skipped.target).await, Value::Null);
+                    assert_eq!(row(&db, &all[0].target).await["views"], 2);
+                    assert_eq!(row(&db, &all[1].target).await["views"], 1, "not read again");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_failed_read_keeps_the_numbers_and_waits_longer_each_time() {
+                    let (s, db, state, base) = on_networks().await;
+                    let (cookie, team, set) = owner(&s, &db).await;
+                    let a = account(&db, &team, "youtube", &base).await;
+                    let m = published(&db, (&team, &set), &a, "youtube", &ago(10)).await;
+                    put(&m.remote, json!({"viewCount": "8", "likeCount": "1"}));
+                    read_before(&db, &m.target, 61, ["4", "0", "NULL", "40"]).await;
+                    let set_row = |sql: &'static str| {
+                        let sql = format!(
+                            "UPDATE post_metrics SET {sql} WHERE target_id = '{}'",
+                            m.target
+                        );
+                        exec(&db, sql)
+                    };
+                    let round = || async {
+                        let before = calls("youtube").len();
+                        metrics::tick(&state).await.unwrap();
+                        calls("youtube").len() - before
+                    };
+
+                    DOWN.store(true, Ordering::SeqCst);
+                    assert_eq!(round().await, 1);
+                    let r = row(&db, &m.target).await;
+                    assert_eq!(r["attempts"], 1);
+                    assert_eq!(r["error"], "Statistics: Try again later");
+                    assert_eq!((&r["likes"], &r["views"]), (&json!(4), &json!(40)));
+                    let p = read_post(&s, &cookie, &m.post).await;
+                    assert_eq!(counts(&p), json!([4, 0, null, 40]), "the last good numbers");
+
+                    // One failed try: two hours, not one.
+                    set_row("fetched_at = now() - interval '119 minutes'").await;
+                    assert_eq!(round().await, 0);
+                    set_row("fetched_at = now() - interval '121 minutes'").await;
+                    assert_eq!(round().await, 1);
+                    assert_eq!(row(&db, &m.target).await["attempts"], 2);
+                    // Never longer than a day.
+                    set_row("attempts = 30, fetched_at = now() - interval '23 hours'").await;
+                    assert_eq!(round().await, 0);
+                    set_row("fetched_at = now() - interval '25 hours'").await;
+                    assert_eq!(round().await, 1);
+                    assert_eq!(row(&db, &m.target).await["attempts"], 31);
+
+                    // A read that works clears the error and the count.
+                    DOWN.store(false, Ordering::SeqCst);
+                    set_row("fetched_at = now() - interval '25 hours'").await;
+                    assert_eq!(round().await, 1);
+                    let r = row(&db, &m.target).await;
+                    assert_eq!((&r["attempts"], &r["error"]), (&json!(0), &json!(null)));
+                    assert_eq!(
+                        counts(&read_post(&s, &cookie, &m.post).await),
+                        json!([1, null, null, 8])
+                    );
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_post_the_platform_lost_is_gone_and_not_read_again() {
+                    let (s, db, state, base) = on_networks().await;
+                    let (cookie, team, set) = owner(&s, &db).await;
+                    let at = (team.as_str(), set.as_str());
+                    let bsky = account(&db, &team, "bluesky", &base).await;
+                    let kept = published(&db, at, &bsky, "bluesky", &ago(120)).await;
+                    let lost = published(&db, at, &bsky, "bluesky", &ago(120)).await;
+                    let new = published(&db, at, &bsky, "bluesky", &ago(10)).await;
+                    put(&kept.remote, json!({"likeCount": 1}));
+                    read_before(&db, &lost.target, 61, ["6", "0", "0", "NULL"]).await;
+                    // Graph fails a whole call over one missing object: each is asked again.
+                    let page = account(&db, &team, "facebook", &base).await;
+                    let mut posts = Vec::new();
+                    for _ in 0..3 {
+                        posts.push(published(&db, at, &page, "facebook", &ago(120)).await);
+                    }
+                    let total = |n: i64| json!({"summary": {"total_count": n}});
+                    put(
+                        &posts[0].remote,
+                        json!({"reactions": total(2), "comments": total(0)}),
+                    );
+                    put(
+                        &posts[2].remote,
+                        json!({"reactions": total(3), "comments": total(1)}),
+                    );
+
+                    metrics::tick(&state).await.unwrap();
+                    assert_eq!(row(&db, &kept.target).await["likes"], 1);
+                    let r = row(&db, &lost.target).await;
+                    assert_eq!((&r["error"], &r["likes"]), (&json!("gone"), &json!(6)));
+                    let p = read_post(&s, &cookie, &lost.post).await;
+                    assert_eq!(counts(&p), json!([6, 0, 0, null]), "its last numbers stay");
+                    // A post under an hour old may not show yet: tried again, with a wait.
+                    let r = row(&db, &new.target).await;
+                    assert_eq!(
+                        (&r["error"], &r["attempts"]),
+                        (&json!("not_found"), &json!(1))
+                    );
+                    let mut sizes: Vec<usize> = calls("facebook").iter().map(Vec::len).collect();
+                    sizes.sort_unstable();
+                    assert_eq!(sizes, [1, 1, 1, 3]);
+                    assert_eq!(row(&db, &posts[0].target).await["likes"], 2);
+                    assert_eq!(row(&db, &posts[1].target).await["error"], "gone");
+                    assert_eq!(row(&db, &posts[2].target).await["likes"], 3);
+
+                    exec(
+                        &db,
+                        "UPDATE post_metrics SET fetched_at = now() - interval '5 days' \
+                         WHERE error = 'gone'"
+                            .into(),
+                    )
+                    .await;
+                    CALLS.lock().unwrap().clear();
+                    metrics::tick(&state).await.unwrap();
+                    let asked: Vec<String> = CALLS
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .flat_map(|c| c.1.clone())
+                        .collect();
+                    assert!(!asked.contains(&lost.remote) && !asked.contains(&posts[1].remote));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn analytics_sums_a_range_by_platform_and_day_with_the_top_posts() {
+                    let (s, db, _, base) = on_networks().await;
+                    let (cookie, team, set) = owner(&s, &db).await;
+                    let res = req(&s, Method::POST, "/v1/social-sets", &cookie)
+                        .json(&json!({"name": "Clients"}))
+                        .await;
+                    let clients = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                    let today = Utc::now().date_naive();
+                    let noon = |days_ago: i64| {
+                        format!("'{} 12:00:00+00'", today - Duration::days(days_ago))
+                    };
+                    let bsky = account(&db, &team, "bluesky", &base).await;
+                    let yt = account(&db, &team, "youtube", &base).await;
+                    let yt2 = account(&db, &team, "youtube", &base).await;
+                    let th = account(&db, &team, "threads", &base).await;
+                    let home = (team.as_str(), set.as_str());
+                    let a = published(&db, home, &bsky, "bluesky", &noon(0)).await;
+                    read_before(&db, &a.target, 5, ["5", "1", "2", "NULL"]).await;
+                    let b = published(&db, (&team, &clients), &yt, "youtube", &noon(2)).await;
+                    read_before(&db, &b.target, 5, ["10", "3", "NULL", "100"]).await;
+                    // A post's second account counts with its first.
+                    let second = uuid::Uuid::now_v7();
+                    exec(
+                        &db,
+                        format!(
+                            "INSERT INTO post_targets (id, post_id, social_account_id, status, \
+                             remote_id, published_at) VALUES ('{second}', '{}', '{yt2}', \
+                             'published', 'second', now())",
+                            b.post
+                        ),
+                    )
+                    .await;
+                    read_before(&db, &second.to_string(), 5, ["1", "NULL", "NULL", "20"]).await;
+                    let quiet = published(&db, home, &bsky, "bluesky", &noon(2)).await;
+                    read_before(&db, &quiet.target, 5, ["0", "0", "0", "NULL"]).await;
+                    published(&db, home, &th, "threads", &noon(0)).await;
+                    let old = published(&db, home, &bsky, "bluesky", &noon(40)).await;
+                    read_before(&db, &old.target, 5, ["50", "0", "0", "NULL"]).await;
+                    let taken_down = published(&db, home, &bsky, "bluesky", &noon(1)).await;
+                    read_before(&db, &taken_down.target, 5, ["70", "0", "0", "NULL"]).await;
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE posts SET status = 'deleted' WHERE id = '{}'",
+                            taken_down.post
+                        ),
+                    )
+                    .await;
+
+                    let read = |cookie: String, query: String| {
+                        let path = format!("/v1/analytics{query}");
+                        s.get(&path).add_header("cookie", cookie)
+                    };
+                    let sums = |posts: i64, likes: i64, comments: i64, shares: i64, views: i64| {
+                        json!({"posts": posts, "likes": likes, "comments": comments,
+                            "shares": shares, "views": views})
+                    };
+                    let with = |mut sums: Value, key: &str, value: Value| {
+                        sums[key] = value;
+                        sums
+                    };
+                    let res = read(cookie.clone(), String::new()).await;
+                    res.assert_status_ok();
+                    let body = res.json::<Value>();
+                    assert_eq!(
+                        body["supported"],
+                        json!(["bluesky", "facebook", "instagram", "youtube"])
+                    );
+                    assert_eq!(body["totals"], sums(4, 16, 4, 2, 120));
+                    let supported = |s: Value, on: bool| with(s, "supported", json!(on));
+                    assert_eq!(
+                        body["by_platform"],
+                        json!([
+                            supported(
+                                with(sums(2, 5, 1, 2, 0), "platform", json!("bluesky")),
+                                true
+                            ),
+                            supported(
+                                with(sums(1, 0, 0, 0, 0), "platform", json!("threads")),
+                                false
+                            ),
+                            supported(
+                                with(sums(1, 11, 3, 0, 120), "platform", json!("youtube")),
+                                true
+                            ),
+                        ])
+                    );
+                    let days = body["by_day"].as_array().unwrap();
+                    assert_eq!(days.len(), 30, "the last 30 days, each of them");
+                    let top: Vec<&str> = body["top_posts"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|p| p["id"].as_str().unwrap())
+                        .collect();
+                    assert_eq!(
+                        top,
+                        [b.post.as_str(), a.post.as_str()],
+                        "most first, none left out"
+                    );
+                    assert_eq!(counts(&body["top_posts"][1]), json!([5, 1, 2, null]));
+                    assert_eq!(body["top_posts"][0]["targets"].as_array().unwrap().len(), 2);
+
+                    // A range of days, both ends in it.
+                    let day = |ago: i64| (today - Duration::days(ago)).to_string();
+                    let span = |from: i64, to: i64| format!("?from={}&to={}", day(from), day(to));
+                    let body = read(cookie.clone(), span(2, 0)).await.json::<Value>();
+                    assert_eq!(
+                        body["by_day"],
+                        json!([
+                            with(sums(2, 11, 3, 0, 120), "date", json!(day(2))),
+                            with(sums(0, 0, 0, 0, 0), "date", json!(day(1))),
+                            with(sums(2, 5, 1, 2, 0), "date", json!(day(0))),
+                        ])
+                    );
+                    let body = read(cookie.clone(), span(40, 40)).await.json::<Value>();
+                    assert_eq!(body["totals"], sums(1, 50, 0, 0, 0));
+                    let body = read(cookie.clone(), span(365, 0)).await.json::<Value>();
+                    assert_eq!(body["by_day"].as_array().unwrap().len(), 366);
+                    for bad in [
+                        span(366, 0),
+                        span(0, 1),
+                        "?from=yesterday".into(),
+                        "?to=2026-13-01".into(),
+                        "?from=2026-01-01T00:00:00Z".into(),
+                    ] {
+                        let res = read(cookie.clone(), bad.clone()).await;
+                        assert_eq!(res.status_code(), 422, "{bad}");
+                        res.assert_json(&json!({"error": "invalid_range"}));
+                    }
+                    let res = read(cookie.clone(), "?social_set_id=nope".into()).await;
+                    assert_eq!(res.status_code(), 422);
+
+                    // One set's posts; the default set is every set's.
+                    let of = |set: &str| format!("?social_set_id={set}");
+                    let body = read(cookie.clone(), of(&clients)).await.json::<Value>();
+                    assert_eq!(body["totals"], sums(1, 11, 3, 0, 120));
+                    let body = read(cookie.clone(), of(&set)).await.json::<Value>();
+                    assert_eq!(body["totals"], sums(4, 16, 4, 2, 120));
+
+                    // Any member reads; another team sees none of it.
+                    let (member, _) = joined(&s, &db, &team, "member").await;
+                    let body = read(member, String::new()).await.json::<Value>();
+                    assert_eq!(body["totals"], sums(4, 16, 4, 2, 120));
+                    let (_, stranger, _) = user(&s, &db).await;
+                    let body = read(stranger, of(&clients)).await.json::<Value>();
+                    assert_eq!(body["totals"], sums(0, 0, 0, 0, 0));
+                    assert_eq!(body["by_platform"], json!([]));
+                    assert_eq!(body["top_posts"], json!([]));
+                    assert_eq!(s.get("/v1/analytics").await.status_code(), 401);
+
+                    // A read-only token reads; a set token sees its set whatever it asks for.
+                    let secret = |made: Value| made["secret"].as_str().unwrap().to_owned();
+                    let ro = json!({"name": "ro", "read_only": true});
+                    let ro = secret(make_token(&s, &cookie, ro).await);
+                    let res = bearer(&s, Method::GET, "/v1/analytics", &ro).await;
+                    assert_eq!(res.json::<Value>()["totals"], sums(4, 16, 4, 2, 120));
+                    let cm = json!({"name": "cm", "social_set_id": clients});
+                    let cm = secret(make_token(&s, &cookie, cm).await);
+                    for query in [String::new(), of(&set)] {
+                        let path = format!("/v1/analytics{query}");
+                        let res = bearer(&s, Method::GET, &path, &cm).await;
+                        assert_eq!(res.json::<Value>()["totals"], sums(1, 11, 3, 0, 120));
+                    }
+
+                    let (err, v) = call(
+                        &s,
+                        &ro,
+                        "get-analytics",
+                        json!({"from": day(40), "to": day(40)}),
+                    )
+                    .await;
+                    assert!(!err, "{v}");
+                    assert_eq!(v["totals"], sums(1, 50, 0, 0, 0));
+                    let (err, v) = call(&s, &ro, "get-analytics", json!({"from": "soon"})).await;
+                    assert!(err);
+                    assert_eq!(v, json!({"error": "invalid_range"}));
+
+                    let doc = s.get("/openapi.json").await.json::<Value>();
+                    assert!(doc["paths"]["/analytics"]["get"].is_object());
+                    assert!(doc["paths"]["/posts/{id}/metrics/refresh"]["post"].is_object());
+                    let schemas = &doc["components"]["schemas"];
+                    assert!(schemas["Target"]["properties"]["metrics"].is_object());
+                    assert!(schemas["Analytics"]["properties"]["by_day"].is_object());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_refresh_reads_a_post_now_at_most_once_a_minute() {
+                    let (s, db, _, base) = on_networks().await;
+                    let (cookie, team, set) = owner(&s, &db).await;
+                    let at = (team.as_str(), set.as_str());
+                    let yt = account(&db, &team, "youtube", &base).await;
+                    let m = published(&db, at, &yt, "youtube", &ago(10)).await;
+                    put(
+                        &m.remote,
+                        json!({"viewCount": "7", "likeCount": "2", "commentCount": "0"}),
+                    );
+                    let refresh = |cookie: String, id: String| {
+                        let path = format!("/v1/posts/{id}/metrics/refresh");
+                        req(&s, Method::POST, &path, &cookie)
+                    };
+
+                    let res = refresh(cookie.clone(), m.post.clone()).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let p = res.json::<Value>();
+                    assert_eq!(p["id"], m.post.as_str());
+                    assert_eq!(counts(&p), json!([2, 0, null, 7]));
+                    let res = refresh(cookie.clone(), m.post.clone()).await;
+                    assert_eq!(res.status_code(), 429);
+                    res.assert_json(&json!({"error": "refreshed_recently"}));
+                    assert_eq!(calls("youtube").len(), 1);
+                    // A minute on it reads again, though the round would wait an hour.
+                    put(&m.remote, json!({"viewCount": "9"}));
+                    read_before(&db, &m.target, 2, ["0", "0", "0", "0"]).await;
+                    let res = refresh(cookie.clone(), m.post.clone()).await;
+                    assert_eq!(counts(&res.json()), json!([null, null, null, 9]));
+
+                    // Another team's post is not there; a read-only token may not ask.
+                    let (_, stranger, _) = user(&s, &db).await;
+                    let res = refresh(stranger, m.post.clone()).await;
+                    assert_eq!(res.status_code(), 404);
+                    let ro = json!({"name": "ro", "read_only": true});
+                    let ro = make_token(&s, &cookie, ro).await;
+                    let path = format!("/v1/posts/{}/metrics/refresh", m.post);
+                    let res = bearer(&s, Method::POST, &path, ro["secret"].as_str().unwrap()).await;
+                    assert_eq!(res.status_code(), 403);
+                    res.assert_json(&json!({"error": "read_only_token"}));
+
+                    // A platform without metrics is never called: the post comes back as it is.
+                    let th = account(&db, &team, "threads", &base).await;
+                    let t = published(&db, at, &th, "threads", &ago(10)).await;
+                    let before = CALLS.lock().unwrap().len();
+                    for _ in 0..2 {
+                        let res = refresh(cookie.clone(), t.post.clone()).await;
+                        assert_eq!(res.status_code(), 200);
+                        assert_eq!(res.json::<Value>()["targets"][0]["metrics"], json!(null));
+                    }
+                    assert_eq!(CALLS.lock().unwrap().len(), before);
                 }
             }
 
