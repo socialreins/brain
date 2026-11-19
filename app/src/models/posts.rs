@@ -54,6 +54,9 @@ pub struct Model {
     /// Who approved or rejected it; null for an API token.
     pub approval_by: Option<Uuid>,
     pub approval_at: Option<DateTimeWithTimeZone>,
+    /// The repeat rule (`repeat::Repeat`); null for none. Only a `scheduled` post has one.
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub repeat: Option<Json>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }

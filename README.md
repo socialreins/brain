@@ -31,7 +31,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/health` | `{"status":"ok"}` |
 | GET | `/version` | `{"commit":"<sha>"}`, from `RAILWAY_GIT_COMMIT_SHA`, `dev` locally |
 | GET | `/openapi.json` | OpenAPI document for `/v1` |
-| POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, posting queues, accounts, posts (with `approve-post` and `reject-post`, write tools), lists, the media library (`list-media`, `add-media`) and snippets (`list-snippets`, `save-snippet` creating or, with an `id`, replacing, `delete-snippet`). Bearer API token only, same scope and per-token limit as `/v1`, bodies up to 64 KiB; `Idempotency-Key` does not apply. `create-post` and `create-post-group` take `validate_only` (see "Validate only"), which a read-only token may send |
+| POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, posting queues, accounts, posts (with `approve-post`, `reject-post`, `set-post-repeat` and `clear-post-repeat`, write tools), lists, the media library (`list-media`, `add-media`) and snippets (`list-snippets`, `save-snippet` creating or, with an `id`, replacing, `delete-snippet`). Bearer API token only, same scope and per-token limit as `/v1`, bodies up to 64 KiB; `Idempotency-Key` does not apply. `create-post` and `create-post-group` take `validate_only` (see "Validate only"), which a read-only token may send |
 | POST | `/v1/waitlist` | `{"email":"...","source":"..."}` joins the waitlist and emails a confirmation link |
 | POST | `/v1/waitlist/verify` | `{"token"}` from the emailed link: marks the signup verified, `200 {"status":"verified"}`, else `422 {"error":"invalid_link"}` |
 | GET | `/v1/waitlist/count` | `{"count":n}`: every signup, verified or not, cached for 30 seconds |
@@ -96,13 +96,14 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | PATCH, DELETE | `/v1/social-sets/{id}` | Rename (`{"name"}`, the default set too); delete (sign-in from the last 10 minutes, not the default set), restorable for 30 days. Owner, admin |
 | POST | `/v1/social-sets/{id}/restore` | Restore a set deleted in the last 30 days, with its accounts (owner, admin) |
 | GET, PUT | `/v1/social-sets/{id}/queue` | The set's posting queue: `{"time_zone","slots":[{"weekday","time"}],"next"}` (weekday 0 is Sunday, `time` is `HH:MM` in the IANA `time_zone`, `UTC` until saved; `next` is the next 10 slot times with no `scheduled` post of the set). `PUT {"time_zone","slots"}` replaces both (any member): `422 invalid_time_zone`, `invalid_slot`, `duplicate_slot`, `too_many_slots` (over 50). A slot missing on a spring-forward day is skipped, an ambiguous fall-back one is its first occurrence |
-| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&group_id=&approval=&from=&to=` on `scheduled_at`, `approval` being `pending`, `approved` or `rejected`; the default set's id gives every set's posts), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"thread":[{"body","media"}],"first_comment","cover","tiktok","youtube","scheduled_at","queue"}`; any member). `"queue": true` instead of `scheduled_at` schedules it at the earliest free slot of the set's queue, picked under a lock per set so two calls never share one (`422 queue_with_scheduled_at` with both, `422 queue_empty` without slots; `PUT` answers `422 queue_not_supported`). `first_comment`: see "First comment" below; `cover`: see "Video cover"; `tiktok`: see "TikTok settings"; `youtube`: see YouTube below. `thread`: up to 25 follow-up posts, each a reply to the one before and checked like the post (`422 {"error","part"}` names a bad one); `?validate_only=true` checks without creating (see "Validate only"); each part is saved on its target as it goes out, a target whose part fails is `failed` naming it with the parts before it kept, and a takedown deletes the parts last first, then the root |
+| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&group_id=&approval=&repeat=&from=&to=` on `scheduled_at`, `approval` being `pending`, `approved` or `rejected`, `repeat=true` the posts with a repeat rule; the default set's id gives every set's posts), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"thread":[{"body","media"}],"first_comment","cover","tiktok","youtube","scheduled_at","queue"}`; any member). `"queue": true` instead of `scheduled_at` schedules it at the earliest free slot of the set's queue, picked under a lock per set so two calls never share one (`422 queue_with_scheduled_at` with both, `422 queue_empty` without slots; `PUT` answers `422 queue_not_supported`). `first_comment`: see "First comment" below; `cover`: see "Video cover"; `tiktok`: see "TikTok settings"; `youtube`: see YouTube below. `thread`: up to 25 follow-up posts, each a reply to the one before and checked like the post (`422 {"error","part"}` names a bad one); `?validate_only=true` checks without creating (see "Validate only"); each part is saved on its target as it goes out, a target whose part fails is `failed` naming it with the parts before it kept, and a takedown deletes the parts last first, then the root |
 | GET, PUT, DELETE | `/v1/posts/{id}` | One post with its `targets`; replace a `draft` or `scheduled` one; delete (`204` for draft or scheduled, `200` after taking a published one down, `422 takedown_failed` with a `message`, `409` for queued or failed) |
 | GET, PUT | `/v1/posts/{id}/page` | The post's public page, one per post or per group: `{"enabled","details","code","live"}` (`code` is `null` before the first save, `live` says whether the public route serves it now). `PUT {"enabled","details"}` saves it whatever the post's status and makes the permanent 10-character `code` the first time: `422 details_too_long` over 5000 characters, `422 public_pages_off` for `enabled: true` while the team has public pages off |
 | GET | `/v1/public/pages/{code}` | Public, no sign-in: `{"team","body","media","thread","details","published_at","links":[{"platform","url"}]}` from the first published post of the page, `links` from every published target. `404` unless the page is enabled, its team has public pages on and a post of it is `published`. `Cache-Control: public, max-age=60`; 120 requests a minute per IP |
 | POST | `/v1/post-groups` | One post per platform of a set in one call (`{"social_set_id","platforms","body","media","scheduled_at","queue","list_id","position","thread","first_comment","cover","tiktok","youtube","overrides":{"<platform>":{"body","media","thread","first_comment","cover","tiktok","youtube"}}}`; `platforms` defaults to those brain publishes to with a connected account; bodies up to 64 KiB): `201 {"group_id","posts","skipped"}`; `"queue": true` puts the whole group at one free slot of the queue; an invalid post creates nothing and its error names the `platform`, unless `"on_invalid":"skip"` (see "Validate only"). `?validate_only=true` checks without creating |
 | POST | `/v1/posts/{id}/publish` | Publish a draft or scheduled post now: `202` with the post `queued`; poll it for the result. `403 approval_required` for a member while the team requires approval, unless the post is `approved`, and for anyone when the post is `rejected`. An owner's, admin's or token's publish of a `pending` post approves it |
 | POST | `/v1/posts/{id}/approve`, `/v1/posts/{id}/reject` | Approve or reject a `scheduled` post (optional `{"note"}`, trimmed, at most 500 characters, else `422 invalid_note`): `200` with the post. Owner, admin or a token that is not read-only (`403 forbidden` for a member); `409 not_awaiting_approval` unless the post is `scheduled` with an `approval`. See "Approvals" |
+| PUT, DELETE | `/v1/posts/{id}/repeat` | Make a `scheduled` post repeat (`{"every":"day"\|"week"\|"month","interval":1..12,"until":"YYYY-MM-DD"\|null,"remaining":1..100\|null}`), or stop it: `200` with the post, the rule in its `repeat`. It covers the other `scheduled` posts of the post's group. Any member; `409 not_scheduled`, `422 repeat_not_supported` for TikTok, `422 {"error":"invalid_repeat","field"}`, `422 too_many_repeats` over 200 posts with a rule per team. See "Repeating posts" |
 | POST | `/v1/post-groups/{group_id}/approve`, `/v1/post-groups/{group_id}/reject` | The same for every `scheduled` post of a group that has an `approval`, all or none: `200 {"posts":[...]}` with the posts it changed, `409 not_awaiting_approval` when there is none |
 | GET, POST | `/v1/lists` | Post lists (ordered groups such as a series), or create one (`{"name","social_set_id"}`; no set means team-wide, or the token's own set for a set token) |
 | GET, PATCH, DELETE | `/v1/lists/{id}` | One list with its `items` (`post_id`, 1-based `position`, `post`); rename (`{"name"}`); delete (posts stay) |
@@ -697,6 +698,35 @@ and `approval_at`.
 - Switching `require_approval` off releases every `pending` post: they publish at their time
   (at once when it has passed), and new saves set `approval: null`. `rejected` posts stay held.
   A post scheduled before the switch went on has `approval: null` and is never held.
+
+## Repeating posts
+
+A `scheduled` post may carry a rule in `repeat` (`PUT /v1/posts/{id}/repeat`, cleared with
+`DELETE`): `every` (`day`, `week` or `month`), `interval` (1 to 12), `until` (a UTC date, or
+`null`) and `remaining` (how many more copies will be made after this post, 1 to 100, or `null`).
+With both `null` it repeats until the rule is removed.
+
+- When the post is taken to publish, by the scheduler or by publish now, brain schedules the
+  next copy in the same transaction and clears the post's own rule, so a post yields one copy at
+  most, whether it then publishes or fails. The rule lives on the one upcoming copy:
+  `GET /v1/posts?repeat=true` lists a team's series.
+- The copy is a new post with the same set, platform, body, media, thread, first comment, cover,
+  YouTube settings, author and `approval`. It is in no list and has no public page. Copies of
+  the posts of one group share one new `group_id`.
+- Its time is the post's `scheduled_at` plus the interval: exact multiples of 24 hours or 7 days,
+  or the same day of the month and time in UTC, on the month's last day when the month is
+  shorter (January 31, February 28, March 31). A time already past is skipped, so a post held
+  back for a week yields one copy, not seven. Publish now counts from the time the post was
+  scheduled at, not from now.
+- The copy carries the rule with `remaining` one lower, and the copy of a post with
+  `remaining: 1` carries no rule: `remaining: N` makes N copies in all. No copy is made when the
+  next time is after the end of `until`, or when the team is at its 2000 posts.
+- A copy that cannot be made is logged and ends the series; the post itself still publishes.
+- Setting or clearing a rule covers the other `scheduled` posts of the post's group and is an
+  edit: while the team requires approval, a member's puts those posts back to `pending`.
+- An edit (`PUT /v1/posts/{id}`) keeps the rule, unless it makes the post a draft or a TikTok
+  post. TikTok posts never repeat: TikTok needs a person to confirm every post.
+- At most 200 posts with a rule per team.
 
 ## Local development
 

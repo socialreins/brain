@@ -7943,6 +7943,518 @@ mod teams {
                 }
             }
 
+            mod repeats {
+                use super::*;
+                use chrono::{DateTime, Datelike, Months, SubsecRound};
+                use sea_orm::ConnectionTrait;
+
+                fn soon() -> String {
+                    (Utc::now() + Duration::hours(1)).to_rfc3339()
+                }
+
+                /// An owner with an account: `(cookie, team id, default set)`.
+                async fn team(s: &TestServer, db: &DatabaseConnection) -> (String, String, String) {
+                    let (cookie, team_id, _) = owner_with_account(s, db).await;
+                    let set = default_set(db, &team_id).await.to_string();
+                    (cookie, team_id, set)
+                }
+
+                async fn scheduled(s: &TestServer, cookie: &str, set: &str) -> String {
+                    let res = create(s, cookie, input(set, "again", Some(&soon()))).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    id_of(&res)
+                }
+
+                async fn sql(db: &DatabaseConnection, sql: String) {
+                    db.execute_unprepared(&sql).await.unwrap();
+                }
+
+                /// Moves a post to `at`, as if it had been scheduled then.
+                async fn at(db: &DatabaseConnection, id: &str, at: DateTime<Utc>) {
+                    let at = at.to_rfc3339();
+                    sql(
+                        db,
+                        format!("UPDATE posts SET scheduled_at = '{at}' WHERE id = '{id}'"),
+                    )
+                    .await;
+                }
+
+                fn repeat(s: &TestServer, cookie: &str, id: &str, rule: Value) -> TestRequest {
+                    req(s, Method::PUT, &format!("/v1/posts/{id}/repeat"), cookie).json(&rule)
+                }
+
+                async fn repeating(s: &TestServer, cookie: &str, id: &str, rule: Value) {
+                    let res = repeat(s, cookie, id, rule).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                }
+
+                fn daily() -> Value {
+                    json!({"every": "day", "interval": 1, "until": null, "remaining": null})
+                }
+
+                /// The team's posts that have a rule: the copies, once their sources went out.
+                async fn with_rule(s: &TestServer, cookie: &str) -> Vec<Value> {
+                    let res = req(s, Method::GET, "/v1/posts?repeat=true", cookie).await;
+                    res.assert_status_ok();
+                    res.json()
+                }
+
+                fn time(p: &Value) -> DateTime<Utc> {
+                    p["scheduled_at"].as_str().unwrap().parse().unwrap()
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_rule_is_validated_set_listed_and_cleared() {
+                    let (s, db, _) = on_mock().await;
+                    let (cookie, _, set) = team(&s, &db).await;
+                    let id = scheduled(&s, &cookie, &set).await;
+                    for (field, rule) in [
+                        ("every", json!({"every": "year", "interval": 1})),
+                        ("interval", json!({"every": "day", "interval": 0})),
+                        ("interval", json!({"every": "day", "interval": 13})),
+                        (
+                            "until",
+                            json!({"every": "day", "interval": 1, "until": "2099-02-30"}),
+                        ),
+                        (
+                            "remaining",
+                            json!({"every": "day", "interval": 1, "remaining": 0}),
+                        ),
+                        (
+                            "remaining",
+                            json!({"every": "day", "interval": 1, "remaining": 101}),
+                        ),
+                    ] {
+                        let res = repeat(&s, &cookie, &id, rule.clone()).await;
+                        assert_eq!(res.status_code(), 422, "{rule}");
+                        res.assert_json(&json!({"error": "invalid_repeat", "field": field}));
+                    }
+                    assert_eq!(get_post(&s, &cookie, &id).await["repeat"], Value::Null);
+
+                    // A draft, a TikTok post and another team's post are refused.
+                    let path = |id: &str| format!("/v1/posts/{id}/repeat");
+                    let draft = id_of(&create(&s, &cookie, input(&set, "d", None)).await);
+                    let res = repeat(&s, &cookie, &draft, daily()).await;
+                    assert_eq!(res.status_code(), 409);
+                    res.assert_json(&json!({"error": "not_scheduled"}));
+                    let res = req(&s, Method::DELETE, &path(&draft), &cookie).await;
+                    assert_eq!(res.status_code(), 409);
+                    res.assert_json(&json!({"error": "not_scheduled"}));
+                    let tiktok = scheduled(&s, &cookie, &set).await;
+                    sql(
+                        &db,
+                        format!("UPDATE posts SET platform = 'tiktok' WHERE id = '{tiktok}'"),
+                    )
+                    .await;
+                    let res = repeat(&s, &cookie, &tiktok, daily()).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "repeat_not_supported"}));
+                    let (other, _, _) = team(&s, &db).await;
+                    let res = repeat(&s, &other, &id, daily()).await;
+                    assert_eq!(res.status_code(), 404);
+                    let res = req(&s, Method::DELETE, &path(&id), &other).await;
+                    assert_eq!(res.status_code(), 404);
+
+                    // `day` is brain's own; a caller's is dropped.
+                    let rule = json!({"every": "week", "interval": 2, "until": "2099-01-01",
+                        "remaining": 5});
+                    let mut sent = rule.clone();
+                    sent["day"] = json!(31);
+                    let res = repeat(&s, &cookie, &id, sent).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    assert_eq!(res.json::<Value>()["repeat"], rule);
+                    assert_eq!(get_post(&s, &cookie, &id).await["repeat"], rule);
+                    let listed = with_rule(&s, &cookie).await;
+                    assert_eq!(listed.len(), 1, "{listed:?}");
+                    assert_eq!(listed[0]["id"], id.as_str());
+                    let res = req(&s, Method::GET, "/v1/posts?repeat=false", &cookie).await;
+                    let without = res.json::<Vec<Value>>();
+                    assert_eq!(without.len(), 2, "{without:?}");
+                    assert!(without.iter().all(|p| p["id"] != id.as_str()));
+
+                    // An edit keeps the rule; a draft has none.
+                    let edit = |at: Option<String>| {
+                        req(&s, Method::PUT, &format!("/v1/posts/{id}"), &cookie).json(&input(
+                            &set,
+                            "edited",
+                            at.as_deref(),
+                        ))
+                    };
+                    assert_eq!(edit(Some(soon())).await.json::<Value>()["repeat"], rule);
+                    assert_eq!(edit(None).await.json::<Value>()["repeat"], Value::Null);
+                    edit(Some(soon())).await.assert_status_ok();
+                    repeating(&s, &cookie, &id, rule).await;
+                    let res = req(&s, Method::DELETE, &path(&id), &cookie).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    assert_eq!(res.json::<Value>()["repeat"], Value::Null);
+                    assert!(with_rule(&s, &cookie).await.is_empty());
+
+                    let doc = s.get("/openapi.json").await.json::<Value>();
+                    let ops = &doc["paths"]["/posts/{id}/repeat"];
+                    for method in ["put", "delete"] {
+                        let security = ops[method]["security"].to_string();
+                        assert!(security.contains("api_token"), "{method}");
+                    }
+                    let schemas = &doc["components"]["schemas"];
+                    assert!(schemas["Post"]["properties"]["repeat"].is_object());
+                    let rule = &schemas["Repeat"]["properties"];
+                    assert!(rule["every"].is_object() && rule["day"].is_null(), "{rule}");
+                    let params = doc["paths"]["/posts"]["get"]["parameters"].to_string();
+                    assert!(params.contains("\"repeat\""), "{params}");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_rule_covers_the_scheduled_posts_of_the_group() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, _, set) = team(&s, &db).await;
+                    let a = scheduled(&s, &cookie, &set).await;
+                    let b = scheduled(&s, &cookie, &set).await;
+                    let tiktok = scheduled(&s, &cookie, &set).await;
+                    let draft = id_of(&create(&s, &cookie, input(&set, "d", None)).await);
+                    let alone = scheduled(&s, &cookie, &set).await;
+                    let group = uuid::Uuid::now_v7();
+                    sql(
+                        &db,
+                        format!(
+                            "UPDATE posts SET group_id = '{group}' \
+                             WHERE id IN ('{a}', '{b}', '{tiktok}', '{draft}');
+                             UPDATE posts SET platform = 'tiktok' WHERE id = '{tiktok}'"
+                        ),
+                    )
+                    .await;
+                    repeating(&s, &cookie, &a, daily()).await;
+                    let rule = |id: String| {
+                        let (s, cookie) = (&s, cookie.clone());
+                        async move { get_post(s, &cookie, &id).await["repeat"].clone() }
+                    };
+                    assert_eq!(rule(b.clone()).await, daily());
+                    for other in [&tiktok, &draft, &alone] {
+                        assert_eq!(rule(other.clone()).await, Value::Null);
+                    }
+
+                    // Clearing through one clears both; setting it again, they go out together
+                    // and their copies share one new group.
+                    let path = format!("/v1/posts/{b}/repeat");
+                    req(&s, Method::DELETE, &path, &cookie)
+                        .await
+                        .assert_status_ok();
+                    assert_eq!(rule(a.clone()).await, Value::Null);
+                    repeating(&s, &cookie, &b, daily()).await;
+                    let due = Utc::now().trunc_subsecs(0) - Duration::hours(1);
+                    at(&db, &a, due).await;
+                    at(&db, &b, due).await;
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &a).await["status"], "published");
+                    assert_eq!(rule(a.clone()).await, Value::Null);
+                    let copies = with_rule(&s, &cookie).await;
+                    assert_eq!(copies.len(), 2, "{copies:?}");
+                    let new = copies[0]["group_id"].as_str().expect("a group");
+                    assert_eq!(copies[1]["group_id"], new);
+                    assert_ne!(new, group.to_string());
+                    for copy in &copies {
+                        assert_eq!(time(copy), due + Duration::days(1), "{copy}");
+                    }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn the_tick_schedules_one_copy_a_day_a_week_or_a_month_on() {
+                    let (s, db, state) = on_mock().await;
+                    let now = Utc::now().trunc_subsecs(0);
+                    let hour_ago = now - Duration::hours(1);
+                    // The last 31st at or before now: its next month may be a shorter one.
+                    let last_31st = (0..)
+                        .map(|back| now - Duration::days(back))
+                        .find(|d| d.day() == 31)
+                        .unwrap();
+                    let month_on = (1..)
+                        .filter_map(|k| last_31st.checked_add_months(Months::new(k)))
+                        .find(|t| *t > now)
+                        .unwrap();
+                    for (every, interval, from, next) in [
+                        ("day", 1, hour_ago, hour_ago + Duration::days(1)),
+                        ("day", 3, hour_ago, hour_ago + Duration::days(3)),
+                        ("week", 2, hour_ago, hour_ago + Duration::days(14)),
+                        // Late by more than a day: the first time still ahead.
+                        (
+                            "day",
+                            1,
+                            hour_ago - Duration::days(2),
+                            hour_ago + Duration::days(1),
+                        ),
+                        ("month", 1, last_31st, month_on),
+                    ] {
+                        let (cookie, _, set) = team(&s, &db).await;
+                        let id = scheduled(&s, &cookie, &set).await;
+                        let rule = json!({"every": every, "interval": interval, "until": null,
+                            "remaining": null});
+                        repeating(&s, &cookie, &id, rule.clone()).await;
+                        at(&db, &id, from).await;
+                        publish::tick(&state).await.unwrap();
+                        let source = get_post(&s, &cookie, &id).await;
+                        assert_eq!(source["status"], "published", "{every}: {source}");
+                        assert_eq!(source["repeat"], Value::Null);
+                        let copies = with_rule(&s, &cookie).await;
+                        assert_eq!(copies.len(), 1, "{every}: {copies:?}");
+                        let copy = &copies[0];
+                        assert_eq!(time(copy), next, "{every} {interval}: {copy}");
+                        assert_eq!(copy["repeat"], rule);
+                        assert_eq!(copy["status"], "scheduled");
+                        for same in ["social_set_id", "platform", "body", "created_by"] {
+                            assert_eq!(copy[same], source[same], "{same}");
+                        }
+                        for none in ["group_id", "published_at", "error"] {
+                            assert_eq!(copy[none], Value::Null, "{none}");
+                        }
+                        assert_eq!(copy["lists"], json!([]));
+                        assert_eq!(copy["targets"], json!([]));
+
+                        // Nothing more until the copy itself is due.
+                        publish::tick(&state).await.unwrap();
+                        let all = req(&s, Method::GET, "/v1/posts", &cookie).await;
+                        assert_eq!(all.json::<Vec<Value>>().len(), 2, "{every}");
+                    }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn remaining_and_until_end_the_series() {
+                    let (s, db, state) = on_mock().await;
+                    let due = Utc::now().trunc_subsecs(0) - Duration::hours(1);
+                    let count = |cookie: String| {
+                        let s = &s;
+                        async move {
+                            let all = req(s, Method::GET, "/v1/posts", &cookie).await;
+                            all.json::<Vec<Value>>().len()
+                        }
+                    };
+
+                    // `remaining: 3` makes three copies: with 2, with 1, and a last with no rule.
+                    let (cookie, _, set) = team(&s, &db).await;
+                    let id = scheduled(&s, &cookie, &set).await;
+                    let mut rule = daily();
+                    rule["remaining"] = json!(3);
+                    repeating(&s, &cookie, &id, rule).await;
+                    for left in [2, 1] {
+                        let last = with_rule(&s, &cookie).await.remove(0);
+                        at(&db, last["id"].as_str().unwrap(), due).await;
+                        publish::tick(&state).await.unwrap();
+                        let copies = with_rule(&s, &cookie).await;
+                        assert_eq!(copies.len(), 1, "{copies:?}");
+                        assert_eq!(copies[0]["repeat"]["remaining"], left);
+                    }
+                    let last = with_rule(&s, &cookie).await.remove(0);
+                    at(&db, last["id"].as_str().unwrap(), due).await;
+                    publish::tick(&state).await.unwrap();
+                    assert!(with_rule(&s, &cookie).await.is_empty());
+                    assert_eq!(count(cookie.clone()).await, 4);
+                    let path = "/v1/posts?status=scheduled";
+                    let ahead = req(&s, Method::GET, path, &cookie).await;
+                    let mut ahead = ahead.json::<Vec<Value>>();
+                    assert_eq!(ahead.len(), 1, "{ahead:?}");
+                    let last = ahead.remove(0);
+                    assert_eq!(last["repeat"], Value::Null);
+                    assert_eq!(time(&last), due + Duration::days(1));
+                    // The last copy goes out and leaves nothing behind.
+                    at(&db, last["id"].as_str().unwrap(), due).await;
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(count(cookie).await, 4);
+
+                    // An end date ahead lets the copy through, one behind does not.
+                    let day = |days: i64| (Utc::now() + Duration::days(days)).date_naive();
+                    for (until, copies) in [(day(3), 1), (day(-2), 0)] {
+                        let (cookie, _, set) = team(&s, &db).await;
+                        let id = scheduled(&s, &cookie, &set).await;
+                        let mut rule = daily();
+                        rule["until"] = json!(until.to_string());
+                        repeating(&s, &cookie, &id, rule.clone()).await;
+                        at(&db, &id, due).await;
+                        publish::tick(&state).await.unwrap();
+                        let made = with_rule(&s, &cookie).await;
+                        assert_eq!(made.len(), copies, "{until}: {made:?}");
+                        assert_eq!(count(cookie).await, 1 + copies);
+                        if let Some(copy) = made.first() {
+                            assert_eq!(copy["repeat"], rule);
+                        }
+                    }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_copy_that_fails_costs_neither_its_post_nor_the_others() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, _, set) = team(&s, &db).await;
+                    // Three posts of one claim: one whose copy the database refuses, one whose
+                    // stored rule is not a rule, and a sound one.
+                    let poison = format!("poison {}", uuid::Uuid::now_v7());
+                    let res = create(&s, &cookie, input(&set, &poison, Some(&soon()))).await;
+                    let refused = id_of(&res);
+                    let garbled = scheduled(&s, &cookie, &set).await;
+                    let sound = scheduled(&s, &cookie, &set).await;
+                    let due = Utc::now().trunc_subsecs(0) - Duration::hours(1);
+                    for id in [&refused, &garbled, &sound] {
+                        repeating(&s, &cookie, id, daily()).await;
+                        at(&db, id, due).await;
+                    }
+                    sql(
+                        &db,
+                        format!(
+                            "UPDATE posts SET repeat = '{{\"every\": 7}}' WHERE id = '{garbled}';
+                             CREATE FUNCTION refuse_copy() RETURNS trigger AS $$ BEGIN \
+                             RAISE EXCEPTION 'no copy'; END $$ LANGUAGE plpgsql;
+                             CREATE TRIGGER refuse_copy BEFORE INSERT ON posts FOR EACH ROW \
+                             WHEN (NEW.body = '{poison}') EXECUTE FUNCTION refuse_copy()"
+                        ),
+                    )
+                    .await;
+                    let ticked = publish::tick(&state).await;
+                    sql(
+                        &db,
+                        "DROP TRIGGER refuse_copy ON posts; DROP FUNCTION refuse_copy()".into(),
+                    )
+                    .await;
+                    ticked.unwrap();
+                    // Every post went out with its rule cleared; only the sound one has a copy.
+                    for id in [&refused, &garbled, &sound] {
+                        let p = get_post(&s, &cookie, id).await;
+                        assert_eq!(p["status"], "published", "{p}");
+                        assert_eq!(p["repeat"], Value::Null, "{p}");
+                    }
+                    let copies = with_rule(&s, &cookie).await;
+                    assert_eq!(copies.len(), 1, "{copies:?}");
+                    assert_eq!(copies[0]["body"], "again");
+                    assert_eq!(time(&copies[0]), due + Duration::days(1));
+                    let all = req(&s, Method::GET, "/v1/posts", &cookie).await;
+                    assert_eq!(all.json::<Vec<Value>>().len(), 4);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_rule_is_an_edit_and_the_copy_keeps_the_approval() {
+                    let (s, db, state) = on_mock().await;
+                    let (owner, team_id, set) = team(&s, &db).await;
+                    let (member, _) = joined(&s, &db, &team_id, "member").await;
+                    req(&s, Method::PATCH, "/v1/team", &owner)
+                        .json(&json!({"require_approval": true}))
+                        .await
+                        .assert_status_ok();
+                    let id = scheduled(&s, &owner, &set).await;
+                    let p = get_post(&s, &owner, &id).await;
+                    assert_eq!(p["approval"], "approved", "{p}");
+                    let by = p["approval_by"].clone();
+
+                    // A member's rule, and a member's removal of it, ask again.
+                    let res = repeat(&s, &member, &id, daily()).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let p = res.json::<Value>();
+                    assert_eq!(p["approval"], "pending", "{p}");
+                    assert_eq!(p["approval_by"], Value::Null);
+                    let approve = format!("/v1/posts/{id}/approve");
+                    req(&s, Method::POST, &approve, &owner)
+                        .await
+                        .assert_status_ok();
+                    let path = format!("/v1/posts/{id}/repeat");
+                    let res = req(&s, Method::DELETE, &path, &member).await;
+                    assert_eq!(res.json::<Value>()["approval"], "pending");
+                    // A manager's leaves it approved.
+                    let res = repeat(&s, &owner, &id, daily()).await;
+                    let p = res.json::<Value>();
+                    assert_eq!(p["approval"], "approved", "{p}");
+                    assert_eq!(p["approval_by"], by);
+
+                    let due = Utc::now().trunc_subsecs(0) - Duration::hours(1);
+                    at(&db, &id, due).await;
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &owner, &id).await["status"], "published");
+                    let copies = with_rule(&s, &owner).await;
+                    assert_eq!(copies.len(), 1, "{copies:?}");
+                    assert_eq!(copies[0]["approval"], "approved");
+                    assert_eq!(copies[0]["approval_by"], by);
+
+                    // A pending post waits, rule and all; released, its copy is pending too.
+                    let held = copies[0]["id"].as_str().unwrap();
+                    repeating(&s, &member, held, daily()).await;
+                    at(&db, held, due).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &owner, held).await;
+                    assert_eq!(p["status"], "scheduled", "{p}");
+                    assert_eq!(p["repeat"], daily());
+                    req(&s, Method::PATCH, "/v1/team", &owner)
+                        .json(&json!({"require_approval": false}))
+                        .await
+                        .assert_status_ok();
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &owner, held).await["status"], "published");
+                    let copies = with_rule(&s, &owner).await;
+                    assert_eq!(copies.len(), 1, "{copies:?}");
+                    assert_eq!(copies[0]["approval"], "pending");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_team_keeps_at_most_200_posts_with_a_rule() {
+                    let (s, db, _) = on_mock().await;
+                    let (cookie, _, set) = team(&s, &db).await;
+                    let id = scheduled(&s, &cookie, &set).await;
+                    let other = scheduled(&s, &cookie, &set).await;
+                    sql(
+                        &db,
+                        format!(
+                            "INSERT INTO posts (id, team_id, social_set_id, platform, body, \
+                             status, scheduled_at, repeat) \
+                             SELECT gen_random_uuid(), team_id, social_set_id, platform, body, \
+                             status, scheduled_at, '{{\"every\":\"day\",\"interval\":1}}' \
+                             FROM posts, generate_series(1, 199) WHERE id = '{id}'"
+                        ),
+                    )
+                    .await;
+                    repeating(&s, &cookie, &id, daily()).await;
+                    // Setting it again on one that has it is no new rule.
+                    repeating(&s, &cookie, &id, daily()).await;
+                    let res = repeat(&s, &cookie, &other, daily()).await;
+                    assert_eq!(res.status_code(), 422, "{}", res.text());
+                    res.assert_json(&json!({"error": "too_many_repeats"}));
+                    assert_eq!(get_post(&s, &cookie, &other).await["repeat"], Value::Null);
+                    let path = format!("/v1/posts/{id}/repeat");
+                    req(&s, Method::DELETE, &path, &cookie)
+                        .await
+                        .assert_status_ok();
+                    repeating(&s, &cookie, &other, daily()).await;
+                    // Another team's rules do not count.
+                    let (cookie, _, set) = team(&s, &db).await;
+                    let id = scheduled(&s, &cookie, &set).await;
+                    repeating(&s, &cookie, &id, daily()).await;
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn publish_now_schedules_the_copy_from_the_posts_own_time() {
+                    let (s, db, _) = on_mock().await;
+                    let (cookie, _, set) = team(&s, &db).await;
+                    let id = scheduled(&s, &cookie, &set).await;
+                    let was = Utc::now().trunc_subsecs(0) + Duration::hours(5);
+                    at(&db, &id, was).await;
+                    let mut rule = daily();
+                    rule["remaining"] = json!(4);
+                    repeating(&s, &cookie, &id, rule).await;
+                    let path = format!("/v1/posts/{id}/publish");
+                    let res = req(&s, Method::POST, &path, &cookie).await;
+                    assert_eq!(res.status_code(), 202, "{}", res.text());
+                    assert_eq!(res.json::<Value>()["repeat"], Value::Null);
+                    let copies = with_rule(&s, &cookie).await;
+                    assert_eq!(copies.len(), 1, "{copies:?}");
+                    assert_eq!(time(&copies[0]), was + Duration::days(1));
+                    assert_eq!(copies[0]["repeat"]["remaining"], 3);
+                    assert_eq!(settled(&s, &cookie, &id).await["status"], "published");
+                    // A second call finds it gone from `scheduled`: no second copy.
+                    let res = req(&s, Method::POST, &path, &cookie).await;
+                    assert_eq!(res.status_code(), 409);
+                    assert_eq!(with_rule(&s, &cookie).await.len(), 1);
+                }
+            }
+
             mod threads_api {
                 use super::*;
                 use axum::{
@@ -18145,6 +18657,46 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
+                async fn repeat_tools_set_and_clear_a_posts_rule() {
+                    let (s, db) = on_mock(120).await;
+                    let (owner, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let mut body = post_body(Some(&set), "again");
+                    body["scheduled_at"] = json!("2099-01-01T00:00:00Z");
+                    let res = req(&s, Method::POST, "/v1/posts", &owner).json(&body).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let id = res.json::<Value>()["id"].clone();
+                    let secret = |made: Value| made["secret"].as_str().unwrap().to_owned();
+                    let rw = secret(make_token(&s, &owner, json!({"name": "rw"})).await);
+                    let ro = json!({"name": "ro", "read_only": true});
+                    let ro = secret(make_token(&s, &owner, ro).await);
+                    let rule = json!({"every": "month", "interval": 1, "until": null,
+                        "remaining": 6});
+                    let mut args = rule.clone();
+                    args["id"] = id.clone();
+
+                    for tool in ["set-post-repeat", "clear-post-repeat"] {
+                        let (err, v) = call(&s, &ro, tool, args.clone()).await;
+                        assert!(err, "{tool}: {v}");
+                        assert_eq!(v, json!({"error": "read_only_token"}));
+                    }
+                    let mut bad = args.clone();
+                    bad["interval"] = json!(13);
+                    let (err, v) = call(&s, &rw, "set-post-repeat", bad).await;
+                    assert!(err, "{v}");
+                    assert_eq!(v, json!({"error": "invalid_repeat", "field": "interval"}));
+                    let (err, v) = call(&s, &rw, "set-post-repeat", args).await;
+                    assert!(!err, "{v}");
+                    assert_eq!(v["repeat"], rule);
+                    let (_, listed) = call(&s, &ro, "list-posts", json!({"repeat": true})).await;
+                    assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+                    let (err, v) = call(&s, &rw, "clear-post-repeat", json!({"id": id})).await;
+                    assert!(!err, "{v}");
+                    assert_eq!(v["repeat"], Value::Null);
+                }
+
+                #[tokio::test]
+                #[serial]
                 async fn approve_and_reject_tools_decide_a_members_post() {
                     let (s, db) = on_mock(120).await;
                     let (owner, team_id, _) = owner_with_account(&s, &db).await;
@@ -18482,6 +19034,7 @@ mod teams {
                             "add-media",
                             "add-post-to-list",
                             "approve-post",
+                            "clear-post-repeat",
                             "create-list",
                             "create-post",
                             "create-post-group",
@@ -18500,6 +19053,7 @@ mod teams {
                             "remove-post-from-list",
                             "reorder-list",
                             "save-snippet",
+                            "set-post-repeat",
                             "set-queue",
                             "update-post",
                         ]

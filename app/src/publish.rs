@@ -1132,7 +1132,8 @@ pub async fn claim_due(db: &DatabaseConnection) -> Result<Vec<(Uuid, Uuid)>, DbE
     claim(db, CLAIM_BATCH).await
 }
 
-/// `claim_due` of at most `limit` posts.
+/// `claim_due` of at most `limit` posts. A claimed post with a repeat rule yields its next copy
+/// in the same transaction (`repeat::spawn`), so it does once.
 async fn claim(db: &DatabaseConnection, limit: i64) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
     // A CTE runs once; a LIMIT inside `IN (...)` may be re-run and claim more.
     let stmt = sql(
@@ -1154,10 +1155,16 @@ async fn claim(db: &DatabaseConnection, limit: i64) -> Result<Vec<(Uuid, Uuid)>,
          RETURNING p.id, p.team_id",
         vec![PUBLISHES_PER_DAY.into(), limit.into()],
     );
-    let rows = db.query_all_raw(stmt).await?;
-    rows.iter()
+    let txn = db.begin().await?;
+    let rows = txn.query_all_raw(stmt).await?;
+    let claimed = rows
+        .iter()
         .map(|r| Ok((r.try_get("", "id")?, r.try_get("", "team_id")?)))
-        .collect()
+        .collect::<Result<Vec<(Uuid, Uuid)>, DbErr>>()?;
+    let ids: Vec<Uuid> = claimed.iter().map(|c| c.0).collect();
+    crate::repeat::spawn(&txn, &ids, None).await?;
+    txn.commit().await?;
+    Ok(claimed)
 }
 
 pub enum Quota {
@@ -1170,12 +1177,15 @@ pub enum Quota {
 
 /// In one transaction: reserve a hit of the team's daily publish cap (unless the post already
 /// holds one) and run `update`, which must set `quota_reserved = true` on exactly this post.
-/// The hit is rolled back when the update touches nothing.
+/// The hit is rolled back when the update touches nothing. `repeats` is the post and the time it
+/// was scheduled at, when the update takes it out of `scheduled`: its repeat rule then yields
+/// the next copy here (`repeat::spawn`).
 pub async fn reserve_and(
     db: &DatabaseConnection,
     team_id: Uuid,
     already: bool,
     update: Statement,
+    repeats: Option<(Uuid, chrono::DateTime<chrono::FixedOffset>)>,
 ) -> Result<Quota, DbErr> {
     let txn = db.begin().await?;
     if !already {
@@ -1186,6 +1196,9 @@ pub async fn reserve_and(
     }
     if txn.execute_raw(update).await?.rows_affected() != 1 {
         return Ok(Quota::Lost);
+    }
+    if let Some((id, at)) = repeats {
+        crate::repeat::spawn(&txn, &[id], Some(at)).await?;
     }
     txn.commit().await?;
     Ok(Quota::Reserved)
@@ -1342,7 +1355,7 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
              WHERE id = $1 AND status = 'queued' AND NOT quota_reserved",
             vec![id.into()],
         );
-        let back = match reserve_and(db, post.team_id, false, mark).await {
+        let back = match reserve_and(db, post.team_id, false, mark, None).await {
             Ok(Quota::Reserved) => None,
             Ok(Quota::Over) => Some(Some(OVER_QUOTA)),
             Ok(Quota::Lost) => return Ok(()),

@@ -11,6 +11,7 @@ pub mod meta_inbox;
 pub mod models;
 pub mod publish;
 pub mod rate_limit;
+pub mod repeat;
 pub mod scheduler;
 pub mod state;
 pub mod turnstile;
