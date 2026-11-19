@@ -369,9 +369,9 @@ fn clip(text: &str) -> String {
 const INSERT: &str = "INSERT INTO inbox_items (id, team_id, social_account_id, platform, kind, \
     remote_id, remote_cid, parent_remote_id, root_remote_id, root_remote_cid, convo_id, \
     author_id, author_handle, author_name, author_avatar, text, received_at, permalink, \
-    story_reply, story_id, story_url, state, post_id) \
+    story_reply, story_id, story_url, state, button_payload, post_id) \
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
-    $19, $20, $21, $22, (SELECT t.post_id FROM post_targets t WHERE t.social_account_id = $3 \
+    $19, $20, $21, $22, $23, (SELECT t.post_id FROM post_targets t WHERE t.social_account_id = $3 \
      AND t.remote_id IN ($8, $9) LIMIT 1)) \
     ON CONFLICT (social_account_id, remote_id) DO NOTHING RETURNING *";
 
@@ -392,6 +392,29 @@ pub struct Fresh {
     pub permalink: Option<String>,
     /// For a DM replying to a story: the story's id and link, when given.
     pub story: Option<(Option<String>, Option<String>)>,
+    /// For a DM that is a click on a quick reply button (Meta): the button's payload.
+    pub button_payload: Option<String>,
+}
+
+/// A button under a DM: a quick reply on Messenger and Instagram, whose click comes back as a
+/// `button_clicked` item carrying `payload`. Bluesky has no buttons: the labels are appended
+/// to the text as numbered lines, and an answer is an ordinary DM.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Button {
+    /// 1 to 20 characters.
+    pub label: String,
+    /// 1 to 64 characters of `a-z`, `0-9`, `_` and `-`.
+    pub payload: String,
+}
+
+/// `text` as it goes out where there are no buttons: the labels after it, one numbered line each.
+pub fn numbered(text: &str, buttons: &[Button]) -> String {
+    let mut out = text.to_owned();
+    for (i, b) in buttons.iter().enumerate() {
+        out.push_str(&format!("\n{}. {}", i + 1, b.label));
+    }
+    out
 }
 
 /// Stores `f` for `account`; the new item, or `None` when it was already there. The unique key
@@ -425,6 +448,7 @@ pub async fn store(
         f.story.and_then(|s| s.1).into(),
         // A follow is not work to answer.
         (if f.kind == "follow" { "done" } else { "open" }).into(),
+        f.button_payload.into(),
     ];
     inbox_items::Entity::find()
         .from_raw_sql(sql(INSERT, values))
@@ -450,6 +474,7 @@ async fn store_notification(
         at: n.indexed_at,
         permalink: None,
         story: None,
+        button_payload: None,
     };
     store(db, account, fresh).await
 }
@@ -471,6 +496,7 @@ async fn store_message(
         at: m.sent_at,
         permalink: None,
         story: None,
+        button_payload: None,
     };
     store(db, account, fresh).await
 }
@@ -534,7 +560,27 @@ pub async fn send(
     sent_by: Option<Uuid>,
     automation_id: Option<Uuid>,
 ) -> Result<Result<inbox_replies::Model, InboxError>, DbErr> {
+    let from = (sent_by, automation_id);
+    send_with(app, account, item, via, text, skip, from, &[]).await
+}
+
+/// `send` with `buttons` under a DM (`from`: who sent it, a user or an automation): quick
+/// replies on Facebook and Instagram, numbered lines after the text on Bluesky.
+#[allow(clippy::too_many_arguments)]
+pub async fn send_with(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    via: Via,
+    text: &str,
+    skip: &[std::ops::Range<usize>],
+    (sent_by, automation_id): (Option<Uuid>, Option<Uuid>),
+    buttons: &[Button],
+) -> Result<Result<inbox_replies::Model, InboxError>, DbErr> {
     let meta = matches!(account.provider.as_str(), "facebook" | "instagram");
+    let lined = numbered(text, buttons);
+    // `skip` still holds: the lines come after everything it names.
+    let text = if meta { text } else { &lined };
     if !meta && account.provider != "bluesky" {
         return Ok(Err(InboxError::Invalid("unsupported_platform")));
     }
@@ -542,7 +588,7 @@ pub async fn send(
         return Ok(Err(InboxError::Invalid("too_long")));
     }
     let sent = if meta {
-        meta_inbox::send(app, account, item, via, text).await?
+        meta_inbox::send(app, account, item, via, text, buttons).await?
     } else {
         send_bluesky(app, account, item, (via, text, skip)).await
     };

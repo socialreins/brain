@@ -8,7 +8,7 @@ pub struct Model {
     pub automation_id: Uuid,
     pub inbox_item_id: Uuid,
     pub team_id: Uuid,
-    /// `running`, `sent`, `failed` or `skipped`.
+    /// `running`, `waiting` (a flow at a `wait` step), `sent`, `failed` or `skipped`.
     #[sea_orm(column_type = "Text")]
     pub status: String,
     #[sea_orm(column_type = "Text", nullable)]
@@ -16,6 +16,10 @@ pub struct Model {
     /// One `{type, status, reason, remote_id}` per action tried.
     #[sea_orm(column_type = "JsonBinary")]
     pub results: Json,
+    /// A flow's step last tried, from 0; null for an automation with `actions`.
+    pub step_index: Option<i32>,
+    /// When a `waiting` run goes on.
+    pub resume_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }

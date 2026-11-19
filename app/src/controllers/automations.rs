@@ -24,7 +24,7 @@ use super::{
     waitlist::{error, Error},
 };
 use crate::{
-    automations::{self as rules, Action, ActionResult, Conditions},
+    automations::{self as rules, Action, ActionResult, Conditions, Step},
     inbox,
     models::{automation_runs, automations, teams},
     state::AppState,
@@ -41,10 +41,14 @@ pub struct Automation {
     pub active: bool,
     /// When it was last switched on; items received before that never run it.
     pub activated_at: DateTime<FixedOffset>,
-    /// `comment_received`, `dm_received`, `mention_received`, `new_follower` or `story_reply`.
+    /// `button_clicked`, `comment_received`, `dm_received`, `mention_received`, `new_follower`
+    /// or `story_reply`.
     pub trigger: String,
     pub conditions: Conditions,
+    /// Empty for a flow.
     pub actions: Vec<Action>,
+    /// A flow's steps, in order; null for an automation with `actions`.
+    pub steps: Option<Vec<Step>>,
     /// A public reply sent when a `send_dm` could not go (`dm_not_allowed`, `no_dm_access`)
     /// and no `reply_publicly` went out.
     pub fallback_public_reply: Option<String>,
@@ -62,6 +66,8 @@ pub struct RunStats {
     pub skipped: i64,
     pub failed: i64,
     pub running: i64,
+    /// Runs of a flow at a `wait` step.
+    pub waiting: i64,
     pub total: i64,
     /// The same as `total`, kept for older clients.
     pub count: i64,
@@ -73,19 +79,27 @@ pub struct RunStats {
 pub struct AutomationInput {
     /// 1 to 60 characters after trimming.
     pub name: String,
-    /// `comment_received`, `dm_received`, `mention_received`, `new_follower` or `story_reply`
-    /// (see `Conditions` for the conditions each takes). `reply_publicly`, a fallback reply and
-    /// `{page}` are for `comment_received` and `mention_received` only.
+    /// `button_clicked`, `comment_received`, `dm_received`, `mention_received`, `new_follower`
+    /// or `story_reply` (see `Conditions` for the conditions each takes). `reply_publicly`, a
+    /// fallback reply and `{page}` are for `comment_received` and `mention_received` only.
     pub trigger: String,
     #[serde(default)]
     pub conditions: Conditions,
-    /// 1 or 2 actions, at most one of each type.
-    pub actions: Vec<Action>,
+    /// 1 or 2 actions, at most one of each type. Either this or `steps`: both is
+    /// `422 actions_and_steps`.
+    #[serde(default)]
+    pub actions: Option<Vec<Action>>,
+    /// A flow instead of `actions`: 1 to 10 steps run in order, each a `send_dm` (with up to 3
+    /// `buttons`), a `reply_publicly` (where the trigger takes one) or a `wait`. Never a wait
+    /// first or last (`422 invalid_steps`). A send that does not go out ends the run.
+    #[serde(default)]
+    pub steps: Option<Vec<Step>>,
     /// Default `true`.
     #[serde(default = "yes")]
     pub active: bool,
     /// Needs a `send_dm` action; at most 300 graphemes; may hold `{name}` and
     /// `{page}` (set off by spaces; the automation does not run when the post has no live page).
+    /// Not with `steps` (`422 invalid_fallback`).
     #[serde(default)]
     pub fallback_public_reply: Option<String>,
 }
@@ -99,12 +113,20 @@ pub struct Run {
     pub id: Uuid,
     pub automation_id: Uuid,
     pub inbox_item_id: Uuid,
-    /// `running`, `sent`, `failed` or `skipped`.
+    /// `running`, `waiting` (a flow at a `wait` step), `sent`, `failed` or `skipped`. A flow's
+    /// run is `sent` once every step went out, else it has the status of the send that ended it.
     pub status: String,
     /// Why not everything was sent: `dm_not_allowed`, `no_dm_access`, `rate_limited`,
     /// `no_public_page`, `daily_cap`, `reconnect_required`, `interrupted`, `bluesky_refused`, ...
+    /// and, for a waiting run of a flow that was switched off or whose steps were changed,
+    /// `automation_changed`.
     pub reason: Option<String>,
     pub results: Vec<ActionResult>,
+    /// A flow's step last tried, from 0 (the `wait` itself while `waiting`); null for an
+    /// automation with `actions`.
+    pub step_index: Option<i32>,
+    /// When a `waiting` run goes on; null otherwise.
+    pub resume_at: Option<DateTime<FixedOffset>>,
     pub created_at: DateTime<FixedOffset>,
     pub updated_at: DateTime<FixedOffset>,
 }
@@ -143,6 +165,7 @@ fn automation_json(a: automations::Model) -> Automation {
         trigger: a.trigger,
         conditions: serde_json::from_value(a.conditions).unwrap_or_default(),
         actions: serde_json::from_value(a.actions).unwrap_or_default(),
+        steps: a.steps.and_then(|s| serde_json::from_value(s).ok()),
         fallback_public_reply: a.fallback_public_reply,
         created_by: a.created_by,
         created_at: a.created_at,
@@ -175,12 +198,17 @@ async fn checked(
         .fallback_public_reply
         .map(|f| f.trim().to_owned())
         .filter(|f| !f.is_empty());
-    let shape = rules::validate(
-        &input.trigger,
-        &mut input.conditions,
-        &input.actions,
-        input.fallback_public_reply.as_deref(),
-    );
+    let fallback = input.fallback_public_reply.as_deref();
+    let (trigger, conditions) = (input.trigger.as_str(), &mut input.conditions);
+    let shape = match (&input.actions, &mut input.steps) {
+        (Some(_), Some(_)) => Err("actions_and_steps"),
+        (_, Some(_)) if fallback.is_some() => Err("invalid_fallback"),
+        (_, Some(steps)) => rules::validate_steps(trigger, conditions, steps),
+        (actions, None) => {
+            let actions = actions.as_deref().unwrap_or_default();
+            rules::validate(trigger, conditions, actions, fallback)
+        }
+    };
     if let Err(code) = shape {
         return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, code)));
     }
@@ -208,6 +236,7 @@ async fn run_stats(
              COUNT(*) FILTER (WHERE status = 'skipped') AS skipped, \
              COUNT(*) FILTER (WHERE status = 'failed') AS failed, \
              COUNT(*) FILTER (WHERE status = 'running') AS running, \
+             COUNT(*) FILTER (WHERE status = 'waiting') AS waiting, \
              MAX(created_at) AS last_at FROM automation_runs \
              WHERE team_id = $1 AND ($2::uuid IS NULL OR automation_id = $2) \
              GROUP BY automation_id",
@@ -223,6 +252,7 @@ async fn run_stats(
                 skipped: r.try_get("", "skipped")?,
                 failed: r.try_get("", "failed")?,
                 running: r.try_get("", "running")?,
+                waiting: r.try_get("", "waiting")?,
                 total,
                 count: total,
                 last_at: r.try_get("", "last_at")?,
@@ -287,7 +317,7 @@ async fn show(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> R
 /// Creates an automation; it acts on items received from now on. Owners and admins; at
 /// most 50 per team. Unknown fields, triggers, condition keys and action types are refused
 /// (`422 invalid_body`, `invalid_trigger`, `invalid_conditions`, `invalid_actions`,
-/// `invalid_text`, `invalid_fallback`).
+/// `invalid_text`, `invalid_fallback`, and for a flow `invalid_steps` and `actions_and_steps`).
 #[utoipa::path(post, path = "/automations", tag = "automations", request_body = AutomationInput,
     responses((status = 201, body = Automation), (status = 401, body = Error),
         (status = 403, body = Error), (status = 409, body = Error), (status = 422, body = Error)))]
@@ -324,7 +354,8 @@ async fn create(
             active: Set(input.active),
             trigger: Set(input.trigger),
             conditions: Set(serde_json::json!(input.conditions)),
-            actions: Set(serde_json::json!(input.actions)),
+            actions: Set(serde_json::json!(input.actions.unwrap_or_default())),
+            steps: Set(input.steps.map(|s| serde_json::json!(s))),
             fallback_public_reply: Set(input.fallback_public_reply),
             created_by: Set(Some(t.current.0.id)),
             ..Default::default()
@@ -343,6 +374,7 @@ async fn create(
 }
 
 /// Sets `active`, moving `activated_at` to now when it switches on. `None` when not found.
+/// Switching off ends its waiting runs.
 async fn switch(
     db: &impl ConnectionTrait,
     team_id: Uuid,
@@ -356,10 +388,18 @@ async fn switch(
          WHERE id = $1 AND team_id = $2 RETURNING *",
         [id.into(), team_id.into(), active.into()],
     );
-    automations::Entity::find().from_raw_sql(stmt).one(db).await
+    let a = automations::Entity::find()
+        .from_raw_sql(stmt)
+        .one(db)
+        .await?;
+    if a.is_some() && !active {
+        rules::cancel_waiting(db, id).await?;
+    }
+    Ok(a)
 }
 
-/// Replaces an automation. Owners and admins. Its runs stay.
+/// Replaces an automation. Owners and admins. Its runs stay; changing its steps (or switching
+/// it off) ends its waiting runs as `skipped: automation_changed`.
 #[utoipa::path(put, path = "/automations/{id}", tag = "automations",
     request_body = AutomationInput, params(("id" = Uuid, Path)),
     responses((status = 200, body = Automation), (status = 401, body = Error),
@@ -379,7 +419,14 @@ async fn update(
             Ok(v) => v,
             Err(res) => return Ok(Err(res)),
         };
+        let steps = input.steps.map(|s| serde_json::json!(s));
         let txn = app.db.begin().await?;
+        let Some(old) = find(&txn, t.team.id, id).await? else {
+            return Ok(Err(not_found()));
+        };
+        if old.steps != steps {
+            rules::cancel_waiting(&txn, id).await?;
+        }
         let done = automations::Entity::update_many()
             .col_expr(automations::Column::Name, name.into())
             .col_expr(automations::Column::Trigger, input.trigger.into())
@@ -389,8 +436,9 @@ async fn update(
             )
             .col_expr(
                 automations::Column::Actions,
-                serde_json::json!(input.actions).into(),
+                serde_json::json!(input.actions.unwrap_or_default()).into(),
             )
+            .col_expr(automations::Column::Steps, steps.into())
             .col_expr(
                 automations::Column::FallbackPublicReply,
                 input.fallback_public_reply.into(),
@@ -438,7 +486,8 @@ async fn enable(
     set_active(&app, &t, id, true).await
 }
 
-/// Switches an automation off. Owners and admins.
+/// Switches an automation off. Owners and admins. Its waiting runs end as
+/// `skipped: automation_changed`.
 #[utoipa::path(post, path = "/automations/{id}/disable", tag = "automations",
     params(("id" = Uuid, Path)),
     responses((status = 200, body = Automation), (status = 401, body = Error),
@@ -452,7 +501,8 @@ async fn disable(
     set_active(&app, &t, id, false).await
 }
 
-/// Deletes an automation and its runs; replies it sent stay on their items. Owners and admins.
+/// Deletes an automation and its runs, waiting ones included; replies it sent stay on their
+/// items. Owners and admins.
 #[utoipa::path(delete, path = "/automations/{id}", tag = "automations",
     params(("id" = Uuid, Path)),
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
@@ -478,8 +528,8 @@ async fn destroy(
     }
 }
 
-/// An automation's runs, newest first, 50 a page. At most 500 runs act per team a day; past
-/// that a run is `skipped: daily_cap`.
+/// An automation's runs, newest first, 50 a page. At most 500 runs act per team a day (a flow
+/// counts once per send step); past that a run is `skipped: daily_cap`.
 #[utoipa::path(get, path = "/automations/{id}/runs", tag = "automations",
     params(("id" = Uuid, Path), RunQuery),
     responses((status = 200, body = RunPage), (status = 401, body = Error),
@@ -520,6 +570,8 @@ async fn runs(
                 status: r.status,
                 reason: r.reason,
                 results: serde_json::from_value(r.results).unwrap_or_default(),
+                step_index: r.step_index,
+                resume_at: r.resume_at,
                 created_at: r.created_at,
                 updated_at: r.updated_at,
             })

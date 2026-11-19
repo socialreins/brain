@@ -55,6 +55,9 @@ pub struct Model {
     pub story_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub story_url: Option<String>,
+    /// A `dm` that is a click on a quick reply button (Meta): the button's payload.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub button_payload: Option<String>,
     pub created_at: DateTimeWithTimeZone,
 }
 

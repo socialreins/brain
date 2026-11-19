@@ -732,13 +732,15 @@ impl Meta {
 
     /// A message from Page `page` (`pages_messaging`, `instagram_manage_messages`): the private
     /// reply to a comment (once per comment, within 7 days), or a DM to a person who wrote
-    /// within 24 hours. Returns the message id.
+    /// within 24 hours. `buttons` (label, payload) go with it as quick replies. Returns the
+    /// message id.
     pub async fn message(
         &self,
         page: &str,
         token: &str,
         to: To<'_>,
         body: &str,
+        buttons: &[(&str, &str)],
     ) -> Result<String, InboxError> {
         let (To::Comment(id) | To::Person(id)) = to;
         if !graph_id(page) || !graph_id(id) {
@@ -749,7 +751,14 @@ impl Meta {
             To::Person(id) => serde_json::json!({ "id": id }),
         }
         .to_string();
-        let message = serde_json::json!({ "text": body }).to_string();
+        let mut message = serde_json::json!({ "text": body });
+        if !buttons.is_empty() {
+            let quick = buttons.iter().map(|(label, payload)| {
+                serde_json::json!({"content_type": "text", "title": label, "payload": payload})
+            });
+            message["quick_replies"] = quick.collect();
+        }
+        let message = message.to_string();
         let mut form = vec![
             ("recipient", recipient.as_str()),
             ("message", message.as_str()),
