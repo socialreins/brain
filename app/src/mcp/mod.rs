@@ -32,6 +32,7 @@ use crate::{
     controllers::{
         api_tokens::{read_only_token, Actor},
         connections,
+        library::{self, MediaInput, MediaQuery, SnippetInput, SnippetQuery},
         lists::{self, AddPost, ListInput, Order},
         posts,
         posts::{PostGroupInput, PostInput, PostQuery},
@@ -100,6 +101,19 @@ struct Reorder {
     order: Order,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct SaveSnippet {
+    /// The snippet to replace; absent creates one.
+    id: Option<Uuid>,
+    #[serde(flatten)]
+    snippet: SnippetInput,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SnippetId {
+    id: Uuid,
+}
+
 /// A create tool's arguments: the route's body, and its `?validate_only`.
 #[derive(Deserialize, JsonSchema)]
 struct Create<T> {
@@ -141,6 +155,11 @@ fn specs() -> Vec<(&'static str, &'static str, Value, bool)> {
         ("add-post-to-list", "Adds a post to a list at a 1-based position, appending by default; a post already there moves. Same as POST /v1/lists/{id}/posts.", schema::<AddToList>(), false),
         ("remove-post-from-list", "Takes a post out of a list; the post stays. Same as DELETE /v1/lists/{id}/posts/{post_id}.", schema::<RemoveFromList>(), false),
         ("reorder-list", "Reorders a list: post_ids holds every post of the list, each once. Same as PUT /v1/lists/{id}/order.", schema::<Reorder>(), false),
+        ("list-media", "The team's media library (saved media URLs), newest first, a page at a time; q searches names and URLs. Same as GET /v1/media-library.", schema::<MediaQuery>(), true),
+        ("add-media", "Adds an https media URL to the team's media library, named by its last path segment unless name is given. Same as POST /v1/media-library.", schema::<MediaInput>(), false),
+        ("list-snippets", "The team's saved text snippets by name: kind caption or hashtags, both when absent. Same as GET /v1/snippets.", schema::<SnippetQuery>(), true),
+        ("save-snippet", "Saves a caption or hashtags snippet: creates one, or with id replaces that one. Same as POST /v1/snippets and PUT /v1/snippets/{id}.", schema::<SaveSnippet>(), false),
+        ("delete-snippet", "Deletes a saved snippet. Same as DELETE /v1/snippets/{id}.", schema::<SnippetId>(), false),
     ]
 }
 
@@ -155,7 +174,10 @@ fn to_mcp(
     t.annotations = Some(
         ToolAnnotations::new()
             .read_only(read_only)
-            .destructive(matches!(name, "delete-post" | "remove-post-from-list"))
+            .destructive(matches!(
+                name,
+                "delete-post" | "remove-post-from-list" | "delete-snippet"
+            ))
             .open_world(false),
     );
     t
@@ -251,6 +273,32 @@ async fn run(app: &AppState, a: &Actor, name: &str, v: Value) -> Option<Response
         },
         "reorder-list" => match args::<Reorder>(v) {
             Some(l) => lists::reorder_list(app, a, l.id, l.order).await,
+            None => invalid("invalid_body"),
+        },
+        "list-media" => match args(v) {
+            Some(q) => library::list_media(app, a, q).await,
+            None => invalid("invalid_query"),
+        },
+        "add-media" => match args(v) {
+            Some(m) => library::add_media(app, a, m).await,
+            None => invalid("invalid_body"),
+        },
+        "list-snippets" => match args(v) {
+            Some(q) => library::list_snippets(app, a, q).await,
+            None => invalid("invalid_query"),
+        },
+        "save-snippet" => match args::<SaveSnippet>(v) {
+            Some(SaveSnippet {
+                id: Some(id),
+                snippet,
+            }) => library::update_snippet(app, a, id, snippet).await,
+            Some(SaveSnippet { id: None, snippet }) => {
+                library::create_snippet(app, a, snippet).await
+            }
+            None => invalid("invalid_body"),
+        },
+        "delete-snippet" => match args::<SnippetId>(v) {
+            Some(s) => library::delete_snippet(app, a, s.id).await,
             None => invalid("invalid_body"),
         },
         _ => return None,

@@ -31,7 +31,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/health` | `{"status":"ok"}` |
 | GET | `/version` | `{"commit":"<sha>"}`, from `RAILWAY_GIT_COMMIT_SHA`, `dev` locally |
 | GET | `/openapi.json` | OpenAPI document for `/v1` |
-| POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, posting queues, accounts, posts and lists. Bearer API token only, same scope and per-token limit as `/v1`, bodies up to 64 KiB; `Idempotency-Key` does not apply. `create-post` and `create-post-group` take `validate_only` (see "Validate only"), which a read-only token may send |
+| POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, posting queues, accounts, posts, lists, the media library (`list-media`, `add-media`) and snippets (`list-snippets`, `save-snippet` creating or, with an `id`, replacing, `delete-snippet`). Bearer API token only, same scope and per-token limit as `/v1`, bodies up to 64 KiB; `Idempotency-Key` does not apply. `create-post` and `create-post-group` take `validate_only` (see "Validate only"), which a read-only token may send |
 | POST | `/v1/waitlist` | `{"email":"...","source":"..."}` joins the waitlist and emails a confirmation link |
 | POST | `/v1/waitlist/verify` | `{"token"}` from the emailed link: marks the signup verified, `200 {"status":"verified"}`, else `422 {"error":"invalid_link"}` |
 | GET | `/v1/waitlist/count` | `{"count":n}`: every signup, verified or not, cached for 30 seconds |
@@ -107,6 +107,10 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | POST | `/v1/lists/{id}/posts` | Add a post (`{"post_id","position"}`; appends by default, an existing post moves) |
 | DELETE | `/v1/lists/{id}/posts/{post_id}` | Take a post out; later posts move up |
 | PUT | `/v1/lists/{id}/order` | Reorder (`{"post_ids"}`: every post of the list once, else `422 invalid_order`) |
+| GET, POST | `/v1/media-library` | The team's media library, newest first: `{"items":[{"id","url","name","created_at","created_by"}],"next_cursor"}` (`?q=&cursor=&limit=`: `q` searches name and URL in any case, wildcards matched as typed; `limit` 1 to 100, default 50; `created_by` is `null` for a token). Add one (`{"url","name"}`, `201`): `url` a public `https://` URL up to 2048 bytes with no user or password, `name` trimmed up to 100 characters, by default the URL's last path segment decoded. `422 {"error":"invalid_media","field"}`, `409 {"error":"already_in_library","id"}` for a URL the team has, `422 library_full` past 1000 items |
+| PATCH, DELETE | `/v1/media-library/{id}` | Rename (`{"name"}`, `200` with the item); remove (`204`). Posts keep their media URLs |
+| GET, POST | `/v1/snippets` | Saved captions and hashtag sets by name, ignoring case: `{"items":[{"id","kind","name","body","created_at","updated_at"}]}` (`?kind=caption` or `hashtags`). Save one (`{"kind","name","body"}`, `201`): `name` trimmed 1 to 80 characters, unique per team and kind ignoring case (`409 snippet_name_taken`), `body` 1 to 5000 characters. `422 {"error":"invalid_snippet","field"}`, `422 too_many_snippets` past 500 per team |
+| PUT, DELETE | `/v1/snippets/{id}` | Replace kind, name and body, checked as on create (`200`); delete (`204`) |
 | GET, POST | `/v1/inboxes` | The team's inboxes, the undeletable "All" first, each with `open_count` (its `open` items, follows left out; in the list only); create one (`{"name","filters":{"social_set_id"\|"account_ids","kinds","platforms","keywords","unanswered"}}`, owner, admin) |
 | PUT, DELETE | `/v1/inboxes/{id}` | Replace name and filters; delete (owner, admin; not "All") |
 | GET | `/v1/inboxes/{id}/items` | `?state=open\|done&kind=comment\|mention\|dm\|follow&q=&cursor=&limit=`: items newest first with their `replies`, and `next_cursor`. `q` (1 to 100 characters after trimming) searches the text and the author's name and handle, any case, `%` and `_` literal. `follow` items (new Bluesky followers, stored `done`) are listed only with `kind=follow`. A DM replying to an Instagram story has `story_reply: true` and `story_id`, `story_url` when Meta gave them |
@@ -365,6 +369,11 @@ before anything runs, except a create with `validate_only`, which creates nothin
 revoked when the member who created it is removed from the team, leaves it, or becomes a plain
 member: only an owner or admin may hold one. `GET /v1/posts/{id}` lists the post's `accounts` (id, provider, handle,
 display name, target id and status), also before it publishes and has targets.
+
+The media library and snippets are team assets, not set assets: any member reads and writes
+them, and so does every token of the team, a set token too (it sees and changes the whole
+team's library and snippets); a read-only token only reads them. Another team's id is `404`.
+Adding a URL to the library stores the URL only, nothing is downloaded.
 
 API token writes (`POST`, `PUT`, `PATCH`, `DELETE`) take an optional `Idempotency-Key` header,
 1 to 255 printable ASCII characters (else `422 invalid_idempotency_key`). Keys belong to the
