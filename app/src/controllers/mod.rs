@@ -9,6 +9,7 @@ pub mod auth;
 pub mod automations;
 pub mod connections;
 pub mod contact;
+pub mod feeds;
 pub mod google;
 pub mod health;
 pub mod idempotency;
@@ -104,6 +105,8 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(lists::api())
         .merge(library::media_api())
         .merge(library::snippets_api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
+        // A URL of 2048 characters and a template of 2000 can pass 4 KiB.
+        .merge(feeds::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
         .merge(inbox::api())
         // Two DM texts of 1000 graphemes can pass 4 KiB.
         .merge(automations::api().layer(DefaultBodyLimit::max(MAX_AUTOMATION_BODY_BYTES)))

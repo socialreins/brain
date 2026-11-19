@@ -19031,6 +19031,7 @@ mod teams {
                     assert_eq!(
                         names,
                         [
+                            "add-feed",
                             "add-media",
                             "add-post-to-list",
                             "approve-post",
@@ -19043,6 +19044,7 @@ mod teams {
                             "get-list",
                             "get-post",
                             "get-queue",
+                            "list-feeds",
                             "list-lists",
                             "list-media",
                             "list-posts",
@@ -19050,6 +19052,7 @@ mod teams {
                             "list-social-accounts",
                             "list-social-sets",
                             "reject-post",
+                            "remove-feed",
                             "remove-post-from-list",
                             "reorder-list",
                             "save-snippet",
@@ -20647,6 +20650,880 @@ mod teams {
                     let (err, v) = call(&s, &t, "delete-snippet", json!({"id": id})).await;
                     assert!(err);
                     assert_eq!(v, json!({"error": "not_found"}));
+                }
+            }
+
+            mod feeds {
+                use super::mcp::call;
+                use super::*;
+                use axum::http::{header, HeaderMap, StatusCode};
+                use chrono::DateTime;
+                use sea_orm::{ConnectionTrait, DbBackend, Statement};
+                use socialreins_brain::{feeds as reader, media::Media};
+                use std::sync::Mutex;
+
+                type Docs = Arc<Mutex<HashMap<String, String>>>;
+
+                /// A fake blog on loopback. `/f/{name}` is the document `put` under `name` (`404`
+                /// without one) with an `ETag`, so an unchanged feed answers `304`; `/hop/{n}`
+                /// redirects `n` times before `/f/hop`; `/to-private` redirects to a link-local
+                /// address; `/big` is over 1 MB; `/img.jpg` is a JPEG.
+                struct Blog {
+                    base: String,
+                    docs: Docs,
+                }
+
+                impl Blog {
+                    fn put(&self, name: &str, doc: String) {
+                        self.docs.lock().unwrap().insert(name.into(), doc);
+                    }
+
+                    fn drop(&self, name: &str) {
+                        self.docs.lock().unwrap().remove(name);
+                    }
+
+                    fn url(&self, name: &str) -> String {
+                        format!("{}/f/{name}", self.base)
+                    }
+                }
+
+                async fn doc(
+                    State(docs): State<Docs>,
+                    Path(name): Path<String>,
+                    headers: HeaderMap,
+                ) -> axum::response::Response {
+                    use axum::response::IntoResponse;
+                    let Some(doc) = docs.lock().unwrap().get(&name).cloned() else {
+                        return StatusCode::NOT_FOUND.into_response();
+                    };
+                    let etag = format!("\"{}\"", socialreins_core::token::hash(&doc));
+                    let sent = headers.get(header::IF_NONE_MATCH);
+                    if sent.is_some_and(|v| v.as_bytes() == etag.as_bytes()) {
+                        return StatusCode::NOT_MODIFIED.into_response();
+                    }
+                    let headers = [
+                        (header::CONTENT_TYPE, "application/xml".to_owned()),
+                        (header::ETAG, etag),
+                    ];
+                    (headers, doc).into_response()
+                }
+
+                async fn blog() -> Blog {
+                    use axum::response::{IntoResponse, Redirect};
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let base = format!("http://{}", listener.local_addr().unwrap());
+                    let docs = Docs::default();
+                    let app = Router::new()
+                        .route("/f/{name}", get(doc))
+                        .route(
+                            "/hop/{n}",
+                            get(|Path(n): Path<u32>| async move {
+                                match n {
+                                    0 => Redirect::temporary("/f/hop"),
+                                    n => Redirect::temporary(&format!("/hop/{}", n - 1)),
+                                }
+                            }),
+                        )
+                        .route(
+                            "/to-private",
+                            get(|| async {
+                                Redirect::temporary("http://169.254.169.254/latest/meta-data")
+                            }),
+                        )
+                        .route("/big", get(|| async { "x".repeat(1024 * 1024 + 1) }))
+                        .route(
+                            "/img.jpg",
+                            get(|| async {
+                                let mut bytes = vec![7u8; 64];
+                                bytes[..4].copy_from_slice(b"\xff\xd8\xff\xe0");
+                                ([("content-type", "image/jpeg")], bytes).into_response()
+                            }),
+                        )
+                        .with_state(docs.clone());
+                    tokio::spawn(async move { axum::serve(listener, app).await });
+                    Blog { base, docs }
+                }
+
+                /// Item images under this are probed on the blog when a post is saved.
+                const IMAGES: &str = "https://images.test";
+
+                /// A brain whose feed reader may also read the blog, and nothing else that is
+                /// not public.
+                async fn on_blog() -> (TestServer, DatabaseConnection, AppState, Blog) {
+                    let blog = blog().await;
+                    let base = mock_bluesky().await;
+                    let mut config = Config::from_env().expect("test config");
+                    config.trust_proxy = true;
+                    config.bluesky.appview = base.clone();
+                    config.bluesky.plc = base;
+                    config.bluesky.allow_insecure_pds = true;
+                    let store = object_store::memory::InMemory::new();
+                    config.media = Media::new(Arc::new(store), true);
+                    config.media.probe_rewrite = Some((IMAGES.into(), blog.base.clone()));
+                    let db = socialreins_brain::connect(&config)
+                        .await
+                        .expect("database reachable");
+                    let mut state = AppState::new(db.clone(), &config);
+                    state.feeds = reader::Fetcher::new(Some(blog.base.clone()));
+                    let app = controllers::router(state.clone(), &config);
+                    (TestServer::new(app).unwrap(), db, state, blog)
+                }
+
+                /// `<item>`s as an RSS 2.0 document; each is `(guid, title, more XML)`.
+                fn rss(items: &[(&str, &str, &str)]) -> String {
+                    let items: String = items
+                        .iter()
+                        .map(|(guid, title, more)| {
+                            format!(
+                                "<item><guid>{guid}</guid><title>{title}</title>\
+                                 <link>https://blog.example/{guid}</link>{more}</item>"
+                            )
+                        })
+                        .collect();
+                    format!(
+                        "<?xml version=\"1.0\"?><rss version=\"2.0\" \
+                         xmlns:media=\"http://search.yahoo.com/mrss/\"><channel>\
+                         <title>Blog</title>{items}</channel></rss>"
+                    )
+                }
+
+                fn input(url: &str, set: &str, mode: &str) -> Value {
+                    json!({"url": url, "social_set_id": set, "platforms": ["bluesky"],
+                        "mode": mode})
+                }
+
+                async fn add(s: &TestServer, cookie: &str, body: Value) -> axum_test::TestResponse {
+                    req(s, Method::POST, "/v1/feeds", cookie).json(&body).await
+                }
+
+                async fn added(s: &TestServer, cookie: &str, body: Value) -> String {
+                    let res = add(s, cookie, body).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    res.json::<Value>()["id"].as_str().unwrap().to_owned()
+                }
+
+                async fn sql(db: &DatabaseConnection, sql: String) {
+                    db.execute_raw(Statement::from_string(DbBackend::Postgres, sql))
+                        .await
+                        .unwrap();
+                }
+
+                /// Makes the feed due again: for the scheduler, and for a check now.
+                async fn rewind(db: &DatabaseConnection, id: &str) {
+                    let back = "UPDATE feeds SET last_checked_at = now() - interval '1 hour'";
+                    sql(db, format!("{back} WHERE id = '{id}'")).await;
+                }
+
+                /// A check now of a feed that is due, answering the feed.
+                async fn check(
+                    s: &TestServer,
+                    db: &DatabaseConnection,
+                    cookie: &str,
+                    id: &str,
+                ) -> Value {
+                    rewind(db, id).await;
+                    let res = req(s, Method::POST, &format!("/v1/feeds/{id}/check"), cookie).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    res.json()
+                }
+
+                async fn feed(s: &TestServer, cookie: &str, id: &str) -> Value {
+                    let res = s
+                        .get(&format!("/v1/feeds/{id}"))
+                        .add_header("cookie", cookie)
+                        .await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    res.json()
+                }
+
+                /// The team's posts, oldest first.
+                async fn posts(s: &TestServer, cookie: &str) -> Vec<Value> {
+                    let res = s.get("/v1/posts").add_header("cookie", cookie).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let mut all = res.json::<Vec<Value>>();
+                    all.sort_by_key(|p| p["id"].as_str().unwrap().to_owned());
+                    all
+                }
+
+                fn bodies(posts: &[Value]) -> Vec<&str> {
+                    posts.iter().map(|p| p["body"].as_str().unwrap()).collect()
+                }
+
+                /// Puts an account of `provider` in the set, as a connect would.
+                async fn account(
+                    db: &DatabaseConnection,
+                    team_id: &str,
+                    set: &str,
+                    provider: &str,
+                ) {
+                    let id = uuid::Uuid::now_v7();
+                    let row = social_accounts::ActiveModel {
+                        id: Set(id),
+                        team_id: Set(team_id.parse().unwrap()),
+                        provider: Set(provider.into()),
+                        external_id: Set(id.to_string()),
+                        access_token: Set(Vec::new()),
+                        meta: Set(json!({})),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::insert(row)
+                        .exec_without_returning(db)
+                        .await
+                        .unwrap();
+                    let link = social_account_social_set::ActiveModel {
+                        social_account_id: Set(id),
+                        social_set_id: Set(set.parse().unwrap()),
+                    };
+                    social_account_social_set::Entity::insert(link)
+                        .exec_without_returning(db)
+                        .await
+                        .unwrap();
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_feed_is_validated_read_once_and_seeded_without_posting() {
+                    let (s, db, _, blog) = on_blog().await;
+                    let (owner, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    blog.put("a", rss(&[("1", "One", ""), ("2", "Two", "")]));
+                    let good = input(&blog.url("a"), &set, "now");
+                    let with = |field: &str, value: Value| {
+                        let mut v = good.clone();
+                        v[field] = value;
+                        v
+                    };
+                    let long_url = format!("https://blog.example/{}", "a".repeat(2048));
+                    for (body, field) in [
+                        (with("url", json!("")), "url"),
+                        (with("url", json!("http://blog.example/feed.xml")), "url"),
+                        (with("url", json!("https://u:p@blog.example/feed")), "url"),
+                        (with("url", json!(long_url)), "url"),
+                        // Private, loopback and link-local addresses, also on the blog's host
+                        // at another port: only the blog itself is let through, in tests.
+                        (with("url", json!("https://10.0.0.5/feed.xml")), "url"),
+                        (with("url", json!("https://127.0.0.1/feed.xml")), "url"),
+                        (with("url", json!("https://169.254.169.254/feed")), "url"),
+                        (with("url", json!("https://[::1]/feed.xml")), "url"),
+                        (with("url", json!("https://localhost/feed.xml")), "url"),
+                        (with("url", json!("http://127.0.0.1:9/f/a")), "url"),
+                        (with("social_set_id", Value::Null), "social_set_id"),
+                        (
+                            with("social_set_id", json!(uuid::Uuid::now_v7())),
+                            "social_set_id",
+                        ),
+                        (with("platforms", json!([])), "platforms"),
+                        (with("platforms", json!(["bluesky", "x"])), "platforms"),
+                        (with("platforms", json!(["mastodon"])), "platforms"),
+                        (with("template", json!("  ")), "template"),
+                        (with("template", json!("a".repeat(2001))), "template"),
+                        (with("mode", json!("")), "mode"),
+                        (with("mode", json!("later")), "mode"),
+                    ] {
+                        let res = add(&s, &owner, body.clone()).await;
+                        assert_eq!(res.status_code(), 422, "{body}: {}", res.text());
+                        res.assert_json(&json!({"error": "invalid_feed", "field": field}));
+                    }
+                    for platform in ["tiktok", "youtube"] {
+                        let res =
+                            add(&s, &owner, with("platforms", json!(["bluesky", platform]))).await;
+                        assert_eq!(res.status_code(), 422);
+                        res.assert_json(
+                            &json!({"error": "platform_not_supported", "platform": platform}),
+                        );
+                    }
+                    // A feed that cannot be read or is no feed, with a short reason.
+                    blog.put("page", "<html><body>Hi</body></html>".into());
+                    blog.put("hop", rss(&[]));
+                    let redirected = "too many redirects, or one to a URL that is not public";
+                    for (path, reason) in [
+                        ("/f/none", "HTTP 404"),
+                        ("/f/page", "not an RSS or Atom feed"),
+                        ("/big", "over 1 MB"),
+                        ("/to-private", redirected),
+                        ("/hop/3", redirected),
+                    ] {
+                        let url = format!("{}{path}", blog.base);
+                        let res = add(&s, &owner, with("url", json!(url))).await;
+                        assert_eq!(res.status_code(), 422, "{path}: {}", res.text());
+                        res.assert_json(&json!({"error": "feed_unreadable", "reason": reason}));
+                    }
+                    let none = s.get("/v1/feeds").add_header("cookie", &owner).await;
+                    none.assert_json(&json!([]));
+
+                    let res = add(&s, &owner, good.clone()).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let f = res.json::<Value>();
+                    let id = f["id"].as_str().unwrap().to_owned();
+                    assert_eq!(f["url"], blog.url("a"));
+                    assert_eq!(f["social_set_id"], set);
+                    assert_eq!(f["platforms"], json!(["bluesky"]));
+                    assert_eq!(f["template"], "{title}\n{link}");
+                    assert_eq!(f["mode"], "now");
+                    assert_eq!(f["active"], true);
+                    assert_eq!(f["last_error"], Value::Null);
+                    assert_eq!(f["items_posted"], 0);
+                    assert!(f["last_checked_at"].is_string() && f["created_at"].is_string());
+                    assert_eq!(f.as_object().unwrap().len(), 11, "{f}");
+                    assert_eq!(feed(&s, &owner, &id).await, f);
+                    let listed = s.get("/v1/feeds").add_header("cookie", &owner).await;
+                    listed.assert_json(&json!([f]));
+                    // The create was a check: another one has to wait a minute.
+                    let path = format!("/v1/feeds/{id}/check");
+                    let res = req(&s, Method::POST, &path, &owner).await;
+                    assert_eq!(res.status_code(), 429);
+                    res.assert_json(&json!({"error": "checked_recently"}));
+                    // What the feed held when it was added is never posted.
+                    let f = check(&s, &db, &owner, &id).await;
+                    assert_eq!(
+                        (&f["items_posted"], &f["last_error"]),
+                        (&json!(0), &Value::Null)
+                    );
+                    assert!(posts(&s, &owner).await.is_empty());
+                    let res = req(&s, Method::POST, &path, &owner).await;
+                    assert_eq!(res.status_code(), 429, "a check now counts too");
+
+                    // Three redirects are followed, each to an allowed URL.
+                    let hop = format!("{}/hop/2", blog.base);
+                    let hopped = added(&s, &owner, with("url", json!(hop))).await;
+                    // A replace is checked the same way; a new URL is read and seeded again.
+                    let path = format!("/v1/feeds/{hopped}");
+                    let res = req(&s, Method::PUT, &path, &owner)
+                        .json(&with("mode", json!("soon")))
+                        .await;
+                    res.assert_json(&json!({"error": "invalid_feed", "field": "mode"}));
+                    let private = with("url", json!(format!("{}/to-private", blog.base)));
+                    let res = req(&s, Method::PUT, &path, &owner).json(&private).await;
+                    res.assert_json(&json!({"error": "feed_unreadable", "reason": redirected}));
+                    blog.put("b", rss(&[("9", "Nine", "")]));
+                    let mut moved = input(&blog.url("b"), &set, "draft");
+                    moved["template"] = json!("{title}");
+                    moved["active"] = json!(false);
+                    let res = req(&s, Method::PUT, &path, &owner).json(&moved).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let f = res.json::<Value>();
+                    assert_eq!(
+                        (&f["url"], &f["mode"], &f["template"], &f["active"]),
+                        (
+                            &json!(blog.url("b")),
+                            &json!("draft"),
+                            &json!("{title}"),
+                            &json!(false)
+                        )
+                    );
+                    let f = check(&s, &db, &owner, &hopped).await;
+                    assert_eq!(f["items_posted"], 0, "the new URL's items were seeded");
+                    let res = req(&s, Method::DELETE, &path, &owner).await;
+                    assert_eq!(res.status_code(), 204);
+                    assert_eq!(
+                        req(&s, Method::DELETE, &path, &owner).await.status_code(),
+                        404
+                    );
+
+                    // A team keeps 20 feeds.
+                    sql(
+                        &db,
+                        format!(
+                            "INSERT INTO feeds (id, team_id, social_set_id, url, platforms, \
+                             template, mode) SELECT gen_random_uuid(), team_id, social_set_id, \
+                             url, platforms, template, mode FROM feeds, generate_series(1, 19) \
+                             WHERE id = '{id}'"
+                        ),
+                    )
+                    .await;
+                    let res = add(&s, &owner, good).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "too_many_feeds"}));
+
+                    let doc = s.get("/openapi.json").await.json::<Value>();
+                    for (p, m) in [
+                        ("/feeds", "get"),
+                        ("/feeds", "post"),
+                        ("/feeds/{id}", "get"),
+                        ("/feeds/{id}", "put"),
+                        ("/feeds/{id}", "delete"),
+                        ("/feeds/{id}/check", "post"),
+                    ] {
+                        assert!(doc["paths"][p][m].is_object(), "{m} {p}");
+                    }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_new_item_makes_one_group_in_each_mode_and_never_twice() {
+                    let (s, db, state, blog) = on_blog().await;
+                    let (owner, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    req(&s, Method::PATCH, "/v1/team", &owner)
+                        .json(&json!({"require_approval": true}))
+                        .await
+                        .assert_status_ok();
+                    let mut ids = HashMap::new();
+                    for mode in ["draft", "queue", "now"] {
+                        blog.put(mode, rss(&[("old", "Old", "")]));
+                        let id = added(&s, &owner, input(&blog.url(mode), &set, mode)).await;
+                        ids.insert(mode, id);
+                        blog.put(mode, rss(&[(mode, mode, ""), ("old", "Old", "")]));
+                    }
+                    let f = check(&s, &db, &owner, &ids["draft"]).await;
+                    assert_eq!(
+                        (&f["items_posted"], &f["last_error"]),
+                        (&json!(1), &Value::Null)
+                    );
+                    // No slot in the set's queue: a draft, and the feed says so.
+                    let f = check(&s, &db, &owner, &ids["queue"]).await;
+                    assert_eq!(f["items_posted"], 1);
+                    assert_eq!(
+                        f["last_error"],
+                        "The queue has no slots, so the post was saved as a draft."
+                    );
+                    let before = Utc::now();
+                    let f = check(&s, &db, &owner, &ids["now"]).await;
+                    assert_eq!(f["items_posted"], 1);
+                    let all = posts(&s, &owner).await;
+                    assert_eq!(
+                        bodies(&all),
+                        [
+                            "draft\nhttps://blog.example/draft",
+                            "queue\nhttps://blog.example/queue",
+                            "now\nhttps://blog.example/now"
+                        ]
+                    );
+                    for p in &all[..2] {
+                        assert_eq!(p["status"], "draft", "{p}");
+                        assert_eq!(p["scheduled_at"], Value::Null);
+                        assert_eq!(p["approval"], Value::Null);
+                    }
+                    let now = &all[2];
+                    assert_eq!(now["status"], "scheduled", "{now}");
+                    let at: DateTime<Utc> = now["scheduled_at"].as_str().unwrap().parse().unwrap();
+                    assert!(at >= before - Duration::seconds(1) && at <= Utc::now());
+                    // No one is there to approve a feed's post: it is approved as a manager's.
+                    assert_eq!(now["approval"], "approved");
+                    assert!(all.iter().all(|p| p["group_id"].is_string()));
+                    assert!(all.iter().all(|p| p["platform"] == "bluesky"));
+
+                    // With a slot the next item takes it.
+                    let slots: Vec<Value> = (0..7)
+                        .map(|d| json!({"weekday": d, "time": "09:00"}))
+                        .collect();
+                    let path = format!("/v1/social-sets/{set}/queue");
+                    req(&s, Method::PUT, &path, &owner)
+                        .json(&json!({"time_zone": "UTC", "slots": slots}))
+                        .await
+                        .assert_status_ok();
+                    blog.put(
+                        "queue",
+                        rss(&[
+                            ("q2", "Second", ""),
+                            ("queue", "queue", ""),
+                            ("old", "Old", ""),
+                        ]),
+                    );
+                    let f = check(&s, &db, &owner, &ids["queue"]).await;
+                    assert_eq!(
+                        (&f["items_posted"], &f["last_error"]),
+                        (&json!(2), &Value::Null)
+                    );
+                    let all = posts(&s, &owner).await;
+                    let queued = all.last().unwrap();
+                    assert_eq!(queued["body"], "Second\nhttps://blog.example/q2");
+                    assert_eq!(queued["status"], "scheduled");
+                    assert!(queued["scheduled_at"]
+                        .as_str()
+                        .unwrap()
+                        .contains("T09:00:00"));
+
+                    // Nothing new: a check now, a scheduler round and an unchanged feed (`304`)
+                    // post nothing again.
+                    for id in ids.values() {
+                        let f = check(&s, &db, &owner, id).await;
+                        assert_eq!(f["last_error"], Value::Null);
+                        rewind(&db, id).await;
+                    }
+                    reader::tick(&state).await.unwrap();
+                    assert_eq!(posts(&s, &owner).await.len(), 4);
+                    let f = feed(&s, &owner, &ids["now"]).await;
+                    assert_eq!(f["items_posted"], 1);
+                    let checked: DateTime<Utc> =
+                        f["last_checked_at"].as_str().unwrap().parse().unwrap();
+                    assert!(
+                        checked > Utc::now() - Duration::minutes(1),
+                        "the round checked it"
+                    );
+                    // The scheduler leaves a feed checked in the last 15 minutes alone, and one
+                    // switched off.
+                    blog.put("now", rss(&[("n2", "Later", ""), ("now", "now", "")]));
+                    reader::tick(&state).await.unwrap();
+                    assert_eq!(posts(&s, &owner).await.len(), 4);
+                    let mut off = input(&blog.url("now"), &set, "now");
+                    off["active"] = json!(false);
+                    let path = format!("/v1/feeds/{}", ids["now"]);
+                    let res = req(&s, Method::PUT, &path, &owner).json(&off).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    rewind(&db, &ids["now"]).await;
+                    reader::tick(&state).await.unwrap();
+                    assert_eq!(posts(&s, &owner).await.len(), 4);
+                    off["active"] = json!(true);
+                    req(&s, Method::PUT, &path, &owner).json(&off).await;
+                    rewind(&db, &ids["now"]).await;
+                    reader::tick(&state).await.unwrap();
+                    let all = posts(&s, &owner).await;
+                    assert_eq!(all.len(), 5);
+                    assert_eq!(all[4]["body"], "Later\nhttps://blog.example/n2");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn five_items_post_per_check_oldest_first() {
+                    let (s, db, _, blog) = on_blog().await;
+                    let (owner, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    blog.put("a", rss(&[]));
+                    let mut body = input(&blog.url("a"), &set, "draft");
+                    body["template"] = json!("{title}");
+                    let id = added(&s, &owner, body).await;
+                    // Seven items, the newest first, as feeds list them.
+                    let dated: Vec<(String, String, String)> = (1..=7)
+                        .rev()
+                        .map(|n| {
+                            let date = format!("<pubDate>0{n} Nov 2026 10:00:00 GMT</pubDate>");
+                            (format!("g{n}"), format!("Item {n}"), date)
+                        })
+                        .collect();
+                    let items: Vec<(&str, &str, &str)> = dated
+                        .iter()
+                        .map(|(g, t, d)| (g.as_str(), t.as_str(), d.as_str()))
+                        .collect();
+                    blog.put("a", rss(&items));
+                    let f = check(&s, &db, &owner, &id).await;
+                    assert_eq!(f["items_posted"], 5);
+                    let all = posts(&s, &owner).await;
+                    assert_eq!(
+                        bodies(&all),
+                        ["Item 1", "Item 2", "Item 3", "Item 4", "Item 5"]
+                    );
+                    // The rest wait for the next check, though the feed did not change.
+                    let f = check(&s, &db, &owner, &id).await;
+                    assert_eq!(f["items_posted"], 7);
+                    let all = posts(&s, &owner).await;
+                    assert_eq!(bodies(&all)[5..], ["Item 6", "Item 7"]);
+                    let f = check(&s, &db, &owner, &id).await;
+                    assert_eq!(f["items_posted"], 7);
+                    assert_eq!(posts(&s, &owner).await.len(), 7);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn atom_items_fill_the_template_and_are_cut_to_each_platform() {
+                    let (s, db, _, blog) = on_blog().await;
+                    let (owner, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    account(&db, &team_id, &set, "x").await;
+                    account(&db, &team_id, &set, "linkedin").await;
+                    let atom = |entries: &str| {
+                        format!(
+                            "<?xml version=\"1.0\"?><feed xmlns=\"http://www.w3.org/2005/Atom\">\
+                             <title>Blog</title><id>urn:blog</id>{entries}</feed>"
+                        )
+                    };
+                    blog.put("atom", atom(""));
+                    let mut body = input(&blog.url("atom"), &set, "draft");
+                    body["platforms"] = json!(["bluesky", "x", "linkedin"]);
+                    body["template"] = json!("New: {title}\n\n{summary}\n\nRead: {link} #blog");
+                    let id = added(&s, &owner, body).await;
+                    let words = "word ".repeat(80);
+                    let entry = format!(
+                        "<entry><id>urn:post:1</id><title>Tea &amp; cake</title>\
+                         <link rel=\"alternate\" href=\"https://blog.example/tea\"/>\
+                         <updated>2026-11-01T00:00:00Z</updated>\
+                         <summary type=\"html\">&lt;p&gt;Hello &lt;b&gt;there&lt;/b&gt;. \
+                         {words}&lt;/p&gt;</summary></entry>"
+                    );
+                    blog.put("atom", atom(&entry));
+                    let f = check(&s, &db, &owner, &id).await;
+                    assert_eq!(
+                        (&f["items_posted"], &f["last_error"]),
+                        (&json!(1), &Value::Null)
+                    );
+                    let all = posts(&s, &owner).await;
+                    assert_eq!(all.len(), 3);
+                    assert!(all.iter().all(|p| p["group_id"] == all[0]["group_id"]));
+                    let of = |platform: &str| {
+                        let p = all.iter().find(|p| p["platform"] == platform).unwrap();
+                        p["body"].as_str().unwrap().to_owned()
+                    };
+                    // 300 characters of the description as plain text fit LinkedIn whole.
+                    let summary: String = format!("Hello there . {words}")
+                        .trim()
+                        .chars()
+                        .take(300)
+                        .collect();
+                    let whole = format!(
+                        "New: Tea & cake\n\n{summary}\n\nRead: https://blog.example/tea #blog"
+                    );
+                    assert_eq!(of("linkedin"), whole);
+                    // Bluesky takes 300 graphemes and X 280: the summary is cut, the title,
+                    // the link and the template's own text stay.
+                    let tail = "\n\nRead: https://blog.example/tea #blog";
+                    for (platform, limit) in [("bluesky", 300), ("x", 280)] {
+                        let body = of(platform);
+                        assert!(
+                            body.starts_with("New: Tea & cake\n\nHello there . word"),
+                            "{body}"
+                        );
+                        assert!(body.ends_with(&format!("word…{tail}")), "{body}");
+                        let len = match platform {
+                            "x" => socialreins_core::post::x_weight(&body),
+                            _ => body.chars().count(),
+                        };
+                        assert!(len <= limit && len > limit - 6, "{platform}: {len}");
+                    }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn instagram_is_left_out_of_an_item_without_an_image() {
+                    let (s, db, _, blog) = on_blog().await;
+                    let (owner, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    account(&db, &team_id, &set, "instagram").await;
+                    blog.put("a", rss(&[]));
+                    let mut body = input(&blog.url("a"), &set, "draft");
+                    body["platforms"] = json!(["bluesky", "instagram"]);
+                    body["template"] = json!("{title}");
+                    let both = added(&s, &owner, body.clone()).await;
+                    blog.put("b", rss(&[]));
+                    body["url"] = json!(blog.url("b"));
+                    body["platforms"] = json!(["instagram"]);
+                    let only = added(&s, &owner, body).await;
+                    let image = format!("{IMAGES}/img.jpg");
+                    let enclosure =
+                        format!("<enclosure url=\"{image}\" type=\"image/jpeg\" length=\"64\"/>");
+                    let media = format!("<media:content url=\"{image}\" medium=\"image\"/>");
+                    // An http image and an audio enclosure are no image.
+                    let not = "<enclosure url=\"https://blog.example/a.mp3\" type=\"audio/mpeg\" \
+                        length=\"1\"/><media:content url=\"http://blog.example/a.jpg\"/>";
+                    let doc = rss(&[
+                        ("3", "Media", &media),
+                        ("2", "Enclosure", &enclosure),
+                        ("1", "Plain", not),
+                    ]);
+                    blog.put("a", doc.clone());
+                    blog.put("b", doc);
+                    let f = check(&s, &db, &owner, &both).await;
+                    assert_eq!(
+                        (&f["items_posted"], &f["last_error"]),
+                        (&json!(3), &Value::Null)
+                    );
+                    let all = posts(&s, &owner).await;
+                    let made: Vec<(&str, &str, Value)> = all
+                        .iter()
+                        .map(|p| {
+                            let platform = p["platform"].as_str().unwrap();
+                            (p["body"].as_str().unwrap(), platform, p["media"].clone())
+                        })
+                        .collect();
+                    assert_eq!(
+                        made,
+                        [
+                            ("Plain", "bluesky", json!([])),
+                            ("Enclosure", "bluesky", json!([image])),
+                            ("Enclosure", "instagram", json!([image])),
+                            ("Media", "bluesky", json!([image])),
+                            ("Media", "instagram", json!([image])),
+                        ]
+                    );
+                    // With Instagram alone the item makes no post and is not tried again.
+                    let f = check(&s, &db, &owner, &only).await;
+                    assert_eq!(
+                        (&f["items_posted"], &f["last_error"]),
+                        (&json!(2), &Value::Null)
+                    );
+                    let f = check(&s, &db, &owner, &only).await;
+                    assert_eq!(f["items_posted"], 2);
+                    assert_eq!(posts(&s, &owner).await.len(), 7);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_refused_item_is_tried_three_times_then_given_up() {
+                    let (s, db, _, blog) = on_blog().await;
+                    let (owner, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    blog.put("a", rss(&[]));
+                    let mut body = input(&blog.url("a"), &set, "draft");
+                    // Over Bluesky's 300 with nothing left to cut.
+                    body["template"] = json!(format!("{} {{link}}", "a".repeat(300)));
+                    let id = added(&s, &owner, body).await;
+                    blog.put("a", rss(&[("1", "One", "")]));
+                    for attempt in 1..=3 {
+                        let f = check(&s, &db, &owner, &id).await;
+                        assert_eq!(
+                            f["last_error"], "\"One\" was not posted: too_long",
+                            "{attempt}"
+                        );
+                        assert_eq!(
+                            (&f["items_posted"], &f["active"]),
+                            (&json!(0), &json!(true))
+                        );
+                    }
+                    let f = check(&s, &db, &owner, &id).await;
+                    assert_eq!(f["last_error"], Value::Null, "given up after three tries");
+                    assert!(posts(&s, &owner).await.is_empty());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn ten_failed_checks_in_a_row_switch_a_feed_off() {
+                    let (s, db, state, blog) = on_blog().await;
+                    let (owner, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    blog.put("a", rss(&[]));
+                    let id = added(&s, &owner, input(&blog.url("a"), &set, "draft")).await;
+                    let round = || async {
+                        rewind(&db, &id).await;
+                        reader::tick(&state).await.unwrap();
+                        feed(&s, &owner, &id).await
+                    };
+                    blog.drop("a");
+                    for _ in 0..9 {
+                        let f = round().await;
+                        assert_eq!(
+                            (&f["active"], &f["last_error"]),
+                            (&json!(true), &json!("HTTP 404"))
+                        );
+                    }
+                    // A good check starts the count again.
+                    blog.put("a", rss(&[]));
+                    let f = round().await;
+                    assert_eq!(
+                        (&f["active"], &f["last_error"]),
+                        (&json!(true), &Value::Null)
+                    );
+                    blog.put("a", "not xml".into());
+                    for n in 1..=10 {
+                        let f = round().await;
+                        assert_eq!(f["last_error"], "not an RSS or Atom feed");
+                        assert_eq!(f["active"], n < 10, "check {n}");
+                    }
+                    // Off: the scheduler leaves it alone until someone switches it back on.
+                    blog.put("a", rss(&[("1", "One", "")]));
+                    let f = round().await;
+                    assert_eq!(f["active"], false);
+                    assert!(posts(&s, &owner).await.is_empty());
+                    let mut on = input(&blog.url("a"), &set, "draft");
+                    on["active"] = json!(true);
+                    let path = format!("/v1/feeds/{id}");
+                    let res = req(&s, Method::PUT, &path, &owner).json(&on).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let f = round().await;
+                    assert_eq!(
+                        (&f["active"], &f["items_posted"]),
+                        (&json!(true), &json!(1))
+                    );
+                    blog.drop("a");
+                    let f = round().await;
+                    assert_eq!(f["active"], true, "the count started again");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn managers_and_full_tokens_write_feeds_and_other_teams_see_none() {
+                    let (s, db, _, blog) = on_blog().await;
+                    let (owner, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let (member, _) = joined(&s, &db, &team_id, "member").await;
+                    let (admin, _) = joined(&s, &db, &team_id, "admin").await;
+                    blog.put("a", rss(&[]));
+                    let body = input(&blog.url("a"), &set, "draft");
+                    let id = added(&s, &admin, body.clone()).await;
+                    let one = format!("/v1/feeds/{id}");
+                    let check_now = format!("{one}/check");
+                    let writes = [
+                        (Method::POST, "/v1/feeds"),
+                        (Method::PUT, one.as_str()),
+                        (Method::POST, check_now.as_str()),
+                        (Method::DELETE, one.as_str()),
+                    ];
+                    // A member reads, and writes nothing.
+                    assert_eq!(feed(&s, &member, &id).await["id"], id.as_str());
+                    let listed = s.get("/v1/feeds").add_header("cookie", &member).await;
+                    assert_eq!(listed.json::<Value>().as_array().unwrap().len(), 1);
+                    for (m, p) in &writes {
+                        let res = req(&s, m.clone(), p, &member).json(&body).await;
+                        assert_eq!(res.status_code(), 403, "{m} {p}");
+                        res.assert_json(&json!({"error": "forbidden"}));
+                    }
+                    // A read-only token reads; a full one writes.
+                    let secret = |made: Value| made["secret"].as_str().unwrap().to_owned();
+                    let ro = json!({"name": "ro", "read_only": true});
+                    let ro = secret(make_token(&s, &owner, ro).await);
+                    let rw = secret(make_token(&s, &owner, json!({"name": "rw"})).await);
+                    for path in ["/v1/feeds", one.as_str()] {
+                        let res = bearer(&s, Method::GET, path, &ro).await;
+                        assert_eq!(res.status_code(), 200, "{path}");
+                    }
+                    for (m, p) in &writes {
+                        let res = bearer(&s, m.clone(), p, &ro).json(&body).await;
+                        assert_eq!(res.status_code(), 403, "{m} {p}");
+                        res.assert_json(&json!({"error": "read_only_token"}));
+                    }
+                    let res = bearer(&s, Method::POST, "/v1/feeds", &rw).json(&body).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let by_token = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                    rewind(&db, &by_token).await;
+                    let path = format!("/v1/feeds/{by_token}/check");
+                    let res = bearer(&s, Method::POST, &path, &rw).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+
+                    // The tools answer as the routes do.
+                    let (err, v) = call(&s, &ro, "list-feeds", json!({})).await;
+                    assert!(!err, "{v}");
+                    assert_eq!(v.as_array().unwrap().len(), 2);
+                    for (tool, args) in [
+                        ("add-feed", body.clone()),
+                        ("remove-feed", json!({"id": id})),
+                    ] {
+                        let (err, v) = call(&s, &ro, tool, args).await;
+                        assert!(err, "{tool}");
+                        assert_eq!(v, json!({"error": "read_only_token"}), "{tool}");
+                    }
+                    let mut bad = body.clone();
+                    bad["platforms"] = json!(["youtube"]);
+                    let (err, v) = call(&s, &rw, "add-feed", bad).await;
+                    assert!(err);
+                    assert_eq!(
+                        v,
+                        json!({"error": "platform_not_supported", "platform": "youtube"})
+                    );
+                    let (err, v) = call(&s, &rw, "add-feed", body.clone()).await;
+                    assert!(!err, "{v}");
+                    assert_eq!(v["mode"], "draft");
+                    let (err, v) = call(&s, &rw, "remove-feed", json!({"id": v["id"]})).await;
+                    assert!(!err && v == json!({"ok": true}), "{v}");
+                    let (err, v) = call(&s, &rw, "remove-feed", json!({"id": by_token})).await;
+                    assert!(!err, "{v}");
+                    let (err, v) = call(&s, &rw, "remove-feed", json!({"id": by_token})).await;
+                    assert!(err);
+                    assert_eq!(v, json!({"error": "not_found"}));
+
+                    // Another team's feed is not there, and its set is no set.
+                    let (stranger, other_team, _) = owner_with_account(&s, &db).await;
+                    let listed = s.get("/v1/feeds").add_header("cookie", &stranger).await;
+                    listed.assert_json(&json!([]));
+                    let other_set = default_set(&db, &other_team).await.to_string();
+                    let theirs = input(&blog.url("a"), &other_set, "draft");
+                    let res = s.get(&one).add_header("cookie", &stranger).await;
+                    assert_eq!(res.status_code(), 404);
+                    for (m, p) in &writes[1..] {
+                        let res = req(&s, m.clone(), p, &stranger).json(&theirs).await;
+                        assert_eq!(res.status_code(), 404, "{m} {p}");
+                        res.assert_json(&json!({"error": "not_found"}));
+                    }
+                    let res = add(&s, &stranger, body).await;
+                    res.assert_json(&json!({"error": "invalid_feed", "field": "social_set_id"}));
+                    assert_eq!(feed(&s, &owner, &id).await["active"], true, "untouched");
                 }
             }
 

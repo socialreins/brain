@@ -3,6 +3,7 @@ pub mod config;
 pub mod connectors;
 pub mod controllers;
 pub mod expiry;
+pub mod feeds;
 pub mod inbox;
 pub mod mail;
 pub mod mcp;
