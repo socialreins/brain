@@ -75,6 +75,47 @@ pub fn parse_code(raw: &str) -> Option<String> {
     (code.len() == CODE_CHARS && code.bytes().all(|b| CODE_ALPHABET.contains(&b))).then_some(code)
 }
 
+/// Words a team slug may not be: the web app's own first path segments and names that would
+/// pass for SocialReins itself.
+pub const RESERVED_SLUGS: &[&str] = &[
+    "new",
+    "admin",
+    "api",
+    "app",
+    "t",
+    "team",
+    "teams",
+    "login",
+    "signup",
+    "settings",
+    "billing",
+    "www",
+    "socialreins",
+    "support",
+    "help",
+    "_",
+];
+
+/// `raw` as a team slug (trimmed, lowercase): 3 to 30 of `a-z`, `0-9` and `-`, a letter or digit
+/// at both ends, no `--`, not in `RESERVED_SLUGS`. The error is the reason: `reserved`,
+/// `length` or `characters`, checked in that order.
+pub fn slug(raw: &str) -> Result<String, &'static str> {
+    let slug = raw.trim().to_ascii_lowercase();
+    if RESERVED_SLUGS.contains(&slug.as_str()) {
+        return Err("reserved");
+    }
+    if !(3..=30).contains(&slug.chars().count()) {
+        return Err("length");
+    }
+    let plain = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    let bytes = slug.as_bytes();
+    let ok = bytes.iter().all(|&b| plain(b) || b == b'-')
+        && plain(bytes[0])
+        && plain(bytes[bytes.len() - 1])
+        && !slug.contains("--");
+    ok.then_some(slug).ok_or("characters")
+}
+
 /// A trimmed team or set name of 1 to `MAX_NAME_CHARS` characters, without control characters
 /// (it goes into email subjects).
 pub fn name(raw: &str) -> Option<String> {
@@ -105,7 +146,29 @@ pub fn inert(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{inert, name, name_up_to, Role::*};
+    use super::{inert, name, name_up_to, slug, Role::*};
+
+    #[test]
+    fn slugs_are_lowercase_words_with_single_hyphens() {
+        assert_eq!(slug("  Acme-Co2 ").as_deref(), Ok("acme-co2"));
+        assert_eq!(slug(&"a".repeat(30)), Ok("a".repeat(30)));
+        for (raw, why) in [
+            ("ab", "length"),
+            ("", "length"),
+            (&*"a".repeat(31), "length"),
+            ("-acme", "characters"),
+            ("acme-", "characters"),
+            ("ac--me", "characters"),
+            ("ac me", "characters"),
+            ("ac_me", "characters"),
+            ("acmé", "characters"),
+            ("Admin", "reserved"),
+            ("t", "reserved"),
+            ("_", "reserved"),
+        ] {
+            assert_eq!(slug(raw), Err(why), "{raw}");
+        }
+    }
 
     #[test]
     fn inert_names_cannot_pass_as_links() {

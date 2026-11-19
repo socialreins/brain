@@ -47,7 +47,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | POST | `/auth/link/me` | Session cookie. Emails a sign-in link to the signed-in user's own address, `202 {"status":"sent"}`. No body and no captcha; opening the link starts a fresh session, for actions that answer `403 reauth_required` |
 | GET | `/auth/magic/{token}` | The emailed link: a page with a sign-in button, does not use the link |
 | POST | `/auth/magic` | Form field `token`: uses the link, sets the session cookie, redirects to `WEB_URL` |
-| GET | `/auth/me` | The signed-in user with `current_team` (`{"id","name","code","role"}`) and `is_admin` (in `ADMIN_EMAILS`), or `401 {"error":"unauthorized"}`. When the request names a team (see "Team codes"), that team is returned, and with the `X-Team` header it becomes the current team |
+| GET | `/auth/me` | The signed-in user with `current_team` (the team as `GET /v1/team` gives it) and `is_admin` (in `ADMIN_EMAILS`), or `401 {"error":"unauthorized"}`. When the request names a team (see "Team codes"), that team is returned, and with the `X-Team` header it becomes the current team |
 | PATCH | `/auth/me` | `{"name":"..."}`: trimmed, 1 to 80 characters, no control characters, else `422 {"error":"invalid_name"}`. Replies like `GET /auth/me`. Origin must be in `CORS_ORIGINS` |
 | POST | `/auth/logout` | Deletes the session, `204`. Origin must be in `CORS_ORIGINS` |
 | GET | `/auth/providers` | `{"google":bool,"turnstile_site_key":"..."\|null}`: the optional sign-in methods this install offers, and the Turnstile key when the captcha is on |
@@ -62,7 +62,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | DELETE | `/auth/passkeys/{id}` | Deletes one of the signed-in user's passkeys, `204`, else `404` |
 | POST, GET | `/v1/teams` | Create a team (`{"name"}`, with its default set, named "All sets"; caller owns it and switches to it), or list mine |
 | PUT | `/v1/current-team` | `{"team_id"}`: switch to one of my teams |
-| GET, PATCH, DELETE | `/v1/team` | The current team (`{"id","name","code","public_pages","newsletter","require_approval","role"}`), or the one the request names; rename it or switch its public pages, their newsletter sign-up or post approvals (`{"name","public_pages","newsletter","require_approval"}`, any of them; owner, admin; see "Approvals"); delete it (owner, sign-in from the last 10 minutes) |
+| GET, PATCH, DELETE | `/v1/team` | The current team (`{"id","name","code","slug","public_pages","newsletter","require_approval","role"}`), or the one the request names; rename it, set or clear its slug, or switch its public pages, their newsletter sign-up or post approvals (`{"name","slug","public_pages","newsletter","require_approval"}`, any of them; owner, admin; see "Team slugs" and "Approvals"); delete it (owner, sign-in from the last 10 minutes) |
 | GET | `/v1/team/members` | The current team's members |
 | PATCH, DELETE | `/v1/team/members/{user_id}` | `{"role"}`: change a role (owner, admin); remove a member, or leave |
 | POST, GET | `/v1/team/invitations` | `{"email","role"}`: invite as `admin` or `member` (owner, admin); list pending |
@@ -222,6 +222,21 @@ caller's membership every time, and answers `404 {"error":"not_found"}` both for
 caller is not in and for a code no team has. A request that names no team acts in the user's
 current team (`users.current_team_id`, the team opened last), so older clients keep working.
 API tokens ignore both: a token always acts in its own team.
+
+Team slugs: a team may also pick a `slug` (`null` until it does), and wherever a request names
+a team by code (`X-Team`, `?team=`) it may use the slug instead, in any case. The code keeps
+working and never changes. `PATCH /v1/team` with `{"slug": "acme"}` sets it and `{"slug": null}`
+clears it (owner or admin). A slug is trimmed and lowercased, then must be 3 to 30 characters
+of `a-z`, `0-9` and `-`, start and end with a letter or digit, hold no `--`, and not be one of
+`new`, `admin`, `api`, `app`, `t`, `team`, `teams`, `login`, `signup`, `settings`, `billing`,
+`www`, `socialreins`, `support`, `help`, `_`: otherwise `422 {"error":"invalid_slug","reason":...}`
+with `reason` one of `reserved`, `length`, `characters` (checked in that order). A slug that
+is another team's slug or any team's code is `409 {"error":"slug_taken"}`, and no new team is
+given a code that is a slug. A team changes its slug (a set or a clear) at most 5 times a day,
+then `429 {"error":"slug_changed_too_often"}`; refused changes and sending the slug it already
+has do not count. A slug a team gives up is free for any team at once, and old links by that
+slug stop working (`404`), so link by code where a link must last. Everything else is keyed by
+the team's id: API tokens, posts and connections do not notice a slug change.
 
 Teams: every sign-in gives a user with no team a personal team named after the first word of
 their name, owned by them, with its Default social set. The team routes use the session cookie, and the state-changing ones the same origin

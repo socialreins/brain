@@ -114,6 +114,10 @@ cargo run -p socialreins-brain
   it in the transaction of anything that takes a post out of `scheduled` to publish it
   (`publish::claim`, and publish now through `publish::reserve_and`), so a post yields one copy
   at most. A copy's group id is a UUID v5 of the old one, so group mates agree without talking.
+- Team slugs (`teams.slug`, optional, set with `PATCH /v1/team`): `teams::team_by_code` is the
+  one place a request's `X-Team` or `?team=` becomes a team, by `code` or by slug. A slug never
+  equals a code (`rename` checks, `insert_team` draws again) and is unique on `lower(slug)`; the
+  code is permanent, the slug may change (5 times a day per team) and is free once given up.
 - `app/src/webhooks.rs`: outbound webhooks. Every `post_targets` status change goes through
   `webhooks::with_event`, so its event is queued in the same statement; README documents the
   payload and signature.
