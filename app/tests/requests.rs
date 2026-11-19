@@ -17953,20 +17953,25 @@ mod teams {
                     assert_eq!(
                         names,
                         [
+                            "add-media",
                             "add-post-to-list",
                             "create-list",
                             "create-post",
                             "create-post-group",
                             "delete-post",
+                            "delete-snippet",
                             "get-list",
                             "get-post",
                             "get-queue",
                             "list-lists",
+                            "list-media",
                             "list-posts",
+                            "list-snippets",
                             "list-social-accounts",
                             "list-social-sets",
                             "remove-post-from-list",
                             "reorder-list",
+                            "save-snippet",
                             "set-queue",
                             "update-post",
                         ]
@@ -18946,6 +18951,623 @@ mod teams {
             }
 
             /// `Idempotency-Key` on token writes.
+            /// `/v1/media-library` and `/v1/snippets`: team assets.
+            mod library {
+                use super::*;
+                use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+                async fn add(s: &TestServer, cookie: &str, body: Value) -> axum_test::TestResponse {
+                    req(s, Method::POST, "/v1/media-library", cookie)
+                        .json(&body)
+                        .await
+                }
+
+                async fn page(s: &TestServer, cookie: &str, query: &str) -> Value {
+                    let res = s
+                        .get(&format!("/v1/media-library{query}"))
+                        .add_header("cookie", cookie)
+                        .await;
+                    assert_eq!(res.status_code(), 200, "{query}: {}", res.text());
+                    res.json()
+                }
+
+                fn names(page: &Value) -> Vec<String> {
+                    page["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v["name"].as_str().unwrap().to_owned())
+                        .collect()
+                }
+
+                async fn snippet(
+                    s: &TestServer,
+                    cookie: &str,
+                    body: Value,
+                ) -> axum_test::TestResponse {
+                    req(s, Method::POST, "/v1/snippets", cookie)
+                        .json(&body)
+                        .await
+                }
+
+                async fn snippets(s: &TestServer, cookie: &str, query: &str) -> Value {
+                    let res = s
+                        .get(&format!("/v1/snippets{query}"))
+                        .add_header("cookie", cookie)
+                        .await;
+                    assert_eq!(res.status_code(), 200, "{query}: {}", res.text());
+                    res.json()
+                }
+
+                async fn sql(db: &DatabaseConnection, sql: String) {
+                    db.execute_raw(Statement::from_string(DbBackend::Postgres, sql))
+                        .await
+                        .unwrap();
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn media_is_added_named_renamed_and_removed() {
+                    let (s, db) = on_mock(120).await;
+                    let (_, owner, owner_id) = user(&s, &db).await;
+                    let res = add(
+                        &s,
+                        &owner,
+                        json!({"url": "https://a.example/x/My%20Photo.jpg?w=1"}),
+                    )
+                    .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let item = res.json::<Value>();
+                    assert_eq!(item["name"], "My Photo.jpg");
+                    assert_eq!(item["url"], "https://a.example/x/My%20Photo.jpg?w=1");
+                    assert_eq!(item["created_by"], owner_id.to_string());
+                    assert!(item["created_at"].is_string());
+                    let id = item["id"].as_str().unwrap().to_owned();
+                    let res = add(
+                        &s,
+                        &owner,
+                        json!({"url": "https://a.example/v.mp4", "name": "  Intro  "}),
+                    )
+                    .await;
+                    assert_eq!(res.json::<Value>()["name"], "Intro");
+                    let res = add(
+                        &s,
+                        &owner,
+                        json!({"url": "https://a.example/w.mp4", "name": "  "}),
+                    )
+                    .await;
+                    assert_eq!(
+                        res.json::<Value>()["name"],
+                        "w.mp4",
+                        "blank means the default"
+                    );
+
+                    for (body, field) in [
+                        (json!({}), "url"),
+                        (json!({"url": "http://a.example/a.jpg"}), "url"),
+                        (json!({"url": "https://user:pw@a.example/a.jpg"}), "url"),
+                        (json!({"url": "https://a.example/a b.jpg"}), "url"),
+                        (
+                            json!({"url": format!("https://a.example/{}", "a".repeat(2040))}),
+                            "url",
+                        ),
+                        (
+                            json!({"url": "https://a.example/n.jpg", "name": "n".repeat(101)}),
+                            "name",
+                        ),
+                    ] {
+                        let res = add(&s, &owner, body.clone()).await;
+                        assert_eq!(res.status_code(), 422, "{body}");
+                        res.assert_json(&json!({"error": "invalid_media", "field": field}));
+                    }
+                    let ok = add(
+                        &s,
+                        &owner,
+                        json!({"url": "https://a.example/n.jpg", "name": "n".repeat(100)}),
+                    )
+                    .await;
+                    assert_eq!(ok.status_code(), 201);
+
+                    let res = add(
+                        &s,
+                        &owner,
+                        json!({"url": "https://a.example/x/My%20Photo.jpg?w=1"}),
+                    )
+                    .await;
+                    assert_eq!(res.status_code(), 409);
+                    res.assert_json(&json!({"error": "already_in_library", "id": id}));
+
+                    let path = format!("/v1/media-library/{id}");
+                    let res = req(&s, Method::PATCH, &path, &owner)
+                        .json(&json!({"name": " Hero "}))
+                        .await;
+                    res.assert_status_ok();
+                    assert_eq!(res.json::<Value>()["name"], "Hero");
+                    assert_eq!(res.json::<Value>()["id"], id.as_str());
+                    for name in ["", "   ", &"n".repeat(101)] {
+                        let res = req(&s, Method::PATCH, &path, &owner)
+                            .json(&json!({"name": name}))
+                            .await;
+                        assert_eq!(res.status_code(), 422);
+                        res.assert_json(&json!({"error": "invalid_media", "field": "name"}));
+                    }
+                    assert_eq!(
+                        names(&page(&s, &owner, "").await),
+                        [
+                            "n".repeat(100),
+                            "w.mp4".into(),
+                            "Intro".into(),
+                            "Hero".into()
+                        ]
+                    );
+                    let res = req(&s, Method::DELETE, &path, &owner).await;
+                    assert_eq!(res.status_code(), 204);
+                    let res = req(&s, Method::DELETE, &path, &owner).await;
+                    assert_eq!(res.status_code(), 404);
+                    let res = req(&s, Method::PATCH, &path, &owner)
+                        .json(&json!({"name": "x"}))
+                        .await;
+                    assert_eq!(res.status_code(), 404);
+                    assert_eq!(
+                        page(&s, &owner, "").await["items"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        3
+                    );
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn media_search_escapes_wildcards_and_pages_newest_first() {
+                    let (s, db) = on_mock(120).await;
+                    let (_, owner, _) = user(&s, &db).await;
+                    for (url, name) in [
+                        ("https://cdn.example/1.jpg", "50% off"),
+                        ("https://cdn.example/2.jpg", "500 off"),
+                        ("https://cdn.example/3.jpg", "a_b"),
+                        ("https://cdn.example/4.jpg", "axb"),
+                        ("https://other.example/Summer.png", "beach"),
+                    ] {
+                        let res = add(&s, &owner, json!({"url": url, "name": name})).await;
+                        assert_eq!(res.status_code(), 201);
+                    }
+                    assert_eq!(names(&page(&s, &owner, "?q=50%25").await), ["50% off"]);
+                    assert_eq!(names(&page(&s, &owner, "?q=a_b").await), ["a_b"]);
+                    assert_eq!(
+                        names(&page(&s, &owner, "?q=%5C").await),
+                        Vec::<String>::new()
+                    );
+                    assert_eq!(
+                        names(&page(&s, &owner, "?q=SUMMER").await),
+                        ["beach"],
+                        "url, any case"
+                    );
+                    assert_eq!(
+                        names(&page(&s, &owner, "?q=OFF").await),
+                        ["500 off", "50% off"]
+                    );
+                    assert_eq!(
+                        names(&page(&s, &owner, "?q=%20").await).len(),
+                        5,
+                        "blank is no search"
+                    );
+
+                    let first = page(&s, &owner, "?limit=2").await;
+                    assert_eq!(names(&first), ["beach", "axb"]);
+                    let next = first["next_cursor"].as_str().unwrap();
+                    let second = page(&s, &owner, &format!("?limit=2&cursor={next}")).await;
+                    assert_eq!(names(&second), ["a_b", "500 off"]);
+                    let next = second["next_cursor"].as_str().unwrap();
+                    let last = page(&s, &owner, &format!("?limit=2&cursor={next}")).await;
+                    assert_eq!(names(&last), ["50% off"]);
+                    assert_eq!(last["next_cursor"], Value::Null);
+                    assert_eq!(page(&s, &owner, "").await["next_cursor"], Value::Null);
+                    let q = format!("?q=cdn&limit=1&cursor={next}");
+                    assert_eq!(names(&page(&s, &owner, &q).await), ["50% off"]);
+
+                    for q in [
+                        "?limit=0",
+                        "?limit=101",
+                        "?limit=x",
+                        "?cursor=nope",
+                        &format!("?q={}", "a".repeat(2049)),
+                    ] {
+                        let res = s
+                            .get(&format!("/v1/media-library{q}"))
+                            .add_header("cookie", &owner)
+                            .await;
+                        assert_eq!(res.status_code(), 422, "{q}");
+                        res.assert_json(&json!({"error": "invalid_query"}));
+                    }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_library_holds_1000_items() {
+                    let (s, db) = on_mock(120).await;
+                    let (_, owner, _) = user(&s, &db).await;
+                    let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+                    sql(
+                        &db,
+                        format!(
+                            "INSERT INTO media_library (id, team_id, url, name) \
+                         SELECT gen_random_uuid(), '{team}', 'https://a.example/' || n, n::text \
+                         FROM generate_series(1, 999) n"
+                        ),
+                    )
+                    .await;
+                    let res = add(&s, &owner, json!({"url": "https://a.example/last"})).await;
+                    assert_eq!(res.status_code(), 201);
+                    let res = add(&s, &owner, json!({"url": "https://a.example/over"})).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "library_full"}));
+                    let res = add(&s, &owner, json!({"url": "https://a.example/last"})).await;
+                    assert_eq!(res.status_code(), 409, "a duplicate says so even when full");
+                    // Another team is not affected.
+                    let (_, other, _) = user(&s, &db).await;
+                    assert_eq!(
+                        add(&s, &other, json!({"url": "https://a.example/over"}))
+                            .await
+                            .status_code(),
+                        201
+                    );
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn snippets_are_saved_sorted_replaced_and_deleted() {
+                    let (s, db) = on_mock(120).await;
+                    let (_, owner, _) = user(&s, &db).await;
+                    let made = |kind: &str, name: &str, body: &str| json!({"kind": kind, "name": name, "body": body});
+                    let res =
+                        snippet(&s, &owner, made("hashtags", "  Travel ", "#trip #sea")).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let travel = res.json::<Value>();
+                    assert_eq!(travel["name"], "Travel");
+                    assert_eq!(travel["kind"], "hashtags");
+                    assert_eq!(travel["body"], "#trip #sea");
+                    assert!(travel["created_at"].is_string() && travel["updated_at"].is_string());
+                    let id = travel["id"].as_str().unwrap().to_owned();
+                    for (kind, name) in [
+                        ("caption", "beta"),
+                        ("caption", "Alpha"),
+                        ("hashtags", "food"),
+                        ("caption", "travel"),
+                    ] {
+                        let res = snippet(&s, &owner, made(kind, name, "text\nmore")).await;
+                        assert_eq!(res.status_code(), 201, "same name, other kind is fine");
+                    }
+                    let all = snippets(&s, &owner, "").await;
+                    let order: Vec<String> = all["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v["name"].as_str().unwrap().to_lowercase())
+                        .collect();
+                    // By name ignoring case; how a tie of case falls is up to the collation.
+                    assert_eq!(order, ["alpha", "beta", "food", "travel", "travel"]);
+                    let caps = snippets(&s, &owner, "?kind=caption").await;
+                    assert_eq!(caps["items"].as_array().unwrap().len(), 3);
+                    assert!(caps["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|v| v["kind"] == "caption"));
+                    let res = s
+                        .get("/v1/snippets?kind=video")
+                        .add_header("cookie", &owner)
+                        .await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "invalid_query"}));
+
+                    let res = snippet(&s, &owner, made("hashtags", "TRAVEL", "x")).await;
+                    assert_eq!(res.status_code(), 409);
+                    res.assert_json(&json!({"error": "snippet_name_taken"}));
+
+                    let long = "\u{09ac}".repeat(5000);
+                    for (body, field) in [
+                        (json!({"name": "a", "body": "b"}), "kind"),
+                        (made("video", "a", "b"), "kind"),
+                        (json!({"kind": "caption", "body": "b"}), "name"),
+                        (made("caption", "  ", "b"), "name"),
+                        (made("caption", &"n".repeat(81), "b"), "name"),
+                        (json!({"kind": "caption", "name": "a"}), "body"),
+                        (made("caption", "a", " \n "), "body"),
+                        (made("caption", "a", &format!("{long}x")), "body"),
+                    ] {
+                        let res = snippet(&s, &owner, body.clone()).await;
+                        assert_eq!(res.status_code(), 422, "{body}");
+                        res.assert_json(&json!({"error": "invalid_snippet", "field": field}));
+                    }
+                    let res = snippet(&s, &owner, made("caption", &"n".repeat(80), &long)).await;
+                    assert_eq!(
+                        res.status_code(),
+                        201,
+                        "5000 characters fit, though over 4 KiB"
+                    );
+
+                    let path = format!("/v1/snippets/{id}");
+                    let res = req(&s, Method::PUT, &path, &owner)
+                        .json(&made("hashtags", "food", "x"))
+                        .await;
+                    assert_eq!(res.status_code(), 409);
+                    let res = req(&s, Method::PUT, &path, &owner)
+                        .json(&made("hashtags", "travel", "#new"))
+                        .await;
+                    res.assert_status_ok();
+                    let v = res.json::<Value>();
+                    assert_eq!(
+                        (v["id"].as_str(), v["name"].as_str(), v["body"].as_str()),
+                        (Some(id.as_str()), Some("travel"), Some("#new")),
+                        "own name, new case"
+                    );
+                    assert_ne!(v["updated_at"], travel["updated_at"]);
+                    assert_eq!(v["created_at"], travel["created_at"]);
+                    let res = req(&s, Method::PUT, &path, &owner)
+                        .json(&made("caption", "Travel", "x"))
+                        .await;
+                    assert_eq!(res.status_code(), 409, "the caption travel is taken");
+                    let res = req(&s, Method::PUT, &path, &owner)
+                        .json(&made("caption", "", "x"))
+                        .await;
+                    res.assert_json(&json!({"error": "invalid_snippet", "field": "name"}));
+                    let res = req(&s, Method::DELETE, &path, &owner).await;
+                    assert_eq!(res.status_code(), 204);
+                    for m in [Method::DELETE, Method::PUT] {
+                        let res = req(&s, m, &path, &owner)
+                            .json(&made("caption", "z", "x"))
+                            .await;
+                        assert_eq!(res.status_code(), 404);
+                    }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_team_holds_500_snippets() {
+                    let (s, db) = on_mock(120).await;
+                    let (_, owner, _) = user(&s, &db).await;
+                    let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+                    sql(
+                        &db,
+                        format!(
+                            "INSERT INTO snippets (id, team_id, kind, name, body) \
+                         SELECT gen_random_uuid(), '{team}', 'caption', 's' || n, 'b' \
+                         FROM generate_series(1, 499) n"
+                        ),
+                    )
+                    .await;
+                    let body = |name: &str| json!({"kind": "hashtags", "name": name, "body": "#a"});
+                    assert_eq!(snippet(&s, &owner, body("last")).await.status_code(), 201);
+                    let res = snippet(&s, &owner, body("over")).await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "too_many_snippets"}));
+                    let res = snippet(&s, &owner, body("LAST")).await;
+                    assert_eq!(
+                        res.status_code(),
+                        409,
+                        "a taken name says so even when full"
+                    );
+                }
+
+                /// Any member, any token of the team (a set token too) reads and writes; a
+                /// read-only token only reads; another team's ids are `404`.
+                #[tokio::test]
+                #[serial]
+                async fn members_and_tokens_share_the_team_assets() {
+                    let (s, db) = on_mock(120).await;
+                    let (_, owner, _) = user(&s, &db).await;
+                    let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+                    let (member, member_id) = joined(&s, &db, &team_id, "member").await;
+                    let res = add(&s, &member, json!({"url": "https://a.example/m.jpg"})).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    assert_eq!(res.json::<Value>()["created_by"], member_id.to_string());
+                    let res = snippet(
+                        &s,
+                        &member,
+                        json!({"kind": "caption", "name": "m", "body": "b"}),
+                    )
+                    .await;
+                    assert_eq!(res.status_code(), 201);
+
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let secret = |v: Value| v["secret"].as_str().unwrap().to_owned();
+                    let rw = secret(make_token(&s, &owner, json!({"name": "rw"})).await);
+                    let set_tok = secret(
+                        make_token(&s, &owner, json!({"name": "set", "social_set_id": set})).await,
+                    );
+                    let ro = secret(
+                        make_token(&s, &owner, json!({"name": "ro", "read_only": true})).await,
+                    );
+                    for (i, t) in [&rw, &set_tok].into_iter().enumerate() {
+                        let res = bearer(&s, Method::POST, "/v1/media-library", t)
+                            .json(&json!({"url": format!("https://a.example/t{i}.jpg")}))
+                            .await;
+                        assert_eq!(res.status_code(), 201, "{}", res.text());
+                        let item = res.json::<Value>();
+                        assert_eq!(item["created_by"], Value::Null);
+                        let path = format!("/v1/media-library/{}", item["id"].as_str().unwrap());
+                        let res = bearer(&s, Method::PATCH, &path, t)
+                            .json(&json!({"name": "t"}))
+                            .await;
+                        res.assert_status_ok();
+                        let res = bearer(&s, Method::POST, "/v1/snippets", t)
+                            .json(&json!({"kind": "caption", "name": format!("t{i}"), "body": "b"}))
+                            .await;
+                        assert_eq!(res.status_code(), 201);
+                        let path = format!(
+                            "/v1/snippets/{}",
+                            res.json::<Value>()["id"].as_str().unwrap()
+                        );
+                        let res = bearer(&s, Method::PUT, &path, t)
+                            .json(
+                                &json!({"kind": "hashtags", "name": format!("t{i}"), "body": "#b"}),
+                            )
+                            .await;
+                        res.assert_status_ok();
+                    }
+                    let media = bearer(&s, Method::GET, "/v1/media-library", &set_tok)
+                        .await
+                        .json::<Value>();
+                    assert_eq!(media["items"].as_array().unwrap().len(), 3);
+                    let listed = bearer(&s, Method::GET, "/v1/snippets", &ro).await;
+                    listed.assert_status_ok();
+                    assert_eq!(listed.json::<Value>()["items"].as_array().unwrap().len(), 3);
+                    let media_id = media["items"][0]["id"].as_str().unwrap().to_owned();
+                    let snippet_id = listed.json::<Value>()["items"][0]["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let body = json!({"url": "https://a.example/ro.jpg", "kind": "caption", "name": "ro", "body": "b"});
+                    for (m, p) in [
+                        (Method::POST, "/v1/media-library".to_owned()),
+                        (Method::PATCH, format!("/v1/media-library/{media_id}")),
+                        (Method::DELETE, format!("/v1/media-library/{media_id}")),
+                        (Method::POST, "/v1/snippets".to_owned()),
+                        (Method::PUT, format!("/v1/snippets/{snippet_id}")),
+                        (Method::DELETE, format!("/v1/snippets/{snippet_id}")),
+                    ] {
+                        let res = bearer(&s, m.clone(), &p, &ro).json(&body).await;
+                        assert_eq!(res.status_code(), 403, "{m} {p}");
+                        res.assert_json(&json!({"error": "read_only_token"}));
+                    }
+
+                    // Another team sees none of it and reaches none of it.
+                    let (_, stranger, _) = user(&s, &db).await;
+                    assert_eq!(page(&s, &stranger, "").await["items"], json!([]));
+                    assert_eq!(snippets(&s, &stranger, "").await["items"], json!([]));
+                    let q = format!("?cursor={media_id}");
+                    assert_eq!(page(&s, &stranger, &q).await["items"], json!([]));
+                    for (m, p) in [
+                        (Method::PATCH, format!("/v1/media-library/{media_id}")),
+                        (Method::DELETE, format!("/v1/media-library/{media_id}")),
+                        (Method::PUT, format!("/v1/snippets/{snippet_id}")),
+                        (Method::DELETE, format!("/v1/snippets/{snippet_id}")),
+                    ] {
+                        let res = req(&s, m.clone(), &p, &stranger).json(&body).await;
+                        assert_eq!(res.status_code(), 404, "{m} {p}");
+                    }
+                    let res = add(&s, &stranger, json!({"url": "https://a.example/m.jpg"})).await;
+                    assert_eq!(res.status_code(), 201, "a URL is unique per team only");
+                    let res = bearer(
+                        &s,
+                        Method::DELETE,
+                        &format!("/v1/snippets/{snippet_id}"),
+                        &rw,
+                    )
+                    .await;
+                    assert_eq!(res.status_code(), 204, "still there for its own team");
+
+                    let doc = s.get("/openapi.json").await.json::<Value>();
+                    for (p, m) in [
+                        ("/media-library", "get"),
+                        ("/media-library", "post"),
+                        ("/media-library/{id}", "patch"),
+                        ("/media-library/{id}", "delete"),
+                        ("/snippets", "get"),
+                        ("/snippets", "post"),
+                        ("/snippets/{id}", "put"),
+                        ("/snippets/{id}", "delete"),
+                    ] {
+                        let sec = doc["paths"][p][m]["security"].to_string();
+                        assert!(sec.contains("api_token"), "{p} {m} {sec}");
+                    }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn mcp_library_tools_match_rest() {
+                    let (s, db) = on_mock(120).await;
+                    let (_, owner, _) = user(&s, &db).await;
+                    let t = make_token(&s, &owner, json!({"name": "mcp"})).await;
+                    let t = t["secret"].as_str().unwrap().to_owned();
+                    let ro = make_token(&s, &owner, json!({"name": "ro", "read_only": true})).await;
+                    let ro = ro["secret"].as_str().unwrap().to_owned();
+                    use super::mcp::call;
+
+                    let (err, item) = call(
+                        &s,
+                        &t,
+                        "add-media",
+                        json!({"url": "https://a.example/a.jpg"}),
+                    )
+                    .await;
+                    assert!(!err, "{item}");
+                    assert_eq!(item["name"], "a.jpg");
+                    let (err, dup) = call(
+                        &s,
+                        &t,
+                        "add-media",
+                        json!({"url": "https://a.example/a.jpg"}),
+                    )
+                    .await;
+                    assert!(err);
+                    assert_eq!(
+                        dup,
+                        json!({"error": "already_in_library", "id": item["id"]})
+                    );
+                    let (err, got) =
+                        call(&s, &t, "list-media", json!({"q": "A.JPG", "limit": 10})).await;
+                    assert!(!err);
+                    let rest =
+                        bearer(&s, Method::GET, "/v1/media-library?q=A.JPG&limit=10", &t).await;
+                    assert_eq!(got, rest.json::<Value>());
+                    assert_eq!(got["items"][0]["id"], item["id"]);
+
+                    let (err, made) = call(
+                        &s,
+                        &t,
+                        "save-snippet",
+                        json!({"kind": "caption", "name": "Hi", "body": "Hello"}),
+                    )
+                    .await;
+                    assert!(!err, "{made}");
+                    let id = made["id"].as_str().unwrap().to_owned();
+                    let args =
+                        json!({"id": id, "kind": "caption", "name": "Hi", "body": "Hello again"});
+                    let (err, saved) = call(&s, &t, "save-snippet", args).await;
+                    assert!(!err, "{saved}");
+                    assert_eq!(
+                        (saved["id"].as_str(), saved["body"].as_str()),
+                        (Some(id.as_str()), Some("Hello again"))
+                    );
+                    let (err, bad) = call(
+                        &s,
+                        &t,
+                        "save-snippet",
+                        json!({"kind": "caption", "name": "x"}),
+                    )
+                    .await;
+                    assert!(err);
+                    assert_eq!(bad, json!({"error": "invalid_snippet", "field": "body"}));
+                    let (_, listed) =
+                        call(&s, &t, "list-snippets", json!({"kind": "caption"})).await;
+                    let rest = bearer(&s, Method::GET, "/v1/snippets?kind=caption", &t).await;
+                    assert_eq!(listed, rest.json::<Value>());
+                    assert_eq!(listed["items"].as_array().unwrap().len(), 1);
+
+                    for (tool, args) in [
+                        ("add-media", json!({"url": "https://a.example/b.jpg"})),
+                        (
+                            "save-snippet",
+                            json!({"kind": "caption", "name": "x", "body": "y"}),
+                        ),
+                        ("delete-snippet", json!({"id": id})),
+                    ] {
+                        let (err, v) = call(&s, &ro, tool, args).await;
+                        assert!(err, "{tool}");
+                        assert_eq!(v, json!({"error": "read_only_token"}), "{tool}");
+                    }
+                    let (err, v) = call(&s, &ro, "list-media", json!({})).await;
+                    assert!(!err, "{v}");
+                    let (err, v) = call(&s, &t, "delete-snippet", json!({"id": id})).await;
+                    assert!(!err && v == json!({"ok": true}), "{v}");
+                    let (err, v) = call(&s, &t, "delete-snippet", json!({"id": id})).await;
+                    assert!(err);
+                    assert_eq!(v, json!({"error": "not_found"}));
+                }
+            }
+
             mod idempotency {
                 use super::*;
                 use axum::{

@@ -79,6 +79,10 @@ cargo run -p socialreins-brain
   `time_zone`, `slots` as sorted minutes of the week, weekday 0 Sunday). `queue: true` on a create
   takes `queue::pick` inside the insert's transaction, under a per-set advisory lock held until
   commit; a slot is free when no `scheduled` post of the set is at that exact time.
+- `app/src/controllers/library.rs`: the media library (`media_library`, URLs only, unique per team,
+  at most 1000) and snippets (`snippets`, `caption` or `hashtags`, name unique per team and kind
+  ignoring case, at most 500). Team assets: every member and token writes them, set tokens too,
+  read-only tokens never; creates take a per-team advisory lock so the caps hold.
 - `app/src/webhooks.rs`: outbound webhooks. Every `post_targets` status change goes through
   `webhooks::with_event`, so its event is queued in the same statement; README documents the
   payload and signature.
