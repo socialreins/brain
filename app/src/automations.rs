@@ -755,7 +755,8 @@ impl Flow<'_> {
 }
 
 /// Adds `tag` to the contact of the item's author, as a result: `done` when it was added,
-/// `skipped` when the contact has it already (`already_tagged`) or holds 20 (`tag_limit`).
+/// `skipped` when the contact has it already (`already_tagged`), holds 20 (`tag_limit`) or was
+/// deleted (`no_contact`).
 async fn tag_contact(
     db: &DatabaseConnection,
     item: &inbox_items::Model,

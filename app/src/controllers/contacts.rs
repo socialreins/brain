@@ -1,13 +1,15 @@
 //! Contacts of the current team: the people who wrote to its accounts, one per platform and
 //! author id, made and kept up by the inbox (`inbox::store`). Every member reads them and writes
-//! their notes and tags, as with inbox items; like the inbox, these routes take a session only.
+//! their notes and tags, as with inbox items; owners and admins delete one. Like the inbox,
+//! these routes take a session only.
 use axum::{
     extract::{rejection::QueryRejection, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
-use chrono::{DateTime, FixedOffset};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use chrono::{DateTime, FixedOffset, SecondsFormat};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, DbErr, EntityTrait, QueryFilter, QueryOrder,
     QueryResult, QuerySelect, Statement, TransactionTrait, Value,
@@ -67,8 +69,8 @@ pub struct ContactDetail {
 pub struct ContactPage {
     /// Newest `last_seen_at` first.
     pub items: Vec<Contact>,
-    /// Pass as `cursor` for the next page; `null` on the last.
-    pub next_cursor: Option<Uuid>,
+    /// Pass as `cursor` for the next page, as it is; `null` on the last.
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -81,7 +83,7 @@ pub struct ContactQuery {
     /// e.g. `bluesky`.
     pub platform: Option<String>,
     /// `next_cursor` of the previous page.
-    pub cursor: Option<Uuid>,
+    pub cursor: Option<String>,
     /// 1 to 100, default 50.
     pub limit: Option<u64>,
 }
@@ -165,13 +167,29 @@ async fn find(db: &impl ConnectionTrait, team: Uuid, id: Uuid) -> Result<Option<
     Ok(contacts_json(db, rows).await?.pop())
 }
 
+/// Where a page ended: a contact's `last_seen_at` as it was then, and its id. The cursor holds
+/// both, so a contact seen again between two pages moves no page boundary.
+type Seen = (DateTime<FixedOffset>, Uuid);
+
+fn cursor_of(c: &Contact) -> String {
+    let at = c.last_seen_at.to_rfc3339_opts(SecondsFormat::Micros, true);
+    URL_SAFE_NO_PAD.encode(format!("{at}|{}", c.id))
+}
+
+fn seen_of(cursor: &str) -> Option<Seen> {
+    let raw = String::from_utf8(URL_SAFE_NO_PAD.decode(cursor).ok()?).ok()?;
+    let (at, id) = raw.split_once('|')?;
+    Some((DateTime::parse_from_rfc3339(at).ok()?, id.parse().ok()?))
+}
+
 /// What narrows a page of contacts.
 #[derive(Default)]
 pub struct Narrow<'a> {
     pub q: Option<&'a str>,
     pub tag: Option<&'a str>,
     pub platform: Option<&'a str>,
-    pub cursor: Option<Uuid>,
+    /// The `last_seen_at` and id of the last contact of the page before.
+    pub cursor: Option<Seen>,
 }
 
 /// The SQL for one page of a team's contacts, newest `last_seen_at` first; fetches `limit + 1`
@@ -196,13 +214,10 @@ pub fn contacts_sql(team: Uuid, n: &Narrow<'_>, limit: u64) -> Statement {
         values.push(platform.to_owned().into());
         sql += &format!(" AND c.platform = ${}", values.len());
     }
-    if let Some(cursor) = n.cursor {
-        values.push(cursor.into());
-        sql += &format!(
-            " AND (c.last_seen_at, c.id) < (SELECT p.last_seen_at, p.id FROM contacts p \
-             WHERE p.id = ${} AND p.team_id = $1)",
-            values.len()
-        );
+    if let Some((seen, id)) = n.cursor {
+        values.extend([seen.into(), id.into()]);
+        let p = values.len();
+        sql += &format!(" AND (c.last_seen_at, c.id) < (${}, ${p})", p - 1);
     }
     values.push(((limit + 1) as i64).into());
     sql += &format!(
@@ -234,7 +249,9 @@ async fn list(
         .platform
         .as_deref()
         .is_none_or(|p| inbox::PLATFORMS.contains(&p));
-    if !search_ok || !tag_ok || !platform_ok || !(1..=MAX_PAGE).contains(&limit) {
+    let cursor = q.cursor.as_deref().map(seen_of);
+    let cursor_ok = cursor.is_none_or(|c| c.is_some());
+    if !search_ok || !tag_ok || !platform_ok || !cursor_ok || !(1..=MAX_PAGE).contains(&limit) {
         return bad();
     }
     let tag = tag.flatten();
@@ -242,7 +259,7 @@ async fn list(
         q: search,
         tag: tag.as_deref(),
         platform: q.platform.as_deref(),
-        cursor: q.cursor,
+        cursor: cursor.flatten(),
     };
     let found = async {
         let mut rows = app
@@ -252,7 +269,7 @@ async fn list(
         let more = rows.len() as u64 > limit;
         rows.truncate(limit as usize);
         let items = contacts_json(&app.db, rows).await?;
-        let next_cursor = more.then(|| items.last().map(|c| c.id)).flatten();
+        let next_cursor = more.then(|| items.last().map(cursor_of)).flatten();
         Ok::<_, DbErr>(ContactPage { items, next_cursor })
     };
     match found.await {
@@ -354,6 +371,29 @@ async fn change(
     }
 }
 
+/// Deletes a contact with its notes and tags. Owners and admins. Its inbox items stay, without
+/// a contact; a later item of the same person makes a new one.
+#[utoipa::path(delete, path = "/contacts/{id}", tag = "contacts", params(("id" = Uuid, Path)),
+    responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
+        (status = 404, body = Error)))]
+async fn destroy(
+    _: FromWeb,
+    State(app): State<AppState>,
+    t: InTeam,
+    Path(id): Path<Uuid>,
+) -> Response {
+    if !t.role.manages() {
+        return reply(StatusCode::FORBIDDEN, "forbidden");
+    }
+    let sql = "DELETE FROM contacts WHERE id = $1 AND team_id = $2";
+    let key: Vec<Value> = vec![id.into(), t.team.id.into()];
+    match app.db.execute_raw(stmt(sql.into(), key)).await {
+        Ok(r) if r.rows_affected() == 1 => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => not_found(),
+        Err(e) => internal(e, "contact delete"),
+    }
+}
+
 /// The tags the team's contacts have, the most used first, then by name.
 #[utoipa::path(get, path = "/contact-tags", tag = "contacts",
     responses((status = 200, body = [TagCount]), (status = 401, body = Error)))]
@@ -384,7 +424,7 @@ async fn tags(State(app): State<AppState>, t: InTeam) -> Response {
 pub fn api() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(list))
-        .routes(routes!(show, change))
+        .routes(routes!(show, change, destroy))
         .routes(routes!(tags))
 }
 
@@ -398,19 +438,22 @@ mod tests {
             q: Some("50%_off"),
             tag: Some("vip"),
             platform: Some("bluesky"),
-            cursor: Some(Uuid::nil()),
+            cursor: seen_of(
+                &URL_SAFE_NO_PAD.encode(format!("2026-01-02T03:04:05.000006Z|{}", Uuid::nil())),
+            ),
         };
+        assert!(n.cursor.is_some());
+        assert_eq!(seen_of("x"), None);
         let got = contacts_sql(Uuid::nil(), &n, 50);
         assert!(got.sql.ends_with(
             " WHERE c.team_id = $1 AND (c.handle ILIKE $2 OR c.display_name ILIKE $2) \
              AND EXISTS (SELECT 1 FROM contact_tags t WHERE t.contact_id = c.id AND t.tag = $3) \
-             AND c.platform = $4 AND (c.last_seen_at, c.id) < (SELECT p.last_seen_at, p.id \
-             FROM contacts p WHERE p.id = $5 AND p.team_id = $1) \
-             ORDER BY c.last_seen_at DESC, c.id DESC LIMIT $6"
+             AND c.platform = $4 AND (c.last_seen_at, c.id) < ($5, $6) \
+             ORDER BY c.last_seen_at DESC, c.id DESC LIMIT $7"
         ));
         let values = got.values.unwrap().0;
         assert_eq!(values[1], Value::from("%50\\%\\_off%".to_owned()));
-        assert_eq!(values[5], Value::from(51i64));
+        assert_eq!(values[6], Value::from(51i64));
     }
 
     #[test]

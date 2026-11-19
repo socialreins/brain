@@ -47,7 +47,8 @@ pub const BACKFILL_CONTACTS: &str = "INSERT INTO contacts (id, team_id, platform
 pub const BACKFILL_ITEMS: &str = "UPDATE inbox_items i SET contact_id = c.id FROM contacts c \
     WHERE i.contact_id IS NULL AND c.team_id = i.team_id AND c.platform = i.platform \
     AND c.external_id = i.author_id";
-// After the backfill, so it is built once.
+// The backfill holds `inbox_items` for as long as it runs: split it into batches if the table grows.
+// The index comes after it, so it is built once.
 const INDEX: &str = "CREATE INDEX inbox_items_contact_idx ON inbox_items (contact_id)";
 
 #[async_trait::async_trait]

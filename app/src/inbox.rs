@@ -115,16 +115,19 @@ impl Filters {
 /// Most tags one contact holds.
 pub const MAX_TAGS: usize = 20;
 
-/// A contact tag, trimmed and lowercased: 1 to 30 characters, no commas or control characters.
+/// A contact tag, trimmed and lowercased: 1 to 30 characters, no commas, control characters or
+/// characters that do not show (zero-width and text direction marks), so two tags that look the
+/// same are the same.
 pub fn tag(raw: &str) -> Option<String> {
     let t = raw.trim().to_lowercase();
-    let ok =
-        (1..=30).contains(&t.chars().count()) && !t.chars().any(|c| c == ',' || c.is_control());
+    let hidden = |c: char| matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{FEFF}');
+    let ok = (1..=30).contains(&t.chars().count())
+        && !t.chars().any(|c| c == ',' || c.is_control() || hidden(c));
     ok.then_some(t)
 }
 
 /// Adds `tag` (one `tag` gave) to a contact: `None` when it was added, else why not
-/// (`already_tagged`, `tag_limit`). The contact's row lock keeps adds at once under the cap.
+/// (`already_tagged`, `tag_limit`, or `no_contact` when the contact was deleted). The contact's row lock keeps adds at once under the cap.
 pub async fn add_tag(
     db: &DatabaseConnection,
     contact: Uuid,
@@ -135,7 +138,9 @@ pub async fn add_tag(
         "SELECT 1 FROM contacts WHERE id = $1 FOR UPDATE",
         vec![contact.into()],
     );
-    txn.execute_raw(lock).await?;
+    if txn.query_one_raw(lock).await?.is_none() {
+        return Ok(Some("no_contact"));
+    }
     let values: Vec<Value> = vec![contact.into(), tag.into(), (MAX_TAGS as i64).into()];
     let add = sql(
         "INSERT INTO contact_tags (contact_id, tag) SELECT c.id, $2 FROM contacts c \
@@ -816,6 +821,16 @@ mod tests {
     fn tags_are_trimmed_lowercased_and_checked() {
         assert_eq!(tag("  VIP Lead "), Some("vip lead".into()));
         assert_eq!(tag(&"a".repeat(30)), Some("a".repeat(30)));
+        let hidden = [
+            "vi\u{200B}p",
+            "\u{202E}vip",
+            "v\u{2060}ip",
+            "vip\u{FEFF}x",
+            "a\u{200F}b",
+        ];
+        for bad in hidden {
+            assert_eq!(tag(bad), None, "{bad:?}");
+        }
         for bad in ["", "  ", "a,b", "a\tb", &"a".repeat(31)] {
             assert_eq!(tag(bad), None, "{bad:?}");
         }

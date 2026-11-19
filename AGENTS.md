@@ -95,6 +95,8 @@ cargo run -p socialreins-brain
   upserts the author's contact in the same statement, so never insert into `inbox_items` any
   other way; the contact keeps the profile of its newest item. Tags are written under the
   contact's row lock (`inbox::add_tag`, `PATCH /v1/contacts/{id}`), checked by `inbox::tag`.
+  `DELETE /v1/contacts/{id}` (owner, admin) and a disconnect (contacts left with no items)
+  remove a person's data; items outlive a deleted contact with `contact_id` null.
   Session only, like the inbox. `inbox_items.assigned_to` is set under a share lock of the
   member's `team_user` row, and `teams::change_member` clears it after deleting that row.
 - `app/src/feeds.rs` and `controllers/feeds.rs`: RSS and Atom feeds that post on their own

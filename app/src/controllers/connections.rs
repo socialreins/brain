@@ -575,7 +575,8 @@ async fn update_plan(
     }
 }
 
-/// Disconnects an account and deletes its stored token. Owners and admins, with a sign-in from
+/// Disconnects an account and deletes its stored token, its inbox items and the contacts left
+/// with no inbox items. Owners and admins, with a sign-in from
 /// the last 10 minutes (else `403 reauth_required`).
 #[utoipa::path(delete, path = "/connections/{id}", tag = "connections",
     params(("id" = Uuid, Path)),
@@ -601,12 +602,28 @@ async fn disconnect(
         Ok(found) => found,
         Err(e) => return internal(e, "connection read"),
     };
-    let deleted = social_accounts::Entity::delete_many()
-        .filter(social_accounts::Column::Id.eq(id))
-        .filter(social_accounts::Column::TeamId.eq(t.team.id))
-        .exec(&app.db)
-        .await;
-    match deleted {
+    // Its inbox items go with it, and so do the contacts that then have none left.
+    let deleted = async {
+        let txn = app.db.begin().await?;
+        let done = social_accounts::Entity::delete_many()
+            .filter(social_accounts::Column::Id.eq(id))
+            .filter(social_accounts::Column::TeamId.eq(t.team.id))
+            .exec(&txn)
+            .await?;
+        if done.rows_affected == 1 {
+            let orphans = "DELETE FROM contacts c WHERE c.team_id = $1 AND NOT EXISTS \
+                           (SELECT 1 FROM inbox_items i WHERE i.contact_id = c.id)";
+            txn.execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Postgres,
+                orphans,
+                [t.team.id.into()],
+            ))
+            .await?;
+        }
+        txn.commit().await?;
+        Ok::<_, DbErr>(done)
+    };
+    match deleted.await {
         Ok(r) if r.rows_affected == 1 => {
             if let Some(gone) = gone {
                 super::meta::unsubscribe(&app, &gone).await;

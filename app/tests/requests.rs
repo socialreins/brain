@@ -18573,6 +18573,7 @@ mod teams {
                     ("/contacts", "get"),
                     ("/contacts/{id}", "get"),
                     ("/contacts/{id}", "patch"),
+                    ("/contacts/{id}", "delete"),
                     ("/contact-tags", "get"),
                     ("/automations", "get"),
                     ("/automations", "post"),
@@ -18687,6 +18688,8 @@ mod teams {
                     (json!({"notes": "n".repeat(2001)}), "notes"),
                     (json!({"tags": ["a,b"]}), "tags"),
                     (json!({"tags": ["a\tb"]}), "tags"),
+                    (json!({"tags": ["vi\u{200B}p"]}), "tags"),
+                    (json!({"tags": ["\u{202E}vip"]}), "tags"),
                     (json!({"tags": [" "]}), "tags"),
                     (json!({"tags": ["t".repeat(31)]}), "tags"),
                     (json!({"tags": many}), "tags"),
@@ -18763,7 +18766,7 @@ mod teams {
                 let p1 = fetch(&s, &cookie, "/v1/contacts?limit=2").await;
                 assert_eq!(count(&p1), 2);
                 let cursor = p1["next_cursor"].as_str().unwrap();
-                assert_eq!(cursor, fan2);
+                assert_ne!(cursor, fan2, "opaque");
                 let p2 = fetch(
                     &s,
                     &cookie,
@@ -18833,6 +18836,132 @@ mod teams {
                     .json(&json!({"tags": []}))
                     .await;
                 assert_eq!(res.status_code(), 403, "a write needs the web origin");
+            }
+
+            /// A person's data goes with their contact (owners and admins), and with the last
+            /// account they wrote to. Pages hold while contacts move between them.
+            #[tokio::test]
+            #[serial]
+            async fn contacts_are_deleted_and_pages_hold_when_one_moves() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
+                set_inbox(&me, three_people(&me));
+                ingest(&db, &state, &account).await;
+                let ids = |v: &Value| -> Vec<String> {
+                    let list = v["items"].as_array().unwrap().iter();
+                    list.map(|c| c["external_id"].as_str().unwrap().to_owned())
+                        .collect()
+                };
+
+                // fan2, the last of page one, writes again before page two is read: page two
+                // still starts after where page one ended, and repeats nobody.
+                let p1 = fetch(&s, &cookie, "/v1/contacts?limit=2").await;
+                assert_eq!(ids(&p1), ["did:plc:dmer", "did:plc:fan2"]);
+                let cursor = p1["next_cursor"].as_str().unwrap().to_owned();
+                let again = note("reply", "did:plc:fan2", "c3", "and again", &at(-2), &me);
+                set_inbox(&me, json!({"notifications": [again]}));
+                ingest(&db, &state, &account).await;
+                let p2 = fetch(
+                    &s,
+                    &cookie,
+                    &format!("/v1/contacts?limit=2&cursor={cursor}"),
+                )
+                .await;
+                assert_eq!(ids(&p2), ["did:plc:fan1"]);
+                assert!(p2["next_cursor"].is_null());
+                let all = fetch(&s, &cookie, "/v1/contacts").await;
+                assert_eq!(ids(&all)[0], "did:plc:fan2", "first on a fresh read");
+
+                // Only owners and admins delete; another team finds nothing.
+                let fan1 = by(&all, "did:plc:fan1")["id"].as_str().unwrap().to_owned();
+                let path = format!("/v1/contacts/{fan1}");
+                let res = req(&s, Method::PATCH, &path, &cookie)
+                    .json(&json!({"notes": "private", "tags": ["vip"]}))
+                    .await;
+                assert_eq!(res.status_code(), 200);
+                let (member, _) = joined(&s, &db, &team_id, "member").await;
+                let res = req(&s, Method::DELETE, &path, &member).await;
+                assert_eq!(res.status_code(), 403);
+                let (_, stranger, _) = user(&s, &db).await;
+                let res = req(&s, Method::DELETE, &path, &stranger).await;
+                assert_eq!(res.status_code(), 404);
+                let res = s
+                    .method(Method::DELETE, &path)
+                    .add_header("cookie", &cookie)
+                    .await;
+                assert_eq!(res.status_code(), 403, "a write needs the web origin");
+                let (admin, _) = joined(&s, &db, &team_id, "admin").await;
+                let res = req(&s, Method::DELETE, &path, &admin).await;
+                assert_eq!(res.status_code(), 204, "{}", res.text());
+                let res = req(&s, Method::DELETE, &path, &cookie).await;
+                assert_eq!(res.status_code(), 404);
+                let res = s.get(&path).add_header("cookie", &cookie).await;
+                assert_eq!(res.status_code(), 404);
+                assert_eq!(fetch(&s, &cookie, "/v1/contact-tags").await, json!([]));
+                // Their items stay, without a contact; tagging one does nothing.
+                let inbox = all_inbox(&s, &cookie).await;
+                let listed = items(&s, &cookie, inbox["id"].as_str().unwrap(), "").await;
+                let theirs: Vec<&Value> = listed["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|i| i["author"]["id"] == "did:plc:fan1")
+                    .collect();
+                assert_eq!(theirs.len(), 2);
+                for i in &theirs {
+                    assert!(i["contact_id"].is_null(), "{i}");
+                    assert_eq!(i["contact_tags"], json!([]));
+                }
+                let gone = inbox::add_tag(&db, fan1.parse().unwrap(), "vip").await;
+                assert_eq!(gone.unwrap(), Some("no_contact"));
+                // A later item of theirs makes a new contact, with nothing of the old one.
+                let back = note("reply", "did:plc:fan1", "c9", "hello again", &at(-3), &me);
+                set_inbox(&me, json!({"notifications": [back]}));
+                ingest(&db, &state, &account).await;
+                let all = fetch(&s, &cookie, "/v1/contacts").await;
+                let fresh = by(&all, "did:plc:fan1");
+                assert_ne!(fresh["id"], fan1.as_str());
+                assert_eq!(fresh["items_count"], 1);
+                assert_eq!(fresh["tags"], json!([]));
+                assert!(fresh["notes"].is_null());
+                assert_eq!(fresh["first_seen_at"], fresh["last_seen_at"]);
+
+                // fan2 also wrote to a second account. Disconnecting the first takes its items
+                // and the contacts left with none; fan2 stays, with the one item left.
+                let res = connect(&s, &cookie, &new_handle(), DM_APP_PASSWORD).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let second = res.json::<Value>();
+                let (other, me2) = (
+                    second["id"].as_str().unwrap(),
+                    second["external_id"].as_str().unwrap(),
+                );
+                let there = note("reply", "did:plc:fan2", "d1", "over here", &at(-4), me2);
+                set_inbox(me2, json!({"notifications": [there]}));
+                ingest(&db, &state, other).await;
+                assert_eq!(
+                    by(&fetch(&s, &cookie, "/v1/contacts").await, "did:plc:fan2")["items_count"],
+                    3
+                );
+                let res = req(
+                    &s,
+                    Method::DELETE,
+                    &format!("/v1/connections/{account}"),
+                    &cookie,
+                )
+                .await;
+                assert_eq!(res.status_code(), 204, "{}", res.text());
+                let left = fetch(&s, &cookie, "/v1/contacts").await;
+                assert_eq!(ids(&left), ["did:plc:fan2"]);
+                assert_eq!(left["items"][0]["items_count"], 1);
+                let res = req(
+                    &s,
+                    Method::DELETE,
+                    &format!("/v1/connections/{other}"),
+                    &cookie,
+                )
+                .await;
+                assert_eq!(res.status_code(), 204);
+                assert_eq!(fetch(&s, &cookie, "/v1/contacts").await["items"], json!([]));
             }
 
             /// The migration's backfill, run on items stored before there were contacts.
