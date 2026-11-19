@@ -3,7 +3,8 @@
 //! `comments`) and direct messages (`messaging`) of every connected account, across all teams,
 //! into `inbox_items` with the same unique key as Bluesky, so a repeated delivery adds nothing.
 //! `follow_up` then fills in what the webhook leaves out (a sender's name, an Instagram link)
-//! and runs automations on new comments. Replies and DMs go out through `send`, once, never
+//! and runs automations on new items. An Instagram reply to a story (`message.reply_to.story`)
+//! is a `dm` with `story_reply` set: it runs `story_reply` automations, not `dm_received` ones. Replies and DMs go out through `send`, once, never
 //! retried.
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 use sea_orm::ColumnTrait;
@@ -58,6 +59,7 @@ fn facebook_comment(v: &Value, entry_time: Option<i64>) -> Option<Fresh> {
         parent: Some(parent),
         root: (Some(post.clone()), None),
         convo_id: None,
+        story: None,
         author: Author {
             did: sid(&from["id"])?,
             display_name: sid(&from["name"]),
@@ -81,6 +83,7 @@ fn instagram_comment(v: &Value, entry_time: Option<i64>) -> Option<Fresh> {
         parent: Some(parent),
         root: (Some(media), None),
         convo_id: None,
+        story: None,
         author: Author {
             did: sid(&from["id"])?,
             handle: sid(&from["username"]),
@@ -108,7 +111,12 @@ fn message(m: &Value, entry_time: Option<i64>) -> Option<Fresh> {
             let files = msg["attachments"].as_array()?;
             (!files.is_empty()).then(|| "[attachment]".to_owned())
         })?;
+    let story = &msg["reply_to"]["story"];
+    let story = story
+        .is_object()
+        .then(|| (sid(&story["id"]), sid(&story["url"])));
     Some(Fresh {
+        story,
         kind: "dm",
         remote_id: mid,
         remote_cid: None,
@@ -223,7 +231,7 @@ fn sql(sql: &str, values: Vec<sea_orm::Value>) -> Statement {
     Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
 }
 
-/// After the webhook answered: fills in each new item, then runs automations on new comments.
+/// After the webhook answered: fills in each new item, then runs automations on it.
 /// Failures are logged; nothing here sends twice.
 pub async fn follow_up(app: &AppState, fresh: Vec<(social_accounts::Model, inbox_items::Model)>) {
     for (account, item) in fresh {
@@ -245,7 +253,7 @@ async fn enrich_and_run(
                 let stmt = sql(
                     "UPDATE inbox_items SET author_name = COALESCE($2, author_name), \
                      author_handle = COALESCE($3, author_handle), \
-                     author_avatar = COALESCE($4, author_avatar) WHERE id = $1",
+                     author_avatar = COALESCE($4, author_avatar) WHERE id = $1 RETURNING *",
                     vec![
                         item.id.into(),
                         p.name.into(),
@@ -253,7 +261,11 @@ async fn enrich_and_run(
                         p.avatar.into(),
                     ],
                 );
-                app.db.execute_raw(stmt).await?;
+                // The name is what a welcome DM's `{name}` stands for.
+                let named = inbox_items::Entity::find().from_raw_sql(stmt);
+                if let Some(row) = named.one(&app.db).await? {
+                    item = row;
+                }
             }
         } else if let (true, None, Some(media)) = (instagram, &item.permalink, &item.root_remote_id)
         {
@@ -289,9 +301,7 @@ async fn enrich_and_run(
             }
         }
     }
-    if item.kind == "comment" {
-        automations::run(app, account, &item).await?;
-    }
+    automations::run(app, account, &item).await?;
     Ok(())
 }
 
@@ -425,6 +435,28 @@ mod tests {
         assert_eq!(got[1].convo_id.as_deref(), Some("777"));
         assert_eq!(got[1].at.timestamp(), 1_700_000_200);
         assert_eq!(got[2].text, "[attachment]");
+        assert!(got.iter().all(|f| f.story.is_none()));
+    }
+
+    #[test]
+    fn story_replies_are_marked_dms() {
+        let entry = json!({"id": "1784", "time": 1_700_000_000, "messaging": [
+            {"sender": {"id": "555"}, "recipient": {"id": "1784"}, "timestamp": 1_700_000_000_000i64,
+             "message": {"mid": "s1", "text": "love this",
+                "reply_to": {"story": {"id": "st9", "url": "https://cdn.example/st9.jpg"}}}},
+            {"sender": {"id": "555"}, "recipient": {"id": "1784"},
+             "message": {"mid": "s2", "text": "plain", "reply_to": {"mid": "s1"}}}]});
+        let got = events("instagram", &entry);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].kind, "dm");
+        assert_eq!(
+            got[0].story,
+            Some((
+                Some("st9".into()),
+                Some("https://cdn.example/st9.jpg".into())
+            ))
+        );
+        assert_eq!(got[1].story, None);
     }
 
     #[test]

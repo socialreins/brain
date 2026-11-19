@@ -907,7 +907,8 @@ fn author(v: &Value) -> Option<Author> {
     })
 }
 
-/// A reply to the account (`comment`) or a mention or quote of it (`mention`).
+/// A reply to the account (`comment`), a mention or quote of it (`mention`), or a new follower
+/// (`follow`: the follow record, no text).
 #[derive(Debug, PartialEq, Eq)]
 pub struct Notification {
     pub kind: &'static str,
@@ -930,6 +931,7 @@ pub fn notification(n: &Value) -> Option<Notification> {
     let kind = match n["reason"].as_str()? {
         "reply" => "comment",
         "mention" | "quote" => "mention",
+        "follow" => "follow",
         _ => return None,
     };
     let uri = n["uri"].as_str()?.to_owned();
@@ -1068,7 +1070,7 @@ impl Bluesky {
         Err(InboxError::Reconnect)
     }
 
-    /// Replies and mentions newer than `since`, newest first, at most `MAX_NOTIFICATIONS`.
+    /// Replies, mentions and follows newer than `since`, newest first, at most `MAX_NOTIFICATIONS`.
     /// Never marks them read.
     pub async fn notifications(
         &self,
@@ -1089,6 +1091,7 @@ impl Bluesky {
                 ("reasons", "reply"),
                 ("reasons", "mention"),
                 ("reasons", "quote"),
+                ("reasons", "follow"),
             ];
             if let Some(c) = &cursor {
                 query.push(("cursor", c));
@@ -1644,6 +1647,15 @@ mod tests {
                 Some("c1".into())
             )
         );
+        let follow = serde_json::json!({
+            "uri": "at://did:plc:fan/app.bsky.graph.follow/f1", "cid": "cf", "reason": "follow",
+            "author": {"did": "did:plc:fan", "handle": "fan.test"},
+            "record": {"$type": "app.bsky.graph.follow", "subject": "did:plc:me"},
+            "indexedAt": "2026-10-30T10:00:00.000Z",
+        });
+        let got = notification(&follow).unwrap();
+        assert_eq!((got.kind, got.text.as_str()), ("follow", ""));
+        assert_eq!(got.author.did, "did:plc:fan");
         let mut like = n;
         like["reason"] = "like".into();
         assert_eq!(notification(&like), None);

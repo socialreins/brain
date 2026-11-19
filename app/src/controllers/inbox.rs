@@ -46,6 +46,9 @@ pub struct Inbox {
     pub filters: Filters,
     pub created_at: DateTime<FixedOffset>,
     pub updated_at: DateTime<FixedOffset>,
+    /// Its `open` items (follows left out); only in the list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_count: Option<i64>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -88,7 +91,8 @@ pub struct Item {
     pub id: Uuid,
     pub social_account_id: Uuid,
     pub platform: String,
-    /// `comment` (a reply to the account), `mention` (a mention or quote) or `dm`.
+    /// `comment` (a reply to the account), `mention` (a mention or quote), `dm` or `follow` (a
+    /// new Bluesky follower, stored `done`; listed only with `kind=follow`).
     pub kind: String,
     pub remote_id: String,
     /// The public link, for comments and mentions.
@@ -110,6 +114,11 @@ pub struct Item {
     pub replied_at: Option<DateTime<FixedOffset>>,
     /// Replies sent from SocialReins, oldest first.
     pub replies: Vec<Reply>,
+    /// A DM replying to one of the account's stories (Instagram).
+    pub story_reply: bool,
+    pub story_id: Option<String>,
+    /// The story's media link, as Meta gave it (it expires).
+    pub story_url: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -124,8 +133,12 @@ pub struct ItemPage {
 pub struct ItemQuery {
     /// `open` or `done`; both when absent.
     pub state: Option<String>,
-    /// `comment`, `mention` or `dm`, within the inbox's own filters; every kind when absent.
+    /// `comment`, `mention`, `dm` or `follow`, within the inbox's own filters; every kind but
+    /// `follow` when absent.
     pub kind: Option<String>,
+    /// Case-insensitive search in the text and the author's name and handle, 1 to 100
+    /// characters after trimming.
+    pub q: Option<String>,
     /// `next_cursor` of the previous page.
     pub cursor: Option<Uuid>,
     /// 1 to 100, default 50.
@@ -167,6 +180,7 @@ fn inbox_json(i: inboxes::Model) -> Inbox {
         filters: serde_json::from_value(i.filters).unwrap_or_default(),
         created_at: i.created_at,
         updated_at: i.updated_at,
+        open_count: None,
     }
 }
 
@@ -221,6 +235,9 @@ async fn items_json(
             received_at: i.received_at,
             state: i.state,
             replied_at: i.replied_at,
+            story_reply: i.story_reply,
+            story_id: i.story_id,
+            story_url: i.story_url,
         })
         .collect())
 }
@@ -275,7 +292,33 @@ async fn checked(
     Ok(Ok((name, filters)))
 }
 
-/// The team's inboxes, "All" first, then oldest first. Makes "All" when it is missing.
+/// Each inbox's `open_count`, in one query that reads the team's open items once.
+pub fn open_counts_sql(team_id: Uuid, inboxes: &[(Uuid, Filters)]) -> Statement {
+    let mut values: Vec<Value> = vec![team_id.into()];
+    let counts: Vec<String> = inboxes
+        .iter()
+        .enumerate()
+        .map(|(n, (_, f))| {
+            format!(
+                "COUNT(*) FILTER (WHERE TRUE{}) AS c{n}",
+                filter_sql(f, &mut values)
+            )
+        })
+        .collect();
+    let sql = format!(
+        "SELECT {} FROM inbox_items i WHERE i.team_id = $1 AND i.state = 'open' \
+         AND i.kind <> 'follow'",
+        if counts.is_empty() {
+            "1".into()
+        } else {
+            counts.join(", ")
+        }
+    );
+    Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
+}
+
+/// The team's inboxes, "All" first, then oldest first, each with its `open_count`. Makes "All"
+/// when it is missing.
 #[utoipa::path(get, path = "/inboxes", tag = "inbox",
     responses((status = 200, body = [Inbox]), (status = 401, body = Error)))]
 async fn list(State(app): State<AppState>, t: InTeam) -> Response {
@@ -287,16 +330,36 @@ async fn list(State(app): State<AppState>, t: InTeam) -> Response {
             [Uuid::now_v7().into(), t.team.id.into()],
         );
         app.db.execute_raw(stmt).await?;
-        inboxes::Entity::find()
+        let rows = inboxes::Entity::find()
             .filter(inboxes::Column::TeamId.eq(t.team.id))
             .order_by_desc(inboxes::Column::IsAll)
             .order_by_asc(inboxes::Column::CreatedAt)
             .order_by_asc(inboxes::Column::Id)
             .all(&app.db)
-            .await
+            .await?;
+        let list: Vec<Inbox> = rows.into_iter().map(inbox_json).collect();
+        let filtered: Vec<(Uuid, Filters)> =
+            list.iter().map(|i| (i.id, i.filters.clone())).collect();
+        let counts = app
+            .db
+            .query_one_raw(open_counts_sql(t.team.id, &filtered))
+            .await?;
+        list.into_iter()
+            .enumerate()
+            .map(|(n, i)| {
+                let open = match &counts {
+                    Some(r) => r.try_get("", &format!("c{n}"))?,
+                    None => 0,
+                };
+                Ok(Inbox {
+                    open_count: Some(open),
+                    ..i
+                })
+            })
+            .collect::<Result<Vec<_>, DbErr>>()
     };
     match found.await {
-        Ok(rows) => Json(rows.into_iter().map(inbox_json).collect::<Vec<_>>()).into_response(),
+        Ok(list) => Json(list).into_response(),
         Err(e) => internal(e, "inbox list"),
     }
 }
@@ -426,16 +489,25 @@ async fn destroy(
     }
 }
 
+/// What narrows one page of items beyond the inbox's filters.
+#[derive(Default)]
+pub struct Narrow<'a> {
+    pub state: Option<&'a str>,
+    pub kind: Option<&'a str>,
+    /// Searched in the text and the author's name and handle.
+    pub q: Option<&'a str>,
+    pub cursor: Option<Uuid>,
+}
+
 /// The SQL for one page of an inbox's items, newest first; fetches `limit + 1` rows to tell
-/// whether another page follows.
-pub fn items_sql(
-    team_id: Uuid,
-    filters: &Filters,
-    state: Option<&str>,
-    kind: Option<&str>,
-    cursor: Option<Uuid>,
-    limit: u64,
-) -> Statement {
+/// whether another page follows. Follows only when `kind` asks for them.
+pub fn items_sql(team_id: Uuid, filters: &Filters, n: &Narrow<'_>, limit: u64) -> Statement {
+    let Narrow {
+        state,
+        kind,
+        q,
+        cursor,
+    } = *n;
     let mut values: Vec<Value> = vec![team_id.into()];
     let mut sql = String::from("SELECT i.* FROM inbox_items i WHERE i.team_id = $1");
     sql += &filter_sql(filters, &mut values);
@@ -446,6 +518,15 @@ pub fn items_sql(
     if let Some(kind) = kind {
         values.push(kind.to_owned().into());
         sql += &format!(" AND i.kind = ${}", values.len());
+    } else {
+        sql += " AND i.kind <> 'follow'";
+    }
+    if let Some(q) = q {
+        values.push(format!("%{}%", inbox::escape_like(q)).into());
+        let p = values.len();
+        sql += &format!(
+            " AND (i.text ILIKE ${p} OR i.author_name ILIKE ${p} OR i.author_handle ILIKE ${p})"
+        );
     }
     if let Some(c) = cursor {
         values.push(c.into());
@@ -485,8 +566,10 @@ async fn items(
     let kind_ok = q
         .kind
         .as_deref()
-        .is_none_or(|k| matches!(k, "comment" | "mention" | "dm"));
-    if !state_ok || !kind_ok || !(1..=MAX_PAGE).contains(&limit) {
+        .is_none_or(|k| matches!(k, "comment" | "mention" | "dm" | "follow"));
+    let search = q.q.as_deref().map(str::trim);
+    let search_ok = search.is_none_or(|s| (1..=100).contains(&s.chars().count()));
+    if !state_ok || !kind_ok || !search_ok || !(1..=MAX_PAGE).contains(&limit) {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     }
     let found = async {
@@ -494,14 +577,13 @@ async fn items(
             return Ok(None);
         };
         let filters: Filters = serde_json::from_value(found.filters).unwrap_or_default();
-        let stmt = items_sql(
-            t.team.id,
-            &filters,
-            q.state.as_deref(),
-            q.kind.as_deref(),
-            q.cursor,
-            limit,
-        );
+        let narrow = Narrow {
+            state: q.state.as_deref(),
+            kind: q.kind.as_deref(),
+            q: search,
+            cursor: q.cursor,
+        };
+        let stmt = items_sql(t.team.id, &filters, &narrow, limit);
         let mut rows = inbox_items::Entity::find()
             .from_raw_sql(stmt)
             .all(&app.db)
@@ -688,7 +770,13 @@ mod tests {
             kinds: vec!["dm".into()],
             ..Filters::default()
         };
-        let stmt = items_sql(team, &f, Some("open"), Some("dm"), Some(Uuid::nil()), 50);
+        let n = Narrow {
+            state: Some("open"),
+            kind: Some("dm"),
+            q: None,
+            cursor: Some(Uuid::nil()),
+        };
+        let stmt = items_sql(team, &f, &n, 50);
         assert_eq!(
             stmt.sql,
             "SELECT i.* FROM inbox_items i WHERE i.team_id = $1 AND i.kind IN ($2) \
@@ -699,5 +787,39 @@ mod tests {
         let values = stmt.values.unwrap().0;
         assert_eq!(values.len(), 6);
         assert_eq!(values[5], Value::from(51i64));
+        // No kind: follows are left out. A search is one bound, escaped pattern.
+        let n = Narrow {
+            q: Some("50%_off"),
+            ..Narrow::default()
+        };
+        let stmt = items_sql(team, &Filters::default(), &n, 10);
+        assert_eq!(
+            stmt.sql,
+            "SELECT i.* FROM inbox_items i WHERE i.team_id = $1 AND i.kind <> 'follow' \
+             AND (i.text ILIKE $2 OR i.author_name ILIKE $2 OR i.author_handle ILIKE $2) \
+             ORDER BY i.received_at DESC, i.id DESC LIMIT $3"
+        );
+        assert_eq!(
+            stmt.values.unwrap().0[1],
+            Value::from("%50\\%\\_off%".to_owned())
+        );
+    }
+
+    #[test]
+    fn open_counts_are_one_query() {
+        let f = Filters {
+            kinds: vec!["dm".into()],
+            ..Filters::default()
+        };
+        let stmt = open_counts_sql(
+            Uuid::nil(),
+            &[(Uuid::nil(), Filters::default()), (Uuid::nil(), f)],
+        );
+        assert_eq!(
+            stmt.sql,
+            "SELECT COUNT(*) FILTER (WHERE TRUE) AS c0, \
+             COUNT(*) FILTER (WHERE TRUE AND i.kind IN ($2)) AS c1 \
+             FROM inbox_items i WHERE i.team_id = $1 AND i.state = 'open' AND i.kind <> 'follow'"
+        );
     }
 }

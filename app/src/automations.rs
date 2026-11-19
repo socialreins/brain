@@ -1,5 +1,8 @@
-//! Automations: a trigger, conditions and actions, stored as typed JSON. v1 has one trigger,
-//! `comment_received`, run by the inbox tick on each new comment. A run row unique per
+//! Automations: a trigger, conditions and actions, stored as typed JSON. Each new inbox item runs
+//! the automations of the trigger its kind stands for (`trigger_of`): `comment_received`,
+//! `mention_received`, `dm_received`, `story_reply` (an Instagram DM replying to a story, which
+//! never runs `dm_received` ones) and `new_follower` (a Bluesky follow, once per follower per
+//! account ever). A run row unique per
 //! (automation, item) is inserted before anything is sent, together with a hit of the team's
 //! daily cap, and a run is never retried, the same rules as publishing.
 use sea_orm::{
@@ -21,7 +24,13 @@ use crate::{
     state::AppState,
 };
 
-pub const TRIGGERS: [&str; 1] = ["comment_received"];
+pub const TRIGGERS: [&str; 5] = [
+    "comment_received",
+    "dm_received",
+    "mention_received",
+    "new_follower",
+    "story_reply",
+];
 /// Automation runs that act, per team per day (`rate_limit::reserve_in`).
 pub const RUNS_PER_DAY: i64 = 500;
 /// A run `running` this long was cut off (crash, restart); it fails and is not retried.
@@ -37,8 +46,10 @@ pub fn quota_bucket(team_id: Uuid) -> String {
     format!("automation:team:{team_id}")
 }
 
-/// When an automation acts on a comment. Empty lists mean "any". At most one of
-/// `social_set_id` and `account_ids`.
+/// When an automation acts on an item. Empty lists mean "any". At most one of
+/// `social_set_id` and `account_ids`. Every trigger takes the scope (`social_set_id` or
+/// `account_ids`); `keywords` all but `new_follower`; `post_remote_ids` and `first_per_author`
+/// only `comment_received`; `first_message` only `dm_received`.
 #[derive(Serialize, Deserialize, ToSchema, Default, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Conditions {
@@ -58,6 +69,9 @@ pub struct Conditions {
     /// Only an author's first matching comment runs this automation.
     #[serde(default)]
     pub first_per_author: bool,
+    /// Only a DM that is the first one ever stored from its author on the account (a welcome).
+    #[serde(default)]
+    pub first_message: bool,
 }
 
 /// What an automation does. Texts may hold `{name}`, the commenter's display name ("there"
@@ -68,10 +82,11 @@ pub struct Conditions {
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
-    /// A DM to the comment's author, at most 1000 graphemes. On Facebook and Instagram it is the
-    /// private reply to the comment, once per comment and within 7 days.
+    /// A DM to the item's author, at most 1000 graphemes: in the same conversation for a DM, a
+    /// new one for a follower. On Facebook and Instagram, for a comment, it is the private reply
+    /// to the comment, once per comment and within 7 days.
     SendDm { text: String },
-    /// A reply under the comment, at most 300 graphemes.
+    /// A reply under the comment or mention, at most 300 graphemes.
     ReplyPublicly { text: String },
 }
 
@@ -91,6 +106,18 @@ impl Action {
     }
 }
 
+/// The trigger a new item runs: by its kind, and a story reply apart from other DMs.
+pub fn trigger_of(item: &inbox_items::Model) -> Option<&'static str> {
+    match item.kind.as_str() {
+        "comment" => Some("comment_received"),
+        "mention" => Some("mention_received"),
+        "dm" if item.story_reply => Some("story_reply"),
+        "dm" => Some("dm_received"),
+        "follow" => Some("new_follower"),
+        _ => None,
+    }
+}
+
 /// Checks an automation's shape; the error code otherwise. Account and set ids are checked
 /// against the team by the caller.
 pub fn validate(
@@ -103,6 +130,29 @@ pub fn validate(
         return Err("invalid_trigger");
     }
     let c = conditions;
+    let comment = trigger == "comment_received";
+    let fits_trigger = (comment || (c.post_remote_ids.is_empty() && !c.first_per_author))
+        && (trigger == "dm_received" || !c.first_message)
+        && (trigger != "new_follower" || c.keywords.is_empty());
+    if !fits_trigger {
+        return Err("invalid_conditions");
+    }
+    // A public reply needs a thread to go under.
+    let public = matches!(trigger, "comment_received" | "mention_received");
+    if !public
+        && actions
+            .iter()
+            .any(|a| matches!(a, Action::ReplyPublicly { .. }))
+    {
+        return Err("invalid_actions");
+    }
+    if !public && fallback.is_some() {
+        return Err("invalid_fallback");
+    }
+    // `{page}` is the page of the post a comment or mention hangs off; DMs and follows have none.
+    if !public && actions.iter().any(|a| a.via_text().1.contains("{page}")) {
+        return Err("invalid_text");
+    }
     let ids_ok = c.post_remote_ids.len() <= 100
         && c.post_remote_ids
             .iter()
@@ -164,7 +214,7 @@ fn page_stands_alone(text: &str) -> bool {
     true
 }
 
-/// What conditions look at in a comment.
+/// What conditions look at in an item.
 pub struct Facts<'a> {
     pub account_id: Uuid,
     /// Live sets holding the account.
@@ -174,6 +224,8 @@ pub struct Facts<'a> {
     pub text: &'a str,
     /// No earlier run of this automation for the same author.
     pub first_from_author: bool,
+    /// No earlier DM item from the same author on the account.
+    pub first_message: bool,
 }
 
 pub fn matches(c: &Conditions, f: &Facts<'_>) -> bool {
@@ -186,7 +238,12 @@ pub fn matches(c: &Conditions, f: &Facts<'_>) -> bool {
     let text = f.text.to_lowercase();
     let keyword_ok =
         c.keywords.is_empty() || c.keywords.iter().any(|k| text.contains(&k.to_lowercase()));
-    set_ok && account_ok && post_ok && keyword_ok && (!c.first_per_author || f.first_from_author)
+    set_ok
+        && account_ok
+        && post_ok
+        && keyword_ok
+        && (!c.first_per_author || f.first_from_author)
+        && (!c.first_message || f.first_message)
 }
 
 /// The commenter's display name when it is plainly a name: letters, digits, spaces, `'`, `-`
@@ -247,18 +304,21 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
     db.execute_raw(stmt).await.map(|_| ())
 }
 
-/// Runs every active `comment_received` automation of the item's team that was on when the
-/// comment came.
+/// Runs every active automation of the item's team for the item's trigger (`trigger_of`) that
+/// was on when the item came.
 pub async fn run(
     app: &AppState,
     account: &social_accounts::Model,
     item: &inbox_items::Model,
 ) -> Result<(), DbErr> {
     let db = &app.db;
+    let Some(trigger) = trigger_of(item) else {
+        return Ok(());
+    };
     let autos = automations::Entity::find()
         .filter(automations::Column::TeamId.eq(item.team_id))
         .filter(automations::Column::Active.eq(true))
-        .filter(automations::Column::Trigger.eq("comment_received"))
+        .filter(automations::Column::Trigger.eq(trigger))
         .filter(automations::Column::ActivatedAt.lte(item.received_at))
         .order_by_asc(automations::Column::CreatedAt)
         .all(db)
@@ -277,6 +337,26 @@ pub async fn run(
         .await?;
     if own.is_some() {
         return Ok(());
+    }
+    // A follower is welcomed once per account ever: an unfollow and a new follow stores a new
+    // item (a new record) but runs nothing.
+    if item.kind == "follow" {
+        let stmt = sql(
+            "SELECT EXISTS (SELECT 1 FROM inbox_items WHERE social_account_id = $1 \
+             AND kind = 'follow' AND author_id = $2 AND id < $3) AS ok",
+            vec![
+                account.id.into(),
+                item.author_id.clone().into(),
+                item.id.into(),
+            ],
+        );
+        let again: bool = match db.query_one_raw(stmt).await? {
+            Some(r) => r.try_get("", "ok")?,
+            None => false,
+        };
+        if again {
+            return Ok(());
+        }
     }
     let in_live = Query::select()
         .column(membership::Column::SocialSetId)
@@ -312,6 +392,24 @@ pub async fn run(
         } else {
             true
         };
+        // Ids are v7 UUIDs and ingest stores oldest first, so a smaller id came earlier.
+        let first_message = if cond.first_message {
+            let stmt = sql(
+                "SELECT NOT EXISTS (SELECT 1 FROM inbox_items WHERE social_account_id = $1 \
+                 AND kind = 'dm' AND author_id = $2 AND id < $3) AS ok",
+                vec![
+                    account.id.into(),
+                    item.author_id.clone().into(),
+                    item.id.into(),
+                ],
+            );
+            match db.query_one_raw(stmt).await? {
+                Some(r) => r.try_get("", "ok")?,
+                None => false,
+            }
+        } else {
+            true
+        };
         let facts = Facts {
             account_id: account.id,
             account_sets: &sets,
@@ -319,6 +417,7 @@ pub async fn run(
             root: item.root_remote_id.as_deref(),
             text: &item.text,
             first_from_author: first,
+            first_message,
         };
         if !matches(&cond, &facts) {
             continue;
@@ -551,6 +650,7 @@ mod tests {
             root: Some("at://me/app.bsky.feed.post/p0"),
             text,
             first_from_author: true,
+            first_message: true,
         }
     }
 
@@ -596,6 +696,95 @@ mod tests {
         again.first_from_author = false;
         assert!(!matches(&first, &again));
         assert!(matches(&any, &again));
+        let welcome = Conditions {
+            first_message: true,
+            ..Conditions::default()
+        };
+        assert!(matches(&welcome, &facts(&[], "hi")));
+        let mut later = facts(&[], "hi");
+        later.first_message = false;
+        assert!(!matches(&welcome, &later));
+        assert!(matches(&any, &later));
+    }
+
+    #[test]
+    fn each_trigger_takes_its_own_conditions_and_actions() {
+        let dm = || Action::SendDm {
+            text: "Welcome {name}".into(),
+        };
+        let reply = || Action::ReplyPublicly {
+            text: "Thanks".into(),
+        };
+        let ok = |t: &str, c: Conditions, a: &[Action], f: Option<&str>| {
+            validate(t, &mut c.clone(), a, f)
+        };
+        let welcome = Conditions {
+            first_message: true,
+            keywords: vec!["hi".into()],
+            ..Conditions::default()
+        };
+        assert_eq!(ok("dm_received", welcome.clone(), &[dm()], None), Ok(()));
+        for t in [
+            "comment_received",
+            "mention_received",
+            "story_reply",
+            "new_follower",
+        ] {
+            assert_eq!(
+                ok(t, welcome.clone(), &[dm()], None),
+                Err("invalid_conditions"),
+                "{t}"
+            );
+        }
+        let kw = Conditions {
+            keywords: vec!["hi".into()],
+            ..Conditions::default()
+        };
+        assert_eq!(ok("story_reply", kw.clone(), &[dm()], None), Ok(()));
+        assert_eq!(
+            ok("mention_received", kw.clone(), &[reply(), dm()], Some("x")),
+            Ok(())
+        );
+        assert_eq!(
+            ok("new_follower", kw, &[dm()], None),
+            Err("invalid_conditions")
+        );
+        assert_eq!(
+            ok("new_follower", Conditions::default(), &[dm()], None),
+            Ok(())
+        );
+        let post = Conditions {
+            post_remote_ids: vec!["p".into()],
+            ..Conditions::default()
+        };
+        let author = Conditions {
+            first_per_author: true,
+            ..Conditions::default()
+        };
+        for c in [post, author] {
+            assert_eq!(ok("comment_received", c.clone(), &[dm()], None), Ok(()));
+            assert_eq!(
+                ok("mention_received", c, &[dm()], None),
+                Err("invalid_conditions")
+            );
+        }
+        for t in ["dm_received", "story_reply", "new_follower"] {
+            let none = Conditions::default();
+            assert_eq!(
+                ok(t, none.clone(), &[reply()], None),
+                Err("invalid_actions"),
+                "{t}"
+            );
+            assert_eq!(
+                ok(t, none.clone(), &[dm()], Some("x")),
+                Err("invalid_fallback"),
+                "{t}"
+            );
+            let paged = Action::SendDm {
+                text: "see {page}".into(),
+            };
+            assert_eq!(ok(t, none, &[paged], None), Err("invalid_text"), "{t}");
+        }
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub mod m20261123_000001_all_sets_name;
 pub mod m20261124_000001_team_code;
 mod m20261125_000001_post_pages;
 mod m20261126_000001_newsletter;
+mod m20261127_000001_automation_triggers;
 
 pub struct Migrator;
 
@@ -75,6 +76,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261124_000001_team_code::Migration),
             Box::new(m20261125_000001_post_pages::Migration),
             Box::new(m20261126_000001_newsletter::Migration),
+            Box::new(m20261127_000001_automation_triggers::Migration),
             // inject-above (do not remove this comment)
         ]
     }

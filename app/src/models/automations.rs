@@ -11,7 +11,7 @@ pub struct Model {
     pub active: bool,
     /// When it was last switched on; items received before it never run it.
     pub activated_at: DateTimeWithTimeZone,
-    /// `comment_received`.
+    /// `comment_received`, `dm_received`, `mention_received`, `new_follower` or `story_reply`.
     #[sea_orm(column_type = "Text")]
     pub trigger: String,
     /// `automations::Conditions` as JSON.

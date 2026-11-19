@@ -9,7 +9,7 @@ pub struct Model {
     pub social_account_id: Uuid,
     #[sea_orm(column_type = "Text")]
     pub platform: String,
-    /// `comment`, `mention` or `dm`.
+    /// `comment`, `mention`, `dm` or `follow` (a Bluesky follow, stored `done`).
     #[sea_orm(column_type = "Text")]
     pub kind: String,
     /// The platform's id: a Bluesky post `at://` URI, or a chat message id.
@@ -49,6 +49,12 @@ pub struct Model {
     /// `remote_id`.
     #[sea_orm(column_type = "Text", nullable)]
     pub permalink: Option<String>,
+    /// A `dm` that replies to one of the account's stories (Instagram).
+    pub story_reply: bool,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub story_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub story_url: Option<String>,
     pub created_at: DateTimeWithTimeZone,
 }
 
