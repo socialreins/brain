@@ -33,7 +33,7 @@ use super::{
 };
 use crate::{
     models::{social_sets, team_invitations, team_user, teams, users},
-    rate_limit::{daily_refund, daily_reserve},
+    rate_limit::{daily_refund, daily_reserve, reserve_in},
     state::AppState,
 };
 
@@ -44,6 +44,10 @@ const INVITES_PER_TEAM_EMAIL: i64 = 3;
 const INVITES_PER_EMAIL: i64 = 20;
 const INVITES_PER_TEAM: i64 = 50;
 const INVITES_PER_INVITER: i64 = 50;
+const SLUG_CHANGES_PER_TEAM: i64 = 5;
+/// Keeps slug `$1` for team `$2` alone for 30 days from now (`team_slug_holds`).
+const HOLD: &str = "INSERT INTO team_slug_holds (slug, team_id) VALUES ($1, $2) \
+    ON CONFLICT (slug) DO UPDATE SET team_id = excluded.team_id, released_at = now()";
 
 #[derive(Serialize, ToSchema)]
 pub struct Team {
@@ -52,6 +56,9 @@ pub struct Team {
     /// The team's address in the web app (`/t/<code>/...`): 6 lowercase characters that never
     /// change. Not a secret; it gives no access.
     pub code: String,
+    /// An address the team chose (`PATCH /team`), accepted wherever the code is; `null` when it
+    /// has none. Unlike the code it may change.
+    pub slug: Option<String>,
     /// Posts of this team may have a public page (`PUT /posts/{id}/page`).
     pub public_pages: bool,
     /// Public pages offer a newsletter sign-up (`GET /subscribers`).
@@ -112,6 +119,16 @@ pub struct TeamChange {
     /// Whether a member's scheduled posts need an owner's or admin's approval before they
     /// publish. Switching it off releases the posts still waiting. Absent: unchanged.
     pub require_approval: Option<bool>,
+    /// The team's slug: 3 to 30 of `a-z`, `0-9` and `-` after trimming and lowercasing, a
+    /// letter or digit at both ends, no `--`. `null` clears it. Absent: unchanged.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Option<String>)]
+    pub slug: Option<Option<String>>,
+}
+
+/// A field that was sent, `null` included (an absent one stays `None` through `default`).
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+    Deserialize::deserialize(d).map(Some)
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -154,6 +171,7 @@ pub(crate) fn team_json(team: &teams::Model, role: Role) -> Team {
         id: team.id,
         name: team.name.clone(),
         code: team.code.clone(),
+        slug: team.slug.clone(),
         public_pages: team.public_pages,
         newsletter: team.newsletter,
         require_approval: team.require_approval,
@@ -206,7 +224,7 @@ pub(crate) async fn set_current(
 }
 
 /// Inserts a team under a code from `code`, asking for another while the code is taken (the
-/// unique index decides, so this is safe inside a transaction).
+/// unique index decides, so this is safe inside a transaction) or is some team's slug.
 pub async fn insert_team(
     db: &impl ConnectionTrait,
     name: &str,
@@ -214,7 +232,8 @@ pub async fn insert_team(
 ) -> Result<teams::Model, DbErr> {
     // Plain SQL: `ON CONFLICT DO NOTHING` returns no row for a taken code, without failing
     // the surrounding transaction.
-    let sql = "INSERT INTO teams (id, name, code) VALUES ($1, $2, $3) \
+    let sql = "INSERT INTO teams (id, name, code) SELECT $1::uuid, $2::text, $3::text \
+               WHERE NOT EXISTS (SELECT 1 FROM teams WHERE lower(slug) = $3::text) \
                ON CONFLICT (code) DO NOTHING RETURNING *";
     loop {
         let values = [Uuid::now_v7().into(), name.into(), code().into()];
@@ -326,7 +345,7 @@ pub(crate) async fn current_team(
         .ok_or_else(|| DbErr::RecordNotFound("no team after ensure_team".into()))
 }
 
-/// The header a cookie request names its team in, by code.
+/// The header a cookie request names its team in, by code or slug.
 pub const TEAM_HEADER: &str = "x-team";
 
 #[derive(Deserialize)]
@@ -334,7 +353,7 @@ struct NamedTeam {
     team: Option<String>,
 }
 
-/// The team code the request names: the `X-Team` header, else `?team=` (a page navigation
+/// The team code or slug the request names: the `X-Team` header, else `?team=` (a page navigation
 /// cannot set a header). The header is only ever sent by the web app, since CORS allows it for
 /// `CORS_ORIGINS` alone. A link can come from anywhere, so the query counts only when the
 /// navigation came from the web app (`FromWeb`: `Origin`, else `Referer`); otherwise it is
@@ -347,27 +366,29 @@ async fn named_team(parts: &mut Parts, app: &AppState) -> Option<String> {
     (FromWeb::from_request_parts(parts, app).await.ok()).map(|_| code)
 }
 
-/// The team with `code` (any case) and the user's role in it; `None` when there is no such
-/// team or the user is not in it, so the two look the same to the caller.
+/// The team with the code or slug `named` (any case) and the user's role in it; `None` when
+/// there is no such team or the user is not in it, so the two look the same to the caller.
 async fn team_by_code(
     db: &DatabaseConnection,
     user_id: Uuid,
-    code: &str,
+    named: &str,
 ) -> Result<Option<(teams::Model, Role)>, DbErr> {
-    let Some(code) = team::parse_code(code) else {
+    let named = named.trim().to_ascii_lowercase();
+    if team::parse_code(&named).is_none() && team::slug(&named).is_err() {
         return Ok(None);
-    };
-    let found = teams::Entity::find()
-        .filter(teams::Column::Code.eq(code))
-        .one(db)
-        .await?;
+    }
+    // A slug never equals a code (`set_slug`, `insert_team`); the code would win if one did.
+    let sql = "SELECT * FROM teams WHERE code = $1 OR lower(slug) = $1 \
+               ORDER BY (code = $1) DESC LIMIT 1";
+    let stmt = Statement::from_sql_and_values(DbBackend::Postgres, sql, [named.into()]);
+    let found = teams::Entity::find().from_raw_sql(stmt).one(db).await?;
     let Some(found) = found else { return Ok(None) };
     let row = membership(db, found.id, user_id).await?;
     Ok(row.map(|row| (found, role_of(&row))))
 }
 
 /// The signed-in user inside a team; `401` without a session. The team is the one the request
-/// names by code (`X-Team` header or `?team=`), checked against the user's memberships: `404
+/// names by code or slug (`X-Team` header or `?team=`), checked against the user's memberships: `404
 /// not_found` when they are not in it or it does not exist. A request that names none acts in
 /// the user's current team, so API tokens and older clients are unaffected.
 pub struct InTeam {
@@ -507,10 +528,17 @@ async fn show(t: InTeam) -> Response {
 }
 
 /// Renames the current team (`name`) or switches its public pages (`public_pages`) or their
-/// newsletter sign-up (`newsletter`) or post approvals (`require_approval`). Owners and admins only.
+/// newsletter sign-up (`newsletter`) or post approvals (`require_approval`), or sets or clears
+/// its `slug`. Owners and admins only. A bad slug is `422 invalid_slug` with a `reason`
+/// (`length`, `characters` or `reserved`); one that is another team's slug or any team's code is
+/// `409 slug_taken`; a team changes its slug at most 5 times a day (`429
+/// slug_changed_too_often`). A slug given up (changed, cleared, or its team deleted) stops
+/// naming the team at once and stays `409 slug_taken` for every other team for 30 days; the
+/// team that had it may take it back any time.
 #[utoipa::path(patch, path = "/team", tag = "teams", request_body = TeamChange,
     responses((status = 200, body = Team), (status = 401, body = Error),
-        (status = 403, body = Error), (status = 422, body = Error)))]
+        (status = 403, body = Error), (status = 409, body = Error),
+        (status = 422, body = Error), (status = 429, body = Error)))]
 async fn rename(
     _: FromWeb,
     State(app): State<AppState>,
@@ -540,8 +568,66 @@ async fn rename(
     if let Some(on) = body.require_approval {
         row.require_approval = Set(on);
     }
-    match teams::Entity::update(row).exec(&app.db).await {
-        Ok(team) => Json(team_json(&team, t.role)).into_response(),
+    let slug = match body.slug.map(|s| s.as_deref().map(team::slug).transpose()) {
+        Some(Err(reason)) => {
+            let body = serde_json::json!({"error": "invalid_slug", "reason": reason});
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
+        }
+        // The slug the team already has is no change, and costs none of the day's five.
+        Some(Ok(slug)) if slug != t.team.slug => Some(slug),
+        _ => None,
+    };
+    let saved = async {
+        let txn = app.db.begin().await?;
+        if let Some(slug) = slug {
+            let caps = [(format!("team:slug:{}", t.team.id), SLUG_CHANGES_PER_TEAM)];
+            if reserve_in(&txn, &caps).await?.is_none() {
+                return Ok(Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "slug_changed_too_often",
+                )));
+            }
+            let raw = |sql: &str, values: [sea_orm::Value; 2]| {
+                Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
+            };
+            let id = t.team.id;
+            // Locked, so the slug held back below is the one this change replaces.
+            let before = teams::Entity::find_by_id(id)
+                .lock_exclusive()
+                .one(&txn)
+                .await?;
+            if let Some(new) = &slug {
+                let sql = "SELECT 1 FROM teams WHERE code = $1 OR (lower(slug) = $1 AND id <> $2) \
+                    UNION ALL SELECT 1 FROM team_slug_holds WHERE slug = $1 AND team_id <> $2 \
+                    AND released_at > now() - interval '30 days'";
+                let taken = raw(sql, [new.clone().into(), id.into()]);
+                if txn.query_one_raw(taken).await?.is_some() {
+                    return Ok(Err((StatusCode::CONFLICT, "slug_taken")));
+                }
+                // Its own hold, or one that ran out.
+                let sql = "DELETE FROM team_slug_holds WHERE slug = $1";
+                let free =
+                    Statement::from_sql_and_values(DbBackend::Postgres, sql, [new.clone().into()]);
+                txn.execute_raw(free).await?;
+            }
+            if let Some(old) = before
+                .and_then(|b| b.slug)
+                .filter(|old| Some(old) != slug.as_ref())
+            {
+                txn.execute_raw(raw(HOLD, [old.into(), id.into()])).await?;
+            }
+            row.slug = Set(slug);
+        }
+        let team = teams::Entity::update(row).exec(&txn).await?;
+        txn.commit().await.map(|_| Ok(team))
+    };
+    match saved.await {
+        Ok(Ok(team)) => Json(team_json(&team, t.role)).into_response(),
+        Ok(Err((status, code))) => reply(status, code),
+        // Two teams took one slug at once: the unique index let the first through.
+        Err(e) if matches!(e.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) => {
+            reply(StatusCode::CONFLICT, "slug_taken")
+        }
         Err(e) => internal(e, "team rename"),
     }
 }
@@ -564,7 +650,7 @@ async fn destroy(_: FromWeb, State(app): State<AppState>, t: InTeam) -> Response
         let txn = app.db.begin().await?;
         // The team row lock orders this against role changes (see `change_member`), so the
         // owner check below cannot be stale.
-        teams::Entity::find_by_id(t.team.id)
+        let locked = teams::Entity::find_by_id(t.team.id)
             .lock_exclusive()
             .one(&txn)
             .await?;
@@ -583,6 +669,13 @@ async fn destroy(_: FromWeb, State(app): State<AppState>, t: InTeam) -> Response
             .await?;
         if teams < 2 {
             return Ok(Some((StatusCode::CONFLICT, "last_team")));
+        }
+        // A deleted team's slug is held back like one it gave up: read under the lock, since a
+        // change may have landed after this request loaded the team.
+        if let Some(slug) = locked.and_then(|team| team.slug) {
+            let values = [slug.into(), t.team.id.into()];
+            let hold = Statement::from_sql_and_values(DbBackend::Postgres, HOLD, values);
+            txn.execute_raw(hold).await?;
         }
         // API tokens go with the team through their cascading foreign key.
         teams::Entity::delete_by_id(t.team.id).exec(&txn).await?;
