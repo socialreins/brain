@@ -33,6 +33,7 @@ use super::{
     auth::{internal, Body},
     connections::live_sets,
     idempotency::IDEMPOTENCY,
+    library,
     lists::{self, lists_of, ListRef},
     queue,
     waitlist::{error, Error},
@@ -45,11 +46,15 @@ use crate::{
         teams,
     },
     publish,
+    repeat::Repeat,
     state::AppState,
 };
 
-/// Most posts a team keeps that are not `deleted`.
-const MAX_POSTS: u64 = 2000;
+/// Most posts a team keeps that are not `deleted`; at the cap a repeat rule makes no copy.
+pub(crate) const MAX_POSTS: u64 = 2000;
+
+/// Most posts of a team that carry a repeat rule.
+const MAX_REPEATS: u64 = 200;
 const APPROVALS: [&str; 3] = ["pending", "approved", "rejected"];
 const MAX_NOTE_CHARS: usize = 500;
 const STATUSES: [&str; 6] = [
@@ -101,6 +106,9 @@ pub struct Post {
     /// The user who approved or rejected it; `null` for an API token.
     pub approval_by: Option<Uuid>,
     pub approval_at: Option<DateTime<FixedOffset>>,
+    /// How the post repeats (`PUT /posts/{id}/repeat`), else `null`. When the post is taken
+    /// to publish, the next copy is scheduled with the rule and this post's becomes `null`.
+    pub repeat: Option<Repeat>,
     pub created_at: DateTime<FixedOffset>,
     pub updated_at: DateTime<FixedOffset>,
     pub targets: Vec<Target>,
@@ -280,6 +288,8 @@ pub struct PostQuery {
     pub group_id: Option<Uuid>,
     /// `pending`, `approved` or `rejected`.
     pub approval: Option<String>,
+    /// `true`: only posts with a repeat rule; `false`: only posts without one.
+    pub repeat: Option<bool>,
 }
 
 /// The body of an approve or reject call; the body itself is optional.
@@ -573,6 +583,7 @@ fn post_json(
         approval_note: p.approval_note,
         approval_by: p.approval_by,
         approval_at: p.approval_at,
+        repeat: p.repeat.and_then(|v| serde_json::from_value(v).ok()),
         created_at: p.created_at,
         updated_at: p.updated_at,
         targets,
@@ -1093,17 +1104,17 @@ fn stored_cover(input: &PostInput) -> Option<String> {
 }
 
 /// What a save by `a` leaves as the post's approval, with who gave it and when: nothing unless
-/// the team requires approval and the post is scheduled; then `approved` for an owner, an admin
+/// the team requires approval and the post is `scheduled`; then `approved` for an owner, an admin
 /// or a token (which acts as an admin), `pending` for a member.
 fn approval_for(
     a: &Actor,
-    input: &PostInput,
+    scheduled: bool,
 ) -> (
     Option<&'static str>,
     Option<Uuid>,
     Option<DateTime<FixedOffset>>,
 ) {
-    if !a.team.require_approval || input.scheduled_at.is_none() {
+    if !a.team.require_approval || !scheduled {
         (None, None, None)
     } else if a.role.manages() {
         (Some("approved"), a.user_id, Some(Utc::now().fixed_offset()))
@@ -1177,6 +1188,14 @@ pub async fn list_posts(app: &AppState, a: &Actor, q: PostQuery) -> Response {
         }
         if let Some(approval) = &q.approval {
             sel = sel.filter(posts::Column::Approval.eq(approval));
+        }
+        if let Some(repeats) = q.repeat {
+            let rule = posts::Column::Repeat;
+            sel = sel.filter(if repeats {
+                rule.is_not_null()
+            } else {
+                rule.is_null()
+            });
         }
         let rows = sel
             .order_by_asc(posts::Column::ScheduledAt)
@@ -1599,7 +1618,7 @@ async fn store(
     if live >= MAX_POSTS {
         return Ok(Err(reply(StatusCode::CONFLICT, "too_many_posts")));
     }
-    let (approval, approval_by, approval_at) = approval_for(a, input);
+    let (approval, approval_by, approval_at) = approval_for(a, input.scheduled_at.is_some());
     let row = posts::ActiveModel {
         id: Set(Uuid::now_v7()),
         team_id: Set(a.team.id),
@@ -1903,7 +1922,7 @@ async fn naming(res: Response, platform: &str) -> Response {
 }
 
 /// Replaces a `draft` or `scheduled` post's set, platform, body, media, thread, first comment, cover and time; anything else
-/// is `409 not_editable`. While the team requires approval, a member's edit of a scheduled post
+/// is `409 not_editable`. Its repeat rule stays, unless the post becomes a draft or a TikTok post. While the team requires approval, a member's edit of a scheduled post
 /// puts it back to `approval: "pending"` and a manager's or a token's leaves it `approved`.
 #[utoipa::path(put, path = "/posts/{id}", tag = "posts",
     security(("session" = []), ("api_token" = [])), request_body = PostInput,
@@ -1937,10 +1956,15 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) 
             Err(res) => return Ok(Err(res)),
         };
         // An edit is a new version: a member's goes back to `pending`, a manager's is approved.
-        let (approval, approval_by, approval_at) = approval_for(a, &input);
+        let (approval, approval_by, approval_at) = approval_for(a, input.scheduled_at.is_some());
         let txn = app.db.begin().await?;
         // One conditional statement, so a tick claiming the post cannot interleave.
-        let done = posts::Entity::update_many()
+        let mut change = posts::Entity::update_many();
+        // Only a scheduled post that is not TikTok's repeats.
+        if input.scheduled_at.is_none() || input.platform == "tiktok" {
+            change = change.col_expr(posts::Column::Repeat, None::<serde_json::Value>.into());
+        }
+        let done = change
             .col_expr(posts::Column::SocialSetId, set.into())
             .col_expr(posts::Column::Platform, input.platform.clone().into())
             .col_expr(posts::Column::Body, input.body.clone().into())
@@ -2003,7 +2027,8 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) 
 /// most 100 published a day per team (`429 publish_quota`). While the team requires approval, a
 /// member publishes only an `approved` post: anything else is `403 approval_required`, as is a
 /// `rejected` post for anyone, whatever the team requires. A manager's or a token's publish of a
-/// `pending` post approves it.
+/// `pending` post approves it. A post with a repeat rule yields its next copy here, as when the
+/// scheduler takes it: the copy keeps the time of day the post was scheduled at.
 #[utoipa::path(post, path = "/posts/{id}/publish", tag = "posts",
     security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 202, body = Post), (status = 401, body = Error),
@@ -2052,7 +2077,11 @@ async fn publish_now(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>
                 a.user_id.into(),
             ],
         );
-        match publish::reserve_and(&app.db, a.team.id, post.quota_reserved, claim).await? {
+        // The claim sets `scheduled_at` to now; a repeat rule counts from the time it had.
+        let repeats = post.scheduled_at.map(|at| (id, at));
+        let reserved =
+            publish::reserve_and(&app.db, a.team.id, post.quota_reserved, claim, repeats).await?;
+        match reserved {
             publish::Quota::Reserved => {}
             publish::Quota::Over => {
                 return Ok(Err(reply(StatusCode::TOO_MANY_REQUESTS, "publish_quota")))
@@ -2077,6 +2106,116 @@ async fn publish_now(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>
         Ok(Err(res)) => res,
         Err(e) => internal(e, "post publish"),
     }
+}
+
+/// The body of `PUT` (`rule`) and `DELETE /posts/{id}/repeat`, shared with the MCP
+/// `set-post-repeat` and `clear-post-repeat` tools.
+pub async fn set_repeat(app: &AppState, a: &Actor, id: Uuid, rule: Option<Repeat>) -> Response {
+    let unprocessable = StatusCode::UNPROCESSABLE_ENTITY;
+    if let Some(field) = rule.as_ref().and_then(Repeat::invalid) {
+        let body = serde_json::json!({"error": "invalid_repeat", "field": field});
+        return (unprocessable, Json(body)).into_response();
+    }
+    // `day` is brain's own note on a copy, never a caller's.
+    let rule = rule.map(|r| Repeat { day: None, ..r });
+    let saved = async {
+        let Some(found) = find(&app.db, a, id).await? else {
+            return Ok(not_found());
+        };
+        if found.status != "scheduled" {
+            return Ok(reply(StatusCode::CONFLICT, "not_scheduled"));
+        }
+        if rule.is_some() && found.platform == "tiktok" {
+            return Ok(reply(unprocessable, "repeat_not_supported"));
+        }
+        // The post and the other scheduled posts of its group: one edit, by this actor.
+        let mut which = Condition::any().add(posts::Column::Id.eq(id));
+        if let Some(group) = found.group_id {
+            which = which.add(posts::Column::GroupId.eq(group));
+        }
+        let (approval, approval_by, approval_at) = approval_for(a, true);
+        let mut change = posts::Entity::update_many();
+        if rule.is_some() {
+            change = change.filter(posts::Column::Platform.ne("tiktok"));
+        }
+        let txn = app.db.begin().await?;
+        library::lock(&txn, "repeats", a.team.id).await?;
+        let done = change
+            .col_expr(posts::Column::Repeat, rule.map(|r| r.stored()).into())
+            .col_expr(posts::Column::Approval, approval.into())
+            .col_expr(posts::Column::ApprovalNote, None::<String>.into())
+            .col_expr(posts::Column::ApprovalBy, approval_by.into())
+            .col_expr(posts::Column::ApprovalAt, approval_at.into())
+            .col_expr(posts::Column::UpdatedAt, Utc::now().fixed_offset().into())
+            .filter(which)
+            .filter(posts::Column::TeamId.eq(a.team.id))
+            .filter(posts::Column::SocialSetId.in_subquery(live_sets()))
+            .filter(posts::Column::Status.eq("scheduled"))
+            .filter(in_scope(a))
+            .exec(&txn)
+            .await?;
+        // Zero: a tick took the post meanwhile.
+        if done.rows_affected == 0 {
+            return Ok(reply(StatusCode::CONFLICT, "not_scheduled"));
+        }
+        let repeating = posts::Entity::find()
+            .filter(posts::Column::TeamId.eq(a.team.id))
+            .filter(posts::Column::Repeat.is_not_null())
+            .count(&txn)
+            .await?;
+        // Dropping the transaction undoes the change.
+        if repeating > MAX_REPEATS {
+            return Ok(reply(unprocessable, "too_many_repeats"));
+        }
+        txn.commit().await?;
+        match find(&app.db, a, id).await? {
+            Some(p) => Ok(Json(one_json(&app.db, a, p).await?).into_response()),
+            None => Ok(not_found()),
+        }
+    };
+    saved
+        .await
+        .unwrap_or_else(|e: DbErr| internal(e, "post repeat"))
+}
+
+/// Makes a `scheduled` post repeat: when it is taken to publish (by the scheduler or publish
+/// now), the next copy is scheduled `interval` days, weeks or months later (a month keeps the
+/// day of the month and the time in UTC, or uses the month's last day; a time already past is
+/// skipped), carrying the rule with `remaining` one lower, and this post's rule is cleared. No
+/// copy is made once `remaining` is 1 or the next time is after `until`. The copy has the post's
+/// set, platform, content and `approval`, is in no list and has no public page; copies of one
+/// group share a new `group_id`.
+///
+/// The rule is set on every other `scheduled` post of the post's group too. Any member may set
+/// it; it counts as an edit, so a member's puts the posts back to `approval: "pending"` while
+/// the team requires approval. `409 not_scheduled` for a post that is not `scheduled`, `422
+/// repeat_not_supported` for a TikTok post (TikTok needs a person to confirm every post), `422
+/// {"error":"invalid_repeat","field"}` for a value out of range, `422 too_many_repeats` over 200
+/// posts with a rule per team.
+#[utoipa::path(put, path = "/posts/{id}/repeat", tag = "posts",
+    security(("session" = []), ("api_token" = [])), request_body = Repeat,
+    params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    responses((status = 200, body = Post), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
+        (status = 422, body = Error)))]
+async fn put_repeat(
+    State(app): State<AppState>,
+    a: Actor,
+    Path(id): Path<Uuid>,
+    Body(rule): Body<Repeat>,
+) -> Response {
+    set_repeat(&app, &a, id, Some(rule)).await
+}
+
+/// Clears the repeat rule of a `scheduled` post and of the other `scheduled` posts of its
+/// group; an edit like setting one. `409 not_scheduled` for any other post.
+#[utoipa::path(delete, path = "/posts/{id}/repeat", tag = "posts",
+    security(("session" = []), ("api_token" = [])),
+    params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    responses((status = 200, body = Post), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error)))]
+async fn delete_repeat(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
+    set_repeat(&app, &a, id, None).await
 }
 
 /// Deletes a post. `draft` or `scheduled`: removed (`204`). `published`: taken down from every
@@ -2579,6 +2718,7 @@ pub fn api() -> OpenApiRouter<AppState> {
         .routes(routes!(retry_post))
         .routes(routes!(approve))
         .routes(routes!(reject))
+        .routes(routes!(put_repeat, delete_repeat))
 }
 
 /// `POST /post-groups`, apart so it can take a larger body than the rest of `/v1`.

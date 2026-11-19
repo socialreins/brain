@@ -90,6 +90,11 @@ cargo run -p socialreins-brain
   post or a group in one statement. A member's publish now is `403 approval_required` unless
   the post is `approved`, anyone's is for a `rejected` post, and a manager's approves a
   `pending` one in the claim.
+- `app/src/repeat.rs`: repeating posts (`posts.repeat`, set by `posts::set_repeat` on the post and
+  the scheduled posts of its group). `repeat::spawn` makes the next copy and clears the rule; call
+  it in the transaction of anything that takes a post out of `scheduled` to publish it
+  (`publish::claim`, and publish now through `publish::reserve_and`), so a post yields one copy
+  at most. A copy's group id is a UUID v5 of the old one, so group mates agree without talking.
 - `app/src/webhooks.rs`: outbound webhooks. Every `post_targets` status change goes through
   `webhooks::with_event`, so its event is queued in the same statement; README documents the
   payload and signature.

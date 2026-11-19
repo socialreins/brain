@@ -41,6 +41,7 @@ use crate::{
         waitlist::error,
         MAX_GROUP_BODY_BYTES,
     },
+    repeat::Repeat,
     state::AppState,
 };
 
@@ -61,6 +62,14 @@ struct Decide {
     id: Uuid,
     #[serde(flatten)]
     decision: Decision,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SetRepeat {
+    /// The post.
+    id: Uuid,
+    #[serde(flatten)]
+    rule: Repeat,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -157,6 +166,8 @@ fn specs() -> Vec<(&'static str, &'static str, Value, bool)> {
         ("update-post", "Replaces a draft or scheduled post. Same as PUT /v1/posts/{id}.", schema::<UpdatePost>(), false),
         ("approve-post", "Approves a scheduled post waiting for approval (or rejected before), with an optional note; it publishes at its time, or on the next tick when that has passed. Whole-team or set token, not read-only. Same as POST /v1/posts/{id}/approve.", schema::<Decide>(), false),
         ("reject-post", "Rejects a scheduled post with an optional note: it is held back until approved. Same as POST /v1/posts/{id}/reject.", schema::<Decide>(), false),
+        ("set-post-repeat", "Makes a scheduled post (and the other scheduled posts of its group) repeat every interval (1 to 12) day, week or month, until an optional YYYY-MM-DD date or for remaining (1 to 100) more copies: each time it publishes, the next copy is scheduled. Not for TikTok. Same as PUT /v1/posts/{id}/repeat.", schema::<SetRepeat>(), false),
+        ("clear-post-repeat", "Stops a scheduled post (and the other scheduled posts of its group) repeating; the post itself stays scheduled. Same as DELETE /v1/posts/{id}/repeat.", schema::<PostId>(), false),
         ("delete-post", "Deletes a draft or scheduled post, or takes a published one down. Same as DELETE /v1/posts/{id}.", schema::<PostId>(), false),
         ("list-lists", "The team's post lists (ordered groups of posts, such as a series), without their posts. Same as GET /v1/lists.", schema::<NoArgs>(), true),
         ("create-list", "Creates a post list, team-wide or tied to one set. Same as POST /v1/lists.", schema::<ListInput>(), false),
@@ -264,6 +275,14 @@ async fn run(app: &AppState, a: &Actor, name: &str, v: Value) -> Option<Response
                 let approve = name == "approve-post";
                 posts::decide_post(app, a, d.id, approve, d.decision.note).await
             }
+            None => invalid("invalid_body"),
+        },
+        "set-post-repeat" => match args::<SetRepeat>(v) {
+            Some(r) => posts::set_repeat(app, a, r.id, Some(r.rule)).await,
+            None => invalid("invalid_body"),
+        },
+        "clear-post-repeat" => match args::<PostId>(v) {
+            Some(p) => posts::set_repeat(app, a, p.id, None).await,
             None => invalid("invalid_body"),
         },
         "delete-post" => match args::<PostId>(v) {

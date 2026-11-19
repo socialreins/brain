@@ -168,7 +168,7 @@ fn snippet_json(s: snippets::Model) -> Snippet {
 }
 
 /// Holds the team's `what` lock until `txn` ends.
-async fn lock(txn: &impl ConnectionTrait, what: &str, team: Uuid) -> Result<(), DbErr> {
+pub(super) async fn lock(txn: &impl ConnectionTrait, what: &str, team: Uuid) -> Result<(), DbErr> {
     let sql = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
     let key = format!("{what}:{team}");
     txn.execute_raw(Statement::from_sql_and_values(
