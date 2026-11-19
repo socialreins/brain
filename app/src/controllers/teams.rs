@@ -56,6 +56,8 @@ pub struct Team {
     pub public_pages: bool,
     /// Public pages offer a newsletter sign-up (`GET /subscribers`).
     pub newsletter: bool,
+    /// A member's scheduled posts wait for an owner or admin (`POST /posts/{id}/approve`).
+    pub require_approval: bool,
     /// The caller's role: `owner`, `admin` or `member`.
     pub role: String,
 }
@@ -107,6 +109,9 @@ pub struct TeamChange {
     pub public_pages: Option<bool>,
     /// Whether public pages offer a newsletter sign-up. Absent: unchanged.
     pub newsletter: Option<bool>,
+    /// Whether a member's scheduled posts need an owner's or admin's approval before they
+    /// publish. Switching it off releases the posts still waiting. Absent: unchanged.
+    pub require_approval: Option<bool>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -151,6 +156,7 @@ pub(crate) fn team_json(team: &teams::Model, role: Role) -> Team {
         code: team.code.clone(),
         public_pages: team.public_pages,
         newsletter: team.newsletter,
+        require_approval: team.require_approval,
         role: role.as_str().into(),
     }
 }
@@ -501,7 +507,7 @@ async fn show(t: InTeam) -> Response {
 }
 
 /// Renames the current team (`name`) or switches its public pages (`public_pages`) or their
-/// newsletter sign-up (`newsletter`). Owners and admins only.
+/// newsletter sign-up (`newsletter`) or post approvals (`require_approval`). Owners and admins only.
 #[utoipa::path(patch, path = "/team", tag = "teams", request_body = TeamChange,
     responses((status = 200, body = Team), (status = 401, body = Error),
         (status = 403, body = Error), (status = 422, body = Error)))]
@@ -530,6 +536,9 @@ async fn rename(
     }
     if let Some(on) = body.newsletter {
         row.newsletter = Set(on);
+    }
+    if let Some(on) = body.require_approval {
+        row.require_approval = Set(on);
     }
     match teams::Entity::update(row).exec(&app.db).await {
         Ok(team) => Json(team_json(&team, t.role)).into_response(),

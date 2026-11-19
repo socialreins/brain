@@ -2283,7 +2283,8 @@ mod teams {
         assert_eq!(
             ok.json::<Value>(),
             json!({"id": team["id"], "name": team["name"], "code": team["code"],
-                "public_pages": false, "newsletter": false, "role": "admin"})
+                "public_pages": false, "newsletter": false,
+                "require_approval": false, "role": "admin"})
         );
         assert_eq!(current(&s, &invited).await["id"], team["id"]);
         assert_eq!(memberships(&db, invited_id).await, 2);
@@ -7464,6 +7465,482 @@ mod teams {
                 let res = group(json!({"social_set_id": set, "body": "hi", "on_invalid": "drop"}));
                 assert_eq!(res.await.status_code(), 422);
                 assert_eq!(count().await, before);
+            }
+
+            mod approvals {
+                use super::*;
+
+                /// An owner with an account, a member and an admin of the team, and its set.
+                struct Team {
+                    owner: String,
+                    member: String,
+                    admin: String,
+                    admin_id: String,
+                    set: String,
+                }
+
+                async fn team(s: &TestServer, db: &DatabaseConnection, on: bool) -> Team {
+                    let (owner, team_id, _) = owner_with_account(s, db).await;
+                    let (member, _) = joined(s, db, &team_id, "member").await;
+                    let (admin, admin_id) = joined(s, db, &team_id, "admin").await;
+                    let set = default_set(db, &team_id).await.to_string();
+                    if on {
+                        require(s, &owner, true).await;
+                    }
+                    Team {
+                        owner,
+                        member,
+                        admin,
+                        admin_id: admin_id.to_string(),
+                        set,
+                    }
+                }
+
+                async fn require(s: &TestServer, cookie: &str, on: bool) {
+                    let res = req(s, Method::PATCH, "/v1/team", cookie)
+                        .json(&json!({"require_approval": on}))
+                        .await;
+                    res.assert_status_ok();
+                    assert_eq!(res.json::<Value>()["require_approval"], on);
+                }
+
+                fn soon() -> String {
+                    (Utc::now() + Duration::hours(1)).to_rfc3339()
+                }
+
+                /// A whole-team token's secret (`read_only` or not).
+                async fn token(s: &TestServer, cookie: &str, read_only: bool) -> String {
+                    let res = req(s, Method::POST, "/v1/api-tokens", cookie)
+                        .json(&json!({"name": "t", "read_only": read_only}))
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    res.json::<Value>()["secret"].as_str().unwrap().to_owned()
+                }
+
+                fn bearer(s: &TestServer, method: Method, path: &str, secret: &str) -> TestRequest {
+                    s.method(method, path)
+                        .add_header("authorization", format!("Bearer {secret}"))
+                }
+
+                /// `POST /v1/posts/{id}/{verb}` (or a group's) from the web app.
+                fn decide(s: &TestServer, cookie: &str, path: &str, verb: &str) -> TestRequest {
+                    req(s, Method::POST, &format!("/v1/{path}/{verb}"), cookie)
+                }
+
+                async fn scheduled(s: &TestServer, cookie: &str, set: &str, at: &str) -> String {
+                    let res = create(s, cookie, input(set, "hi", Some(at))).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    id_of(&res)
+                }
+
+                fn none_given(p: &Value) {
+                    for field in ["approval_note", "approval_by", "approval_at"] {
+                        assert_eq!(p[field], Value::Null, "{field}: {p}");
+                    }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn the_switch_is_on_the_team_and_only_managers_set_it() {
+                    let (s, db, _) = on_mock().await;
+                    let t = team(&s, &db, false).await;
+                    assert_eq!(current(&s, &t.member).await["require_approval"], false);
+                    let res = req(&s, Method::PATCH, "/v1/team", &t.member)
+                        .json(&json!({"require_approval": true}))
+                        .await;
+                    assert_eq!(res.status_code(), 403);
+                    res.assert_json(&json!({"error": "forbidden"}));
+                    require(&s, &t.admin, true).await;
+                    assert_eq!(current(&s, &t.member).await["require_approval"], true);
+                    let me = s.get("/auth/me").add_header("cookie", &t.owner).await;
+                    assert_eq!(me.json::<Value>()["current_team"]["require_approval"], true);
+                    // Another change leaves it alone.
+                    let res = req(&s, Method::PATCH, "/v1/team", &t.owner)
+                        .json(&json!({"newsletter": true}))
+                        .await;
+                    assert_eq!(res.json::<Value>()["require_approval"], true);
+                    require(&s, &t.owner, false).await;
+
+                    let doc = s.get("/openapi.json").await.json::<Value>();
+                    for path in [
+                        "/posts/{id}/approve",
+                        "/posts/{id}/reject",
+                        "/post-groups/{group_id}/approve",
+                        "/post-groups/{group_id}/reject",
+                    ] {
+                        let op = &doc["paths"][path]["post"];
+                        assert!(op["security"].to_string().contains("api_token"), "{path}");
+                    }
+                    let schemas = &doc["components"]["schemas"];
+                    assert!(schemas["Team"]["properties"]["require_approval"].is_object());
+                    assert!(schemas["TeamChange"]["properties"]["require_approval"].is_object());
+                    for field in ["approval", "approval_note", "approval_by", "approval_at"] {
+                        assert!(schemas["Post"]["properties"][field].is_object(), "{field}");
+                    }
+                    let params = doc["paths"]["/posts"]["get"]["parameters"].to_string();
+                    assert!(params.contains("\"approval\""), "{params}");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_save_sets_the_approval_by_who_saves() {
+                    let (s, db, _) = on_mock().await;
+                    let t = team(&s, &db, false).await;
+                    // Not required: nothing is asked.
+                    let free = scheduled(&s, &t.member, &t.set, &soon()).await;
+                    assert_eq!(
+                        get_post(&s, &t.member, &free).await["approval"],
+                        Value::Null
+                    );
+                    require(&s, &t.owner, true).await;
+
+                    // A member's draft asks nothing; a scheduled or queued post waits.
+                    let draft = id_of(&create(&s, &t.member, input(&t.set, "d", None)).await);
+                    let p = get_post(&s, &t.member, &draft).await;
+                    assert_eq!(p["approval"], Value::Null, "{p}");
+                    let pending = scheduled(&s, &t.member, &t.set, &soon()).await;
+                    let p = get_post(&s, &t.member, &pending).await;
+                    assert_eq!(p["approval"], "pending", "{p}");
+                    none_given(&p);
+                    let slots: Vec<Value> = (0..7)
+                        .map(|d| json!({"weekday": d, "time": "09:00"}))
+                        .collect();
+                    let path = format!("/v1/social-sets/{}/queue", t.set);
+                    req(&s, Method::PUT, &path, &t.member)
+                        .json(&json!({"time_zone": "UTC", "slots": slots}))
+                        .await
+                        .assert_status_ok();
+                    let queued = json!({"social_set_id": t.set, "platform": "bluesky",
+                        "body": "q", "queue": true});
+                    let res = create(&s, &t.member, queued).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    assert_eq!(res.json::<Value>()["approval"], "pending");
+
+                    // An admin's is approved by them, a token's by nobody.
+                    let res = create(&s, &t.admin, input(&t.set, "a", Some(&soon()))).await;
+                    let p = res.json::<Value>();
+                    assert_eq!(p["approval"], "approved", "{p}");
+                    assert_eq!(p["approval_by"], t.admin_id.as_str());
+                    assert!(p["approval_at"].is_string(), "{p}");
+                    let secret = token(&s, &t.owner, false).await;
+                    let res = bearer(&s, Method::POST, "/v1/posts", &secret)
+                        .json(&input(&t.set, "t", Some(&soon())))
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let p = res.json::<Value>();
+                    assert_eq!(p["approval"], "approved", "{p}");
+                    assert_eq!(p["approval_by"], Value::Null);
+                    assert!(p["approval_at"].is_string(), "{p}");
+
+                    // A member's edit of an approved or rejected post asks again.
+                    let edit =
+                        |cookie: &str, at: Option<String>| {
+                            req(&s, Method::PUT, &format!("/v1/posts/{pending}"), cookie)
+                                .json(&input(&t.set, "edited", at.as_deref()))
+                        };
+                    let post = format!("posts/{pending}");
+                    for verb in ["approve", "reject"] {
+                        let res = decide(&s, &t.admin, &post, verb)
+                            .json(&json!({"note": "see the note"}))
+                            .await;
+                        res.assert_status_ok();
+                        assert_eq!(res.json::<Value>()["approval_note"], "see the note");
+                        let res = edit(&t.member, Some(soon())).await;
+                        res.assert_status_ok();
+                        let p = res.json::<Value>();
+                        assert_eq!(p["approval"], "pending", "{verb}: {p}");
+                        none_given(&p);
+                    }
+                    // A manager's edit approves it; a member's keeps their own draft unasked.
+                    let p = edit(&t.admin, Some(soon())).await.json::<Value>();
+                    assert_eq!(p["approval"], "approved", "{p}");
+                    assert_eq!(p["approval_by"], t.admin_id.as_str());
+                    let p = edit(&t.member, None).await.json::<Value>();
+                    assert_eq!(p["status"], "draft");
+                    assert_eq!(p["approval"], Value::Null, "{p}");
+                    none_given(&p);
+                    let p = edit(&t.member, Some(soon())).await.json::<Value>();
+                    assert_eq!(p["approval"], "pending", "{p}");
+
+                    // The filter, alone and with another.
+                    let listed = |query: &str| {
+                        let (s, cookie) = (&s, t.member.clone());
+                        let path = format!("/v1/posts?{query}");
+                        async move { s.get(&path).add_header("cookie", &cookie).await }
+                    };
+                    let waiting = listed("approval=pending").await.json::<Value>();
+                    let waiting = waiting.as_array().unwrap();
+                    assert_eq!(waiting.len(), 2, "{waiting:?}");
+                    assert!(waiting.iter().all(|p| p["approval"] == "pending"));
+                    let approved = listed("approval=approved").await.json::<Value>();
+                    assert_eq!(approved.as_array().unwrap().len(), 2, "{approved}");
+                    let none = listed("approval=rejected").await.json::<Value>();
+                    assert_eq!(none, json!([]));
+                    let none = listed("approval=pending&status=draft").await;
+                    assert_eq!(none.json::<Value>(), json!([]));
+                    let both = listed("approval=pending&status=scheduled").await;
+                    assert_eq!(both.json::<Value>().as_array().unwrap().len(), 2);
+                    let res = listed("approval=maybe").await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "invalid_query"}));
+
+                    // Switched off, a save asks nothing again.
+                    require(&s, &t.owner, false).await;
+                    let p = edit(&t.member, Some(soon())).await.json::<Value>();
+                    assert_eq!(p["approval"], Value::Null, "{p}");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn managers_and_full_tokens_approve_and_reject() {
+                    let (s, db, _) = on_mock().await;
+                    let t = team(&s, &db, false).await;
+                    let unasked = scheduled(&s, &t.member, &t.set, &soon()).await;
+                    require(&s, &t.owner, true).await;
+                    let id = scheduled(&s, &t.member, &t.set, &soon()).await;
+                    let post = format!("posts/{id}");
+                    let draft = id_of(&create(&s, &t.member, input(&t.set, "d", None)).await);
+
+                    for verb in ["approve", "reject"] {
+                        let res = decide(&s, &t.member, &post, verb).await;
+                        assert_eq!(res.status_code(), 403, "{verb}");
+                        res.assert_json(&json!({"error": "forbidden"}));
+                        let ro = token(&s, &t.owner, true).await;
+                        let path = format!("/v1/{post}/{verb}");
+                        let res = bearer(&s, Method::POST, &path, &ro).await;
+                        assert_eq!(res.status_code(), 403, "{verb}");
+                        res.assert_json(&json!({"error": "read_only_token"}));
+                        // Another team's post, a draft and a post nobody asked about.
+                        let (_, stranger, _) = user(&s, &db).await;
+                        let res = decide(&s, &stranger, &post, verb).await;
+                        assert_eq!(res.status_code(), 404, "{verb}");
+                        for other in [&draft, &unasked] {
+                            let res = decide(&s, &t.owner, &format!("posts/{other}"), verb).await;
+                            assert_eq!(res.status_code(), 409, "{verb}");
+                            res.assert_json(&json!({"error": "not_awaiting_approval"}));
+                        }
+                        let res = decide(&s, &t.owner, &post, verb)
+                            .json(&json!({"note": "x".repeat(501)}))
+                            .await;
+                        assert_eq!(res.status_code(), 422, "{verb}");
+                        res.assert_json(&json!({"error": "invalid_note"}));
+                    }
+                    let p = get_post(&s, &t.member, &id).await;
+                    assert_eq!(p["approval"], "pending", "nothing changed yet: {p}");
+
+                    // Rejected with a trimmed note, by the admin; then approved without a body.
+                    let res = decide(&s, &t.admin, &post, "reject")
+                        .json(&json!({"note": format!("  {}  ", "n".repeat(500))}))
+                        .await;
+                    res.assert_status_ok();
+                    let p = res.json::<Value>();
+                    assert_eq!(p["id"], id.as_str());
+                    assert_eq!(p["status"], "scheduled");
+                    assert_eq!(p["approval"], "rejected", "{p}");
+                    assert_eq!(p["approval_note"], "n".repeat(500));
+                    assert_eq!(p["approval_by"], t.admin_id.as_str());
+                    assert!(p["approval_at"].is_string(), "{p}");
+                    let res = decide(&s, &t.owner, &post, "approve").await;
+                    res.assert_status_ok();
+                    let p = res.json::<Value>();
+                    assert_eq!(p["approval"], "approved", "{p}");
+                    assert_eq!(p["approval_note"], Value::Null);
+                    assert_ne!(p["approval_by"], t.admin_id.as_str());
+                    // Again is fine, and a full token decides as nobody.
+                    let res = decide(&s, &t.owner, &post, "approve")
+                        .json(&json!({"note": " "}))
+                        .await;
+                    assert_eq!(res.json::<Value>()["approval_note"], Value::Null);
+                    let rw = token(&s, &t.owner, false).await;
+                    let res = bearer(&s, Method::POST, &format!("/v1/{post}/reject"), &rw)
+                        .json(&json!({"note": "by a token"}))
+                        .await;
+                    res.assert_status_ok();
+                    let p = res.json::<Value>();
+                    assert_eq!(p["approval"], "rejected", "{p}");
+                    assert_eq!(p["approval_note"], "by a token");
+                    assert_eq!(p["approval_by"], Value::Null);
+                    let res = decide(&s, &t.owner, &post, "approve").text("{").await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "invalid_body"}));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn the_tick_holds_a_post_until_it_is_approved_or_the_switch_is_off() {
+                    let (s, db, state) = on_mock().await;
+                    let t = team(&s, &db, false).await;
+                    // Scheduled before the switch: nobody asked, so it goes out.
+                    let before = scheduled(&s, &t.member, &t.set, &past()).await;
+                    require(&s, &t.owner, true).await;
+                    let held = scheduled(&s, &t.member, &t.set, &past()).await;
+                    let released = scheduled(&s, &t.member, &t.set, &past()).await;
+                    let rejected = scheduled(&s, &t.member, &t.set, &past()).await;
+                    let admins = scheduled(&s, &t.admin, &t.set, &past()).await;
+                    let status = |id: String| {
+                        let (s, cookie) = (&s, t.member.clone());
+                        async move { get_post(s, &cookie, &id).await["status"].clone() }
+                    };
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(status(before).await, "published");
+                    assert_eq!(status(admins).await, "published");
+                    assert_eq!(status(held.clone()).await, "scheduled", "pending");
+
+                    let post = format!("posts/{held}");
+                    decide(&s, &t.owner, &post, "reject")
+                        .await
+                        .assert_status_ok();
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(status(held.clone()).await, "scheduled", "rejected");
+                    // Approved after its time: out on the next tick.
+                    decide(&s, &t.owner, &post, "approve")
+                        .await
+                        .assert_status_ok();
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(status(held).await, "published");
+
+                    // Switching the requirement off releases what is pending, never a rejection.
+                    assert_eq!(status(released.clone()).await, "scheduled");
+                    decide(&s, &t.owner, &format!("posts/{rejected}"), "reject")
+                        .await
+                        .assert_status_ok();
+                    require(&s, &t.owner, false).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &t.member, &released).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(p["approval"], "pending", "the value stays, unread");
+                    assert_eq!(
+                        status(rejected.clone()).await,
+                        "scheduled",
+                        "still rejected"
+                    );
+                    for cookie in [&t.member, &t.owner] {
+                        let path = format!("/v1/posts/{rejected}/publish");
+                        let res = req(&s, Method::POST, &path, cookie).await;
+                        assert_eq!(res.status_code(), 403, "{}", res.text());
+                        res.assert_json(&json!({"error": "approval_required"}));
+                    }
+                    // An edit with the switch off clears the rejection, and the post goes out.
+                    let res = req(&s, Method::PUT, &format!("/v1/posts/{rejected}"), &t.member)
+                        .json(&input(&t.set, "edited", Some(&past())))
+                        .await;
+                    assert_eq!(res.json::<Value>()["approval"], Value::Null);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(status(rejected).await, "published");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_member_publishes_now_only_what_is_approved() {
+                    let (s, db, _) = on_mock().await;
+                    let t = team(&s, &db, true).await;
+                    let publish = |cookie: &str, id: &str| {
+                        req(&s, Method::POST, &format!("/v1/posts/{id}/publish"), cookie)
+                    };
+                    let draft = id_of(&create(&s, &t.member, input(&t.set, "d", None)).await);
+                    let pending = scheduled(&s, &t.member, &t.set, &soon()).await;
+                    for id in [&draft, &pending] {
+                        let res = publish(&t.member, id).await;
+                        assert_eq!(res.status_code(), 403, "{}", res.text());
+                        res.assert_json(&json!({"error": "approval_required"}));
+                    }
+                    assert_eq!(
+                        get_post(&s, &t.member, &pending).await["status"],
+                        "scheduled"
+                    );
+                    decide(&s, &t.owner, &format!("posts/{pending}"), "approve")
+                        .await
+                        .assert_status_ok();
+                    assert_eq!(publish(&t.member, &pending).await.status_code(), 202);
+                    assert_eq!(
+                        settled(&s, &t.member, &pending).await["status"],
+                        "published"
+                    );
+                    // A manager publishes anything, and so does a member once the switch is off.
+                    assert_eq!(publish(&t.admin, &draft).await.status_code(), 202);
+                    let p = settled(&s, &t.admin, &draft).await;
+                    assert_eq!(p["status"], "published");
+                    assert_eq!(p["approval"], Value::Null, "a draft had none: {p}");
+                    // Publishing a pending post approves it, so no published post is pending.
+                    let waiting = scheduled(&s, &t.member, &t.set, &soon()).await;
+                    let res = publish(&t.admin, &waiting).await;
+                    assert_eq!(res.status_code(), 202, "{}", res.text());
+                    let p = res.json::<Value>();
+                    assert_eq!(p["approval"], "approved", "{p}");
+                    assert_eq!(p["approval_by"], t.admin_id.as_str());
+                    assert!(p["approval_at"].is_string(), "{p}");
+                    assert_eq!(settled(&s, &t.admin, &waiting).await["status"], "published");
+                    let listed = s
+                        .get("/v1/posts?approval=pending")
+                        .add_header("cookie", &t.admin)
+                        .await;
+                    assert_eq!(listed.json::<Value>(), json!([]));
+                    // Nobody publishes a rejected one.
+                    let refused = scheduled(&s, &t.member, &t.set, &soon()).await;
+                    decide(&s, &t.owner, &format!("posts/{refused}"), "reject")
+                        .await
+                        .assert_status_ok();
+                    let res = publish(&t.owner, &refused).await;
+                    assert_eq!(res.status_code(), 403, "{}", res.text());
+                    res.assert_json(&json!({"error": "approval_required"}));
+                    let other = scheduled(&s, &t.member, &t.set, &soon()).await;
+                    assert_eq!(publish(&t.member, &other).await.status_code(), 403);
+                    require(&s, &t.owner, false).await;
+                    assert_eq!(publish(&t.member, &other).await.status_code(), 202);
+                    assert_eq!(settled(&s, &t.member, &other).await["status"], "published");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_group_is_approved_or_rejected_at_once() {
+                    let (s, db, _) = on_mock().await;
+                    let t = team(&s, &db, true).await;
+                    let group = |at: Option<String>| {
+                        let (s, t) = (&s, &t);
+                        async move {
+                            let body = json!({"social_set_id": t.set, "body": "hi",
+                                "scheduled_at": at});
+                            let res = req(s, Method::POST, "/v1/post-groups", &t.member)
+                                .json(&body)
+                                .await;
+                            assert_eq!(res.status_code(), 201, "{}", res.text());
+                            let made = res.json::<Value>();
+                            assert_eq!(made["posts"].as_array().unwrap().len(), 1, "{made}");
+                            made
+                        }
+                    };
+                    let made = group(Some(soon())).await;
+                    assert_eq!(made["posts"][0]["approval"], "pending", "{made}");
+                    let path = format!("post-groups/{}", made["group_id"].as_str().unwrap());
+                    let drafts = group(None).await;
+                    let drafts = format!("post-groups/{}", drafts["group_id"].as_str().unwrap());
+                    let (_, stranger, _) = user(&s, &db).await;
+                    let missing = format!("post-groups/{}", uuid::Uuid::now_v7());
+                    for (verb, to) in [("reject", "rejected"), ("approve", "approved")] {
+                        let res = decide(&s, &t.member, &path, verb).await;
+                        assert_eq!(res.status_code(), 403, "{verb}");
+                        res.assert_json(&json!({"error": "forbidden"}));
+                        assert_eq!(decide(&s, &stranger, &path, verb).await.status_code(), 404);
+                        assert_eq!(
+                            decide(&s, &t.owner, &missing, verb).await.status_code(),
+                            404
+                        );
+                        let res = decide(&s, &t.owner, &drafts, verb).await;
+                        assert_eq!(res.status_code(), 409, "{verb}");
+                        res.assert_json(&json!({"error": "not_awaiting_approval"}));
+                        let res = decide(&s, &t.admin, &path, verb)
+                            .json(&json!({"note": "all of it"}))
+                            .await;
+                        res.assert_status_ok();
+                        let body = res.json::<Value>();
+                        let posts = body["posts"].as_array().unwrap();
+                        assert_eq!(posts.len(), 1, "{body}");
+                        assert_eq!(posts[0]["id"], made["posts"][0]["id"]);
+                        assert_eq!(posts[0]["approval"], to, "{body}");
+                        assert_eq!(posts[0]["approval_note"], "all of it");
+                        assert_eq!(posts[0]["approval_by"], t.admin_id.as_str());
+                    }
+                }
             }
 
             mod threads_api {
@@ -17668,6 +18145,55 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
+                async fn approve_and_reject_tools_decide_a_members_post() {
+                    let (s, db) = on_mock(120).await;
+                    let (owner, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let (member, _) = joined(&s, &db, &team_id, "member").await;
+                    req(&s, Method::PATCH, "/v1/team", &owner)
+                        .json(&json!({"require_approval": true}))
+                        .await
+                        .assert_status_ok();
+                    let mut body = post_body(Some(&set), "mine");
+                    body["scheduled_at"] = json!("2099-01-01T00:00:00Z");
+                    let res = req(&s, Method::POST, "/v1/posts", &member)
+                        .json(&body)
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let p = res.json::<Value>();
+                    assert_eq!(p["approval"], "pending", "{p}");
+                    let id = p["id"].clone();
+                    let secret = |made: Value| made["secret"].as_str().unwrap().to_owned();
+                    let rw = secret(make_token(&s, &owner, json!({"name": "rw"})).await);
+                    let ro = json!({"name": "ro", "read_only": true});
+                    let ro = secret(make_token(&s, &owner, ro).await);
+
+                    for tool in ["approve-post", "reject-post"] {
+                        let (err, v) = call(&s, &ro, tool, json!({"id": id})).await;
+                        assert!(err, "{tool}: {v}");
+                        assert_eq!(v, json!({"error": "read_only_token"}));
+                        let missing = json!({"id": uuid::Uuid::now_v7()});
+                        let (err, v) = call(&s, &rw, tool, missing).await;
+                        assert!(err, "{tool}: {v}");
+                        assert_eq!(v, json!({"error": "not_found"}));
+                    }
+                    let args = json!({"id": id, "note": " not yet "});
+                    let (err, v) = call(&s, &rw, "reject-post", args).await;
+                    assert!(!err, "{v}");
+                    assert_eq!(v["approval"], "rejected", "{v}");
+                    assert_eq!(v["approval_note"], "not yet");
+                    assert_eq!(v["approval_by"], Value::Null);
+                    let (err, v) = call(&s, &rw, "approve-post", json!({"id": id})).await;
+                    assert!(!err, "{v}");
+                    assert_eq!(v["approval"], "approved", "{v}");
+                    assert_eq!(v["approval_note"], Value::Null);
+                    let (_, listed) =
+                        call(&s, &ro, "list-posts", json!({"approval": "approved"})).await;
+                    assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+                }
+
+                #[tokio::test]
+                #[serial]
                 async fn read_only_tokens_read_but_never_write() {
                     let (s, db) = on_mock(120).await;
                     let (owner, team_id, account) = owner_with_account(&s, &db).await;
@@ -17955,6 +18481,7 @@ mod teams {
                         [
                             "add-media",
                             "add-post-to-list",
+                            "approve-post",
                             "create-list",
                             "create-post",
                             "create-post-group",
@@ -17969,6 +18496,7 @@ mod teams {
                             "list-snippets",
                             "list-social-accounts",
                             "list-social-sets",
+                            "reject-post",
                             "remove-post-from-list",
                             "reorder-list",
                             "save-snippet",

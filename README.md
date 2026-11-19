@@ -31,7 +31,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/health` | `{"status":"ok"}` |
 | GET | `/version` | `{"commit":"<sha>"}`, from `RAILWAY_GIT_COMMIT_SHA`, `dev` locally |
 | GET | `/openapi.json` | OpenAPI document for `/v1` |
-| POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, posting queues, accounts, posts, lists, the media library (`list-media`, `add-media`) and snippets (`list-snippets`, `save-snippet` creating or, with an `id`, replacing, `delete-snippet`). Bearer API token only, same scope and per-token limit as `/v1`, bodies up to 64 KiB; `Idempotency-Key` does not apply. `create-post` and `create-post-group` take `validate_only` (see "Validate only"), which a read-only token may send |
+| POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, posting queues, accounts, posts (with `approve-post` and `reject-post`, write tools), lists, the media library (`list-media`, `add-media`) and snippets (`list-snippets`, `save-snippet` creating or, with an `id`, replacing, `delete-snippet`). Bearer API token only, same scope and per-token limit as `/v1`, bodies up to 64 KiB; `Idempotency-Key` does not apply. `create-post` and `create-post-group` take `validate_only` (see "Validate only"), which a read-only token may send |
 | POST | `/v1/waitlist` | `{"email":"...","source":"..."}` joins the waitlist and emails a confirmation link |
 | POST | `/v1/waitlist/verify` | `{"token"}` from the emailed link: marks the signup verified, `200 {"status":"verified"}`, else `422 {"error":"invalid_link"}` |
 | GET | `/v1/waitlist/count` | `{"count":n}`: every signup, verified or not, cached for 30 seconds |
@@ -62,7 +62,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | DELETE | `/auth/passkeys/{id}` | Deletes one of the signed-in user's passkeys, `204`, else `404` |
 | POST, GET | `/v1/teams` | Create a team (`{"name"}`, with its default set, named "All sets"; caller owns it and switches to it), or list mine |
 | PUT | `/v1/current-team` | `{"team_id"}`: switch to one of my teams |
-| GET, PATCH, DELETE | `/v1/team` | The current team (`{"id","name","code","public_pages","role"}`), or the one the request names; rename it or switch its public pages (`{"name","public_pages"}`, either one; owner, admin); delete it (owner, sign-in from the last 10 minutes) |
+| GET, PATCH, DELETE | `/v1/team` | The current team (`{"id","name","code","public_pages","newsletter","require_approval","role"}`), or the one the request names; rename it or switch its public pages, their newsletter sign-up or post approvals (`{"name","public_pages","newsletter","require_approval"}`, any of them; owner, admin; see "Approvals"); delete it (owner, sign-in from the last 10 minutes) |
 | GET | `/v1/team/members` | The current team's members |
 | PATCH, DELETE | `/v1/team/members/{user_id}` | `{"role"}`: change a role (owner, admin); remove a member, or leave |
 | POST, GET | `/v1/team/invitations` | `{"email","role"}`: invite as `admin` or `member` (owner, admin); list pending |
@@ -96,12 +96,14 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | PATCH, DELETE | `/v1/social-sets/{id}` | Rename (`{"name"}`, the default set too); delete (sign-in from the last 10 minutes, not the default set), restorable for 30 days. Owner, admin |
 | POST | `/v1/social-sets/{id}/restore` | Restore a set deleted in the last 30 days, with its accounts (owner, admin) |
 | GET, PUT | `/v1/social-sets/{id}/queue` | The set's posting queue: `{"time_zone","slots":[{"weekday","time"}],"next"}` (weekday 0 is Sunday, `time` is `HH:MM` in the IANA `time_zone`, `UTC` until saved; `next` is the next 10 slot times with no `scheduled` post of the set). `PUT {"time_zone","slots"}` replaces both (any member): `422 invalid_time_zone`, `invalid_slot`, `duplicate_slot`, `too_many_slots` (over 50). A slot missing on a spring-forward day is skipped, an ambiguous fall-back one is its first occurrence |
-| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&group_id=&from=&to=` on `scheduled_at`; the default set's id gives every set's posts), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"thread":[{"body","media"}],"first_comment","cover","tiktok","youtube","scheduled_at","queue"}`; any member). `"queue": true` instead of `scheduled_at` schedules it at the earliest free slot of the set's queue, picked under a lock per set so two calls never share one (`422 queue_with_scheduled_at` with both, `422 queue_empty` without slots; `PUT` answers `422 queue_not_supported`). `first_comment`: see "First comment" below; `cover`: see "Video cover"; `tiktok`: see "TikTok settings"; `youtube`: see YouTube below. `thread`: up to 25 follow-up posts, each a reply to the one before and checked like the post (`422 {"error","part"}` names a bad one); `?validate_only=true` checks without creating (see "Validate only"); each part is saved on its target as it goes out, a target whose part fails is `failed` naming it with the parts before it kept, and a takedown deletes the parts last first, then the root |
+| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&group_id=&approval=&from=&to=` on `scheduled_at`, `approval` being `pending`, `approved` or `rejected`; the default set's id gives every set's posts), or create one (`{"social_set_id","platform":"bluesky","body","media":[urls],"thread":[{"body","media"}],"first_comment","cover","tiktok","youtube","scheduled_at","queue"}`; any member). `"queue": true` instead of `scheduled_at` schedules it at the earliest free slot of the set's queue, picked under a lock per set so two calls never share one (`422 queue_with_scheduled_at` with both, `422 queue_empty` without slots; `PUT` answers `422 queue_not_supported`). `first_comment`: see "First comment" below; `cover`: see "Video cover"; `tiktok`: see "TikTok settings"; `youtube`: see YouTube below. `thread`: up to 25 follow-up posts, each a reply to the one before and checked like the post (`422 {"error","part"}` names a bad one); `?validate_only=true` checks without creating (see "Validate only"); each part is saved on its target as it goes out, a target whose part fails is `failed` naming it with the parts before it kept, and a takedown deletes the parts last first, then the root |
 | GET, PUT, DELETE | `/v1/posts/{id}` | One post with its `targets`; replace a `draft` or `scheduled` one; delete (`204` for draft or scheduled, `200` after taking a published one down, `422 takedown_failed` with a `message`, `409` for queued or failed) |
 | GET, PUT | `/v1/posts/{id}/page` | The post's public page, one per post or per group: `{"enabled","details","code","live"}` (`code` is `null` before the first save, `live` says whether the public route serves it now). `PUT {"enabled","details"}` saves it whatever the post's status and makes the permanent 10-character `code` the first time: `422 details_too_long` over 5000 characters, `422 public_pages_off` for `enabled: true` while the team has public pages off |
 | GET | `/v1/public/pages/{code}` | Public, no sign-in: `{"team","body","media","thread","details","published_at","links":[{"platform","url"}]}` from the first published post of the page, `links` from every published target. `404` unless the page is enabled, its team has public pages on and a post of it is `published`. `Cache-Control: public, max-age=60`; 120 requests a minute per IP |
 | POST | `/v1/post-groups` | One post per platform of a set in one call (`{"social_set_id","platforms","body","media","scheduled_at","queue","list_id","position","thread","first_comment","cover","tiktok","youtube","overrides":{"<platform>":{"body","media","thread","first_comment","cover","tiktok","youtube"}}}`; `platforms` defaults to those brain publishes to with a connected account; bodies up to 64 KiB): `201 {"group_id","posts","skipped"}`; `"queue": true` puts the whole group at one free slot of the queue; an invalid post creates nothing and its error names the `platform`, unless `"on_invalid":"skip"` (see "Validate only"). `?validate_only=true` checks without creating |
-| POST | `/v1/posts/{id}/publish` | Publish a draft or scheduled post now: `202` with the post `queued`; poll it for the result |
+| POST | `/v1/posts/{id}/publish` | Publish a draft or scheduled post now: `202` with the post `queued`; poll it for the result. `403 approval_required` for a member while the team requires approval, unless the post is `approved`, and for anyone when the post is `rejected`. An owner's, admin's or token's publish of a `pending` post approves it |
+| POST | `/v1/posts/{id}/approve`, `/v1/posts/{id}/reject` | Approve or reject a `scheduled` post (optional `{"note"}`, trimmed, at most 500 characters, else `422 invalid_note`): `200` with the post. Owner, admin or a token that is not read-only (`403 forbidden` for a member); `409 not_awaiting_approval` unless the post is `scheduled` with an `approval`. See "Approvals" |
+| POST | `/v1/post-groups/{group_id}/approve`, `/v1/post-groups/{group_id}/reject` | The same for every `scheduled` post of a group that has an `approval`, all or none: `200 {"posts":[...]}` with the posts it changed, `409 not_awaiting_approval` when there is none |
 | GET, POST | `/v1/lists` | Post lists (ordered groups such as a series), or create one (`{"name","social_set_id"}`; no set means team-wide, or the token's own set for a set token) |
 | GET, PATCH, DELETE | `/v1/lists/{id}` | One list with its `items` (`post_id`, 1-based `position`, `post`); rename (`{"name"}`); delete (posts stay) |
 | POST | `/v1/lists/{id}/posts` | Add a post (`{"post_id","position"}`; appends by default, an existing post moves) |
@@ -669,6 +671,32 @@ t, v1 = (p.split("=", 1)[1] for p in header.split(","))
 mac = hmac.new(secret.encode(), f"{t}.".encode() + raw_body, hashlib.sha256).hexdigest()
 assert hmac.compare_digest(mac, v1) and abs(time.time() - int(t)) < 300
 ```
+
+## Approvals
+
+A team with `require_approval` on (`PATCH /v1/team`, owner or admin, off by default) holds its
+members' posts back until an owner or admin approves them. Every post carries `approval`
+(`null`, `pending`, `approved` or `rejected`), `approval_note`, `approval_by` (the user's id)
+and `approval_at`.
+
+- While the switch is on, a create or an update that leaves the post `scheduled` (by
+  `scheduled_at` or the queue) sets `approval`: `pending` for a member, `approved` for an owner
+  or admin, with `approval_by` and `approval_at`. An API token acts as an admin, because only
+  owners and admins make tokens and a token ends when its maker stops managing the team: its
+  posts are `approved` with `approval_by` null. A draft has `approval: null`.
+- Every edit is a new version: a member's edit of an `approved` or `rejected` post puts it back
+  to `pending`, a manager's leaves it `approved`, and the note is cleared.
+- The scheduler skips a `scheduled` post that is `pending` or `rejected`. Once approved it goes
+  out on the next round, even when its time has passed. A member cannot publish one now either
+  (`403 approval_required`). An owner, admin or token that publishes a `pending` post now
+  approves it by doing so.
+- A rejection is final until someone acts on it: a `rejected` post is never published, by the
+  scheduler or by publish now (`403 approval_required` for anyone), whether or not the team
+  still requires approval. Approve it, or edit it (an edit sets `approval` again as above, so
+  with the switch off it becomes `null` and the post can go out).
+- Switching `require_approval` off releases every `pending` post: they publish at their time
+  (at once when it has passed), and new saves set `approval: null`. `rejected` posts stay held.
+  A post scheduled before the switch went on has `approval: null` and is never held.
 
 ## Local development
 

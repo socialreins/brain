@@ -37,6 +37,7 @@ mod m20261126_000001_newsletter;
 mod m20261127_000001_automation_triggers;
 mod m20261128_000001_posting_queue;
 mod m20261129_000001_media_library;
+mod m20261130_000001_post_approvals;
 
 pub struct Migrator;
 
@@ -81,6 +82,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261127_000001_automation_triggers::Migration),
             Box::new(m20261128_000001_posting_queue::Migration),
             Box::new(m20261129_000001_media_library::Migration),
+            Box::new(m20261130_000001_post_approvals::Migration),
             // inject-above (do not remove this comment)
         ]
     }

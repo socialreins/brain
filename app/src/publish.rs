@@ -1126,7 +1126,8 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
 }
 
 /// Claims up to 50 due `scheduled` posts, oldest first, `scheduled` to `queued`: only posts of
-/// a live set, of a team under its daily publish cap. Returns `(post, team)`.
+/// a live set, of a team under its daily publish cap, and none `rejected`, nor `pending` while its
+/// team requires approval. Returns `(post, team)`.
 pub async fn claim_due(db: &DatabaseConnection) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
     claim(db, CLAIM_BATCH).await
 }
@@ -1138,6 +1139,9 @@ async fn claim(db: &DatabaseConnection, limit: i64) -> Result<Vec<(Uuid, Uuid)>,
         "WITH due AS ( \
            SELECT d.id FROM posts d \
            WHERE d.status = 'scheduled' AND d.scheduled_at <= now() \
+           AND d.approval IS DISTINCT FROM 'rejected' \
+           AND (d.approval IS DISTINCT FROM 'pending' OR NOT EXISTS ( \
+                SELECT 1 FROM teams t WHERE t.id = d.team_id AND t.require_approval)) \
            AND EXISTS (SELECT 1 FROM social_sets s \
                        WHERE s.id = d.social_set_id AND s.deleted_at IS NULL) \
            AND (SELECT count(*) FROM rate_limit_hits h \

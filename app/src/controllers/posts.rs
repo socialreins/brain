@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use axum::{
-    body::to_bytes,
+    body::{to_bytes, Bytes},
     extract::{rejection::QueryRejection, Path, Query, State},
     http::{StatusCode, Uri},
     response::{IntoResponse, Response},
@@ -50,6 +50,8 @@ use crate::{
 
 /// Most posts a team keeps that are not `deleted`.
 const MAX_POSTS: u64 = 2000;
+const APPROVALS: [&str; 3] = ["pending", "approved", "rejected"];
+const MAX_NOTE_CHARS: usize = 500;
 const STATUSES: [&str; 6] = [
     "draft",
     "scheduled",
@@ -90,6 +92,15 @@ pub struct Post {
     pub created_by: Option<Uuid>,
     /// Ties the posts of one `POST /post-groups` call; `null` for a single post.
     pub group_id: Option<Uuid>,
+    /// `pending`, `approved` or `rejected` for a `scheduled` post saved while its team required
+    /// approval, else `null`. A `rejected` post is never published; a `pending` one is held back
+    /// while the team requires approval.
+    pub approval: Option<String>,
+    /// The note of the last approval or rejection.
+    pub approval_note: Option<String>,
+    /// The user who approved or rejected it; `null` for an API token.
+    pub approval_by: Option<Uuid>,
+    pub approval_at: Option<DateTime<FixedOffset>>,
     pub created_at: DateTime<FixedOffset>,
     pub updated_at: DateTime<FixedOffset>,
     pub targets: Vec<Target>,
@@ -267,6 +278,21 @@ pub struct PostQuery {
     pub to: Option<DateTime<FixedOffset>>,
     /// The posts of one post group.
     pub group_id: Option<Uuid>,
+    /// `pending`, `approved` or `rejected`.
+    pub approval: Option<String>,
+}
+
+/// The body of an approve or reject call; the body itself is optional.
+#[derive(Default, Deserialize, ToSchema, JsonSchema)]
+pub struct Decision {
+    /// A note for the author: trimmed, at most 500 characters, blank is none.
+    pub note: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct DecidedPosts {
+    /// The group's posts the call approved or rejected.
+    pub posts: Vec<Post>,
 }
 
 #[derive(Deserialize, ToSchema, JsonSchema)]
@@ -543,6 +569,10 @@ fn post_json(
         error: p.error,
         created_by: p.created_by,
         group_id: p.group_id,
+        approval: p.approval,
+        approval_note: p.approval_note,
+        approval_by: p.approval_by,
+        approval_at: p.approval_at,
         created_at: p.created_at,
         updated_at: p.updated_at,
         targets,
@@ -1062,6 +1092,26 @@ fn stored_cover(input: &PostInput) -> Option<String> {
     post::cover(input.cover.as_deref()).map(str::to_owned)
 }
 
+/// What a save by `a` leaves as the post's approval, with who gave it and when: nothing unless
+/// the team requires approval and the post is scheduled; then `approved` for an owner, an admin
+/// or a token (which acts as an admin), `pending` for a member.
+fn approval_for(
+    a: &Actor,
+    input: &PostInput,
+) -> (
+    Option<&'static str>,
+    Option<Uuid>,
+    Option<DateTime<FixedOffset>>,
+) {
+    if !a.team.require_approval || input.scheduled_at.is_none() {
+        (None, None, None)
+    } else if a.role.manages() {
+        (Some("approved"), a.user_id, Some(Utc::now().fixed_offset()))
+    } else {
+        (Some("pending"), None, None)
+    }
+}
+
 fn status_for(input: &PostInput) -> &'static str {
     if input.scheduled_at.is_some() {
         "scheduled"
@@ -1089,7 +1139,11 @@ async fn list(
 
 /// The body of `GET /posts`, shared with the MCP `list-posts` tool.
 pub async fn list_posts(app: &AppState, a: &Actor, q: PostQuery) -> Response {
-    if q.status.as_deref().is_some_and(|s| !STATUSES.contains(&s)) {
+    if q.status.as_deref().is_some_and(|s| !STATUSES.contains(&s))
+        || q.approval
+            .as_deref()
+            .is_some_and(|s| !APPROVALS.contains(&s))
+    {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     }
     let found = async {
@@ -1120,6 +1174,9 @@ pub async fn list_posts(app: &AppState, a: &Actor, q: PostQuery) -> Response {
         }
         if let Some(group) = q.group_id {
             sel = sel.filter(posts::Column::GroupId.eq(group));
+        }
+        if let Some(approval) = &q.approval {
+            sel = sel.filter(posts::Column::Approval.eq(approval));
         }
         let rows = sel
             .order_by_asc(posts::Column::ScheduledAt)
@@ -1542,6 +1599,7 @@ async fn store(
     if live >= MAX_POSTS {
         return Ok(Err(reply(StatusCode::CONFLICT, "too_many_posts")));
     }
+    let (approval, approval_by, approval_at) = approval_for(a, input);
     let row = posts::ActiveModel {
         id: Set(Uuid::now_v7()),
         team_id: Set(a.team.id),
@@ -1558,6 +1616,9 @@ async fn store(
         scheduled_at: Set(when(input)),
         created_by: Set(a.user_id),
         group_id: Set(group_id),
+        approval: Set(approval.map(Into::into)),
+        approval_by: Set(approval_by),
+        approval_at: Set(approval_at),
         ..Default::default()
     };
     let p = posts::Entity::insert(row).exec_with_returning(txn).await?;
@@ -1842,7 +1903,8 @@ async fn naming(res: Response, platform: &str) -> Response {
 }
 
 /// Replaces a `draft` or `scheduled` post's set, platform, body, media, thread, first comment, cover and time; anything else
-/// is `409 not_editable`.
+/// is `409 not_editable`. While the team requires approval, a member's edit of a scheduled post
+/// puts it back to `approval: "pending"` and a manager's or a token's leaves it `approved`.
 #[utoipa::path(put, path = "/posts/{id}", tag = "posts",
     security(("session" = []), ("api_token" = [])), request_body = PostInput,
     params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
@@ -1874,6 +1936,8 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) 
             Ok(set) => set,
             Err(res) => return Ok(Err(res)),
         };
+        // An edit is a new version: a member's goes back to `pending`, a manager's is approved.
+        let (approval, approval_by, approval_at) = approval_for(a, &input);
         let txn = app.db.begin().await?;
         // One conditional statement, so a tick claiming the post cannot interleave.
         let done = posts::Entity::update_many()
@@ -1891,6 +1955,10 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) 
             .col_expr(posts::Column::Youtube, stored_youtube(&input).into())
             .col_expr(posts::Column::Status, status_for(&input).into())
             .col_expr(posts::Column::ScheduledAt, when(&input).into())
+            .col_expr(posts::Column::Approval, approval.into())
+            .col_expr(posts::Column::ApprovalNote, None::<String>.into())
+            .col_expr(posts::Column::ApprovalBy, approval_by.into())
+            .col_expr(posts::Column::ApprovalAt, approval_at.into())
             .col_expr(posts::Column::UpdatedAt, Utc::now().fixed_offset().into())
             .filter(posts::Column::Id.eq(id))
             .filter(posts::Column::Status.is_in(["draft", "scheduled"]))
@@ -1932,7 +2000,10 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) 
 /// Publishes a `draft` or `scheduled` post now: `scheduled_at` becomes now and the post is
 /// claimed (`queued`) and sent in the background. `202` with the queued post; poll it for the
 /// result. At most 10 publish or take-down calls a minute per user; with scheduled posts, at
-/// most 100 published a day per team (`429 publish_quota`).
+/// most 100 published a day per team (`429 publish_quota`). While the team requires approval, a
+/// member publishes only an `approved` post: anything else is `403 approval_required`, as is a
+/// `rejected` post for anyone, whatever the team requires. A manager's or a token's publish of a
+/// `pending` post approves it.
 #[utoipa::path(post, path = "/posts/{id}/publish", tag = "posts",
     security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 202, body = Post), (status = 401, body = Error),
@@ -1946,17 +2017,40 @@ async fn publish_now(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>
         let Some(post) = find(&app.db, &a, id).await? else {
             return Ok(Err(not_found()));
         };
+        // A rejection outlives the switch and binds managers too: approve or edit it first.
+        let held = a.team.require_approval && !a.role.manages();
+        let approval = post.approval.as_deref();
+        if approval == Some("rejected") || (held && approval != Some("approved")) {
+            return Ok(Err(reply(StatusCode::FORBIDDEN, "approval_required")));
+        }
+        // A manager publishing a `pending` post approves it.
+        let manages = a.role.manages();
         // The claim and its hit of the daily cap (shared with scheduled publishes) commit
         // together. `quota_reserved = $2` keeps a stale read from skipping the reserve.
         let claim = Statement::from_sql_and_values(
             DbBackend::Postgres,
             "UPDATE posts p SET status = 'queued', quota_reserved = true, \
-             scheduled_at = now(), updated_at = now() \
+             scheduled_at = now(), updated_at = now(), \
+             approval = CASE WHEN $5 AND p.approval = 'pending' THEN 'approved' \
+                        ELSE p.approval END, \
+             approval_by = CASE WHEN $5 AND p.approval = 'pending' THEN $6 \
+                           ELSE p.approval_by END, \
+             approval_at = CASE WHEN $5 AND p.approval = 'pending' THEN now() \
+                           ELSE p.approval_at END \
              WHERE p.id = $1 AND p.status IN ('draft', 'scheduled') AND p.quota_reserved = $2 \
              AND ($3::uuid IS NULL OR p.social_set_id = $3) \
+             AND p.approval IS DISTINCT FROM 'rejected' \
+             AND (NOT $4 OR p.approval = 'approved') \
              AND EXISTS (SELECT 1 FROM social_sets s \
                          WHERE s.id = p.social_set_id AND s.deleted_at IS NULL)",
-            [id.into(), post.quota_reserved.into(), a.set_id().into()],
+            [
+                id.into(),
+                post.quota_reserved.into(),
+                a.set_id().into(),
+                held.into(),
+                manages.into(),
+                a.user_id.into(),
+            ],
         );
         match publish::reserve_and(&app.db, a.team.id, post.quota_reserved, claim).await? {
             publish::Quota::Reserved => {}
@@ -2291,12 +2385,200 @@ async fn retry_group(
         .unwrap_or_else(|e| internal(e, "post group retry"))
 }
 
+/// The note of an approve or reject body: no body at all, or `{"note"}`. `Err` is the `422`'s
+/// code.
+fn decision(body: &[u8]) -> Result<Option<String>, &'static str> {
+    if body.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_slice::<Decision>(body)
+        .map(|d| d.note)
+        .map_err(|_| "invalid_body")
+}
+
+/// A note as saved: trimmed, blank is none. `Err` is the `422`'s code, over the limit.
+fn stored_note(note: Option<String>) -> Result<Option<String>, &'static str> {
+    let note = note.as_deref().map(str::trim).filter(|n| !n.is_empty());
+    if note.is_some_and(|n| n.chars().count() > MAX_NOTE_CHARS) {
+        return Err("invalid_note");
+    }
+    Ok(note.map(str::to_owned))
+}
+
+/// Approves or rejects the caller's posts matching `which` that are `scheduled` and have an
+/// approval, in one statement, and returns them in creation order.
+async fn decide(
+    db: &impl ConnectionTrait,
+    a: &Actor,
+    which: Condition,
+    approve: bool,
+    note: Option<String>,
+) -> Result<Vec<posts::Model>, DbErr> {
+    let now = Utc::now().fixed_offset();
+    let to = if approve { "approved" } else { "rejected" };
+    let mut rows = posts::Entity::update_many()
+        .col_expr(posts::Column::Approval, to.into())
+        .col_expr(posts::Column::ApprovalNote, note.into())
+        .col_expr(posts::Column::ApprovalBy, a.user_id.into())
+        .col_expr(posts::Column::ApprovalAt, now.into())
+        .col_expr(posts::Column::UpdatedAt, now.into())
+        .filter(which)
+        .filter(posts::Column::TeamId.eq(a.team.id))
+        .filter(posts::Column::SocialSetId.in_subquery(live_sets()))
+        .filter(in_scope(a))
+        .filter(posts::Column::Status.eq("scheduled"))
+        .filter(posts::Column::Approval.is_not_null())
+        .exec_with_returning(db)
+        .await?;
+    rows.sort_by_key(|p| (p.created_at, p.id));
+    Ok(rows)
+}
+
+/// The body of the approve and reject routes of one post, shared with the MCP `approve-post`
+/// and `reject-post` tools.
+pub async fn decide_post(
+    app: &AppState,
+    a: &Actor,
+    id: Uuid,
+    approve: bool,
+    note: Option<String>,
+) -> Response {
+    let note = match stored_note(note) {
+        Ok(note) => note,
+        Err(code) => return reply(StatusCode::UNPROCESSABLE_ENTITY, code),
+    };
+    if !a.role.manages() {
+        return reply(StatusCode::FORBIDDEN, "forbidden");
+    }
+    let done = async {
+        if find(&app.db, a, id).await?.is_none() {
+            return Ok(not_found());
+        }
+        let which = Condition::all().add(posts::Column::Id.eq(id));
+        let mut rows = decide(&app.db, a, which, approve, note).await?;
+        let Some(p) = rows.pop() else {
+            return Ok(reply(StatusCode::CONFLICT, "not_awaiting_approval"));
+        };
+        Ok::<_, DbErr>(Json(one_json(&app.db, a, p).await?).into_response())
+    };
+    done.await.unwrap_or_else(|e| internal(e, "post approval"))
+}
+
+async fn decide_group(
+    app: &AppState,
+    a: &Actor,
+    group_id: Uuid,
+    approve: bool,
+    body: &[u8],
+) -> Response {
+    let note = match decision(body).and_then(stored_note) {
+        Ok(note) => note,
+        Err(code) => return reply(StatusCode::UNPROCESSABLE_ENTITY, code),
+    };
+    if !a.role.manages() {
+        return reply(StatusCode::FORBIDDEN, "forbidden");
+    }
+    let done = async {
+        if group_rows(&app.db, a, group_id).await?.is_empty() {
+            return Ok(not_found());
+        }
+        let which = Condition::all().add(posts::Column::GroupId.eq(group_id));
+        let rows = decide(&app.db, a, which, approve, note).await?;
+        if rows.is_empty() {
+            return Ok(reply(StatusCode::CONFLICT, "not_awaiting_approval"));
+        }
+        let posts = posts_json(&app.db, a, rows).await?;
+        Ok::<_, DbErr>(Json(DecidedPosts { posts }).into_response())
+    };
+    done.await
+        .unwrap_or_else(|e| internal(e, "post group approval"))
+}
+
+/// Approves a `scheduled` post that is `pending`, `rejected` or already `approved`, with an
+/// optional `{"note"}` (trimmed, at most 500 characters, else `422 invalid_note`); it goes out
+/// on the next tick, even when its time has passed. Owners and admins only (`403 forbidden`); an
+/// API token acts as an admin, with `approval_by` null. Any other post is `409
+/// not_awaiting_approval`.
+#[utoipa::path(post, path = "/posts/{id}/approve", tag = "posts",
+    security(("session" = []), ("api_token" = [])), request_body(content = Option<Decision>),
+    params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    responses((status = 200, body = Post), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
+        (status = 422, body = Error)))]
+async fn approve(
+    State(app): State<AppState>,
+    a: Actor,
+    Path(id): Path<Uuid>,
+    body: Bytes,
+) -> Response {
+    match decision(&body) {
+        Ok(note) => decide_post(&app, &a, id, true, note).await,
+        Err(code) => reply(StatusCode::UNPROCESSABLE_ENTITY, code),
+    }
+}
+
+/// Rejects a post, as `POST /posts/{id}/approve` approves one: it stays `scheduled` and is held
+/// back while the team requires approval, until it is approved.
+#[utoipa::path(post, path = "/posts/{id}/reject", tag = "posts",
+    security(("session" = []), ("api_token" = [])), request_body(content = Option<Decision>),
+    params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    responses((status = 200, body = Post), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
+        (status = 422, body = Error)))]
+async fn reject(
+    State(app): State<AppState>,
+    a: Actor,
+    Path(id): Path<Uuid>,
+    body: Bytes,
+) -> Response {
+    match decision(&body) {
+        Ok(note) => decide_post(&app, &a, id, false, note).await,
+        Err(code) => reply(StatusCode::UNPROCESSABLE_ENTITY, code),
+    }
+}
+
+/// `POST /posts/{id}/approve` for every `scheduled` post of a group that has an approval, all
+/// at once: `200 {"posts"}` with the posts it approved, `409 not_awaiting_approval` when there
+/// is none.
+#[utoipa::path(post, path = "/post-groups/{group_id}/approve", tag = "posts",
+    security(("session" = []), ("api_token" = [])), request_body(content = Option<Decision>),
+    params(("group_id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    responses((status = 200, body = DecidedPosts), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
+        (status = 422, body = Error)))]
+async fn approve_group(
+    State(app): State<AppState>,
+    a: Actor,
+    Path(group_id): Path<Uuid>,
+    body: Bytes,
+) -> Response {
+    decide_group(&app, &a, group_id, true, &body).await
+}
+
+/// `POST /posts/{id}/reject` for every `scheduled` post of a group that has an approval.
+#[utoipa::path(post, path = "/post-groups/{group_id}/reject", tag = "posts",
+    security(("session" = []), ("api_token" = [])), request_body(content = Option<Decision>),
+    params(("group_id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    responses((status = 200, body = DecidedPosts), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
+        (status = 422, body = Error)))]
+async fn reject_group(
+    State(app): State<AppState>,
+    a: Actor,
+    Path(group_id): Path<Uuid>,
+    body: Bytes,
+) -> Response {
+    decide_group(&app, &a, group_id, false, &body).await
+}
+
 pub fn api() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(list, create))
         .routes(routes!(show, update, destroy))
         .routes(routes!(publish_now))
         .routes(routes!(retry_post))
+        .routes(routes!(approve))
+        .routes(routes!(reject))
 }
 
 /// `POST /post-groups`, apart so it can take a larger body than the rest of `/v1`.
@@ -2305,4 +2587,6 @@ pub fn groups_api() -> OpenApiRouter<AppState> {
         .routes(routes!(create_group))
         .routes(routes!(show_group))
         .routes(routes!(retry_group))
+        .routes(routes!(approve_group))
+        .routes(routes!(reject_group))
 }

@@ -45,6 +45,15 @@ pub struct Model {
     /// The targets were created (one per account of the platform in the set); a retry never
     /// adds more.
     pub fanned_out: bool,
+    /// `pending`, `approved` or `rejected`; null when no approval was asked. The publish tick
+    /// reads it only while `teams.require_approval` is on.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub approval: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub approval_note: Option<String>,
+    /// Who approved or rejected it; null for an API token.
+    pub approval_by: Option<Uuid>,
+    pub approval_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }
