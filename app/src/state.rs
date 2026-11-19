@@ -58,6 +58,8 @@ pub struct AppState {
     pub waitlist_count: Arc<std::sync::Mutex<Option<(std::time::Instant, u64)>>>,
     /// Post media while a post publishes (`media.rs`).
     pub media: crate::media::Media,
+    /// The client that reads RSS and Atom feeds (`feeds.rs`).
+    pub feeds: crate::feeds::Fetcher,
     pub threads: crate::connectors::threads::Threads,
     pub linkedin: crate::connectors::linkedin::LinkedIn,
     pub youtube: crate::connectors::youtube::YouTube,
@@ -107,6 +109,7 @@ impl AppState {
             review_login_token: config.review_login_token.clone(),
             waitlist_count: Arc::default(),
             media: config.media.clone(),
+            feeds: crate::feeds::Fetcher::new(None),
             threads: config.threads.clone(),
             linkedin: config.linkedin.clone(),
             youtube: config.youtube.clone(),

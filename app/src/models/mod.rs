@@ -1,6 +1,8 @@
 pub mod api_tokens;
 pub mod automation_runs;
 pub mod automations;
+pub mod feed_items;
+pub mod feeds;
 pub mod inbox_items;
 pub mod inbox_replies;
 pub mod inboxes;

@@ -1354,7 +1354,7 @@ fn first_refusal(checks: &[Check]) -> Option<Response> {
 }
 
 /// The provider and id of the team's accounts in `set`.
-async fn accounts_in(
+pub(crate) async fn accounts_in(
     db: &impl ConnectionTrait,
     team: Uuid,
     set: Uuid,
@@ -1687,6 +1687,19 @@ pub async fn create_post_group(
     input: PostGroupInput,
     validate_only: bool,
 ) -> Response {
+    create_group_guarded(app, a, input, validate_only, None).await
+}
+
+/// `create_post_group` with a `guard` statement run first in the group's transaction: when it
+/// changes no row nothing is created and the answer is `409 guard_failed`. A feed marks its item
+/// seen this way, so the group and the mark are saved together or not at all (`feeds::check`).
+pub(crate) async fn create_group_guarded(
+    app: &AppState,
+    a: &Actor,
+    input: PostGroupInput,
+    validate_only: bool,
+    guard: Option<Statement>,
+) -> Response {
     let made = async {
         // Without the set or a platform there is nothing to check a post against, so these two
         // end a validate-only report too.
@@ -1785,6 +1798,11 @@ pub async fn create_post_group(
             }
         }
         let txn = app.db.begin().await?;
+        if let Some(guard) = guard {
+            if txn.execute_raw(guard).await?.rows_affected() == 0 {
+                return Ok(reply(StatusCode::CONFLICT, "guard_failed"));
+            }
+        }
         if input.queue {
             let Some(at) = queue::pick(&txn, set).await? else {
                 return Ok(queue_empty());

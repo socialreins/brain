@@ -31,7 +31,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/health` | `{"status":"ok"}` |
 | GET | `/version` | `{"commit":"<sha>"}`, from `RAILWAY_GIT_COMMIT_SHA`, `dev` locally |
 | GET | `/openapi.json` | OpenAPI document for `/v1` |
-| POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, posting queues, accounts, posts (with `approve-post`, `reject-post`, `set-post-repeat` and `clear-post-repeat`, write tools), lists, the media library (`list-media`, `add-media`) and snippets (`list-snippets`, `save-snippet` creating or, with an `id`, replacing, `delete-snippet`). Bearer API token only, same scope and per-token limit as `/v1`, bodies up to 64 KiB; `Idempotency-Key` does not apply. `create-post` and `create-post-group` take `validate_only` (see "Validate only"), which a read-only token may send |
+| POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, posting queues, accounts, posts (with `approve-post`, `reject-post`, `set-post-repeat` and `clear-post-repeat`, write tools), lists, the media library (`list-media`, `add-media`), feeds (`list-feeds`, `add-feed`, `remove-feed`) and snippets (`list-snippets`, `save-snippet` creating or, with an `id`, replacing, `delete-snippet`). Bearer API token only, same scope and per-token limit as `/v1`, bodies up to 64 KiB; `Idempotency-Key` does not apply. `create-post` and `create-post-group` take `validate_only` (see "Validate only"), which a read-only token may send |
 | POST | `/v1/waitlist` | `{"email":"...","source":"..."}` joins the waitlist and emails a confirmation link |
 | POST | `/v1/waitlist/verify` | `{"token"}` from the emailed link: marks the signup verified, `200 {"status":"verified"}`, else `422 {"error":"invalid_link"}` |
 | GET | `/v1/waitlist/count` | `{"count":n}`: every signup, verified or not, cached for 30 seconds |
@@ -112,6 +112,9 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | PUT | `/v1/lists/{id}/order` | Reorder (`{"post_ids"}`: every post of the list once, else `422 invalid_order`) |
 | GET, POST | `/v1/media-library` | The team's media library, newest first: `{"items":[{"id","url","name","created_at","created_by"}],"next_cursor"}` (`?q=&cursor=&limit=`: `q` searches name and URL in any case, wildcards matched as typed; `limit` 1 to 100, default 50; `created_by` is `null` for a token). Add one (`{"url","name"}`, `201`): `url` a public `https://` URL up to 2048 bytes with no user or password, `name` trimmed up to 100 characters, by default the URL's last path segment decoded. `422 {"error":"invalid_media","field"}`, `409 {"error":"already_in_library","id"}` for a URL the team has, `422 library_full` past 1000 items |
 | PATCH, DELETE | `/v1/media-library/{id}` | Rename (`{"name"}`, `200` with the item); remove (`204`). Posts keep their media URLs |
+| GET, POST | `/v1/feeds` | The team's RSS and Atom feeds, oldest first, as an array of `{"id","url","social_set_id","platforms":[..],"template","mode":"draft"\|"queue"\|"now","active","last_checked_at","last_error","items_posted","created_at"}`. Add one (`{"url","social_set_id","platforms","template","mode"}`, `201`; owner, admin or a full token): see [Feeds](#feeds). `422 {"error":"invalid_feed","field"}`, `422 {"error":"platform_not_supported","platform"}` for TikTok and YouTube, `422 {"error":"feed_unreadable","reason"}`, `422 too_many_feeds` past 20 |
+| GET, PUT, DELETE | `/v1/feeds/{id}` | One feed; replace it (the same fields and `active`, `200`); remove it (`204`, its posts stay). Another team's id is `404` |
+| POST | `/v1/feeds/{id}/check` | Check the feed now and answer it (`200`). At most once a minute per feed, every other check included: `429 checked_recently` |
 | GET, POST | `/v1/snippets` | Saved captions and hashtag sets by name, ignoring case: `{"items":[{"id","kind","name","body","created_at","updated_at"}]}` (`?kind=caption` or `hashtags`). Save one (`{"kind","name","body"}`, `201`): `name` trimmed 1 to 80 characters, unique per team and kind ignoring case (`409 snippet_name_taken`), `body` 1 to 5000 characters. `422 {"error":"invalid_snippet","field"}`, `422 too_many_snippets` past 500 per team |
 | PUT, DELETE | `/v1/snippets/{id}` | Replace kind, name and body, checked as on create (`200`); delete (`204`) |
 | GET, POST | `/v1/inboxes` | The team's inboxes, the undeletable "All" first, each with `open_count` (its `open` items, follows left out; in the list only); create one (`{"name","filters":{"social_set_id"\|"account_ids","kinds","platforms","keywords","unanswered"}}`, owner, admin) |
@@ -672,6 +675,40 @@ t, v1 = (p.split("=", 1)[1] for p in header.split(","))
 mac = hmac.new(secret.encode(), f"{t}.".encode() + raw_body, hashlib.sha256).hexdigest()
 assert hmac.compare_digest(mac, v1) and abs(time.time() - int(t)) < 300
 ```
+
+## Feeds
+
+A feed (`/v1/feeds`) is an RSS 2.0 or Atom URL whose new items become posts on their own. Every
+member and a read-only token read feeds; only owners, admins and full tokens write them, since a
+feed posts without anyone looking. A set token sees and writes the feeds of its own set.
+
+- `url`: a public `https://` URL up to 2048 characters, no user or password. `platforms`: not
+  empty, each one the set has an account for; TikTok and YouTube are refused (an item has no
+  video). `template`: 1 to 2000 characters, default `{title}\n{link}`, with `{title}`, `{link}`
+  and `{summary}` (the item's description as plain text, 300 characters at most). `mode`:
+  `draft`, `queue` or `now`. At most 20 feeds per team.
+- Adding a feed (or giving one a new `url`) reads it once. One that cannot be read or parsed is
+  `422 feed_unreadable` with a short `reason` (`HTTP 404`, `timed out`, `over 1 MB`,
+  `not an RSS or Atom feed`, ...). Every item it holds then is marked seen and never posted.
+- The scheduler checks each active feed every 15 minutes (`feeds::tick`, one instance at a time).
+  The read is as careful as a media download: public addresses only (names are resolved by
+  brain, so a name pointing at a private address is refused), at most 3 redirects, each checked
+  the same way, 10 seconds and 1 MB at most, and `If-None-Match` or `If-Modified-Since` when the
+  feed gave an `ETag` or `Last-Modified`.
+- An item is new when its guid (else its link) was not seen for this feed. A check posts at most
+  5 new items, oldest first; the rest wait for the next check. Each becomes one post group of
+  the feed's set and platforms: a `draft`, a post at the set's next free `queue` slot (a draft
+  when the queue has no slot, which `last_error` says), or one scheduled `now`. The template is
+  filled in per platform: over the platform's limit (X: 280) the summary is cut first, then the
+  title, never the link. The item's image (an image enclosure or `media:content`, https only)
+  is the posts' media; Instagram is left out of an item without one, and a platform that
+  refuses the item is left out while the others post.
+- A feed posts as a manager: where the team requires approval its posts are `approved`.
+- The group and the mark that the item was seen are saved in one transaction, so no item posts
+  twice. An item whose posts are all refused sets `last_error` and is tried again by the next
+  check, 3 times in all, then given up.
+- A check that cannot read or parse the feed sets `last_error`; 10 such checks in a row set
+  `active` to `false`. `PUT` with `"active": true` switches it back on.
 
 ## Approvals
 

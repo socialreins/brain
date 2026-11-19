@@ -32,6 +32,7 @@ use crate::{
     controllers::{
         api_tokens::{read_only_token, Actor},
         connections,
+        feeds::{self, FeedId, FeedInput},
         library::{self, MediaInput, MediaQuery, SnippetInput, SnippetQuery},
         lists::{self, AddPost, ListInput, Order},
         posts,
@@ -177,6 +178,9 @@ fn specs() -> Vec<(&'static str, &'static str, Value, bool)> {
         ("reorder-list", "Reorders a list: post_ids holds every post of the list, each once. Same as PUT /v1/lists/{id}/order.", schema::<Reorder>(), false),
         ("list-media", "The team's media library (saved media URLs), newest first, a page at a time; q searches names and URLs. Same as GET /v1/media-library.", schema::<MediaQuery>(), true),
         ("add-media", "Adds an https media URL to the team's media library, named by its last path segment unless name is given. Same as POST /v1/media-library.", schema::<MediaInput>(), false),
+        ("list-feeds", "The team's RSS and Atom feeds, which post their new items on their own. Same as GET /v1/feeds.", schema::<NoArgs>(), true),
+        ("add-feed", "Adds an RSS or Atom feed (https URL) whose new items are posted to the given platforms of a set: mode draft, queue or now; template with {title}, {link} and {summary}. The items it holds now are not posted. Same as POST /v1/feeds.", schema::<FeedInput>(), false),
+        ("remove-feed", "Removes a feed; the posts it made stay. Same as DELETE /v1/feeds/{id}.", schema::<FeedId>(), false),
         ("list-snippets", "The team's saved text snippets by name: kind caption or hashtags, both when absent. Same as GET /v1/snippets.", schema::<SnippetQuery>(), true),
         ("save-snippet", "Saves a caption or hashtags snippet: creates one, or with id replaces that one. Same as POST /v1/snippets and PUT /v1/snippets/{id}.", schema::<SaveSnippet>(), false),
         ("delete-snippet", "Deletes a saved snippet. Same as DELETE /v1/snippets/{id}.", schema::<SnippetId>(), false),
@@ -196,7 +200,7 @@ fn to_mcp(
             .read_only(read_only)
             .destructive(matches!(
                 name,
-                "delete-post" | "remove-post-from-list" | "delete-snippet"
+                "delete-post" | "remove-post-from-list" | "delete-snippet" | "remove-feed"
             ))
             .open_world(false),
     );
@@ -316,6 +320,15 @@ async fn run(app: &AppState, a: &Actor, name: &str, v: Value) -> Option<Response
         },
         "add-media" => match args(v) {
             Some(m) => library::add_media(app, a, m).await,
+            None => invalid("invalid_body"),
+        },
+        "list-feeds" => feeds::list_feeds(app, a).await,
+        "add-feed" => match args(v) {
+            Some(f) => feeds::add_feed(app, a, f).await,
+            None => invalid("invalid_body"),
+        },
+        "remove-feed" => match args::<FeedId>(v) {
+            Some(f) => feeds::remove_feed(app, a, f.id).await,
             None => invalid("invalid_body"),
         },
         "list-snippets" => match args(v) {

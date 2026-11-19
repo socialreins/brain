@@ -32,7 +32,7 @@ pub const MAX_BYTES: usize = socialreins_core::post::MAX_VIDEO_BYTES as usize;
 pub const MAX_STILL_BYTES: usize = socialreins_core::post::MAX_MEDIA_BYTES as usize;
 /// Files older than this whose post no longer waits to publish are deleted by the sweep.
 pub const SWEEP_DAYS: i32 = 7;
-const MAX_REDIRECTS: usize = 3;
+pub(crate) const MAX_REDIRECTS: usize = 3;
 /// A download's base time: its answer must start within it, and the whole file may take it plus
 /// the bytes that came so far at `MIN_SPEED`, so 60 s for a small image and about 3.5 minutes for
 /// 300 MB. The size a server claims earns nothing: only bytes that arrived do.
@@ -1032,7 +1032,7 @@ fn storage(e: object_store::Error) -> Fail {
 }
 
 /// The request never got an answer because `PublicOnly` refused the host.
-fn blocked(e: &reqwest::Error) -> bool {
+pub(crate) fn blocked(e: &reqwest::Error) -> bool {
     let mut cause: Option<&dyn std::error::Error> = Some(e);
     while let Some(c) = cause {
         if c.to_string()

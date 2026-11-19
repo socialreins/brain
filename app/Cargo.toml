@@ -36,6 +36,7 @@ utoipa = { version = "6", features = ["uuid", "chrono"] }
 utoipa-axum = "0.3"
 uuid = { version = "1", features = ["v5", "v7"] }
 webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation", "conditional-ui"] }
+feed-rs = { version = "3.0.0", default-features = false }
 
 [[bin]]
 name = "socialreins-brain"
