@@ -14,6 +14,8 @@ pub struct Model {
     pub public_pages: bool,
     /// Public pages offer a newsletter sign-up (`subscribers`).
     pub newsletter: bool,
+    /// A member's scheduled posts wait for an owner or admin to approve them (`posts.approval`).
+    pub require_approval: bool,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }

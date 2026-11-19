@@ -35,7 +35,7 @@ use crate::{
         library::{self, MediaInput, MediaQuery, SnippetInput, SnippetQuery},
         lists::{self, AddPost, ListInput, Order},
         posts,
-        posts::{PostGroupInput, PostInput, PostQuery},
+        posts::{Decision, PostGroupInput, PostInput, PostQuery},
         queue::{self, QueueInput},
         social_sets::{self, ListQuery},
         waitlist::error,
@@ -54,6 +54,13 @@ struct UpdatePost {
     id: Uuid,
     #[serde(flatten)]
     post: PostInput,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct Decide {
+    id: Uuid,
+    #[serde(flatten)]
+    decision: Decision,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -143,11 +150,13 @@ fn specs() -> Vec<(&'static str, &'static str, Value, bool)> {
         ("list-social-accounts", "The team's connected social accounts with their set ids. Same as GET /v1/connections.", schema::<NoArgs>(), true),
         ("get-queue", "A social set's posting queue: its IANA time_zone, weekly slots (weekday 0 is Sunday, time HH:MM) and the next 10 free slot times. Same as GET /v1/social-sets/{id}/queue.", schema::<SetId>(), true),
         ("set-queue", "Replaces a social set's posting queue: time_zone (IANA, default UTC) and up to 50 slots. Same as PUT /v1/social-sets/{id}/queue.", schema::<SetQueue>(), false),
-        ("list-posts", "The team's posts by scheduled_at, filtered by set, status and a from/to window on scheduled_at. Same as GET /v1/posts.", schema::<PostQuery>(), true),
+        ("list-posts", "The team's posts by scheduled_at, filtered by set, status, approval (pending, approved or rejected) and a from/to window on scheduled_at. Same as GET /v1/posts.", schema::<PostQuery>(), true),
         ("get-post", "One post with its targets. Same as GET /v1/posts/{id}.", schema::<PostId>(), true),
         ("create-post", "Creates a post: scheduled with scheduled_at, or at the earliest free slot of the set's queue with queue: true, else draft. With validate_only nothing is created and the answer lists every problem. Same as POST /v1/posts.", schema::<Create<PostInput>>(), false),
         ("create-post-group", "Creates one post per platform of a set (by default every platform with a connected account), with optional per-platform body and media overrides, tied by a group_id; queue: true schedules the whole group at one free slot of the set's queue; any invalid post creates nothing, unless on_invalid is skip, which leaves that platform out and lists it in skipped. With validate_only nothing is created and the answer lists every problem of every platform. Same as POST /v1/post-groups.", schema::<Create<PostGroupInput>>(), false),
         ("update-post", "Replaces a draft or scheduled post. Same as PUT /v1/posts/{id}.", schema::<UpdatePost>(), false),
+        ("approve-post", "Approves a scheduled post waiting for approval (or rejected before), with an optional note; it publishes at its time, or on the next tick when that has passed. Whole-team or set token, not read-only. Same as POST /v1/posts/{id}/approve.", schema::<Decide>(), false),
+        ("reject-post", "Rejects a scheduled post with an optional note: it is held back until approved. Same as POST /v1/posts/{id}/reject.", schema::<Decide>(), false),
         ("delete-post", "Deletes a draft or scheduled post, or takes a published one down. Same as DELETE /v1/posts/{id}.", schema::<PostId>(), false),
         ("list-lists", "The team's post lists (ordered groups of posts, such as a series), without their posts. Same as GET /v1/lists.", schema::<NoArgs>(), true),
         ("create-list", "Creates a post list, team-wide or tied to one set. Same as POST /v1/lists.", schema::<ListInput>(), false),
@@ -248,6 +257,13 @@ async fn run(app: &AppState, a: &Actor, name: &str, v: Value) -> Option<Response
         },
         "update-post" => match args::<UpdatePost>(v) {
             Some(u) => posts::update_post(app, a, u.id, u.post).await,
+            None => invalid("invalid_body"),
+        },
+        "approve-post" | "reject-post" => match args::<Decide>(v) {
+            Some(d) => {
+                let approve = name == "approve-post";
+                posts::decide_post(app, a, d.id, approve, d.decision.note).await
+            }
             None => invalid("invalid_body"),
         },
         "delete-post" => match args::<PostId>(v) {

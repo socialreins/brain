@@ -83,6 +83,12 @@ cargo run -p socialreins-brain
   at most 1000) and snippets (`snippets`, `caption` or `hashtags`, name unique per team and kind
   ignoring case, at most 500). Team assets: every member and token writes them, set tokens too,
   read-only tokens never; creates take a per-team advisory lock so the caps hold.
+- Post approvals (`teams.require_approval`, `posts.approval*`): `posts::approval_for` is the one
+  place a save decides the value (member `pending`, owner, admin or token `approved`, draft or
+  switch off null), `publish::claim` skips `pending` and `rejected` only while the team's switch
+  is on (so switching it off releases them), and `posts::decide` is the approve and reject of a
+  post or a group in one statement. A member's publish now is `403 approval_required` unless
+  the post is `approved`.
 - `app/src/webhooks.rs`: outbound webhooks. Every `post_targets` status change goes through
   `webhooks::with_event`, so its event is queued in the same statement; README documents the
   payload and signature.
