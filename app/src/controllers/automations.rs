@@ -85,13 +85,15 @@ pub struct AutomationInput {
     pub trigger: String,
     #[serde(default)]
     pub conditions: Conditions,
-    /// 1 or 2 actions, at most one of each type. Either this or `steps`: both is
+    /// 1 or 2 sends (`send_dm`, `reply_publicly`), at most one of each type, and beside them
+    /// up to 3 `tag_contact`, each tag once. Either this or `steps`: both is
     /// `422 actions_and_steps`.
     #[serde(default)]
     pub actions: Option<Vec<Action>>,
     /// A flow instead of `actions`: 1 to 10 steps run in order, each a `send_dm` (with up to 3
-    /// `buttons`), a `reply_publicly` (where the trigger takes one) or a `wait`. Never a wait
-    /// first or last (`422 invalid_steps`). A send that does not go out ends the run.
+    /// `buttons`), a `reply_publicly` (where the trigger takes one), a `wait` or a
+    /// `tag_contact`. Never a wait first or last, and at least one send (`422 invalid_steps`).
+    /// A send that does not go out ends the run.
     #[serde(default)]
     pub steps: Option<Vec<Step>>,
     /// Default `true`.

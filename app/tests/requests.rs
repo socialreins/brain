@@ -16097,6 +16097,54 @@ mod teams {
                     assert_eq!(c["author"]["name"], "Ada Fan");
                 }
 
+                /// The webhook path keeps contacts as the Bluesky poll does.
+                #[tokio::test]
+                #[serial]
+                async fn meta_items_keep_their_authors_contact() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    let comment = page_comment("101_9_5", "Love it", "777", now() - 60);
+                    assert_eq!(deliver(&s, &comment).await.status_code(), 200);
+                    let contacts = || async {
+                        let res = s
+                            .get("/v1/contacts?platform=facebook")
+                            .add_header("cookie", &cookie)
+                            .await;
+                        res.assert_status_ok();
+                        res.json::<Value>()["items"].as_array().unwrap().clone()
+                    };
+                    let first = contacts().await;
+                    assert_eq!(first.len(), 1);
+                    assert_eq!(first[0]["external_id"], "777");
+                    assert_eq!(first[0]["display_name"], "Ada Fan");
+                    assert_eq!(first[0]["first_seen_at"], first[0]["last_seen_at"]);
+
+                    // A message of the same person, and the comment delivered again.
+                    let dm = page_message("101", "m_1", "777", "hello");
+                    assert_eq!(deliver(&s, &dm).await.status_code(), 200);
+                    assert_eq!(deliver(&s, &comment).await.status_code(), 200);
+                    // The profile looked up after the 200 reaches the contact too.
+                    let named = until(|| async {
+                        Some(contacts().await).filter(|c| c[0]["avatar_url"].is_string())
+                    })
+                    .await;
+                    assert_eq!(named.len(), 1, "one contact for both items");
+                    assert_eq!(named[0]["id"], first[0]["id"]);
+                    assert_eq!(named[0]["items_count"], 2);
+                    assert_eq!(named[0]["display_name"], "Dana Doe");
+                    assert_eq!(named[0]["avatar_url"], "https://scontent.example/d.jpg");
+                    assert_eq!(named[0]["first_seen_at"], first[0]["first_seen_at"]);
+                    assert_ne!(named[0]["last_seen_at"], first[0]["last_seen_at"]);
+                    let items = stored(&db, &team_id).await;
+                    assert_eq!(items.len(), 2);
+                    let id: uuid::Uuid = first[0]["id"].as_str().unwrap().parse().unwrap();
+                    assert!(items.iter().all(|i| i.contact_id == Some(id)));
+                    let all = all_inbox_id(&s, &cookie).await;
+                    let page = inbox_items_of(&s, &cookie, &all).await;
+                    assert!(page.iter().all(|i| i["contact_id"] == first[0]["id"]));
+                }
+
                 #[tokio::test]
                 #[serial]
                 async fn instagram_comments_and_messages_land_in_the_inbox() {
@@ -18522,6 +18570,11 @@ mod teams {
                     ("/inbox-items/{id}", "get"),
                     ("/inbox-items/{id}", "patch"),
                     ("/inbox-items/{id}/reply", "post"),
+                    ("/contacts", "get"),
+                    ("/contacts/{id}", "get"),
+                    ("/contacts/{id}", "patch"),
+                    ("/contacts/{id}", "delete"),
+                    ("/contact-tags", "get"),
                     ("/automations", "get"),
                     ("/automations", "post"),
                     ("/automations/{id}", "get"),
@@ -18533,6 +18586,714 @@ mod teams {
                 ] {
                     assert!(doc["paths"][p][m].is_object(), "{p} {m}");
                 }
+            }
+
+            async fn fetch(s: &TestServer, cookie: &str, path: &str) -> Value {
+                let res = s.get(path).add_header("cookie", cookie).await;
+                assert_eq!(res.status_code(), 200, "{path}: {}", res.text());
+                res.json()
+            }
+
+            /// Two comments of fan1, one of fan2 and a DM, newest first as Bluesky lists them.
+            fn three_people(me: &str) -> Value {
+                json!({
+                    "notifications": [
+                        note("reply", "did:plc:fan2", "c2", "me too", &at(10), me),
+                        note("mention", "did:plc:fan1", "m1", "cc @me", &at(20), me),
+                        note("reply", "did:plc:fan1", "c1", "Love it", &at(30), me),
+                    ],
+                    "convos": [{"id": "cv1", "members": [
+                        {"did": me, "handle": "me.test"},
+                        {"did": "did:plc:dmer", "handle": "dmer.test", "displayName": "DMer"}],
+                        "lastMessage": {"sentAt": at(5)}}],
+                    "messages": {"cv1": [dm("msg1", "did:plc:dmer", "hello there", &at(5))]},
+                })
+            }
+
+            fn by<'a>(page: &'a Value, external_id: &str) -> &'a Value {
+                let found = page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|c| c["external_id"] == external_id);
+                found.unwrap_or_else(|| panic!("no {external_id} in {page}"))
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn every_stored_item_keeps_its_authors_contact() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
+                set_inbox(&me, three_people(&me));
+                ingest(&db, &state, &account).await;
+                ingest(&db, &state, &account).await;
+
+                let page = fetch(&s, &cookie, "/v1/contacts").await;
+                let ids: Vec<&str> = page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c["external_id"].as_str().unwrap())
+                    .collect();
+                assert_eq!(
+                    ids,
+                    ["did:plc:dmer", "did:plc:fan2", "did:plc:fan1"],
+                    "one per author, newest last_seen_at first"
+                );
+                assert!(page["next_cursor"].is_null());
+                let fan1 = by(&page, "did:plc:fan1");
+                assert_eq!(fan1["platform"], "bluesky");
+                assert_eq!(fan1["items_count"], 2);
+                assert_eq!(fan1["handle"], "m1.fan.test", "of their newest item");
+                assert_eq!(fan1["display_name"], "Fan m1");
+                assert_eq!(fan1["tags"], json!([]));
+                assert!(fan1["notes"].is_null() && fan1["avatar_url"].is_null());
+                let seen = |c: &Value, k: &str| -> chrono::DateTime<Utc> {
+                    c[k].as_str().unwrap().parse().unwrap()
+                };
+                let span = seen(fan1, "last_seen_at") - seen(fan1, "first_seen_at");
+                assert_eq!(span.num_seconds(), 10);
+                let dmer = by(&page, "did:plc:dmer");
+                assert_eq!(
+                    (&dmer["display_name"], &dmer["items_count"]),
+                    (&json!("DMer"), &json!(1))
+                );
+                let fan1 = fan1["id"].as_str().unwrap().to_owned();
+                let fan2 = by(&page, "did:plc:fan2")["id"].as_str().unwrap().to_owned();
+
+                // Items name their contact.
+                let all = all_inbox(&s, &cookie).await;
+                let all_id = all["id"].as_str().unwrap();
+                let listed = items(&s, &cookie, all_id, "").await;
+                for i in listed["items"].as_array().unwrap() {
+                    let author = i["author"]["id"].as_str().unwrap();
+                    assert_eq!(i["contact_id"], by(&page, author)["id"], "{i}");
+                    assert_eq!(i["contact_tags"], json!([]));
+                    assert!(i["assigned_to"].is_null());
+                }
+
+                // Any member writes notes and tags; tags are a set, trimmed and lowercased.
+                let (member, _) = joined(&s, &db, &team_id, "member").await;
+                let path = format!("/v1/contacts/{fan1}");
+                let res = req(&s, Method::PATCH, &path, &member)
+                    .json(&json!({"notes": "Met at the conf", "tags": [" VIP ", "vip", "Lead"]}))
+                    .await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                let saved = res.json::<Value>();
+                assert_eq!(saved["tags"], json!(["lead", "vip"]));
+                assert_eq!(saved["notes"], "Met at the conf");
+                assert_eq!(saved["items_count"], 2);
+                let many: Vec<String> = (0..21).map(|n| format!("t{n}")).collect();
+                for (body, field) in [
+                    (json!({"notes": "n".repeat(2001)}), "notes"),
+                    (json!({"tags": ["a,b"]}), "tags"),
+                    (json!({"tags": ["a\tb"]}), "tags"),
+                    (json!({"tags": ["vi\u{200B}p"]}), "tags"),
+                    (json!({"tags": ["\u{202E}vip"]}), "tags"),
+                    (json!({"tags": [" "]}), "tags"),
+                    (json!({"tags": ["t".repeat(31)]}), "tags"),
+                    (json!({"tags": many}), "tags"),
+                ] {
+                    let res = req(&s, Method::PATCH, &path, &cookie).json(&body).await;
+                    assert_eq!(res.status_code(), 422, "{field}");
+                    res.assert_json(&json!({"error": "invalid_contact", "field": field}));
+                }
+                let res = req(&s, Method::PATCH, &path, &cookie)
+                    .json(&json!({"name": "x"}))
+                    .await;
+                assert_eq!(res.status_code(), 422);
+                // Each field alone leaves the other; 2000 characters and 20 tags fit.
+                let res = req(&s, Method::PATCH, &path, &cookie)
+                    .json(&json!({"notes": "n".repeat(2000)}))
+                    .await;
+                assert_eq!(res.json::<Value>()["tags"], json!(["lead", "vip"]));
+                let res = req(&s, Method::PATCH, &path, &cookie)
+                    .json(&json!({"tags": many[..20]}))
+                    .await;
+                let v = res.json::<Value>();
+                assert_eq!(v["tags"].as_array().unwrap().len(), 20);
+                assert_eq!(v["notes"].as_str().unwrap().len(), 2000);
+                let res = req(&s, Method::PATCH, &path, &cookie)
+                    .json(&json!({"notes": null, "tags": ["vip", "lead"]}))
+                    .await;
+                let v = res.json::<Value>();
+                assert!(v["notes"].is_null());
+                assert_eq!(v["tags"], json!(["lead", "vip"]));
+                let res = req(&s, Method::PATCH, &format!("/v1/contacts/{fan2}"), &cookie)
+                    .json(&json!({"tags": ["vip"]}))
+                    .await;
+                assert_eq!(res.status_code(), 200);
+
+                // Tags by count, then name.
+                let tags = fetch(&s, &cookie, "/v1/contact-tags").await;
+                assert_eq!(
+                    tags,
+                    json!([{"tag": "vip", "count": 2}, {"tag": "lead", "count": 1}])
+                );
+
+                // Search, tag, platform and paging.
+                let count = |v: &Value| v["items"].as_array().unwrap().len();
+                for (query, n) in [
+                    ("?q=FAN", 2),
+                    ("?q=%20dmer%20", 1),
+                    ("?q=50%25", 0),
+                    ("?q=_", 0),
+                    ("?tag=vip", 2),
+                    ("?tag=%20Lead", 1),
+                    ("?tag=none", 0),
+                    ("?platform=bluesky", 3),
+                    ("?platform=facebook", 0),
+                    ("?q=fan&tag=vip&platform=bluesky&limit=100", 2),
+                ] {
+                    let got = fetch(&s, &cookie, &format!("/v1/contacts{query}")).await;
+                    assert_eq!(count(&got), n, "{query}");
+                }
+                for bad in [
+                    "?platform=myspace",
+                    "?limit=0",
+                    "?limit=101",
+                    "?tag=a%2Cb",
+                    "?q=%20",
+                    "?cursor=x",
+                ] {
+                    let res = s
+                        .get(&format!("/v1/contacts{bad}"))
+                        .add_header("cookie", &cookie)
+                        .await;
+                    assert_eq!(res.status_code(), 422, "{bad}");
+                    res.assert_json(&json!({"error": "invalid_query"}));
+                }
+                let p1 = fetch(&s, &cookie, "/v1/contacts?limit=2").await;
+                assert_eq!(count(&p1), 2);
+                let cursor = p1["next_cursor"].as_str().unwrap();
+                assert_ne!(cursor, fan2, "opaque");
+                let p2 = fetch(
+                    &s,
+                    &cookie,
+                    &format!("/v1/contacts?limit=2&cursor={cursor}"),
+                )
+                .await;
+                assert_eq!(count(&p2), 1);
+                assert_eq!(p2["items"][0]["id"], fan1.as_str());
+                assert!(p2["next_cursor"].is_null());
+
+                // One contact, with its latest items as the inbox lists them.
+                let one = fetch(&s, &member, &path).await;
+                assert_eq!(one["tags"], json!(["lead", "vip"]));
+                let recent = one["recent"].as_array().unwrap();
+                let kinds: Vec<&str> = recent.iter().map(|i| i["kind"].as_str().unwrap()).collect();
+                assert_eq!(kinds, ["mention", "comment"]);
+                assert_eq!(recent[0]["contact_tags"], json!(["lead", "vip"]));
+                assert_eq!(recent[0]["contact_id"], fan1.as_str());
+                assert!(recent[0]["replies"].is_array());
+
+                // The inbox narrows by a contact's tag.
+                let vip = items(&s, &cookie, all_id, "?tag=vip").await;
+                assert_eq!(count(&vip), 3);
+                let lead = items(&s, &cookie, all_id, "?tag=LEAD&kind=mention").await;
+                assert_eq!(count(&lead), 1);
+                assert_eq!(count(&items(&s, &cookie, all_id, "?tag=none").await), 0);
+                let res = s
+                    .get(&format!("/v1/inboxes/{all_id}/items?tag=a%2Cb"))
+                    .add_header("cookie", &cookie)
+                    .await;
+                assert_eq!(res.status_code(), 422);
+
+                // Another team sees none of it; like the inbox, the routes take no API token.
+                let (_, stranger, _) = user(&s, &db).await;
+                assert_eq!(count(&fetch(&s, &stranger, "/v1/contacts").await), 0);
+                assert_eq!(fetch(&s, &stranger, "/v1/contact-tags").await, json!([]));
+                let res = s.get(&path).add_header("cookie", &stranger).await;
+                assert_eq!(res.status_code(), 404);
+                let res = req(&s, Method::PATCH, &path, &stranger)
+                    .json(&json!({"tags": []}))
+                    .await;
+                assert_eq!(res.status_code(), 404);
+                let gone = format!("/v1/contacts/{}", uuid::Uuid::now_v7());
+                let res = s.get(&gone).add_header("cookie", &cookie).await;
+                assert_eq!(res.status_code(), 404);
+                let res = req(&s, Method::POST, "/v1/api-tokens", &cookie)
+                    .json(&json!({"name": "t", "read_only": true}))
+                    .await;
+                let secret = res.json::<Value>()["secret"].as_str().unwrap().to_owned();
+                for p in [
+                    "/v1/contacts",
+                    "/v1/contact-tags",
+                    "/v1/inboxes",
+                    path.as_str(),
+                ] {
+                    let res = s
+                        .get(p)
+                        .add_header("authorization", format!("Bearer {secret}"))
+                        .await;
+                    assert_eq!(res.status_code(), 401, "{p}");
+                }
+                let res = s.get("/v1/contacts").await;
+                assert_eq!(res.status_code(), 401);
+                let res = s
+                    .method(Method::PATCH, &path)
+                    .add_header("cookie", &cookie)
+                    .json(&json!({"tags": []}))
+                    .await;
+                assert_eq!(res.status_code(), 403, "a write needs the web origin");
+            }
+
+            /// A person's data goes with their contact (owners and admins), and with the last
+            /// account they wrote to. Pages hold while contacts move between them.
+            #[tokio::test]
+            #[serial]
+            async fn contacts_are_deleted_and_pages_hold_when_one_moves() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
+                set_inbox(&me, three_people(&me));
+                ingest(&db, &state, &account).await;
+                let ids = |v: &Value| -> Vec<String> {
+                    let list = v["items"].as_array().unwrap().iter();
+                    list.map(|c| c["external_id"].as_str().unwrap().to_owned())
+                        .collect()
+                };
+
+                // fan2, the last of page one, writes again before page two is read: page two
+                // still starts after where page one ended, and repeats nobody.
+                let p1 = fetch(&s, &cookie, "/v1/contacts?limit=2").await;
+                assert_eq!(ids(&p1), ["did:plc:dmer", "did:plc:fan2"]);
+                let cursor = p1["next_cursor"].as_str().unwrap().to_owned();
+                let again = note("reply", "did:plc:fan2", "c3", "and again", &at(-2), &me);
+                set_inbox(&me, json!({"notifications": [again]}));
+                ingest(&db, &state, &account).await;
+                let p2 = fetch(
+                    &s,
+                    &cookie,
+                    &format!("/v1/contacts?limit=2&cursor={cursor}"),
+                )
+                .await;
+                assert_eq!(ids(&p2), ["did:plc:fan1"]);
+                assert!(p2["next_cursor"].is_null());
+                let all = fetch(&s, &cookie, "/v1/contacts").await;
+                assert_eq!(ids(&all)[0], "did:plc:fan2", "first on a fresh read");
+
+                // Only owners and admins delete; another team finds nothing.
+                let fan1 = by(&all, "did:plc:fan1")["id"].as_str().unwrap().to_owned();
+                let path = format!("/v1/contacts/{fan1}");
+                let res = req(&s, Method::PATCH, &path, &cookie)
+                    .json(&json!({"notes": "private", "tags": ["vip"]}))
+                    .await;
+                assert_eq!(res.status_code(), 200);
+                let (member, _) = joined(&s, &db, &team_id, "member").await;
+                let res = req(&s, Method::DELETE, &path, &member).await;
+                assert_eq!(res.status_code(), 403);
+                let (_, stranger, _) = user(&s, &db).await;
+                let res = req(&s, Method::DELETE, &path, &stranger).await;
+                assert_eq!(res.status_code(), 404);
+                let res = s
+                    .method(Method::DELETE, &path)
+                    .add_header("cookie", &cookie)
+                    .await;
+                assert_eq!(res.status_code(), 403, "a write needs the web origin");
+                let (admin, _) = joined(&s, &db, &team_id, "admin").await;
+                let res = req(&s, Method::DELETE, &path, &admin).await;
+                assert_eq!(res.status_code(), 204, "{}", res.text());
+                let res = req(&s, Method::DELETE, &path, &cookie).await;
+                assert_eq!(res.status_code(), 404);
+                let res = s.get(&path).add_header("cookie", &cookie).await;
+                assert_eq!(res.status_code(), 404);
+                assert_eq!(fetch(&s, &cookie, "/v1/contact-tags").await, json!([]));
+                // Their items stay, without a contact; tagging one does nothing.
+                let inbox = all_inbox(&s, &cookie).await;
+                let listed = items(&s, &cookie, inbox["id"].as_str().unwrap(), "").await;
+                let theirs: Vec<&Value> = listed["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|i| i["author"]["id"] == "did:plc:fan1")
+                    .collect();
+                assert_eq!(theirs.len(), 2);
+                for i in &theirs {
+                    assert!(i["contact_id"].is_null(), "{i}");
+                    assert_eq!(i["contact_tags"], json!([]));
+                }
+                let gone = inbox::add_tag(&db, fan1.parse().unwrap(), "vip").await;
+                assert_eq!(gone.unwrap(), Some("no_contact"));
+                // A later item of theirs makes a new contact, with nothing of the old one.
+                let back = note("reply", "did:plc:fan1", "c9", "hello again", &at(-3), &me);
+                set_inbox(&me, json!({"notifications": [back]}));
+                ingest(&db, &state, &account).await;
+                let all = fetch(&s, &cookie, "/v1/contacts").await;
+                let fresh = by(&all, "did:plc:fan1");
+                assert_ne!(fresh["id"], fan1.as_str());
+                assert_eq!(fresh["items_count"], 1);
+                assert_eq!(fresh["tags"], json!([]));
+                assert!(fresh["notes"].is_null());
+                assert_eq!(fresh["first_seen_at"], fresh["last_seen_at"]);
+
+                // fan2 also wrote to a second account. Disconnecting the first takes its items
+                // and the contacts left with none; fan2 stays, with the one item left.
+                let res = connect(&s, &cookie, &new_handle(), DM_APP_PASSWORD).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let second = res.json::<Value>();
+                let (other, me2) = (
+                    second["id"].as_str().unwrap(),
+                    second["external_id"].as_str().unwrap(),
+                );
+                let there = note("reply", "did:plc:fan2", "d1", "over here", &at(-4), me2);
+                set_inbox(me2, json!({"notifications": [there]}));
+                ingest(&db, &state, other).await;
+                assert_eq!(
+                    by(&fetch(&s, &cookie, "/v1/contacts").await, "did:plc:fan2")["items_count"],
+                    3
+                );
+                let res = req(
+                    &s,
+                    Method::DELETE,
+                    &format!("/v1/connections/{account}"),
+                    &cookie,
+                )
+                .await;
+                assert_eq!(res.status_code(), 204, "{}", res.text());
+                let left = fetch(&s, &cookie, "/v1/contacts").await;
+                assert_eq!(ids(&left), ["did:plc:fan2"]);
+                assert_eq!(left["items"][0]["items_count"], 1);
+                let res = req(
+                    &s,
+                    Method::DELETE,
+                    &format!("/v1/connections/{other}"),
+                    &cookie,
+                )
+                .await;
+                assert_eq!(res.status_code(), 204);
+                assert_eq!(fetch(&s, &cookie, "/v1/contacts").await["items"], json!([]));
+            }
+
+            /// The migration's backfill, run on items stored before there were contacts.
+            #[tokio::test]
+            #[serial]
+            async fn the_backfill_gives_old_items_their_contacts() {
+                use migration::m20261205_000001_contacts::{BACKFILL_CONTACTS, BACKFILL_ITEMS};
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
+                set_inbox(&me, three_people(&me));
+                ingest(&db, &state, &account).await;
+                let before = fetch(&s, &cookie, "/v1/contacts").await;
+                // As it was before the migration: no contacts, and the newest item of fan1
+                // came without a handle.
+                exec(
+                    &db,
+                    &format!("DELETE FROM contacts WHERE team_id = '{team_id}'"),
+                )
+                .await;
+                let sql = format!(
+                    "UPDATE inbox_items SET author_handle = NULL WHERE team_id = '{team_id}' \
+                     AND kind = 'mention'"
+                );
+                exec(&db, &sql).await;
+                let orphans = || async {
+                    inbox_items::Entity::find()
+                        .filter(inbox_items::Column::ContactId.is_null())
+                        .count(&db)
+                        .await
+                        .unwrap()
+                };
+                assert_eq!(orphans().await, 4, "the foreign key let the items go");
+                assert_eq!(fetch(&s, &cookie, "/v1/contacts").await["items"], json!([]));
+
+                for _ in 0..2 {
+                    exec(&db, BACKFILL_CONTACTS).await;
+                    exec(&db, BACKFILL_ITEMS).await;
+                }
+                assert_eq!(orphans().await, 0);
+                let after = fetch(&s, &cookie, "/v1/contacts").await;
+                assert_eq!(
+                    after["items"].as_array().unwrap().len(),
+                    3,
+                    "run twice, made once"
+                );
+                for was in before["items"].as_array().unwrap() {
+                    let now = by(&after, was["external_id"].as_str().unwrap());
+                    for k in [
+                        "platform",
+                        "display_name",
+                        "first_seen_at",
+                        "last_seen_at",
+                        "items_count",
+                    ] {
+                        assert_eq!(now[k], was[k], "{k} of {was}");
+                    }
+                }
+                let fan1 = by(&after, "did:plc:fan1");
+                assert_eq!(
+                    fan1["handle"], "c1.fan.test",
+                    "the newest handle that was given"
+                );
+                assert_eq!(fan1["display_name"], "Fan m1");
+                let one = fetch(
+                    &s,
+                    &cookie,
+                    &format!("/v1/contacts/{}", fan1["id"].as_str().unwrap()),
+                )
+                .await;
+                assert_eq!(one["recent"].as_array().unwrap().len(), 2);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn items_are_assigned_to_members_until_they_leave() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
+                set_inbox(&me, three_people(&me));
+                ingest(&db, &state, &account).await;
+                let all = all_inbox(&s, &cookie).await;
+                let all_id = all["id"].as_str().unwrap();
+                let listed = items(&s, &cookie, all_id, "").await;
+                let ids: Vec<&str> = listed["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| i["id"].as_str().unwrap())
+                    .collect();
+                let (member, member_id) = joined(&s, &db, &team_id, "member").await;
+                let me_json = fetch(&s, &cookie, "/auth/me").await;
+                let name = fetch(&s, &member, "/auth/me").await["name"].clone();
+                let patch = |cookie: &str, item: &str, body: Value| {
+                    req(
+                        &s,
+                        Method::PATCH,
+                        &format!("/v1/inbox-items/{item}"),
+                        cookie,
+                    )
+                    .json(&body)
+                };
+
+                // A member assigns, to themselves or anyone in the team, with the state or alone.
+                let res = patch(&member, ids[0], json!({"assigned_to": member_id})).await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                let v = res.json::<Value>();
+                assert_eq!(v["assigned_to"], json!({"id": member_id, "name": name}));
+                assert_eq!(v["state"], "open");
+                let res = patch(
+                    &member,
+                    ids[1],
+                    json!({"state": "done", "assigned_to": me_json["id"]}),
+                )
+                .await;
+                let v = res.json::<Value>();
+                assert_eq!(
+                    (&v["state"], &v["assigned_to"]["id"]),
+                    (&json!("done"), &me_json["id"])
+                );
+                let res = patch(&cookie, ids[1], json!({"state": "open"})).await;
+                assert_eq!(
+                    res.json::<Value>()["assigned_to"]["id"],
+                    me_json["id"],
+                    "kept"
+                );
+                let (_, _, stranger_id) = user(&s, &db).await;
+                for (body, code) in [
+                    (json!({"assigned_to": stranger_id}), "invalid_assignee"),
+                    (
+                        json!({"assigned_to": uuid::Uuid::now_v7()}),
+                        "invalid_assignee",
+                    ),
+                    (
+                        json!({"state": "closed", "assigned_to": member_id}),
+                        "invalid_state",
+                    ),
+                    (json!({}), "invalid_body"),
+                    (json!({"assigned_to": "me"}), "invalid_body"),
+                    (json!({"assignee": member_id}), "invalid_body"),
+                ] {
+                    let res = patch(&cookie, ids[2], body.clone()).await;
+                    assert_eq!(res.status_code(), 422, "{body}");
+                    res.assert_json(&json!({"error": code}));
+                }
+                let gone = uuid::Uuid::now_v7().to_string();
+                let res = patch(&cookie, &gone, json!({"assigned_to": member_id})).await;
+                assert_eq!(res.status_code(), 404);
+
+                // The inbox narrows by assignee.
+                let of = |v: Value| -> Vec<String> {
+                    let list = v["items"].as_array().unwrap().iter();
+                    list.map(|i| i["id"].as_str().unwrap().to_owned()).collect()
+                };
+                assert_eq!(
+                    of(items(&s, &member, all_id, "?assigned=me").await),
+                    [ids[0]]
+                );
+                assert_eq!(
+                    of(items(&s, &cookie, all_id, "?assigned=me").await),
+                    [ids[1]]
+                );
+                let theirs = format!("?assigned={member_id}");
+                assert_eq!(of(items(&s, &cookie, all_id, &theirs).await), [ids[0]]);
+                let free = of(items(&s, &cookie, all_id, "?assigned=none").await);
+                assert_eq!(free, [ids[2], ids[3]]);
+                let res = s
+                    .get(&format!("/v1/inboxes/{all_id}/items?assigned=nobody"))
+                    .add_header("cookie", &cookie)
+                    .await;
+                assert_eq!(res.status_code(), 422);
+                let one = fetch(&s, &cookie, &format!("/v1/inbox-items/{}", ids[0])).await;
+                assert_eq!(one["assigned_to"]["id"], json!(member_id));
+
+                // `null` frees an item; so does the member leaving the team.
+                let res = patch(&cookie, ids[1], json!({"assigned_to": null})).await;
+                assert!(res.json::<Value>()["assigned_to"].is_null());
+                let path = format!("/v1/team/members/{member_id}");
+                let res = req(&s, Method::DELETE, &path, &cookie).await;
+                assert_eq!(res.status_code(), 204, "{}", res.text());
+                let one = fetch(&s, &cookie, &format!("/v1/inbox-items/{}", ids[0])).await;
+                assert!(one["assigned_to"].is_null());
+                assert_eq!(
+                    of(items(&s, &cookie, all_id, "?assigned=none").await).len(),
+                    4
+                );
+                let res = patch(&cookie, ids[0], json!({"assigned_to": member_id})).await;
+                res.assert_json(&json!({"error": "invalid_assignee"}));
+            }
+
+            /// `tag_contact` beside the sends of an automation and as a step of a flow: it tags
+            /// the author's contact, takes no daily hit, and says so in the run.
+            #[tokio::test]
+            #[serial]
+            async fn automations_tag_the_contact_without_a_daily_hit() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
+                let tag = |t: &str| json!({"type": "tag_contact", "tag": t});
+                let hi = json!({"type": "send_dm", "text": "Hi"});
+                for (body, code) in [
+                    (json!({"actions": [tag("lead")]}), "invalid_actions"),
+                    (
+                        json!({"actions": [hi, tag("a"), tag("A ")]}),
+                        "invalid_actions",
+                    ),
+                    (
+                        json!({"actions": [hi, tag("a"), tag("b"), tag("c"), tag("d")]}),
+                        "invalid_actions",
+                    ),
+                    (json!({"actions": [hi, tag("a,b")]}), "invalid_actions"),
+                    (
+                        json!({"actions": [hi, {"type": "tag_contact"}]}),
+                        "invalid_body",
+                    ),
+                    (json!({"steps": [tag("lead")]}), "invalid_steps"),
+                    (
+                        json!({"steps": [tag("lead"), {"type": "wait", "minutes": 1}, tag("x")]}),
+                        "invalid_steps",
+                    ),
+                    (json!({"steps": [hi, tag(" ")]}), "invalid_steps"),
+                ] {
+                    let mut body = body;
+                    body["name"] = json!("x");
+                    body["trigger"] = json!("dm_received");
+                    let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                        .json(&body)
+                        .await;
+                    assert_eq!(res.status_code(), 422, "{body}");
+                    assert_eq!(res.json::<Value>()["error"], code, "{body}");
+                }
+                // Every trigger takes one beside a send.
+                let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                    .json(
+                        &json!({"name": "Fans", "trigger": "new_follower", "active": false,
+                        "actions": [hi, tag("fan"), tag("b"), tag("c")]}),
+                    )
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+
+                let plain = json!({"name": "Leads", "trigger": "dm_received",
+                    "actions": [tag("  Lead "), hi]});
+                let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                    .json(&plain)
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let v = res.json::<Value>();
+                assert_eq!(v["actions"][0], tag("lead"), "stored as contacts keep it");
+                let plain = v["id"].as_str().unwrap().to_owned();
+                let steps = json!([tag("Flow"), {"type": "send_dm", "text": "Yo"}, tag("lead")]);
+                let flowed = automation(&s, &cookie, flow("Tagging flow", steps)).await;
+
+                let convo = format!("cv-tag-{me}");
+                set_inbox(&me, start_dm(&me, &convo));
+                ingest(&db, &state, &account).await;
+                ingest(&db, &state, &account).await;
+                assert_eq!(sent_to(&convo), ["Hi", "Yo"]);
+                let flo = fetch(&s, &cookie, "/v1/contacts?q=flo").await["items"][0].clone();
+                assert_eq!(flo["tags"], json!(["flow", "lead"]));
+                let result = |kind: &str, status: &str, reason: Value| json!({"type": kind, "status": status, "reason": reason});
+                let shape = |run: &Value| -> Vec<Value> {
+                    let list = run["results"].as_array().unwrap().iter();
+                    list.map(|r| {
+                        result(
+                            r["type"].as_str().unwrap(),
+                            r["status"].as_str().unwrap(),
+                            r["reason"].clone(),
+                        )
+                    })
+                    .collect()
+                };
+                let got = runs(&s, &cookie, &plain).await;
+                assert_eq!(got.len(), 1, "{got:?}");
+                assert_eq!(got[0]["status"], "sent");
+                assert_eq!(
+                    shape(&got[0]),
+                    [
+                        result("tag_contact", "done", Value::Null),
+                        result("send_dm", "sent", Value::Null)
+                    ]
+                );
+                let got = runs(&s, &cookie, &flowed).await;
+                assert_eq!(got.len(), 1, "{got:?}");
+                assert_eq!(
+                    (&got[0]["status"], &got[0]["step_index"]),
+                    (&json!("sent"), &json!(2))
+                );
+                assert_eq!(
+                    shape(&got[0]),
+                    [
+                        result("tag_contact", "done", Value::Null),
+                        result("send_dm", "sent", Value::Null),
+                        result("tag_contact", "skipped", json!("already_tagged")),
+                    ]
+                );
+                let bucket = format!("automation:team:{team_id}");
+                let hits = || async {
+                    let stmt = sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Postgres,
+                        "SELECT count(*) AS n FROM rate_limit_hits WHERE bucket = $1",
+                        [bucket.clone().into()],
+                    );
+                    let row = sea_orm::ConnectionTrait::query_one_raw(&db, stmt).await;
+                    row.unwrap().unwrap().try_get::<i64>("", "n").unwrap()
+                };
+                assert_eq!(hits().await, 2, "one per send, none for a tag");
+
+                // A contact with 20 tags takes no more, and the DM still goes.
+                let full: Vec<String> = (0..20).map(|n| format!("t{n}")).collect();
+                let path = format!("/v1/contacts/{}", flo["id"].as_str().unwrap());
+                let res = req(&s, Method::PATCH, &path, &cookie)
+                    .json(&json!({"tags": full}))
+                    .await;
+                assert_eq!(res.status_code(), 200);
+                let mut next = start_dm(&me, &convo);
+                next["messages"][&convo] = json!([dm("start2", "did:plc:flo", "again", &at(-7))]);
+                set_inbox(&me, next);
+                ingest(&db, &state, &account).await;
+                let got = runs(&s, &cookie, &plain).await;
+                assert_eq!(got.len(), 2, "{got:?}");
+                assert_eq!(got[0]["status"], "sent");
+                assert_eq!(
+                    shape(&got[0]),
+                    [
+                        result("tag_contact", "skipped", json!("tag_limit")),
+                        result("send_dm", "sent", Value::Null),
+                    ]
+                );
+                assert_eq!(
+                    fetch(&s, &cookie, &path).await["tags"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    20
+                );
             }
 
             /// Reads the real Bluesky test account's notifications and DMs, read-only. Needs
@@ -21537,6 +22298,43 @@ mod teams {
                             .await;
                         assert_eq!(res.status_code(), 404);
                     }
+                }
+
+                /// A saved reply is a snippet of kind `reply`, under the same rules.
+                #[tokio::test]
+                #[serial]
+                async fn saved_replies_are_snippets_of_their_own_kind() {
+                    let (s, db) = on_mock(120).await;
+                    let (_, owner, _) = user(&s, &db).await;
+                    let made = |kind: &str, name: &str| json!({"kind": kind, "name": name, "body": "Thanks {name}!"});
+                    let res = snippet(&s, &owner, made("reply", " Thanks ")).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let v = res.json::<Value>();
+                    assert_eq!(
+                        (&v["kind"], &v["name"]),
+                        (&json!("reply"), &json!("Thanks"))
+                    );
+                    let res = snippet(&s, &owner, made("reply", "THANKS")).await;
+                    assert_eq!(res.status_code(), 409);
+                    let res = snippet(&s, &owner, made("caption", "Thanks")).await;
+                    assert_eq!(res.status_code(), 201, "same name, other kind");
+                    let replies = snippets(&s, &owner, "?kind=reply").await;
+                    assert_eq!(replies["items"].as_array().unwrap().len(), 1);
+                    assert_eq!(replies["items"][0]["id"], v["id"]);
+                    assert_eq!(
+                        snippets(&s, &owner, "").await["items"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        2
+                    );
+                    let path = format!("/v1/snippets/{}", v["id"].as_str().unwrap());
+                    let res = req(&s, Method::PUT, &path, &owner)
+                        .json(&json!({"kind": "reply", "name": "Thanks", "body": " "}))
+                        .await;
+                    res.assert_json(&json!({"error": "invalid_snippet", "field": "body"}));
+                    let res = req(&s, Method::DELETE, &path, &owner).await;
+                    assert_eq!(res.status_code(), 204);
                 }
 
                 #[tokio::test]

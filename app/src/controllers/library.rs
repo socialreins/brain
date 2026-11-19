@@ -38,7 +38,7 @@ use crate::{
 
 /// Most media items a team keeps.
 pub const MAX_MEDIA: u64 = 1000;
-/// Most snippets a team keeps, of both kinds.
+/// Most snippets a team keeps, of all kinds.
 pub const MAX_SNIPPETS: u64 = 500;
 const MAX_MEDIA_NAME: usize = 100;
 const MAX_SNIPPET_NAME: usize = 80;
@@ -98,7 +98,7 @@ pub struct MediaName {
 #[derive(Serialize, ToSchema)]
 pub struct Snippet {
     pub id: Uuid,
-    /// `caption` or `hashtags`.
+    /// `caption`, `hashtags` or `reply` (a saved inbox reply).
     pub kind: String,
     pub name: String,
     pub body: String,
@@ -115,13 +115,13 @@ pub struct SnippetList {
 #[derive(Deserialize, IntoParams, JsonSchema)]
 #[into_params(parameter_in = Query)]
 pub struct SnippetQuery {
-    /// `caption` or `hashtags`; both when absent.
+    /// `caption`, `hashtags` or `reply`; all when absent.
     pub kind: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema, JsonSchema)]
 pub struct SnippetInput {
-    /// Required: `caption` or `hashtags`.
+    /// Required: `caption`, `hashtags` or `reply` (a saved inbox reply).
     #[serde(default)]
     pub kind: String,
     /// Required: trimmed, 1 to 80 characters, unique per team and kind ignoring case.
@@ -405,7 +405,7 @@ async fn media_destroy(State(app): State<AppState>, a: Actor, Path(id): Path<Uui
     }
 }
 
-/// The team's snippets by name, of one `kind` or both.
+/// The team's snippets by name, of one `kind` or all.
 #[utoipa::path(get, path = "/snippets", tag = "library",
     security(("session" = []), ("api_token" = [])), params(SnippetQuery),
     responses((status = 200, body = SnippetList), (status = 401, body = Error),
@@ -422,7 +422,7 @@ async fn snippet_index(
 }
 
 fn kind_ok(kind: &str) -> bool {
-    matches!(kind, "caption" | "hashtags")
+    matches!(kind, "caption" | "hashtags" | "reply")
 }
 
 /// The body of `GET /snippets`, shared with the MCP `list-snippets` tool.

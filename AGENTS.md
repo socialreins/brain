@@ -87,9 +87,18 @@ cargo run -p socialreins-brain
   takes `queue::pick` inside the insert's transaction, under a per-set advisory lock held until
   commit; a slot is free when no `scheduled` post of the set is at that exact time.
 - `app/src/controllers/library.rs`: the media library (`media_library`, URLs only, unique per team,
-  at most 1000) and snippets (`snippets`, `caption` or `hashtags`, name unique per team and kind
+  at most 1000) and snippets (`snippets`, `caption`, `hashtags` or `reply`, a saved inbox reply; name unique per team and kind
   ignoring case, at most 500). Team assets: every member and token writes them, set tokens too,
   read-only tokens never; creates take a per-team advisory lock so the caps hold.
+- `app/src/controllers/contacts.rs`: contacts (`contacts`, one per team, platform and author id;
+  `contact_tags`, at most 20 a contact). `inbox::store` is the only place an item is stored and
+  upserts the author's contact in the same statement, so never insert into `inbox_items` any
+  other way; the contact keeps the profile of its newest item. Tags are written under the
+  contact's row lock (`inbox::add_tag`, `PATCH /v1/contacts/{id}`), checked by `inbox::tag`.
+  `DELETE /v1/contacts/{id}` (owner, admin) and a disconnect (contacts left with no items)
+  remove a person's data; items outlive a deleted contact with `contact_id` null.
+  Session only, like the inbox. `inbox_items.assigned_to` is set under a share lock of the
+  member's `team_user` row, and `teams::change_member` clears it after deleting that row.
 - `app/src/feeds.rs` and `controllers/feeds.rs`: RSS and Atom feeds that post on their own
   (`feeds`, `feed_items`, at most 20 per team; owners, admins and full tokens write). `Fetcher`
   is the only way a feed is read: `public_url`, `PublicOnly`, at most 3 redirects each checked

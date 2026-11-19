@@ -6,7 +6,7 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
     pub team_id: Uuid,
-    /// `caption` or `hashtags`.
+    /// `caption`, `hashtags` or `reply` (a saved inbox reply).
     #[sea_orm(column_type = "Text")]
     pub kind: String,
     /// Unique per team and kind, ignoring case.
