@@ -2284,7 +2284,7 @@ mod teams {
             ok.json::<Value>(),
             json!({"id": team["id"], "name": team["name"], "code": team["code"],
                 "slug": null, "public_pages": false, "newsletter": false,
-                "require_approval": false, "role": "admin"})
+                "newsletter_sender": null, "require_approval": false, "role": "admin"})
         );
         assert_eq!(current(&s, &invited).await["id"], team["id"]);
         assert_eq!(memberships(&db, invited_id).await, 2);
@@ -22185,6 +22185,788 @@ mod teams {
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
                     assert!(changed, "the second sign-up made a new link");
+                }
+
+                mod newsletters_api {
+                    use super::*;
+                    use socialreins_brain::newsletters;
+                    use std::sync::atomic::{AtomicU16, Ordering};
+
+                    struct Brain {
+                        s: TestServer,
+                        db: DatabaseConnection,
+                        state: AppState,
+                        /// Every mail the fake Resend took.
+                        seen: Sent,
+                        /// What the fake Resend answers; anything but 200 takes no mail.
+                        answer: std::sync::Arc<AtomicU16>,
+                    }
+
+                    /// A brain whose mail goes to a fake Resend, over a database with no
+                    /// newsletter of an earlier test left to send.
+                    async fn brain() -> Brain {
+                        use axum::{routing::post, Json, Router};
+                        let seen = Sent::default();
+                        let answer = std::sync::Arc::new(AtomicU16::new(200));
+                        let (log, status) = (seen.clone(), answer.clone());
+                        let app = Router::new().route(
+                            "/emails",
+                            post(move |Json(body): Json<Value>| async move {
+                                let code = status.load(Ordering::SeqCst);
+                                if code == 200 {
+                                    log.lock().unwrap().push(body);
+                                }
+                                let code = axum::http::StatusCode::from_u16(code).unwrap();
+                                (code, Json(json!({"id": "x"})))
+                            }),
+                        );
+                        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        let url = format!("http://{}/emails", listener.local_addr().unwrap());
+                        tokio::spawn(async move { axum::serve(listener, app).await });
+                        let base = mock_bluesky().await;
+                        let mut config = Config::from_env().expect("test config");
+                        config.trust_proxy = true;
+                        config.bluesky.appview = base.clone();
+                        config.bluesky.plc = base;
+                        config.bluesky.allow_insecure_pds = true;
+                        config.mailer = socialreins_brain::mail::Mailer::resend_at(
+                            &url,
+                            "re_test",
+                            "b@example.com",
+                        )
+                        .unwrap();
+                        let db = socialreins_brain::connect(&config).await.unwrap();
+                        sql(
+                            &db,
+                            "DELETE FROM newsletters; DELETE FROM rate_limit_hits \
+                             WHERE bucket = 'newsletter:mail'"
+                                .into(),
+                        )
+                        .await;
+                        let state = AppState::new(db.clone(), &config);
+                        let app = controllers::router(state.clone(), &config);
+                        let s = TestServer::new(app).unwrap();
+                        Brain {
+                            s,
+                            db,
+                            state,
+                            seen,
+                            answer,
+                        }
+                    }
+
+                    impl Brain {
+                        /// The mails `to` got so far.
+                        fn mails(&self, to: &str) -> Vec<Value> {
+                            let seen = self.seen.lock().unwrap();
+                            seen.iter().filter(|m| m["to"][0] == to).cloned().collect()
+                        }
+
+                        fn count(&self) -> usize {
+                            self.seen.lock().unwrap().len()
+                        }
+
+                        async fn tick(&self) {
+                            newsletters::tick(&self.state).await.unwrap();
+                        }
+
+                        /// A subscriber of `team`: `confirmed`, `unconfirmed` or `unsubscribed`.
+                        async fn subscriber(&self, team: &str, kind: &str) -> String {
+                            let email = unique_email();
+                            let (verified, gone) = match kind {
+                                "confirmed" => ("now()", "NULL"),
+                                "unconfirmed" => ("NULL", "NULL"),
+                                _ => ("now()", "now()"),
+                            };
+                            let insert = format!(
+                                "INSERT INTO subscribers (id, team_id, email, verified_at, \
+                                 unsubscribed_at) VALUES (gen_random_uuid(), '{team}', \
+                                 '{email}', {verified}, {gone})"
+                            );
+                            sql(&self.db, insert).await;
+                            email
+                        }
+
+                        /// Lets `team` start another newsletter today.
+                        async fn another_day(&self, team: &str) {
+                            let forget = format!(
+                                "DELETE FROM rate_limit_hits \
+                                 WHERE bucket = 'newsletter:start:team:{team}'"
+                            );
+                            sql(&self.db, forget).await;
+                        }
+                    }
+
+                    const SENDER: &str = "1 Main Street\nSpringfield 12345";
+
+                    async fn sender_on(s: &TestServer, cookie: &str) {
+                        let from = json!({"name": "Ann Lee", "address": SENDER});
+                        let res = req(s, Method::PATCH, "/v1/team", cookie)
+                            .json(&json!({"newsletter_sender": from}))
+                            .await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                    }
+
+                    fn act(s: &TestServer, cookie: &str, id: &str, what: &str) -> TestRequest {
+                        let path = format!("/v1/newsletters/{id}/{what}");
+                        req(s, Method::POST, &path, cookie)
+                    }
+
+                    fn start(s: &TestServer, cookie: &str, id: &str, n: u64) -> TestRequest {
+                        act(s, cookie, id, "send").json(&json!({"confirm_total": n}))
+                    }
+
+                    async fn draft(
+                        s: &TestServer,
+                        cookie: &str,
+                        subject: &str,
+                        body: &str,
+                    ) -> String {
+                        let res = req(s, Method::POST, "/v1/newsletters", cookie)
+                            .json(&json!({"subject": subject, "body": body}))
+                            .await;
+                        assert_eq!(res.status_code(), 201, "{}", res.text());
+                        res.json::<Value>()["id"].as_str().unwrap().to_owned()
+                    }
+
+                    /// A draft whose test mail went out.
+                    async fn tested(s: &TestServer, cookie: &str, subject: &str) -> String {
+                        let id = draft(s, cookie, subject, "Hello").await;
+                        let res = act(s, cookie, &id, "test").await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        id
+                    }
+
+                    async fn shown(s: &TestServer, cookie: &str, id: &str) -> Value {
+                        let path = format!("/v1/newsletters/{id}");
+                        let res = s.get(&path).add_header("cookie", cookie).await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        res.json()
+                    }
+
+                    fn counts(total: u64, sent: u64, failed: u64, pending: u64) -> Value {
+                        json!({"total": total, "sent": sent, "failed": failed,
+                            "pending": pending})
+                    }
+
+                    fn failed(res: axum_test::TestResponse, status: u16, code: &str) {
+                        assert_eq!(res.status_code(), status, "{}", res.text());
+                        assert_eq!(res.json::<Value>()["error"], code);
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn sender_details_are_checked_and_shown_on_the_team() {
+                        let b = brain().await;
+                        let (_, owner, _) = user(&b.s, &b.db).await;
+                        let team = current(&b.s, &owner).await;
+                        assert!(team["newsletter_sender"].is_null());
+                        let patch = |cookie: &str, from: Value| {
+                            req(&b.s, Method::PATCH, "/v1/team", cookie)
+                                .json(&json!({"newsletter_sender": from}))
+                        };
+                        let from =
+                            |name: &str, address: &str| json!({"name": name, "address": address});
+                        let (member, _) =
+                            joined(&b.s, &b.db, team["id"].as_str().unwrap(), "member").await;
+                        failed(patch(&member, from("Ann", SENDER)).await, 403, "forbidden");
+                        for (name, address, field) in [
+                            (" ", SENDER, "name"),
+                            (&*"n".repeat(81), SENDER, "name"),
+                            ("Ann\nBcc: x@example.com", SENDER, "name"),
+                            ("Ann", "too short", "address"),
+                            ("Ann", &*"a".repeat(301), "address"),
+                            ("Ann", "1 Main Street\u{7} Springfield", "address"),
+                        ] {
+                            let res = patch(&owner, from(name, address)).await;
+                            assert_eq!(res.status_code(), 422, "{name} {address}");
+                            let want = json!({"error": "invalid_sender", "field": field});
+                            assert_eq!(res.json::<Value>(), want);
+                        }
+                        assert!(current(&b.s, &owner).await["newsletter_sender"].is_null());
+                        let res = patch(&owner, from(" Ann Lee ", &format!(" {SENDER}\r\n"))).await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        let want = json!({"name": "Ann Lee", "address": SENDER});
+                        assert_eq!(res.json::<Value>()["newsletter_sender"], want);
+                        // Another change leaves it; null clears it.
+                        let res = req(&b.s, Method::PATCH, "/v1/team", &owner)
+                            .json(&json!({"newsletter": true}))
+                            .await;
+                        assert_eq!(res.json::<Value>()["newsletter_sender"], want);
+                        assert_eq!(current(&b.s, &owner).await["newsletter_sender"], want);
+                        let res = patch(&owner, Value::Null).await;
+                        assert!(res.json::<Value>()["newsletter_sender"].is_null());
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn managers_write_drafts_and_a_test_goes_to_the_caller_alone() {
+                        let b = brain().await;
+                        let s = &b.s;
+                        let (email, owner, user_id) = user(s, &b.db).await;
+                        let team = current(s, &owner).await;
+                        let team_id = team["id"].as_str().unwrap();
+                        let (member, _) = joined(s, &b.db, team_id, "member").await;
+                        let (_, other, _) = user(s, &b.db).await;
+                        let subscriber = b.subscriber(team_id, "confirmed").await;
+
+                        for (subject, body, field) in [
+                            ("", "b", "subject"),
+                            ("two\nlines", "b", "subject"),
+                            (&*"s".repeat(151), "b", "subject"),
+                            ("s", "  ", "body"),
+                            ("s", &*"b".repeat(20_001), "body"),
+                            ("s", &*"https://x.test ".repeat(21), "body"),
+                        ] {
+                            let res = req(s, Method::POST, "/v1/newsletters", &owner)
+                                .json(&json!({"subject": subject, "body": body}))
+                                .await;
+                            assert_eq!(res.status_code(), 422, "{subject}");
+                            let want = json!({"error": "invalid_newsletter", "field": field});
+                            assert_eq!(res.json::<Value>(), want);
+                        }
+                        // The longest body, of four-byte characters, passes the body limit.
+                        let long = draft(s, &owner, "Long", &"\u{1F600}".repeat(20_000)).await;
+                        let body =
+                            "Hi <b>all</b> & **welcome**\n\nRead https://x.test/a?b=1&c=2.\n\
+                                    Not http://x.test <script>alert(1)</script>";
+                        let id = draft(s, &owner, " News <1> ", body).await;
+                        let n = shown(s, &owner, &id).await;
+                        assert_eq!(n["subject"], "News <1>");
+                        assert_eq!(n["body"], body);
+                        assert_eq!(n["status"], "draft");
+                        assert_eq!(n["counts"], counts(0, 0, 0, 0));
+                        assert_eq!(n["created_by"], user_id.to_string());
+                        for key in ["pause_reason", "tested_at", "started_at", "finished_at"] {
+                            assert!(n[key].is_null(), "{key}");
+                        }
+                        let res = s.get("/v1/newsletters").add_header("cookie", &owner).await;
+                        let list = res.json::<Value>();
+                        assert_eq!(list.as_array().unwrap().len(), 2);
+                        assert_eq!(list[0]["id"], id.as_str());
+
+                        // Members get nothing, another team sees nothing, strangers sign in.
+                        let path = format!("/v1/newsletters/{id}");
+                        let input = json!({"subject": "s", "body": "b"});
+                        let calls = |cookie: &str| {
+                            let call = |m: Method, p: &str| req(s, m, p, cookie);
+                            vec![
+                                call(Method::GET, &path),
+                                call(Method::PUT, &path).json(&input),
+                                call(Method::DELETE, &path),
+                                act(s, cookie, &id, "test"),
+                                start(s, cookie, &id, 1),
+                                act(s, cookie, &id, "cancel"),
+                                act(s, cookie, &id, "resume"),
+                            ]
+                        };
+                        for call in calls(&member) {
+                            failed(call.await, 403, "forbidden");
+                        }
+                        for call in calls(&other) {
+                            failed(call.await, 404, "not_found");
+                        }
+                        let res = s.get("/v1/newsletters").add_header("cookie", &member).await;
+                        failed(res, 403, "forbidden");
+                        let res = req(s, Method::POST, "/v1/newsletters", &member).json(&input);
+                        failed(res.await, 403, "forbidden");
+                        let res = s.get("/v1/newsletters").add_header("cookie", &other).await;
+                        assert_eq!(res.json::<Value>(), json!([]));
+                        assert_eq!(s.get("/v1/newsletters").await.status_code(), 401);
+                        assert_eq!(s.get(&path).await.status_code(), 401);
+
+                        // No test and no send without the sender details.
+                        failed(act(s, &owner, &id, "test").await, 422, "sender_required");
+                        failed(start(s, &owner, &id, 1).await, 422, "sender_required");
+                        sender_on(s, &owner).await;
+                        failed(start(s, &owner, &id, 1).await, 422, "test_required");
+                        let res = act(s, &owner, &id, "test").await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        assert!(res.json::<Value>()["tested_at"].is_string());
+                        assert_eq!(res.json::<Value>()["status"], "draft");
+
+                        // The one mail went to the caller, as a subscriber would get it.
+                        assert_eq!(b.count(), 1);
+                        assert!(b.mails(&subscriber).is_empty());
+                        let mail = b.mails(&email).remove(0);
+                        assert_eq!(mail["from"], "Ann Lee <b@example.com>");
+                        assert_eq!(mail["to"], json!([email]));
+                        assert_eq!(mail["subject"], "News <1>");
+                        let one_click = mail["headers"]["List-Unsubscribe"].as_str().unwrap();
+                        let link = format!(
+                            "<{}/v1/public/newsletter/unsubscribe?token=",
+                            b.state.brain_url
+                        );
+                        assert!(one_click.starts_with(&link) && one_click.ends_with('>'));
+                        assert_eq!(
+                            mail["headers"]["List-Unsubscribe-Post"],
+                            "List-Unsubscribe=One-Click"
+                        );
+                        let page = format!(
+                            "{}/newsletter/unsubscribe?token={}",
+                            b.state.web_url,
+                            token_in(one_click)
+                        );
+                        let text = mail["text"].as_str().unwrap();
+                        let name = team["name"].as_str().unwrap();
+                        let footer = format!(
+                            "\n\n-- \nAnn Lee\n{SENDER}\n\nYou get this because you signed up \
+                             on a {name} page.\nUnsubscribe: {page}\n"
+                        );
+                        assert_eq!(text, format!("{body}{footer}"));
+                        let html = mail["html"].as_str().unwrap();
+                        assert!(html.contains(
+                            "Hi &lt;b&gt;all&lt;/b&gt; &amp; <strong>welcome</strong></p>"
+                        ));
+                        assert!(html.contains(
+                            "Read <a href=\"https://x.test/a?b=1&amp;c=2\">\
+                             https://x.test/a?b=1&amp;c=2</a>.<br>Not http://x.test \
+                             &lt;script&gt;alert(1)&lt;/script&gt;</p>"
+                        ));
+                        assert!(!html.contains("<script") && !html.contains("<b>"));
+                        assert!(html.contains("<title>News &lt;1&gt;</title>"));
+                        assert!(html.contains("Ann Lee<br>1 Main Street<br>Springfield 12345<br>"));
+                        let unsubscribe = format!("<a href=\"{page}\"");
+                        assert!(html.contains(&unsubscribe), "{html}");
+                        assert_eq!(html.matches("<a ").count(), 2, "only https links, and ours");
+
+                        // Saving the same text keeps the test; a change asks for a new one.
+                        let same = json!({"subject": "News <1>", "body": body});
+                        let res = req(s, Method::PUT, &path, &owner).json(&same).await;
+                        assert!(res.json::<Value>()["tested_at"].is_string());
+                        let res = req(s, Method::PUT, &path, &owner)
+                            .json(&json!({"subject": "News", "body": body, "status": "sent"}))
+                            .await;
+                        assert_eq!(res.status_code(), 422, "unknown fields are refused");
+                        let changed = json!({"subject": "News", "body": body});
+                        let res = req(s, Method::PUT, &path, &owner).json(&changed).await;
+                        assert_eq!(res.status_code(), 200);
+                        assert_eq!(res.json::<Value>()["subject"], "News");
+                        assert!(res.json::<Value>()["tested_at"].is_null());
+                        failed(start(s, &owner, &id, 1).await, 422, "test_required");
+                        let bad = json!({"subject": "", "body": body});
+                        let res = req(s, Method::PUT, &path, &owner).json(&bad).await;
+                        failed(res, 422, "invalid_newsletter");
+
+                        // Ten tests a day per team.
+                        for _ in 0..9 {
+                            assert_eq!(act(s, &owner, &id, "test").await.status_code(), 200);
+                        }
+                        failed(act(s, &owner, &id, "test").await, 429, "too_many_tests");
+                        assert_eq!(b.count(), 10);
+                        assert_eq!(b.mails(&email).len(), 10);
+
+                        let gone = format!("/v1/newsletters/{long}");
+                        assert_eq!(
+                            req(s, Method::DELETE, &gone, &owner).await.status_code(),
+                            204
+                        );
+                        assert_eq!(
+                            req(s, Method::DELETE, &gone, &owner).await.status_code(),
+                            404
+                        );
+                        let doc = s.get("/openapi.json").await.json::<Value>();
+                        for (p, m) in [
+                            ("/newsletters", "get"),
+                            ("/newsletters", "post"),
+                            ("/newsletters/{id}", "get"),
+                            ("/newsletters/{id}", "put"),
+                            ("/newsletters/{id}", "delete"),
+                            ("/newsletters/{id}/test", "post"),
+                            ("/newsletters/{id}/send", "post"),
+                            ("/newsletters/{id}/cancel", "post"),
+                            ("/newsletters/{id}/resume", "post"),
+                            ("/public/newsletter/unsubscribe", "post"),
+                        ] {
+                            assert!(doc["paths"][p][m].is_object(), "{p} {m}");
+                        }
+                        let schemas = &doc["components"]["schemas"];
+                        assert!(schemas["Team"]["properties"]["newsletter_sender"].is_object());
+                        assert!(schemas["Subscriber"]["properties"]["unsubscribed_at"].is_object());
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn a_send_snapshots_the_confirmed_and_mails_each_once() {
+                        let b = brain().await;
+                        let s = &b.s;
+                        let (_, owner, _) = user(s, &b.db).await;
+                        let team = current(s, &owner).await["id"].as_str().unwrap().to_owned();
+                        sender_on(s, &owner).await;
+                        let id = tested(s, &owner, "News").await;
+                        let tests = b.count();
+
+                        failed(start(s, &owner, &id, 0).await, 422, "no_recipients");
+                        let unconfirmed = b.subscriber(&team, "unconfirmed").await;
+                        let unsubscribed = b.subscriber(&team, "unsubscribed").await;
+                        failed(start(s, &owner, &id, 2).await, 422, "no_recipients");
+                        let ann = b.subscriber(&team, "confirmed").await;
+                        let bob = b.subscriber(&team, "confirmed").await;
+
+                        // Over 5000 confirmed subscribers nothing starts.
+                        let crowd = format!(
+                            "INSERT INTO subscribers (id, team_id, email, verified_at) \
+                             SELECT gen_random_uuid(), '{team}', 'crowd' || g || '@example.com', \
+                             now() FROM generate_series(1, 4999) g"
+                        );
+                        sql(&b.db, crowd).await;
+                        failed(
+                            start(s, &owner, &id, 5001).await,
+                            422,
+                            "too_many_recipients",
+                        );
+                        let leave = format!(
+                            "DELETE FROM subscribers WHERE team_id = '{team}' \
+                             AND email LIKE 'crowd%'"
+                        );
+                        sql(&b.db, leave).await;
+
+                        // The count the sender saw must be the count of this moment.
+                        let res = start(s, &owner, &id, 3).await;
+                        assert_eq!(res.status_code(), 409);
+                        let want = json!({"error": "audience_changed", "total": 2});
+                        assert_eq!(res.json::<Value>(), want);
+                        assert_eq!(shown(s, &owner, &id).await["counts"], counts(0, 0, 0, 0));
+                        let res = start(s, &owner, &id, 2).await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        let n = res.json::<Value>();
+                        assert_eq!(n["status"], "sending");
+                        assert_eq!(n["counts"], counts(2, 0, 0, 2));
+                        assert!(n["started_at"].is_string() && n["finished_at"].is_null());
+
+                        // A second send starts nothing, nor does a second newsletter today.
+                        failed(start(s, &owner, &id, 2).await, 409, "already_started");
+                        failed(act(s, &owner, &id, "test").await, 409, "already_started");
+                        let path = format!("/v1/newsletters/{id}");
+                        let input = json!({"subject": "s", "body": "b"});
+                        let res = req(s, Method::PUT, &path, &owner).json(&input).await;
+                        failed(res, 409, "already_started");
+                        let res = req(s, Method::DELETE, &path, &owner).await;
+                        failed(res, 409, "still_sending");
+                        let next = tested(s, &owner, "Next").await;
+                        let tests = tests + 1;
+                        failed(
+                            start(s, &owner, &next, 2).await,
+                            429,
+                            "too_many_newsletters",
+                        );
+                        assert_eq!(shown(s, &owner, &next).await["status"], "draft");
+                        assert_eq!(b.count(), tests, "nothing went out before a round");
+
+                        // Two rounds at once and one more: each recipient is mailed once.
+                        let (one, two) =
+                            tokio::join!(newsletters::tick(&b.state), newsletters::tick(&b.state));
+                        one.unwrap();
+                        two.unwrap();
+                        b.tick().await;
+                        assert_eq!(b.count(), tests + 2);
+                        for who in [&ann, &bob] {
+                            let mails = b.mails(who);
+                            assert_eq!(mails.len(), 1);
+                            assert_eq!(mails[0]["subject"], "News");
+                            assert_eq!(mails[0]["from"], "Ann Lee <b@example.com>");
+                            assert!(mails[0]["headers"]["List-Unsubscribe"].is_string());
+                        }
+                        assert!(b.mails(&unconfirmed).is_empty());
+                        assert!(b.mails(&unsubscribed).is_empty());
+                        let n = shown(s, &owner, &id).await;
+                        assert_eq!(n["status"], "sent");
+                        assert_eq!(n["counts"], counts(2, 2, 0, 0));
+                        assert!(n["finished_at"].is_string());
+                        // Each subscriber has their own link.
+                        let link = |who: &str| token_in(b.mails(who)[0]["text"].as_str().unwrap());
+                        assert_ne!(link(&ann), link(&bob));
+                        failed(start(s, &owner, &id, 2).await, 409, "already_started");
+                        failed(act(s, &owner, &id, "cancel").await, 409, "not_sending");
+                        assert_eq!(
+                            req(s, Method::DELETE, &path, &owner).await.status_code(),
+                            204
+                        );
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn a_mail_error_pauses_until_resumed_and_a_cancel_skips_the_rest() {
+                        let b = brain().await;
+                        let s = &b.s;
+                        let (_, owner, _) = user(s, &b.db).await;
+                        let team = current(s, &owner).await["id"].as_str().unwrap().to_owned();
+                        let (member, _) = joined(s, &b.db, &team, "member").await;
+                        sender_on(s, &owner).await;
+                        for _ in 0..3 {
+                            b.subscriber(&team, "confirmed").await;
+                        }
+                        let id = tested(s, &owner, "News").await;
+                        let tests = b.count();
+                        assert_eq!(start(s, &owner, &id, 3).await.status_code(), 200);
+
+                        // The provider limits us from the first mail on.
+                        b.answer.store(429, Ordering::SeqCst);
+                        b.tick().await;
+                        let n = shown(s, &owner, &id).await;
+                        assert_eq!(n["status"], "paused");
+                        let why = n["pause_reason"].as_str().unwrap();
+                        assert!(
+                            why.contains("rate limiting") && why.contains("429"),
+                            "{why}"
+                        );
+                        assert_eq!(
+                            n["counts"],
+                            counts(3, 0, 1, 2),
+                            "one tried, two handed back"
+                        );
+                        assert!(n["finished_at"].is_null());
+                        // It never goes on by itself, even once the provider is back.
+                        b.answer.store(200, Ordering::SeqCst);
+                        b.tick().await;
+                        assert_eq!(shown(s, &owner, &id).await["status"], "paused");
+                        assert_eq!(b.count(), tests);
+                        failed(act(s, &member, &id, "resume").await, 403, "forbidden");
+                        let res = act(s, &owner, &id, "resume").await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        assert_eq!(res.json::<Value>()["status"], "sending");
+                        assert!(res.json::<Value>()["pause_reason"].is_null());
+                        failed(act(s, &owner, &id, "resume").await, 409, "not_paused");
+                        b.tick().await;
+                        let n = shown(s, &owner, &id).await;
+                        assert_eq!(n["status"], "sent");
+                        assert_eq!(
+                            n["counts"],
+                            counts(3, 2, 1, 0),
+                            "the failed one is not retried"
+                        );
+                        assert_eq!(b.count(), tests + 2);
+
+                        // Any other refusal pauses too.
+                        b.another_day(&team).await;
+                        let id = tested(s, &owner, "Second").await;
+                        assert_eq!(start(s, &owner, &id, 3).await.status_code(), 200);
+                        b.answer.store(500, Ordering::SeqCst);
+                        b.tick().await;
+                        b.answer.store(200, Ordering::SeqCst);
+                        let n = shown(s, &owner, &id).await;
+                        assert_eq!(n["status"], "paused");
+                        assert!(n["pause_reason"].as_str().unwrap().contains("500"), "{n}");
+                        // Cancelled, the two not tried are never mailed.
+                        let before = b.count();
+                        let res = act(s, &owner, &id, "cancel").await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        let n = res.json::<Value>();
+                        assert_eq!(n["status"], "cancelled");
+                        assert_eq!(n["counts"], counts(3, 0, 1, 0));
+                        assert!(n["pause_reason"].is_null() && n["finished_at"].is_string());
+                        failed(act(s, &owner, &id, "cancel").await, 409, "not_sending");
+                        failed(act(s, &owner, &id, "resume").await, 409, "not_paused");
+                        b.tick().await;
+                        assert_eq!(b.count(), before);
+
+                        // A sending one is cancelled the same way.
+                        b.another_day(&team).await;
+                        let id = tested(s, &owner, "Third").await;
+                        let before = b.count();
+                        assert_eq!(start(s, &owner, &id, 3).await.status_code(), 200);
+                        assert_eq!(act(s, &owner, &id, "cancel").await.status_code(), 200);
+                        b.tick().await;
+                        assert_eq!(b.count(), before);
+                        assert_eq!(shown(s, &owner, &id).await["counts"], counts(3, 0, 0, 0));
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn who_left_after_the_start_gets_no_mail_and_the_cap_holds_the_rest() {
+                        let b = brain().await;
+                        let s = &b.s;
+                        let (_, owner, _) = user(s, &b.db).await;
+                        let team = current(s, &owner).await["id"].as_str().unwrap().to_owned();
+                        sender_on(s, &owner).await;
+                        let stays = b.subscriber(&team, "confirmed").await;
+                        let leaves = b.subscriber(&team, "confirmed").await;
+                        let removed = b.subscriber(&team, "confirmed").await;
+                        let id = tested(s, &owner, "News").await;
+                        let tests = b.count();
+                        assert_eq!(start(s, &owner, &id, 3).await.status_code(), 200);
+
+                        // All teams together are at the day's cap: everyone waits.
+                        let full = format!(
+                            "INSERT INTO rate_limit_hits (bucket) SELECT '{}' \
+                             FROM generate_series(1, {})",
+                            newsletters::MAIL_BUCKET,
+                            newsletters::MAILS_PER_DAY
+                        );
+                        sql(&b.db, full).await;
+                        b.tick().await;
+                        let n = shown(s, &owner, &id).await;
+                        assert_eq!(n["status"], "sending");
+                        assert_eq!(n["counts"], counts(3, 0, 0, 3));
+                        assert_eq!(b.count(), tests);
+                        let room = format!(
+                            "DELETE FROM rate_limit_hits WHERE bucket = '{}'",
+                            newsletters::MAIL_BUCKET
+                        );
+                        sql(&b.db, room).await;
+
+                        // Meanwhile one unsubscribed and one was removed.
+                        let left = format!(
+                            "UPDATE subscribers SET unsubscribed_at = now() \
+                             WHERE email = '{leaves}'; \
+                             DELETE FROM subscribers WHERE email = '{removed}'"
+                        );
+                        sql(&b.db, left).await;
+                        b.tick().await;
+                        assert_eq!(b.count(), tests + 1);
+                        assert_eq!(b.mails(&stays).len(), 1);
+                        assert!(b.mails(&leaves).is_empty() && b.mails(&removed).is_empty());
+                        let n = shown(s, &owner, &id).await;
+                        assert_eq!(n["status"], "sent");
+                        assert_eq!(n["counts"], counts(3, 1, 0, 0));
+                        // Only the mail that went out counts against the cap.
+                        let hits = format!(
+                            "DELETE FROM rate_limit_hits WHERE bucket = '{}' \
+                             AND (SELECT count(*) FROM rate_limit_hits WHERE bucket = '{0}') = 1",
+                            newsletters::MAIL_BUCKET
+                        );
+                        let used = b.db.execute_unprepared(&hits).await.unwrap();
+                        assert_eq!(used.rows_affected(), 1);
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn a_reader_unsubscribes_by_the_page_or_one_click_and_may_come_back() {
+                        let b = brain().await;
+                        let s = &b.s;
+                        let (owner, team, account) = owner_with_account(s, &b.db).await;
+                        let set = default_set(&b.db, &team).await.to_string();
+                        pages_on(s, &owner, true).await;
+                        newsletter_on(s, &owner, true).await;
+                        sender_on(s, &owner).await;
+                        let post = new_post(s, &owner, &set, "hello").await;
+                        let page = put_page(s, &owner, &post, true, "x").await;
+                        let code = page.json::<Value>()["code"].as_str().unwrap().to_owned();
+                        publish(&b.db, &post, &account, "https://bsky.test/a").await;
+
+                        // Ann signs up on the page and confirms; Bob is there already.
+                        let ann = unique_email();
+                        subscribe(s, &code, &ann, "10.0.2.1")
+                            .await
+                            .assert_status_ok();
+                        let confirm = mails_to(&b.seen, &ann, 1).await;
+                        let first = token_in(&confirm[0].1);
+                        let verify = |token: String| {
+                            s.post("/v1/public/newsletter/verify")
+                                .json(&json!({"token": token}))
+                        };
+                        verify(first.clone()).await.assert_status_ok();
+                        let bob = b.subscriber(&team, "confirmed").await;
+                        let list = subscribers(s, &owner).await;
+                        assert!(list[0]["unsubscribed_at"].is_null());
+                        assert!(list[1]["unsubscribed_at"].is_null());
+
+                        let id = tested(s, &owner, "News").await;
+                        assert_eq!(start(s, &owner, &id, 2).await.status_code(), 200);
+                        b.tick().await;
+                        let link = |who: &str| {
+                            let mail = b.mails(who).pop().unwrap();
+                            assert_eq!(mail["subject"], "News");
+                            let header = mail["headers"]["List-Unsubscribe"].as_str().unwrap();
+                            let token = token_in(header);
+                            let page =
+                                format!("{}/newsletter/unsubscribe?token={token}", b.state.web_url);
+                            assert!(mail["text"].as_str().unwrap().contains(&page));
+                            token
+                        };
+                        let (ann_token, bob_token) = (link(&ann), link(&bob));
+                        let state = |email: &str| left_at(s, &owner, email.to_owned());
+
+                        // A GET changes nothing: mail scanners open links.
+                        let path = "/v1/public/newsletter/unsubscribe";
+                        let res = s.get(&format!("{path}?token={ann_token}")).await;
+                        assert_eq!(res.status_code(), 405);
+                        assert!(state(&ann).await.is_null());
+                        // The page's button posts the token; an unknown one gets the same answer.
+                        let ok = json!({"status": "ok"});
+                        for token in [json!("f".repeat(64)), json!("nope"), Value::Null] {
+                            let res = s.post(path).json(&json!({"token": token})).await;
+                            assert_eq!(res.status_code(), 200);
+                            assert_eq!(res.json::<Value>(), ok);
+                        }
+                        assert!(state(&ann).await.is_null() && state(&bob).await.is_null());
+                        let res = s.post(path).json(&json!({"token": ann_token})).await;
+                        assert_eq!(res.status_code(), 200);
+                        assert_eq!(res.json::<Value>(), ok);
+                        let at = state(&ann).await;
+                        assert!(at.is_string());
+                        assert!(state(&bob).await.is_null());
+                        // Again is the same answer and the same moment.
+                        let res = s.post(path).json(&json!({"token": ann_token})).await;
+                        assert_eq!(res.json::<Value>(), ok);
+                        assert_eq!(state(&ann).await, at);
+
+                        // A mail provider's one-click POST: the token in the query, a form body.
+                        let one_click = |token: &str| {
+                            s.post(&format!("{path}?token={token}"))
+                                .form(&[("List-Unsubscribe", "One-Click")])
+                        };
+                        let res = one_click(&"e".repeat(64)).await;
+                        assert_eq!(res.status_code(), 200);
+                        assert_eq!(res.json::<Value>(), ok);
+                        assert!(state(&bob).await.is_null());
+                        let res = one_click(&bob_token).await;
+                        assert_eq!(res.status_code(), 200);
+                        assert_eq!(res.json::<Value>(), ok);
+                        assert!(state(&bob).await.is_string());
+
+                        // Nobody is left to mail.
+                        b.another_day(&team).await;
+                        let next = tested(s, &owner, "Next").await;
+                        failed(start(s, &owner, &next, 2).await, 422, "no_recipients");
+
+                        // The old confirmation link does not bring Ann back; signing up again
+                        // (the hourly resend limit aside) and confirming the new link does.
+                        verify(first.clone()).await.assert_status_ok();
+                        assert!(state(&ann).await.is_string());
+                        let earlier = format!(
+                            "UPDATE subscribers SET verify_sent_at = now() - interval '2 hours' \
+                             WHERE email = '{ann}'"
+                        );
+                        sql(&b.db, earlier).await;
+                        subscribe(s, &code, &ann, "10.0.2.2")
+                            .await
+                            .assert_status_ok();
+                        let confirm = mails_to(&b.seen, &ann, 3).await;
+                        let again: Vec<_> = confirm
+                            .iter()
+                            .filter(|m| m.0 == "Confirm your newsletter subscription")
+                            .collect();
+                        assert_eq!(again.len(), 2, "an unsubscribed address is asked again");
+                        assert!(
+                            state(&ann).await.is_string(),
+                            "not before the link is confirmed"
+                        );
+                        let second = token_in(&again[1].1);
+                        assert_ne!(first, second);
+                        verify(second).await.assert_status_ok();
+                        assert!(state(&ann).await.is_null());
+
+                        // She is mailed again, with the link she had; Bob is not.
+                        assert_eq!(start(s, &owner, &next, 1).await.status_code(), 200);
+                        b.tick().await;
+                        assert_eq!(link_of(&b.mails(&ann).pop().unwrap()), ann_token);
+                        assert_eq!(b.mails(&bob).len(), 1);
+                        assert_eq!(shown(s, &owner, &next).await["counts"], counts(1, 1, 0, 0));
+                    }
+
+                    /// The `unsubscribed_at` the list shows for `email`.
+                    async fn left_at(s: &TestServer, cookie: &str, email: String) -> Value {
+                        let list = subscribers(s, cookie).await;
+                        let mut rows = list.as_array().unwrap().iter();
+                        let row = rows.find(|r| r["email"] == email.as_str());
+                        row.unwrap()["unsubscribed_at"].clone()
+                    }
+
+                    fn link_of(mail: &Value) -> String {
+                        assert_eq!(mail["subject"], "Next");
+                        token_in(mail["headers"]["List-Unsubscribe"].as_str().unwrap())
+                    }
                 }
             }
 

@@ -50,6 +50,9 @@ pub struct AppState {
     pub contact_limiter: Arc<RateLimiter>,
     /// Per-IP limit on `GET /v1/public/pages/{code}`.
     pub page_limiter: Arc<RateLimiter>,
+    /// Per-IP limit on `POST /v1/public/newsletter/unsubscribe`. Generous: a mail provider
+    /// posts its readers' one-click unsubscribes from few addresses.
+    pub unsubscribe_limiter: Arc<RateLimiter>,
     /// `ADMIN_EMAILS`: users who may read `/v1/admin/*`.
     pub admin_emails: Vec<String>,
     /// `REVIEW_LOGIN_TOKEN`: `GET /review-login/{token}`.
@@ -105,6 +108,7 @@ impl AppState {
                 crate::rate_limit::MAX_KEYS,
             )),
             page_limiter: Arc::new(RateLimiter::per_minute(120)),
+            unsubscribe_limiter: Arc::new(RateLimiter::per_minute(120)),
             admin_emails: config.admin_emails.clone(),
             review_login_token: config.review_login_token.clone(),
             waitlist_count: Arc::default(),

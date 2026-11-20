@@ -3,9 +3,11 @@
 //! and gets a confirmation link to the web app, which posts its token to
 //! `POST /public/newsletter/verify` (never a state-changing GET: mail scanners open links). Owners
 //! and admins read the list (`GET /subscribers`) and remove a row (`DELETE /subscribers/{id}`).
-//! Nothing is sent to subscribers yet beyond the confirmation.
+//! `POST /public/newsletter/unsubscribe` takes the token of a newsletter's unsubscribe links
+//! (`crate::newsletters`) and sets `unsubscribed_at`, which keeps the address out of every send
+//! until the person signs up again and confirms.
 use axum::{
-    extract::{FromRequest, Path, Request, State},
+    extract::{rejection::QueryRejection, FromRequest, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -64,6 +66,9 @@ pub struct Subscriber {
     /// Whether the emailed link was confirmed. Only these should ever be mailed.
     pub confirmed: bool,
     pub subscribed_at: DateTime<FixedOffset>,
+    /// When the person unsubscribed, else `null`. Never mailed while set; signing up again on
+    /// a public page and confirming clears it.
+    pub unsubscribed_at: Option<DateTime<FixedOffset>>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -134,8 +139,9 @@ async fn subscribe(
     Json(serde_json::json!({"status": "ok"})).into_response()
 }
 
-/// Adds the email as unconfirmed, or gives an unconfirmed one a new link token unless one went
-/// out in the last hour, and returns the token to mail. One statement checks and stamps, so
+/// Adds the email as unconfirmed, or gives an unconfirmed one (or one that unsubscribed, who
+/// must confirm again) a new link token unless one went out in the last hour, and returns the
+/// token to mail. One statement checks and stamps, so
 /// concurrent sign-ups cannot both send; a resend replaces the token, so only the newest link works.
 async fn claim(
     app: &AppState,
@@ -149,7 +155,8 @@ async fn claim(
          verify_sent_at) VALUES ($1, $2, $3, $4, $5, now()) \
          ON CONFLICT (team_id, email) DO UPDATE \
          SET verify_token_hash = EXCLUDED.verify_token_hash, verify_sent_at = now() \
-         WHERE subscribers.verified_at IS NULL AND (subscribers.verify_sent_at IS NULL \
+         WHERE (subscribers.verified_at IS NULL OR subscribers.unsubscribed_at IS NOT NULL) \
+         AND (subscribers.verify_sent_at IS NULL \
          OR subscribers.verify_sent_at < now() - interval '{RESEND_AFTER_HOURS} hour') \
          RETURNING id"
     );
@@ -224,6 +231,7 @@ async fn unclaim(app: &AppState, secret: &str) {
 /// Confirms an email with the token from its confirmation link, which opens
 /// `{WEB_URL}/newsletter/verify?token=...`; the web page posts it here, so a mail scanner that
 /// opens the link changes nothing. The first call sets the confirmation time, later ones keep it.
+/// A link mailed after the person unsubscribed also subscribes them again.
 /// `422 invalid_link` for a missing, malformed or unknown token. Shares the waitlist IP limit.
 #[utoipa::path(post, path = "/public/newsletter/verify", tag = "posts", request_body = VerifyBody,
     responses((status = 200, body = Confirmed), (status = 400, body = Error),
@@ -241,7 +249,10 @@ async fn verify(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Re
     if secret.len() != 64 || !secret.bytes().all(|b| b.is_ascii_hexdigit()) {
         return invalid();
     }
-    let sql = "UPDATE subscribers s SET verified_at = COALESCE(s.verified_at, now()) \
+    // Only a link from after the unsubscribe clears it: an older mail's link does not.
+    let sql = "UPDATE subscribers s SET verified_at = COALESCE(s.verified_at, now()), \
+               unsubscribed_at = CASE WHEN s.verify_sent_at > s.unsubscribed_at THEN NULL \
+               ELSE s.unsubscribed_at END \
                FROM teams t WHERE s.verify_token_hash = $1 AND t.id = s.team_id RETURNING t.name";
     let stmt =
         Statement::from_sql_and_values(DbBackend::Postgres, sql, [token::hash(&secret).into()]);
@@ -257,6 +268,51 @@ async fn verify(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Re
         Ok(None) => invalid(),
         Err(e) => internal(e, "newsletter verify"),
     }
+}
+
+#[derive(Deserialize)]
+struct UnsubscribeQuery {
+    token: Option<String>,
+}
+
+/// Unsubscribes the address a newsletter's unsubscribe link belongs to, for good until the
+/// person signs up and confirms again. The token comes in the body (`{"token"}`, from the web
+/// page `{WEB_URL}/newsletter/unsubscribe?token=...` the mail links to, whose button posts it)
+/// or in the query, where the body is ignored: that is the one-click POST of the mail's
+/// `List-Unsubscribe` header (RFC 8058). There is no `GET`: mail scanners open links. The
+/// answer is `200 ok` for any token, known or not. 120 a minute per IP.
+#[utoipa::path(post, path = "/public/newsletter/unsubscribe", tag = "posts",
+    params(("token" = Option<String>, Query, description = "The token, for a one-click POST")),
+    request_body = Option<VerifyBody>,
+    responses((status = 200, body = Status), (status = 400, body = Error),
+        (status = 413, body = Error), (status = 415, body = Error), (status = 422, body = Error),
+        (status = 429, body = Error), (status = 500, body = Error)))]
+async fn unsubscribe(
+    State(app): State<AppState>,
+    ClientIp(ip): ClientIp,
+    query: Result<Query<UnsubscribeQuery>, QueryRejection>,
+    request: Request,
+) -> Response {
+    if !app.unsubscribe_limiter.allow(ip) {
+        return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    }
+    let secret = match query.ok().and_then(|q| q.0.token) {
+        Some(secret) => secret,
+        None => match Json::<VerifyBody>::from_request(request, &()).await {
+            Ok(Json(body)) => body.token.unwrap_or_default(),
+            Err(r) => return rejected(&r).into_response(),
+        },
+    };
+    if secret.len() == 64 && secret.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let sql = "UPDATE subscribers SET unsubscribed_at = COALESCE(unsubscribed_at, now()) \
+                   WHERE unsubscribe_token_hash = $1";
+        let stmt =
+            Statement::from_sql_and_values(DbBackend::Postgres, sql, [token::hash(&secret).into()]);
+        if let Err(e) = app.db.execute_raw(stmt).await {
+            return internal(e, "newsletter unsubscribe");
+        }
+    }
+    Json(serde_json::json!({"status": "ok"})).into_response()
 }
 
 /// The team's newsletter sign-ups, newest first. Owners and admins only.
@@ -283,6 +339,7 @@ async fn list(State(app): State<AppState>, t: InTeam) -> Response {
                     email: r.email,
                     confirmed: r.verified_at.is_some(),
                     subscribed_at: r.created_at,
+                    unsubscribed_at: r.unsubscribed_at,
                 })
                 .collect(),
         })
@@ -321,6 +378,7 @@ pub fn api() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(subscribe))
         .routes(routes!(verify))
+        .routes(routes!(unsubscribe))
         .routes(routes!(list))
         .routes(routes!(remove))
 }

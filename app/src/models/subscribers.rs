@@ -19,6 +19,9 @@ pub struct Model {
     pub verify_sent_at: Option<DateTimeWithTimeZone>,
     /// When the emailed link was first confirmed; `None` until then.
     pub verified_at: Option<DateTimeWithTimeZone>,
+    /// When the person unsubscribed; never mailed while set. Confirming a new sign-up clears it.
+    /// (The token of their unsubscribe links lives in `unsubscribe_token*`, read by raw SQL.)
+    pub unsubscribed_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
 }
 

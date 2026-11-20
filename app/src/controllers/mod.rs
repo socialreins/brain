@@ -1,6 +1,6 @@
 //! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, the documented `/v1` API
 //! (waitlist, the admin console, contact, teams, API tokens, webhooks, connections, social sets, posting queues, posts, lists,
-//! the media library and snippets, inboxes, contacts, broadcasts,
+//! the media library and snippets, inboxes, contacts, broadcasts, newsletters,
 //! automations, public post pages), `/webhooks/meta` (Facebook and Instagram deliveries), `/mcp` (see `crate::mcp`), the Threads and Meta connect pages and
 //! `/media/{name}` (stored post files for platforms that download them).
 pub mod admin;
@@ -23,6 +23,7 @@ pub mod lists;
 pub mod media;
 pub mod meta;
 pub mod meta_webhook;
+pub mod newsletters;
 pub mod oauth;
 pub mod pages;
 pub mod passkeys;
@@ -73,6 +74,8 @@ const MAX_CONTACT_BODY_BYTES: usize = 32 * 1024;
 /// A post group carries a body and media per platform, a post a thread of up to 26 posts;
 /// `/mcp` takes the same.
 pub(crate) const MAX_GROUP_BODY_BYTES: usize = 64 * 1024;
+/// A newsletter body of 20000 characters, each up to 4 bytes and some escaped.
+const MAX_NEWSLETTER_BODY_BYTES: usize = 128 * 1024;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -113,6 +116,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(inbox::api())
         .merge(contacts::api())
         .merge(broadcasts::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
+        .merge(newsletters::api().layer(DefaultBodyLimit::max(MAX_NEWSLETTER_BODY_BYTES)))
         .merge(analytics::api())
         // Two DM texts of 1000 graphemes can pass 4 KiB.
         .merge(automations::api().layer(DefaultBodyLimit::max(MAX_AUTOMATION_BODY_BYTES)))
