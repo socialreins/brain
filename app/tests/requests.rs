@@ -18570,6 +18570,7 @@ mod teams {
                     ("/inbox-items/{id}", "get"),
                     ("/inbox-items/{id}", "patch"),
                     ("/inbox-items/{id}/reply", "post"),
+                    ("/inbox-items/{id}/conversation", "get"),
                     ("/contacts", "get"),
                     ("/contacts/{id}", "get"),
                     ("/contacts/{id}", "patch"),
@@ -19148,6 +19149,342 @@ mod teams {
                 );
                 let res = patch(&cookie, ids[0], json!({"assigned_to": member_id})).await;
                 res.assert_json(&json!({"error": "invalid_assignee"}));
+            }
+
+            /// Ann wrote four DMs and Bob two, between a comment and a mention: the ids by
+            /// text, and the "All" inbox's id.
+            async fn two_conversations(
+                s: &TestServer,
+                db: &DatabaseConnection,
+                state: &AppState,
+                cookie: &str,
+                account: &str,
+                me: &str,
+            ) -> (std::collections::HashMap<String, String>, String) {
+                let (ann, bob) = ("did:plc:ann", "did:plc:bob");
+                let convo = |id: &str, did: &str, last: i64| {
+                    json!({"id": id, "members": [{"did": me, "handle": "me.test"},
+                        {"did": did, "handle": format!("{id}.test")}],
+                        "lastMessage": {"sentAt": at(last)}})
+                };
+                set_inbox(
+                    me,
+                    json!({
+                        "notifications": [
+                            note("reply", "did:plc:fan1", "c1", "comment", &at(10), me),
+                            note("mention", "did:plc:fan2", "m1", "mention", &at(35), me),
+                        ],
+                        "convos": [convo("cva", ann, 5), convo("cvb", bob, 15)],
+                        "messages": {
+                            "cva": [dm("a4", ann, "ann four", &at(5)),
+                                dm("a3", ann, "ann three", &at(20)),
+                                dm("a2", ann, "ann two", &at(30)),
+                                dm("a1", ann, "ann one, a refund please", &at(40))],
+                            "cvb": [dm("b2", bob, "bob two", &at(15)),
+                                dm("b1", bob, "bob one", &at(25))],
+                        },
+                    }),
+                );
+                ingest(db, state, account).await;
+                let all = all_inbox(s, cookie).await;
+                assert_eq!(all["open_count"], 8, "items, not conversations");
+                let all_id = all["id"].as_str().unwrap().to_owned();
+                let listed = items(s, cookie, &all_id, "").await;
+                let texts: Vec<&str> = listed["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| {
+                        assert!(i.get("conversation").is_none(), "ungrouped: as before");
+                        i["text"].as_str().unwrap()
+                    })
+                    .collect();
+                assert_eq!(
+                    texts,
+                    [
+                        "ann four",
+                        "comment",
+                        "bob two",
+                        "ann three",
+                        "bob one",
+                        "ann two",
+                        "mention",
+                        "ann one, a refund please"
+                    ]
+                );
+                let ids = listed["items"].as_array().unwrap().iter();
+                let ids = ids
+                    .map(|i| {
+                        let text = i["text"].as_str().unwrap();
+                        let key = text.split(',').next().unwrap().to_owned();
+                        (key, i["id"].as_str().unwrap().to_owned())
+                    })
+                    .collect();
+                (ids, all_id)
+            }
+
+            fn texts(page: &Value) -> Vec<String> {
+                let list = page["items"].as_array().unwrap().iter();
+                list.map(|i| i["text"].as_str().unwrap().replace(", a refund please", ""))
+                    .collect()
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn dms_of_one_person_list_as_one_conversation() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                let (ids, all) = two_conversations(&s, &db, &state, &cookie, &account, &me).await;
+                let patch = |item: &str, body: Value| {
+                    req(
+                        &s,
+                        Method::PATCH,
+                        &format!("/v1/inbox-items/{item}"),
+                        &cookie,
+                    )
+                    .json(&body)
+                };
+
+                // One row per conversation, its latest item, between the other items.
+                let page = items(&s, &cookie, &all, "?group=conversations").await;
+                assert_eq!(texts(&page), ["ann four", "comment", "bob two", "mention"]);
+                assert!(page["next_cursor"].is_null());
+                let ann = &page["items"][0];
+                let one = fetch(&s, &cookie, &format!("/v1/inbox-items/{}", ids["ann one"])).await;
+                assert_eq!(
+                    ann["conversation"],
+                    json!({"count": 4, "open_count": 4, "first_at": one["received_at"],
+                        "last_at": ann["received_at"]})
+                );
+                assert_eq!(page["items"][2]["conversation"]["count"], 2);
+                for n in [1, 3] {
+                    let c = page["items"][n].get("conversation");
+                    assert_eq!(c, Some(&Value::Null), "a comment or mention");
+                }
+                let page = items(&s, &cookie, &all, "?group=conversations&kind=dm").await;
+                assert_eq!(texts(&page), ["ann four", "bob two"]);
+                let res = s
+                    .get(&format!("/v1/inboxes/{all}/items?group=threads"))
+                    .add_header("cookie", &cookie)
+                    .await;
+                assert_eq!(res.status_code(), 422);
+
+                // Pages follow the latest items, each row once.
+                let mut seen = Vec::new();
+                let mut query = "?group=conversations&limit=1".to_owned();
+                loop {
+                    let page = items(&s, &cookie, &all, &query).await;
+                    seen.extend(texts(&page));
+                    let Some(next) = page["next_cursor"].as_str() else {
+                        break;
+                    };
+                    query = format!("?group=conversations&limit=1&cursor={next}");
+                }
+                assert_eq!(seen, ["ann four", "comment", "bob two", "mention"]);
+                let page = items(&s, &cookie, &all, "?group=conversations&limit=3").await;
+                assert_eq!(page["next_cursor"], json!(ids["bob two"]));
+
+                // A conversation is open while any of its items is, done once none is. Without
+                // `conversation`, a change is the one item's.
+                for text in ["ann one", "ann two", "ann four"] {
+                    let res = patch(&ids[text], json!({"state": "done"})).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                }
+                let open = "?group=conversations&kind=dm&state=open";
+                let done = "?group=conversations&kind=dm&state=done";
+                let page = items(&s, &cookie, &all, open).await;
+                assert_eq!(texts(&page), ["ann four", "bob two"]);
+                assert_eq!(
+                    page["items"][0]["state"], "done",
+                    "the latest item, as it is"
+                );
+                assert_eq!(page["items"][0]["conversation"]["open_count"], 1);
+                assert_eq!(page["items"][0]["conversation"]["count"], 4);
+                assert_eq!(items(&s, &cookie, &all, done).await["items"], json!([]));
+                assert_eq!(all_inbox(&s, &cookie).await["open_count"], 5);
+
+                // With it, a DM's whole conversation changes; the answer is the item asked for.
+                let body = json!({"state": "done", "conversation": true});
+                let res = patch(&ids["bob one"], body.clone()).await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                assert_eq!(res.json::<Value>()["text"], "bob one");
+                assert_eq!(texts(&items(&s, &cookie, &all, open).await), ["ann four"]);
+                let page = items(&s, &cookie, &all, done).await;
+                assert_eq!(texts(&page), ["bob two"]);
+                assert_eq!(page["items"][0]["conversation"]["open_count"], 0);
+                // A comment's flag is ignored: the comment alone.
+                let res = patch(&ids["comment"], body).await;
+                assert_eq!(res.json::<Value>()["state"], "done");
+                assert_eq!(all_inbox(&s, &cookie).await["open_count"], 2);
+                let page = items(&s, &cookie, &all, "?group=conversations&state=done").await;
+                assert_eq!(texts(&page), ["comment", "bob two"]);
+                let me_id = fetch(&s, &cookie, "/auth/me").await["id"].clone();
+                let body = json!({"state": "open", "assigned_to": me_id, "conversation": true});
+                patch(&ids["bob two"], body).await;
+                let path = format!("/v1/inbox-items/{}/conversation", ids["bob one"]);
+                let bob = fetch(&s, &cookie, &path).await;
+                assert_eq!(texts(&bob), ["bob one", "bob two"]);
+                for i in bob["items"].as_array().unwrap() {
+                    assert_eq!(
+                        (&i["state"], &i["assigned_to"]["id"]),
+                        (&json!("open"), &me_id)
+                    );
+                }
+
+                // `q` and `tag` find a conversation by any of its items, `assigned` by its latest.
+                let page = items(&s, &cookie, &all, "?group=conversations&q=REFUND").await;
+                assert_eq!(texts(&page), ["ann four"]);
+                assert_eq!(page["items"][0]["conversation"]["count"], 4);
+                let none = items(&s, &cookie, &all, "?group=conversations&q=nothing").await;
+                assert_eq!(none["items"], json!([]));
+                let contact = ann["contact_id"].as_str().unwrap();
+                let res = req(
+                    &s,
+                    Method::PATCH,
+                    &format!("/v1/contacts/{contact}"),
+                    &cookie,
+                )
+                .json(&json!({"tags": ["vip"]}))
+                .await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                let page = items(&s, &cookie, &all, "?group=conversations&tag=vip").await;
+                assert_eq!(texts(&page), ["ann four"]);
+                let page = items(&s, &cookie, &all, "?group=conversations&assigned=me").await;
+                assert_eq!(texts(&page), ["bob two"]);
+                patch(&ids["ann one"], json!({"assigned_to": me_id})).await;
+                let page = items(&s, &cookie, &all, "?group=conversations&assigned=me").await;
+                assert_eq!(
+                    texts(&page),
+                    ["bob two"],
+                    "an older item's assignee does not count"
+                );
+                let page = items(&s, &cookie, &all, "?assigned=me").await;
+                assert_eq!(texts(&page), ["bob two", "bob one", "ann one"], "ungrouped");
+
+                // The counts are of the items the inbox holds.
+                let res = req(&s, Method::POST, "/v1/inboxes", &cookie)
+                    .json(&json!({"name": "Refunds", "filters": {"keywords": ["refund"]}}))
+                    .await;
+                let refunds = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                let page = items(&s, &cookie, &refunds, "?group=conversations").await;
+                assert_eq!(texts(&page), ["ann one"]);
+                assert_eq!(page["items"][0]["conversation"]["count"], 1);
+
+                // A DM without a contact is a conversation of its own.
+                let sql = format!(
+                    "UPDATE inbox_items SET contact_id = NULL WHERE id = '{}'",
+                    ids["bob one"]
+                );
+                exec(&db, &sql).await;
+                let page = items(&s, &cookie, &all, "?group=conversations&kind=dm").await;
+                assert_eq!(texts(&page), ["ann four", "bob two", "bob one"]);
+                assert_eq!(page["items"][1]["conversation"]["count"], 1);
+                assert_eq!(page["items"][2]["conversation"]["count"], 1);
+                let alone = fetch(&s, &cookie, &path).await;
+                assert_eq!(texts(&alone), ["bob one"]);
+                let body = json!({"state": "done", "conversation": true});
+                patch(&ids["bob one"], body).await;
+                let two = fetch(&s, &cookie, &format!("/v1/inbox-items/{}", ids["bob two"])).await;
+                assert_eq!(two["state"], "open");
+                // The backfill test counts items without a contact in the whole database.
+                let sql = format!("DELETE FROM inbox_items WHERE id = '{}'", ids["bob one"]);
+                exec(&db, &sql).await;
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_conversation_is_read_and_answered_as_one() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                let (ids, _) = two_conversations(&s, &db, &state, &cookie, &account, &me).await;
+                let of =
+                    |id: &str, query: &str| format!("/v1/inbox-items/{id}/conversation{query}");
+
+                // Every DM of the account and contact, oldest first, whichever item is asked for.
+                let page = fetch(&s, &cookie, &of(&ids["ann two"], "")).await;
+                assert_eq!(
+                    texts(&page),
+                    ["ann one", "ann two", "ann three", "ann four"]
+                );
+                assert_eq!(page["has_more"], false);
+                // The newest page first; `before` pages back.
+                let page = fetch(&s, &cookie, &of(&ids["ann one"], "?limit=3")).await;
+                assert_eq!(texts(&page), ["ann two", "ann three", "ann four"]);
+                assert_eq!(page["has_more"], true);
+                let before = format!("?limit=3&before={}", ids["ann two"]);
+                let page = fetch(&s, &cookie, &of(&ids["ann four"], &before)).await;
+                assert_eq!(texts(&page), ["ann one"]);
+                assert_eq!(page["has_more"], false);
+
+                let get = |cookie: &str, path: String| s.get(&path).add_header("cookie", cookie);
+                let res = get(&cookie, of(&ids["comment"], "")).await;
+                assert_eq!(res.status_code(), 422);
+                res.assert_json(&json!({"error": "not_a_conversation"}));
+                let res = get(&cookie, of(&ids["ann one"], "?limit=0")).await;
+                assert_eq!(res.status_code(), 422);
+                let gone = uuid::Uuid::now_v7().to_string();
+                assert_eq!(get(&cookie, of(&gone, "")).await.status_code(), 404);
+
+                // Another team reads and changes none of it.
+                let (_, stranger, _) = user(&s, &db).await;
+                let res = get(&stranger, of(&ids["ann one"], "")).await;
+                assert_eq!(res.status_code(), 404);
+                let path = format!("/v1/inbox-items/{}", ids["ann one"]);
+                let res = req(&s, Method::PATCH, &path, &stranger)
+                    .json(&json!({"state": "done", "conversation": true}))
+                    .await;
+                assert_eq!(res.status_code(), 404);
+                let reply = |id: &str, body: Value| {
+                    req(
+                        &s,
+                        Method::POST,
+                        &format!("/v1/inbox-items/{id}/reply"),
+                        &cookie,
+                    )
+                    .json(&body)
+                };
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/inbox-items/{}/reply", ids["ann four"]),
+                    &stranger,
+                )
+                .json(&json!({"text": "hi", "conversation": true}))
+                .await;
+                assert_eq!(res.status_code(), 404);
+
+                // A reply leaves the states alone, as before.
+                let res = reply(&ids["bob two"], json!({"text": "Hi Bob"})).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let page = fetch(&s, &cookie, &of(&ids["bob two"], "")).await;
+                for i in page["items"].as_array().unwrap() {
+                    assert_eq!(i["state"], "open");
+                }
+                // With `conversation`, it settles every open item of the conversation, and no other.
+                let body = json!({"text": "Hi Ann", "conversation": true});
+                let res = reply(&ids["ann four"], body).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                assert_eq!(res.json::<Value>()["state"], "done");
+                assert_eq!(SENT.lock().unwrap().last().unwrap()["convoId"], "cva");
+                let page = fetch(&s, &cookie, &of(&ids["ann one"], "")).await;
+                for i in page["items"].as_array().unwrap() {
+                    assert_eq!(i["state"], "done", "{}", i["text"]);
+                }
+                // Our replies come with the item they answered.
+                let me_id = fetch(&s, &cookie, "/auth/me").await["id"].clone();
+                let ours = &page["items"][3]["replies"];
+                assert_eq!(ours.as_array().unwrap().len(), 1);
+                assert_eq!(
+                    (&ours[0]["text"], &ours[0]["kind"], &ours[0]["sent_by"]),
+                    (&json!("Hi Ann"), &json!("dm"), &me_id)
+                );
+                assert_eq!(page["items"][0]["replies"], json!([]));
+                assert_eq!(all_inbox(&s, &cookie).await["open_count"], 4);
+                // On a comment the flag does nothing.
+                let body = json!({"text": "Thanks", "conversation": true});
+                let res = reply(&ids["comment"], body).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                assert_eq!(res.json::<Value>()["state"], "open");
             }
 
             /// `tag_contact` beside the sends of an automation and as a step of a flow: it tags
