@@ -106,8 +106,11 @@ cargo run -p socialreins-brain
   `POST /v1/posts/{id}/metrics/refresh` both go through `claim`, one statement that marks a batch
   as tried, so a target is never read twice within a minute and no connection is held while a
   platform is asked. `fetched_at` is the last try; a failed one keeps the numbers, a missing post
-  is `gone` (only once the target is an hour old). `GET /v1/analytics` sums in Rust over at most
-  `MAX_POSTS` posts.
+  is `gone` (only once the target is an hour old), asked for again a week later, 4 times. A
+  reconnect (`connections::save_account`) clears every error of the account's targets
+  (`metrics::reset`). One id can fail a whole Graph `?ids=` call, so `meta_counts` asks again id
+  by id (and a Reel with a video node's fields); never store one post's error on its batch.
+  `GET /v1/analytics` sums in Postgres (`analytics::SCOPED`) and loads only the top posts.
 - `app/src/feeds.rs` and `controllers/feeds.rs`: RSS and Atom feeds that post on their own
   (`feeds`, `feed_items`, at most 20 per team; owners, admins and full tokens write). `Fetcher`
   is the only way a feed is read: `public_url`, `PublicOnly`, at most 3 redirects each checked

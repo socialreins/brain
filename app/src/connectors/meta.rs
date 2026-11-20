@@ -123,6 +123,27 @@ fn missing(status: reqwest::StatusCode, body: &Value) -> bool {
         || (code == Some(100) && body["error"]["error_subcode"].as_i64() == Some(33))
 }
 
+/// Why `Meta::counts` gave nothing.
+pub enum Uncounted {
+    /// An object asked for is not there.
+    Missing,
+    /// Graph refused the request itself, such as a field one of the objects does not have:
+    /// asking for each id alone tells which.
+    Refused(String),
+    /// The token, a rate limit or Meta out of reach: asking again would not help.
+    Failed(PostError),
+}
+
+/// A `4xx` that is about what was asked, not about the token, a permission or a rate limit
+/// (codes 4, 17, 32 and 613, or a `429`).
+fn about_the_request(status: reqwest::StatusCode, body: &Value) -> bool {
+    let limited = matches!(body["error"]["code"].as_i64(), Some(4 | 17 | 32 | 613));
+    status.is_client_error()
+        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+        && !limited
+        && dead_or_denied(body).is_none()
+}
+
 /// A reply or message that Meta did not take, as the inbox words it.
 fn inbox_error(refused: Refused) -> InboxError {
     let Refused::Graph(status, body) = refused else {
@@ -292,25 +313,29 @@ impl Meta {
 
     /// `fields` of each of `ids` (at most 50) in one call, `/?ids=`, keyed by id, with the Page
     /// token: a Page post's reactions, comments and shares (`pages_read_engagement`) or an
-    /// Instagram media's counts (`instagram_basic`). `None` when Graph says an object is not
-    /// there, which fails the whole call, so the caller asks again one id at a time.
+    /// Instagram media's counts (`instagram_basic`). One object that is missing or lacks a field
+    /// fails the whole call (`Missing`, `Refused`), so the caller asks again one id at a time.
     pub async fn counts(
         &self,
         token: &str,
         ids: &[&str],
         fields: &str,
-    ) -> Result<Option<Value>, PostError> {
+    ) -> Result<Value, Uncounted> {
         let url = format!("{}/{}/", self.graph_url, self.version);
         let ids = ids.join(",");
         let req = self
             .client
             .get(url)
             .query(&[("ids", ids.as_str()), ("fields", fields)]);
-        match self.raw(req, Some(token), None, "Metrics").await {
-            Ok(got) => Ok(Some(got)),
-            Err(Refused::Graph(status, body)) if missing(status, &body) => Ok(None),
-            Err(refused) => Err(post_error(refused, "Metrics")),
-        }
+        self.raw(req, Some(token), None, "Metrics")
+            .await
+            .map_err(|refused| match refused {
+                Refused::Graph(status, body) if missing(status, &body) => Uncounted::Missing,
+                Refused::Graph(status, body) if about_the_request(status, &body) => {
+                    Uncounted::Refused(format!("Metrics: {}", reason(&body, status)))
+                }
+                other => Uncounted::Failed(post_error(other, "Metrics")),
+            })
     }
 
     /// One Graph API call on `path` under the version.

@@ -23553,16 +23553,21 @@ mod teams {
                     (StatusCode::OK, Json(json!({ "items": items })))
                 }
 
-                /// Graph's `/?ids=`: one object that is not there fails the whole call.
+                /// Graph's `/?ids=`: one object that is not there, or that lacks a field asked
+                /// for, fails the whole call.
                 async fn graph(h: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Answer {
                     let ids: Vec<String> = q["ids"].split(',').map(str::to_owned).collect();
+                    let post = "reactions.summary(total_count).limit(0),\
+                                comments.summary(total_count).limit(0),shares";
+                    let video = "likes.summary(total_count).limit(0),\
+                                 comments.summary(total_count).limit(0)";
                     let network = if q["fields"] == "like_count,comments_count" {
                         "instagram"
                     } else {
-                        assert_eq!(
-                            q["fields"],
-                            "reactions.summary(total_count).limit(0),\
-                             comments.summary(total_count).limit(0),shares"
+                        assert!(
+                            q["fields"] == post || q["fields"] == video,
+                            "{}",
+                            q["fields"]
                         );
                         "facebook"
                     };
@@ -23576,6 +23581,13 @@ mod teams {
                             let err = json!({"message": msg, "code": 100, "error_subcode": 33});
                             return (StatusCode::BAD_REQUEST, Json(json!({ "error": err })));
                         };
+                        // A Reel is a video node, without the fields of a post; a `broken`
+                        // object takes no field at all.
+                        if one["broken"] == true || (one["video"] == true && q["fields"] == post) {
+                            let msg = "(#100) Tried accessing nonexisting field (reactions)";
+                            let err = json!({"message": msg, "code": 100});
+                            return (StatusCode::BAD_REQUEST, Json(json!({ "error": err })));
+                        }
                         one["id"] = json!(id);
                         all.insert(id, one);
                     }
@@ -23611,6 +23623,10 @@ mod teams {
                     let mut config = Config::from_env().expect("test config");
                     config.trust_proxy = true;
                     config.bluesky.allow_insecure_pds = true;
+                    // Connecting a Bluesky account goes to the mock every other test uses.
+                    let bluesky = mock_bluesky().await;
+                    config.bluesky.appview = bluesky.clone();
+                    config.bluesky.plc = bluesky;
                     config.youtube.api_url = base.clone();
                     config.meta.graph_url = base.clone();
                     let db = socialreins_brain::connect(&config)
@@ -23619,7 +23635,7 @@ mod teams {
                     let quiet = "INSERT INTO post_metrics (target_id, post_id, team_id, platform, \
                         fetched_at, error) SELECT t.id, p.id, p.team_id, p.platform, now(), 'gone' \
                         FROM post_targets t JOIN posts p ON p.id = t.post_id \
-                        ON CONFLICT (target_id) DO UPDATE SET error = 'gone'";
+                        ON CONFLICT (target_id) DO UPDATE SET error = 'gone', fetched_at = now()";
                     exec(&db, quiet.into()).await;
                     let state = AppState::new(db.clone(), &config);
                     let app = controllers::router(state.clone(), &config);
@@ -23670,6 +23686,11 @@ mod teams {
                     );
                     db.execute_raw(stmt).await.unwrap();
                     id.to_string()
+                }
+
+                /// A YouTube account of the team that is not the one under test.
+                async fn account_of_other(db: &DatabaseConnection, team: &str) -> String {
+                    account(db, team, "youtube", "http://127.0.0.1:9").await
                 }
 
                 struct Made {
@@ -23920,6 +23941,17 @@ mod teams {
                         ),
                     )
                     .await;
+                    // An account whose token cannot be read is not asked, and its targets wait
+                    // their turn like read ones, so they do not head every round.
+                    let stuck = account(&db, &team, "bluesky", &base).await;
+                    let waiting = published(&db, (&team, &set), &stuck, "bluesky", &ago(10)).await;
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE social_accounts SET access_token = '\\x00' WHERE id = '{stuck}'"
+                        ),
+                    )
+                    .await;
                     let failed = published(&db, (&team, &set), &a, "youtube", &ago(10)).await;
                     exec(
                         &db,
@@ -23936,6 +23968,10 @@ mod teams {
                     want.sort();
                     assert_eq!(asked, want);
                     assert_eq!(row(&db, &skipped.target).await, Value::Null);
+                    assert!(calls("bluesky").is_empty());
+                    let r = row(&db, &waiting.target).await;
+                    assert!(r["fetched_at"].is_string(), "claimed: {r}");
+                    assert_eq!((&r["error"], &r["attempts"]), (&json!(null), &json!(0)));
                     assert_eq!(row(&db, &all[0].target).await["views"], 2);
                     assert_eq!(row(&db, &all[1].target).await["views"], 1, "not read again");
                 }
@@ -23998,7 +24034,7 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
-                async fn a_post_the_platform_lost_is_gone_and_not_read_again() {
+                async fn a_post_the_platform_lost_is_gone_and_asked_for_a_week_later() {
                     let (s, db, state, base) = on_networks().await;
                     let (cookie, team, set) = owner(&s, &db).await;
                     let at = (team.as_str(), set.as_str());
@@ -24059,6 +24095,156 @@ mod teams {
                         .flat_map(|c| c.1.clone())
                         .collect();
                     assert!(!asked.contains(&lost.remote) && !asked.contains(&posts[1].remote));
+
+                    // A week on it is asked for again: still gone counts up, back is read.
+                    // Only this team's: other tests' leftovers stay out of the round.
+                    let age = |sets: &'static str| {
+                        let sql = format!(
+                            "UPDATE post_metrics SET {sets}fetched_at = now() - interval '8 days' \
+                             WHERE error = 'gone' AND team_id = '{team}'"
+                        );
+                        exec(&db, sql)
+                    };
+                    age("").await;
+                    put(&lost.remote, json!({"likeCount": 8}));
+                    metrics::tick(&state).await.unwrap();
+                    let r = row(&db, &lost.target).await;
+                    assert_eq!((&r["error"], &r["likes"]), (&json!(null), &json!(8)));
+                    let r = row(&db, &posts[1].target).await;
+                    assert_eq!((&r["error"], &r["attempts"]), (&json!("gone"), &json!(2)));
+                    // Four more tries in all, then no more.
+                    age("attempts = 5, ").await;
+                    CALLS.lock().unwrap().clear();
+                    metrics::tick(&state).await.unwrap();
+                    assert!(calls("facebook").is_empty());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn one_post_graph_refuses_does_not_fail_the_others_of_its_call() {
+                    let (s, db, state, base) = on_networks().await;
+                    let (_, team, set) = owner(&s, &db).await;
+                    let at = (team.as_str(), set.as_str());
+                    let page = account(&db, &team, "facebook", &base).await;
+                    let total = |n: i64| json!({"summary": {"total_count": n}});
+                    let plain = published(&db, at, &page, "facebook", &ago(120)).await;
+                    put(
+                        &plain.remote,
+                        json!({"reactions": total(2), "comments": total(0)}),
+                    );
+                    let reel = published(&db, at, &page, "facebook", &ago(120)).await;
+                    put(
+                        &reel.remote,
+                        json!({"video": true, "likes": total(4), "comments": total(1)}),
+                    );
+                    let broken = published(&db, at, &page, "facebook", &ago(120)).await;
+                    put(&broken.remote, json!({"broken": true}));
+
+                    metrics::tick(&state).await.unwrap();
+                    // The call of all three, each alone, and the two refused as videos.
+                    let mut sizes: Vec<usize> = calls("facebook").iter().map(Vec::len).collect();
+                    sizes.sort_unstable();
+                    assert_eq!(sizes, [1, 1, 1, 1, 1, 3]);
+                    let r = row(&db, &plain.target).await;
+                    assert_eq!(
+                        (&r["likes"], &r["shares"], &r["error"]),
+                        (&json!(2), &json!(0), &json!(null))
+                    );
+                    let r = row(&db, &reel.target).await;
+                    assert_eq!((&r["likes"], &r["comments"]), (&json!(4), &json!(1)));
+                    assert_eq!((&r["shares"], &r["error"]), (&json!(null), &json!(null)));
+                    let r = row(&db, &broken.target).await;
+                    assert_eq!(
+                        r["error"],
+                        "Metrics: (#100) Tried accessing nonexisting field (reactions)"
+                    );
+                    assert_eq!((&r["attempts"], &r["likes"]), (&json!(1), &json!(null)));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connecting_an_account_again_clears_the_errors_of_its_posts() {
+                    let (s, db, state, _) = on_networks().await;
+                    let (cookie, team, set) = owner(&s, &db).await;
+                    let handle = new_handle();
+                    let res = connect(&s, &cookie, &handle, APP_PASSWORD).await;
+                    assert_eq!(res.status_code(), 201);
+                    let account = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                    let at = (team.as_str(), set.as_str());
+                    let gone = published(&db, at, &account, "bluesky", &ago(600)).await;
+                    let failing = published(&db, at, &account, "bluesky", &ago(600)).await;
+                    for (m, state) in [
+                        (&gone, "error = 'gone', attempts = 5"),
+                        (&failing, "error = 'denied', attempts = 9"),
+                    ] {
+                        read_before(&db, &m.target, 5, ["3", "0", "0", "NULL"]).await;
+                        let sql = format!(
+                            "UPDATE post_metrics SET {state} WHERE target_id = '{}'",
+                            m.target
+                        );
+                        exec(&db, sql).await;
+                    }
+                    // Another account's posts keep their state.
+                    let other = account_of_other(&db, &team).await;
+                    let theirs = published(&db, at, &other, "youtube", &ago(600)).await;
+                    read_before(&db, &theirs.target, 5, ["1", "1", "NULL", "1"]).await;
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE post_metrics SET error = 'gone' WHERE target_id = '{}'",
+                            theirs.target
+                        ),
+                    )
+                    .await;
+                    metrics::tick(&state).await.unwrap();
+                    assert_eq!(row(&db, &gone.target).await["error"], "gone", "left alone");
+
+                    let res = connect(&s, &cookie, &handle, APP_PASSWORD).await;
+                    assert_eq!(res.status_code(), 200, "a reconnect");
+                    for m in [&gone, &failing] {
+                        let r = row(&db, &m.target).await;
+                        assert_eq!((&r["error"], &r["attempts"]), (&json!(null), &json!(0)));
+                        assert_eq!(r["likes"], 3, "the numbers stay");
+                    }
+                    assert_eq!(row(&db, &theirs.target).await["error"], "gone");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn analytics_counts_every_post_of_a_long_range() {
+                    let (s, db, _, base) = on_networks().await;
+                    let (cookie, team, set) = owner(&s, &db).await;
+                    let a = account(&db, &team, "bluesky", &base).await;
+                    // More posts than a list of posts gives (2000).
+                    let sql = format!(
+                        "INSERT INTO posts (id, team_id, social_set_id, platform, body, status, \
+                         published_at, fanned_out) SELECT gen_random_uuid(), '{team}', '{set}', \
+                         'bluesky', 'n', 'published', now() - make_interval(days => n % 3), true \
+                         FROM generate_series(1, 2100) n; \
+                         INSERT INTO post_targets (id, post_id, social_account_id, status, \
+                         remote_id, published_at) SELECT gen_random_uuid(), id, '{a}', 'published', \
+                         id::text, published_at FROM posts WHERE team_id = '{team}'; \
+                         INSERT INTO post_metrics (target_id, post_id, team_id, platform, likes, \
+                         views, fetched_at) SELECT t.id, p.id, p.team_id, p.platform, 2, 5, now() \
+                         FROM post_targets t JOIN posts p ON p.id = t.post_id \
+                         WHERE p.team_id = '{team}'"
+                    );
+                    exec(&db, sql).await;
+                    let res = s.get("/v1/analytics").add_header("cookie", &cookie).await;
+                    res.assert_status_ok();
+                    let body = res.json::<Value>();
+                    let all = json!({"posts": 2100, "likes": 4200, "comments": 0, "shares": 0,
+                        "views": 10500});
+                    assert_eq!(body["totals"], all);
+                    let mut bluesky = all.clone();
+                    bluesky["platform"] = json!("bluesky");
+                    bluesky["supported"] = json!(true);
+                    assert_eq!(body["by_platform"], json!([bluesky]));
+                    let days = body["by_day"].as_array().unwrap();
+                    let posts: i64 = days.iter().map(|d| d["posts"].as_i64().unwrap()).sum();
+                    assert_eq!(posts, 2100);
+                    assert_eq!(days[29]["posts"], 700);
+                    assert_eq!(body["top_posts"].as_array().unwrap().len(), 10);
                 }
 
                 #[tokio::test]

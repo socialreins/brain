@@ -1,6 +1,6 @@
 //! Analytics of the current team: the metrics `metrics.rs` keeps for published posts, summed
 //! over a range of days. Any member reads it, and so does a token (a set token for its set).
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use axum::{
     extract::{rejection::QueryRejection, Query, State},
@@ -10,7 +10,9 @@ use axum::{
 };
 use chrono::{Duration, NaiveDate, NaiveTime, Utc};
 use schemars::JsonSchema;
-use sea_orm::{ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DbBackend, DbErr, EntityTrait, QueryFilter, Statement,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -19,14 +21,10 @@ use uuid::Uuid;
 use super::{
     api_tokens::Actor,
     auth::internal,
-    posts::{self, Post, MAX_POSTS},
+    posts::{self, Post},
     waitlist::{error, Error},
 };
-use crate::{
-    metrics::SUPPORTED,
-    models::{post_metrics, posts as post_rows},
-    state::AppState,
-};
+use crate::{metrics::SUPPORTED, models::posts as post_rows, state::AppState};
 
 /// Most days one call covers.
 const MAX_DAYS: i64 = 366;
@@ -124,7 +122,21 @@ async fn show(
     get_analytics(&app, &a, q).await
 }
 
-/// The body of `GET /analytics`, shared with the MCP `get-analytics` tool.
+/// The caller's published posts of the range, each with the numbers of its targets together.
+/// `$4` is a set token's set and `$5` the set asked for; either may be null.
+const SCOPED: &str = "WITH scoped AS (SELECT p.id, p.platform, p.published_at, \
+    COALESCE(sum(m.likes), 0)::bigint AS likes, COALESCE(sum(m.comments), 0)::bigint AS comments, \
+    COALESCE(sum(m.shares), 0)::bigint AS shares, COALESCE(sum(m.views), 0)::bigint AS views \
+    FROM posts p LEFT JOIN post_metrics m ON m.post_id = p.id \
+    WHERE p.team_id = $1 AND p.status = 'published' AND p.published_at >= $2 \
+      AND p.published_at < $3 \
+      AND p.social_set_id IN (SELECT id FROM social_sets WHERE deleted_at IS NULL) \
+      AND ($4::uuid IS NULL OR p.social_set_id = $4) \
+      AND ($5::uuid IS NULL OR p.social_set_id = $5) \
+    GROUP BY p.id)";
+
+/// The body of `GET /analytics`, shared with the MCP `get-analytics` tool. The sums are
+/// Postgres's, per platform and day; only the top posts are loaded.
 pub async fn get_analytics(app: &AppState, a: &Actor, q: AnalyticsQuery) -> Response {
     let Some((from, to)) = range(&q) else {
         return invalid_range();
@@ -132,37 +144,24 @@ pub async fn get_analytics(app: &AppState, a: &Actor, q: AnalyticsQuery) -> Resp
     let found = async {
         let start = from.and_time(NaiveTime::MIN).and_utc();
         let end = (to + Duration::days(1)).and_time(NaiveTime::MIN).and_utc();
-        let rows = posts::in_set(&app.db, a, q.social_set_id)
-            .await?
-            .filter(post_rows::Column::Status.eq("published"))
-            .filter(post_rows::Column::PublishedAt.gte(start))
-            .filter(post_rows::Column::PublishedAt.lt(end))
-            .order_by_desc(post_rows::Column::PublishedAt)
-            .order_by_asc(post_rows::Column::Id)
-            .limit(MAX_POSTS)
-            .all(&app.db)
-            .await?;
-        // A post's numbers are those of its targets together.
-        let mut sums: HashMap<Uuid, Totals> = HashMap::new();
-        let read = post_metrics::Entity::find()
-            .filter(post_metrics::Column::TeamId.eq(a.team.id))
-            .filter(post_metrics::Column::PostId.is_in(rows.iter().map(|p| p.id)))
-            .all(&app.db)
-            .await?;
-        for m in read {
-            let s = sums.entry(m.post_id).or_default();
-            s.likes += m.likes.unwrap_or(0);
-            s.comments += m.comments.unwrap_or(0);
-            s.shares += m.shares.unwrap_or(0);
-            s.views += m.views.unwrap_or(0);
-        }
-        let add = |to: &mut Totals, s: Totals| {
-            to.posts += 1;
-            to.likes += s.likes;
-            to.comments += s.comments;
-            to.shares += s.shares;
-            to.views += s.views;
+        let set = posts::narrowed(&app.db, a, q.social_set_id).await?;
+        let query = |rest: &str| {
+            Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                format!("{SCOPED} {rest}"),
+                [
+                    a.team.id.into(),
+                    start.into(),
+                    end.into(),
+                    a.set_id().into(),
+                    set.into(),
+                ],
+            )
         };
+        let sums = "SELECT platform, (published_at AT TIME ZONE 'UTC')::date AS day, \
+            count(*) AS posts, sum(likes)::bigint AS likes, sum(comments)::bigint AS comments, \
+            sum(shares)::bigint AS shares, sum(views)::bigint AS views \
+            FROM scoped GROUP BY 1, 2";
         let mut totals = Totals::default();
         let mut platforms: BTreeMap<String, Totals> = BTreeMap::new();
         let mut days: BTreeMap<NaiveDate, Totals> = from
@@ -170,20 +169,41 @@ pub async fn get_analytics(app: &AppState, a: &Actor, q: AnalyticsQuery) -> Resp
             .take_while(|d| *d <= to)
             .map(|d| (d, Totals::default()))
             .collect();
-        for p in &rows {
-            let s = sums.get(&p.id).copied().unwrap_or_default();
-            add(&mut totals, s);
-            add(platforms.entry(p.platform.clone()).or_default(), s);
-            if let Some(day) = p.published_at.map(|t| t.to_utc().date_naive()) {
-                add(days.entry(day).or_default(), s);
+        for r in app.db.query_all_raw(query(sums)).await? {
+            let s = Totals {
+                posts: r.try_get("", "posts")?,
+                likes: r.try_get("", "likes")?,
+                comments: r.try_get("", "comments")?,
+                shares: r.try_get("", "shares")?,
+                views: r.try_get("", "views")?,
+            };
+            let platform: String = r.try_get("", "platform")?;
+            let day: NaiveDate = r.try_get("", "day")?;
+            for to in [
+                &mut totals,
+                platforms.entry(platform).or_default(),
+                days.entry(day).or_default(),
+            ] {
+                to.posts += s.posts;
+                to.likes += s.likes;
+                to.comments += s.comments;
+                to.shares += s.shares;
+                to.views += s.views;
             }
         }
-        let score = |id: &Uuid| sums.get(id).map_or(0, |s| s.likes + s.comments + s.shares);
-        // The sort is stable, so equal posts stay newest first.
-        let mut top: Vec<post_rows::Model> =
-            rows.into_iter().filter(|p| score(&p.id) > 0).collect();
-        top.sort_by_key(|p| std::cmp::Reverse(score(&p.id)));
-        top.truncate(TOP);
+        let top = format!(
+            "SELECT id FROM scoped WHERE likes + comments + shares > 0 \
+             ORDER BY likes + comments + shares DESC, published_at DESC, id LIMIT {TOP}"
+        );
+        let mut ids = Vec::new();
+        for r in app.db.query_all_raw(query(&top)).await? {
+            ids.push(r.try_get::<Uuid>("", "id")?);
+        }
+        let mut top = post_rows::Entity::find()
+            .filter(post_rows::Column::Id.is_in(ids.iter().copied()))
+            .all(&app.db)
+            .await?;
+        top.sort_by_key(|p| ids.iter().position(|id| *id == p.id));
         Ok::<_, DbErr>(Analytics {
             supported: SUPPORTED.map(str::to_owned).to_vec(),
             totals,

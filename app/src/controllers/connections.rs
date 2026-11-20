@@ -452,6 +452,10 @@ pub(crate) async fn save_account(
         .exec_without_returning(&txn)
         .await?;
     let created = account.id == new_id;
+    if !created {
+        // A reconnect mends what made a read fail, a lost permission above all.
+        crate::metrics::reset(&txn, account.id).await?;
+    }
     let json = one_json(&txn, account).await?;
     txn.commit().await.map(|_| (created, json))
 }

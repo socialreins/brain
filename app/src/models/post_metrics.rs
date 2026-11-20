@@ -16,9 +16,10 @@ pub struct Model {
     pub views: Option<i64>,
     /// The last try, failed or not.
     pub fetched_at: DateTimeWithTimeZone,
-    /// Why the last try failed; `gone` is never tried again.
+    /// Why the last try failed; `gone` is a post the platform does not show.
     #[sea_orm(column_type = "Text", nullable)]
     pub error: Option<String>,
+    /// Failed tries in a row; of a `gone` row, the times it was found gone.
     pub attempts: i32,
 }
 

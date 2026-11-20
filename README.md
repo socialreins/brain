@@ -798,8 +798,11 @@ never called. One latest set of numbers is kept per target (`post_metrics`), no 
   `app.bsky.feed.getPosts`) or 50 (YouTube `videos.list?part=statistics`, Graph `/?ids=`), 8
   accounts at once, and starts no call after 5 minutes.
 - A read that fails keeps the numbers of the one before and waits twice as long per failed try,
-  a day at most. A post the platform no longer has stops being read (its last numbers stay); an
-  account that needs a reconnect is skipped. `fetched_at` is the last try, failed or not.
+  a day at most. A post the platform does not show keeps its last numbers and is asked for
+  again a week later, 4 times; an account that needs a reconnect is skipped, and connecting it
+  again clears the errors of its posts, so they are read in the next round. One post Graph
+  refuses (a Reel has no reactions or shares, so it is asked for its likes and comments) never
+  fails the others of its call. `fetched_at` is the last try, failed or not.
 - `POST /v1/posts/{id}/metrics/refresh` reads one post now, waiting up to 20 seconds for its
   platforms, at most once a minute per post.
 - `GET /v1/analytics` sums the `published` posts whose `published_at` falls on the days `from` to

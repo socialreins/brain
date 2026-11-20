@@ -7,7 +7,8 @@
 //! once-a-minute limit of `POST /posts/{id}/metrics/refresh`), so two instances never read one
 //! target twice and no connection is held while a platform is asked. A failed batch keeps the
 //! old numbers, stores `error` and waits twice as long per failed try, at most a day; a post the
-//! platform no longer has is `gone` and is not read again by the tick.
+//! platform does not show is `gone` and asked for again a week later, `GONE_TRIES` times. A
+//! reconnect of the account clears both (`reset`), so a lost permission heals itself.
 use std::{
     collections::{HashMap, HashSet},
     time::Duration,
@@ -21,7 +22,12 @@ use serde_json::Value as Json;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::{connectors::bluesky::PostError, models::social_accounts, publish, state::AppState};
+use crate::{
+    connectors::{bluesky::PostError, meta::Uncounted},
+    models::social_accounts,
+    publish,
+    state::AppState,
+};
 
 /// The platforms whose counts are read. Threads, LinkedIn, X and TikTok would need scopes or
 /// paid access the accounts do not have, so they are never called.
@@ -36,14 +42,27 @@ const PER_TICK: usize = 500;
 const AT_ONCE: usize = 8;
 const FACEBOOK_FIELDS: &str =
     "reactions.summary(total_count).limit(0),comments.summary(total_count).limit(0),shares";
+/// What a video node (a Reel) has of them: no reactions and no shares.
+const FACEBOOK_VIDEO_FIELDS: &str =
+    "likes.summary(total_count).limit(0),comments.summary(total_count).limit(0)";
 const INSTAGRAM_FIELDS: &str = "like_count,comments_count";
+/// Times a `gone` post is asked for again, a week apart.
+const GONE_TRIES: i32 = 4;
 
 /// When the tick reads a target again: never read, or last tried over an hour ago (12 hours once
-/// the post is two days old), doubled per failed try up to a day. Not after 30 days.
-const DUE: &str = "t.published_at > now() - interval '30 days' \
-    AND (m.target_id IS NULL OR (m.error IS DISTINCT FROM 'gone' AND m.fetched_at <= now() - LEAST( \
-      (CASE WHEN t.published_at > now() - interval '48 hours' THEN interval '1 hour' \
-        ELSE interval '12 hours' END) * power(2, LEAST(m.attempts, 10)), interval '24 hours')))";
+/// the post is two days old), doubled per failed try up to a day; a `gone` one a week after its
+/// last try, `GONE_TRIES` times. Not after 30 days.
+fn due_now() -> String {
+    format!(
+        "t.published_at > now() - interval '30 days' AND (m.target_id IS NULL \
+         OR (m.error = 'gone' AND m.attempts <= {GONE_TRIES} \
+           AND m.fetched_at <= now() - interval '7 days') \
+         OR (m.error IS DISTINCT FROM 'gone' AND m.fetched_at <= now() - LEAST( \
+           (CASE WHEN t.published_at > now() - interval '48 hours' THEN interval '1 hour' \
+             ELSE interval '12 hours' END) * power(2, LEAST(m.attempts, 10)), \
+           interval '24 hours')))"
+    )
+}
 
 /// What a platform counts on one post; `None` is a number it does not give (or hides).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -123,6 +142,17 @@ async fn claim(db: &DatabaseConnection, batch: &[Due]) -> Result<HashSet<Uuid>, 
     rows.iter().map(|r| r.try_get("", "target_id")).collect()
 }
 
+/// Forgets the errors of an account's targets, `gone` included, so the next round reads them
+/// again: called when the account is connected again, which is what mends a lost permission.
+pub async fn reset(db: &impl ConnectionTrait, account: Uuid) -> Result<(), DbErr> {
+    let stmt = sql(
+        "UPDATE post_metrics SET error = NULL, attempts = 0 WHERE error IS NOT NULL \
+         AND target_id IN (SELECT id FROM post_targets WHERE social_account_id = $1)",
+        vec![account.into()],
+    );
+    db.execute_raw(stmt).await.map(|_| ())
+}
+
 fn why(e: PostError) -> String {
     match e {
         PostError::Reconnect => "reconnect".into(),
@@ -136,26 +166,54 @@ fn num(v: &Json) -> Option<i64> {
     v.as_i64().or_else(|| v.as_str()?.parse().ok())
 }
 
-/// Meta's answer for `ids`, keyed by id. One missing object fails a whole `?ids=` call, so
-/// then each id is asked on its own and the missing ones are left out.
+/// One post's counts, or why the platform would not give them for it alone.
+type Read = Result<Counts, String>;
+
+/// Meta's answer for `ids`, by id; a post that is not there is left out. One object that is
+/// missing, or that lacks a field, fails a whole `?ids=` call, so then each id is asked on its
+/// own, and one that is refused alone once more with `video` (the fields a video node has, for a
+/// Reel). What is still refused is that post's error only. `Err` is a failure of the account
+/// (token, rate limit, Meta down), where asking again would not help.
 async fn meta_counts(
     app: &AppState,
     token: &str,
     ids: &[&str],
-    fields: &str,
-) -> Result<Json, PostError> {
-    if let Some(all) = app.meta.counts(token, ids, fields).await? {
-        return Ok(all);
-    }
-    let mut found = serde_json::Map::new();
-    if ids.len() > 1 {
-        for id in ids {
-            if let Some(Json::Object(one)) = app.meta.counts(token, &[id], fields).await? {
-                found.extend(one);
+    (fields, video): (&str, Option<&str>),
+    counts: fn(&Json) -> Counts,
+) -> Result<HashMap<String, Read>, String> {
+    let mut whole = match app.meta.counts(token, ids, fields).await {
+        Ok(all) => {
+            let all = all.as_object().cloned().unwrap_or_default();
+            return Ok(all
+                .iter()
+                .map(|(id, v)| (id.clone(), Ok(counts(v))))
+                .collect());
+        }
+        Err(Uncounted::Failed(e)) => return Err(why(e)),
+        // Of one id this was already its own call.
+        refused => (ids.len() == 1).then_some(refused),
+    };
+    let mut found = HashMap::new();
+    for id in ids {
+        let mut got = match whole.take() {
+            Some(got) => got,
+            None => app.meta.counts(token, &[id], fields).await,
+        };
+        if let (Err(Uncounted::Refused(_)), Some(video)) = (&got, video) {
+            got = app.meta.counts(token, &[id], video).await;
+        }
+        match got {
+            Ok(one) if one[*id].is_object() => {
+                found.insert((*id).to_owned(), Ok(counts(&one[*id])));
             }
+            Ok(_) | Err(Uncounted::Missing) => {}
+            Err(Uncounted::Refused(msg)) => {
+                found.insert((*id).to_owned(), Err(msg));
+            }
+            Err(Uncounted::Failed(e)) => return Err(why(e)),
         }
     }
-    Ok(Json::Object(found))
+    Ok(found)
 }
 
 /// The counts of the posts `ids` of one account, by remote id; a post the platform no longer
@@ -165,11 +223,7 @@ async fn fetch(
     account: &social_accounts::Model,
     token: &str,
     ids: &[&str],
-) -> Result<HashMap<String, Counts>, String> {
-    let by_id = |all: Json, counts: fn(&Json) -> Counts| -> HashMap<String, Counts> {
-        let all = all.as_object().cloned().unwrap_or_default();
-        all.iter().map(|(id, v)| (id.clone(), counts(v))).collect()
-    };
+) -> Result<HashMap<String, Read>, String> {
     match account.provider.as_str() {
         "bluesky" => {
             let creds = publish::creds(account, token);
@@ -185,7 +239,7 @@ async fn fetch(
             };
             Ok(posts
                 .iter()
-                .filter_map(|p| Some((p["uri"].as_str()?.to_owned(), counts(p))))
+                .filter_map(|p| Some((p["uri"].as_str()?.to_owned(), Ok(counts(p)))))
                 .collect())
         }
         "youtube" => {
@@ -198,40 +252,46 @@ async fn fetch(
             };
             Ok(videos
                 .iter()
-                .filter_map(|v| Some((v["id"].as_str()?.to_owned(), counts(&v["statistics"]))))
+                .filter_map(|v| Some((v["id"].as_str()?.to_owned(), Ok(counts(&v["statistics"])))))
                 .collect())
         }
         "facebook" => {
-            let all = meta_counts(app, token, ids, FACEBOOK_FIELDS).await;
-            Ok(by_id(all.map_err(why)?, |p| Counts {
-                likes: num(&p["reactions"]["summary"]["total_count"]),
-                comments: num(&p["comments"]["summary"]["total_count"]),
-                // Graph leaves `shares` out of a post nobody shared.
-                shares: Some(num(&p["shares"]["count"]).unwrap_or(0)),
-                views: None,
-            }))
+            let fields = (FACEBOOK_FIELDS, Some(FACEBOOK_VIDEO_FIELDS));
+            meta_counts(app, token, ids, fields, |p| {
+                let post = p["reactions"].is_object();
+                let likes = if post { &p["reactions"] } else { &p["likes"] };
+                Counts {
+                    likes: num(&likes["summary"]["total_count"]),
+                    comments: num(&p["comments"]["summary"]["total_count"]),
+                    // Graph leaves `shares` out of a post nobody shared; a video has none.
+                    shares: post.then(|| num(&p["shares"]["count"]).unwrap_or(0)),
+                    views: None,
+                }
+            })
+            .await
         }
         "instagram" => {
-            let all = meta_counts(app, token, ids, INSTAGRAM_FIELDS).await;
-            Ok(by_id(all.map_err(why)?, |m| Counts {
+            meta_counts(app, token, ids, (INSTAGRAM_FIELDS, None), |m| Counts {
                 // Left out when the account hides its like counts.
                 likes: num(&m["like_count"]),
                 comments: num(&m["comments_count"]),
                 shares: None,
                 views: None,
-            }))
+            })
+            .await
         }
         _ => Err("unsupported".into()),
     }
 }
 
-/// Saves what a read of `batch` gave: the counts, `gone` for a post the platform no longer has
+/// Saves what a read of `batch` gave: the counts, `gone` for a post the platform does not show
 /// (`not_found` while it is under an hour old, since a platform can be slow to show a new
-/// post), or the error with one more failed try.
+/// post), or the error, of the post or of the whole read, with one more failed try. `attempts`
+/// of a `gone` row counts the times it was found gone.
 async fn record(
     db: &DatabaseConnection,
     batch: &[&Due],
-    got: &Result<HashMap<String, Counts>, String>,
+    got: &Result<HashMap<String, Read>, String>,
 ) -> Result<(), DbErr> {
     let failed = |d: &Due, error: &str| {
         sql(
@@ -242,7 +302,7 @@ async fn record(
     };
     for d in batch {
         let stmt = match got.as_ref().map(|all| all.get(&d.remote_id)) {
-            Ok(Some(c)) => sql(
+            Ok(Some(Ok(c))) => sql(
                 "UPDATE post_metrics SET likes = $2, comments = $3, shares = $4, views = $5, \
                  fetched_at = now(), error = NULL, attempts = 0 WHERE target_id = $1",
                 vec![
@@ -254,11 +314,12 @@ async fn record(
                 ],
             ),
             Ok(None) if d.old => sql(
-                "UPDATE post_metrics SET error = 'gone', fetched_at = now() WHERE target_id = $1",
+                "UPDATE post_metrics SET fetched_at = now(), error = 'gone', attempts = \
+                 CASE WHEN error = 'gone' THEN attempts + 1 ELSE 1 END WHERE target_id = $1",
                 vec![d.target.into()],
             ),
             Ok(None) => failed(d, "not_found"),
-            Err(e) => failed(d, e),
+            Ok(Some(Err(e))) | Err(e) => failed(d, e),
         };
         db.execute_raw(stmt).await?;
     }
@@ -266,7 +327,9 @@ async fn record(
 }
 
 /// Reads the targets of one account, a batch at a time (25 for Bluesky, 50 for the others). An
-/// account whose token cannot be had (it needs a reconnect, or its renewal failed) is skipped.
+/// account whose token cannot be had (it needs a reconnect, or its renewal failed) is skipped:
+/// its targets are claimed all the same, so they wait their turn again (an hour, or 12) and do
+/// not fill the front of every round while the account is out.
 async fn read_account(
     app: &AppState,
     account: Uuid,
@@ -280,7 +343,7 @@ async fn read_account(
         return Ok(());
     };
     let Ok(token) = publish::credential(app, &account).await else {
-        return Ok(());
+        return claim(&app.db, &rows).await.map(|_| ());
     };
     let size = if account.provider == "bluesky" {
         25
@@ -347,7 +410,7 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
     if !locked {
         return Ok(());
     }
-    let rows = due(&lock, DUE, vec![]).await?;
+    let rows = due(&lock, &due_now(), vec![]).await?;
     lock.commit().await?;
     read(app, rows, Instant::now() + ROUND).await;
     Ok(())

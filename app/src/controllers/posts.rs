@@ -1166,29 +1166,23 @@ fn status_for(input: &PostInput) -> &'static str {
     }
 }
 
-/// The caller's posts in live sets: those of `set`, or of every set when it is absent or the
-/// default set, which holds every account. A set token still only sees its own set's.
-pub(crate) async fn in_set(
+/// The set a query for `set` narrows to: none when it is absent or the team's default set,
+/// which holds every account and so stands for every set.
+pub(crate) async fn narrowed(
     db: &impl ConnectionTrait,
     a: &Actor,
     set: Option<Uuid>,
-) -> Result<sea_orm::Select<posts::Entity>, DbErr> {
-    let mut sel = posts::Entity::find()
-        .filter(posts::Column::TeamId.eq(a.team.id))
-        .filter(posts::Column::SocialSetId.in_subquery(live_sets()))
-        .filter(in_scope(a));
-    if let Some(set) = set {
-        let default = social_sets::Entity::find_by_id(set)
-            .filter(social_sets::Column::TeamId.eq(a.team.id))
-            .filter(social_sets::Column::IsDefault.eq(true))
-            .count(db)
-            .await?
-            > 0;
-        if !default {
-            sel = sel.filter(posts::Column::SocialSetId.eq(set));
-        }
-    }
-    Ok(sel)
+) -> Result<Option<Uuid>, DbErr> {
+    let Some(set) = set else {
+        return Ok(None);
+    };
+    let default = social_sets::Entity::find_by_id(set)
+        .filter(social_sets::Column::TeamId.eq(a.team.id))
+        .filter(social_sets::Column::IsDefault.eq(true))
+        .count(db)
+        .await?
+        > 0;
+    Ok((!default).then_some(set))
 }
 
 /// The current team's posts, by `scheduled_at` (unscheduled last), at most 2000. For a calendar,
@@ -1218,7 +1212,14 @@ pub async fn list_posts(app: &AppState, a: &Actor, q: PostQuery) -> Response {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     }
     let found = async {
-        let mut sel = in_set(&app.db, a, q.social_set_id).await?;
+        let mut sel = posts::Entity::find()
+            .filter(posts::Column::TeamId.eq(a.team.id))
+            .filter(posts::Column::SocialSetId.in_subquery(live_sets()))
+            .filter(in_scope(a));
+        // The default set holds every account, so it lists every set's posts.
+        if let Some(set) = narrowed(&app.db, a, q.social_set_id).await? {
+            sel = sel.filter(posts::Column::SocialSetId.eq(set));
+        }
         if let Some(status) = &q.status {
             sel = sel.filter(posts::Column::Status.eq(status));
         }
