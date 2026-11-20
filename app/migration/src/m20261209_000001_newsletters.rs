@@ -14,7 +14,8 @@ pub struct Migration;
 // and subscriber); a recipient moves `pending` to `sending` (claimed) to `mailing` (the mail
 // call is about to start) to an end state and never back from `mailing`, so it is mailed at
 // most once. A `paused` newsletter waits for a person (`pause_reason`), and
-// `resumed_at` is where its run of failures starts counting again.
+// `resumed_at` is where its run of failures starts counting again. Broadcast recipients get
+// the same in-between state, `delivering`.
 const UP: &str = r#"ALTER TABLE teams ADD COLUMN newsletter_sender_name text,
   ADD COLUMN newsletter_sender_address text,
   ADD CONSTRAINT teams_newsletter_sender_check
@@ -51,7 +52,10 @@ CREATE TABLE newsletter_recipients (
   updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (newsletter_id, subscriber_id));
 CREATE INDEX newsletter_recipients_status_idx
-  ON newsletter_recipients (newsletter_id, status, id);"#;
+  ON newsletter_recipients (newsletter_id, status, id);
+ALTER TABLE broadcast_recipients DROP CONSTRAINT broadcast_recipients_status_check,
+  ADD CONSTRAINT broadcast_recipients_status_check
+    CHECK (status IN ('pending', 'sending', 'delivering', 'sent', 'skipped', 'failed'));"#;
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
@@ -60,7 +64,11 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, m: &SchemaManager) -> Result<(), DbErr> {
-        let sql = "DROP TABLE IF EXISTS newsletter_recipients;
+        let sql = "UPDATE broadcast_recipients SET status = 'sending' WHERE status = 'delivering';
+ALTER TABLE broadcast_recipients DROP CONSTRAINT broadcast_recipients_status_check,
+  ADD CONSTRAINT broadcast_recipients_status_check
+    CHECK (status IN ('pending', 'sending', 'sent', 'skipped', 'failed'));
+DROP TABLE IF EXISTS newsletter_recipients;
 DROP TABLE IF EXISTS newsletters;
 ALTER TABLE subscribers DROP COLUMN IF EXISTS unsubscribe_token,
   DROP COLUMN IF EXISTS unsubscribe_token_hash, DROP COLUMN IF EXISTS unsubscribed_at;

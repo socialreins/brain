@@ -132,8 +132,10 @@ cargo run -p socialreins-brain
   checks the same audience clause again (tag included) and sends through `inbox::send`. A
   platform error that is not about the one person (`Tried::Trip`), or 5 failed sends in a row
   (`pause_failing`), sets the broadcast `paused`; only `resume` (a person) puts it back. Never send to a recipient without
-  claiming it, and never retry one: `recover` fails a claim older than 15 minutes as
-  `interrupted`. Only `release` (the round ran out of time before the send began) puts one back.
+  claiming it, and never retry one. `attempt` commits `delivering` right before `inbox::send`:
+  after 15 minutes `recover` fails a `delivering` row as `interrupted` and hands a merely claimed
+  (`sending`) one back, as `release` does when the round ran out of time before the send began
+  (`HAND_BACK`: `pending`, or `skipped` when the broadcast was cancelled).
 - `app/src/metrics.rs` and `controllers/analytics.rs`: post metrics (`post_metrics`, one latest
   row per published target, no history) from Bluesky, Facebook, Instagram and YouTube
   (`metrics::SUPPORTED`; never add a platform that needs a new scope). `metrics::tick` (every 15

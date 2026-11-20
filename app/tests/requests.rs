@@ -17779,7 +17779,7 @@ mod teams {
                         // Four claims in a row were cut off.
                         let cut = |who: uuid::Uuid| {
                             format!(
-                                "UPDATE broadcast_recipients SET status = 'sending', \
+                                "UPDATE broadcast_recipients SET status = 'delivering', \
                                  updated_at = now() - interval '16 minutes' WHERE contact_id = '{who}'"
                             )
                         };
@@ -17803,7 +17803,7 @@ mod teams {
                         assert_eq!(start(&s, &t.cookie, &id, 6).await.status_code(), 200);
                         for who in &people[..5] {
                             let cut = format!(
-                                "UPDATE broadcast_recipients SET status = 'sending', \
+                                "UPDATE broadcast_recipients SET status = 'delivering', \
                                  updated_at = now() - interval '16 minutes' WHERE contact_id = '{who}'"
                             );
                             exec(&db, &cut).await;
@@ -18210,10 +18210,10 @@ mod teams {
                         let people = crowd(&db, &t, 3).await;
                         let id = draft(&s, &t.cookie, vip("Launch", "Hello")).await;
                         assert_eq!(start(&s, &t.cookie, &id, 3).await.status_code(), 200);
-                        // A process claimed two and died: one 16 minutes ago, one just now.
+                        // A process began two sends and died: one 16 minutes ago, one just now.
                         let claim = |who: uuid::Uuid, ago: &str| {
                             format!(
-                                "UPDATE broadcast_recipients SET status = 'sending', \
+                                "UPDATE broadcast_recipients SET status = 'delivering', \
                  updated_at = now() - interval '{ago}' WHERE contact_id = '{who}'"
                             )
                         };
@@ -18227,7 +18227,7 @@ mod teams {
                         );
                         assert_eq!(
                             got[&people[1].to_string()],
-                            ("sending".to_owned(), Value::Null)
+                            ("delivering".to_owned(), Value::Null)
                         );
                         assert_eq!(
                             got[&people[2].to_string()],
@@ -18246,6 +18246,54 @@ mod teams {
                         assert_eq!(b["status"], "sent");
                         assert_eq!(b["counts"], counts(3, 1, 0, 2, 0));
                         assert_eq!(t.bsky_sent().len(), 1);
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn a_claim_nothing_was_sent_for_goes_back_or_is_skipped_once_cancelled() {
+                        let (s, db, state) = on_both().await;
+                        let t = team_bsky(&s, &db).await;
+                        let people = crowd(&db, &t, 3).await;
+                        let id = draft(&s, &t.cookie, vip("Launch", "Hello")).await;
+                        assert_eq!(start(&s, &t.cookie, &id, 3).await.status_code(), 200);
+                        // A process claimed two and died before any send: one 16 minutes ago,
+                        // one just now.
+                        let claim = |who: uuid::Uuid, ago: &str| {
+                            format!(
+                                "UPDATE broadcast_recipients SET status = 'sending', \
+                                 updated_at = now() - interval '{ago}' WHERE contact_id = '{who}'"
+                            )
+                        };
+                        exec(&db, &claim(people[0], "16 minutes")).await;
+                        exec(&db, &claim(people[1], "1 minute")).await;
+                        broadcasts::tick(&state).await.unwrap();
+                        let got = ends(&s, &t.cookie, &id).await;
+                        let sent = ("sent".to_owned(), Value::Null);
+                        assert_eq!(got[&people[0].to_string()], sent, "no failure, no pause");
+                        assert_eq!(
+                            got[&people[1].to_string()],
+                            ("sending".to_owned(), Value::Null)
+                        );
+                        assert_eq!(got[&people[2].to_string()], sent);
+                        assert_eq!(t.bsky_sent().len(), 2);
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "sending");
+                        assert_eq!(b["counts"], counts(3, 2, 0, 0, 1));
+
+                        // Cancelled, the claim left behind is skipped, not pending for ever.
+                        let res = act(&s, &t.cookie, &id, "cancel", json!({})).await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        exec(&db, &claim(people[1], "16 minutes")).await;
+                        broadcasts::tick(&state).await.unwrap();
+                        let got = ends(&s, &t.cookie, &id).await;
+                        assert_eq!(
+                            got[&people[1].to_string()],
+                            ("skipped".to_owned(), json!("cancelled"))
+                        );
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "cancelled");
+                        assert_eq!(b["counts"], counts(3, 2, 1, 0, 0));
+                        assert_eq!(t.bsky_sent().len(), 2);
                     }
                 }
             }
