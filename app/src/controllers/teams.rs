@@ -79,6 +79,23 @@ pub struct Sender {
     /// The sender's postal address, shown under every newsletter as the law requires: 10 to
     /// 300 characters after trimming; it may have line breaks.
     pub address: String,
+    /// The team's logo, shown above every newsletter in place of the name: a public `https`
+    /// image link of at most 2000 characters, with a host and without a user name or password.
+    /// `null`, an empty string or no `logo` at all means none. It is never fetched here, only
+    /// put in the mail.
+    pub logo: Option<String>,
+}
+
+/// The logo link as stored (the parsed URL written out, so it holds no white space or control
+/// character), or `None` for one that is not a public `https` link.
+fn logo(input: &str) -> Option<String> {
+    let url = reqwest::Url::parse(input).ok()?;
+    let public = url.scheme() == "https"
+        && url.host_str().is_some_and(|h| !h.is_empty())
+        && url.username().is_empty()
+        && url.password().is_none();
+    let url = String::from(url);
+    (public && url.len() <= 2000).then_some(url)
 }
 
 /// The sender details as stored, or the field `422 invalid_sender` names.
@@ -95,9 +112,14 @@ fn sender(input: Sender) -> Result<Sender, &'static str> {
     {
         return Err("address");
     }
+    let logo = match input.logo.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(link) => Some(logo(link).ok_or("logo")?),
+    };
     Ok(Sender {
         name: name.to_owned(),
         address: address.to_owned(),
+        logo,
     })
 }
 
@@ -217,7 +239,11 @@ pub(crate) fn team_json(team: &teams::Model, role: Role) -> Team {
             .newsletter_sender_name
             .clone()
             .zip(team.newsletter_sender_address.clone())
-            .map(|(name, address)| Sender { name, address }),
+            .map(|(name, address)| Sender {
+                name,
+                address,
+                logo: team.newsletter_sender_logo.clone(),
+            }),
         require_approval: team.require_approval,
         role: role.as_str().into(),
     }
@@ -574,7 +600,7 @@ async fn show(t: InTeam) -> Response {
 /// Renames the current team (`name`) or switches its public pages (`public_pages`) or their
 /// newsletter sign-up (`newsletter`) or post approvals (`require_approval`), or sets or clears
 /// its `slug` or who its newsletters are from (`newsletter_sender`, `422 invalid_sender` with
-/// the bad `field`, `name` or `address`; a change clears `tested_at` of the team's draft
+/// the bad `field`, `name`, `address` or `logo`; a change clears `tested_at` of the team's draft
 /// newsletters). Owners and admins only. A bad slug is `422 invalid_slug` with a `reason`
 /// (`length`, `characters` or `reserved`); one that is another team's slug or any team's code is
 /// `409 slug_taken`; a team changes its slug at most 5 times a day (`429
@@ -623,15 +649,20 @@ async fn rename(
                 return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
             }
         };
-        let (name, address) = from.map(|s| (s.name, s.address)).unzip();
+        let (name, address, logo) = match from {
+            Some(s) => (Some(s.name), Some(s.address), s.logo),
+            None => (None, None, None),
+        };
         let team = &t.team;
-        sender_changed = (&name, &address)
+        sender_changed = (&name, &address, &logo)
             != (
                 &team.newsletter_sender_name,
                 &team.newsletter_sender_address,
+                &team.newsletter_sender_logo,
             );
         row.newsletter_sender_name = Set(name);
         row.newsletter_sender_address = Set(address);
+        row.newsletter_sender_logo = Set(logo);
     }
     let slug = match body.slug.map(|s| s.as_deref().map(team::slug).transpose()) {
         Some(Err(reason)) => {
@@ -1063,7 +1094,7 @@ async fn send_invitation(app: &AppState, t: &InTeam, email: String, role: Role) 
         role.as_str()
     );
     let subject = "You're invited to a team on SocialReins";
-    if let Err(e) = app.mailer.send(&email, subject, text).await {
+    if let Err(e) = app.mailer.send(&email, subject, text, &app.web_url).await {
         tracing::error!(error = %e, "invitation not sent");
         // The link was never delivered, so it should not stay usable.
         let undo = team_invitations::Entity::delete_by_id(row.id)

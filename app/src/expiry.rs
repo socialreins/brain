@@ -224,7 +224,11 @@ async fn tell_admins(
     let mut sent = false;
     for r in to {
         let email: String = r.try_get("", "email")?;
-        match app.mailer.send(&email, &subject, text.clone()).await {
+        match app
+            .mailer
+            .send(&email, &subject, text.clone(), &app.web_url)
+            .await
+        {
             Ok(()) => sent = true,
             Err(e) => tracing::warn!(error = %e, account = %a.id, "expiry mail not sent"),
         }

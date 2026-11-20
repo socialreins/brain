@@ -196,7 +196,7 @@ async fn send_link(
              {LINK_MINUTES} minutes. If you did not ask for it, ignore this email.\n"
         );
         app.mailer
-            .send(&email, "Your sign-in link", text)
+            .send(&email, "Your sign-in link", text, &app.web_url)
             .await
             .map_err(|e| format!("mail: {e}"))?;
         Ok(true)
@@ -228,7 +228,12 @@ async fn send_no_account_notice(app: &AppState, email: &str) -> Result<(), Strin
         app.web_url
     );
     app.mailer
-        .send(email, "No SocialReins account for this email", text)
+        .send(
+            email,
+            "No SocialReins account for this email",
+            text,
+            &app.web_url,
+        )
         .await
         .map_err(|e| format!("mail: {e}"))
 }

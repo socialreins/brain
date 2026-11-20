@@ -51,7 +51,7 @@ cargo run -p socialreins-brain
   (paragraphs, `**bold**`, bare `https://` links; everything escaped, never pass HTML through), `compose`
   the mail with its legal footer, `mail` the one place a newsletter mail is sent (test included), with
   the `List-Unsubscribe` headers (`Mailer::send_list`). `start` needs the team's sender
-  (`teams.newsletter_sender_*`, copied onto the newsletter), a test since the last edit and
+  (`teams.newsletter_sender_*`, copied onto the newsletter; the optional `logo` is a public `https` link, checked in `teams::logo`, never fetched and only ever the escaped `src` of the image above the mail), a test since the last edit and
   `confirm_total` equal to the snapshot's row count (one a team per 24 hours, 5000 recipients).
   `newsletters::tick` (every minute, own advisory lock held for the claim only) moves up to 50
   recipients a newsletter `pending` to `sending` with their hit of the cap over all teams

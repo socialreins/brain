@@ -22448,7 +22448,42 @@ mod teams {
                         assert!(current(&b.s, &owner).await["newsletter_sender"].is_null());
                         let res = patch(&owner, from(" Ann Lee ", &format!(" {SENDER}\r\n"))).await;
                         assert_eq!(res.status_code(), 200, "{}", res.text());
-                        let want = json!({"name": "Ann Lee", "address": SENDER});
+                        let want = json!({"name": "Ann Lee", "address": SENDER, "logo": null});
+                        assert_eq!(res.json::<Value>()["newsletter_sender"], want);
+                        // The logo is a public https link: stored, shown, cleared by an empty
+                        // one, and anything else is refused and changes nothing.
+                        let with = |logo: Value| json!({"name": "Ann Lee", "address": SENDER, "logo": logo});
+                        let link = "https://cdn.example.com/logo.png?v=1&w=2";
+                        let res = patch(&owner, with(json!(format!(" {link} ")))).await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        assert_eq!(res.json::<Value>()["newsletter_sender"], with(json!(link)));
+                        let long = format!("https://cdn.example.com/{}", "a".repeat(2000));
+                        for logo in [
+                            "http://cdn.example.com/logo.png",
+                            "logo.png",
+                            "not a link",
+                            "https://",
+                            "https://ann:secret@cdn.example.com/logo.png",
+                            "https://ann@cdn.example.com/logo.png",
+                            "data:image/png;base64,AAAA",
+                            "javascript:alert(1)",
+                            &*long,
+                        ] {
+                            let res = patch(&owner, with(json!(logo))).await;
+                            assert_eq!(res.status_code(), 422, "{logo}");
+                            let want = json!({"error": "invalid_sender", "field": "logo"});
+                            assert_eq!(res.json::<Value>(), want);
+                        }
+                        let shown = current(&b.s, &owner).await;
+                        assert_eq!(shown["newsletter_sender"], with(json!(link)));
+                        // What the parser would drop or encode cannot reach the mail as typed.
+                        let res = patch(&owner, with(json!("https://x.test/a b\"<c>\n.png"))).await;
+                        let stored = res.json::<Value>()["newsletter_sender"]["logo"].clone();
+                        assert_eq!(stored, "https://x.test/a%20b%22%3Cc%3E.png");
+                        let res = patch(&owner, with(json!(" "))).await;
+                        assert_eq!(res.json::<Value>()["newsletter_sender"], want);
+                        patch(&owner, with(json!(link))).await;
+                        let res = patch(&owner, with(Value::Null)).await;
                         assert_eq!(res.json::<Value>()["newsletter_sender"], want);
                         // Another change leaves it; null clears it.
                         let res = req(&b.s, Method::PATCH, "/v1/team", &owner)
@@ -22592,6 +22627,9 @@ mod teams {
                         let unsubscribe = format!("<a href=\"{page}\"");
                         assert!(html.contains(&unsubscribe), "{html}");
                         assert_eq!(html.matches("<a ").count(), 2, "only https links, and ours");
+                        // No logo yet: the sender's name heads the mail, the subject the card.
+                        assert!(html.contains("\">Ann Lee</td>") && !html.contains("<img"));
+                        assert!(html.contains("\">News &lt;1&gt;</h1><p "));
 
                         // Saving the same text keeps the test; a change asks for a new one.
                         let same = json!({"subject": "News <1>", "body": body});
@@ -22614,6 +22652,23 @@ mod teams {
                         sender_on(s, &owner).await;
                         assert!(shown(s, &owner, &id).await["tested_at"].is_null());
                         assert_eq!(act(s, &owner, &id, "test").await.status_code(), 200);
+                        // A logo is a change too, and the test mail shows it above the card.
+                        let logo = "https://cdn.example.com/logo.png?v=1&w=2";
+                        let from = json!({"name": "Ann Lee", "address": SENDER, "logo": logo});
+                        let res = req(s, Method::PATCH, "/v1/team", &owner)
+                            .json(&json!({"newsletter_sender": from}))
+                            .await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        assert!(shown(s, &owner, &id).await["tested_at"].is_null());
+                        assert_eq!(act(s, &owner, &id, "test").await.status_code(), 200);
+                        let mail = b.mails(&email).pop().unwrap();
+                        let html = mail["html"].as_str().unwrap();
+                        let img = "<img src=\"https://cdn.example.com/logo.png?v=1&amp;w=2\" \
+                                   height=\"40\" alt=\"Ann Lee\" style=";
+                        assert!(html.contains(img), "{html}");
+                        assert!(html.contains("Ann Lee<br>1 Main Street<br>Springfield 12345<br>"));
+                        assert!(html.contains("/newsletter/unsubscribe?token="));
+                        assert!(mail["text"].as_str().unwrap().starts_with(body));
                         let res = req(s, Method::PUT, &path, &owner)
                             .json(&json!({"subject": "News", "body": body, "status": "sent"}))
                             .await;
@@ -22629,7 +22684,7 @@ mod teams {
                         failed(res, 422, "invalid_newsletter");
 
                         // Ten tests a day per team.
-                        for _ in 0..7 {
+                        for _ in 0..6 {
                             assert_eq!(act(s, &owner, &id, "test").await.status_code(), 200);
                         }
                         failed(act(s, &owner, &id, "test").await, 429, "too_many_tests");
@@ -22672,7 +22727,12 @@ mod teams {
                         let s = &b.s;
                         let (_, owner, _) = user(s, &b.db).await;
                         let team = current(s, &owner).await["id"].as_str().unwrap().to_owned();
-                        sender_on(s, &owner).await;
+                        let logo = "https://cdn.example.com/logo.png";
+                        let from = json!({"name": "Ann Lee", "address": SENDER, "logo": logo});
+                        let res = req(s, Method::PATCH, "/v1/team", &owner)
+                            .json(&json!({"newsletter_sender": from}))
+                            .await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
                         let id = tested(s, &owner, "News").await;
                         let tests = b.count();
 
@@ -22713,6 +22773,8 @@ mod teams {
                         assert_eq!(n["status"], "sending");
                         assert_eq!(n["counts"], counts(2, 0, 0, 2));
                         assert!(n["started_at"].is_string() && n["finished_at"].is_null());
+                        // The start copied the sender, logo included: a later change is not its.
+                        sender_on(s, &owner).await;
 
                         // A second send starts nothing, nor does a second newsletter today.
                         failed(start(s, &owner, &id, 2).await, 409, "already_started");
@@ -22746,6 +22808,8 @@ mod teams {
                             assert_eq!(mails[0]["subject"], "News");
                             assert_eq!(mails[0]["from"], "Ann Lee <b@example.com>");
                             assert!(mails[0]["headers"]["List-Unsubscribe"].is_string());
+                            let html = mails[0]["html"].as_str().unwrap();
+                            assert!(html.contains(&format!("<img src=\"{logo}\" height=\"40\"")));
                         }
                         assert!(b.mails(&unconfirmed).is_empty());
                         assert!(b.mails(&unsubscribed).is_empty());
