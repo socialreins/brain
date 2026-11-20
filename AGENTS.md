@@ -42,7 +42,24 @@ cargo run -p socialreins-brain
   stores `subscribers (team_id, email)` unconfirmed and mails a link (once an hour per email, 20 a day per IP,
   200 per team, 5000 overall) to the web app, which posts its token to `POST /v1/public/newsletter/verify`.
   Same reply for a known email. `GET /v1/subscribers` and `DELETE /v1/subscribers/{id}` are for owners and
-  admins. Mail only confirmed rows; nothing but the confirmation is sent yet.
+  admins. Mail only confirmed rows without `unsubscribed_at`. `POST /v1/public/newsletter/unsubscribe`
+  sets it (token in the body or, one-click, in the query; same `200` for any token; never a GET) and only
+  confirming a link mailed after it clears it.
+- `app/src/newsletters.rs` and `controllers/newsletters.rs`: newsletters, one email to every confirmed,
+  not unsubscribed subscriber (owners and admins only, session only). It goes out from our own mail
+  domain, so everything errs on the side of not sending. `checked` and `render` are the whole markup
+  (paragraphs, `**bold**`, bare `https://` links; everything escaped, never pass HTML through), `compose`
+  the mail with its legal footer, `mail` the one place a newsletter mail is sent (test included), with
+  the `List-Unsubscribe` headers (`Mailer::send_list`). `start` needs the team's sender
+  (`teams.newsletter_sender_*`, copied onto the newsletter), a test since the last edit and
+  `confirm_total` equal to the snapshot's row count (one a team per 24 hours, 5000 recipients).
+  `newsletters::tick` (every minute, own advisory lock held for the claim only) moves up to 50
+  recipients a newsletter `pending` to `sending` with their hit of the cap over all teams
+  (`MAILS_PER_DAY`, `claim`, `SKIP LOCKED`), commits, then `attempt` reads the subscriber again
+  (`addressee`, which also makes their unsubscribe token: its hash for lookups, a sealed copy so each
+  mail carries the same link) and sends. Any mailer error (`Tried::Trip`) or 5 failed sends in a row
+  set it `paused`; only `resume` (a person) puts it back. Never mail a recipient without claiming it,
+  and never retry one: `recover` fails a claim older than 15 minutes as `interrupted`.
 - `app/src/controllers/admin.rs`: the admin console, `/v1/admin/*` (totals, users, teams, waitlist
   approve and delete, sign-up rules). Every handler takes the `Admin` extractor (`ADMIN_EMAILS`,
   session cookie only) and changing ones `FromWeb`; never return post bodies, tokens or
