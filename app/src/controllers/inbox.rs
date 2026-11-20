@@ -12,7 +12,8 @@ use axum::{
 use chrono::{DateTime, FixedOffset, Utc};
 use sea_orm::{
     sea_query::Expr, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, DbErr, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait, Value,
+    FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
+    TransactionTrait, Value,
 };
 use serde::{Deserialize, Serialize};
 use socialreins_core::team;
@@ -134,6 +135,21 @@ pub struct Item {
     pub contact_tags: Vec<String>,
     /// The member it is assigned to; `null` for nobody.
     pub assigned_to: Option<Assignee>,
+    /// Only with `group=conversations`: the DM conversation this item is the latest of; `null`
+    /// for a comment or mention.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Conversation>)]
+    pub conversation: Option<Option<Conversation>>,
+}
+
+/// A DM conversation: every `dm` item of one account and contact that the inbox holds.
+#[derive(Serialize, ToSchema)]
+pub struct Conversation {
+    pub count: i64,
+    /// How many of them are `open`.
+    pub open_count: i64,
+    pub first_at: DateTime<FixedOffset>,
+    pub last_at: DateTime<FixedOffset>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -162,6 +178,26 @@ pub struct ItemQuery {
     pub cursor: Option<Uuid>,
     /// 1 to 100, default 50.
     pub limit: Option<u64>,
+    /// `conversations`: the DMs of one account and contact become one row, the latest, with a
+    /// `conversation` object. `state=open` keeps a conversation with any open item, `done` one
+    /// with none; `q` and `tag` match any of its items, `assigned` its latest.
+    pub group: Option<String>,
+}
+
+#[derive(Deserialize, IntoParams)]
+pub struct ConversationQuery {
+    /// 1 to 100, default 50.
+    pub limit: Option<u64>,
+    /// The id of the oldest item of the previous page, for the page before it.
+    pub before: Option<Uuid>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ConversationPage {
+    /// Oldest first, each with its `replies`.
+    pub items: Vec<Item>,
+    /// Older items are left: ask again with `before` set to the first item's id.
+    pub has_more: bool,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -170,6 +206,9 @@ pub struct ReplyInput {
     /// A public reply for comments and mentions (at most 300 graphemes), a DM in the
     /// conversation for DMs (at most 1000).
     pub text: String,
+    /// For a DM: once the reply went out, every open item of its conversation is marked `done`.
+    #[serde(default)]
+    pub conversation: bool,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -182,6 +221,9 @@ pub struct ItemChange {
     #[serde(default, deserialize_with = "present")]
     #[schema(value_type = Option<Uuid>)]
     pub assigned_to: Option<Option<Uuid>>,
+    /// For a DM: the change reaches every DM item of its conversation. Ignored for other kinds.
+    #[serde(default)]
+    pub conversation: bool,
 }
 
 fn reply(status: StatusCode, code: &str) -> Response {
@@ -301,6 +343,7 @@ pub(super) async fn items_json(
                 let name = names.get(&id)?.clone();
                 Some(Assignee { id, name })
             }),
+            conversation: None,
         })
         .collect())
 }
@@ -331,6 +374,19 @@ async fn find_item(
         .filter(inbox_items::Column::TeamId.eq(team_id))
         .one(db)
         .await
+}
+
+/// The items of `item`'s conversation: every DM of its account and contact, or `item` alone when
+/// it is no DM or has no contact.
+fn conversation_of(item: &inbox_items::Model) -> sea_orm::Condition {
+    let own = sea_orm::Condition::all().add(inbox_items::Column::TeamId.eq(item.team_id));
+    match item.contact_id {
+        Some(contact) if item.kind == "dm" => own
+            .add(inbox_items::Column::Kind.eq("dm"))
+            .add(inbox_items::Column::SocialAccountId.eq(item.social_account_id))
+            .add(inbox_items::Column::ContactId.eq(contact)),
+        _ => own.add(inbox_items::Column::Id.eq(item.id)),
+    }
 }
 
 /// The input's name and filters, checked; `Err` holds the 422 reply.
@@ -568,7 +624,18 @@ pub struct Narrow<'a> {
 
 /// The SQL for one page of an inbox's items, newest first; fetches `limit + 1` rows to tell
 /// whether another page follows. Follows only when `kind` asks for them.
-pub fn items_sql(team_id: Uuid, filters: &Filters, n: &Narrow<'_>, limit: u64) -> Statement {
+///
+/// `grouped`: one row per DM conversation (the `dm` items of one account and contact), its
+/// latest item, with `conv_count`, `conv_open` and `conv_first` over the items in the inbox's
+/// scope; every other item is a group of its own. `state`, `q` and `assigned` then narrow the
+/// groups, not the items.
+pub fn items_sql(
+    team_id: Uuid,
+    filters: &Filters,
+    n: &Narrow<'_>,
+    limit: u64,
+    grouped: bool,
+) -> Statement {
     let Narrow {
         state,
         kind,
@@ -578,52 +645,81 @@ pub fn items_sql(team_id: Uuid, filters: &Filters, n: &Narrow<'_>, limit: u64) -
         cursor,
     } = *n;
     let mut values: Vec<Value> = vec![team_id.into()];
-    let mut sql = String::from("SELECT i.* FROM inbox_items i WHERE i.team_id = $1");
-    sql += &filter_sql(filters, &mut values);
-    if let Some(state) = state {
-        values.push(state.to_owned().into());
-        sql += &format!(" AND i.state = ${}", values.len());
-    }
+    // What an item must be to be in scope, then what narrows the rows that are listed.
+    let mut scope = filter_sql(filters, &mut values);
+    let mut rest = String::new();
+    let mut hit = String::from("TRUE");
     if let Some(kind) = kind {
         values.push(kind.to_owned().into());
-        sql += &format!(" AND i.kind = ${}", values.len());
+        scope += &format!(" AND i.kind = ${}", values.len());
     } else {
-        sql += " AND i.kind <> 'follow'";
-    }
-    if let Some(q) = q {
-        values.push(format!("%{}%", inbox::escape_like(q)).into());
-        let p = values.len();
-        sql += &format!(
-            " AND (i.text ILIKE ${p} OR i.author_name ILIKE ${p} OR i.author_handle ILIKE ${p})"
-        );
+        scope += " AND i.kind <> 'follow'";
     }
     if let Some(tag) = tag {
         values.push(tag.to_owned().into());
-        sql += &format!(
+        scope += &format!(
             " AND EXISTS (SELECT 1 FROM contact_tags ct WHERE ct.contact_id = i.contact_id \
              AND ct.tag = ${})",
             values.len()
         );
     }
+    match state {
+        Some("open") if grouped => rest += " AND i.conv_open > 0",
+        Some(_) if grouped => rest += " AND i.conv_open = 0",
+        Some(state) => {
+            values.push(state.to_owned().into());
+            rest += &format!(" AND i.state = ${}", values.len());
+        }
+        None => {}
+    }
+    if let Some(q) = q {
+        values.push(format!("%{}%", inbox::escape_like(q)).into());
+        let p = values.len();
+        hit = format!(
+            "(i.text ILIKE ${p} OR i.author_name ILIKE ${p} OR i.author_handle ILIKE ${p})"
+        );
+        rest += &if grouped {
+            " AND i.conv_hit".to_owned()
+        } else {
+            format!(" AND {hit}")
+        };
+    }
     match assigned {
         Some(Some(user)) => {
             values.push(user.into());
-            sql += &format!(" AND i.assigned_to = ${}", values.len());
+            rest += &format!(" AND i.assigned_to = ${}", values.len());
         }
-        Some(None) => sql += " AND i.assigned_to IS NULL",
+        Some(None) => rest += " AND i.assigned_to IS NULL",
         None => {}
     }
     if let Some(c) = cursor {
         values.push(c.into());
         let n = values.len();
-        sql += &format!(
+        rest += &format!(
             " AND (i.received_at, i.id) < \
              (SELECT c.received_at, c.id FROM inbox_items c WHERE c.id = ${n} AND c.team_id = $1)"
         );
     }
     values.push(((limit + 1) as i64).into());
-    sql += &format!(
-        " ORDER BY i.received_at DESC, i.id DESC LIMIT ${}",
+    let from = if grouped {
+        // shortcut: the windows read every item in the inbox's scope for each page; keep a
+        // conversations table once a team's inbox is too large for that.
+        format!(
+            "(SELECT i.*, count(*) OVER w AS conv_count, \
+             count(*) FILTER (WHERE i.state = 'open') OVER w AS conv_open, \
+             min(i.received_at) OVER w AS conv_first, bool_or({hit}) OVER w AS conv_hit, \
+             row_number() OVER (w ORDER BY i.received_at DESC, i.id DESC) AS conv_rank \
+             FROM inbox_items i WHERE i.team_id = $1{scope} \
+             WINDOW w AS (PARTITION BY \
+             CASE WHEN i.kind = 'dm' AND i.contact_id IS NOT NULL THEN i.social_account_id END, \
+             CASE WHEN i.kind = 'dm' AND i.contact_id IS NOT NULL THEN i.contact_id ELSE i.id END)) \
+             i WHERE i.conv_rank = 1"
+        )
+    } else {
+        format!("inbox_items i WHERE i.team_id = $1{scope}")
+    };
+    let sql = format!(
+        "SELECT i.* FROM {from}{rest} ORDER BY i.received_at DESC, i.id DESC LIMIT ${}",
         values.len()
     );
     Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
@@ -666,6 +762,11 @@ async fn items(
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     }
     let (tag, assigned) = (tag.flatten(), assigned.flatten());
+    let grouped = match q.group.as_deref() {
+        None => false,
+        Some("conversations") => true,
+        Some(_) => return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query"),
+    };
     let found = async {
         let Some(found) = find_inbox(&app.db, t.team.id, id).await? else {
             return Ok(None);
@@ -679,15 +780,33 @@ async fn items(
             assigned,
             cursor: q.cursor,
         };
-        let stmt = items_sql(t.team.id, &filters, &narrow, limit);
-        let mut rows = inbox_items::Entity::find()
-            .from_raw_sql(stmt)
-            .all(&app.db)
-            .await?;
-        let more = rows.len() as u64 > limit;
-        rows.truncate(limit as usize);
+        let stmt = items_sql(t.team.id, &filters, &narrow, limit, grouped);
+        let mut found = app.db.query_all_raw(stmt).await?;
+        let more = found.len() as u64 > limit;
+        found.truncate(limit as usize);
+        let mut rows = Vec::new();
+        let mut conversations = Vec::new();
+        for r in &found {
+            let row = inbox_items::Model::from_query_result(r, "")?;
+            if grouped {
+                conversations.push(if row.kind == "dm" {
+                    Some(Conversation {
+                        count: r.try_get("", "conv_count")?,
+                        open_count: r.try_get("", "conv_open")?,
+                        first_at: r.try_get("", "conv_first")?,
+                        last_at: row.received_at,
+                    })
+                } else {
+                    None
+                });
+            }
+            rows.push(row);
+        }
         let next_cursor = more.then(|| rows.last().map(|r| r.id)).flatten();
-        let items = items_json(&app.db, rows).await?;
+        let mut items = items_json(&app.db, rows).await?;
+        for (item, c) in items.iter_mut().zip(conversations) {
+            item.conversation = Some(c);
+        }
         Ok::<_, DbErr>(Some(ItemPage { items, next_cursor }))
     };
     match found.await {
@@ -715,8 +834,64 @@ async fn show_item(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>)
     }
 }
 
+/// A DM item's conversation: every DM item of the same account and contact, each with its
+/// `replies`. The newest page first, oldest first within it; `before` (the first item's id)
+/// pages back. `422 not_a_conversation` for an item that is no DM.
+#[utoipa::path(get, path = "/inbox-items/{id}/conversation", tag = "inbox",
+    params(("id" = Uuid, Path), ConversationQuery),
+    responses((status = 200, body = ConversationPage), (status = 401, body = Error),
+        (status = 404, body = Error), (status = 422, body = Error)))]
+async fn conversation(
+    State(app): State<AppState>,
+    t: InTeam,
+    Path(id): Path<Uuid>,
+    q: Result<Query<ConversationQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(q)) = q else {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
+    };
+    let limit = q.limit.unwrap_or(PAGE);
+    if !(1..=MAX_PAGE).contains(&limit) {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
+    }
+    let found = async {
+        let Some(item) = find_item(&app.db, t.team.id, id).await? else {
+            return Ok(Err(not_found()));
+        };
+        if item.kind != "dm" {
+            let code = "not_a_conversation";
+            return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, code)));
+        }
+        let mut page = inbox_items::Entity::find().filter(conversation_of(&item));
+        if let Some(before) = q.before {
+            page = page.filter(Expr::cust_with_values(
+                "(received_at, id) < (SELECT c.received_at, c.id FROM inbox_items c \
+                 WHERE c.id = $1 AND c.team_id = $2)",
+                [before, t.team.id],
+            ));
+        }
+        let mut rows = page
+            .order_by_desc(inbox_items::Column::ReceivedAt)
+            .order_by_desc(inbox_items::Column::Id)
+            .limit(limit + 1)
+            .all(&app.db)
+            .await?;
+        let has_more = rows.len() as u64 > limit;
+        rows.truncate(limit as usize);
+        rows.reverse();
+        let items = items_json(&app.db, rows).await?;
+        Ok::<_, DbErr>(Ok(ConversationPage { items, has_more }))
+    };
+    match found.await {
+        Ok(Ok(page)) => Json(page).into_response(),
+        Ok(Err(res)) => res,
+        Err(e) => internal(e, "inbox conversation"),
+    }
+}
+
 /// Marks an item `done` or `open` again (`state`), assigns it to a member of the team or to
-/// nobody (`assigned_to`), or both. Every member. `422 invalid_state`, `invalid_assignee` (not
+/// nobody (`assigned_to`), or both; with `conversation: true` on a DM, every DM item of its
+/// conversation in one statement. Every member. `422 invalid_state`, `invalid_assignee` (not
 /// a member of the team), and `invalid_body` when neither field is sent.
 #[utoipa::path(patch, path = "/inbox-items/{id}", tag = "inbox", request_body = ItemChange,
     params(("id" = Uuid, Path)),
@@ -752,9 +927,17 @@ async fn change_item(
                 return Ok(Err(unprocessable("invalid_assignee")));
             }
         }
-        let mut change = inbox_items::Entity::update_many()
-            .filter(inbox_items::Column::Id.eq(id))
-            .filter(inbox_items::Column::TeamId.eq(t.team.id));
+        let mut change = inbox_items::Entity::update_many();
+        if input.conversation {
+            let Some(item) = find_item(&txn, t.team.id, id).await? else {
+                return Ok(Ok(None));
+            };
+            change = change.filter(conversation_of(&item));
+        } else {
+            change = change
+                .filter(inbox_items::Column::Id.eq(id))
+                .filter(inbox_items::Column::TeamId.eq(t.team.id));
+        }
         if let Some(state) = input.state {
             change = change.col_expr(inbox_items::Column::State, state.into());
         }
@@ -792,7 +975,8 @@ fn send_error(e: &InboxError) -> Response {
 
 /// Replies to an item from its account, once (never retried): a public reply in the thread for
 /// a comment or mention, a DM in the conversation for a DM. `201` with the item and its
-/// replies. Every member; at most 10 a minute per user, shared with publishing; `409
+/// replies. The item's state is left alone, unless `conversation: true` on a DM: then every
+/// open item of its conversation is `done` once the reply went out. Every member; at most 10 a minute per user, shared with publishing; `409
 /// reply_in_progress` while another reply to the item is going out. Failures:
 /// `422` with `error` (`reconnect_required`, `no_dm_access`, `dm_not_allowed`, `too_long`,
 /// `not_repliable`, `bluesky_refused`, `bluesky_unreachable`; on Facebook and Instagram
@@ -863,6 +1047,17 @@ async fn send_reply(
         Ok(Err(e)) => return send_error(&e),
         Err(e) => return internal(e, "inbox reply"),
     }
+    if input.conversation && item.kind == "dm" {
+        let done = inbox_items::Entity::update_many()
+            .filter(conversation_of(&item))
+            .filter(inbox_items::Column::State.eq("open"))
+            .col_expr(inbox_items::Column::State, "done".into())
+            .exec(&app.db)
+            .await;
+        if let Err(e) = done {
+            return internal(e, "inbox conversation done");
+        }
+    }
     match find_item(&app.db, t.team.id, id).await {
         Ok(Some(i)) => match item_json(&app.db, i).await {
             Ok(i) => (StatusCode::CREATED, Json(i)).into_response(),
@@ -879,6 +1074,7 @@ pub fn api() -> OpenApiRouter<AppState> {
         .routes(routes!(update, destroy))
         .routes(routes!(items))
         .routes(routes!(show_item, change_item))
+        .routes(routes!(conversation))
         .routes(routes!(send_reply))
 }
 
@@ -899,11 +1095,11 @@ mod tests {
             cursor: Some(Uuid::nil()),
             ..Narrow::default()
         };
-        let stmt = items_sql(team, &f, &n, 50);
+        let stmt = items_sql(team, &f, &n, 50, false);
         assert_eq!(
             stmt.sql,
             "SELECT i.* FROM inbox_items i WHERE i.team_id = $1 AND i.kind IN ($2) \
-             AND i.state = $3 AND i.kind = $4 AND (i.received_at, i.id) < (SELECT c.received_at, c.id \
+             AND i.kind = $3 AND i.state = $4 AND (i.received_at, i.id) < (SELECT c.received_at, c.id \
              FROM inbox_items c WHERE c.id = $5 AND c.team_id = $1) \
              ORDER BY i.received_at DESC, i.id DESC LIMIT $6"
         );
@@ -915,7 +1111,7 @@ mod tests {
             q: Some("50%_off"),
             ..Narrow::default()
         };
-        let stmt = items_sql(team, &Filters::default(), &n, 10);
+        let stmt = items_sql(team, &Filters::default(), &n, 10, false);
         assert_eq!(
             stmt.sql,
             "SELECT i.* FROM inbox_items i WHERE i.team_id = $1 AND i.kind <> 'follow' \
@@ -932,7 +1128,7 @@ mod tests {
             assigned: Some(None),
             ..Narrow::default()
         };
-        let stmt = items_sql(team, &Filters::default(), &n, 10);
+        let stmt = items_sql(team, &Filters::default(), &n, 10, false);
         assert!(stmt.sql.contains(
             " AND EXISTS (SELECT 1 FROM contact_tags ct WHERE ct.contact_id = i.contact_id \
              AND ct.tag = $2) AND i.assigned_to IS NULL ORDER BY"
@@ -941,7 +1137,7 @@ mod tests {
             assigned: Some(Some(Uuid::nil())),
             ..Narrow::default()
         };
-        let stmt = items_sql(team, &Filters::default(), &n, 10);
+        let stmt = items_sql(team, &Filters::default(), &n, 10, false);
         assert!(stmt.sql.contains(" AND i.assigned_to = $2 ORDER BY"));
     }
 
