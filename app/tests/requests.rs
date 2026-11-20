@@ -17663,6 +17663,12 @@ mod teams {
                         assert_eq!(b["counts"], counts(5, 1, 4, 0, 0));
                         // A skip is no send: only Eve's counts against the daily cap.
                         assert_eq!(hits(&db, &t.id).await, 1);
+                        // Bob's items lost their contact; another test counts such items.
+                        let orphans = format!(
+                            "DELETE FROM inbox_items WHERE team_id = '{}' AND contact_id IS NULL",
+                            t.id
+                        );
+                        exec(&db, &orphans).await;
                     }
 
                     /// The team's hits of the daily cap of broadcast messages.
@@ -17812,9 +17818,10 @@ mod teams {
 
                         // One fewer starts, and the recipients come 100 a page, each once.
                         let one = format!(
-            "DELETE FROM contacts WHERE id = (SELECT id FROM contacts WHERE team_id = '{}' LIMIT 1)",
-            t.id
-        );
+                            "DELETE FROM contact_tags WHERE contact_id = \
+                             (SELECT id FROM contacts WHERE team_id = '{}' LIMIT 1)",
+                            t.id
+                        );
                         exec(&db, &one).await;
                         assert_eq!(start(&s, &t.cookie, &id, 1000).await.status_code(), 200);
                         let mut seen = std::collections::HashSet::new();
