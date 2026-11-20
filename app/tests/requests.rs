@@ -23575,7 +23575,9 @@ mod teams {
                         );
                         "facebook"
                     };
-                    if let Some(refused) = taken(network, &h, "page-token", &[id.clone()]) {
+                    if let Some(refused) =
+                        taken(network, &h, "page-token", std::slice::from_ref(&id))
+                    {
                         return refused;
                     }
                     let Some(mut one) = known(&id) else {
