@@ -101,6 +101,49 @@ enum Refused {
     Graph(reqwest::StatusCode, Value),
 }
 
+/// A call that did not succeed, as a publish words it: `Reconnect` when the token is refused,
+/// else `Failed` with `step` and Meta's reason.
+fn post_error(refused: Refused, step: &str) -> PostError {
+    match refused {
+        Refused::Unreachable => failed(format!("{step}: Meta could not be reached.")),
+        Refused::Graph(_, body) if dead_or_denied(&body).is_some() => {
+            dead_or_denied(&body).unwrap_or(PostError::Reconnect)
+        }
+        Refused::Graph(status, body) => failed(format!("{step}: {}", reason(&body, status))),
+    }
+}
+
+/// Graph says an object asked for does not exist: a `404`, "some of the aliases you requested
+/// do not exist" (803) or "object does not exist" (100 with subcode 33). A plain 100, such as a
+/// field the object does not have, is not that.
+fn missing(status: reqwest::StatusCode, body: &Value) -> bool {
+    let code = body["error"]["code"].as_i64();
+    status == reqwest::StatusCode::NOT_FOUND
+        || code == Some(803)
+        || (code == Some(100) && body["error"]["error_subcode"].as_i64() == Some(33))
+}
+
+/// Why `Meta::counts` gave nothing.
+pub enum Uncounted {
+    /// An object asked for is not there.
+    Missing,
+    /// Graph refused the request itself, such as a field one of the objects does not have:
+    /// asking for each id alone tells which.
+    Refused(String),
+    /// The token, a rate limit or Meta out of reach: asking again would not help.
+    Failed(PostError),
+}
+
+/// A `4xx` that is about what was asked, not about the token, a permission or a rate limit
+/// (codes 4, 17, 32 and 613, or a `429`).
+fn about_the_request(status: reqwest::StatusCode, body: &Value) -> bool {
+    let limited = matches!(body["error"]["code"].as_i64(), Some(4 | 17 | 32 | 613));
+    status.is_client_error()
+        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+        && !limited
+        && dead_or_denied(body).is_none()
+}
+
 /// A reply or message that Meta did not take, as the inbox words it.
 fn inbox_error(refused: Refused) -> InboxError {
     let Refused::Graph(status, body) = refused else {
@@ -265,14 +308,33 @@ impl Meta {
     ) -> Result<Value, PostError> {
         self.raw(req, token, form, step)
             .await
+            .map_err(|refused| post_error(refused, step))
+    }
+
+    /// `fields` of each of `ids` (at most 50) in one call, `/?ids=`, keyed by id, with the Page
+    /// token: a Page post's reactions, comments and shares (`pages_read_engagement`) or an
+    /// Instagram media's counts (`instagram_basic`). One object that is missing or lacks a field
+    /// fails the whole call (`Missing`, `Refused`), so the caller asks again one id at a time.
+    pub async fn counts(
+        &self,
+        token: &str,
+        ids: &[&str],
+        fields: &str,
+    ) -> Result<Value, Uncounted> {
+        let url = format!("{}/{}/", self.graph_url, self.version);
+        let ids = ids.join(",");
+        let req = self
+            .client
+            .get(url)
+            .query(&[("ids", ids.as_str()), ("fields", fields)]);
+        self.raw(req, Some(token), None, "Metrics")
+            .await
             .map_err(|refused| match refused {
-                Refused::Unreachable => failed(format!("{step}: Meta could not be reached.")),
-                Refused::Graph(_, body) if dead_or_denied(&body).is_some() => {
-                    dead_or_denied(&body).unwrap_or(PostError::Reconnect)
+                Refused::Graph(status, body) if missing(status, &body) => Uncounted::Missing,
+                Refused::Graph(status, body) if about_the_request(status, &body) => {
+                    Uncounted::Refused(format!("Metrics: {}", reason(&body, status)))
                 }
-                Refused::Graph(status, body) => {
-                    failed(format!("{step}: {}", reason(&body, status)))
-                }
+                other => Uncounted::Failed(post_error(other, "Metrics")),
             })
     }
 

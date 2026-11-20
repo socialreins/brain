@@ -552,6 +552,17 @@ impl YouTube {
         }
     }
 
+    /// The videos `ids` (at most 50) with their `statistics`, in one `videos.list` call (one
+    /// quota unit, `youtube.readonly`). A video that is gone is left out.
+    pub async fn statistics(&self, token: &str, ids: &[&str]) -> Result<Vec<Value>, PostError> {
+        let params = [("part", "statistics"), ("id", &ids.join(","))];
+        let url = Url::parse_with_params(&format!("{}/youtube/v3/videos", self.api_url), params)
+            .map_err(|_| failed("These are not YouTube video ids."))?;
+        let req = self.client.get(url).bearer_auth(token);
+        let (_, body) = self.send(req, "Statistics").await?;
+        Ok(body["items"].as_array().cloned().unwrap_or_default())
+    }
+
     /// Takes a video down. A video already gone counts as down.
     pub async fn delete_video(&self, token: &str, id: &str) -> Result<(), PostError> {
         if !video_id(id) {

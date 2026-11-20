@@ -11,6 +11,7 @@ pub mod media_library;
 pub mod passkey_challenges;
 pub mod passkeys;
 pub mod post_lists;
+pub mod post_metrics;
 pub mod post_pages;
 pub mod post_targets;
 pub mod posts;

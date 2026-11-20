@@ -99,6 +99,18 @@ cargo run -p socialreins-brain
   remove a person's data; items outlive a deleted contact with `contact_id` null.
   Session only, like the inbox. `inbox_items.assigned_to` is set under a share lock of the
   member's `team_user` row, and `teams::change_member` clears it after deleting that row.
+- `app/src/metrics.rs` and `controllers/analytics.rs`: post metrics (`post_metrics`, one latest
+  row per published target, no history) from Bluesky, Facebook, Instagram and YouTube
+  (`metrics::SUPPORTED`; never add a platform that needs a new scope). `metrics::tick` (every 15
+  minutes, own advisory lock held only while it reads what is due) and
+  `POST /v1/posts/{id}/metrics/refresh` both go through `claim`, one statement that marks a batch
+  as tried, so a target is never read twice within a minute and no connection is held while a
+  platform is asked. `fetched_at` is the last try; a failed one keeps the numbers, a missing post
+  is `gone` (only once the target is an hour old), asked for again a week later, 4 times. A
+  reconnect (`connections::save_account`) clears every error of the account's targets
+  (`metrics::reset`). One id can fail a whole Graph `?ids=` call, so `meta_counts` asks again id
+  by id (and a Reel with a video node's fields); never store one post's error on its batch.
+  `GET /v1/analytics` sums in Postgres (`analytics::SCOPED`) and loads only the top posts.
 - `app/src/feeds.rs` and `controllers/feeds.rs`: RSS and Atom feeds that post on their own
   (`feeds`, `feed_items`, at most 20 per team; owners, admins and full tokens write). `Fetcher`
   is the only way a feed is read: `public_url`, `PublicOnly`, at most 3 redirects each checked

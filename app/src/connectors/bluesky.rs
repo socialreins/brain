@@ -1070,6 +1070,14 @@ impl Bluesky {
         Err(InboxError::Reconnect)
     }
 
+    /// The posts `uris` (at most 25, `app.bsky.feed.getPosts`) with their counts, as the account
+    /// sees them. A post that is gone is left out.
+    pub async fn posts(&self, c: &Creds<'_>, uris: &[&str]) -> Result<Vec<Value>, InboxError> {
+        let query: Vec<(&str, &str)> = uris.iter().map(|u| ("uris", *u)).collect();
+        let got = self.xrpc(c, "app.bsky.feed.getPosts", &query, None).await?;
+        Ok(got["posts"].as_array().cloned().unwrap_or_default())
+    }
+
     /// Replies, mentions and follows newer than `since`, newest first, at most `MAX_NOTIFICATIONS`.
     /// Never marks them read.
     pub async fn notifications(

@@ -1,7 +1,7 @@
 //! Background jobs, in process: publishing due posts and reading inboxes (then running
 //! automations), taking up waiting automation flows and sending webhooks every minute (the old app ran every 5), and purging deleted
 //! sets, old idempotency keys, old webhook deliveries and leftover stored media every hour, and
-//! extending Threads and LinkedIn tokens and mailing about ending ones daily and renewing X tokens and reading RSS feeds every 15 minutes, each run by one instance at a time through an advisory lock.
+//! extending Threads and LinkedIn tokens and mailing about ending ones daily and renewing X tokens, reading RSS feeds and reading post metrics every 15 minutes, each run by one instance at a time through an advisory lock.
 //! shortcut: no job queue; move to one if jobs need retries or exact times.
 use std::time::Duration;
 
@@ -10,7 +10,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, 
 use crate::{
     automations,
     controllers::{idempotency, linkedin, threads, x},
-    expiry, feeds, inbox, media, publish,
+    expiry, feeds, inbox, media, metrics, publish,
     state::AppState,
     webhooks,
 };
@@ -72,6 +72,17 @@ pub fn spawn(app: AppState) {
             tick.tick().await;
             if let Err(e) = feeds::tick(&feed_app).await {
                 tracing::warn!(error = %e, "feed tick failed");
+            }
+        }
+    });
+    let metrics_app = app.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(metrics::EVERY_SECS));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if let Err(e) = metrics::tick(&metrics_app).await {
+                tracing::warn!(error = %e, "metrics tick failed");
             }
         }
     });

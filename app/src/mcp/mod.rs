@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 use crate::{
     controllers::{
+        analytics,
         api_tokens::{read_only_token, Actor},
         connections,
         feeds::{self, FeedId, FeedInput},
@@ -169,6 +170,7 @@ fn specs() -> Vec<(&'static str, &'static str, Value, bool)> {
         ("reject-post", "Rejects a scheduled post with an optional note: it is held back until approved. Same as POST /v1/posts/{id}/reject.", schema::<Decide>(), false),
         ("set-post-repeat", "Makes a scheduled post (and the other scheduled posts of its group) repeat every interval (1 to 12) day, week or month, until an optional YYYY-MM-DD date or for remaining (1 to 100) more copies in all: each time it publishes, the next copy is scheduled. Not for TikTok. Same as PUT /v1/posts/{id}/repeat.", schema::<SetRepeat>(), false),
         ("clear-post-repeat", "Stops a scheduled post (and the other scheduled posts of its group) repeating; the post itself stays scheduled. Same as DELETE /v1/posts/{id}/repeat.", schema::<PostId>(), false),
+        ("get-analytics", "The metrics (likes, comments, shares, views) of the posts published in a range of UTC days, from and to as YYYY-MM-DD (default the last 30 days, at most 366): totals, per platform, per day and the 10 top posts. Read from Bluesky, Facebook, Instagram and YouTube only. Same as GET /v1/analytics.", schema::<analytics::AnalyticsQuery>(), true),
         ("delete-post", "Deletes a draft or scheduled post, or takes a published one down. Same as DELETE /v1/posts/{id}.", schema::<PostId>(), false),
         ("list-lists", "The team's post lists (ordered groups of posts, such as a series), without their posts. Same as GET /v1/lists.", schema::<NoArgs>(), true),
         ("create-list", "Creates a post list, team-wide or tied to one set. Same as POST /v1/lists.", schema::<ListInput>(), false),
@@ -256,6 +258,10 @@ async fn run(app: &AppState, a: &Actor, name: &str, v: Value) -> Option<Response
         },
         "list-posts" => match args(v) {
             Some(q) => posts::list_posts(app, a, q).await,
+            None => invalid("invalid_query"),
+        },
+        "get-analytics" => match args(v) {
+            Some(q) => analytics::get_analytics(app, a, q).await,
             None => invalid("invalid_query"),
         },
         "get-post" => match args::<PostId>(v) {
