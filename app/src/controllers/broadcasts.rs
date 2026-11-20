@@ -33,7 +33,14 @@ const MAX_TEXT: usize = 1000;
 // shortcut: no paging of the list; add a cursor once a team keeps more than 200.
 const LIST: i64 = 200;
 const PAGE: i64 = 100;
-const RECIPIENT_STATUSES: [&str; 5] = ["pending", "sending", "sent", "skipped", "failed"];
+const RECIPIENT_STATUSES: [&str; 6] = [
+    "pending",
+    "sending",
+    "delivering",
+    "sent",
+    "skipped",
+    "failed",
+];
 
 #[derive(Serialize, ToSchema)]
 pub struct Counts {
@@ -95,7 +102,8 @@ pub struct Recipient {
     pub display_name: Option<String>,
     pub handle: Option<String>,
     pub platform: Option<String>,
-    /// `pending`, `sending`, `sent`, `skipped` or `failed`.
+    /// `pending`, `sending` (claimed by a round), `delivering` (the send was started), `sent`,
+    /// `skipped` or `failed`.
     pub status: String,
     /// Why it was not sent. Skipped: `opted_out`, `recently_messaged`, `outside_window`,
     /// `no_conversation`, `account_disconnected`, `untagged`, `dm_not_allowed`, `too_long`,
@@ -115,7 +123,7 @@ pub struct RecipientPage {
 
 #[derive(Deserialize, IntoParams)]
 pub struct RecipientQuery {
-    /// `pending`, `sending`, `sent`, `skipped` or `failed`.
+    /// `pending`, `sending`, `delivering`, `sent`, `skipped` or `failed`.
     pub status: Option<String>,
     /// `next_cursor` of the previous page.
     pub cursor: Option<Uuid>,
@@ -168,7 +176,7 @@ const SELECT: &str = "SELECT b.*, n.* FROM broadcasts b, LATERAL (SELECT count(*
     count(*) FILTER (WHERE r.status = 'sent') AS sent, \
     count(*) FILTER (WHERE r.status = 'skipped') AS skipped, \
     count(*) FILTER (WHERE r.status = 'failed') AS failed, \
-    count(*) FILTER (WHERE r.status IN ('pending', 'sending')) AS pending \
+    count(*) FILTER (WHERE r.status IN ('pending', 'sending', 'delivering')) AS pending \
     FROM broadcast_recipients r WHERE r.broadcast_id = b.id) n WHERE b.team_id = $1";
 
 fn broadcast_json(r: &QueryResult) -> Result<Broadcast, DbErr> {

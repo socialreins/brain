@@ -17,6 +17,12 @@ pub struct Model {
     pub public_pages: bool,
     /// Public pages offer a newsletter sign-up (`subscribers`).
     pub newsletter: bool,
+    /// Who the team's newsletters are from; set together with the address or not at all.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub newsletter_sender_name: Option<String>,
+    /// The sender's postal address, which the law wants in every newsletter.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub newsletter_sender_address: Option<String>,
     /// A member's scheduled posts wait for an owner or admin to approve them (`posts.approval`).
     pub require_approval: bool,
     pub created_at: DateTimeWithTimeZone,

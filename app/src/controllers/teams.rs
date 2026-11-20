@@ -63,10 +63,42 @@ pub struct Team {
     pub public_pages: bool,
     /// Public pages offer a newsletter sign-up (`GET /subscribers`).
     pub newsletter: bool,
+    /// Who the team's newsletters are from; `null` until set, and no newsletter is sent then.
+    pub newsletter_sender: Option<Sender>,
     /// A member's scheduled posts wait for an owner or admin (`POST /posts/{id}/approve`).
     pub require_approval: bool,
     /// The caller's role: `owner`, `admin` or `member`.
     pub role: String,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct Sender {
+    /// The From name of the team's newsletters: 1 to 80 characters after trimming, one line,
+    /// without `@`, `<`, `>`, `:` or `/` (so it cannot pass as an address or a link).
+    pub name: String,
+    /// The sender's postal address, shown under every newsletter as the law requires: 10 to
+    /// 300 characters after trimming; it may have line breaks.
+    pub address: String,
+}
+
+/// The sender details as stored, or the field `422 invalid_sender` names.
+fn sender(input: Sender) -> Result<Sender, &'static str> {
+    let name = input.name.trim();
+    let bad = |c: char| c.is_control() || "@<>:/".contains(c);
+    if !(1..=80).contains(&name.chars().count()) || name.chars().any(bad) {
+        return Err("name");
+    }
+    let address = input.address.replace("\r\n", "\n");
+    let address = address.trim();
+    if !(10..=300).contains(&address.chars().count())
+        || address.chars().any(|c| c.is_control() && c != '\n')
+    {
+        return Err("address");
+    }
+    Ok(Sender {
+        name: name.to_owned(),
+        address: address.to_owned(),
+    })
 }
 
 #[derive(Serialize, ToSchema)]
@@ -119,6 +151,11 @@ pub struct TeamChange {
     /// Whether a member's scheduled posts need an owner's or admin's approval before they
     /// publish. Switching it off releases the posts still waiting. Absent: unchanged.
     pub require_approval: Option<bool>,
+    /// Who the team's newsletters are from, with the postal address. `null` clears it. Absent:
+    /// unchanged.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Option<Sender>)]
+    pub newsletter_sender: Option<Option<Sender>>,
     /// The team's slug: 3 to 30 of `a-z`, `0-9` and `-` after trimming and lowercasing, a
     /// letter or digit at both ends, no `--`. `null` clears it. Absent: unchanged.
     #[serde(default, deserialize_with = "present")]
@@ -176,6 +213,11 @@ pub(crate) fn team_json(team: &teams::Model, role: Role) -> Team {
         slug: team.slug.clone(),
         public_pages: team.public_pages,
         newsletter: team.newsletter,
+        newsletter_sender: team
+            .newsletter_sender_name
+            .clone()
+            .zip(team.newsletter_sender_address.clone())
+            .map(|(name, address)| Sender { name, address }),
         require_approval: team.require_approval,
         role: role.as_str().into(),
     }
@@ -531,7 +573,9 @@ async fn show(t: InTeam) -> Response {
 
 /// Renames the current team (`name`) or switches its public pages (`public_pages`) or their
 /// newsletter sign-up (`newsletter`) or post approvals (`require_approval`), or sets or clears
-/// its `slug`. Owners and admins only. A bad slug is `422 invalid_slug` with a `reason`
+/// its `slug` or who its newsletters are from (`newsletter_sender`, `422 invalid_sender` with
+/// the bad `field`, `name` or `address`; a change clears `tested_at` of the team's draft
+/// newsletters). Owners and admins only. A bad slug is `422 invalid_slug` with a `reason`
 /// (`length`, `characters` or `reserved`); one that is another team's slug or any team's code is
 /// `409 slug_taken`; a team changes its slug at most 5 times a day (`429
 /// slug_changed_too_often`). A slug given up (changed, cleared, or its team deleted) stops
@@ -569,6 +613,25 @@ async fn rename(
     }
     if let Some(on) = body.require_approval {
         row.require_approval = Set(on);
+    }
+    let mut sender_changed = false;
+    if let Some(from) = body.newsletter_sender {
+        let from = match from.map(sender).transpose() {
+            Ok(from) => from,
+            Err(field) => {
+                let body = serde_json::json!({"error": "invalid_sender", "field": field});
+                return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
+            }
+        };
+        let (name, address) = from.map(|s| (s.name, s.address)).unzip();
+        let team = &t.team;
+        sender_changed = (&name, &address)
+            != (
+                &team.newsletter_sender_name,
+                &team.newsletter_sender_address,
+            );
+        row.newsletter_sender_name = Set(name);
+        row.newsletter_sender_address = Set(address);
     }
     let slug = match body.slug.map(|s| s.as_deref().map(team::slug).transpose()) {
         Some(Err(reason)) => {
@@ -621,6 +684,14 @@ async fn rename(
             row.slug = Set(slug);
         }
         let team = teams::Entity::update(row).exec(&txn).await?;
+        if sender_changed {
+            // The test mail showed the old sender: drafts need a new one before they send.
+            let sql = "UPDATE newsletters SET tested_at = NULL \
+                       WHERE team_id = $1 AND status = 'draft'";
+            let untest =
+                Statement::from_sql_and_values(DbBackend::Postgres, sql, [t.team.id.into()]);
+            txn.execute_raw(untest).await?;
+        }
         txn.commit().await.map(|_| Ok(team))
     };
     match saved.await {

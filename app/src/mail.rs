@@ -2,11 +2,23 @@
 use std::time::Duration;
 
 use lettre::{
-    message::{Mailbox, MultiPart},
+    message::{
+        header::{HeaderName, HeaderValue},
+        Mailbox, MultiPart,
+    },
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
 
 const RESEND_API: &str = "https://api.resend.com/emails";
+const ONE_CLICK: &str = "List-Unsubscribe=One-Click";
+
+/// What makes a mail a newsletter: the name it comes from (the address stays ours) and the URL
+/// a mail provider posts to when the reader unsubscribes there (RFC 8058).
+#[derive(Clone, Copy)]
+pub struct List<'a> {
+    pub from_name: &'a str,
+    pub unsubscribe: &'a str,
+}
 
 #[derive(Clone)]
 pub enum Mailer {
@@ -59,7 +71,22 @@ impl Mailer {
     /// The plain text is also sent as a branded HTML version (`html`), for mail we write.
     pub async fn send(&self, to: &str, subject: &str, body: String) -> Result<(), String> {
         let page = html(subject, &body);
-        self.deliver(to, None, subject, body, Some(page)).await
+        self.deliver(to, None, subject, body, Some(page), None)
+            .await
+    }
+
+    /// A newsletter: the caller's own text and HTML, from `list.from_name`, with the
+    /// `List-Unsubscribe` and `List-Unsubscribe-Post` headers.
+    pub async fn send_list(
+        &self,
+        to: &str,
+        list: List<'_>,
+        subject: &str,
+        text: String,
+        html: String,
+    ) -> Result<(), String> {
+        self.deliver(to, None, subject, text, Some(html), Some(list))
+            .await
     }
 
     /// Plain text only, with a `Reply-To` address: a contact form message, whose text a
@@ -71,7 +98,7 @@ impl Mailer {
         subject: &str,
         body: String,
     ) -> Result<(), String> {
-        self.deliver(to, reply_to, subject, body, None).await
+        self.deliver(to, reply_to, subject, body, None, None).await
     }
 
     async fn deliver(
@@ -81,7 +108,12 @@ impl Mailer {
         subject: &str,
         body: String,
         html: Option<String>,
+        list: Option<List<'_>>,
     ) -> Result<(), String> {
+        let named = |from: &Mailbox| match list {
+            Some(l) => Mailbox::new(Some(l.from_name.to_owned()), from.email.clone()),
+            None => from.clone(),
+        };
         let (transport, from) = match self {
             Self::Log => {
                 tracing::info!(
@@ -93,7 +125,7 @@ impl Mailer {
                 );
                 return Ok(());
             }
-            Self::Smtp { transport, from } => (transport, from),
+            Self::Smtp { transport, from } => (transport, named(from)),
             Self::Resend {
                 client,
                 endpoint,
@@ -101,11 +133,17 @@ impl Mailer {
                 from,
             } => {
                 let mut mail = serde_json::json!({
-                    "from": from.to_string(),
+                    "from": named(from).to_string(),
                     "to": [to],
                     "subject": subject,
                     "text": body,
                 });
+                if let Some(l) = list {
+                    mail["headers"] = serde_json::json!({
+                        "List-Unsubscribe": format!("<{}>", l.unsubscribe),
+                        "List-Unsubscribe-Post": ONE_CLICK,
+                    });
+                }
                 if let Some(r) = reply_to {
                     mail["reply_to"] = r.into();
                 }
@@ -134,19 +172,7 @@ impl Mailer {
                 };
             }
         };
-        let to = to.parse().map_err(|_| "recipient is not a mailbox")?;
-        let mut message = Message::builder()
-            .from(from.clone())
-            .to(to)
-            .subject(subject);
-        if let Some(r) = reply_to {
-            message = message.reply_to(r.parse().map_err(|_| "reply-to is not a mailbox")?);
-        }
-        let message = match html {
-            Some(page) => message.multipart(MultiPart::alternative_plain_html(body, page)),
-            None => message.body(body),
-        }
-        .map_err(|_| "message did not build")?;
+        let message = smtp_message(from, to, reply_to, subject, body, html, list)?;
         transport.send(message).await.map(|_| ()).map_err(|e| {
             let kind = if e.is_permanent() {
                 "permanent"
@@ -165,7 +191,35 @@ impl Mailer {
     }
 }
 
-fn escape(text: &str) -> String {
+/// The message the SMTP transport sends.
+fn smtp_message(
+    from: Mailbox,
+    to: &str,
+    reply_to: Option<&str>,
+    subject: &str,
+    body: String,
+    html: Option<String>,
+    list: Option<List<'_>>,
+) -> Result<Message, String> {
+    let to = to.parse().map_err(|_| "recipient is not a mailbox")?;
+    let mut message = Message::builder().from(from).to(to).subject(subject);
+    if let Some(r) = reply_to {
+        message = message.reply_to(r.parse().map_err(|_| "reply-to is not a mailbox")?);
+    }
+    if let Some(l) = list {
+        let header = |name, value| HeaderValue::new(HeaderName::new_from_ascii_str(name), value);
+        message = message
+            .raw_header(header("List-Unsubscribe", format!("<{}>", l.unsubscribe)))
+            .raw_header(header("List-Unsubscribe-Post", ONE_CLICK.to_owned()));
+    }
+    let message = match html {
+        Some(page) => message.multipart(MultiPart::alternative_plain_html(body, page)),
+        None => message.body(body),
+    };
+    message.map_err(|_| "message did not build".to_owned())
+}
+
+pub(crate) fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -314,6 +368,65 @@ mod tests {
         assert!(page.contains("<p style=\"margin:0 0 16px\">Not a link: javascript:alert(1)</p>"));
         assert!(!page.contains("href=\"javascript"));
         assert!(page.contains(">Open link</a>"));
+    }
+
+    #[tokio::test]
+    async fn a_newsletter_carries_its_name_and_the_one_click_headers() {
+        let link = format!(
+            "https://brain.test/v1/public/newsletter/unsubscribe?token={}",
+            "a".repeat(64)
+        );
+        let list = super::List {
+            from_name: "Ann, Inc.",
+            unsubscribe: &link,
+        };
+        let (url, seen) = mock(StatusCode::OK).await;
+        let mailer = Mailer::resend_at(&url, "re_test", "Brain <login@example.com>").unwrap();
+        let send = mailer.send_list("a@example.com", list, "Hi", "T".into(), "<p>T</p>".into());
+        send.await.unwrap();
+        let (_, body) = seen.lock().unwrap().pop().unwrap();
+        assert_eq!(body["from"], "\"Ann, Inc.\" <login@example.com>");
+        assert_eq!(body["html"], "<p>T</p>");
+        assert_eq!(body["headers"]["List-Unsubscribe"], format!("<{link}>"));
+        assert_eq!(
+            body["headers"]["List-Unsubscribe-Post"],
+            "List-Unsubscribe=One-Click"
+        );
+        // Over SMTP the same headers, the long link on one unbroken line.
+        let from: super::Mailbox = "login@example.com".parse().unwrap();
+        // A name cannot leave its quotes, whatever it holds.
+        let tricky = "Ann \"x\" \\ <evil@example.com>, Bob";
+        let named = super::Mailbox::new(Some(tricky.to_owned()), from.email.clone());
+        // What Resend gets: the quotes and the backslash escaped inside one quoted name.
+        assert_eq!(
+            named.to_string(),
+            "\"Ann \\\"x\\\" \\\\ <evil@example.com>, Bob\" <login@example.com>"
+        );
+        // Over SMTP the name is one encoded word, so the header holds our address alone.
+        let m = super::smtp_message(named, "a@example.com", None, "Hi", "T".into(), None, None);
+        let raw = String::from_utf8(m.unwrap().formatted()).unwrap();
+        let header = raw.lines().find(|l| l.starts_with("From: ")).unwrap();
+        assert_eq!(
+            header,
+            "From: =?utf-8?b?QW5uICJ4IiBcIDxldmlsQGV4YW1wbGUuY29tPiwgQm9i?= <login@example.com>"
+        );
+        let args = (Some("<p>T</p>".to_owned()), Some(list));
+        let message = super::smtp_message(
+            from,
+            "a@example.com",
+            None,
+            "Hi",
+            "T".into(),
+            args.0,
+            args.1,
+        );
+        let raw = String::from_utf8(message.unwrap().formatted()).unwrap();
+        let unfolded = raw.replace("\r\n ", " ");
+        assert!(
+            unfolded.contains(&format!("List-Unsubscribe: <{link}>\r\n")),
+            "{raw}"
+        );
+        assert!(raw.contains("List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n"));
     }
 
     #[tokio::test]

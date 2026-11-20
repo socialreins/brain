@@ -2,9 +2,10 @@
 //! audience into `broadcast_recipients`; `tick` (every minute, own advisory lock) then claims up
 //! to 20 pending recipients of each sending broadcast in one short transaction (`claim`, with
 //! each send's hit of the daily cap), commits, and only then sends through `inbox::send`.
-//! A recipient moves `pending` to `sending` to an end state and never back once a send was
-//! started, so nobody is sent a broadcast twice: one cut off mid-send ends `failed: interrupted`
-//! (`recover`). Never send to a recipient without claiming it, and never retry one.
+//! A recipient moves `pending` to `sending` (claimed) to `delivering` (committed right before
+//! the send) to an end state, and never back once it was `delivering`, so nobody is sent a
+//! broadcast twice: one cut off mid-send ends `failed: interrupted`, one only claimed goes back
+//! to `pending` (`recover`). Never send to a recipient without claiming it, and never retry one.
 //! A platform that refuses a send for anything but the recipient's own settings (a rate limit,
 //! a block, an outage, a dead token) pauses the broadcast at once, as do 5 failed sends in a
 //! row: `paused` waits for a person (`resume`), it never goes on by itself.
@@ -390,15 +391,29 @@ struct Claimed {
     hits: Vec<i64>,
 }
 
-/// Recipients cut off mid-send fail as `interrupted`; they are never sent again.
+/// Hands the claimed (`sending`) recipients matching the `WHERE` appended to it back: nothing
+/// was sent to them, so they are `pending` again, or `skipped: cancelled` when their broadcast
+/// was cancelled meanwhile (a cancelled one never shows anybody pending).
+const HAND_BACK: &str = "UPDATE broadcast_recipients r SET updated_at = now(), \
+    status = CASE WHEN b.status = 'cancelled' THEN 'skipped' ELSE 'pending' END, \
+    reason = CASE WHEN b.status = 'cancelled' THEN 'cancelled' END \
+    FROM broadcasts b WHERE b.id = r.broadcast_id AND r.status = 'sending'";
+
+/// What a process that died left behind. A recipient whose send was started (`delivering`)
+/// fails as `interrupted` and is never sent to again; one only claimed (`sending`) got nothing,
+/// so it is handed back.
 async fn recover(db: &impl ConnectionTrait) -> Result<(), DbErr> {
-    let stmt = sql(
+    let stale = "updated_at < now() - make_interval(mins => $1)";
+    let cut = format!(
         "UPDATE broadcast_recipients SET status = 'failed', reason = 'interrupted', \
-         updated_at = now() WHERE status = 'sending' \
-         AND updated_at < now() - make_interval(mins => $1)",
-        vec![STUCK_MINUTES.into()],
+         updated_at = now() WHERE status = 'delivering' AND {stale}"
     );
-    db.execute_raw(stmt).await.map(|_| ())
+    db.execute_raw(sql(&cut, vec![STUCK_MINUTES.into()]))
+        .await?;
+    let back = format!("{HAND_BACK} AND r.{stale}");
+    db.execute_raw(sql(&back, vec![STUCK_MINUTES.into()]))
+        .await
+        .map(|_| ())
 }
 
 /// Moves up to `BATCH` pending recipients of every sending broadcast to `sending`, each with
@@ -450,6 +465,9 @@ enum Tried {
     End(&'static str, Option<String>),
     /// The broadcast was paused meanwhile: nothing was sent, it is `pending` again.
     Back,
+    /// The claim is no longer ours (`recover` took it for dead): nothing was sent, and the row
+    /// is somebody else's now.
+    Lost,
     /// The platform refused the send for more than this one person: the recipient is `failed`
     /// with the code, and the broadcast pauses with what the platform said.
     Trip(&'static str, String),
@@ -516,6 +534,16 @@ async fn attempt(app: &AppState, c: &Claimed) -> Result<Tried, DbErr> {
     };
     let name: Option<String> = route.try_get("", "display_name")?;
     let (text, filled) = automations::render(&c.text, name.as_deref());
+    // Committed before the send starts: from here on the recipient counts as sent to, whatever
+    // becomes of this process. Only one holder of a claim gets through.
+    let begin = sql(
+        "UPDATE broadcast_recipients SET status = 'delivering', updated_at = now() \
+         WHERE id = $1 AND status = 'sending'",
+        vec![c.id.into()],
+    );
+    if db.execute_raw(begin).await?.rows_affected() != 1 {
+        return Ok(Tried::Lost);
+    }
     // Before the send, so whatever becomes of it, no other broadcast reaches them today.
     let mark = sql(
         "UPDATE contacts SET last_broadcast_at = now() WHERE id = $1",
@@ -553,6 +581,10 @@ async fn deliver(app: &AppState, c: &Claimed) -> Result<bool, DbErr> {
     let db = &app.db;
     let (status, reason, trip) = match attempt(app, c).await {
         Ok(Tried::Back) => return release(db, c).await.map(|()| false),
+        Ok(Tried::Lost) => {
+            daily_refund(db, &c.hits).await;
+            return Ok(false);
+        }
         Ok(Tried::End(status, reason)) => (status, reason, None),
         Ok(Tried::Trip(code, why)) => ("failed", Some(code.to_owned()), Some(why)),
         // Before the send: every query of `attempt` comes before it.
@@ -567,7 +599,7 @@ async fn deliver(app: &AppState, c: &Claimed) -> Result<bool, DbErr> {
     }
     let end = sql(
         "UPDATE broadcast_recipients SET status = $2, reason = $3, updated_at = now() \
-         WHERE id = $1 AND status = 'sending'",
+         WHERE id = $1 AND status IN ('sending', 'delivering')",
         vec![c.id.into(), status.into(), reason.into()],
     );
     db.execute_raw(end).await?;
@@ -578,14 +610,10 @@ async fn deliver(app: &AppState, c: &Claimed) -> Result<bool, DbErr> {
 }
 
 /// Hands back a recipient nothing was sent to (the round ran out of time, or the broadcast was
-/// paused): it is `pending` again.
+/// paused or cancelled): see `HAND_BACK`.
 async fn release(db: &DatabaseConnection, c: &Claimed) -> Result<(), DbErr> {
-    let back = sql(
-        "UPDATE broadcast_recipients SET status = 'pending', updated_at = now() \
-         WHERE id = $1 AND status = 'sending'",
-        vec![c.id.into()],
-    );
-    db.execute_raw(back).await?;
+    let back = format!("{HAND_BACK} AND r.id = $1");
+    db.execute_raw(sql(&back, vec![c.id.into()])).await?;
     daily_refund(db, &c.hits).await;
     Ok(())
 }
@@ -628,7 +656,7 @@ async fn finish(db: &impl ConnectionTrait) -> Result<(), DbErr> {
     let stmt = "UPDATE broadcasts b SET status = 'sent', pause_reason = NULL, finished_at = now() \
                 WHERE b.status IN ('sending', 'paused') AND NOT EXISTS (SELECT 1 \
                 FROM broadcast_recipients r WHERE r.broadcast_id = b.id \
-                AND r.status IN ('pending', 'sending'))";
+                AND r.status IN ('pending', 'sending', 'delivering'))";
     db.execute_raw(sql(stmt, vec![])).await.map(|_| ())
 }
 
