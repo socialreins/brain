@@ -795,8 +795,8 @@ never called. One latest set of numbers is kept per target (`post_metrics`), no 
   published in the last 30 days that was never read, or last tried over an hour ago while the
   post is under 48 hours old, over 12 hours ago after that. A round takes at most 500 targets,
   the longest unread first, grouped by account and asked in one call per 25 (Bluesky,
-  `app.bsky.feed.getPosts`) or 50 (YouTube `videos.list?part=statistics`, Graph `/?ids=`), 8
-  accounts at once, and starts no call after 5 minutes.
+  `app.bsky.feed.getPosts`) or 50 (YouTube `videos.list?part=statistics`); Graph takes one post a call (v26 has no
+  `/?ids=`). 8 accounts at once, and starts no call after 5 minutes.
 - A read that fails keeps the numbers of the one before and waits twice as long per failed try,
   a day at most. A post the platform does not show keeps its last numbers and is asked for
   again a week later, 4 times; an account that needs a reconnect is skipped, and connecting it

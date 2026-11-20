@@ -23553,10 +23553,14 @@ mod teams {
                     (StatusCode::OK, Json(json!({ "items": items })))
                 }
 
-                /// Graph's `/?ids=`: one object that is not there, or that lacks a field asked
-                /// for, fails the whole call.
-                async fn graph(h: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Answer {
-                    let ids: Vec<String> = q["ids"].split(',').map(str::to_owned).collect();
+                /// Graph's `/{id}`: one object a call (v26 has no `/?ids=`). One that is not
+                /// there, or that lacks a field asked for, is refused.
+                async fn graph(
+                    h: HeaderMap,
+                    Path((_version, id)): Path<(String, String)>,
+                    Query(q): Query<HashMap<String, String>>,
+                ) -> Answer {
+                    assert!(!q.contains_key("ids"), "Graph v26 refuses ?ids=");
                     let post = "reactions.summary(total_count).limit(0),\
                                 comments.summary(total_count).limit(0),shares";
                     let video = "likes.summary(total_count).limit(0),\
@@ -23571,27 +23575,23 @@ mod teams {
                         );
                         "facebook"
                     };
-                    if let Some(refused) = taken(network, &h, "page-token", &ids) {
+                    if let Some(refused) = taken(network, &h, "page-token", &[id.clone()]) {
                         return refused;
                     }
-                    let mut all = serde_json::Map::new();
-                    for id in ids {
-                        let Some(mut one) = known(&id) else {
-                            let msg = format!("Object with ID '{id}' does not exist");
-                            let err = json!({"message": msg, "code": 100, "error_subcode": 33});
-                            return (StatusCode::BAD_REQUEST, Json(json!({ "error": err })));
-                        };
-                        // A Reel is a video node, without the fields of a post; a `broken`
-                        // object takes no field at all.
-                        if one["broken"] == true || (one["video"] == true && q["fields"] == post) {
-                            let msg = "(#100) Tried accessing nonexisting field (reactions)";
-                            let err = json!({"message": msg, "code": 100});
-                            return (StatusCode::BAD_REQUEST, Json(json!({ "error": err })));
-                        }
-                        one["id"] = json!(id);
-                        all.insert(id, one);
+                    let Some(mut one) = known(&id) else {
+                        let msg = format!("Object with ID '{id}' does not exist");
+                        let err = json!({"message": msg, "code": 100, "error_subcode": 33});
+                        return (StatusCode::BAD_REQUEST, Json(json!({ "error": err })));
+                    };
+                    // A Reel is a video node, without the fields of a post; a `broken` object
+                    // takes no field at all.
+                    if one["broken"] == true || (one["video"] == true && q["fields"] == post) {
+                        let msg = "(#100) Tried accessing nonexisting field (reactions)";
+                        let err = json!({"message": msg, "code": 100});
+                        return (StatusCode::BAD_REQUEST, Json(json!({ "error": err })));
                     }
-                    (StatusCode::OK, Json(Value::Object(all)))
+                    one["id"] = json!(id);
+                    (StatusCode::OK, Json(one))
                 }
 
                 async fn networks() -> String {
@@ -23604,7 +23604,7 @@ mod teams {
                         .route("/xrpc/com.atproto.server.createSession", post(session))
                         .route("/xrpc/app.bsky.feed.getPosts", get(get_posts))
                         .route("/youtube/v3/videos", get(videos))
-                        .route("/{version}/", get(graph));
+                        .route("/{version}/{id}", get(graph));
                     tokio::spawn(async move { axum::serve(listener, app).await });
                     base
                 }
@@ -23846,11 +23846,15 @@ mod teams {
                         let p = read_post(&s, &cookie, &made.post).await;
                         assert_eq!(counts(&p), want, "{}", p["platform"]);
                     }
-                    // One call a network for both of an account's posts.
-                    for network in ["bluesky", "youtube", "facebook", "instagram"] {
-                        let asked = calls(network);
-                        assert_eq!(asked.len(), 1, "{network}: {asked:?}");
-                        assert_eq!(asked[0].len(), 2, "{network}");
+                    // One call a network for both of an account's posts; Graph takes one a call.
+                    for (network, sizes) in [
+                        ("bluesky", vec![2]),
+                        ("youtube", vec![2]),
+                        ("facebook", vec![1, 1]),
+                        ("instagram", vec![1, 1]),
+                    ] {
+                        let asked: Vec<usize> = calls(network).iter().map(Vec::len).collect();
+                        assert_eq!(asked, sizes, "{network}");
                     }
                     let asked: Vec<String> = CALLS
                         .lock()
@@ -23889,7 +23893,7 @@ mod teams {
                     };
                     assert_eq!(sizes("bluesky"), [10, 25, 25]);
                     assert_eq!(sizes("youtube"), [10, 50]);
-                    assert_eq!(sizes("facebook"), [10, 50]);
+                    assert_eq!(sizes("facebook"), [1; 60]);
                     // All were just read, so the next round has nothing to ask.
                     CALLS.lock().unwrap().clear();
                     metrics::tick(&state).await.unwrap();
@@ -24074,7 +24078,7 @@ mod teams {
                     );
                     let mut sizes: Vec<usize> = calls("facebook").iter().map(Vec::len).collect();
                     sizes.sort_unstable();
-                    assert_eq!(sizes, [1, 1, 1, 3]);
+                    assert_eq!(sizes, [1, 1, 1]);
                     assert_eq!(row(&db, &posts[0].target).await["likes"], 2);
                     assert_eq!(row(&db, &posts[1].target).await["error"], "gone");
                     assert_eq!(row(&db, &posts[2].target).await["likes"], 3);
@@ -24141,10 +24145,10 @@ mod teams {
                     put(&broken.remote, json!({"broken": true}));
 
                     metrics::tick(&state).await.unwrap();
-                    // The call of all three, each alone, and the two refused as videos.
+                    // Each alone, and the two refused once more as videos.
                     let mut sizes: Vec<usize> = calls("facebook").iter().map(Vec::len).collect();
                     sizes.sort_unstable();
-                    assert_eq!(sizes, [1, 1, 1, 1, 1, 3]);
+                    assert_eq!(sizes, [1, 1, 1, 1, 1]);
                     let r = row(&db, &plain.target).await;
                     assert_eq!(
                         (&r["likes"], &r["shares"], &r["error"]),

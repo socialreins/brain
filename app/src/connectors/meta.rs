@@ -311,22 +311,12 @@ impl Meta {
             .map_err(|refused| post_error(refused, step))
     }
 
-    /// `fields` of each of `ids` (at most 50) in one call, `/?ids=`, keyed by id, with the Page
-    /// token: a Page post's reactions, comments and shares (`pages_read_engagement`) or an
-    /// Instagram media's counts (`instagram_basic`). One object that is missing or lacks a field
-    /// fails the whole call (`Missing`, `Refused`), so the caller asks again one id at a time.
-    pub async fn counts(
-        &self,
-        token: &str,
-        ids: &[&str],
-        fields: &str,
-    ) -> Result<Value, Uncounted> {
-        let url = format!("{}/{}/", self.graph_url, self.version);
-        let ids = ids.join(",");
-        let req = self
-            .client
-            .get(url)
-            .query(&[("ids", ids.as_str()), ("fields", fields)]);
+    /// `fields` of the object `id`, with the Page token: a Page post's reactions, comments and
+    /// shares (`pages_read_engagement`) or an Instagram media's counts (`instagram_basic`). One
+    /// object a call: Graph v26 dropped `/?ids=`.
+    pub async fn counts(&self, token: &str, id: &str, fields: &str) -> Result<Value, Uncounted> {
+        let url = format!("{}/{}/{id}", self.graph_url, self.version);
+        let req = self.client.get(url).query(&[("fields", fields)]);
         self.raw(req, Some(token), None, "Metrics")
             .await
             .map_err(|refused| match refused {

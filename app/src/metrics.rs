@@ -169,11 +169,10 @@ fn num(v: &Json) -> Option<i64> {
 /// One post's counts, or why the platform would not give them for it alone.
 type Read = Result<Counts, String>;
 
-/// Meta's answer for `ids`, by id; a post that is not there is left out. One object that is
-/// missing, or that lacks a field, fails a whole `?ids=` call, so then each id is asked on its
-/// own, and one that is refused alone once more with `video` (the fields a video node has, for a
-/// Reel). What is still refused is that post's error only. `Err` is a failure of the account
-/// (token, rate limit, Meta down), where asking again would not help.
+/// Meta's answer for `ids`, by id, one call each (Graph v26 has no `/?ids=`); a post that is not
+/// there is left out. One that is refused is asked once more with `video` (the fields a video
+/// node has, for a Reel); what is still refused is that post's error only. `Err` is a failure of
+/// the account (token, rate limit, Meta down), where asking again would not help.
 async fn meta_counts(
     app: &AppState,
     token: &str,
@@ -181,30 +180,15 @@ async fn meta_counts(
     (fields, video): (&str, Option<&str>),
     counts: fn(&Json) -> Counts,
 ) -> Result<HashMap<String, Read>, String> {
-    let mut whole = match app.meta.counts(token, ids, fields).await {
-        Ok(all) => {
-            let all = all.as_object().cloned().unwrap_or_default();
-            return Ok(all
-                .iter()
-                .map(|(id, v)| (id.clone(), Ok(counts(v))))
-                .collect());
-        }
-        Err(Uncounted::Failed(e)) => return Err(why(e)),
-        // Of one id this was already its own call.
-        refused => (ids.len() == 1).then_some(refused),
-    };
     let mut found = HashMap::new();
     for id in ids {
-        let mut got = match whole.take() {
-            Some(got) => got,
-            None => app.meta.counts(token, &[id], fields).await,
-        };
+        let mut got = app.meta.counts(token, id, fields).await;
         if let (Err(Uncounted::Refused(_)), Some(video)) = (&got, video) {
-            got = app.meta.counts(token, &[id], video).await;
+            got = app.meta.counts(token, id, video).await;
         }
         match got {
-            Ok(one) if one[*id].is_object() => {
-                found.insert((*id).to_owned(), Ok(counts(&one[*id])));
+            Ok(one) if one.is_object() => {
+                found.insert((*id).to_owned(), Ok(counts(&one)));
             }
             Ok(_) | Err(Uncounted::Missing) => {}
             Err(Uncounted::Refused(msg)) => {
