@@ -45,7 +45,7 @@ mod m20261204_000001_team_slug;
 pub mod m20261205_000001_contacts;
 pub mod m20261206_000001_post_metrics;
 pub mod m20261207_000001_inbox_conversations;
-mod m20261208_000001_broadcasts;
+pub mod m20261208_000001_broadcasts;
 
 pub struct Migrator;
 

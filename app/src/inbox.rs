@@ -489,7 +489,8 @@ pub fn numbered(text: &str, buttons: &[Button]) -> String {
 /// is the account and the platform's id, so a repeated read or webhook delivery adds nothing.
 /// Its author's contact (one per team, platform and author id) is made or brought up to date in
 /// the same statement, and the item points at it. A new DM that says `stop`, `unsubscribe` or
-/// `start` then sets the contact's `opted_out` (`opt_out`), which only broadcasts read.
+/// `start` then opts its author out of broadcasts or back in (`opt_out`, `contact_opt_outs`),
+/// which only broadcasts read.
 pub async fn store(
     db: &DatabaseConnection,
     account: &social_accounts::Model,
@@ -526,15 +527,25 @@ pub async fn store(
         .from_raw_sql(sql(INSERT, values))
         .one(db)
         .await?;
-    if let Some(out) = item.as_ref().and_then(opt_out) {
-        let stmt = sql(
-            "UPDATE contacts SET opted_out = $2 WHERE id = $1",
-            vec![item.as_ref().and_then(|i| i.contact_id).into(), out.into()],
-        );
-        db.execute_raw(stmt).await?;
+    if let Some((i, out)) = item.as_ref().and_then(|i| Some((i, opt_out(i)?))) {
+        let person: Vec<Value> = vec![
+            i.team_id.into(),
+            i.platform.clone().into(),
+            i.author_id.clone().into(),
+        ];
+        db.execute_raw(sql(if out { OPT_OUT } else { OPT_IN }, person))
+            .await?;
     }
     Ok(item)
 }
+
+/// Opts a person (team, platform, the platform's id of them) out of broadcasts, or back in.
+/// The row is the person's, not a contact's: it stays when the contact is deleted, so a contact
+/// made again by a later item is still opted out.
+pub const OPT_OUT: &str = "INSERT INTO contact_opt_outs (team_id, platform, external_id) \
+    VALUES ($1, $2, $3) ON CONFLICT DO NOTHING";
+pub const OPT_IN: &str =
+    "DELETE FROM contact_opt_outs WHERE team_id = $1 AND platform = $2 AND external_id = $3";
 
 /// What a new DM says about broadcasts: its whole text is `stop` or `unsubscribe` (opt out,
 /// `true`) or `start` (back in), whatever the case. Anything else says nothing.

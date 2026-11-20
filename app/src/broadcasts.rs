@@ -5,6 +5,9 @@
 //! A recipient moves `pending` to `sending` to an end state and never back once a send was
 //! started, so nobody is sent a broadcast twice: one cut off mid-send ends `failed: interrupted`
 //! (`recover`). Never send to a recipient without claiming it, and never retry one.
+//! A platform that refuses a send for anything but the recipient's own settings (a rate limit,
+//! a block, an outage, a dead token) pauses the broadcast at once, as do 5 failed sends in a
+//! row: `paused` waits for a person (`resume`), it never goes on by itself.
 use std::{
     collections::HashMap,
     time::{Duration, Instant},
@@ -38,6 +41,8 @@ pub const STARTS_PER_DAY: i64 = 3;
 pub const MESSAGES_PER_DAY: i64 = 1000;
 /// Recipients claimed per sending broadcast per round.
 const BATCH: i64 = 20;
+/// This many sends of a broadcast failing in a row pause it.
+const FAILS_IN_A_ROW: i64 = 5;
 /// A recipient `sending` this long was cut off; far above `ROUND` plus any send's timeout.
 const STUCK_MINUTES: i32 = 15;
 const BROADCAST_LOCK: i64 = 0x0042_5243_5354_5449;
@@ -61,9 +66,11 @@ fn sql(sql: &str, values: Vec<Value>) -> Statement {
 // contact last wrote to: on Facebook and Instagram by DM only, and only while that DM is under
 // 24 hours old (Meta's standard messaging window, never a message tag); on Bluesky by DM,
 // comment or mention. The DM answers the latest DM item of that account when there is one, so
-// it shows in the inbox conversation.
+// it shows in the inbox conversation. Nobody gets two broadcasts within 24 hours
+// (`contacts.last_broadcast_at`, set right before a send).
 const ROUTE: &str = "SELECT c.id AS contact_id, c.display_name, c.platform, \
-    CASE WHEN c.opted_out THEN 'opted_out' \
+    CASE WHEN o.team_id IS NOT NULL THEN 'opted_out' \
+         WHEN c.last_broadcast_at > now() - interval '24 hours' THEN 'recently_messaged' \
          WHEN l.id IS NULL THEN 'no_conversation' \
          WHEN a.id IS NULL OR COALESCE(a.meta->>'reconnect', 'false') = 'true' \
               OR (c.platform = 'bluesky' AND NOT a.dm_access) THEN 'account_disconnected' \
@@ -71,6 +78,8 @@ const ROUTE: &str = "SELECT c.id AS contact_id, c.display_name, c.platform, \
               THEN 'outside_window' END AS reason, \
     COALESCE(d.id, l.id) AS item_id \
     FROM contacts c \
+    LEFT JOIN contact_opt_outs o ON o.team_id = c.team_id AND o.platform = c.platform \
+        AND o.external_id = c.external_id \
     LEFT JOIN LATERAL (SELECT i.id, i.social_account_id, i.received_at FROM inbox_items i \
         WHERE i.contact_id = c.id AND (i.kind = 'dm' \
             OR (c.platform = 'bluesky' AND i.kind IN ('comment', 'mention'))) \
@@ -92,6 +101,8 @@ fn audience_sql() -> String {
 #[derive(Serialize, ToSchema, Default, Debug, PartialEq, Eq)]
 pub struct ByReason {
     pub opted_out: u64,
+    /// A broadcast of the team went out to them within the last 24 hours.
+    pub recently_messaged: u64,
     /// Facebook and Instagram: their last message is over 24 hours old.
     pub outside_window: u64,
     /// They never wrote a DM (Facebook, Instagram), or nothing at all (a Bluesky follower).
@@ -160,6 +171,7 @@ pub async fn preview(
                 }
             }
             Some("opted_out") => p.by_reason.opted_out += 1,
+            Some("recently_messaged") => p.by_reason.recently_messaged += 1,
             Some("outside_window") => p.by_reason.outside_window += 1,
             Some("no_conversation") => p.by_reason.no_conversation += 1,
             Some(_) => p.by_reason.account_disconnected += 1,
@@ -261,15 +273,15 @@ pub async fn start(
     Ok(Start::Started)
 }
 
-/// Cancels a `sending` broadcast: its pending recipients are `skipped: cancelled`. `None` when
-/// the team has no such broadcast, `false` when it is not sending. A recipient already claimed
-/// ends on its own: `deliver` looks at the broadcast again before it sends.
+/// Cancels a `sending` or `paused` broadcast: its pending recipients are `skipped: cancelled`.
+/// `None` when the team has no such broadcast, `false` when it is neither. A recipient already
+/// claimed ends on its own: `attempt` looks at the broadcast again before it sends.
 pub async fn cancel(db: &DatabaseConnection, team: Uuid, id: Uuid) -> Result<Option<bool>, DbErr> {
     let txn = db.begin().await?;
     let key: Vec<Value> = vec![id.into(), team.into()];
     let stop = sql(
-        "UPDATE broadcasts SET status = 'cancelled', finished_at = now() \
-         WHERE id = $1 AND team_id = $2 AND status = 'sending'",
+        "UPDATE broadcasts SET status = 'cancelled', pause_reason = NULL, finished_at = now() \
+         WHERE id = $1 AND team_id = $2 AND status IN ('sending', 'paused')",
         key.clone(),
     );
     if txn.execute_raw(stop).await?.rows_affected() != 1 {
@@ -289,11 +301,90 @@ pub async fn cancel(db: &DatabaseConnection, team: Uuid, id: Uuid) -> Result<Opt
     Ok(Some(true))
 }
 
+/// What `resume` did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Resume {
+    Resumed,
+    NotFound,
+    NotPaused,
+    /// Another broadcast of the team is `sending`.
+    AnotherSending,
+}
+
+/// Puts a `paused` broadcast back to `sending`, in the turn starts take, so one broadcast per
+/// team sends. Its run of failures counts from now (`resumed_at`). It is no new start: the
+/// three-a-day rule does not count it.
+pub async fn resume(db: &DatabaseConnection, team: Uuid, id: Uuid) -> Result<Resume, DbErr> {
+    let txn = db.begin().await?;
+    let turn = sql(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        vec![start_bucket(team).into()],
+    );
+    txn.execute_raw(turn).await?;
+    let found = sql(
+        "SELECT status FROM broadcasts WHERE id = $1 AND team_id = $2 FOR UPDATE",
+        vec![id.into(), team.into()],
+    );
+    let Some(row) = txn.query_one_raw(found).await? else {
+        return Ok(Resume::NotFound);
+    };
+    if row.try_get::<String>("", "status")? != "paused" {
+        return Ok(Resume::NotPaused);
+    }
+    let busy = sql(
+        "SELECT 1 FROM broadcasts WHERE team_id = $1 AND status = 'sending'",
+        vec![team.into()],
+    );
+    if txn.query_one_raw(busy).await?.is_some() {
+        return Ok(Resume::AnotherSending);
+    }
+    let go = sql(
+        "UPDATE broadcasts SET status = 'sending', pause_reason = NULL, resumed_at = now() \
+         WHERE id = $1",
+        vec![id.into()],
+    );
+    txn.execute_raw(go).await?;
+    txn.commit().await?;
+    Ok(Resume::Resumed)
+}
+
+/// Pauses a `sending` broadcast; `why` is for the person who must look at it.
+async fn pause(db: &impl ConnectionTrait, broadcast: Uuid, why: &str) -> Result<(), DbErr> {
+    let stmt = sql(
+        "UPDATE broadcasts SET status = 'paused', pause_reason = $2 \
+         WHERE id = $1 AND status = 'sending'",
+        vec![broadcast.into(), why.into()],
+    );
+    db.execute_raw(stmt).await.map(|_| ())
+}
+
+/// Pauses every sending broadcast (or only `broadcast`) whose last `FAILS_IN_A_ROW` sends since
+/// it started or was resumed all failed, whatever the reason; whether any was paused.
+async fn pause_failing(db: &impl ConnectionTrait, broadcast: Option<Uuid>) -> Result<bool, DbErr> {
+    let stmt = sql(
+        "UPDATE broadcasts b SET status = 'paused', pause_reason = $2 \
+         WHERE b.status = 'sending' AND ($3::uuid IS NULL OR b.id = $3) \
+         AND (SELECT count(*) FROM (SELECT r.status FROM broadcast_recipients r \
+              WHERE r.broadcast_id = b.id AND r.status IN ('sent', 'failed') \
+              AND r.updated_at >= COALESCE(b.resumed_at, b.started_at) \
+              ORDER BY r.updated_at DESC, r.id LIMIT $1) l WHERE l.status = 'failed') = $1",
+        vec![
+            FAILS_IN_A_ROW.into(),
+            format!("{FAILS_IN_A_ROW} sends in a row failed.").into(),
+            broadcast.into(),
+        ],
+    );
+    Ok(db.execute_raw(stmt).await?.rows_affected() > 0)
+}
+
 /// A claimed recipient: `sending`, with its hit of the daily cap taken.
 struct Claimed {
     id: Uuid,
     broadcast: Uuid,
     contact: Option<Uuid>,
+    team: Uuid,
+    tag: String,
+    platform: Option<String>,
     text: String,
     created_by: Option<Uuid>,
     hits: Vec<i64>,
@@ -315,7 +406,7 @@ async fn recover(db: &impl ConnectionTrait) -> Result<(), DbErr> {
 /// `SKIP LOCKED` keeps two callers off the same recipient. At the cap the rest stay `pending`,
 /// for a later round.
 async fn claim(txn: &impl ConnectionTrait) -> Result<Vec<Claimed>, DbErr> {
-    let sending = "SELECT id, team_id, text, created_by FROM broadcasts \
+    let sending = "SELECT id, team_id, tag, platform, text, created_by FROM broadcasts \
                    WHERE status = 'sending' ORDER BY started_at";
     let mut out = Vec::new();
     for b in txn.query_all_raw(sql(sending, vec![])).await? {
@@ -340,7 +431,10 @@ async fn claim(txn: &impl ConnectionTrait) -> Result<Vec<Claimed>, DbErr> {
             out.push(Claimed {
                 id,
                 broadcast,
+                team,
                 contact: r.try_get("", "contact_id")?,
+                tag: b.try_get("", "tag")?,
+                platform: b.try_get("", "platform")?,
                 text: b.try_get("", "text")?,
                 created_by: b.try_get("", "created_by")?,
                 hits,
@@ -350,28 +444,56 @@ async fn claim(txn: &impl ConnectionTrait) -> Result<Vec<Claimed>, DbErr> {
     Ok(out)
 }
 
-/// How a claimed recipient ended: the status, and why when it was not sent.
-type Outcome = (&'static str, Option<String>);
-
-fn skipped(reason: &str) -> Outcome {
-    ("skipped", Some(reason.to_owned()))
+/// What became of a claimed recipient.
+enum Tried {
+    /// Its end state, and why when it was not sent.
+    End(&'static str, Option<String>),
+    /// The broadcast was paused meanwhile: nothing was sent, it is `pending` again.
+    Back,
+    /// The platform refused the send for more than this one person: the recipient is `failed`
+    /// with the code, and the broadcast pauses with what the platform said.
+    Trip(&'static str, String),
 }
 
-/// Sends to one claimed recipient, once. Everything a start checked is checked again first:
-/// the broadcast still sends, the contact is there and did not opt out, the account is
-/// connected, and (Facebook, Instagram) the 24 hours still hold.
-async fn attempt(app: &AppState, c: &Claimed) -> Result<Outcome, DbErr> {
+fn skipped(reason: &str) -> Tried {
+    Tried::End("skipped", Some(reason.to_owned()))
+}
+
+/// Sends to one claimed recipient, once. Everything a start checked is checked again first,
+/// with the start's own audience clause: the broadcast still sends, the contact is there, still
+/// has the tag, did not opt out and got no other broadcast today, the account is connected,
+/// and (Facebook, Instagram) the 24 hours still hold.
+async fn attempt(app: &AppState, c: &Claimed) -> Result<Tried, DbErr> {
     let db = &app.db;
     let live = sql(
-        "SELECT 1 FROM broadcasts WHERE id = $1 AND status = 'sending'",
+        "SELECT status FROM broadcasts WHERE id = $1",
         vec![c.broadcast.into()],
     );
-    if db.query_one_raw(live).await?.is_none() {
-        return Ok(skipped("cancelled"));
+    let status: Option<String> = match db.query_one_raw(live).await? {
+        Some(r) => r.try_get("", "status")?,
+        None => None,
+    };
+    match status.as_deref() {
+        Some("sending") => {}
+        Some("paused") => return Ok(Tried::Back),
+        _ => return Ok(skipped("cancelled")),
     }
-    let route = sql(&format!("{ROUTE} AND c.id = $1"), vec![c.contact.into()]);
+    let route = sql(
+        &format!("{} AND c.id = $4", audience_sql()),
+        vec![
+            c.team.into(),
+            c.tag.clone().into(),
+            c.platform.clone().into(),
+            c.contact.into(),
+        ],
+    );
     let Some(route) = db.query_one_raw(route).await? else {
-        return Ok(skipped("contact_gone"));
+        let there = sql(
+            "SELECT 1 FROM contacts WHERE id = $1",
+            vec![c.contact.into()],
+        );
+        let there = db.query_one_raw(there).await?.is_some();
+        return Ok(skipped(if there { "untagged" } else { "contact_gone" }));
     };
     if let Some(reason) = route.try_get::<Option<String>>("", "reason")? {
         return Ok(skipped(&reason));
@@ -394,63 +516,69 @@ async fn attempt(app: &AppState, c: &Claimed) -> Result<Outcome, DbErr> {
     };
     let name: Option<String> = route.try_get("", "display_name")?;
     let (text, filled) = automations::render(&c.text, name.as_deref());
-    let via = Via::Dm;
-    let sent = inbox::send(
-        app,
-        &account,
-        &item,
-        via,
-        &text,
-        &filled,
-        c.created_by,
-        None,
-    )
-    .await;
+    // Before the send, so whatever becomes of it, no other broadcast reaches them today.
+    let mark = sql(
+        "UPDATE contacts SET last_broadcast_at = now() WHERE id = $1",
+        vec![c.contact.into()],
+    );
+    db.execute_raw(mark).await?;
+    let from = c.created_by;
+    let sent = inbox::send(app, &account, &item, Via::Dm, &text, &filled, from, None).await;
     Ok(match sent {
-        Ok(Ok(_)) => ("sent", None),
-        // Found before any call, or the person takes no DMs: nothing went out.
+        Ok(Ok(_)) => Tried::End("sent", None),
+        // Found before any call, or the person takes no DMs: nothing went out, and it says
+        // nothing about the next person.
         Ok(Err(
             e @ (InboxError::Invalid(_) | InboxError::DmNotAllowed | InboxError::NoDmAccess),
         )) => skipped(e.code()),
+        // Anything else the platform says (a rate limit, a block, a policy or permission
+        // error, an outage, a dead token) would meet the next recipient too: stop here.
         Ok(Err(e)) => {
-            // A dead token: the rest of the audience through this account is then skipped
-            // (`account_disconnected`) without a call each.
             if matches!(e, InboxError::Reconnect | InboxError::MetaReconnect) {
                 expiry::flag_reconnect(db, account.id).await;
             }
-            ("failed", Some(e.code().to_owned()))
+            Tried::Trip(e.code(), e.message())
         }
         // It may have gone out (the reply row is written after the send): never again.
         Err(e) => {
             tracing::error!(error = %e, recipient = %c.id, "broadcast send failed");
-            ("failed", Some("internal".to_owned()))
+            Tried::End("failed", Some("internal".to_owned()))
         }
     })
 }
 
-/// `attempt`, then the recipient's end state. A skip gives its hit of the cap back.
-async fn deliver(app: &AppState, c: &Claimed) -> Result<(), DbErr> {
-    let (status, reason) = match attempt(app, c).await {
-        Ok(o) => o,
+/// `attempt`, then the recipient's end state; `true` when the broadcast was paused over it. A
+/// skip gives its hit of the cap back.
+async fn deliver(app: &AppState, c: &Claimed) -> Result<bool, DbErr> {
+    let db = &app.db;
+    let (status, reason, trip) = match attempt(app, c).await {
+        Ok(Tried::Back) => return release(db, c).await.map(|()| false),
+        Ok(Tried::End(status, reason)) => (status, reason, None),
+        Ok(Tried::Trip(code, why)) => ("failed", Some(code.to_owned()), Some(why)),
         // Before the send: every query of `attempt` comes before it.
         Err(e) => {
             tracing::error!(error = %e, recipient = %c.id, "broadcast recipient check failed");
-            ("failed", Some("internal".to_owned()))
+            ("failed", Some("internal".to_owned()), None)
         }
     };
+    // First of all: the others must stop even if this recipient's own row cannot be written.
+    if let Some(why) = &trip {
+        pause(db, c.broadcast, why).await?;
+    }
     let end = sql(
         "UPDATE broadcast_recipients SET status = $2, reason = $3, updated_at = now() \
          WHERE id = $1 AND status = 'sending'",
         vec![c.id.into(), status.into(), reason.into()],
     );
-    app.db.execute_raw(end).await?;
+    db.execute_raw(end).await?;
     if status == "skipped" {
-        daily_refund(&app.db, &c.hits).await;
+        daily_refund(db, &c.hits).await;
     }
-    Ok(())
+    Ok(trip.is_some() || (status == "failed" && pause_failing(db, Some(c.broadcast)).await?))
 }
 
-/// Hands back a recipient the round had no time for: nothing was sent, so it is `pending` again.
+/// Hands back a recipient nothing was sent to (the round ran out of time, or the broadcast was
+/// paused): it is `pending` again.
 async fn release(db: &DatabaseConnection, c: &Claimed) -> Result<(), DbErr> {
     let back = sql(
         "UPDATE broadcast_recipients SET status = 'pending', updated_at = now() \
@@ -462,7 +590,8 @@ async fn release(db: &DatabaseConnection, c: &Claimed) -> Result<(), DbErr> {
     Ok(())
 }
 
-/// Sends to the claimed recipients: broadcasts side by side, one's recipients one after another.
+/// Sends to the claimed recipients: broadcasts side by side, one's recipients one after
+/// another, until one of them pauses it; the rest are then handed back.
 async fn work(app: &AppState, claimed: Vec<Claimed>, budget: Duration) {
     let started = Instant::now();
     let mut by_broadcast: HashMap<Uuid, Vec<Claimed>> = HashMap::new();
@@ -474,11 +603,12 @@ async fn work(app: &AppState, claimed: Vec<Claimed>, budget: Duration) {
         .map(|list| {
             let app = app.clone();
             tokio::spawn(async move {
+                let mut paused = false;
                 for c in &list {
-                    let done = if started.elapsed() < budget {
-                        deliver(&app, c).await
-                    } else {
+                    let done = if paused || started.elapsed() >= budget {
                         release(&app.db, c).await
+                    } else {
+                        deliver(&app, c).await.map(|p| paused = p)
                     };
                     if let Err(e) = done {
                         tracing::error!(error = %e, recipient = %c.id, "broadcast recipient not settled");
@@ -492,11 +622,13 @@ async fn work(app: &AppState, claimed: Vec<Claimed>, budget: Duration) {
     }
 }
 
-/// A sending broadcast with nobody left to send to is `sent`.
+/// A sending broadcast with nobody left to send to is `sent`; so is a paused one, which has
+/// nothing to resume.
 async fn finish(db: &impl ConnectionTrait) -> Result<(), DbErr> {
-    let stmt = "UPDATE broadcasts b SET status = 'sent', finished_at = now() \
-                WHERE b.status = 'sending' AND NOT EXISTS (SELECT 1 FROM broadcast_recipients r \
-                WHERE r.broadcast_id = b.id AND r.status IN ('pending', 'sending'))";
+    let stmt = "UPDATE broadcasts b SET status = 'sent', pause_reason = NULL, finished_at = now() \
+                WHERE b.status IN ('sending', 'paused') AND NOT EXISTS (SELECT 1 \
+                FROM broadcast_recipients r WHERE r.broadcast_id = b.id \
+                AND r.status IN ('pending', 'sending'))";
     db.execute_raw(sql(stmt, vec![])).await.map(|_| ())
 }
 
@@ -529,6 +661,8 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
         return Ok(());
     }
     recover(&lock).await?;
+    // Recovered recipients are failures too: a broadcast that keeps being cut off stops.
+    pause_failing(&lock, None).await?;
     let claimed = claim(&lock).await?;
     lock.commit().await?;
     work(app, claimed, ROUND).await;

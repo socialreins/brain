@@ -17170,7 +17170,8 @@ mod teams {
                         assert!(b["created_at"].is_string());
                         assert!(b["started_at"].is_null() && b["finished_at"].is_null());
                         let keys: Vec<&String> = b.as_object().unwrap().keys().collect();
-                        assert_eq!(keys.len(), 11, "{keys:?}");
+                        assert_eq!(keys.len(), 12, "{keys:?}");
+                        assert!(b["pause_reason"].is_null());
 
                         let second = draft(&s, &cookie, vip("Second", "Hi {name}")).await;
                         let list = read(&s, &cookie, "/v1/broadcasts").await;
@@ -17234,6 +17235,7 @@ mod teams {
                             ("/broadcasts/{id}/preview", "post"),
                             ("/broadcasts/{id}/send", "post"),
                             ("/broadcasts/{id}/cancel", "post"),
+                            ("/broadcasts/{id}/resume", "post"),
                             ("/broadcasts/{id}/recipients", "get"),
                         ] {
                             assert!(doc["paths"][p][m].is_object(), "{p} {m}");
@@ -17280,7 +17282,7 @@ mod teams {
                         assert_eq!(
                             p["by_reason"],
                             json!({"opted_out": 1, "outside_window": 1, "no_conversation": 2,
-                "account_disconnected": 1})
+                "account_disconnected": 1, "recently_messaged": 0})
                         );
                         assert_eq!(
                             p["by_platform"],
@@ -17582,6 +17584,247 @@ mod teams {
                         assert_eq!(res.json::<Value>()["opted_out"], true);
                         let res = change(&t.cookie, c, json!({"opted_out": "yes"})).await;
                         assert_eq!(res.status_code(), 422);
+
+                        // The opt-out is the person's: it outlives the contact. One deleted and
+                        // made again by a later item is still opted out.
+                        let path = format!("/v1/contacts/{c}");
+                        assert_eq!(
+                            req(&s, Method::DELETE, &path, &t.cookie)
+                                .await
+                                .status_code(),
+                            204
+                        );
+                        let again = wrote(&db, &t.bsky, ("dm", "hello again"), who, 0).await;
+                        assert_ne!(again, c);
+                        assert_eq!(out(again).await, true);
+                        let p = act(&s, &t.cookie, &id, "preview", json!({}))
+                            .await
+                            .json::<Value>();
+                        assert_eq!(p["by_reason"]["opted_out"], 2);
+                        let orphans = format!(
+                            "DELETE FROM inbox_items WHERE team_id = '{}' AND contact_id IS NULL",
+                            t.id
+                        );
+                        exec(&db, &orphans).await;
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn the_backfill_opts_out_whoever_last_said_stop() {
+                        use migration::m20261208_000001_broadcasts::BACKFILL_OPT_OUTS;
+                        let (s, db, _) = on_both().await;
+                        let t = team_bsky(&s, &db).await;
+                        let mut ids = Vec::new();
+                        for (who, texts) in [
+                            ("a", vec!["hi", "Stop"]),
+                            ("b", vec!["stop", "START", "thanks"]),
+                            ("c", vec![" unsubscribe\n"]),
+                            ("d", vec!["stop it"]),
+                            ("e", vec!["start", "stop", "ok"]),
+                        ] {
+                            let did = t.did(who);
+                            let mut contact = None;
+                            for (n, text) in texts.iter().enumerate() {
+                                let ago = 10 - n as i64;
+                                contact =
+                                    Some(said(&db, &t.bsky, ("dm", text), (&did, who), ago).await);
+                            }
+                            ids.push(contact.unwrap());
+                        }
+                        // As it was before the migration: nobody opted out.
+                        let none =
+                            format!("DELETE FROM contact_opt_outs WHERE team_id = '{}'", t.id);
+                        exec(&db, &none).await;
+                        for _ in 0..2 {
+                            exec(&db, BACKFILL_OPT_OUTS).await;
+                        }
+                        let mut got = Vec::new();
+                        for c in ids {
+                            let contact = read(&s, &t.cookie, &format!("/v1/contacts/{c}")).await;
+                            got.push(contact["opted_out"].as_bool().unwrap());
+                        }
+                        assert_eq!(got, [true, false, true, false, true]);
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn a_refused_send_pauses_the_broadcast_until_it_is_resumed() {
+                        let (s, db, state) = on_both().await;
+                        let t = team(&s, &db).await;
+                        for (who, name) in [("777", "Dana"), ("778", "Eve"), ("779", "Fay")] {
+                            wrote(&db, &t.fb, DM, (who, name), 1).await;
+                        }
+                        wrote(&db, &t.bsky, DM, (&t.did("ann"), "Ann"), 1).await;
+                        let facebook = json!({"name": "Launch", "text": "Hello", "tag": "vip",
+                            "platform": "facebook"});
+                        let id = draft(&s, &t.cookie, facebook).await;
+                        // Meta refuses the Page's token from the first send on.
+                        let token = |bytes: Vec<u8>| social_accounts::ActiveModel {
+                            id: Set(t.fb.id),
+                            access_token: Set(bytes),
+                            ..Default::default()
+                        };
+                        let dead = token(cipher().encrypt(b"dead"));
+                        social_accounts::Entity::update(dead)
+                            .exec(&db)
+                            .await
+                            .unwrap();
+                        assert_eq!(start(&s, &t.cookie, &id, 3).await.status_code(), 200);
+                        let before = meta_sent(0).len();
+                        assert_eq!(round(&state).await, 3);
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "paused");
+                        assert!(b["pause_reason"].as_str().unwrap().contains("token"), "{b}");
+                        assert_eq!(
+                            b["counts"],
+                            counts(3, 0, 0, 1, 2),
+                            "one tried, two handed back"
+                        );
+                        assert!(b["finished_at"].is_null());
+                        let got = ends(&s, &t.cookie, &id).await;
+                        let failed: Vec<_> = got.values().filter(|e| e.0 == "failed").collect();
+                        assert_eq!(failed[0].1, "meta_reconnect_required");
+                        assert_eq!(got.values().filter(|e| e.0 == "pending").count(), 2);
+                        assert_eq!(hits(&db, &t.id).await, 1, "the two not tried cost nothing");
+                        // It never goes on by itself, and it is not deleted while it waits.
+                        assert_eq!(round(&state).await, 0);
+                        broadcasts::tick(&state).await.unwrap();
+                        assert_eq!(shown(&s, &t.cookie, &id).await["status"], "paused");
+                        let path = format!("/v1/broadcasts/{id}");
+                        let res = req(&s, Method::DELETE, &path, &t.cookie).await;
+                        assert_eq!(res.status_code(), 409);
+
+                        // A paused broadcast is not sending: another may start, and then the
+                        // paused one waits its turn.
+                        let bluesky = json!({"name": "Other", "text": "Hi", "tag": "vip",
+                            "platform": "bluesky"});
+                        let other = draft(&s, &t.cookie, bluesky).await;
+                        assert_eq!(start(&s, &t.cookie, &other, 1).await.status_code(), 200);
+                        let res = act(&s, &t.cookie, &id, "resume", json!({})).await;
+                        assert_eq!(res.status_code(), 409);
+                        res.assert_json(&json!({"error": "another_sending"}));
+                        assert_eq!(
+                            round(&state).await,
+                            1,
+                            "the other's one, none of the paused"
+                        );
+                        assert_eq!(shown(&s, &t.cookie, &other).await["status"], "sent");
+
+                        // Reconnected (the token works again), an owner or admin resumes it.
+                        let alive = token(t.fb.access_token.clone());
+                        social_accounts::Entity::update(alive)
+                            .exec(&db)
+                            .await
+                            .unwrap();
+                        let clear = format!(
+                            "UPDATE social_accounts SET meta = meta - 'reconnect' WHERE id = '{}'",
+                            t.fb.id
+                        );
+                        exec(&db, &clear).await;
+                        let (member, _) = joined(&s, &db, &t.id, "member").await;
+                        let res = act(&s, &member, &id, "resume", json!({})).await;
+                        assert_eq!(res.status_code(), 403);
+                        let res = act(&s, &t.cookie, &id, "resume", json!({})).await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        let b = res.json::<Value>();
+                        assert_eq!(b["status"], "sending");
+                        assert!(b["pause_reason"].is_null());
+                        let res = act(&s, &t.cookie, &id, "resume", json!({})).await;
+                        assert_eq!(res.status_code(), 409);
+                        res.assert_json(&json!({"error": "not_paused"}));
+                        assert_eq!(round(&state).await, 2);
+                        assert_eq!(
+                            meta_sent(before).len(),
+                            2,
+                            "the failed one is never tried again"
+                        );
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "sent");
+                        assert_eq!(b["counts"], counts(3, 2, 0, 1, 0));
+
+                        // A rate limit pauses the same way, and a paused broadcast is cancelled.
+                        exec(&db, "UPDATE contacts SET last_broadcast_at = NULL").await;
+                        let limited = json!({"name": "Again", "text": "LIMIT offer", "tag": "vip",
+                            "platform": "facebook"});
+                        let id = draft(&s, &t.cookie, limited).await;
+                        assert_eq!(start(&s, &t.cookie, &id, 3).await.status_code(), 200);
+                        assert_eq!(round(&state).await, 3);
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "paused");
+                        assert_eq!(
+                            b["pause_reason"],
+                            "The platform is rate limiting this account."
+                        );
+                        assert_eq!(b["counts"], counts(3, 0, 0, 1, 2));
+                        let got = ends(&s, &t.cookie, &id).await;
+                        let failed: Vec<_> = got.values().filter(|e| e.0 == "failed").collect();
+                        assert_eq!(failed[0].1, "rate_limited");
+                        let res = act(&s, &t.cookie, &id, "cancel", json!({})).await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        let b = res.json::<Value>();
+                        assert_eq!(b["status"], "cancelled");
+                        assert!(b["pause_reason"].is_null());
+                        assert_eq!(b["counts"], counts(3, 0, 2, 1, 0));
+                        assert_eq!(meta_sent(before).len(), 2);
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn four_failed_sends_in_a_row_do_not_pause() {
+                        let (s, db, state) = on_both().await;
+                        let t = team_bsky(&s, &db).await;
+                        let people = crowd(&db, &t, 7).await;
+                        let id = draft(&s, &t.cookie, vip("Launch", "Hello")).await;
+                        assert_eq!(start(&s, &t.cookie, &id, 7).await.status_code(), 200);
+                        // Four claims in a row were cut off.
+                        let cut = |who: uuid::Uuid| {
+                            format!(
+                                "UPDATE broadcast_recipients SET status = 'sending', \
+                                 updated_at = now() - interval '16 minutes' WHERE contact_id = '{who}'"
+                            )
+                        };
+                        for who in &people[..4] {
+                            exec(&db, &cut(*who)).await;
+                        }
+                        broadcasts::tick(&state).await.unwrap();
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "sent", "four are not five: the rest went out");
+                        assert_eq!(b["counts"], counts(7, 3, 0, 4, 0));
+                        assert_eq!(t.bsky_sent().len(), 3);
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn a_broadcast_that_keeps_being_cut_off_waits_for_a_person() {
+                        let (s, db, state) = on_both().await;
+                        let t = team_bsky(&s, &db).await;
+                        let people = crowd(&db, &t, 6).await;
+                        let id = draft(&s, &t.cookie, vip("Launch", "Hello")).await;
+                        assert_eq!(start(&s, &t.cookie, &id, 6).await.status_code(), 200);
+                        for who in &people[..5] {
+                            let cut = format!(
+                                "UPDATE broadcast_recipients SET status = 'sending', \
+                                 updated_at = now() - interval '16 minutes' WHERE contact_id = '{who}'"
+                            );
+                            exec(&db, &cut).await;
+                        }
+                        broadcasts::tick(&state).await.unwrap();
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "paused");
+                        assert_eq!(b["pause_reason"], "5 sends in a row failed.");
+                        assert_eq!(b["counts"], counts(6, 0, 0, 5, 1));
+                        assert!(t.bsky_sent().is_empty(), "the sixth was not tried");
+                        broadcasts::tick(&state).await.unwrap();
+                        assert_eq!(shown(&s, &t.cookie, &id).await["status"], "paused");
+
+                        // Resumed, the count starts again: the old failures do not pause it twice.
+                        let res = act(&s, &t.cookie, &id, "resume", json!({})).await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        broadcasts::tick(&state).await.unwrap();
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "sent");
+                        assert_eq!(b["counts"], counts(6, 1, 0, 5, 0));
+                        assert_eq!(t.bsky_sent().len(), 1);
                     }
 
                     #[tokio::test]
@@ -17594,8 +17837,19 @@ mod teams {
                         let gus = wrote(&db, &t.ig, DM, ("555", "Gus"), 1).await;
                         let ann = wrote(&db, &t.bsky, DM, (&t.did("ann"), "Ann"), 1).await;
                         let bob = wrote(&db, &t.bsky, DM, (&t.did("bob"), "Bob"), 1).await;
+                        let hal = wrote(&db, &t.bsky, DM, (&t.did("hal"), "Hal"), 1).await;
+                        let ivy = wrote(&db, &t.bsky, DM, (&t.did("ivy"), "Ivy"), 1).await;
                         let id = draft(&s, &t.cookie, vip("Launch", "Hi {name}")).await;
-                        assert_eq!(start(&s, &t.cookie, &id, 5).await.status_code(), 200);
+                        assert_eq!(start(&s, &t.cookie, &id, 7).await.status_code(), 200);
+                        // Hal loses the tag, and another broadcast just went out to Ivy.
+                        let res = req(&s, Method::PATCH, &format!("/v1/contacts/{hal}"), &t.cookie)
+                            .json(&json!({"tags": ["other"]}))
+                            .await;
+                        assert_eq!(res.status_code(), 200);
+                        let just = format!(
+                            "UPDATE contacts SET last_broadcast_at = now() WHERE id = '{ivy}'"
+                        );
+                        exec(&db, &just).await;
 
                         // Between the start and the send: Dana's 24 hours end, Ann says stop, Bob is deleted
                         // and the Instagram account needs a reconnect.
@@ -17620,7 +17874,7 @@ mod teams {
                         exec(&db, &flag).await;
 
                         let before = meta_sent(0).len();
-                        assert_eq!(round(&state).await, 5);
+                        assert_eq!(round(&state).await, 7);
                         let meta = meta_sent(before);
                         assert_eq!(meta.len(), 1, "{meta:?}");
                         assert_eq!(meta[0]["recipient"], r#"{"id":"778"}"#);
@@ -17644,6 +17898,11 @@ mod teams {
                             ("skipped".to_owned(), json!("outside_window"))
                         );
                         assert_eq!(reason(ann), ("skipped".to_owned(), json!("opted_out")));
+                        assert_eq!(reason(hal), ("skipped".to_owned(), json!("untagged")));
+                        assert_eq!(
+                            reason(ivy),
+                            ("skipped".to_owned(), json!("recently_messaged"))
+                        );
                         assert_eq!(
                             reason(gus),
                             ("skipped".to_owned(), json!("account_disconnected"))
@@ -17660,7 +17919,7 @@ mod teams {
                         assert!(gone[0]["display_name"].is_null());
                         let b = shown(&s, &t.cookie, &id).await;
                         assert_eq!(b["status"], "sent");
-                        assert_eq!(b["counts"], counts(5, 1, 4, 0, 0));
+                        assert_eq!(b["counts"], counts(7, 1, 6, 0, 0));
                         // A skip is no send: only Eve's counts against the daily cap.
                         assert_eq!(hits(&db, &t.id).await, 1);
                         // Bob's items lost their contact; another test counts such items.
@@ -17746,11 +18005,19 @@ mod teams {
                         assert_eq!(round(&state).await, 1);
                         // A refused start is no start: the second and third still fit the day.
                         for id in &ids[1..3] {
+                            // A day on: nobody gets two broadcasts within 24 hours.
+                            let res = start(&s, &t.cookie, id, 1).await;
+                            assert_eq!(res.status_code(), 409, "{}", res.text());
+                            let p = &res.json::<Value>()["preview"];
+                            assert_eq!(p["by_reason"]["recently_messaged"], 1);
+                            assert_eq!(p["reachable"], 0);
+                            exec(&db, "UPDATE contacts SET last_broadcast_at = NULL").await;
                             let res = start(&s, &t.cookie, id, 1).await;
                             assert_eq!(res.status_code(), 200, "{}", res.text());
                             assert_eq!(round(&state).await, 1);
                             assert_eq!(shown(&s, &t.cookie, id).await["status"], "sent");
                         }
+                        exec(&db, "UPDATE contacts SET last_broadcast_at = NULL").await;
                         let res = start(&s, &t.cookie, &ids[3], 1).await;
                         assert_eq!(res.status_code(), 429);
                         res.assert_json(&json!({"error": "too_many_broadcasts"}));
@@ -17872,6 +18139,7 @@ mod teams {
                                 post("preview", json!({})),
                                 post("send", json!({"confirm_total": 1})),
                                 post("cancel", json!({})),
+                                post("resume", json!({})),
                                 req(&s, Method::GET, &format!("{one}/recipients"), cookie),
                                 req(&s, Method::DELETE, &one, cookie),
                             ]

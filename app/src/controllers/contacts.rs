@@ -52,7 +52,8 @@ pub struct Contact {
     pub tags: Vec<String>,
     pub notes: Option<String>,
     /// Never sent a broadcast: they wrote `stop` or `unsubscribe` (`start` clears it), or a
-    /// member set it. Automations do not look at it.
+    /// member set it. Automations do not look at it. It is kept for the person, so it outlives
+    /// a deleted contact.
     pub opted_out: bool,
     /// When their oldest and newest stored inbox items came.
     pub first_seen_at: DateTime<FixedOffset>,
@@ -134,7 +135,9 @@ fn stmt(sql: String, values: Vec<Value>) -> Statement {
     Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
 }
 
-const SELECT: &str = "SELECT c.*, (SELECT count(*) FROM inbox_items i \
+const SELECT: &str = "SELECT c.*, EXISTS (SELECT 1 FROM contact_opt_outs o \
+    WHERE o.team_id = c.team_id AND o.platform = c.platform \
+    AND o.external_id = c.external_id) AS opted_out, (SELECT count(*) FROM inbox_items i \
     WHERE i.contact_id = c.id) AS items_count FROM contacts c WHERE c.team_id = $1";
 
 /// The rows of `SELECT` as contacts, with their tags.
@@ -367,9 +370,16 @@ async fn change(
                 .await?;
         }
         if let Some(out) = input.opted_out {
-            let sql = "UPDATE contacts SET opted_out = $2 WHERE id = $1";
-            txn.execute_raw(stmt(sql.into(), vec![id.into(), out.into()]))
-                .await?;
+            let sql = if out {
+                "INSERT INTO contact_opt_outs (team_id, platform, external_id) \
+                 SELECT team_id, platform, external_id FROM contacts WHERE id = $1 \
+                 ON CONFLICT DO NOTHING"
+            } else {
+                "DELETE FROM contact_opt_outs o USING contacts c WHERE c.id = $1 \
+                 AND o.team_id = c.team_id AND o.platform = c.platform \
+                 AND o.external_id = c.external_id"
+            };
+            txn.execute_raw(stmt(sql.into(), vec![id.into()])).await?;
         }
         if let Some(tags) = tags {
             let sql = "DELETE FROM contact_tags WHERE contact_id = $1";
@@ -390,7 +400,8 @@ async fn change(
     }
 }
 
-/// Deletes a contact with its notes and tags. Owners and admins. Its inbox items stay, without
+/// Deletes a contact with its notes and tags. Owners and admins. An opt-out of broadcasts is
+/// kept (the platform and the person's id on it), so a later contact of theirs is opted out. Its inbox items stay, without
 /// a contact; a later item of the same person makes a new one.
 #[utoipa::path(delete, path = "/contacts/{id}", tag = "contacts", params(("id" = Uuid, Path)),
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),

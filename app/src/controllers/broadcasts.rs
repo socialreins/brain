@@ -22,7 +22,7 @@ use super::{
 };
 use crate::{
     automations::MAX_NAME_CHARS,
-    broadcasts::{self, Preview, Start},
+    broadcasts::{self, Preview, Resume, Start},
     inbox,
     state::AppState,
 };
@@ -55,8 +55,10 @@ pub struct Broadcast {
     pub tag: String,
     /// `bluesky`, `facebook` or `instagram`; `null` for all three.
     pub platform: Option<String>,
-    /// `draft`, `sending`, `sent` or `cancelled`.
+    /// `draft`, `sending`, `paused`, `sent` or `cancelled`.
     pub status: String,
+    /// Only while `paused`: what the platform said, or that 5 sends in a row failed.
+    pub pause_reason: Option<String>,
     pub counts: Counts,
     pub created_by: Option<Uuid>,
     pub created_at: DateTime<FixedOffset>,
@@ -95,8 +97,9 @@ pub struct Recipient {
     pub platform: Option<String>,
     /// `pending`, `sending`, `sent`, `skipped` or `failed`.
     pub status: String,
-    /// Why it was not sent. Skipped: `opted_out`, `outside_window`, `no_conversation`,
-    /// `account_disconnected`, `dm_not_allowed`, `too_long`, `contact_gone`, `cancelled`.
+    /// Why it was not sent. Skipped: `opted_out`, `recently_messaged`, `outside_window`,
+    /// `no_conversation`, `account_disconnected`, `untagged`, `dm_not_allowed`, `too_long`,
+    /// `contact_gone`, `cancelled`.
     /// Failed: `interrupted` (cut off mid-send, never sent again), `internal`, or the
     /// platform's refusal, e.g. `rate_limited`, `meta_failed`, `bluesky_refused`.
     pub reason: Option<String>,
@@ -176,6 +179,7 @@ fn broadcast_json(r: &QueryResult) -> Result<Broadcast, DbErr> {
         tag: r.try_get("", "tag")?,
         platform: r.try_get("", "platform")?,
         status: r.try_get("", "status")?,
+        pause_reason: r.try_get("", "pause_reason")?,
         counts: Counts {
             total: r.try_get("", "total")?,
             sent: r.try_get("", "sent")?,
@@ -319,7 +323,7 @@ async fn update(
 }
 
 /// Deletes a draft or a finished broadcast with its recipients. Owners and admins.
-/// `409 still_sending` while it sends: cancel it first.
+/// `409 still_sending` while it sends or is paused: cancel it first.
 #[utoipa::path(delete, path = "/broadcasts/{id}", tag = "broadcasts", params(("id" = Uuid, Path)),
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
         (status = 404, body = Error), (status = 409, body = Error)))]
@@ -332,7 +336,8 @@ async fn destroy(
     if !t.role.manages() {
         return forbidden();
     }
-    let sql = "DELETE FROM broadcasts WHERE id = $1 AND team_id = $2 AND status <> 'sending'";
+    let sql = "DELETE FROM broadcasts WHERE id = $1 AND team_id = $2 \
+               AND status NOT IN ('sending', 'paused')";
     let key: Vec<Value> = vec![id.into(), t.team.id.into()];
     match app.db.execute_raw(stmt(sql, key)).await {
         Ok(r) if r.rows_affected() == 1 => StatusCode::NO_CONTENT.into_response(),
@@ -352,7 +357,8 @@ async fn preview_of(app: &AppState, team: Uuid, id: Uuid) -> Result<Option<Previ
 /// Who the broadcast would go to if it started now; nothing is sent. Owners and admins.
 /// `total` is `reachable` plus the `by_reason` counts. A contact is reachable when it has the
 /// tag, did not opt out, and the account it last wrote to is connected; on Facebook and
-/// Instagram only within 24 hours of its last message to that account.
+/// Instagram only within 24 hours of its last message to that account. Nobody is reachable
+/// within 24 hours of a broadcast that went out to them (`recently_messaged`).
 #[utoipa::path(post, path = "/broadcasts/{id}/preview", tag = "broadcasts",
     params(("id" = Uuid, Path)),
     responses((status = 200, body = Preview), (status = 401, body = Error),
@@ -379,7 +385,9 @@ async fn preview(
 /// count of this moment, `409 already_started` for anything but a draft, `409 another_sending`
 /// while another broadcast of the team sends, `422 too_many_recipients` over 1000,
 /// `422 no_recipients` with nobody reachable, `429 too_many_broadcasts` after 3 starts in 24
-/// hours.
+/// hours. A send the platform refuses for more than the one person (a rate limit, a block, an
+/// outage, a dead token), or 5 failed sends in a row, makes it `paused` with a `pause_reason`:
+/// it then waits for `POST /broadcasts/{id}/resume`.
 #[utoipa::path(post, path = "/broadcasts/{id}/send", tag = "broadcasts", request_body = SendInput,
     params(("id" = Uuid, Path)),
     responses((status = 200, body = Broadcast), (status = 401, body = Error),
@@ -422,8 +430,8 @@ async fn send(
     reply(status, code)
 }
 
-/// Cancels a sending broadcast: recipients not sent to yet are `skipped` (`cancelled`), the
-/// ones sent to stay. Owners and admins. `409 not_sending` otherwise.
+/// Cancels a sending or paused broadcast: recipients not sent to yet are `skipped`
+/// (`cancelled`), the ones sent to stay. Owners and admins. `409 not_sending` otherwise.
 #[utoipa::path(post, path = "/broadcasts/{id}/cancel", tag = "broadcasts",
     params(("id" = Uuid, Path)),
     responses((status = 200, body = Broadcast), (status = 401, body = Error),
@@ -442,6 +450,31 @@ async fn cancel(
         Ok(Some(false)) => reply(StatusCode::CONFLICT, "not_sending"),
         Ok(None) => not_found(),
         Err(e) => internal(e, "broadcast cancel"),
+    }
+}
+
+/// Puts a paused broadcast back to `sending`, once whatever paused it is dealt with. Owners
+/// and admins. `409 not_paused` otherwise, `409 another_sending` while another broadcast of the
+/// team sends.
+#[utoipa::path(post, path = "/broadcasts/{id}/resume", tag = "broadcasts",
+    params(("id" = Uuid, Path)),
+    responses((status = 200, body = Broadcast), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error)))]
+async fn resume(
+    _: FromWeb,
+    State(app): State<AppState>,
+    t: InTeam,
+    Path(id): Path<Uuid>,
+) -> Response {
+    if !t.role.manages() {
+        return forbidden();
+    }
+    match broadcasts::resume(&app.db, t.team.id, id).await {
+        Ok(Resume::Resumed) => shown(&app, t.team.id, id, StatusCode::OK).await,
+        Ok(Resume::NotFound) => not_found(),
+        Ok(Resume::NotPaused) => reply(StatusCode::CONFLICT, "not_paused"),
+        Ok(Resume::AnotherSending) => reply(StatusCode::CONFLICT, "another_sending"),
+        Err(e) => internal(e, "broadcast resume"),
     }
 }
 
@@ -517,6 +550,7 @@ pub fn api() -> OpenApiRouter<AppState> {
         .routes(routes!(preview))
         .routes(routes!(send))
         .routes(routes!(cancel))
+        .routes(routes!(resume))
         .routes(routes!(recipients))
 }
 
