@@ -1,6 +1,7 @@
 //! Contacts of the current team: the people who wrote to its accounts, one per platform and
 //! author id, made and kept up by the inbox (`inbox::store`). Every member reads them and writes
-//! their notes and tags, as with inbox items; owners and admins delete one. Like the inbox,
+//! their notes and tags, as with inbox items; owners and admins delete one. `opted_out` keeps a
+//! contact out of broadcasts (`crate::broadcasts`). Like the inbox,
 //! these routes take a session only.
 use axum::{
     extract::{rejection::QueryRejection, Path, Query, State},
@@ -50,6 +51,9 @@ pub struct Contact {
     /// By name.
     pub tags: Vec<String>,
     pub notes: Option<String>,
+    /// Never sent a broadcast: they wrote `stop` or `unsubscribe` (`start` clears it), or a
+    /// member set it. Automations do not look at it.
+    pub opted_out: bool,
     /// When their oldest and newest stored inbox items came.
     pub first_seen_at: DateTime<FixedOffset>,
     pub last_seen_at: DateTime<FixedOffset>,
@@ -99,6 +103,10 @@ pub struct ContactChange {
     /// no commas or control characters. Absent: unchanged.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// Keeps the contact out of every broadcast. Every member sets it; only owners and admins
+    /// clear it. Absent: unchanged.
+    #[serde(default)]
+    pub opted_out: Option<bool>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -151,6 +159,7 @@ async fn contacts_json(
                 avatar_url: r.try_get("", "avatar_url")?,
                 tags: tags.remove(&id).unwrap_or_default(),
                 notes: r.try_get("", "notes")?,
+                opted_out: r.try_get("", "opted_out")?,
                 first_seen_at: r.try_get("", "first_seen_at")?,
                 last_seen_at: r.try_get("", "last_seen_at")?,
                 items_count: r.try_get("", "items_count")?,
@@ -317,8 +326,9 @@ fn checked_tags(raw: &[String]) -> Option<Vec<String>> {
     (out.len() <= MAX_TAGS).then_some(out)
 }
 
-/// Sets a contact's notes, replaces its tags, or both. Every member. `422 invalid_contact`
-/// names the bad `field` (`notes` or `tags`).
+/// Sets a contact's notes, replaces its tags, opts it out of broadcasts, or any of them. Every
+/// member, but only owners and admins opt a contact back in (`opted_out: false`, else `403
+/// forbidden`). `422 invalid_contact` names the bad `field` (`notes` or `tags`).
 #[utoipa::path(patch, path = "/contacts/{id}", tag = "contacts", request_body = ContactChange,
     params(("id" = Uuid, Path)),
     responses((status = 200, body = Contact), (status = 401, body = Error),
@@ -330,6 +340,10 @@ async fn change(
     Path(id): Path<Uuid>,
     Body(input): Body<ContactChange>,
 ) -> Response {
+    // Opting someone back in widens who a broadcast reaches.
+    if input.opted_out == Some(false) && !t.role.manages() {
+        return reply(StatusCode::FORBIDDEN, "forbidden");
+    }
     let notes = input.notes.map(|n| n.filter(|n| !n.trim().is_empty()));
     if matches!(&notes, Some(Some(n)) if n.chars().count() > MAX_NOTES) {
         return invalid("notes");
@@ -350,6 +364,11 @@ async fn change(
         if let Some(notes) = notes {
             let sql = "UPDATE contacts SET notes = $2 WHERE id = $1";
             txn.execute_raw(stmt(sql.into(), vec![id.into(), notes.into()]))
+                .await?;
+        }
+        if let Some(out) = input.opted_out {
+            let sql = "UPDATE contacts SET opted_out = $2 WHERE id = $1";
+            txn.execute_raw(stmt(sql.into(), vec![id.into(), out.into()]))
                 .await?;
         }
         if let Some(tags) = tags {

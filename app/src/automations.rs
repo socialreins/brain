@@ -74,7 +74,7 @@ const UNCHANGED: &str = "r.steps_hash = md5($4::jsonb::text) AND EXISTS (SELECT 
     AND md5(a.steps::text) = r.steps_hash)";
 const CHANGED: &str = "automation_changed";
 /// Longest `{name}` put into a text.
-const MAX_NAME_CHARS: usize = 64;
+pub(crate) const MAX_NAME_CHARS: usize = 64;
 /// What `{page}` counts as when a text is checked.
 // shortcut: an address over 100 characters (a `WEB_URL` over 85) can make a checked text too
 // long to send, which fails that action; derive this from `WEB_URL` if one ever is.

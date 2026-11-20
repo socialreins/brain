@@ -488,7 +488,8 @@ pub fn numbered(text: &str, buttons: &[Button]) -> String {
 /// Stores `f` for `account`; the new item, or `None` when it was already there. The unique key
 /// is the account and the platform's id, so a repeated read or webhook delivery adds nothing.
 /// Its author's contact (one per team, platform and author id) is made or brought up to date in
-/// the same statement, and the item points at it.
+/// the same statement, and the item points at it. A new DM that says `stop`, `unsubscribe` or
+/// `start` then sets the contact's `opted_out` (`opt_out`), which only broadcasts read.
 pub async fn store(
     db: &DatabaseConnection,
     account: &social_accounts::Model,
@@ -521,10 +522,31 @@ pub async fn store(
         f.button_payload.into(),
         Uuid::now_v7().into(),
     ];
-    inbox_items::Entity::find()
+    let item = inbox_items::Entity::find()
         .from_raw_sql(sql(INSERT, values))
         .one(db)
-        .await
+        .await?;
+    if let Some(out) = item.as_ref().and_then(opt_out) {
+        let stmt = sql(
+            "UPDATE contacts SET opted_out = $2 WHERE id = $1",
+            vec![item.as_ref().and_then(|i| i.contact_id).into(), out.into()],
+        );
+        db.execute_raw(stmt).await?;
+    }
+    Ok(item)
+}
+
+/// What a new DM says about broadcasts: its whole text is `stop` or `unsubscribe` (opt out,
+/// `true`) or `start` (back in), whatever the case. Anything else says nothing.
+fn opt_out(item: &inbox_items::Model) -> Option<bool> {
+    if item.kind != "dm" {
+        return None;
+    }
+    match item.text.trim().to_lowercase().as_str() {
+        "stop" | "unsubscribe" => Some(true),
+        "start" => Some(false),
+        _ => None,
+    }
 }
 
 /// Stores a notification; the new item, or `None` when it was already there.
