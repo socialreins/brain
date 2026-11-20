@@ -333,6 +333,7 @@ async fn test(
         body: &draft.body,
         sender_name,
         sender_address,
+        sender_logo: team.newsletter_sender_logo.as_deref(),
         team: &team.name,
     };
     // A token no subscriber has: the links look and answer as real ones do.

@@ -366,7 +366,11 @@ async fn approve(
             app.web_url
         );
         let subject = "You can now create your SocialReins account";
-        match app.mailer.send(&row.email, subject, text).await {
+        match app
+            .mailer
+            .send(&row.email, subject, text, &app.web_url)
+            .await
+        {
             Ok(()) => "sent",
             Err(e) => {
                 tracing::error!(error = %e, "waitlist approval mail not sent");

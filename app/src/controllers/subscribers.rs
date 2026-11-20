@@ -209,7 +209,12 @@ async fn send_confirmation(app: &AppState, reserved: &[i64], address: &str, secr
     );
     if let Err(e) = app
         .mailer
-        .send(address, "Confirm your newsletter subscription", text)
+        .send(
+            address,
+            "Confirm your newsletter subscription",
+            text,
+            &app.web_url,
+        )
         .await
     {
         tracing::error!(error = %e, "newsletter confirmation not sent");

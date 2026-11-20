@@ -231,7 +231,7 @@ pub(crate) async fn send_confirmation(
         "{intro}\n\nConfirm my email:\n{url}\n\nIf you did not sign up, ignore this email.\n"
     );
     let subject = "Confirm your spot on the SocialReins waitlist";
-    if let Err(e) = app.mailer.send(email, subject, text).await {
+    if let Err(e) = app.mailer.send(email, subject, text, &app.web_url).await {
         tracing::error!(error = %e, "waitlist confirmation not sent");
         daily_refund(&app.db, &reserved).await;
         unclaim(app, secret).await;

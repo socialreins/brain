@@ -23,6 +23,9 @@ pub struct Model {
     /// The sender's postal address, which the law wants in every newsletter.
     #[sea_orm(column_type = "Text", nullable)]
     pub newsletter_sender_address: Option<String>,
+    /// The sender's logo above every newsletter: a public `https` image link, optional.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub newsletter_sender_logo: Option<String>,
     /// A member's scheduled posts wait for an owner or admin to approve them (`posts.approval`).
     pub require_approval: bool,
     pub created_at: DateTimeWithTimeZone,

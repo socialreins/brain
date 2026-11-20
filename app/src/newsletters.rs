@@ -152,12 +152,17 @@ pub struct Envelope<'a> {
     pub sender_name: &'a str,
     /// The sender's postal address, which the law wants in every mail.
     pub sender_address: &'a str,
+    /// The sender's logo, a public `https` image link, shown above the mail instead of the name.
+    pub sender_logo: Option<&'a str>,
     pub team: &'a str,
 }
 
 /// The mail's plain text and its HTML: the body, then a footer with the sender, their postal
 /// address, why the reader gets this, and a link to `page`, the web page whose button
 /// unsubscribes (a link in a mail must never do it by itself: mail scanners open links).
+/// The HTML is laid out as `mail::html` is: the sender's logo (else their name) above a white
+/// card with the subject and the body, the footer below it. Tables and inline styles, because
+/// mail clients ignore most CSS.
 pub fn compose(e: &Envelope<'_>, page: &str) -> (String, String) {
     // The team's name is its own text: `inert`, so it cannot pass as a link in our mail.
     let why = format!(
@@ -168,20 +173,38 @@ pub fn compose(e: &Envelope<'_>, page: &str) -> (String, String) {
         "{}\n\n-- \n{}\n{}\n\n{why}\nUnsubscribe: {}\n",
         e.body, e.sender_name, e.sender_address, page
     );
+    let name = escape(e.sender_name);
+    let header = match e.sender_logo {
+        Some(logo) => format!(
+            "<img src=\"{}\" height=\"40\" alt=\"{name}\" style=\"display:block;border:0;\
+             height:40px;width:auto;max-width:240px\">",
+            escape(logo)
+        ),
+        None => name.clone(),
+    };
     let html = format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-         <title>{title}</title></head>\
-         <body style=\"margin:0;padding:24px 16px;background:#ffffff\">\
-         <div style=\"max-width:560px;margin:0 auto;font-family:-apple-system,BlinkMacSystemFont,\
-         'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:16px;line-height:1.55;\
-         color:#121212\">{body}\
-         <p style=\"margin:32px 0 0;padding-top:16px;border-top:1px solid #e7e5e4;font-size:13px;\
-         line-height:1.5;color:#57534e\">{name}<br>{address}<br><br>{why}<br>\
-         <a href=\"{page}\" style=\"color:#57534e\">Unsubscribe</a></p></div></body></html>",
+         <meta name=\"color-scheme\" content=\"light\">\
+         <meta name=\"supported-color-schemes\" content=\"light\"><title>{title}</title></head>\
+         <body style=\"margin:0;padding:0;background:#faf8f6\">\
+         <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" \
+         style=\"background:#faf8f6\"><tr><td align=\"center\" style=\"padding:32px 16px\">\
+         <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" \
+         style=\"max-width:560px;text-align:left;font-family:-apple-system,BlinkMacSystemFont,\
+         'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#121212\">\
+         <tr><td style=\"padding:0 4px 16px;font-size:20px;font-weight:800;\
+         letter-spacing:-0.02em\">{header}</td></tr>\
+         <tr><td style=\"background:#ffffff;border:1px solid #e7e5e4;border-radius:16px;\
+         padding:32px 28px;font-size:16px;line-height:1.55\">\
+         <h1 style=\"margin:0 0 20px;font-size:24px;line-height:1.25;font-weight:800;\
+         letter-spacing:-0.02em\">{title}</h1>{body}</td></tr>\
+         <tr><td style=\"padding:16px 4px 0;font-size:13px;line-height:1.5;color:#57534e\">\
+         {name}<br>{address}<br><br>{why}<br>\
+         <a href=\"{page}\" style=\"color:#57534e\">Unsubscribe</a></td></tr>\
+         </table></td></tr></table></body></html>",
         title = escape(e.subject),
         body = render(e.body).0,
-        name = escape(e.sender_name),
         address = escape(e.sender_address).replace('\n', "<br>"),
         why = escape(&why),
         page = escape(page),
@@ -238,7 +261,8 @@ pub async fn start(
     let txn = db.begin().await?;
     let found = sql(
         "SELECT n.status, n.tested_at IS NOT NULL AS tested, t.newsletter_sender_name AS name, \
-         t.newsletter_sender_address AS address FROM newsletters n \
+         t.newsletter_sender_address AS address, t.newsletter_sender_logo AS logo \
+         FROM newsletters n \
          JOIN teams t ON t.id = n.team_id WHERE n.id = $1 AND n.team_id = $2 FOR UPDATE OF n",
         vec![id.into(), team.into()],
     );
@@ -253,6 +277,7 @@ pub async fn start(
     let (Some(name), Some(address)) = sender else {
         return Ok(Start::SenderRequired);
     };
+    let logo: Option<String> = row.try_get("", "logo")?;
     if !row.try_get::<bool>("", "tested")? {
         return Ok(Start::TestRequired);
     }
@@ -279,8 +304,8 @@ pub async fn start(
     }
     let go = sql(
         "UPDATE newsletters SET status = 'sending', started_at = now(), sender_name = $2, \
-         sender_address = $3 WHERE id = $1",
-        vec![id.into(), name.into(), address.into()],
+         sender_address = $3, sender_logo = $4 WHERE id = $1",
+        vec![id.into(), name.into(), address.into(), logo.into()],
     );
     txn.execute_raw(go).await?;
     txn.commit().await?;
@@ -373,6 +398,7 @@ struct Claimed {
     body: String,
     sender_name: String,
     sender_address: String,
+    sender_logo: Option<String>,
     team: String,
     hits: Vec<i64>,
 }
@@ -408,7 +434,8 @@ async fn recover(db: &impl ConnectionTrait) -> Result<(), DbErr> {
 /// for a later round.
 async fn claim(txn: &impl ConnectionTrait) -> Result<Vec<Claimed>, DbErr> {
     // A started newsletter always has its sender (`newsletters_sender_check`).
-    let sending = "SELECT n.id, n.subject, n.body, n.sender_name, n.sender_address, \
+    let sending =
+        "SELECT n.id, n.subject, n.body, n.sender_name, n.sender_address, n.sender_logo, \
                    t.name AS team FROM newsletters n JOIN teams t ON t.id = n.team_id \
                    WHERE n.status = 'sending' ORDER BY n.started_at";
     let cap = [(MAIL_BUCKET.to_owned(), MAILS_PER_DAY)];
@@ -439,6 +466,7 @@ async fn claim(txn: &impl ConnectionTrait) -> Result<Vec<Claimed>, DbErr> {
                 body: n.try_get("", "body")?,
                 sender_name: n.try_get("", "sender_name")?,
                 sender_address: n.try_get("", "sender_address")?,
+                sender_logo: n.try_get("", "sender_logo")?,
                 team: n.try_get("", "team")?,
                 hits,
             });
@@ -531,6 +559,7 @@ async fn attempt(app: &AppState, c: &Claimed) -> Result<Tried, DbErr> {
         body: &c.body,
         sender_name: &c.sender_name,
         sender_address: &c.sender_address,
+        sender_logo: c.sender_logo.as_deref(),
         team: &c.team,
     };
     // Committed before the mail starts: from here on the recipient counts as mailed, whatever
@@ -724,6 +753,7 @@ mod tests {
             body: "Hello",
             sender_name: "Ann & Co",
             sender_address: "1 Main St\nSpringfield",
+            sender_logo: None,
             team: "Ann's evil.example/x",
         };
         let page = "https://web.test/newsletter/unsubscribe?token=t";
@@ -735,6 +765,28 @@ mod tests {
         assert!(html.contains("<title>News &lt;1&gt;</title>"));
         assert!(html.contains("Ann &amp; Co<br>1 Main St<br>Springfield<br>"));
         assert!(html.contains(&format!("<br><br>{why}<br>")));
-        assert!(html.contains("<a href=\"https://web.test/newsletter/unsubscribe?token=t\""));
+        let unsubscribe = "<a href=\"https://web.test/newsletter/unsubscribe?token=t\"";
+        assert!(html.contains(unsubscribe));
+        // No logo: the sender's name is the header, and the subject heads the card.
+        assert!(html.contains("letter-spacing:-0.02em\">Ann &amp; Co</td>"));
+        assert!(!html.contains("<img"));
+        assert!(html.contains(">News &lt;1&gt;</h1><p style=\"margin:0 0 16px\">Hello</p>"));
+
+        // With a logo the header is the image, and nothing of the footer or the text changes.
+        let logo = "https://cdn.test/a.png?x=1&y=\"><script>alert(1)</script>";
+        let with = Envelope {
+            sender_logo: Some(logo),
+            ..envelope
+        };
+        let (same, html) = compose(&with, page);
+        assert_eq!(same, text);
+        // The link cannot leave its attribute: no quote or angle bracket of its own survives.
+        let src = "<img src=\"https://cdn.test/a.png?x=1&amp;y=&quot;&gt;&lt;script&gt;\
+                   alert(1)&lt;/script&gt;\" height=\"40\" alt=\"Ann &amp; Co\" style=";
+        assert!(html.contains(src), "{html}");
+        assert!(!html.contains("<script") && html.matches("<img").count() == 1);
+        assert!(!html.contains("letter-spacing:-0.02em\">Ann &amp; Co</td>"));
+        assert!(html.contains("Ann &amp; Co<br>1 Main St<br>Springfield<br>"));
+        assert!(html.contains(&format!("<br><br>{why}<br>")) && html.contains(unsubscribe));
     }
 }

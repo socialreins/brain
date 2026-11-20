@@ -68,9 +68,16 @@ impl Mailer {
     }
 
     /// Errors name the failure kind and status code only, never the recipient, body or key.
-    /// The plain text is also sent as a branded HTML version (`html`), for mail we write.
-    pub async fn send(&self, to: &str, subject: &str, body: String) -> Result<(), String> {
-        let page = html(subject, &body);
+    /// The plain text is also sent as a branded HTML version (`html`), for mail we write;
+    /// `web_url` is the web app, which serves its logo.
+    pub async fn send(
+        &self,
+        to: &str,
+        subject: &str,
+        body: String,
+        web_url: &str,
+    ) -> Result<(), String> {
+        let page = html(subject, &body, web_url);
         self.deliver(to, None, subject, body, Some(page), None)
             .await
     }
@@ -229,8 +236,9 @@ pub(crate) fn escape(text: &str) -> String {
 /// The HTML version of a plain-text mail: the subject as a heading, each paragraph, and every
 /// line that is only a link as a button. A line ending in `:` right before a link is the
 /// button's label ("Confirm my email:"). Everything is escaped; only `http(s)` links are linked.
-/// Tables and inline styles, because mail clients ignore most CSS.
-fn html(subject: &str, text: &str) -> String {
+/// Tables and inline styles, because mail clients ignore most CSS. The logo above it is the web
+/// app's own icon (`{web_url}/icon-192.png`), so a self-hosted install shows its own.
+fn html(subject: &str, text: &str, web_url: &str) -> String {
     const INK: &str = "#121212";
     const SOFT: &str = "#57534e";
     const SIGNAL: &str = "#c2330a";
@@ -281,7 +289,9 @@ fn html(subject: &str, text: &str) -> String {
          style=\"max-width:560px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,\
          Helvetica,Arial,sans-serif;color:{INK}\">\
          <tr><td style=\"padding:0 4px 16px;font-size:20px;font-weight:800;letter-spacing:-0.02em\">\
-         <span style=\"color:{SIGNAL}\">&#9679;</span> SocialReins</td></tr>\
+         <img src=\"{web}/icon-192.png\" width=\"28\" height=\"28\" alt=\"\" \
+         style=\"display:inline-block;vertical-align:middle;border:0;border-radius:6px\"> \
+         <span style=\"vertical-align:middle\">SocialReins</span></td></tr>\
          <tr><td style=\"background:#ffffff;border:1px solid #e7e5e4;border-radius:16px;\
          padding:32px 28px;font-size:16px;line-height:1.55\">\
          <h1 style=\"margin:0 0 20px;font-size:24px;line-height:1.25;font-weight:800;\
@@ -289,7 +299,8 @@ fn html(subject: &str, text: &str) -> String {
          <tr><td style=\"padding:16px 4px 0;font-size:13px;line-height:1.5;color:{SOFT}\">\
          SocialReins, the open-source social media manager.</td></tr>\
          </table></td></tr></table></body></html>",
-        title = escape(subject)
+        title = escape(subject),
+        web = escape(web_url)
     )
 }
 
@@ -336,7 +347,7 @@ mod tests {
         let (url, seen) = mock(StatusCode::OK).await;
         let mailer = Mailer::resend_at(&url, "re_test", "Brain <login@example.com>").unwrap();
         mailer
-            .send("a@example.com", "Hi", "Body".into())
+            .send("a@example.com", "Hi", "Body".into(), "https://web.test")
             .await
             .unwrap();
         let (auth, body) = seen.lock().unwrap().pop().unwrap();
@@ -356,7 +367,13 @@ mod tests {
         let text =
             "Thanks, <b>Ann & co</b>.\n\nConfirm my email:\nhttps://x.test/v?token=a&b=\"c\"\n\n\
                     Not a link: javascript:alert(1)\nhttps://x.test/plain\n";
-        let page = super::html("Hi <you>", text);
+        let page = super::html("Hi <you>", text, "https://web.test/\"><b");
+        // The header is the web app's icon beside the name, its address escaped.
+        let logo = "<img src=\"https://web.test/&quot;&gt;&lt;b/icon-192.png\" width=\"28\" \
+                    height=\"28\" alt=\"\" style=\"display:inline-block;vertical-align:middle;\
+                    border:0;border-radius:6px\"> <span style=\"vertical-align:middle\">\
+                    SocialReins</span>";
+        assert!(page.contains(logo), "{page}");
         assert!(page.contains("<h1 style=") && page.contains(">Hi &lt;you&gt;</h1>"));
         assert!(page.contains("Thanks, &lt;b&gt;Ann &amp; co&lt;/b&gt;."));
         // The label moves onto the button and is not repeated as a paragraph.
@@ -453,7 +470,9 @@ mod tests {
     async fn resend_errors_carry_the_status_only() {
         let (url, _) = mock(StatusCode::UNPROCESSABLE_ENTITY).await;
         let mailer = Mailer::resend_at(&url, "re_secret", "login@example.com").unwrap();
-        let err = mailer.send("a@example.com", "Hi", "Body".into()).await;
+        let err = mailer
+            .send("a@example.com", "Hi", "Body".into(), "https://web.test")
+            .await;
         assert_eq!(err.unwrap_err(), "resend status 422");
     }
 }
