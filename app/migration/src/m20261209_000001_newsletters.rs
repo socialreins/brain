@@ -11,8 +11,9 @@ pub struct Migration;
 // link is looked up by) and sealed under `ENCRYPTION_KEY` (`unsubscribe_token`), so later mails
 // carry the same link and older ones keep working. A start copies the sender onto the
 // newsletter and snapshots the audience into `newsletter_recipients` (one row per newsletter
-// and subscriber); a recipient only ever moves `pending` to `sending` to an end state, so it
-// is mailed at most once. A `paused` newsletter waits for a person (`pause_reason`), and
+// and subscriber); a recipient moves `pending` to `sending` (claimed) to `mailing` (the mail
+// call is about to start) to an end state and never back from `mailing`, so it is mailed at
+// most once. A `paused` newsletter waits for a person (`pause_reason`), and
 // `resumed_at` is where its run of failures starts counting again.
 const UP: &str = r#"ALTER TABLE teams ADD COLUMN newsletter_sender_name text,
   ADD COLUMN newsletter_sender_address text,
@@ -45,7 +46,7 @@ CREATE TABLE newsletter_recipients (
   newsletter_id uuid NOT NULL REFERENCES newsletters (id) ON DELETE CASCADE,
   subscriber_id uuid REFERENCES subscribers (id) ON DELETE SET NULL,
   status text NOT NULL DEFAULT 'pending'
-    CHECK (status IN ('pending', 'sending', 'sent', 'skipped', 'failed')),
+    CHECK (status IN ('pending', 'sending', 'mailing', 'sent', 'skipped', 'failed')),
   reason text,
   updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (newsletter_id, subscriber_id));

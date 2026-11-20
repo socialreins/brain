@@ -22209,20 +22209,8 @@ mod teams {
                         let seen = Sent::default();
                         let answer = std::sync::Arc::new(AtomicU16::new(200));
                         let (log, status) = (seen.clone(), answer.clone());
-                        let app = Router::new().route(
-                            "/emails",
-                            post(move |Json(body): Json<Value>| async move {
-                                let code = status.load(Ordering::SeqCst);
-                                if code == 200 {
-                                    log.lock().unwrap().push(body);
-                                }
-                                let code = axum::http::StatusCode::from_u16(code).unwrap();
-                                (code, Json(json!({"id": "x"})))
-                            }),
-                        );
                         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                         let url = format!("http://{}/emails", listener.local_addr().unwrap());
-                        tokio::spawn(async move { axum::serve(listener, app).await });
                         let base = mock_bluesky().await;
                         let mut config = Config::from_env().expect("test config");
                         config.trust_proxy = true;
@@ -22243,6 +22231,27 @@ mod teams {
                                 .into(),
                         )
                         .await;
+                        let pool = db.clone();
+                        let mock = Router::new().route(
+                            "/emails",
+                            post(move |Json(body): Json<Value>| async move {
+                                let mut code = status.load(Ordering::SeqCst);
+                                if code == 200 {
+                                    log.lock().unwrap().push(body);
+                                }
+                                // 418: somebody cancels every newsletter while this mail is
+                                // on its way, and the mail fails.
+                                if code == 418 {
+                                    let stop = "UPDATE newsletters SET status = 'cancelled', \
+                                                finished_at = now() WHERE status = 'sending'";
+                                    sql(&pool, stop.into()).await;
+                                    code = 500;
+                                }
+                                let code = axum::http::StatusCode::from_u16(code).unwrap();
+                                (code, Json(json!({"id": "x"})))
+                            }),
+                        );
+                        tokio::spawn(async move { axum::serve(listener, mock).await });
                         let state = AppState::new(db.clone(), &config);
                         let app = controllers::router(state.clone(), &config);
                         let s = TestServer::new(app).unwrap();
@@ -22769,6 +22778,86 @@ mod teams {
                         b.tick().await;
                         assert_eq!(b.count(), before);
                         assert_eq!(shown(s, &owner, &id).await["counts"], counts(3, 0, 0, 0));
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn a_dead_process_costs_only_the_mail_it_started() {
+                        let b = brain().await;
+                        let s = &b.s;
+                        let (_, owner, _) = user(s, &b.db).await;
+                        let team = current(s, &owner).await["id"].as_str().unwrap().to_owned();
+                        sender_on(s, &owner).await;
+                        let mailing = b.subscriber(&team, "confirmed").await;
+                        let claimed = b.subscriber(&team, "confirmed").await;
+                        let fresh = b.subscriber(&team, "confirmed").await;
+                        let waiting = b.subscriber(&team, "confirmed").await;
+                        let id = tested(s, &owner, "News").await;
+                        assert_eq!(start(s, &owner, &id, 4).await.status_code(), 200);
+                        // A process died: one mail was started, one recipient only claimed, both
+                        // 16 minutes ago; a third was claimed just now by a process still alive.
+                        let left_in = |id: &str, who: &str, status: &str, ago: &str| {
+                            format!(
+                                "UPDATE newsletter_recipients r SET status = '{status}', \
+                                 updated_at = now() - interval '{ago}' FROM subscribers s \
+                                 WHERE s.id = r.subscriber_id AND s.email = '{who}' \
+                                 AND r.newsletter_id = '{id}'"
+                            )
+                        };
+                        let first = id.clone();
+                        let left =
+                            |who: &str, status: &str, ago: &str| left_in(&first, who, status, ago);
+                        sql(&b.db, left(&mailing, "mailing", "16 minutes")).await;
+                        sql(&b.db, left(&claimed, "sending", "16 minutes")).await;
+                        sql(&b.db, left(&fresh, "sending", "1 minute")).await;
+                        b.tick().await;
+                        assert!(
+                            b.mails(&mailing).is_empty(),
+                            "it may have gone out: never again"
+                        );
+                        assert_eq!(
+                            b.mails(&claimed).len(),
+                            1,
+                            "nothing was started: it is mailed"
+                        );
+                        assert!(
+                            b.mails(&fresh).is_empty(),
+                            "somebody may be about to mail it"
+                        );
+                        assert_eq!(b.mails(&waiting).len(), 1);
+                        let n = shown(s, &owner, &id).await;
+                        assert_eq!(n["status"], "sending");
+                        assert_eq!(n["counts"], counts(4, 2, 1, 1));
+                        // That process died too, right before its mail call.
+                        sql(&b.db, left(&fresh, "sending", "16 minutes")).await;
+                        b.tick().await;
+                        assert_eq!(b.mails(&fresh).len(), 1);
+                        let n = shown(s, &owner, &id).await;
+                        assert_eq!(n["status"], "sent");
+                        assert_eq!(n["counts"], counts(4, 3, 1, 0));
+
+                        // Cancelled while a round holds claims: the mail on its way fails, the
+                        // ones not started are skipped, and nobody is left pending.
+                        b.another_day(&team).await;
+                        let id = tested(s, &owner, "Second").await;
+                        assert_eq!(start(s, &owner, &id, 4).await.status_code(), 200);
+                        let before = b.count();
+                        b.answer.store(418, Ordering::SeqCst);
+                        b.tick().await;
+                        b.answer.store(200, Ordering::SeqCst);
+                        let n = shown(s, &owner, &id).await;
+                        assert_eq!(n["status"], "cancelled");
+                        assert_eq!(n["counts"], counts(4, 0, 1, 0));
+                        // So is a claim a dead process left on a cancelled newsletter.
+                        b.another_day(&team).await;
+                        let id = tested(s, &owner, "Third").await;
+                        assert_eq!(start(s, &owner, &id, 4).await.status_code(), 200);
+                        sql(&b.db, left_in(&id, &claimed, "sending", "16 minutes")).await;
+                        let res = act(s, &owner, &id, "cancel").await;
+                        assert_eq!(res.json::<Value>()["counts"], counts(4, 0, 0, 1));
+                        b.tick().await;
+                        assert_eq!(shown(s, &owner, &id).await["counts"], counts(4, 0, 0, 0));
+                        assert_eq!(b.count(), before + 1, "the third's test mail only");
                     }
 
                     #[tokio::test]

@@ -105,7 +105,7 @@ fn stmt(sql: &str, values: Vec<Value>) -> Statement {
 const SELECT: &str = "SELECT n.*, c.* FROM newsletters n, LATERAL (SELECT count(*) AS total, \
     count(*) FILTER (WHERE r.status = 'sent') AS sent, \
     count(*) FILTER (WHERE r.status = 'failed') AS failed, \
-    count(*) FILTER (WHERE r.status IN ('pending', 'sending')) AS pending \
+    count(*) FILTER (WHERE r.status IN ('pending', 'sending', 'mailing')) AS pending \
     FROM newsletter_recipients r WHERE r.newsletter_id = n.id) c WHERE n.team_id = $1";
 
 fn newsletter_json(r: &QueryResult) -> Result<Newsletter, DbErr> {

@@ -2,9 +2,10 @@
 //! A start (`start`) snapshots the audience into `newsletter_recipients`; `tick` (every minute,
 //! own advisory lock) then claims up to 50 pending recipients of each sending newsletter in one
 //! short transaction (`claim`, with each mail's hit of the cap over all teams), commits, and
-//! only then sends. A recipient moves `pending` to `sending` to an end state and never back once
-//! a send was started, so nobody is mailed a newsletter twice: one cut off mid-send ends
-//! `failed: interrupted` (`recover`). Never mail a recipient without claiming it, and never
+//! only then sends. A recipient moves `pending` to `sending` (claimed) to `mailing` (committed
+//! right before the mail call) to an end state, and never back once it was `mailing`, so nobody
+//! is mailed a newsletter twice: one cut off mid-mail ends `failed: interrupted`, one only
+//! claimed goes back to `pending` (`recover`). Never mail a recipient without claiming it, and never
 //! retry one. Any error of the mail provider (a rate limit, a refusal, an outage) pauses the
 //! newsletter at once, as do 5 failed sends in a row: `paused` waits for a person (`resume`),
 //! it never goes on by itself. The mail comes from our own mail domain, so everything here
@@ -375,15 +376,29 @@ struct Claimed {
     hits: Vec<i64>,
 }
 
-/// Recipients cut off mid-send fail as `interrupted`; they are never mailed again.
+/// Hands the claimed (`sending`) recipients matching the `WHERE` appended to it back: nothing
+/// was sent to them, so they are `pending` again, or `skipped: cancelled` when their newsletter
+/// was cancelled meanwhile (a cancelled one never shows anybody pending).
+const HAND_BACK: &str = "UPDATE newsletter_recipients r SET updated_at = now(), \
+    status = CASE WHEN n.status = 'cancelled' THEN 'skipped' ELSE 'pending' END, \
+    reason = CASE WHEN n.status = 'cancelled' THEN 'cancelled' END \
+    FROM newsletters n WHERE n.id = r.newsletter_id AND r.status = 'sending'";
+
+/// What a process that died left behind. A recipient whose mail was started (`mailing`) fails
+/// as `interrupted` and is never mailed again; one only claimed (`sending`) got nothing, so it
+/// is handed back.
 async fn recover(db: &impl ConnectionTrait) -> Result<(), DbErr> {
-    let stmt = sql(
+    let stale = "updated_at < now() - make_interval(mins => $1)";
+    let cut = format!(
         "UPDATE newsletter_recipients SET status = 'failed', reason = 'interrupted', \
-         updated_at = now() WHERE status = 'sending' \
-         AND updated_at < now() - make_interval(mins => $1)",
-        vec![STUCK_MINUTES.into()],
+         updated_at = now() WHERE status = 'mailing' AND {stale}"
     );
-    db.execute_raw(stmt).await.map(|_| ())
+    db.execute_raw(sql(&cut, vec![STUCK_MINUTES.into()]))
+        .await?;
+    let back = format!("{HAND_BACK} AND r.{stale}");
+    db.execute_raw(sql(&back, vec![STUCK_MINUTES.into()]))
+        .await
+        .map(|_| ())
 }
 
 /// Moves up to `BATCH` pending recipients of every sending newsletter to `sending`, each with
@@ -437,6 +452,9 @@ enum Tried {
     End(&'static str, Option<String>),
     /// The newsletter was paused meanwhile: nothing was sent, it is `pending` again.
     Back,
+    /// The claim is no longer ours (`recover` took it for dead): nothing was sent, and the row
+    /// is somebody else's now.
+    Lost,
     /// The send failed in a way that would meet the next recipient too: the recipient is
     /// `failed` with the first text, and the newsletter pauses with the second.
     Trip(String, String),
@@ -514,6 +532,16 @@ async fn attempt(app: &AppState, c: &Claimed) -> Result<Tried, DbErr> {
         sender_address: &c.sender_address,
         team: &c.team,
     };
+    // Committed before the mail starts: from here on the recipient counts as mailed, whatever
+    // becomes of this process. Only one holder of a claim gets through.
+    let mark = sql(
+        "UPDATE newsletter_recipients SET status = 'mailing', updated_at = now() \
+         WHERE id = $1 AND status = 'sending'",
+        vec![c.id.into()],
+    );
+    if app.db.execute_raw(mark).await?.rows_affected() != 1 {
+        return Ok(Tried::Lost);
+    }
     Ok(match mail(app, &email, &secret, &envelope).await {
         Ok(()) => Tried::End("sent", None),
         // It may have gone out (a timeout): never again. Whatever the provider said would meet
@@ -535,6 +563,10 @@ async fn deliver(app: &AppState, c: &Claimed) -> Result<bool, DbErr> {
     let db = &app.db;
     let (status, reason, trip) = match attempt(app, c).await {
         Ok(Tried::Back) => return release(db, c).await.map(|()| false),
+        Ok(Tried::Lost) => {
+            daily_refund(db, &c.hits).await;
+            return Ok(false);
+        }
         Ok(Tried::End(status, reason)) => (status, reason, None),
         Ok(Tried::Trip(reason, why)) => ("failed", Some(reason), Some(why)),
         // Before the send: every query of `attempt` comes before it.
@@ -549,7 +581,7 @@ async fn deliver(app: &AppState, c: &Claimed) -> Result<bool, DbErr> {
     }
     let end = sql(
         "UPDATE newsletter_recipients SET status = $2, reason = $3, updated_at = now() \
-         WHERE id = $1 AND status = 'sending'",
+         WHERE id = $1 AND status IN ('sending', 'mailing')",
         vec![c.id.into(), status.into(), reason.into()],
     );
     db.execute_raw(end).await?;
@@ -560,14 +592,10 @@ async fn deliver(app: &AppState, c: &Claimed) -> Result<bool, DbErr> {
 }
 
 /// Hands back a recipient nothing was sent to (the round ran out of time, or the newsletter was
-/// paused): it is `pending` again.
+/// paused or cancelled): see `HAND_BACK`.
 async fn release(db: &DatabaseConnection, c: &Claimed) -> Result<(), DbErr> {
-    let back = sql(
-        "UPDATE newsletter_recipients SET status = 'pending', updated_at = now() \
-         WHERE id = $1 AND status = 'sending'",
-        vec![c.id.into()],
-    );
-    db.execute_raw(back).await?;
+    let back = format!("{HAND_BACK} AND r.id = $1");
+    db.execute_raw(sql(&back, vec![c.id.into()])).await?;
     daily_refund(db, &c.hits).await;
     Ok(())
 }
@@ -610,7 +638,7 @@ async fn finish(db: &impl ConnectionTrait) -> Result<(), DbErr> {
     let stmt = "UPDATE newsletters n SET status = 'sent', pause_reason = NULL, \
                 finished_at = now() WHERE n.status IN ('sending', 'paused') AND NOT EXISTS \
                 (SELECT 1 FROM newsletter_recipients r WHERE r.newsletter_id = n.id \
-                AND r.status IN ('pending', 'sending'))";
+                AND r.status IN ('pending', 'sending', 'mailing'))";
     db.execute_raw(sql(stmt, vec![])).await.map(|_| ())
 }
 

@@ -59,7 +59,9 @@ cargo run -p socialreins-brain
   (`addressee`, which also makes their unsubscribe token: its hash for lookups, a sealed copy so each
   mail carries the same link) and sends. Any mailer error (`Tried::Trip`) or 5 failed sends in a row
   set it `paused`; only `resume` (a person) puts it back. Never mail a recipient without claiming it,
-  and never retry one: `recover` fails a claim older than 15 minutes as `interrupted`.
+  and never retry one. `attempt` commits `mailing` right before the mail call: after 15 minutes
+  `recover` fails a `mailing` row as `interrupted` and hands a merely claimed (`sending`) one back
+  (`HAND_BACK`: `pending`, or `skipped` when the newsletter was cancelled, like `release`).
 - `app/src/controllers/admin.rs`: the admin console, `/v1/admin/*` (totals, users, teams, waitlist
   approve and delete, sign-up rules). Every handler takes the `Admin` extractor (`ADMIN_EMAILS`,
   session cookie only) and changing ones `FromWeb`; never return post bodies, tokens or
