@@ -393,7 +393,23 @@ mod tests {
             "List-Unsubscribe=One-Click"
         );
         // Over SMTP the same headers, the long link on one unbroken line.
-        let from = "login@example.com".parse().unwrap();
+        let from: super::Mailbox = "login@example.com".parse().unwrap();
+        // A name cannot leave its quotes, whatever it holds.
+        let tricky = "Ann \"x\" \\ <evil@example.com>, Bob";
+        let named = super::Mailbox::new(Some(tricky.to_owned()), from.email.clone());
+        // What Resend gets: the quotes and the backslash escaped inside one quoted name.
+        assert_eq!(
+            named.to_string(),
+            "\"Ann \\\"x\\\" \\\\ <evil@example.com>, Bob\" <login@example.com>"
+        );
+        // Over SMTP the name is one encoded word, so the header holds our address alone.
+        let m = super::smtp_message(named, "a@example.com", None, "Hi", "T".into(), None, None);
+        let raw = String::from_utf8(m.unwrap().formatted()).unwrap();
+        let header = raw.lines().find(|l| l.starts_with("From: ")).unwrap();
+        assert_eq!(
+            header,
+            "From: =?utf-8?b?QW5uICJ4IiBcIDxldmlsQGV4YW1wbGUuY29tPiwgQm9i?= <login@example.com>"
+        );
         let args = (Some("<p>T</p>".to_owned()), Some(list));
         let message = super::smtp_message(
             from,

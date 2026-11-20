@@ -22430,7 +22430,12 @@ mod teams {
                         for (name, address, field) in [
                             (" ", SENDER, "name"),
                             (&*"n".repeat(81), SENDER, "name"),
-                            ("Ann\nBcc: x@example.com", SENDER, "name"),
+                            ("Ann\nBcc x", SENDER, "name"),
+                            ("ann@example.com", SENDER, "name"),
+                            ("Ann <ann", SENDER, "name"),
+                            ("Ann> ann", SENDER, "name"),
+                            ("Re: Ann", SENDER, "name"),
+                            ("evil.example/ann", SENDER, "name"),
                             ("Ann", "too short", "address"),
                             ("Ann", &*"a".repeat(301), "address"),
                             ("Ann", "1 Main Street\u{7} Springfield", "address"),
@@ -22565,7 +22570,8 @@ mod teams {
                             token_in(one_click)
                         );
                         let text = mail["text"].as_str().unwrap();
-                        let name = team["name"].as_str().unwrap();
+                        let name = socialreins_core::team::inert(team["name"].as_str().unwrap());
+                        let name = name.trim();
                         let footer = format!(
                             "\n\n-- \nAnn Lee\n{SENDER}\n\nYou get this because you signed up \
                              on a {name} page.\nUnsubscribe: {page}\n"
@@ -22591,6 +22597,23 @@ mod teams {
                         let same = json!({"subject": "News <1>", "body": body});
                         let res = req(s, Method::PUT, &path, &owner).json(&same).await;
                         assert!(res.json::<Value>()["tested_at"].is_string());
+                        // So does saving the same sender; another sender asks for a new test.
+                        sender_on(s, &owner).await;
+                        assert!(shown(s, &owner, &id).await["tested_at"].is_string());
+                        let from = json!({"name": "Ann \"A\" Lee \\ Co", "address": SENDER});
+                        let res = req(s, Method::PATCH, "/v1/team", &owner)
+                            .json(&json!({"newsletter_sender": from}))
+                            .await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        assert!(shown(s, &owner, &id).await["tested_at"].is_null());
+                        failed(start(s, &owner, &id, 1).await, 422, "test_required");
+                        assert_eq!(act(s, &owner, &id, "test").await.status_code(), 200);
+                        let mail = b.mails(&email).pop().unwrap();
+                        let quoted = "\"Ann \\\"A\\\" Lee \\\\ Co\" <b@example.com>";
+                        assert_eq!(mail["from"], quoted);
+                        sender_on(s, &owner).await;
+                        assert!(shown(s, &owner, &id).await["tested_at"].is_null());
+                        assert_eq!(act(s, &owner, &id, "test").await.status_code(), 200);
                         let res = req(s, Method::PUT, &path, &owner)
                             .json(&json!({"subject": "News", "body": body, "status": "sent"}))
                             .await;
@@ -22606,7 +22629,7 @@ mod teams {
                         failed(res, 422, "invalid_newsletter");
 
                         // Ten tests a day per team.
-                        for _ in 0..9 {
+                        for _ in 0..7 {
                             assert_eq!(act(s, &owner, &id, "test").await.status_code(), 200);
                         }
                         failed(act(s, &owner, &id, "test").await, 429, "too_many_tests");

@@ -18,7 +18,7 @@ use std::{
 use sea_orm::{
     ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait, Value,
 };
-use socialreins_core::token;
+use socialreins_core::{team::inert, token};
 use uuid::Uuid;
 
 use crate::{
@@ -159,9 +159,10 @@ pub struct Envelope<'a> {
 /// address, why the reader gets this, and a link to `page`, the web page whose button
 /// unsubscribes (a link in a mail must never do it by itself: mail scanners open links).
 pub fn compose(e: &Envelope<'_>, page: &str) -> (String, String) {
+    // The team's name is its own text: `inert`, so it cannot pass as a link in our mail.
     let why = format!(
         "You get this because you signed up on a {} page.",
-        e.team.trim()
+        inert(e.team).trim()
     );
     let text = format!(
         "{}\n\n-- \n{}\n{}\n\n{why}\nUnsubscribe: {}\n",
@@ -723,16 +724,17 @@ mod tests {
             body: "Hello",
             sender_name: "Ann & Co",
             sender_address: "1 Main St\nSpringfield",
-            team: "Ann's",
+            team: "Ann's evil.example/x",
         };
         let page = "https://web.test/newsletter/unsubscribe?token=t";
         let (text, html) = compose(&envelope, page);
         assert!(text.starts_with("Hello\n\n-- \nAnn & Co\n1 Main St\nSpringfield\n\n"));
-        assert!(text.contains("You get this because you signed up on a Ann's page.\n"));
+        let why = "You get this because you signed up on a Ann's evil example x page.";
+        assert!(text.contains(&format!("\n\n{why}\nUnsubscribe: ")));
         assert!(text.ends_with("Unsubscribe: https://web.test/newsletter/unsubscribe?token=t\n"));
         assert!(html.contains("<title>News &lt;1&gt;</title>"));
         assert!(html.contains("Ann &amp; Co<br>1 Main St<br>Springfield<br>"));
-        assert!(html.contains("signed up on a Ann's page."));
+        assert!(html.contains(&format!("<br><br>{why}<br>")));
         assert!(html.contains("<a href=\"https://web.test/newsletter/unsubscribe?token=t\""));
     }
 }
