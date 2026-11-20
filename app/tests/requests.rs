@@ -16882,6 +16882,1372 @@ mod teams {
                     .await;
                     assert!(runs.len() <= 1);
                 }
+
+                /// `/v1/broadcasts`: Bluesky and Meta on their mocks, items stored directly
+                /// (`inbox::store`), rounds driven by hand.
+                mod broadcasts_api {
+                    use super::*;
+                    use socialreins_brain::{
+                        broadcasts,
+                        connectors::bluesky::Author,
+                        inbox::{self, Fresh},
+                    };
+
+                    /// A brain on both mocks. Broadcasts and Meta accounts other tests left go, so a round
+                    /// sends only this test's.
+                    async fn on_both() -> (TestServer, DatabaseConnection, AppState) {
+                        let bsky = mock_bluesky().await;
+                        let graph = mock_meta().await;
+                        let mut config = Config::from_env().expect("test config");
+                        config.trust_proxy = true;
+                        config.bluesky.appview = bsky.clone();
+                        config.bluesky.plc = bsky;
+                        config.bluesky.allow_insecure_pds = true;
+                        let mut m =
+                            Meta::new(Some(("mapp".to_owned(), "msecret".to_owned())), "v26.0")
+                                .unwrap();
+                        m.graph_url = graph.clone();
+                        m.rupload_url = graph;
+                        m.poll_every = std::time::Duration::ZERO;
+                        m.webhook_token = Some("vtoken".to_owned());
+                        config.meta = m;
+                        let db = socialreins_brain::connect(&config)
+                            .await
+                            .expect("database reachable");
+                        exec(&db, "DELETE FROM broadcasts").await;
+                        clean(&db).await;
+                        let state = AppState::new(db.clone(), &config);
+                        let app = controllers::router(state.clone(), &config);
+                        (TestServer::new(app).unwrap(), db, state)
+                    }
+
+                    async fn exec(db: &DatabaseConnection, sql: &str) {
+                        sea_orm::ConnectionTrait::execute_unprepared(db, sql)
+                            .await
+                            .unwrap();
+                    }
+
+                    /// An owner's team with a Bluesky account that may DM, Page 101 and Instagram 1784.
+                    struct Team {
+                        cookie: String,
+                        id: String,
+                        bsky: social_accounts::Model,
+                        fb: social_accounts::Model,
+                        ig: social_accounts::Model,
+                        /// In every Bluesky DID of the team's contacts, so the mock's log can be read per test.
+                        mark: String,
+                    }
+
+                    async fn team(s: &TestServer, db: &DatabaseConnection) -> Team {
+                        let (cookie, id) = owner_connected(s, db).await;
+                        let res = connect(s, &cookie, &new_handle(), DM_APP_PASSWORD).await;
+                        assert_eq!(res.status_code(), 201, "{}", res.text());
+                        let bsky = account(
+                            db,
+                            &id,
+                            "bluesky",
+                            res.json::<Value>()["external_id"].as_str().unwrap(),
+                        )
+                        .await;
+                        assert!(bsky.dm_access);
+                        Team {
+                            fb: account(db, &id, "facebook", "101").await,
+                            ig: account(db, &id, "instagram", "1784").await,
+                            mark: uuid::Uuid::now_v7().simple().to_string()[20..].to_owned(),
+                            cookie,
+                            id,
+                            bsky,
+                        }
+                    }
+
+                    impl Team {
+                        fn did(&self, who: &str) -> String {
+                            format!("did:plc:{who}{}", self.mark)
+                        }
+
+                        /// Bluesky messages the mock took for this team's contacts: (convo, text).
+                        fn bsky_sent(&self) -> Vec<(String, String)> {
+                            let text =
+                                |m: &Value, k: &str| m[k].as_str().unwrap_or_default().to_owned();
+                            SENT.lock()
+                                .unwrap()
+                                .iter()
+                                .filter(|m| text(m, "convoId").contains(&self.mark))
+                                .map(|m| (text(m, "convoId"), text(&m["message"], "text")))
+                                .collect()
+                        }
+                    }
+
+                    /// Messages the Graph mock took since `before`: (recipient, message).
+                    fn meta_sent(before: usize) -> Vec<HashMap<String, String>> {
+                        let calls = calls_since(before);
+                        let messages = calls.into_iter().filter(|(path, _)| path == "101/messages");
+                        messages.map(|(_, form)| form).collect()
+                    }
+
+                    /// Stores an item of `kind` that `who` (named `name`) wrote `hours` ago to `account`, and
+                    /// tags the contact `vip`: the contact's id.
+                    async fn wrote(
+                        db: &DatabaseConnection,
+                        account: &social_accounts::Model,
+                        (kind, text): (&'static str, &str),
+                        (who, name): (&str, &str),
+                        hours: i64,
+                    ) -> uuid::Uuid {
+                        let contact = said(db, account, (kind, text), (who, name), hours).await;
+                        inbox::add_tag(db, contact, "vip").await.unwrap();
+                        contact
+                    }
+
+                    /// `wrote` without the tag.
+                    async fn said(
+                        db: &DatabaseConnection,
+                        account: &social_accounts::Model,
+                        (kind, text): (&'static str, &str),
+                        (who, name): (&str, &str),
+                        hours: i64,
+                    ) -> uuid::Uuid {
+                        let fresh = Fresh {
+                            kind,
+                            remote_id: format!("{who}-{}", uuid::Uuid::now_v7().simple()),
+                            remote_cid: None,
+                            parent: None,
+                            root: (None, None),
+                            convo_id: (kind == "dm").then(|| format!("cv-{who}")),
+                            author: Author {
+                                did: who.to_owned(),
+                                display_name: Some(name.to_owned()),
+                                ..Author::default()
+                            },
+                            text: text.to_owned(),
+                            at: (Utc::now() - Duration::hours(hours)).fixed_offset(),
+                            permalink: None,
+                            story: None,
+                            button_payload: None,
+                        };
+                        let item = inbox::store(db, account, fresh).await.unwrap().unwrap();
+                        item.contact_id.unwrap()
+                    }
+
+                    const DM: (&str, &str) = ("dm", "hello");
+                    const COMMENT: (&str, &str) = ("comment", "nice post");
+
+                    fn vip(name: &str, text: &str) -> Value {
+                        json!({"name": name, "text": text, "tag": "vip"})
+                    }
+
+                    async fn draft(s: &TestServer, cookie: &str, body: Value) -> String {
+                        let res = req(s, Method::POST, "/v1/broadcasts", cookie)
+                            .json(&body)
+                            .await;
+                        assert_eq!(res.status_code(), 201, "{}", res.text());
+                        let b = res.json::<Value>();
+                        assert_eq!(b["status"], "draft");
+                        b["id"].as_str().unwrap().to_owned()
+                    }
+
+                    async fn act(
+                        s: &TestServer,
+                        cookie: &str,
+                        id: &str,
+                        what: &str,
+                        body: Value,
+                    ) -> axum_test::TestResponse {
+                        let path = format!("/v1/broadcasts/{id}/{what}");
+                        req(s, Method::POST, &path, cookie).json(&body).await
+                    }
+
+                    async fn start(
+                        s: &TestServer,
+                        cookie: &str,
+                        id: &str,
+                        n: u64,
+                    ) -> axum_test::TestResponse {
+                        act(s, cookie, id, "send", json!({"confirm_total": n})).await
+                    }
+
+                    async fn read(s: &TestServer, cookie: &str, path: &str) -> Value {
+                        let res = s.get(path).add_header("cookie", cookie).await;
+                        assert_eq!(res.status_code(), 200, "{path}: {}", res.text());
+                        res.json()
+                    }
+
+                    async fn shown(s: &TestServer, cookie: &str, id: &str) -> Value {
+                        read(s, cookie, &format!("/v1/broadcasts/{id}")).await
+                    }
+
+                    /// Each recipient's (status, reason) by contact id.
+                    async fn ends(
+                        s: &TestServer,
+                        cookie: &str,
+                        id: &str,
+                    ) -> HashMap<String, (String, Value)> {
+                        let page =
+                            read(s, cookie, &format!("/v1/broadcasts/{id}/recipients")).await;
+                        let text = |v: &Value| v.as_str().unwrap().to_owned();
+                        let end = |r: &Value| {
+                            (
+                                text(&r["contact_id"]),
+                                (text(&r["status"]), r["reason"].clone()),
+                            )
+                        };
+                        page["items"].as_array().unwrap().iter().map(end).collect()
+                    }
+
+                    async fn round(state: &AppState) -> usize {
+                        broadcasts::round(state, broadcasts::ROUND).await.unwrap()
+                    }
+
+                    fn counts(
+                        total: u64,
+                        sent: u64,
+                        skipped: u64,
+                        failed: u64,
+                        pending: u64,
+                    ) -> Value {
+                        json!({"total": total, "sent": sent, "skipped": skipped, "failed": failed,
+            "pending": pending})
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn drafts_are_validated_edited_and_deleted() {
+                        let (s, db, _) = on_both().await;
+                        let (_, cookie, me) = user(&s, &db).await;
+                        for (body, field) in [
+                            (vip(" ", "hi"), "name"),
+                            (vip(&"n".repeat(81), "hi"), "name"),
+                            (vip("Launch", "  "), "text"),
+                            (vip("Launch", &"a".repeat(1001)), "text"),
+                            (
+                                vip("Launch", &format!("{}{{name}}", "a".repeat(937))),
+                                "text",
+                            ),
+                            (json!({"name": "Launch", "text": "hi", "tag": "a,b"}), "tag"),
+                            (json!({"name": "Launch", "text": "hi", "tag": " "}), "tag"),
+                            (
+                                json!({"name": "Launch", "text": "hi", "tag": "vip", "platform": "x"}),
+                                "platform",
+                            ),
+                            (
+                                json!({"name": "Launch", "text": "hi", "tag": "vip", "platform": "threads"}),
+                                "platform",
+                            ),
+                        ] {
+                            let res = req(&s, Method::POST, "/v1/broadcasts", &cookie)
+                                .json(&body)
+                                .await;
+                            assert_eq!(res.status_code(), 422, "{body}");
+                            res.assert_json(&json!({"error": "invalid_broadcast", "field": field}));
+                        }
+                        for body in [
+                            json!({"name": "Launch", "text": "hi"}),
+                            json!({"name": "Launch", "text": "hi", "tag": "vip", "status": "sending"}),
+                        ] {
+                            let res = req(&s, Method::POST, "/v1/broadcasts", &cookie)
+                                .json(&body)
+                                .await;
+                            assert_eq!(res.status_code(), 422, "{body}");
+                            assert_eq!(res.json::<Value>()["error"], "invalid_body");
+                        }
+                        // A text of 1000 characters in a script of three bytes each passes the body limit of
+                        // most routes.
+                        let long = "\u{0995}".repeat(1000);
+                        let first = draft(
+                            &s,
+                            &cookie,
+                            json!({"name": " Launch ", "text": long, "tag": " VIP ",
+            "platform": null}),
+                        )
+                        .await;
+                        let b = shown(&s, &cookie, &first).await;
+                        assert_eq!(b["name"], "Launch");
+                        assert_eq!(b["tag"], "vip");
+                        assert_eq!(b["text"], long);
+                        assert!(b["platform"].is_null());
+                        assert_eq!(b["counts"], counts(0, 0, 0, 0, 0));
+                        assert_eq!(b["created_by"], me.to_string());
+                        assert!(b["created_at"].is_string());
+                        assert!(b["started_at"].is_null() && b["finished_at"].is_null());
+                        let keys: Vec<&String> = b.as_object().unwrap().keys().collect();
+                        assert_eq!(keys.len(), 12, "{keys:?}");
+                        assert!(b["pause_reason"].is_null());
+
+                        let second = draft(&s, &cookie, vip("Second", "Hi {name}")).await;
+                        let list = read(&s, &cookie, "/v1/broadcasts").await;
+                        let ids: Vec<&str> = list
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|b| b["id"].as_str().unwrap())
+                            .collect();
+                        assert_eq!(ids, [second.as_str(), first.as_str()], "newest first");
+
+                        let path = format!("/v1/broadcasts/{second}");
+                        let res = req(&s, Method::PUT, &path, &cookie)
+                            .json(
+                                &json!({"name": "Renamed", "text": "Hello {name}", "tag": "lead",
+                "platform": "instagram"}),
+                            )
+                            .await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        let b = res.json::<Value>();
+                        assert_eq!(b["name"], "Renamed");
+                        assert_eq!(b["tag"], "lead");
+                        assert_eq!(b["platform"], "instagram");
+                        let res = req(&s, Method::PUT, &path, &cookie)
+                            .json(&vip("", "x"))
+                            .await;
+                        res.assert_json(&json!({"error": "invalid_broadcast", "field": "name"}));
+                        // Nobody has the tag: nothing to start.
+                        let p = act(&s, &cookie, &second, "preview", json!({}))
+                            .await
+                            .json::<Value>();
+                        assert_eq!(p["total"], 0);
+                        assert_eq!(p["reachable"], 0);
+                        assert_eq!(p["sample"], json!([]));
+                        let res = start(&s, &cookie, &second, 0).await;
+                        assert_eq!(res.status_code(), 422);
+                        res.assert_json(&json!({"error": "no_recipients"}));
+                        let res = act(&s, &cookie, &second, "cancel", json!({})).await;
+                        assert_eq!(res.status_code(), 409);
+                        res.assert_json(&json!({"error": "not_sending"}));
+
+                        assert_eq!(
+                            req(&s, Method::DELETE, &path, &cookie).await.status_code(),
+                            204
+                        );
+                        assert_eq!(
+                            req(&s, Method::DELETE, &path, &cookie).await.status_code(),
+                            404
+                        );
+                        let res = s.get(&path).add_header("cookie", &cookie).await;
+                        assert_eq!(res.status_code(), 404);
+                        assert_eq!(s.get("/v1/broadcasts").await.status_code(), 401);
+
+                        let doc = s.get("/openapi.json").await.json::<Value>();
+                        for (p, m) in [
+                            ("/broadcasts", "get"),
+                            ("/broadcasts", "post"),
+                            ("/broadcasts/{id}", "get"),
+                            ("/broadcasts/{id}", "put"),
+                            ("/broadcasts/{id}", "delete"),
+                            ("/broadcasts/{id}/preview", "post"),
+                            ("/broadcasts/{id}/send", "post"),
+                            ("/broadcasts/{id}/cancel", "post"),
+                            ("/broadcasts/{id}/resume", "post"),
+                            ("/broadcasts/{id}/recipients", "get"),
+                        ] {
+                            assert!(doc["paths"][p][m].is_object(), "{p} {m}");
+                        }
+                        let contact = &doc["components"]["schemas"]["Contact"]["properties"];
+                        assert!(contact["opted_out"].is_object());
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn a_preview_counts_who_is_reachable_and_why_not() {
+                        let (s, db, _) = on_both().await;
+                        let t = team(&s, &db).await;
+                        let ann = wrote(&db, &t.bsky, DM, (&t.did("ann"), "Ann"), 30).await;
+                        // Bluesky has no window, and a comment is enough.
+                        let bob = wrote(&db, &t.bsky, COMMENT, (&t.did("bob"), "Bob"), 100).await;
+                        let cy = wrote(&db, &t.bsky, DM, (&t.did("cy"), "Cy"), 1).await;
+                        let res = req(&s, Method::PATCH, &format!("/v1/contacts/{cy}"), &t.cookie)
+                            .json(&json!({"opted_out": true}))
+                            .await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        assert_eq!(res.json::<Value>()["opted_out"], true);
+                        let dana = wrote(&db, &t.fb, DM, ("777", "Dana"), 23).await;
+                        wrote(&db, &t.fb, DM, ("778", "Eve"), 25).await;
+                        // A comment opens no Meta conversation, however new.
+                        wrote(&db, &t.fb, COMMENT, ("779", "Fay"), 1).await;
+                        wrote(&db, &t.ig, DM, ("555", "Gus"), 1).await;
+                        let flag = format!(
+            "UPDATE social_accounts SET meta = meta || '{{\"reconnect\": true}}'::jsonb \
+             WHERE id = '{}'",
+            t.ig.id
+        );
+                        exec(&db, &flag).await;
+                        // No tag, or a follower who never wrote: not in the audience, or not reachable.
+                        said(&db, &t.bsky, DM, (&t.did("zed"), "Zed"), 1).await;
+                        wrote(&db, &t.bsky, ("follow", ""), (&t.did("hal"), "Hal"), 1).await;
+
+                        let id = draft(&s, &t.cookie, vip("Launch", "Hi {name}")).await;
+                        let res = act(&s, &t.cookie, &id, "preview", json!({})).await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        let p = res.json::<Value>();
+                        assert_eq!(p["total"], 8, "{p}");
+                        assert_eq!(p["reachable"], 3);
+                        assert_eq!(
+                            p["by_reason"],
+                            json!({"opted_out": 1, "outside_window": 1, "no_conversation": 2,
+                "account_disconnected": 1, "recently_messaged": 0})
+                        );
+                        assert_eq!(
+                            p["by_platform"],
+                            json!([{"platform": "bluesky", "reachable": 2},
+                {"platform": "facebook", "reachable": 1},
+                {"platform": "instagram", "reachable": 0}])
+                        );
+                        let sample = p["sample"].as_array().unwrap();
+                        let mut got: Vec<&str> = sample
+                            .iter()
+                            .map(|c| c["contact_id"].as_str().unwrap())
+                            .collect();
+                        got.sort();
+                        let mut want = [ann.to_string(), bob.to_string(), dana.to_string()];
+                        want.sort();
+                        assert_eq!(got, want);
+                        let d = sample
+                            .iter()
+                            .find(|c| c["contact_id"] == dana.to_string())
+                            .unwrap();
+                        assert_eq!(d["display_name"], "Dana");
+                        assert_eq!(d["platform"], "facebook");
+                        // A preview stores and sends nothing.
+                        assert_eq!(
+                            shown(&s, &t.cookie, &id).await["counts"],
+                            counts(0, 0, 0, 0, 0)
+                        );
+                        assert!(t.bsky_sent().is_empty());
+
+                        // One platform only.
+                        let res = req(&s, Method::PUT, &format!("/v1/broadcasts/{id}"), &t.cookie)
+                            .json(&json!({"name": "Launch", "text": "Hi {name}", "tag": "vip",
+                "platform": "facebook"}))
+                            .await;
+                        assert_eq!(res.status_code(), 200);
+                        let p = act(&s, &t.cookie, &id, "preview", json!({}))
+                            .await
+                            .json::<Value>();
+                        assert_eq!(p["total"], 3);
+                        assert_eq!(p["reachable"], 1);
+                        assert_eq!(
+                            p["by_platform"],
+                            json!([{"platform": "facebook", "reachable": 1}])
+                        );
+
+                        // A count that is not this moment's starts nothing and says what it is now.
+                        let before = meta_sent(0).len();
+                        for wrong in [0, 2, 3] {
+                            let res = start(&s, &t.cookie, &id, wrong).await;
+                            assert_eq!(res.status_code(), 409, "{wrong}");
+                            let body = res.json::<Value>();
+                            assert_eq!(body["error"], "audience_changed");
+                            assert_eq!(body["preview"], p);
+                        }
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "draft");
+                        assert_eq!(b["counts"], counts(0, 0, 0, 0, 0));
+                        let res = act(&s, &t.cookie, &id, "send", json!({})).await;
+                        assert_eq!(res.status_code(), 422);
+                        assert_eq!(meta_sent(before).len(), 0);
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn a_start_snapshots_the_audience_and_each_recipient_is_sent_to_once() {
+                        let (s, db, state) = on_both().await;
+                        let t = team(&s, &db).await;
+                        let ann = wrote(&db, &t.bsky, DM, (&t.did("ann"), "Ann"), 30).await;
+                        let bob = wrote(&db, &t.bsky, COMMENT, (&t.did("bob"), "Bob"), 2).await;
+                        // The mock's chat service takes no DMs for a `closed` DID.
+                        let shy = wrote(&db, &t.bsky, COMMENT, (&t.did("closed"), "Shy"), 2).await;
+                        let dana = wrote(&db, &t.fb, DM, ("777", "Dana"), 1).await;
+                        let id = draft(&s, &t.cookie, vip("Launch", "Hi {name}, news")).await;
+                        let before = meta_sent(0).len();
+
+                        let (one, two) = tokio::join!(
+                            start(&s, &t.cookie, &id, 4),
+                            start(&s, &t.cookie, &id, 4)
+                        );
+                        let mut codes = [one.status_code().as_u16(), two.status_code().as_u16()];
+                        codes.sort();
+                        assert_eq!(codes, [200, 409], "{} {}", one.text(), two.text());
+                        let res = start(&s, &t.cookie, &id, 4).await;
+                        assert_eq!(res.status_code(), 409);
+                        res.assert_json(&json!({"error": "already_started"}));
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "sending");
+                        assert_eq!(b["counts"], counts(4, 0, 0, 0, 4));
+                        assert!(b["started_at"].is_string() && b["finished_at"].is_null());
+                        // Nothing goes out before a round, and a contact tagged after the start gets nothing.
+                        assert!(t.bsky_sent().is_empty());
+                        let late = wrote(&db, &t.bsky, DM, (&t.did("late"), "Late"), 1).await;
+                        // A draft is the only thing edited.
+                        let path = format!("/v1/broadcasts/{id}");
+                        let res = req(&s, Method::PUT, &path, &t.cookie)
+                            .json(&vip("Other", "Other text"))
+                            .await;
+                        assert_eq!(res.status_code(), 409);
+                        res.assert_json(&json!({"error": "already_started"}));
+                        let res = req(&s, Method::DELETE, &path, &t.cookie).await;
+                        assert_eq!(res.status_code(), 409);
+                        res.assert_json(&json!({"error": "still_sending"}));
+
+                        // Two rounds at once, then more: each recipient is claimed by one of them only.
+                        let (a, b) = tokio::join!(round(&state), round(&state));
+                        assert_eq!(a + b, 4);
+                        assert_eq!(round(&state).await, 0);
+                        let mut sent = t.bsky_sent();
+                        sent.sort();
+                        assert_eq!(
+                            sent,
+                            [
+                                (format!("convo-{}", t.did("bob")), "Hi Bob, news".to_owned()),
+                                (format!("cv-{}", t.did("ann")), "Hi Ann, news".to_owned()),
+                            ]
+                        );
+                        let meta = meta_sent(before);
+                        assert_eq!(meta.len(), 1, "{meta:?}");
+                        assert_eq!(meta[0]["recipient"], r#"{"id":"777"}"#);
+                        assert_eq!(meta[0]["message"], r#"{"text":"Hi Dana, news"}"#);
+                        // Meta's standard window only: a plain response, never a message tag.
+                        assert_eq!(meta[0]["messaging_type"], "RESPONSE");
+                        assert!(!meta[0].contains_key("tag"));
+
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "sent");
+                        assert_eq!(b["counts"], counts(4, 3, 1, 0, 0));
+                        assert!(b["finished_at"].is_string());
+                        let got = ends(&s, &t.cookie, &id).await;
+                        assert_eq!(got.len(), 4);
+                        assert!(!got.contains_key(&late.to_string()));
+                        for who in [ann, bob, dana] {
+                            assert_eq!(got[&who.to_string()], ("sent".to_owned(), Value::Null));
+                        }
+                        assert_eq!(
+                            got[&shy.to_string()],
+                            ("skipped".to_owned(), json!("dm_not_allowed"))
+                        );
+                        let query = format!("/v1/broadcasts/{id}/recipients?status=skipped");
+                        let page = read(&s, &t.cookie, &query).await;
+                        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+                        assert_eq!(page["items"][0]["display_name"], "Shy");
+                        assert_eq!(page["items"][0]["platform"], "bluesky");
+                        assert!(page["next_cursor"].is_null());
+                        let res = s
+                            .get(&format!("/v1/broadcasts/{id}/recipients?status=gone"))
+                            .add_header("cookie", &t.cookie)
+                            .await;
+                        assert_eq!(res.status_code(), 422);
+
+                        // It shows in the inbox conversation as our message, like a reply sent by hand.
+                        let item = inbox_items::Entity::find()
+                            .filter(inbox_items::Column::ContactId.eq(ann))
+                            .one(&db)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        let convo = read(
+                            &s,
+                            &t.cookie,
+                            &format!("/v1/inbox-items/{}/conversation", item.id),
+                        )
+                        .await;
+                        assert_eq!(
+                            convo["items"][0]["replies"][0]["text"], "Hi Ann, news",
+                            "{convo}"
+                        );
+                        assert_eq!(convo["items"][0]["replies"][0]["kind"], "dm");
+
+                        // A finished broadcast is deleted with its recipients; the contacts stay.
+                        assert_eq!(
+                            req(&s, Method::DELETE, &path, &t.cookie)
+                                .await
+                                .status_code(),
+                            204
+                        );
+                        let left = read(&s, &t.cookie, &format!("/v1/contacts/{ann}")).await;
+                        assert_eq!(left["opted_out"], false);
+                        assert_eq!(round(&state).await, 0);
+                        assert_eq!(t.bsky_sent().len(), 2);
+                    }
+
+                    /// `n` Bluesky contacts who wrote a DM, tagged `vip`.
+                    async fn crowd(db: &DatabaseConnection, t: &Team, n: usize) -> Vec<uuid::Uuid> {
+                        let mut out = Vec::new();
+                        for i in 0..n {
+                            let who = (t.did(&format!("p{i}x")), format!("P{i}"));
+                            out.push(wrote(db, &t.bsky, DM, (&who.0, &who.1), 1).await);
+                        }
+                        out
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn a_cancel_skips_everyone_not_sent_to_yet() {
+                        let (s, db, state) = on_both().await;
+                        let t = team(&s, &db).await;
+                        crowd(&db, &t, 25).await;
+                        let id = draft(&s, &t.cookie, vip("Launch", "Hello")).await;
+                        assert_eq!(start(&s, &t.cookie, &id, 25).await.status_code(), 200);
+                        assert_eq!(round(&state).await, 20, "20 a round");
+                        assert_eq!(t.bsky_sent().len(), 20);
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "sending");
+                        assert_eq!(b["counts"], counts(25, 20, 0, 0, 5));
+
+                        let res = act(&s, &t.cookie, &id, "cancel", json!({})).await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        let b = res.json::<Value>();
+                        assert_eq!(b["status"], "cancelled");
+                        assert_eq!(b["counts"], counts(25, 20, 5, 0, 0));
+                        assert!(b["finished_at"].is_string());
+                        let got = ends(&s, &t.cookie, &id).await;
+                        let cancelled = got.values().filter(|e| e.1 == "cancelled").count();
+                        assert_eq!(cancelled, 5);
+                        assert_eq!(round(&state).await, 0);
+                        assert_eq!(t.bsky_sent().len(), 20, "nothing after the cancel");
+                        let res = act(&s, &t.cookie, &id, "cancel", json!({})).await;
+                        assert_eq!(res.status_code(), 409);
+                        let res = start(&s, &t.cookie, &id, 25).await;
+                        res.assert_json(&json!({"error": "already_started"}));
+                        let path = format!("/v1/broadcasts/{id}");
+                        assert_eq!(
+                            req(&s, Method::DELETE, &path, &t.cookie)
+                                .await
+                                .status_code(),
+                            204
+                        );
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn stop_unsubscribe_and_start_set_who_opted_out() {
+                        let (s, db, _) = on_both().await;
+                        let t = team(&s, &db).await;
+                        let out = |c: uuid::Uuid| {
+                            let (s, cookie) = (&s, &t.cookie);
+                            async move {
+                                read(s, cookie, &format!("/v1/contacts/{c}")).await["opted_out"]
+                                    .clone()
+                            }
+                        };
+                        let ann = (t.did("ann"), "Ann");
+                        let who = (ann.0.as_str(), ann.1);
+                        let c = wrote(&db, &t.bsky, ("dm", "please stop by"), who, 5).await;
+                        assert_eq!(out(c).await, false);
+                        wrote(&db, &t.bsky, ("comment", "stop"), who, 4).await;
+                        assert_eq!(out(c).await, false, "only a DM opts out");
+                        wrote(&db, &t.bsky, ("dm", "  STOP \n"), who, 3).await;
+                        assert_eq!(out(c).await, true);
+                        wrote(&db, &t.bsky, ("dm", "thanks"), who, 2).await;
+                        assert_eq!(out(c).await, true, "it stays until they say start");
+                        wrote(&db, &t.bsky, ("dm", "Start"), who, 1).await;
+                        assert_eq!(out(c).await, false);
+                        wrote(&db, &t.bsky, ("dm", "Unsubscribe"), who, 0).await;
+                        assert_eq!(out(c).await, true);
+
+                        // The same through Meta's webhook.
+                        let res = deliver(&s, &page_message("101", "m_stop", "777", "Stop")).await;
+                        assert_eq!(res.status_code(), 200);
+                        let dana = stored(&db, &t.id)
+                            .await
+                            .into_iter()
+                            .find(|i| i.remote_id == "m_stop");
+                        let dana = dana.unwrap().contact_id.unwrap();
+                        assert_eq!(out(dana).await, true);
+                        inbox::add_tag(&db, dana, "vip").await.unwrap();
+
+                        // Opted out contacts are in no audience.
+                        let id = draft(&s, &t.cookie, vip("Launch", "Hello")).await;
+                        let p = act(&s, &t.cookie, &id, "preview", json!({}))
+                            .await
+                            .json::<Value>();
+                        assert_eq!(p["total"], 2);
+                        assert_eq!(p["reachable"], 0);
+                        assert_eq!(p["by_reason"]["opted_out"], 2);
+
+                        // Anyone opts a contact out by hand; only owners and admins opt one back in.
+                        let (member, _) = joined(&s, &db, &t.id, "member").await;
+                        let change = |cookie: &str, c: uuid::Uuid, body: Value| {
+                            req(&s, Method::PATCH, &format!("/v1/contacts/{c}"), cookie).json(&body)
+                        };
+                        let res = change(&member, c, json!({"opted_out": false})).await;
+                        assert_eq!(res.status_code(), 403);
+                        assert_eq!(out(c).await, true);
+                        let res = change(&t.cookie, c, json!({"opted_out": false})).await;
+                        assert_eq!(res.status_code(), 200);
+                        assert_eq!(res.json::<Value>()["opted_out"], false);
+                        let res = change(
+                            &member,
+                            c,
+                            json!({"opted_out": true, "notes": "asked by mail"}),
+                        )
+                        .await;
+                        assert_eq!(res.status_code(), 200);
+                        assert_eq!(res.json::<Value>()["opted_out"], true);
+                        // Other changes leave it alone.
+                        let res = change(&member, c, json!({"notes": "x"})).await;
+                        assert_eq!(res.json::<Value>()["opted_out"], true);
+                        let res = change(&t.cookie, c, json!({"opted_out": "yes"})).await;
+                        assert_eq!(res.status_code(), 422);
+
+                        // The opt-out is the person's: it outlives the contact. One deleted and
+                        // made again by a later item is still opted out.
+                        let path = format!("/v1/contacts/{c}");
+                        assert_eq!(
+                            req(&s, Method::DELETE, &path, &t.cookie)
+                                .await
+                                .status_code(),
+                            204
+                        );
+                        let again = wrote(&db, &t.bsky, ("dm", "hello again"), who, 0).await;
+                        assert_ne!(again, c);
+                        assert_eq!(out(again).await, true);
+                        let p = act(&s, &t.cookie, &id, "preview", json!({}))
+                            .await
+                            .json::<Value>();
+                        assert_eq!(p["by_reason"]["opted_out"], 2);
+                        let orphans = format!(
+                            "DELETE FROM inbox_items WHERE team_id = '{}' AND contact_id IS NULL",
+                            t.id
+                        );
+                        exec(&db, &orphans).await;
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn the_backfill_opts_out_whoever_last_said_stop() {
+                        use migration::m20261208_000001_broadcasts::BACKFILL_OPT_OUTS;
+                        let (s, db, _) = on_both().await;
+                        let t = team_bsky(&s, &db).await;
+                        let mut ids = Vec::new();
+                        for (who, texts) in [
+                            ("a", vec!["hi", "Stop"]),
+                            ("b", vec!["stop", "START", "thanks"]),
+                            ("c", vec![" unsubscribe\n"]),
+                            ("d", vec!["stop it"]),
+                            ("e", vec!["start", "stop", "ok"]),
+                        ] {
+                            let did = t.did(who);
+                            let mut contact = None;
+                            for (n, text) in texts.iter().enumerate() {
+                                let ago = 10 - n as i64;
+                                contact =
+                                    Some(said(&db, &t.bsky, ("dm", text), (&did, who), ago).await);
+                            }
+                            ids.push(contact.unwrap());
+                        }
+                        // As it was before the migration: nobody opted out.
+                        let none =
+                            format!("DELETE FROM contact_opt_outs WHERE team_id = '{}'", t.id);
+                        exec(&db, &none).await;
+                        for _ in 0..2 {
+                            exec(&db, BACKFILL_OPT_OUTS).await;
+                        }
+                        let mut got = Vec::new();
+                        for c in ids {
+                            let contact = read(&s, &t.cookie, &format!("/v1/contacts/{c}")).await;
+                            got.push(contact["opted_out"].as_bool().unwrap());
+                        }
+                        assert_eq!(got, [true, false, true, false, true]);
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn a_refused_send_pauses_the_broadcast_until_it_is_resumed() {
+                        let (s, db, state) = on_both().await;
+                        let t = team(&s, &db).await;
+                        for (who, name) in [("777", "Dana"), ("778", "Eve"), ("779", "Fay")] {
+                            wrote(&db, &t.fb, DM, (who, name), 1).await;
+                        }
+                        wrote(&db, &t.bsky, DM, (&t.did("ann"), "Ann"), 1).await;
+                        let facebook = json!({"name": "Launch", "text": "Hello", "tag": "vip",
+                            "platform": "facebook"});
+                        let id = draft(&s, &t.cookie, facebook).await;
+                        // Meta refuses the Page's token from the first send on.
+                        let token = |bytes: Vec<u8>| social_accounts::ActiveModel {
+                            id: Set(t.fb.id),
+                            access_token: Set(bytes),
+                            ..Default::default()
+                        };
+                        let dead = token(cipher().encrypt(b"dead"));
+                        social_accounts::Entity::update(dead)
+                            .exec(&db)
+                            .await
+                            .unwrap();
+                        assert_eq!(start(&s, &t.cookie, &id, 3).await.status_code(), 200);
+                        let before = meta_sent(0).len();
+                        assert_eq!(round(&state).await, 3);
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "paused");
+                        assert!(b["pause_reason"].as_str().unwrap().contains("token"), "{b}");
+                        assert_eq!(
+                            b["counts"],
+                            counts(3, 0, 0, 1, 2),
+                            "one tried, two handed back"
+                        );
+                        assert!(b["finished_at"].is_null());
+                        let got = ends(&s, &t.cookie, &id).await;
+                        let failed: Vec<_> = got.values().filter(|e| e.0 == "failed").collect();
+                        assert_eq!(failed[0].1, "meta_reconnect_required");
+                        assert_eq!(got.values().filter(|e| e.0 == "pending").count(), 2);
+                        assert_eq!(hits(&db, &t.id).await, 1, "the two not tried cost nothing");
+                        // It never goes on by itself, and it is not deleted while it waits.
+                        assert_eq!(round(&state).await, 0);
+                        broadcasts::tick(&state).await.unwrap();
+                        assert_eq!(shown(&s, &t.cookie, &id).await["status"], "paused");
+                        let path = format!("/v1/broadcasts/{id}");
+                        let res = req(&s, Method::DELETE, &path, &t.cookie).await;
+                        assert_eq!(res.status_code(), 409);
+
+                        // A paused broadcast is not sending: another may start, and then the
+                        // paused one waits its turn.
+                        let bluesky = json!({"name": "Other", "text": "Hi", "tag": "vip",
+                            "platform": "bluesky"});
+                        let other = draft(&s, &t.cookie, bluesky).await;
+                        assert_eq!(start(&s, &t.cookie, &other, 1).await.status_code(), 200);
+                        let res = act(&s, &t.cookie, &id, "resume", json!({})).await;
+                        assert_eq!(res.status_code(), 409);
+                        res.assert_json(&json!({"error": "another_sending"}));
+                        assert_eq!(
+                            round(&state).await,
+                            1,
+                            "the other's one, none of the paused"
+                        );
+                        assert_eq!(shown(&s, &t.cookie, &other).await["status"], "sent");
+
+                        // Reconnected (the token works again), an owner or admin resumes it.
+                        let alive = token(t.fb.access_token.clone());
+                        social_accounts::Entity::update(alive)
+                            .exec(&db)
+                            .await
+                            .unwrap();
+                        let clear = format!(
+                            "UPDATE social_accounts SET meta = meta - 'reconnect' WHERE id = '{}'",
+                            t.fb.id
+                        );
+                        exec(&db, &clear).await;
+                        let (member, _) = joined(&s, &db, &t.id, "member").await;
+                        let res = act(&s, &member, &id, "resume", json!({})).await;
+                        assert_eq!(res.status_code(), 403);
+                        let res = act(&s, &t.cookie, &id, "resume", json!({})).await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        let b = res.json::<Value>();
+                        assert_eq!(b["status"], "sending");
+                        assert!(b["pause_reason"].is_null());
+                        let res = act(&s, &t.cookie, &id, "resume", json!({})).await;
+                        assert_eq!(res.status_code(), 409);
+                        res.assert_json(&json!({"error": "not_paused"}));
+                        assert_eq!(round(&state).await, 2);
+                        assert_eq!(
+                            meta_sent(before).len(),
+                            2,
+                            "the failed one is never tried again"
+                        );
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "sent");
+                        assert_eq!(b["counts"], counts(3, 2, 0, 1, 0));
+
+                        // A rate limit pauses the same way, and a paused broadcast is cancelled.
+                        exec(&db, "UPDATE contacts SET last_broadcast_at = NULL").await;
+                        let limited = json!({"name": "Again", "text": "LIMIT offer", "tag": "vip",
+                            "platform": "facebook"});
+                        let id = draft(&s, &t.cookie, limited).await;
+                        assert_eq!(start(&s, &t.cookie, &id, 3).await.status_code(), 200);
+                        assert_eq!(round(&state).await, 3);
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "paused");
+                        assert_eq!(
+                            b["pause_reason"],
+                            "The platform is rate limiting this account."
+                        );
+                        assert_eq!(b["counts"], counts(3, 0, 0, 1, 2));
+                        let got = ends(&s, &t.cookie, &id).await;
+                        let failed: Vec<_> = got.values().filter(|e| e.0 == "failed").collect();
+                        assert_eq!(failed[0].1, "rate_limited");
+                        let res = act(&s, &t.cookie, &id, "cancel", json!({})).await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        let b = res.json::<Value>();
+                        assert_eq!(b["status"], "cancelled");
+                        assert!(b["pause_reason"].is_null());
+                        assert_eq!(b["counts"], counts(3, 0, 2, 1, 0));
+                        assert_eq!(meta_sent(before).len(), 2);
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn four_failed_sends_in_a_row_do_not_pause() {
+                        let (s, db, state) = on_both().await;
+                        let t = team_bsky(&s, &db).await;
+                        let people = crowd(&db, &t, 7).await;
+                        let id = draft(&s, &t.cookie, vip("Launch", "Hello")).await;
+                        assert_eq!(start(&s, &t.cookie, &id, 7).await.status_code(), 200);
+                        // Four claims in a row were cut off.
+                        let cut = |who: uuid::Uuid| {
+                            format!(
+                                "UPDATE broadcast_recipients SET status = 'sending', \
+                                 updated_at = now() - interval '16 minutes' WHERE contact_id = '{who}'"
+                            )
+                        };
+                        for who in &people[..4] {
+                            exec(&db, &cut(*who)).await;
+                        }
+                        broadcasts::tick(&state).await.unwrap();
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "sent", "four are not five: the rest went out");
+                        assert_eq!(b["counts"], counts(7, 3, 0, 4, 0));
+                        assert_eq!(t.bsky_sent().len(), 3);
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn a_broadcast_that_keeps_being_cut_off_waits_for_a_person() {
+                        let (s, db, state) = on_both().await;
+                        let t = team_bsky(&s, &db).await;
+                        let people = crowd(&db, &t, 6).await;
+                        let id = draft(&s, &t.cookie, vip("Launch", "Hello")).await;
+                        assert_eq!(start(&s, &t.cookie, &id, 6).await.status_code(), 200);
+                        for who in &people[..5] {
+                            let cut = format!(
+                                "UPDATE broadcast_recipients SET status = 'sending', \
+                                 updated_at = now() - interval '16 minutes' WHERE contact_id = '{who}'"
+                            );
+                            exec(&db, &cut).await;
+                        }
+                        broadcasts::tick(&state).await.unwrap();
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "paused");
+                        assert_eq!(b["pause_reason"], "5 sends in a row failed.");
+                        assert_eq!(b["counts"], counts(6, 0, 0, 5, 1));
+                        assert!(t.bsky_sent().is_empty(), "the sixth was not tried");
+                        broadcasts::tick(&state).await.unwrap();
+                        assert_eq!(shown(&s, &t.cookie, &id).await["status"], "paused");
+
+                        // Resumed, the count starts again: the old failures do not pause it twice.
+                        let res = act(&s, &t.cookie, &id, "resume", json!({})).await;
+                        assert_eq!(res.status_code(), 200, "{}", res.text());
+                        broadcasts::tick(&state).await.unwrap();
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "sent");
+                        assert_eq!(b["counts"], counts(6, 1, 0, 5, 0));
+                        assert_eq!(t.bsky_sent().len(), 1);
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn every_recipient_is_checked_again_when_it_is_sent() {
+                        let (s, db, state) = on_both().await;
+                        let t = team(&s, &db).await;
+                        let dana = wrote(&db, &t.fb, DM, ("777", "Dana"), 23).await;
+                        let eve = wrote(&db, &t.fb, DM, ("778", "Eve"), 1).await;
+                        let gus = wrote(&db, &t.ig, DM, ("555", "Gus"), 1).await;
+                        let ann = wrote(&db, &t.bsky, DM, (&t.did("ann"), "Ann"), 1).await;
+                        let bob = wrote(&db, &t.bsky, DM, (&t.did("bob"), "Bob"), 1).await;
+                        let hal = wrote(&db, &t.bsky, DM, (&t.did("hal"), "Hal"), 1).await;
+                        let ivy = wrote(&db, &t.bsky, DM, (&t.did("ivy"), "Ivy"), 1).await;
+                        let id = draft(&s, &t.cookie, vip("Launch", "Hi {name}")).await;
+                        assert_eq!(start(&s, &t.cookie, &id, 7).await.status_code(), 200);
+                        // Hal loses the tag, and another broadcast just went out to Ivy.
+                        let res = req(&s, Method::PATCH, &format!("/v1/contacts/{hal}"), &t.cookie)
+                            .json(&json!({"tags": ["other"]}))
+                            .await;
+                        assert_eq!(res.status_code(), 200);
+                        let just = format!(
+                            "UPDATE contacts SET last_broadcast_at = now() WHERE id = '{ivy}'"
+                        );
+                        exec(&db, &just).await;
+
+                        // Between the start and the send: Dana's 24 hours end, Ann says stop, Bob is deleted
+                        // and the Instagram account needs a reconnect.
+                        let age = format!(
+                            "UPDATE inbox_items SET received_at = now() - interval '25 hours' \
+             WHERE contact_id = '{dana}'"
+                        );
+                        exec(&db, &age).await;
+                        wrote(&db, &t.bsky, ("dm", "stop"), (&t.did("ann"), "Ann"), 0).await;
+                        let path = format!("/v1/contacts/{bob}");
+                        assert_eq!(
+                            req(&s, Method::DELETE, &path, &t.cookie)
+                                .await
+                                .status_code(),
+                            204
+                        );
+                        let flag = format!(
+            "UPDATE social_accounts SET meta = meta || '{{\"reconnect\": true}}'::jsonb \
+             WHERE id = '{}'",
+            t.ig.id
+        );
+                        exec(&db, &flag).await;
+
+                        let before = meta_sent(0).len();
+                        assert_eq!(round(&state).await, 7);
+                        let meta = meta_sent(before);
+                        assert_eq!(meta.len(), 1, "{meta:?}");
+                        assert_eq!(meta[0]["recipient"], r#"{"id":"778"}"#);
+                        assert!(t.bsky_sent().is_empty());
+                        let page =
+                            read(&s, &t.cookie, &format!("/v1/broadcasts/{id}/recipients")).await;
+                        let reason = |c: uuid::Uuid| {
+                            let items = page["items"].as_array().unwrap();
+                            let r = items
+                                .iter()
+                                .find(|r| r["contact_id"] == c.to_string())
+                                .unwrap();
+                            (
+                                r["status"].as_str().unwrap().to_owned(),
+                                r["reason"].clone(),
+                            )
+                        };
+                        assert_eq!(reason(eve), ("sent".to_owned(), Value::Null));
+                        assert_eq!(
+                            reason(dana),
+                            ("skipped".to_owned(), json!("outside_window"))
+                        );
+                        assert_eq!(reason(ann), ("skipped".to_owned(), json!("opted_out")));
+                        assert_eq!(reason(hal), ("skipped".to_owned(), json!("untagged")));
+                        assert_eq!(
+                            reason(ivy),
+                            ("skipped".to_owned(), json!("recently_messaged"))
+                        );
+                        assert_eq!(
+                            reason(gus),
+                            ("skipped".to_owned(), json!("account_disconnected"))
+                        );
+                        let gone: Vec<&Value> = page["items"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter(|r| r["contact_id"].is_null())
+                            .collect();
+                        assert_eq!(gone.len(), 1);
+                        assert_eq!(gone[0]["status"], "skipped");
+                        assert_eq!(gone[0]["reason"], "contact_gone");
+                        assert!(gone[0]["display_name"].is_null());
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "sent");
+                        assert_eq!(b["counts"], counts(7, 1, 6, 0, 0));
+                        // A skip is no send: only Eve's counts against the daily cap.
+                        assert_eq!(hits(&db, &t.id).await, 1);
+                        // Bob's items lost their contact; another test counts such items.
+                        let orphans = format!(
+                            "DELETE FROM inbox_items WHERE team_id = '{}' AND contact_id IS NULL",
+                            t.id
+                        );
+                        exec(&db, &orphans).await;
+                    }
+
+                    /// The team's hits of the daily cap of broadcast messages.
+                    async fn hits(db: &DatabaseConnection, team_id: &str) -> i64 {
+                        let stmt = sea_orm::Statement::from_sql_and_values(
+                            sea_orm::DbBackend::Postgres,
+                            "SELECT count(*) AS n FROM rate_limit_hits WHERE bucket = $1",
+                            [format!("broadcast:team:{team_id}").into()],
+                        );
+                        let row = sea_orm::ConnectionTrait::query_one_raw(db, stmt).await;
+                        row.unwrap().unwrap().try_get::<i64>("", "n").unwrap()
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn the_daily_cap_pauses_a_broadcast_until_there_is_room() {
+                        let (s, db, state) = on_both().await;
+                        let t = team(&s, &db).await;
+                        crowd(&db, &t, 3).await;
+                        let id = draft(&s, &t.cookie, vip("Launch", "Hello")).await;
+                        assert_eq!(start(&s, &t.cookie, &id, 3).await.status_code(), 200);
+                        let fill = format!(
+                            "INSERT INTO rate_limit_hits (bucket, created_at) \
+             SELECT 'broadcast:team:{}', now() - interval '1 hour' FROM generate_series(1, 998)",
+                            t.id
+                        );
+                        exec(&db, &fill).await;
+                        assert_eq!(round(&state).await, 2, "two fit under 1000");
+                        assert_eq!(round(&state).await, 0);
+                        assert_eq!(t.bsky_sent().len(), 2);
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "sending", "it waits, it does not end");
+                        assert_eq!(b["counts"], counts(3, 2, 0, 0, 1));
+                        assert_eq!(hits(&db, &t.id).await, 1000);
+
+                        // A day on, the old hits no longer count.
+                        let age = format!(
+                            "UPDATE rate_limit_hits SET created_at = now() - interval '25 hours' \
+             WHERE bucket = 'broadcast:team:{}' AND created_at < now() - interval '30 minutes'",
+                            t.id
+                        );
+                        exec(&db, &age).await;
+                        assert_eq!(round(&state).await, 1);
+                        assert_eq!(t.bsky_sent().len(), 3);
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "sent");
+                        assert_eq!(b["counts"], counts(3, 3, 0, 0, 0));
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn one_broadcast_sends_at_a_time_and_three_start_a_day() {
+                        let (s, db, state) = on_both().await;
+                        let t = team(&s, &db).await;
+                        crowd(&db, &t, 1).await;
+                        let mut ids = Vec::new();
+                        for n in 0..4 {
+                            ids.push(
+                                draft(
+                                    &s,
+                                    &t.cookie,
+                                    vip(&format!("Launch {n}"), &format!("Hello {n}")),
+                                )
+                                .await,
+                            );
+                        }
+                        assert_eq!(start(&s, &t.cookie, &ids[0], 1).await.status_code(), 200);
+                        let res = start(&s, &t.cookie, &ids[1], 1).await;
+                        assert_eq!(res.status_code(), 409);
+                        res.assert_json(&json!({"error": "another_sending"}));
+                        assert_eq!(
+                            shown(&s, &t.cookie, &ids[1]).await["counts"],
+                            counts(0, 0, 0, 0, 0)
+                        );
+                        assert_eq!(round(&state).await, 1);
+                        // A refused start is no start: the second and third still fit the day.
+                        for id in &ids[1..3] {
+                            // A day on: nobody gets two broadcasts within 24 hours.
+                            let res = start(&s, &t.cookie, id, 1).await;
+                            assert_eq!(res.status_code(), 409, "{}", res.text());
+                            let p = &res.json::<Value>()["preview"];
+                            assert_eq!(p["by_reason"]["recently_messaged"], 1);
+                            assert_eq!(p["reachable"], 0);
+                            exec(&db, "UPDATE contacts SET last_broadcast_at = NULL").await;
+                            let res = start(&s, &t.cookie, id, 1).await;
+                            assert_eq!(res.status_code(), 200, "{}", res.text());
+                            assert_eq!(round(&state).await, 1);
+                            assert_eq!(shown(&s, &t.cookie, id).await["status"], "sent");
+                        }
+                        exec(&db, "UPDATE contacts SET last_broadcast_at = NULL").await;
+                        let res = start(&s, &t.cookie, &ids[3], 1).await;
+                        assert_eq!(res.status_code(), 429);
+                        res.assert_json(&json!({"error": "too_many_broadcasts"}));
+                        let b = shown(&s, &t.cookie, &ids[3]).await;
+                        assert_eq!(b["status"], "draft");
+                        assert_eq!(b["counts"], counts(0, 0, 0, 0, 0));
+                        assert_eq!(round(&state).await, 0);
+                        let texts: Vec<String> = t.bsky_sent().into_iter().map(|m| m.1).collect();
+                        assert_eq!(texts, ["Hello 0", "Hello 1", "Hello 2"]);
+
+                        // Another team has its own day and its own turn.
+                        let other = team_bsky(&s, &db).await;
+                        crowd(&db, &other, 1).await;
+                        let id = draft(&s, &other.cookie, vip("Theirs", "Hi")).await;
+                        assert_eq!(start(&s, &other.cookie, &id, 1).await.status_code(), 200);
+                    }
+
+                    /// A team with a Bluesky account only (the Meta accounts are another team's).
+                    async fn team_bsky(s: &TestServer, db: &DatabaseConnection) -> Team {
+                        let (_, cookie, _) = user(s, db).await;
+                        let id = current(s, &cookie).await["id"].as_str().unwrap().to_owned();
+                        let res = connect(s, &cookie, &new_handle(), DM_APP_PASSWORD).await;
+                        assert_eq!(res.status_code(), 201, "{}", res.text());
+                        let did = res.json::<Value>()["external_id"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned();
+                        let bsky = account(db, &id, "bluesky", &did).await;
+                        Team {
+                            fb: bsky.clone(),
+                            ig: bsky.clone(),
+                            mark: uuid::Uuid::now_v7().simple().to_string()[20..].to_owned(),
+                            cookie,
+                            id,
+                            bsky,
+                        }
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn over_a_thousand_recipients_is_refused() {
+                        let (s, db, _) = on_both().await;
+                        let t = team_bsky(&s, &db).await;
+                        for i in 0..1001 {
+                            said(&db, &t.bsky, DM, (&t.did(&format!("p{i}x")), "P"), 1).await;
+                        }
+                        let tag = format!(
+            "INSERT INTO contact_tags (contact_id, tag) SELECT id, 'vip' FROM contacts \
+             WHERE team_id = '{}'",
+            t.id
+        );
+                        exec(&db, &tag).await;
+                        let id = draft(&s, &t.cookie, vip("Launch", "Hello")).await;
+                        let p = act(&s, &t.cookie, &id, "preview", json!({}))
+                            .await
+                            .json::<Value>();
+                        assert_eq!(p["reachable"], 1001);
+                        assert_eq!(p["sample"].as_array().unwrap().len(), 5);
+                        let res = start(&s, &t.cookie, &id, 1001).await;
+                        assert_eq!(res.status_code(), 422);
+                        res.assert_json(&json!({"error": "too_many_recipients"}));
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "draft");
+                        assert_eq!(b["counts"], counts(0, 0, 0, 0, 0));
+
+                        // One fewer starts, and the recipients come 100 a page, each once.
+                        let one = format!(
+                            "DELETE FROM contact_tags WHERE contact_id = \
+                             (SELECT id FROM contacts WHERE team_id = '{}' LIMIT 1)",
+                            t.id
+                        );
+                        exec(&db, &one).await;
+                        assert_eq!(start(&s, &t.cookie, &id, 1000).await.status_code(), 200);
+                        let mut seen = std::collections::HashSet::new();
+                        let mut path = format!("/v1/broadcasts/{id}/recipients");
+                        loop {
+                            let page = read(&s, &t.cookie, &path).await;
+                            let items = page["items"].as_array().unwrap();
+                            assert!(items.len() <= 100);
+                            seen.extend(
+                                items
+                                    .iter()
+                                    .map(|r| r["contact_id"].as_str().unwrap().to_owned()),
+                            );
+                            let Some(next) = page["next_cursor"].as_str() else {
+                                break;
+                            };
+                            path = format!(
+                                "/v1/broadcasts/{id}/recipients?status=pending&cursor={next}"
+                            );
+                        }
+                        assert_eq!(seen.len(), 1000);
+                        assert_eq!(
+                            act(&s, &t.cookie, &id, "cancel", json!({}))
+                                .await
+                                .status_code(),
+                            200
+                        );
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn members_read_managers_write_and_other_teams_see_nothing() {
+                        let (s, db, state) = on_both().await;
+                        let t = team_bsky(&s, &db).await;
+                        crowd(&db, &t, 1).await;
+                        let id = draft(&s, &t.cookie, vip("Launch", "Hello")).await;
+                        let one = format!("/v1/broadcasts/{id}");
+                        let (member, _) = joined(&s, &db, &t.id, "member").await;
+                        let (admin, _) = joined(&s, &db, &t.id, "admin").await;
+                        let (_, stranger, _) = user(&s, &db).await;
+                        let body = vip("Theirs", "Hi");
+                        let writes = |cookie: &str| {
+                            let post = |what: &str, body: Value| {
+                                req(&s, Method::POST, &format!("{one}/{what}"), cookie).json(&body)
+                            };
+                            vec![
+                                req(&s, Method::PUT, &one, cookie).json(&body),
+                                post("preview", json!({})),
+                                post("send", json!({"confirm_total": 1})),
+                                post("cancel", json!({})),
+                                post("resume", json!({})),
+                                req(&s, Method::GET, &format!("{one}/recipients"), cookie),
+                                req(&s, Method::DELETE, &one, cookie),
+                            ]
+                        };
+
+                        // A member lists and reads, and nothing else.
+                        let list = read(&s, &member, "/v1/broadcasts").await;
+                        assert_eq!(list[0]["id"], id.as_str());
+                        assert_eq!(shown(&s, &member, &id).await["name"], "Launch");
+                        let res = req(&s, Method::POST, "/v1/broadcasts", &member)
+                            .json(&body)
+                            .await;
+                        assert_eq!(res.status_code(), 403);
+                        for call in writes(&member) {
+                            let res = call.await;
+                            assert_eq!(res.status_code(), 403, "{}", res.text());
+                            res.assert_json(&json!({"error": "forbidden"}));
+                        }
+                        // Another team's broadcast is not there, whatever is asked of it.
+                        assert_eq!(read(&s, &stranger, "/v1/broadcasts").await, json!([]));
+                        let res = s.get(&one).add_header("cookie", &stranger).await;
+                        assert_eq!(res.status_code(), 404);
+                        for call in writes(&stranger) {
+                            let res = call.await;
+                            assert_eq!(res.status_code(), 404, "{}", res.text());
+                        }
+                        // No session, or another site's page: nothing.
+                        let res = s
+                            .post(&format!("{one}/send"))
+                            .json(&json!({"confirm_total": 1}))
+                            .await;
+                        assert_eq!(res.status_code(), 403);
+                        let res = s
+                            .post(&format!("{one}/send"))
+                            .add_header("origin", WEB)
+                            .json(&json!({"confirm_total": 1}))
+                            .await;
+                        assert_eq!(res.status_code(), 401);
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "draft");
+                        assert_eq!(b["name"], "Launch");
+
+                        // An admin does all of it.
+                        let theirs = draft(&s, &admin, body.clone()).await;
+                        assert_eq!(
+                            act(&s, &admin, &theirs, "preview", json!({}))
+                                .await
+                                .status_code(),
+                            200
+                        );
+                        assert_eq!(start(&s, &admin, &theirs, 1).await.status_code(), 200);
+                        assert_eq!(
+                            act(&s, &admin, &theirs, "cancel", json!({}))
+                                .await
+                                .status_code(),
+                            200
+                        );
+                        assert_eq!(ends(&s, &admin, &theirs).await.len(), 1);
+                        assert_eq!(round(&state).await, 0);
+                        assert!(t.bsky_sent().is_empty());
+                    }
+
+                    #[tokio::test]
+                    #[serial]
+                    async fn a_recipient_cut_off_mid_send_fails_and_is_never_sent_again() {
+                        let (s, db, state) = on_both().await;
+                        let t = team_bsky(&s, &db).await;
+                        let people = crowd(&db, &t, 3).await;
+                        let id = draft(&s, &t.cookie, vip("Launch", "Hello")).await;
+                        assert_eq!(start(&s, &t.cookie, &id, 3).await.status_code(), 200);
+                        // A process claimed two and died: one 16 minutes ago, one just now.
+                        let claim = |who: uuid::Uuid, ago: &str| {
+                            format!(
+                                "UPDATE broadcast_recipients SET status = 'sending', \
+                 updated_at = now() - interval '{ago}' WHERE contact_id = '{who}'"
+                            )
+                        };
+                        exec(&db, &claim(people[0], "16 minutes")).await;
+                        exec(&db, &claim(people[1], "1 minute")).await;
+                        broadcasts::tick(&state).await.unwrap();
+                        let got = ends(&s, &t.cookie, &id).await;
+                        assert_eq!(
+                            got[&people[0].to_string()],
+                            ("failed".to_owned(), json!("interrupted"))
+                        );
+                        assert_eq!(
+                            got[&people[1].to_string()],
+                            ("sending".to_owned(), Value::Null)
+                        );
+                        assert_eq!(
+                            got[&people[2].to_string()],
+                            ("sent".to_owned(), Value::Null)
+                        );
+                        assert_eq!(t.bsky_sent().len(), 1, "only the one never claimed before");
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "sending", "one may still be going out");
+                        assert_eq!(b["counts"], counts(3, 1, 0, 1, 1));
+
+                        // Later the second is past saving too, and the broadcast ends.
+                        exec(&db, &claim(people[1], "16 minutes")).await;
+                        broadcasts::tick(&state).await.unwrap();
+                        broadcasts::tick(&state).await.unwrap();
+                        let b = shown(&s, &t.cookie, &id).await;
+                        assert_eq!(b["status"], "sent");
+                        assert_eq!(b["counts"], counts(3, 1, 0, 2, 0));
+                        assert_eq!(t.bsky_sent().len(), 1);
+                    }
+                }
             }
         }
 

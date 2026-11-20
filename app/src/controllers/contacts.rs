@@ -1,6 +1,7 @@
 //! Contacts of the current team: the people who wrote to its accounts, one per platform and
 //! author id, made and kept up by the inbox (`inbox::store`). Every member reads them and writes
-//! their notes and tags, as with inbox items; owners and admins delete one. Like the inbox,
+//! their notes and tags, as with inbox items; owners and admins delete one. `opted_out` keeps a
+//! contact out of broadcasts (`crate::broadcasts`). Like the inbox,
 //! these routes take a session only.
 use axum::{
     extract::{rejection::QueryRejection, Path, Query, State},
@@ -50,6 +51,10 @@ pub struct Contact {
     /// By name.
     pub tags: Vec<String>,
     pub notes: Option<String>,
+    /// Never sent a broadcast: they wrote `stop` or `unsubscribe` (`start` clears it), or a
+    /// member set it. Automations do not look at it. It is kept for the person, so it outlives
+    /// a deleted contact.
+    pub opted_out: bool,
     /// When their oldest and newest stored inbox items came.
     pub first_seen_at: DateTime<FixedOffset>,
     pub last_seen_at: DateTime<FixedOffset>,
@@ -99,6 +104,10 @@ pub struct ContactChange {
     /// no commas or control characters. Absent: unchanged.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// Keeps the contact out of every broadcast. Every member sets it; only owners and admins
+    /// clear it. Absent: unchanged.
+    #[serde(default)]
+    pub opted_out: Option<bool>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -126,7 +135,9 @@ fn stmt(sql: String, values: Vec<Value>) -> Statement {
     Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
 }
 
-const SELECT: &str = "SELECT c.*, (SELECT count(*) FROM inbox_items i \
+const SELECT: &str = "SELECT c.*, EXISTS (SELECT 1 FROM contact_opt_outs o \
+    WHERE o.team_id = c.team_id AND o.platform = c.platform \
+    AND o.external_id = c.external_id) AS opted_out, (SELECT count(*) FROM inbox_items i \
     WHERE i.contact_id = c.id) AS items_count FROM contacts c WHERE c.team_id = $1";
 
 /// The rows of `SELECT` as contacts, with their tags.
@@ -151,6 +162,7 @@ async fn contacts_json(
                 avatar_url: r.try_get("", "avatar_url")?,
                 tags: tags.remove(&id).unwrap_or_default(),
                 notes: r.try_get("", "notes")?,
+                opted_out: r.try_get("", "opted_out")?,
                 first_seen_at: r.try_get("", "first_seen_at")?,
                 last_seen_at: r.try_get("", "last_seen_at")?,
                 items_count: r.try_get("", "items_count")?,
@@ -317,8 +329,9 @@ fn checked_tags(raw: &[String]) -> Option<Vec<String>> {
     (out.len() <= MAX_TAGS).then_some(out)
 }
 
-/// Sets a contact's notes, replaces its tags, or both. Every member. `422 invalid_contact`
-/// names the bad `field` (`notes` or `tags`).
+/// Sets a contact's notes, replaces its tags, opts it out of broadcasts, or any of them. Every
+/// member, but only owners and admins opt a contact back in (`opted_out: false`, else `403
+/// forbidden`). `422 invalid_contact` names the bad `field` (`notes` or `tags`).
 #[utoipa::path(patch, path = "/contacts/{id}", tag = "contacts", request_body = ContactChange,
     params(("id" = Uuid, Path)),
     responses((status = 200, body = Contact), (status = 401, body = Error),
@@ -330,6 +343,10 @@ async fn change(
     Path(id): Path<Uuid>,
     Body(input): Body<ContactChange>,
 ) -> Response {
+    // Opting someone back in widens who a broadcast reaches.
+    if input.opted_out == Some(false) && !t.role.manages() {
+        return reply(StatusCode::FORBIDDEN, "forbidden");
+    }
     let notes = input.notes.map(|n| n.filter(|n| !n.trim().is_empty()));
     if matches!(&notes, Some(Some(n)) if n.chars().count() > MAX_NOTES) {
         return invalid("notes");
@@ -352,6 +369,18 @@ async fn change(
             txn.execute_raw(stmt(sql.into(), vec![id.into(), notes.into()]))
                 .await?;
         }
+        if let Some(out) = input.opted_out {
+            let sql = if out {
+                "INSERT INTO contact_opt_outs (team_id, platform, external_id) \
+                 SELECT team_id, platform, external_id FROM contacts WHERE id = $1 \
+                 ON CONFLICT DO NOTHING"
+            } else {
+                "DELETE FROM contact_opt_outs o USING contacts c WHERE c.id = $1 \
+                 AND o.team_id = c.team_id AND o.platform = c.platform \
+                 AND o.external_id = c.external_id"
+            };
+            txn.execute_raw(stmt(sql.into(), vec![id.into()])).await?;
+        }
         if let Some(tags) = tags {
             let sql = "DELETE FROM contact_tags WHERE contact_id = $1";
             txn.execute_raw(stmt(sql.into(), vec![id.into()])).await?;
@@ -371,7 +400,8 @@ async fn change(
     }
 }
 
-/// Deletes a contact with its notes and tags. Owners and admins. Its inbox items stay, without
+/// Deletes a contact with its notes and tags. Owners and admins. An opt-out of broadcasts is
+/// kept (the platform and the person's id on it), so a later contact of theirs is opted out. Its inbox items stay, without
 /// a contact; a later item of the same person makes a new one.
 #[utoipa::path(delete, path = "/contacts/{id}", tag = "contacts", params(("id" = Uuid, Path)),
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),

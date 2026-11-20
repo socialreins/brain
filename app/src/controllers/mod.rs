@@ -1,6 +1,6 @@
 //! Routes: `/health`, `/version`, `/auth/*`, `/openapi.json`, the documented `/v1` API
 //! (waitlist, the admin console, contact, teams, API tokens, webhooks, connections, social sets, posting queues, posts, lists,
-//! the media library and snippets, inboxes, contacts,
+//! the media library and snippets, inboxes, contacts, broadcasts,
 //! automations, public post pages), `/webhooks/meta` (Facebook and Instagram deliveries), `/mcp` (see `crate::mcp`), the Threads and Meta connect pages and
 //! `/media/{name}` (stored post files for platforms that download them).
 pub mod admin;
@@ -8,6 +8,7 @@ pub mod analytics;
 pub mod api_tokens;
 pub mod auth;
 pub mod automations;
+pub mod broadcasts;
 pub mod connections;
 pub mod contact;
 pub mod contacts;
@@ -111,6 +112,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(feeds::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
         .merge(inbox::api())
         .merge(contacts::api())
+        .merge(broadcasts::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
         .merge(analytics::api())
         // Two DM texts of 1000 graphemes can pass 4 KiB.
         .merge(automations::api().layer(DefaultBodyLimit::max(MAX_AUTOMATION_BODY_BYTES)))

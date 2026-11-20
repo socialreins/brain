@@ -488,7 +488,9 @@ pub fn numbered(text: &str, buttons: &[Button]) -> String {
 /// Stores `f` for `account`; the new item, or `None` when it was already there. The unique key
 /// is the account and the platform's id, so a repeated read or webhook delivery adds nothing.
 /// Its author's contact (one per team, platform and author id) is made or brought up to date in
-/// the same statement, and the item points at it.
+/// the same statement, and the item points at it. A new DM that says `stop`, `unsubscribe` or
+/// `start` then opts its author out of broadcasts or back in (`opt_out`, `contact_opt_outs`),
+/// which only broadcasts read.
 pub async fn store(
     db: &DatabaseConnection,
     account: &social_accounts::Model,
@@ -521,10 +523,41 @@ pub async fn store(
         f.button_payload.into(),
         Uuid::now_v7().into(),
     ];
-    inbox_items::Entity::find()
+    let item = inbox_items::Entity::find()
         .from_raw_sql(sql(INSERT, values))
         .one(db)
-        .await
+        .await?;
+    if let Some((i, out)) = item.as_ref().and_then(|i| Some((i, opt_out(i)?))) {
+        let person: Vec<Value> = vec![
+            i.team_id.into(),
+            i.platform.clone().into(),
+            i.author_id.clone().into(),
+        ];
+        db.execute_raw(sql(if out { OPT_OUT } else { OPT_IN }, person))
+            .await?;
+    }
+    Ok(item)
+}
+
+/// Opts a person (team, platform, the platform's id of them) out of broadcasts, or back in.
+/// The row is the person's, not a contact's: it stays when the contact is deleted, so a contact
+/// made again by a later item is still opted out.
+pub const OPT_OUT: &str = "INSERT INTO contact_opt_outs (team_id, platform, external_id) \
+    VALUES ($1, $2, $3) ON CONFLICT DO NOTHING";
+pub const OPT_IN: &str =
+    "DELETE FROM contact_opt_outs WHERE team_id = $1 AND platform = $2 AND external_id = $3";
+
+/// What a new DM says about broadcasts: its whole text is `stop` or `unsubscribe` (opt out,
+/// `true`) or `start` (back in), whatever the case. Anything else says nothing.
+fn opt_out(item: &inbox_items::Model) -> Option<bool> {
+    if item.kind != "dm" {
+        return None;
+    }
+    match item.text.trim().to_lowercase().as_str() {
+        "stop" | "unsubscribe" => Some(true),
+        "start" => Some(false),
+        _ => None,
+    }
 }
 
 /// Stores a notification; the new item, or `None` when it was already there.

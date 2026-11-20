@@ -99,6 +99,22 @@ cargo run -p socialreins-brain
   remove a person's data; items outlive a deleted contact with `contact_id` null.
   Session only, like the inbox. `inbox_items.assigned_to` is set under a share lock of the
   member's `team_user` row, and `teams::change_member` clears it after deleting that row.
+- `app/src/broadcasts.rs` and `controllers/broadcasts.rs`: broadcasts, one DM to every reachable
+  contact with a tag (owners and admins write, session only). `ROUTE` is the one place that says
+  who is reachable and through which item: never opted out (`contact_opt_outs`, a row per team,
+  platform and person that outlives the contact, written by a DM that says `stop` or
+  `unsubscribe` in `inbox::store` and by `PATCH /v1/contacts/{id}`), no broadcast in the last 24
+  hours (`contacts.last_broadcast_at`, set before the send), an account without
+  `meta.reconnect`, and on Facebook and Instagram a DM under 24 hours old (never a message tag). `start` snapshots the
+  audience and checks `confirm_total` against that same statement's row count, under a per-team
+  advisory lock (one `sending` a team, 3 starts a day). `broadcasts::tick` (every minute, own
+  advisory lock held for the claim only) moves up to 20 recipients a broadcast `pending` to
+  `sending` with their hit of the daily cap (`claim`, `SKIP LOCKED`), commits, then `attempt`
+  checks the same audience clause again (tag included) and sends through `inbox::send`. A
+  platform error that is not about the one person (`Tried::Trip`), or 5 failed sends in a row
+  (`pause_failing`), sets the broadcast `paused`; only `resume` (a person) puts it back. Never send to a recipient without
+  claiming it, and never retry one: `recover` fails a claim older than 15 minutes as
+  `interrupted`. Only `release` (the round ran out of time before the send began) puts one back.
 - `app/src/metrics.rs` and `controllers/analytics.rs`: post metrics (`post_metrics`, one latest
   row per published target, no history) from Bluesky, Facebook, Instagram and YouTube
   (`metrics::SUPPORTED`; never add a platform that needs a new scope). `metrics::tick` (every 15
