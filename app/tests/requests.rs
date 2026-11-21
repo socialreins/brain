@@ -28694,7 +28694,15 @@ mod teams {
                     )
                 }
             };
+            let cancel = |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                CALLS
+                    .lock()
+                    .unwrap()
+                    .push((format!("/cancel/{id}"), String::new(), Vec::new()));
+                AxJson(json!({"id": id, "status": "canceled"}))
+            };
             let app = Router::new()
+                .route("/v1/subscriptions/{id}", axum::routing::delete(cancel))
                 .route("/v1/checkout/sessions", route(take("/checkout")))
                 .route("/v1/billing_portal/sessions", route(take("/portal")));
             tokio::spawn(async move { axum::serve(listener, app).await });
@@ -29068,6 +29076,34 @@ mod teams {
             );
         }
 
+        /// Two checkouts open at once end as two live subscriptions: the first stays the team's,
+        /// the second is cancelled in Stripe and never written.
+        #[tokio::test]
+        #[serial]
+        async fn a_second_live_subscription_is_cancelled_not_kept() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let now = Utc::now().timestamp();
+            let first = sub_event("evt_f1", now - 10, "sub_f1", &team, "active", "price_s");
+            assert_eq!(deliver(&s, &first, WHSEC, now).await.status_code(), 200);
+            let before = count(&format!("/cancel/sub_f2_{}", *RUN));
+            let second = sub_event("evt_f2", now, "sub_f2", &team, "active", "price_a");
+            assert_eq!(deliver(&s, &second, WHSEC, now).await.status_code(), 200);
+            assert_eq!(count(&format!("/cancel/sub_f2_{}", *RUN)), before + 1);
+            let p = plan_of(&s, &owner).await;
+            assert_eq!(
+                (p["id"].clone(), p["status"].clone()),
+                (json!("scheduler"), json!("active"))
+            );
+            // Its own later events still apply, and its second delivery cancels nothing more.
+            assert_eq!(deliver(&s, &second, WHSEC, now).await.status_code(), 200);
+            assert_eq!(count(&format!("/cancel/sub_f2_{}", *RUN)), before + 1);
+            let renewed = sub_event("evt_f3", now + 5, "sub_f1", &team, "active", "price_s");
+            assert_eq!(deliver(&s, &renewed, WHSEC, now).await.status_code(), 200);
+            assert_eq!(plan_of(&s, &owner).await["id"], "scheduler");
+        }
+
         #[tokio::test]
         #[serial]
         async fn events_for_nobody_unknown_prices_unstarted_or_other_kinds_change_nothing() {
@@ -29094,6 +29130,17 @@ mod teams {
                 );
             }
             assert_eq!(plan_of(&s, &owner).await, Value::Null);
+            // An event that was not applied is not remembered, so it can be sent again.
+            let row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT count(*)::bigint AS n FROM stripe_events WHERE id = $1",
+                    [format!("evt_b_{}", *RUN).into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
         }
     }
 }

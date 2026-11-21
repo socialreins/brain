@@ -45,6 +45,9 @@ impl Stripe {
         if !shaped(&webhook_secret, &["whsec_"]) {
             return Err("STRIPE_WEBHOOK_SECRET: not a Stripe signing secret (whsec_...)");
         }
+        if prices[0].1.is_some() && prices[0].1 == prices[1].1 {
+            return Err("STRIPE_PRICE_SCHEDULER and STRIPE_PRICE_AUTOMATION are the same price");
+        }
         let mut have = Vec::new();
         for (plan, price) in prices {
             if !shaped(&price, &["price_"]) {
@@ -105,13 +108,22 @@ impl Stripe {
     }
 
     async fn post(&self, path: &str, form: &[(String, String)]) -> Result<Value, StripeError> {
+        self.call(reqwest::Method::POST, path, form).await
+    }
+
+    async fn call(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        form: &[(String, String)],
+    ) -> Result<Value, StripeError> {
         let key = self
             .secret
             .as_deref()
             .ok_or_else(|| StripeError(None, "not_configured".into()))?;
         let res = self
             .client
-            .post(format!("{}{path}", self.api_url))
+            .request(method, format!("{}{path}", self.api_url))
             .basic_auth(key, None::<&str>)
             .form(form)
             .send()
@@ -138,6 +150,21 @@ impl Stripe {
             .as_str()
             .map(str::to_owned)
             .ok_or_else(|| StripeError(None, "no_url".into()))
+    }
+
+    /// Cancels a subscription at once, for a second live one a team started by mistake. `id` is
+    /// a Stripe id (letters, digits and `_`), so it cannot add to the path.
+    pub async fn cancel(&self, id: &str) -> Result<(), StripeError> {
+        if !id.starts_with("sub_") || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err(StripeError(None, "invalid_id".into()));
+        }
+        self.call(
+            reqwest::Method::DELETE,
+            &format!("/v1/subscriptions/{id}"),
+            &[],
+        )
+        .await
+        .map(|_| ())
     }
 
     /// A Billing Portal session for `customer`: where they manage the card and cancel.
@@ -182,6 +209,11 @@ mod tests {
                 .configured()
         );
         let none = [("scheduler", None), ("automation", None)];
+        let same = [
+            ("scheduler", Some("price_1".into())),
+            ("automation", Some("price_1".into())),
+        ];
+        assert!(Stripe::new(None, None, same).is_err());
         assert!(Stripe::new(Some("nope".into()), None, none.clone()).is_err());
         assert!(Stripe::new(None, Some("sk_test_x".into()), none).is_err());
         let bad = [("scheduler", Some("prod_1".into())), ("automation", None)];

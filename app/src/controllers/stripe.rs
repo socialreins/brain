@@ -204,6 +204,17 @@ fn time(v: &Value) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(v.as_i64()?, 0)
 }
 
+/// What a subscription event came to.
+enum Outcome {
+    Applied,
+    /// Not ours to apply (no team, no plan, not started): nothing is stored, not even the event
+    /// id, so sending it again from the Stripe dashboard works once the cause is mended.
+    Ignored,
+    /// A live subscription while the team already has another live one: the team is billed
+    /// twice. The new one is kept out of the books and cancelled in Stripe.
+    Extra(String),
+}
+
 /// Writes one subscription event. Which team: the id in the subscription's metadata, else the
 /// team already holding that subscription. An event for no team, for a price that is no plan,
 /// or older than the last one applied changes nothing.
@@ -212,7 +223,7 @@ async fn apply_subscription(
     db: &impl ConnectionTrait,
     sub: &Value,
     at: DateTime<Utc>,
-) -> Result<(), DbErr> {
+) -> Result<Outcome, DbErr> {
     let id = sub["id"].as_str().unwrap_or_default();
     let team = match sub["metadata"]["team_id"]
         .as_str()
@@ -236,14 +247,33 @@ async fn apply_subscription(
     let status = sub["status"].as_str().and_then(status_of);
     let (Some(team), Some(plan), Some(status)) = (team, plan, status) else {
         tracing::warn!(subscription = id, "stripe subscription event ignored");
-        return Ok(());
+        return Ok(Outcome::Ignored);
     };
     let known = db
         .query_one_raw(stmt("SELECT 1 FROM teams WHERE id = $1", vec![team.into()]))
         .await?;
     if known.is_none() {
         tracing::warn!(subscription = id, "stripe subscription of an unknown team");
-        return Ok(());
+        return Ok(Outcome::Ignored);
+    }
+    // The row is locked while it is read, so two events for one team take turns.
+    let current = db
+        .query_one_raw(stmt(
+            "SELECT status, provider_subscription_id FROM subscriptions \
+             WHERE team_id = $1 FOR UPDATE",
+            vec![team.into()],
+        ))
+        .await?;
+    if let Some(row) = current {
+        let status_now: String = row.try_get("", "status")?;
+        let sub_now: Option<String> = row.try_get("", "provider_subscription_id")?;
+        if billing::live(&status_now)
+            && billing::live(status)
+            && sub_now.as_deref().is_some_and(|s| s != id)
+        {
+            tracing::error!(%team, subscription = id, "second live stripe subscription");
+            return Ok(Outcome::Extra(id.to_owned()));
+        }
     }
     // Stripe moved the period end into the item in newer API versions.
     let period_end = time(&sub["current_period_end"]).or_else(|| time(&item["current_period_end"]));
@@ -263,8 +293,7 @@ async fn apply_subscription(
                       OR subscriptions.provider_event_at <= EXCLUDED.provider_event_at) \
                  AND (subscriptions.provider_subscription_id IS NOT DISTINCT FROM \
                         EXCLUDED.provider_subscription_id \
-                      OR subscriptions.status NOT IN ('trialing', 'active', 'past_due') \
-                      OR EXCLUDED.status IN ('trialing', 'active', 'past_due'))";
+                      OR subscriptions.status NOT IN ('trialing', 'active', 'past_due'))";
     db.execute_raw(stmt(
         sql,
         vec![
@@ -283,7 +312,7 @@ async fn apply_subscription(
         ],
     ))
     .await?;
-    Ok(())
+    Ok(Outcome::Applied)
 }
 
 /// `POST /webhooks/stripe`: `403` unless `Stripe-Signature` signs the raw body (timestamp within
@@ -320,20 +349,34 @@ async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -
             .await?
             .rows_affected()
             == 1;
-        if fresh
-            && matches!(
-                kind,
-                "customer.subscription.created"
-                    | "customer.subscription.updated"
-                    | "customer.subscription.deleted"
-            )
-        {
-            apply_subscription(&app, &txn, &event["data"]["object"], at).await?;
+        let subscription = matches!(
+            kind,
+            "customer.subscription.created"
+                | "customer.subscription.updated"
+                | "customer.subscription.deleted"
+        );
+        let mut extra = None;
+        if fresh && subscription {
+            match apply_subscription(&app, &txn, &event["data"]["object"], at).await? {
+                Outcome::Applied => {}
+                // Dropping the transaction takes the event id back with it.
+                Outcome::Ignored => return Ok::<_, DbErr>(None),
+                Outcome::Extra(sub) => extra = Some(sub),
+            }
         }
-        txn.commit().await
+        txn.commit().await?;
+        Ok(extra)
     };
     match handled.await {
-        Ok(()) => StatusCode::OK.into_response(),
+        Ok(Some(sub)) => {
+            // After the commit, so a failed call leaves the event taken; it is logged for a
+            // person to cancel (and refund) in Stripe.
+            if let Err(e) = app.stripe.cancel(&sub).await {
+                tracing::error!(subscription = %sub, status = ?e.0, code = %e.1, "extra stripe subscription not cancelled");
+            }
+            StatusCode::OK.into_response()
+        }
+        Ok(None) => StatusCode::OK.into_response(),
         Err(e) => internal(e, "stripe webhook"),
     }
 }

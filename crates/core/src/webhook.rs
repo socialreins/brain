@@ -48,7 +48,7 @@ pub fn verify_timestamped(
             _ => {}
         }
     }
-    let Some(t) = t.filter(|t| (now - t).abs() <= tolerance) else {
+    let Some(t) = t.filter(|t| now.abs_diff(*t) <= tolerance.unsigned_abs()) else {
         return false;
     };
     let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
