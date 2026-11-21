@@ -28302,6 +28302,33 @@ mod teams {
             let (admin, _) = joined(&s, &db, &team, "admin").await;
             put(&s, &admin, "anthropic", KEY).await.assert_status_ok();
 
+            // API tokens get the session-only answer, and a write needs the web origin.
+            let token = req(&s, Method::POST, "/v1/api-tokens", &owner)
+                .json(&json!({"name": "t"}))
+                .await
+                .json::<Value>()["secret"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let bearer = format!("Bearer {token}");
+            let res = s
+                .get("/v1/team/ai-key")
+                .add_header("authorization", bearer.clone())
+                .await;
+            assert_eq!(res.status_code(), 401);
+            let res = s
+                .put("/v1/team/ai-key")
+                .add_header("origin", WEB)
+                .add_header("authorization", bearer)
+                .json(&json!({"provider": "anthropic", "key": KEY}))
+                .await;
+            assert_eq!(res.status_code(), 401);
+            let res = s
+                .delete("/v1/team/ai-key")
+                .add_header("cookie", &owner)
+                .await;
+            res.assert_json(&json!({"error": "forbidden_origin"}));
+
             // Setting it needs a sign-in from the last 10 minutes.
             let aged = sessions::ActiveModel {
                 token_hash: Set(token::hash(owner.trim_start_matches("sr_session="))),
