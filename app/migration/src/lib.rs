@@ -48,6 +48,7 @@ pub mod m20261207_000001_inbox_conversations;
 pub mod m20261208_000001_broadcasts;
 mod m20261209_000001_newsletters;
 mod m20261210_000001_newsletter_sender_logo;
+mod m20261211_000001_billing;
 
 pub struct Migrator;
 
@@ -103,6 +104,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261208_000001_broadcasts::Migration),
             Box::new(m20261209_000001_newsletters::Migration),
             Box::new(m20261210_000001_newsletter_sender_logo::Migration),
+            Box::new(m20261211_000001_billing::Migration),
             // inject-above (do not remove this comment)
         ]
     }

@@ -68,6 +68,8 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | POST, GET | `/v1/team/invitations` | `{"email","role"}`: invite as `admin` or `member` (owner, admin); list pending |
 | DELETE | `/v1/team/invitations/{id}` | Withdraw an invitation (owner, admin) |
 | GET, PUT, DELETE | `/v1/team/webhook` | The team's outbound webhook (owner, admin): read it (no secret, `404` when none); `{"url"}` sets it (sign-in from the last 10 minutes), `201` with the `secret` once when new, `200` when changing the URL; delete it, `204` |
+| GET | `/v1/team/billing` | Any member. The team's plan (`null` when none), what it allows (`limits`, `null` is unlimited) and what it uses. `enabled: false` on a self-hosted install, where nothing is capped (`BILLING_ENABLED`). With billing on and no live plan, nothing is allowed. Read-only: nothing enforces a limit yet. |
+| GET | `/v1/team/credits` | Any member. The team's prepaid credits: `x` (posts to X) and `ai` (AI calls on our key). |
 | POST | `/v1/team/webhook/test` | Sends a signed `ping` now: `{"status"}` from the receiver, or `{"error"}` (`blocked_address`, `timeout`, `unreachable`) |
 | GET, POST | `/v1/invitations/{token}` | Public preview of an invitation; accept it as the signed-in invited email |
 | GET | `/v1/connections` | The current team's connected accounts with their `set_ids`; never tokens |
