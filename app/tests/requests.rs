@@ -29131,6 +29131,66 @@ mod teams {
             assert_eq!(plan_of(&s, &owner).await["status"], "active");
         }
 
+        /// Events recorded from the real Stripe sandbox (API version 2026-11-18): a trial that
+        /// starts, is set to cancel, and ends. Ids are made new for each run and the team is ours.
+        #[tokio::test]
+        #[serial]
+        async fn real_stripe_events_set_the_trial_then_the_end() {
+            let mut events: Vec<Value> =
+                serde_json::from_str(include_str!("fixtures/stripe_subscription_events.json"))
+                    .unwrap();
+            let price = events[0]["data"]["object"]["items"]["data"][0]["price"]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let base = mock().await;
+            let (s, db) = server_where(|c| {
+                c.billing_enabled = true;
+                let mut st = Stripe::new(
+                    Some("sk_test_mock".into()),
+                    Some(WHSEC.into()),
+                    [
+                        ("scheduler", Some(price)),
+                        ("automation", Some("price_a".into())),
+                    ],
+                )
+                .unwrap();
+                st.api_url = base;
+                c.stripe = st;
+            })
+            .await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let now = Utc::now().timestamp();
+            for e in &mut events {
+                let id = format!("{}_{}", e["id"].as_str().unwrap(), *RUN);
+                e["id"] = id.into();
+                let o = &mut e["data"]["object"];
+                o["id"] = format!("{}_{}", o["id"].as_str().unwrap(), *RUN).into();
+                o["metadata"]["team_id"] = team.clone().into();
+            }
+            let send = |e: &Value| {
+                let (s, body) = (&s, e.to_string());
+                async move { deliver(s, &body, WHSEC, now).await }
+            };
+            assert_eq!(send(&events[0]).await.status_code(), 200);
+            let p = plan_of(&s, &owner).await;
+            assert_eq!(
+                (p["id"].clone(), p["status"].clone()),
+                (json!("scheduler"), json!("trialing"))
+            );
+            assert!(p["trial_ends_at"].is_string() && p["current_period_end"].is_string());
+            assert_eq!(p["cancel_at_period_end"], false);
+            assert_eq!(send(&events[1]).await.status_code(), 200);
+            let p = plan_of(&s, &owner).await;
+            assert_eq!(
+                (p["status"].clone(), p["cancel_at_period_end"].clone()),
+                (json!("trialing"), json!(true))
+            );
+            assert_eq!(send(&events[2]).await.status_code(), 200);
+            assert_eq!(plan_of(&s, &owner).await["status"], "canceled");
+        }
+
         #[tokio::test]
         #[serial]
         async fn events_for_nobody_unknown_prices_unstarted_or_other_kinds_change_nothing() {
