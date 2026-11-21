@@ -332,6 +332,9 @@ async fn create(
     if !t.role.manages() {
         return forbidden();
     }
+    if let Some(res) = super::billing::needs_automation(&app, t.team.id).await {
+        return res;
+    }
     let made = async {
         let (name, input) = match checked(&app.db, t.team.id, input).await? {
             Ok(v) => v,
@@ -416,6 +419,11 @@ async fn update(
     if !t.role.manages() {
         return forbidden();
     }
+    if input.active {
+        if let Some(res) = super::billing::needs_automation(&app, t.team.id).await {
+            return res;
+        }
+    }
     let saved = async {
         let (name, input) = match checked(&app.db, t.team.id, input).await? {
             Ok(v) => v,
@@ -466,6 +474,11 @@ async fn update(
 async fn set_active(app: &AppState, t: &InTeam, id: Uuid, active: bool) -> Response {
     if !t.role.manages() {
         return forbidden();
+    }
+    if active {
+        if let Some(res) = super::billing::needs_automation(app, t.team.id).await {
+            return res;
+        }
     }
     match switch(&app.db, t.team.id, id, active).await {
         Ok(Some(a)) => Json(automation_json(a)).into_response(),

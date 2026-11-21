@@ -1065,6 +1065,18 @@ async fn send_invitation(app: &AppState, t: &InTeam, email: String, role: Role) 
     // Re-inviting a pending address replaces its invitation, so the old link stops working.
     let replaced = async {
         let txn = app.db.begin().await?;
+        if app.billing_enabled {
+            // One invitation at a time per team, so two cannot both take the last seat.
+            txn.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT 1 FROM teams WHERE id = $1 FOR NO KEY UPDATE",
+                [t.team.id.into()],
+            ))
+            .await?;
+            if crate::billing::members_full(true, &txn, t.team.id, Some(&email)).await? {
+                return Err(DbErr::Custom(crate::billing::MEMBER_LIMIT.into()));
+            }
+        }
         team_invitations::Entity::delete_many()
             .filter(team_invitations::Column::TeamId.eq(t.team.id))
             .filter(team_invitations::Column::Email.eq(&email))
@@ -1079,6 +1091,9 @@ async fn send_invitation(app: &AppState, t: &InTeam, email: String, role: Role) 
         Ok(row) => row,
         Err(e) if matches!(e.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) => {
             return reply(StatusCode::CONFLICT, "already_invited")
+        }
+        Err(e) if crate::billing::is_member_limit(&e) => {
+            return super::billing::plan_limit(crate::billing::Limit::Members)
         }
         Err(e) => return internal(e, "invitation insert"),
     };
@@ -1232,6 +1247,21 @@ async fn accept(
     // Both are stored lowercased; a mismatch leaves the invitation for the right account.
     if inv.email != user.email.to_lowercase() {
         return reply(StatusCode::FORBIDDEN, "email_mismatch");
+    }
+    // The invitation holds its own seat, so only members count here. Someone already in the team
+    // takes none.
+    match membership(&app.db, inv.team_id, user.id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            match crate::billing::members_full(app.billing_enabled, &app.db, inv.team_id, None)
+                .await
+            {
+                Ok(false) => {}
+                Ok(true) => return super::billing::plan_limit(crate::billing::Limit::Members),
+                Err(e) => return internal(e, "plan read"),
+            }
+        }
+        Err(e) => return internal(e, "membership read"),
     }
     let joined = async {
         let txn = app.db.begin().await?;

@@ -497,6 +497,9 @@ async fn create(
     if !t.role.manages() {
         return forbidden();
     }
+    if let Some(res) = super::billing::needs_automation(&app, t.team.id).await {
+        return res;
+    }
     let made = async {
         let (name, filters) = match checked(&app.db, t.team.id, input).await? {
             Ok(v) => v,

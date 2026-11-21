@@ -253,7 +253,7 @@ async fn save(
         social_accounts::Column::Meta,
         social_accounts::Column::UpdatedAt,
     ];
-    let (_, json) = save_account(&app.db, (team_id, new_id), row, refresh).await?;
+    let (_, json) = save_account(app, (team_id, new_id), row, refresh).await?;
     Ok(json)
 }
 
@@ -481,6 +481,9 @@ async fn pick(
     match done.await {
         Ok(Ok(saved)) => (StatusCode::CREATED, Json(saved)).into_response(),
         Ok(Err(res)) => res,
+        Err(e) if crate::billing::is_account_limit(&e) => {
+            super::billing::plan_limit(crate::billing::Limit::Accounts)
+        }
         Err(e) => internal(e, "meta pick save"),
     }
 }

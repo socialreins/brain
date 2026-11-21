@@ -4,6 +4,7 @@
 //! everything is allowed.
 use axum::{
     extract::State,
+    http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
@@ -15,7 +16,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::{auth::internal, teams::InTeam, waitlist::Error};
 use crate::{
-    billing::{self, Kind, Limits},
+    billing::{self, Kind, Limit, Limits},
     state::AppState,
 };
 
@@ -89,6 +90,22 @@ async fn count(app: &AppState, table: &str, team: uuid::Uuid) -> Result<i64, sea
         ))
         .await?;
     row.map_or(Ok(0), |r| r.try_get("", "n"))
+}
+
+/// `402 {"error": "plan_limit", "limit": ...}`: the plan does not allow this.
+pub(crate) fn plan_limit(limit: Limit) -> Response {
+    let body = serde_json::json!({"error": "plan_limit", "limit": limit.as_str()});
+    (StatusCode::PAYMENT_REQUIRED, Json(body)).into_response()
+}
+
+/// `Some(reply)` when the team's plan has no automation (the inbox, automations, broadcasts and
+/// newsletters); `None` when it does, or billing is off.
+pub(crate) async fn needs_automation(app: &AppState, team: uuid::Uuid) -> Option<Response> {
+    match billing::limits_of(app.billing_enabled, &app.db, team).await {
+        Ok(l) if l.automation => None,
+        Ok(_) => Some(plan_limit(Limit::Automation)),
+        Err(e) => Some(internal(e, "plan read")),
+    }
 }
 
 /// The current team's plan, what it allows and what it uses. Any member.

@@ -120,7 +120,10 @@ async fn callback(
         social_accounts::Column::Meta,
         social_accounts::Column::UpdatedAt,
     ];
-    if let Err(e) = save_account(&app.db, (team_id, new_id), row, refresh).await {
+    if let Err(e) = save_account(&app, (team_id, new_id), row, refresh).await {
+        if crate::billing::is_account_limit(&e) {
+            return fail("plan_limit");
+        }
         tracing::error!(error = %e, "linkedin account save failed");
         return fail("internal");
     }

@@ -122,6 +122,80 @@ pub fn effective(enabled: bool, sub: Option<&Subscription>) -> Limits {
     }
 }
 
+/// What a plan can refuse. The answer names it (`plan_limit`, `limit`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Limit {
+    Accounts,
+    Members,
+    Automation,
+}
+
+impl Limit {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accounts => "accounts",
+            Self::Members => "members",
+            Self::Automation => "automation",
+        }
+    }
+}
+
+/// The `DbErr::Custom` text that `save_account` fails with when a new account would pass the
+/// plan's limit; callers answer it as a limit, not as a fault.
+pub const ACCOUNT_LIMIT: &str = "plan_limit:accounts";
+
+pub fn is_account_limit(e: &DbErr) -> bool {
+    matches!(e, DbErr::Custom(m) if m == ACCOUNT_LIMIT)
+}
+
+/// Like `ACCOUNT_LIMIT`, for an invitation that would take the last seat too many.
+pub const MEMBER_LIMIT: &str = "plan_limit:members";
+
+pub fn is_member_limit(e: &DbErr) -> bool {
+    matches!(e, DbErr::Custom(m) if m == MEMBER_LIMIT)
+}
+
+/// What the team may use now (everything when billing is off).
+pub async fn limits_of(
+    enabled: bool,
+    db: &impl ConnectionTrait,
+    team: Uuid,
+) -> Result<Limits, DbErr> {
+    if !enabled {
+        return Ok(Limits::unlimited());
+    }
+    let sub = subscription(db, team).await?;
+    Ok(effective(enabled, sub.as_ref()))
+}
+
+/// Whether the team has no seat left for one more member. `pending` counts open invitations
+/// as seats, except the one for `except_email`, which a new invitation to it would replace.
+pub async fn members_full(
+    enabled: bool,
+    db: &impl ConnectionTrait,
+    team: Uuid,
+    pending: Option<&str>,
+) -> Result<bool, DbErr> {
+    let Some(max) = limits_of(enabled, db, team).await?.members else {
+        return Ok(false);
+    };
+    let row = db
+        .query_one_raw(stmt(
+            "SELECT (SELECT count(*) FROM team_user WHERE team_id = $1)
+                  + (SELECT CASE WHEN $2 THEN count(*) ELSE 0 END
+                     FROM team_invitations WHERE team_id = $1 AND expires_at > now()
+                       AND email <> $3) AS n",
+            vec![
+                team.into(),
+                pending.is_some().into(),
+                pending.unwrap_or_default().into(),
+            ],
+        ))
+        .await?;
+    let n: i64 = row.map_or(Ok(0), |r| r.try_get("", "n"))?;
+    Ok(n >= max)
+}
+
 /// The team's balance of one kind of credit.
 pub async fn balance(db: &impl ConnectionTrait, team: Uuid, kind: Kind) -> Result<i64, DbErr> {
     let row = db
