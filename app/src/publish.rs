@@ -1977,7 +1977,7 @@ async fn publish_target(
             Ok(have) if have >= todo => {}
             Ok(have) => {
                 let msg = format!(
-                    "Posting to X needs {todo} credit{} and the team has {have}. Buy X credits to post.",
+                    "Posting to X needs {todo} credit{} and the team has {have}. Add X credits to post.",
                     if todo == 1 { "" } else { "s" }
                 );
                 return fail_target(db, id, &msg).await;
