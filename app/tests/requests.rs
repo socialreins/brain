@@ -28182,6 +28182,138 @@ mod teams {
             c.assert_json(&json!({"x": 3, "ai": 0}));
         }
     }
+
+    mod ai_key_api {
+        use super::*;
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+        const KEY: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";
+
+        async fn put(
+            s: &TestServer,
+            cookie: &str,
+            provider: &str,
+            key: &str,
+        ) -> axum_test::TestResponse {
+            req(s, Method::PUT, "/v1/team/ai-key", cookie)
+                .json(&json!({"provider": provider, "key": key}))
+                .await
+        }
+
+        async fn show(s: &TestServer, cookie: &str) -> axum_test::TestResponse {
+            s.get("/v1/team/ai-key")
+                .add_header("cookie", cookie.to_owned())
+                .await
+        }
+
+        /// The owner and admins manage the key; it is sealed at rest and never answered whole.
+        #[tokio::test]
+        #[serial]
+        async fn the_key_is_sealed_and_only_its_end_is_shown() {
+            let (s, db) = server_where(|_| {}).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            assert_eq!(show(&s, &owner).await.status_code(), 404);
+
+            let res = put(&s, &owner, "anthropic", KEY).await;
+            res.assert_status_ok();
+            let body: Value = res.json();
+            assert_eq!(body["provider"], "anthropic");
+            assert_eq!(body["last4"], "wxyz");
+            assert!(!body.to_string().contains("sk-ant"));
+            let shown = show(&s, &owner).await;
+            shown.assert_status_ok();
+            assert!(!shown.text().contains("sk-ant"));
+
+            // Sealed in the database: the clear key is nowhere in the row.
+            let row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT key FROM team_ai_keys WHERE team_id = $1",
+                    [team.parse::<uuid::Uuid>().unwrap().into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            let sealed: Vec<u8> = row.try_get("", "key").unwrap();
+            assert!(!sealed.windows(6).any(|w| w == b"sk-ant"));
+
+            // The AI steps read it back in clear, and a new key replaces it.
+            let app = socialreins_brain::state::AppState::new(
+                db.clone(),
+                &Config::from_env().expect("test config"),
+            );
+            let id: uuid::Uuid = team.parse().unwrap();
+            let got = controllers::ai_key::key_of(&app, id).await.unwrap();
+            assert_eq!(got, Some(("anthropic".to_owned(), KEY.to_owned())));
+            let res = put(&s, &owner, "openai", "sk-proj-0123456789abcdefghij").await;
+            res.assert_status_ok();
+            assert_eq!(res.json::<Value>()["last4"], "ghij");
+            assert_eq!(
+                controllers::ai_key::key_of(&app, id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .0,
+                "openai"
+            );
+
+            let res = req(&s, Method::DELETE, "/v1/team/ai-key", &owner).await;
+            assert_eq!(res.status_code(), 204);
+            assert_eq!(show(&s, &owner).await.status_code(), 404);
+            assert!(controllers::ai_key::key_of(&app, id)
+                .await
+                .unwrap()
+                .is_none());
+            let res = req(&s, Method::DELETE, "/v1/team/ai-key", &owner).await;
+            assert_eq!(res.status_code(), 404);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn a_bad_key_a_member_or_an_old_sign_in_is_refused() {
+            let (s, db) = server_where(|_| {}).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            for (provider, key) in [
+                ("gemini", KEY),
+                ("anthropic", "sk-short"),
+                ("anthropic", "sk-proj-0123456789abcdefghij"),
+                ("openai", "0123456789abcdefghij0123"),
+                ("openai", "sk-0123456789 abcdefghij"),
+            ] {
+                let res = put(&s, &owner, provider, key).await;
+                assert_eq!(res.status_code(), 422, "{provider} {key}");
+                res.assert_json(&json!({"error": "invalid_key"}));
+            }
+
+            // A plain member neither reads, sets nor deletes it.
+            let (member, _) = joined(&s, &db, &team, "member").await;
+            assert_eq!(
+                s.get("/v1/team/ai-key")
+                    .add_header("cookie", member.clone())
+                    .await
+                    .status_code(),
+                403
+            );
+            assert_eq!(put(&s, &member, "anthropic", KEY).await.status_code(), 403);
+            let res = req(&s, Method::DELETE, "/v1/team/ai-key", &member).await;
+            assert_eq!(res.status_code(), 403);
+            let (admin, _) = joined(&s, &db, &team, "admin").await;
+            put(&s, &admin, "anthropic", KEY).await.assert_status_ok();
+
+            // Setting it needs a sign-in from the last 10 minutes.
+            let aged = sessions::ActiveModel {
+                token_hash: Set(token::hash(owner.trim_start_matches("sr_session="))),
+                created_at: Set((Utc::now() - Duration::minutes(11)).fixed_offset()),
+                ..Default::default()
+            };
+            sessions::Entity::update(aged).exec(&db).await.unwrap();
+            let res = put(&s, &owner, "anthropic", KEY).await;
+            assert_eq!(res.status_code(), 403);
+            res.assert_json(&json!({"error": "reauth_required"}));
+        }
+    }
 }
 
 /// Turnstile on the public forms and `POST /v1/contact`, against a local fake siteverify (it
