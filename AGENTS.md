@@ -32,6 +32,9 @@ cargo run -p socialreins-brain
   calls: signed amounts, balance is the sum, `grant` and `spend` take an idempotency `ref` unique per team and
   kind, and `spend` locks the team row so the balance never goes below 0. `GET /v1/team/billing` and
   `GET /v1/team/credits` are read-only for any member. Nothing enforces a limit yet.
+- `app/src/controllers/ai_key.rs`: BYOK. `team_ai_keys` holds one sealed provider key per team (`anthropic` or
+  `openai`, plus `last4`); `/v1/team/ai-key` is owner and admin only and never answers the key. `key_of` gives
+  the clear key to the AI steps (not built yet), which use it before any credit is spent.
 - `app/src/controllers/waitlist.rs`: the public waitlist. No captcha: each new or unverified
   email gets a confirmation link to the web app, which posts the token to
   `POST /v1/waitlist/verify` (never a state-changing GET: mail scanners open links). Mail goes

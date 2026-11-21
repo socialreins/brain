@@ -4,6 +4,7 @@
 //! automations, public post pages), `/webhooks/meta` (Facebook and Instagram deliveries), `/mcp` (see `crate::mcp`), the Threads and Meta connect pages and
 //! `/media/{name}` (stored post files for platforms that download them).
 pub mod admin;
+pub mod ai_key;
 pub mod analytics;
 pub mod api_tokens;
 pub mod auth;
@@ -98,6 +99,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(teams::api())
         .merge(api_tokens::api())
         .merge(billing::api())
+        .merge(ai_key::api())
         .merge(webhooks::api())
         .merge(connections::api())
         .merge(meta::api())
