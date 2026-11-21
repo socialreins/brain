@@ -19,6 +19,7 @@ pub mod rate_limit;
 pub mod repeat;
 pub mod scheduler;
 pub mod state;
+pub mod stripe;
 pub mod turnstile;
 pub mod webhooks;
 

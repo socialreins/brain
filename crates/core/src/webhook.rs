@@ -29,8 +29,62 @@ pub fn verify_sha256(secret: &str, body: &[u8], header: &str) -> bool {
     hmac::verify(&key, body, &tag).is_ok()
 }
 
+/// Whether `header` is a `t=<unix seconds>,v1=<hex>[,v1=<hex>...]` signature (the format of
+/// `signature`, and the one Stripe sends) of `body` under `secret`: some `v1` must be the HMAC of
+/// `<t>.<body>`, compared in constant time, and `t` within `tolerance` seconds of `now`.
+pub fn verify_timestamped(
+    secret: &str,
+    body: &[u8],
+    header: &str,
+    now: i64,
+    tolerance: i64,
+) -> bool {
+    let mut t = None;
+    let mut tags: Vec<Vec<u8>> = Vec::new();
+    for part in header.split(',') {
+        match part.trim().split_once('=') {
+            Some(("t", v)) => t = v.parse::<i64>().ok(),
+            Some(("v1", v)) => tags.extend(hex::decode(v)),
+            _ => {}
+        }
+    }
+    let Some(t) = t.filter(|t| now.abs_diff(*t) <= tolerance.unsigned_abs()) else {
+        return false;
+    };
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+    let mut signed = format!("{t}.").into_bytes();
+    signed.extend_from_slice(body);
+    tags.iter()
+        .any(|tag| hmac::verify(&key, &signed, tag).is_ok())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn timestamped_signatures_need_a_fresh_t_and_one_good_v1() {
+        let sig = super::signature("whsec_x", 1000, "{}");
+        let (now, tol) = (1100, 300);
+        assert!(super::verify_timestamped("whsec_x", b"{}", &sig, now, tol));
+        assert!(!super::verify_timestamped("whsec_y", b"{}", &sig, now, tol));
+        assert!(!super::verify_timestamped(
+            "whsec_x", b"{ }", &sig, now, tol
+        ));
+        assert!(!super::verify_timestamped(
+            "whsec_x", b"{}", &sig, 1301, tol
+        ));
+        assert!(!super::verify_timestamped("whsec_x", b"{}", &sig, 699, tol));
+        // A rotated secret sends two v1 values; either may be the good one.
+        let v1 = sig.split_once("v1=").unwrap().1;
+        let two = format!("t=1000,v1={},v1={v1}", "00".repeat(32));
+        assert!(super::verify_timestamped("whsec_x", b"{}", &two, now, tol));
+        assert!(!super::verify_timestamped(
+            "whsec_x", b"{}", "t=1000", now, tol
+        ));
+        assert!(!super::verify_timestamped(
+            "whsec_x", b"{}", "v1=zz", now, tol
+        ));
+    }
+
     #[test]
     fn meta_signatures_are_checked_whole() {
         // Checked with: printf '{"a":1}' | openssl dgst -sha256 -hmac s3cret

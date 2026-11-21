@@ -28651,6 +28651,498 @@ mod teams {
             .unwrap();
         }
     }
+
+    mod stripe_api {
+        use super::*;
+        use axum::{
+            extract::Form, http::HeaderMap, routing::post as route, Json as AxJson, Router,
+        };
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        use socialreins_brain::stripe::Stripe;
+        use std::sync::Mutex;
+
+        const WHSEC: &str = "whsec_testsecret";
+        /// Every call the mock took: (path, basic-auth user, form).
+        static CALLS: Mutex<Vec<Call>> = Mutex::new(Vec::new());
+        type Call = (String, String, Vec<(String, String)>);
+
+        async fn mock() -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let take = |path: &'static str| {
+                move |headers: HeaderMap, Form(form): Form<Vec<(String, String)>>| async move {
+                    let auth = headers["authorization"].to_str().unwrap().to_owned();
+                    let user = String::from_utf8(
+                        base64::Engine::decode(
+                            &base64::engine::general_purpose::STANDARD,
+                            auth.trim_start_matches("Basic "),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    let fail = form.iter().any(|(k, v)| k == "customer" && v == "cus_fail");
+                    CALLS.lock().unwrap().push((path.into(), user, form));
+                    if fail {
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            AxJson(json!({"error": {"code": "resource_missing"}})),
+                        );
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        AxJson(json!({"url": format!("https://stripe.test{path}/s1")})),
+                    )
+                }
+            };
+            let cancel = |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                CALLS
+                    .lock()
+                    .unwrap()
+                    .push((format!("/cancel/{id}"), String::new(), Vec::new()));
+                AxJson(json!({"id": id, "status": "canceled"}))
+            };
+            let app = Router::new()
+                .route("/v1/subscriptions/{id}", axum::routing::delete(cancel))
+                .route("/v1/checkout/sessions", route(take("/checkout")))
+                .route("/v1/billing_portal/sessions", route(take("/portal")));
+            tokio::spawn(async move { axum::serve(listener, app).await });
+            base
+        }
+
+        /// Billing on, Stripe on the mock; `webhook` sets the signing secret.
+        async fn on(webhook: bool) -> (TestServer, DatabaseConnection) {
+            let base = mock().await;
+            server_where(|c| {
+                c.billing_enabled = true;
+                let mut s = Stripe::new(
+                    Some("sk_test_mock".into()),
+                    webhook.then(|| WHSEC.into()),
+                    [
+                        ("scheduler", Some("price_s".into())),
+                        ("automation", Some("price_a".into())),
+                    ],
+                )
+                .unwrap();
+                s.api_url = base;
+                c.stripe = s;
+            })
+            .await
+        }
+
+        async fn checkout(s: &TestServer, cookie: &str, plan: &str) -> axum_test::TestResponse {
+            req(s, Method::POST, "/v1/team/billing/checkout", cookie)
+                .json(&json!({"plan": plan}))
+                .await
+        }
+
+        fn form_of(path: &str, nth: usize) -> std::collections::HashMap<String, String> {
+            CALLS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.0 == path)
+                .nth(nth)
+                .map(|c| c.2.iter().cloned().collect())
+                .unwrap()
+        }
+
+        fn count(path: &str) -> usize {
+            CALLS.lock().unwrap().iter().filter(|c| c.0 == path).count()
+        }
+
+        async fn put_sub(
+            db: &DatabaseConnection,
+            team: &str,
+            status: &str,
+            customer: Option<&str>,
+        ) {
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO subscriptions (team_id, plan_id, status, provider, provider_customer_id)
+                 VALUES ($1, 'scheduler', $2, 'stripe', $3)
+                 ON CONFLICT (team_id) DO UPDATE SET status = $2, provider_customer_id = $3",
+                [team.parse::<uuid::Uuid>().unwrap().into(), status.into(), customer.into()],
+            ))
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn checkout_goes_to_stripe_with_the_team_and_a_first_trial() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let before = count("/checkout");
+            let res = checkout(&s, &owner, "scheduler").await;
+            res.assert_status_ok();
+            res.assert_json(&json!({"url": "https://stripe.test/checkout/s1"}));
+            let f = form_of("/checkout", before);
+            assert_eq!(f["mode"], "subscription");
+            assert_eq!(f["line_items[0][price]"], "price_s");
+            assert_eq!(f["client_reference_id"], team);
+            assert_eq!(f["subscription_data[metadata][team_id]"], team);
+            assert_eq!(f["subscription_data[trial_period_days]"], "7");
+            assert!(f["customer_email"].contains('@'), "{f:?}");
+            assert!(f["success_url"].ends_with("/billing?checkout=success"));
+            assert_eq!(CALLS.lock().unwrap().last().unwrap().1, "sk_test_mock:");
+
+            for bad in ["pro", ""] {
+                let res = checkout(&s, &owner, bad).await;
+                assert_eq!(res.status_code(), 422);
+                res.assert_json(&json!({"error": "invalid_plan"}));
+            }
+            // A live plan is changed in the portal, not bought again.
+            put_sub(&db, &team, "active", Some("cus_1")).await;
+            let res = checkout(&s, &owner, "automation").await;
+            assert_eq!(res.status_code(), 409);
+            res.assert_json(&json!({"error": "already_subscribed"}));
+            // After it ended: no second trial, the same Stripe customer.
+            put_sub(&db, &team, "canceled", Some("cus_1")).await;
+            let n = count("/checkout");
+            checkout(&s, &owner, "automation").await.assert_status_ok();
+            let f = form_of("/checkout", n);
+            assert_eq!(f["line_items[0][price]"], "price_a");
+            assert_eq!(f["customer"], "cus_1");
+            assert!(!f.contains_key("subscription_data[trial_period_days]"));
+            assert!(!f.contains_key("customer_email"));
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn only_a_recently_signed_in_owner_reaches_stripe_and_only_when_it_is_on() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let before = count("/checkout") + count("/portal");
+            // Seats for the two who join.
+            put_sub(&db, &team, "active", Some("cus_1")).await;
+            let (admin, _) = joined(&s, &db, &team, "admin").await;
+            let (member, _) = joined(&s, &db, &team, "member").await;
+            for who in [&admin, &member] {
+                assert_eq!(checkout(&s, who, "scheduler").await.status_code(), 403);
+                let res = req(&s, Method::POST, "/v1/team/billing/portal", who).await;
+                assert_eq!(res.status_code(), 403);
+            }
+            let aged = sessions::ActiveModel {
+                token_hash: Set(token::hash(owner.trim_start_matches("sr_session="))),
+                created_at: Set((Utc::now() - Duration::minutes(11)).fixed_offset()),
+                ..Default::default()
+            };
+            sessions::Entity::update(aged).exec(&db).await.unwrap();
+            let res = checkout(&s, &owner, "scheduler").await;
+            res.assert_json(&json!({"error": "reauth_required"}));
+            assert_eq!(count("/checkout") + count("/portal"), before);
+            // Stripe unset, and billing off, are unavailable, not errors.
+            let (s, db) = server_where(|c| c.billing_enabled = true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let res = checkout(&s, &owner, "scheduler").await;
+            assert_eq!(res.status_code(), 503);
+            res.assert_json(&json!({"error": "billing_unavailable"}));
+            let (s, db) = server_where(|_| {}).await;
+            let (_, owner, _) = user(&s, &db).await;
+            assert_eq!(checkout(&s, &owner, "scheduler").await.status_code(), 503);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn the_portal_needs_a_customer_and_reports_a_refusal_from_stripe() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let portal = || req(&s, Method::POST, "/v1/team/billing/portal", &owner);
+            let res = portal().await;
+            assert_eq!(res.status_code(), 409);
+            res.assert_json(&json!({"error": "no_customer"}));
+            put_sub(&db, &team, "active", Some("cus_9")).await;
+            let n = count("/portal");
+            let res = portal().await;
+            res.assert_status_ok();
+            res.assert_json(&json!({"url": "https://stripe.test/portal/s1"}));
+            let f = form_of("/portal", n);
+            assert_eq!(f["customer"], "cus_9");
+            assert!(f["return_url"].ends_with("/billing"));
+            put_sub(&db, &team, "active", Some("cus_fail")).await;
+            let res = portal().await;
+            assert_eq!(res.status_code(), 502);
+            res.assert_json(&json!({"error": "stripe_failed"}));
+        }
+
+        /// Event ids and subscription ids are kept for good, so each run gets its own.
+        static RUN: std::sync::LazyLock<String> =
+            std::sync::LazyLock::new(|| uuid::Uuid::now_v7().simple().to_string());
+
+        fn sub_event(
+            id: &str,
+            created: i64,
+            sub: &str,
+            team: &str,
+            status: &str,
+            price: &str,
+        ) -> String {
+            json!({
+                "id": format!("{id}_{}", *RUN), "type": "customer.subscription.updated", "created": created,
+                "data": {"object": {
+                    "id": format!("{sub}_{}", *RUN), "customer": "cus_7", "status": status,
+                    "cancel_at_period_end": false, "trial_end": 1_800_000_000,
+                    "metadata": {"team_id": team},
+                    "items": {"data": [{"price": {"id": price}, "current_period_end": 1_900_000_000}]}
+                }}
+            })
+            .to_string()
+        }
+
+        async fn deliver(
+            s: &TestServer,
+            body: &str,
+            secret: &str,
+            t: i64,
+        ) -> axum_test::TestResponse {
+            let sig = socialreins_core::webhook::signature(secret, t, body);
+            s.post("/webhooks/stripe")
+                .add_header("stripe-signature", sig)
+                .bytes(body.to_owned().into())
+                .await
+        }
+
+        async fn plan_of(s: &TestServer, cookie: &str) -> Value {
+            let res = s
+                .get("/v1/team/billing")
+                .add_header("cookie", cookie.to_owned())
+                .await;
+            res.json::<Value>()["plan"].clone()
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn the_webhook_checks_the_signature_first_and_is_off_without_a_secret() {
+            let (s, db) = on(false).await;
+            let res = deliver(&s, "{}", WHSEC, Utc::now().timestamp()).await;
+            assert_eq!(res.status_code(), 404);
+            let _ = db;
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let now = Utc::now().timestamp();
+            let body = sub_event("evt_sig", now, "sub_sig", &team, "active", "price_s");
+            assert_eq!(
+                deliver(&s, &body, "whsec_other", now).await.status_code(),
+                403
+            );
+            assert_eq!(
+                deliver(&s, &body, WHSEC, now - 600).await.status_code(),
+                403
+            );
+            let none = s.post("/webhooks/stripe").bytes(body.clone().into()).await;
+            assert_eq!(none.status_code(), 403);
+            let tampered = s
+                .post("/webhooks/stripe")
+                .add_header(
+                    "stripe-signature",
+                    socialreins_core::webhook::signature(WHSEC, now, &body),
+                )
+                .bytes(body.replace("active", "trialing").into())
+                .await;
+            assert_eq!(tampered.status_code(), 403);
+            assert_eq!(plan_of(&s, &owner).await, Value::Null);
+            assert_eq!(deliver(&s, &body, WHSEC, now).await.status_code(), 200);
+            assert_eq!(plan_of(&s, &owner).await["status"], "active");
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn subscription_events_set_the_plan_once_and_in_order() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let now = Utc::now().timestamp();
+            let send = |body: String| {
+                let s = &s;
+                async move { deliver(s, &body, WHSEC, now).await.status_code() }
+            };
+            // Created in trial on the Scheduler plan.
+            assert_eq!(
+                send(sub_event(
+                    "evt_1",
+                    now - 30,
+                    "sub_1",
+                    &team,
+                    "trialing",
+                    "price_s"
+                ))
+                .await,
+                200
+            );
+            let p = plan_of(&s, &owner).await;
+            assert_eq!(
+                (p["id"].clone(), p["status"].clone()),
+                (json!("scheduler"), json!("trialing"))
+            );
+            assert!(p["trial_ends_at"].is_string() && p["current_period_end"].is_string());
+            // The same event again, even with other content, changes nothing.
+            assert_eq!(
+                send(sub_event(
+                    "evt_1",
+                    now - 30,
+                    "sub_1",
+                    &team,
+                    "canceled",
+                    "price_s"
+                ))
+                .await,
+                200
+            );
+            assert_eq!(plan_of(&s, &owner).await["status"], "trialing");
+            // An upgrade, then an older event arriving late is dropped.
+            assert_eq!(
+                send(sub_event(
+                    "evt_2",
+                    now - 10,
+                    "sub_1",
+                    &team,
+                    "active",
+                    "price_a"
+                ))
+                .await,
+                200
+            );
+            assert_eq!(plan_of(&s, &owner).await["id"], "automation");
+            assert_eq!(
+                send(sub_event(
+                    "evt_3",
+                    now - 20,
+                    "sub_1",
+                    &team,
+                    "trialing",
+                    "price_s"
+                ))
+                .await,
+                200
+            );
+            assert_eq!(plan_of(&s, &owner).await["id"], "automation");
+            assert_eq!(plan_of(&s, &owner).await["status"], "active");
+            // A failed payment keeps the plan, a deleted subscription ends it.
+            assert_eq!(
+                send(sub_event(
+                    "evt_4",
+                    now - 5,
+                    "sub_1",
+                    &team,
+                    "past_due",
+                    "price_a"
+                ))
+                .await,
+                200
+            );
+            let b = s
+                .get("/v1/team/billing")
+                .add_header("cookie", owner.clone())
+                .await
+                .json::<Value>();
+            assert_eq!(b["plan"]["status"], "past_due");
+            assert_eq!(b["limits"]["automation"], true);
+            let gone = sub_event("evt_5", now - 1, "sub_1", &team, "canceled", "price_a")
+                .replace("subscription.updated", "subscription.deleted");
+            assert_eq!(send(gone).await, 200);
+            let b = s
+                .get("/v1/team/billing")
+                .add_header("cookie", owner.clone())
+                .await
+                .json::<Value>();
+            assert_eq!(b["plan"]["status"], "canceled");
+            assert_eq!(b["limits"]["accounts"], 0);
+            // The end of an old subscription does not end a newer live one.
+            assert_eq!(
+                send(sub_event("evt_6", now, "sub_2", &team, "active", "price_s")).await,
+                200
+            );
+            assert_eq!(plan_of(&s, &owner).await["status"], "active");
+            assert_eq!(
+                send(sub_event(
+                    "evt_7",
+                    now + 1,
+                    "sub_1",
+                    &team,
+                    "canceled",
+                    "price_a"
+                ))
+                .await,
+                200
+            );
+            let p = plan_of(&s, &owner).await;
+            assert_eq!(
+                (p["id"].clone(), p["status"].clone()),
+                (json!("scheduler"), json!("active"))
+            );
+        }
+
+        /// Two checkouts open at once end as two live subscriptions: the first stays the team's,
+        /// the second is cancelled in Stripe and never written.
+        #[tokio::test]
+        #[serial]
+        async fn a_second_live_subscription_is_cancelled_not_kept() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let now = Utc::now().timestamp();
+            let first = sub_event("evt_f1", now - 10, "sub_f1", &team, "active", "price_s");
+            assert_eq!(deliver(&s, &first, WHSEC, now).await.status_code(), 200);
+            let before = count(&format!("/cancel/sub_f2_{}", *RUN));
+            let second = sub_event("evt_f2", now, "sub_f2", &team, "active", "price_a");
+            assert_eq!(deliver(&s, &second, WHSEC, now).await.status_code(), 200);
+            assert_eq!(count(&format!("/cancel/sub_f2_{}", *RUN)), before + 1);
+            let p = plan_of(&s, &owner).await;
+            assert_eq!(
+                (p["id"].clone(), p["status"].clone()),
+                (json!("scheduler"), json!("active"))
+            );
+            // Its own later events still apply, and its second delivery cancels nothing more.
+            assert_eq!(deliver(&s, &second, WHSEC, now).await.status_code(), 200);
+            assert_eq!(count(&format!("/cancel/sub_f2_{}", *RUN)), before + 1);
+            let renewed = sub_event("evt_f3", now + 5, "sub_f1", &team, "active", "price_s");
+            assert_eq!(deliver(&s, &renewed, WHSEC, now).await.status_code(), 200);
+            assert_eq!(plan_of(&s, &owner).await["id"], "scheduler");
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn events_for_nobody_unknown_prices_unstarted_or_other_kinds_change_nothing() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let now = Utc::now().timestamp();
+            let nobody = uuid::Uuid::now_v7().to_string();
+            let events = [
+                sub_event("evt_a", now, "sub_a", &nobody, "active", "price_s"),
+                sub_event("evt_b", now, "sub_b", &team, "active", "price_other"),
+                sub_event("evt_c", now, "sub_c", &team, "incomplete", "price_s"),
+                sub_event("evt_d", now, "sub_d", "not-a-uuid", "active", "price_s"),
+                json!({"id": format!("evt_e_{}", *RUN), "type": "invoice.payment_failed", "created": now,
+                       "data": {"object": {}}})
+                .to_string(),
+                "not json".to_owned(),
+            ];
+            for body in events {
+                assert_eq!(
+                    deliver(&s, &body, WHSEC, now).await.status_code(),
+                    200,
+                    "{body}"
+                );
+            }
+            assert_eq!(plan_of(&s, &owner).await, Value::Null);
+            // An event that was not applied is not remembered, so it can be sent again.
+            let row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT count(*)::bigint AS n FROM stripe_events WHERE id = $1",
+                    [format!("evt_b_{}", *RUN).into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
+        }
+    }
 }
 
 /// Turnstile on the public forms and `POST /v1/contact`, against a local fake siteverify (it

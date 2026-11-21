@@ -33,6 +33,7 @@ pub mod posts;
 pub mod queue;
 pub mod review_login;
 pub mod social_sets;
+pub mod stripe;
 pub mod subscribers;
 pub mod teams;
 pub mod threads;
@@ -100,6 +101,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(api_tokens::api())
         .merge(billing::api())
         .merge(ai_key::api())
+        .merge(stripe::api())
         .merge(webhooks::api())
         .merge(connections::api())
         .merge(meta::api())
@@ -201,6 +203,7 @@ pub fn router(state: AppState, config: &Config) -> Router {
         .merge(x::routes())
         .merge(meta::routes())
         .merge(meta_webhook::routes())
+        .merge(stripe::routes())
         .merge(media::routes())
         .nest(
             "/v1",
