@@ -1043,6 +1043,11 @@ async fn invite(
 /// Stores the invitation (replacing a pending one for the address) and emails its link; `201`
 /// with the invitation, or the error reply.
 async fn send_invitation(app: &AppState, t: &InTeam, email: String, role: Role) -> Response {
+    match crate::billing::members_full(app.billing_enabled, &app.db, t.team.id, true).await {
+        Ok(false) => {}
+        Ok(true) => return super::billing::plan_limit(crate::billing::Limit::Members),
+        Err(e) => return internal(e, "plan read"),
+    }
     let now = Utc::now().fixed_offset();
     let swept = team_invitations::Entity::delete_many()
         .filter(team_invitations::Column::ExpiresAt.lt(now))
@@ -1232,6 +1237,21 @@ async fn accept(
     // Both are stored lowercased; a mismatch leaves the invitation for the right account.
     if inv.email != user.email.to_lowercase() {
         return reply(StatusCode::FORBIDDEN, "email_mismatch");
+    }
+    // The invitation holds its own seat, so only members count here. Someone already in the team
+    // takes none.
+    match membership(&app.db, inv.team_id, user.id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            match crate::billing::members_full(app.billing_enabled, &app.db, inv.team_id, false)
+                .await
+            {
+                Ok(false) => {}
+                Ok(true) => return super::billing::plan_limit(crate::billing::Limit::Members),
+                Err(e) => return internal(e, "plan read"),
+            }
+        }
+        Err(e) => return internal(e, "membership read"),
     }
     let joined = async {
         let txn = app.db.begin().await?;

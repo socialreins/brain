@@ -253,6 +253,9 @@ async fn create(
     if !t.role.manages() {
         return forbidden();
     }
+    if let Some(res) = super::billing::needs_automation(&app, t.team.id).await {
+        return res;
+    }
     let (name, text, tag, platform) = match checked(input) {
         Ok(c) => c,
         Err(field) => return invalid(field),
@@ -410,6 +413,9 @@ async fn send(
 ) -> Response {
     if !t.role.manages() {
         return forbidden();
+    }
+    if let Some(res) = super::billing::needs_automation(&app, t.team.id).await {
+        return res;
     }
     let team = t.team.id;
     let started = match broadcasts::start(&app.db, team, id, input.confirm_total).await {

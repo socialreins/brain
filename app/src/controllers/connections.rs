@@ -15,8 +15,8 @@ use chrono::{DateTime, FixedOffset, Utc};
 use sea_orm::{
     sea_query::{OnConflict, Query, SelectStatement},
     ActiveValue::Set,
-    ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DbBackend, DbErr, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, QuerySelect, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -414,7 +414,10 @@ async fn connect_bluesky(
         social_accounts::Column::InboxErrorAt,
         social_accounts::Column::UpdatedAt,
     ];
-    match save_account(&app.db, (t.team.id, new_id), row, refresh).await {
+    match save_account(&app, (t.team.id, new_id), row, refresh).await {
+        Err(e) if crate::billing::is_account_limit(&e) => {
+            super::billing::plan_limit(crate::billing::Limit::Accounts)
+        }
         Ok((true, json)) => (StatusCode::CREATED, Json(json)).into_response(),
         Ok((false, json)) => Json(json).into_response(),
         Err(e) => internal(e, "bluesky account save"),
@@ -425,12 +428,21 @@ async fn connect_bluesky(
 /// updates that row's `refresh` columns and keeps its id, sets and creator. Either way the
 /// account is in the team's default set. Returns whether it is new, and its JSON.
 pub(crate) async fn save_account(
-    db: &DatabaseConnection,
+    app: &AppState,
     (team_id, new_id): (Uuid, Uuid),
     row: social_accounts::ActiveModel,
     refresh: impl IntoIterator<Item = social_accounts::Column>,
 ) -> Result<(bool, Connection), DbErr> {
-    let txn = db.begin().await?;
+    let txn = app.db.begin().await?;
+    if app.billing_enabled {
+        // One connect at a time per team, so two cannot both take the last place.
+        txn.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT 1 FROM teams WHERE id = $1 FOR NO KEY UPDATE",
+            [team_id.into()],
+        ))
+        .await?;
+    }
     let set = default_set(&txn, team_id).await?;
     let upsert = OnConflict::columns([
         social_accounts::Column::TeamId,
@@ -452,6 +464,19 @@ pub(crate) async fn save_account(
         .exec_without_returning(&txn)
         .await?;
     let created = account.id == new_id;
+    if created && app.billing_enabled {
+        let max = crate::billing::limits_of(true, &txn, team_id)
+            .await?
+            .accounts;
+        let have = social_accounts::Entity::find()
+            .filter(social_accounts::Column::TeamId.eq(team_id))
+            .count(&txn)
+            .await?;
+        if max.is_some_and(|m| i64::try_from(have).unwrap_or(i64::MAX) > m) {
+            // Dropping the transaction takes the new account back.
+            return Err(DbErr::Custom(crate::billing::ACCOUNT_LIMIT.into()));
+        }
+    }
     if !created {
         // A reconnect mends what made a read fail, a lost permission above all.
         crate::metrics::reset(&txn, account.id).await?;

@@ -198,6 +198,9 @@ async fn create(
     if !t.role.manages() {
         return forbidden();
     }
+    if let Some(res) = super::billing::needs_automation(&app, t.team.id).await {
+        return res;
+    }
     let (subject, body) = match newsletters::checked(&input.subject, &input.body) {
         Ok(c) => c,
         Err(field) => return invalid(field),
@@ -383,6 +386,9 @@ async fn send(
 ) -> Response {
     if !t.role.manages() {
         return forbidden();
+    }
+    if let Some(res) = super::billing::needs_automation(&app, t.team.id).await {
+        return res;
     }
     let team = t.team.id;
     let started = match newsletters::start(&app.db, team, id, input.confirm_total).await {

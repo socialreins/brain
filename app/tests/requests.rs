@@ -3432,7 +3432,7 @@ mod teams {
         use socialreins_brain::models::{social_account_social_set, social_accounts};
         use std::collections::HashMap;
 
-        const APP_PASSWORD: &str = "abcd-efgh-ijkl-mnop";
+        pub(super) const APP_PASSWORD: &str = "abcd-efgh-ijkl-mnop";
         const NEW_APP_PASSWORD: &str = "qrst-uvwx-yzab-cdef";
         const ACCOUNT_PASSWORD: &str = "the-account-password";
 
@@ -3446,7 +3446,7 @@ mod teams {
         }
 
         /// Handles `*.test` resolve to `did:plc:<first label>`, except `nobody.test`.
-        async fn mock_bluesky() -> String {
+        pub(super) async fn mock_bluesky() -> String {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             let resolve = |Query(q): Query<HashMap<String, String>>| async move {
@@ -28339,6 +28339,186 @@ mod teams {
             let res = put(&s, &owner, "anthropic", KEY).await;
             assert_eq!(res.status_code(), 403);
             res.assert_json(&json!({"error": "reauth_required"}));
+        }
+    }
+
+    mod plan_limits_api {
+        use super::*;
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+        async fn subscribe(db: &DatabaseConnection, team: &str, plan: &str) {
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO subscriptions (team_id, plan_id, status) VALUES ($1, $2, 'active')
+                 ON CONFLICT (team_id) DO UPDATE SET plan_id = $2, status = 'active'",
+                [team.parse::<uuid::Uuid>().unwrap().into(), plan.into()],
+            ))
+            .await
+            .unwrap();
+        }
+
+        async fn post(s: &TestServer, cookie: &str, path: &str, body: Value) -> (u16, Value) {
+            let res = req(s, Method::POST, path, cookie).json(&body).await;
+            (res.status_code().as_u16(), res.json())
+        }
+
+        /// A plan without automation refuses to create or send any of its features; one with it,
+        /// or billing off, gets past the gate (to the route's own checks).
+        #[tokio::test]
+        #[serial]
+        async fn automation_needs_the_plan() {
+            let creates = [
+                (
+                    "/v1/automations",
+                    json!({"name": "a", "trigger": "dm_received"}),
+                ),
+                (
+                    "/v1/broadcasts",
+                    json!({"name": "b", "text": "hi", "tag": "t"}),
+                ),
+                ("/v1/newsletters", json!({"subject": "s", "body": "b"})),
+                ("/v1/inboxes", json!({"name": "i"})),
+            ];
+            let (s, db) = server_where(|c| c.billing_enabled = true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let refused = json!({"error": "plan_limit", "limit": "automation"});
+            // No plan at all.
+            let (code, body) = post(&s, &owner, creates[0].0, creates[0].1.clone()).await;
+            assert_eq!((code, body), (402, refused.clone()));
+            subscribe(&db, &team, "scheduler").await;
+            for (path, body) in &creates {
+                let (code, answer) = post(&s, &owner, path, body.clone()).await;
+                assert_eq!((code, answer), (402, refused.clone()), "{path}");
+            }
+            subscribe(&db, &team, "automation").await;
+            for (path, body) in &creates {
+                let (code, _) = post(&s, &owner, path, body.clone()).await;
+                assert_ne!(code, 402, "{path}");
+            }
+            // Self-hosted: never capped.
+            let (s, db) = server_where(|_| {}).await;
+            let (_, owner, _) = user(&s, &db).await;
+            for (path, body) in &creates {
+                let (code, _) = post(&s, &owner, path, body.clone()).await;
+                assert_ne!(code, 402, "{path}");
+            }
+        }
+
+        /// Open invitations hold a seat: a plan of 3 members takes 2 invitations beside the owner.
+        #[tokio::test]
+        #[serial]
+        async fn members_stop_at_the_plan() {
+            let (s, db) = server_where(|c| c.billing_enabled = true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let invite = |email: String| {
+                let (s, owner) = (&s, owner.clone());
+                async move {
+                    post(
+                        s,
+                        &owner,
+                        "/v1/team/invitations",
+                        json!({"email": email, "role": "member"}),
+                    )
+                    .await
+                }
+            };
+            // No plan: no seat.
+            let (code, body) = invite(unique_email()).await;
+            assert_eq!(
+                (code, body),
+                (402, json!({"error": "plan_limit", "limit": "members"}))
+            );
+            subscribe(&db, &team, "scheduler").await;
+            assert_eq!(invite(unique_email()).await.0, 201);
+            assert_eq!(invite(unique_email()).await.0, 201);
+            let (code, body) = invite(unique_email()).await;
+            assert_eq!(
+                (code, body),
+                (402, json!({"error": "plan_limit", "limit": "members"}))
+            );
+            // The upgrade frees seats.
+            subscribe(&db, &team, "automation").await;
+            assert_eq!(invite(unique_email()).await.0, 201);
+        }
+
+        /// A new account past the plan's limit is refused and not saved; reconnecting one the
+        /// team already holds is not a new place.
+        #[tokio::test]
+        #[serial]
+        async fn accounts_stop_at_the_plan() {
+            let base = super::connections::mock_bluesky().await;
+            let (s, db) = server_where(|c| {
+                c.billing_enabled = true;
+                c.bluesky.appview = base.clone();
+                c.bluesky.plc = base.clone();
+                c.bluesky.video = base;
+                c.bluesky.allow_insecure_pds = true;
+            })
+            .await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            db.execute_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "INSERT INTO plans (id, name, max_accounts, max_members, automation, max_contacts)
+                 VALUES ('test-one', 'Test one', 1, NULL, false, NULL) ON CONFLICT DO NOTHING",
+            ))
+            .await
+            .unwrap();
+            let connect = |handle: String| {
+                let (s, owner) = (&s, owner.clone());
+                async move {
+                    post(
+                        s,
+                        &owner,
+                        "/v1/connections/bluesky",
+                        json!({"handle": handle, "app_password": super::connections::APP_PASSWORD}),
+                    )
+                    .await
+                }
+            };
+            let handle = |n: &str| {
+                format!(
+                    "{n}{}.test",
+                    &uuid::Uuid::now_v7().simple().to_string()[20..]
+                )
+            };
+            let (first, second) = (handle("a"), handle("b"));
+            // No plan: nothing.
+            let (code, body) = connect(first.clone()).await;
+            assert_eq!(
+                (code, body),
+                (402, json!({"error": "plan_limit", "limit": "accounts"}))
+            );
+            subscribe(&db, &team, "test-one").await;
+            assert_eq!(connect(first.clone()).await.0, 201);
+            let (code, body) = connect(second.clone()).await;
+            assert_eq!(
+                (code, body),
+                (402, json!({"error": "plan_limit", "limit": "accounts"}))
+            );
+            // The refused account was not kept, and the held one reconnects.
+            assert_eq!(connect(first).await.0, 200);
+            let held = s
+                .get("/v1/connections")
+                .add_header("cookie", owner.clone())
+                .await;
+            assert_eq!(held.json::<Vec<Value>>().len(), 1);
+            subscribe(&db, &team, "scheduler").await;
+            assert_eq!(connect(second).await.0, 201);
+            db.execute_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "DELETE FROM subscriptions WHERE plan_id = 'test-one'",
+            ))
+            .await
+            .unwrap();
+            db.execute_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "DELETE FROM plans WHERE id = 'test-one'",
+            ))
+            .await
+            .unwrap();
         }
     }
 }

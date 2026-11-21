@@ -253,7 +253,7 @@ async fn save(
         social_accounts::Column::Meta,
         social_accounts::Column::UpdatedAt,
     ];
-    let (_, json) = save_account(&app.db, (team_id, new_id), row, refresh).await?;
+    let (_, json) = save_account(app, (team_id, new_id), row, refresh).await?;
     Ok(json)
 }
 
