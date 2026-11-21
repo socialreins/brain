@@ -14207,6 +14207,34 @@ mod teams {
                     assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 0);
                 }
 
+                /// Credits held for posts that did not go out come back; the ones that went out stay spent.
+                #[tokio::test]
+                #[serial]
+                async fn credits_for_x_posts_that_failed_come_back() {
+                    use socialreins_brain::billing::{self, Kind};
+                    let (s, db, mut state, _, _, cookie, team_id, set) = team().await;
+                    state.billing_enabled = true;
+                    let team: uuid::Uuid = team_id.parse().unwrap();
+                    billing::grant(&db, team, Kind::X, 6, "test", None)
+                        .await
+                        .unwrap();
+                    // The first post is refused by X: nothing went out, nothing is kept.
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "REJECT it")).await);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(
+                        get_post(&s, &cookie, &id).await["targets"][0]["status"],
+                        "failed"
+                    );
+                    assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 6);
+                    // A thread of four stops at its third post: two went out, two are given back.
+                    let body = thread(&set, "one", &["two", "REJECT three", "four"]);
+                    let id = id_of(&create(&s, &cookie, body).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["targets"][0]["status"], "failed", "{p}");
+                    assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 4);
+                }
+
                 /// Several X posts due at once for a team with one credit: one goes out, not all.
                 #[tokio::test]
                 #[serial]

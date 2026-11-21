@@ -1705,39 +1705,52 @@ async fn load(
     Ok(files)
 }
 
-/// One lock per team, for its X posts while billing is on. The map only grows by a team's entry.
-static X_TURNS: LazyLock<
-    std::sync::Mutex<std::collections::HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
-> = LazyLock::new(Default::default);
-
-async fn x_turn(team: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
-    let lock = X_TURNS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry(team)
-        .or_default()
-        .clone();
-    lock.lock_owned().await
+/// Credits held for the X posts of one target, until it is known how many went out.
+struct XHold {
+    reference: String,
+    amount: i64,
+    root_before: bool,
+    parts_before: usize,
 }
 
-/// Takes the credit for one X post that is already out, once per `reference`. A refused or
-/// failed spend is logged and does not undo the post.
-async fn charge_x(app: &AppState, team: Uuid, reference: &str) {
-    match billing::spend(
+/// Gives back the credits held for X posts that did not go out: what was held minus the root and
+/// parts this attempt saved. A failure here is logged; the team is then charged for posts that
+/// never went out, which is the safe side for us.
+async fn release_x(app: &AppState, post: &posts::Model, id: Uuid, hold: XHold) {
+    let read = async {
+        let t = post_targets::Entity::find_by_id(id).one(&app.db).await?;
+        let root = t.as_ref().is_some_and(|t| t.remote_id.is_some());
+        let parts = t
+            .and_then(|t| t.parts.as_array().map(Vec::len))
+            .unwrap_or_default();
+        Ok::<_, DbErr>((root, parts))
+    };
+    let back = match read.await {
+        Ok((root, parts)) => {
+            let sent = i64::from(root && !hold.root_before)
+                + i64::try_from(parts.saturating_sub(hold.parts_before)).unwrap_or(i64::MAX);
+            hold.amount - sent
+        }
+        Err(e) => {
+            tracing::error!(error = %e, %id, "x credits not released: target unreadable");
+            return;
+        }
+    };
+    if back <= 0 {
+        return;
+    }
+    let reference = Some(hold.reference.as_str());
+    if let Err(e) = billing::grant(
         &app.db,
-        team,
+        post.team_id,
         billing::Kind::X,
-        1,
-        "x post",
-        Some(reference),
+        back,
+        "x post unsent",
+        reference,
     )
     .await
     {
-        Ok(billing::Spent::Taken | billing::Spent::Repeated) => {}
-        Ok(billing::Spent::Short(_)) => {
-            tracing::warn!(%team, reference, "x post went out without a credit")
-        }
-        Err(e) => tracing::error!(error = %e, %team, reference, "x credit spend failed"),
+        tracing::error!(error = %e, %id, back, "x credits not released");
     }
 }
 
@@ -1902,6 +1915,21 @@ async fn publish_target(
     id: Uuid,
     stored: &Media,
 ) -> Result<(), DbErr> {
+    let mut hold = None;
+    let done = publish_target_held(app, post, id, stored, &mut hold).await;
+    if let Some(hold) = hold {
+        release_x(app, post, id, hold).await;
+    }
+    done
+}
+
+async fn publish_target_held(
+    app: &AppState,
+    post: &posts::Model,
+    id: Uuid,
+    stored: &Media,
+    hold: &mut Option<XHold>,
+) -> Result<(), DbErr> {
     let Ok(_slot) = TARGET_SLOTS.acquire().await else {
         return Ok(());
     };
@@ -1980,30 +2008,31 @@ async fn publish_target(
             url: t.remote_url.clone(),
         })
     });
-    // On Cloud an X post costs the team one credit each, the root and every thread part. Taken
-    // after each post is out (a failed post costs nothing); this only stops a team that cannot
-    // pay for the whole thread before it starts.
-    // A team's X posts go one at a time here, so two cannot both pass the check on the last
-    // credit. shortcut: this holds inside one process only; with several brain instances a race
-    // can still let a post out, and the later spend is refused and logged.
-    let x_credits = post.platform == "x" && app.billing_enabled;
-    let _one_at_a_time = if x_credits {
-        Some(x_turn(post.team_id).await)
-    } else {
-        None
-    };
-    if x_credits {
+    // On Cloud an X post costs the team one credit each, the root and every thread part. They
+    // are taken here, before anything is sent, so posts due together cannot spend the same
+    // credit; `publish_target` gives back what did not go out. A crash in between keeps them.
+    if post.platform == "x" && app.billing_enabled {
         let todo = i64::from(resumed.is_none()) + thread.len().saturating_sub(saved.len()) as i64;
-        match billing::balance(db, post.team_id, billing::Kind::X).await {
-            Ok(have) if have >= todo => {}
-            Ok(have) => {
-                let msg = format!(
-                    "Posting to X needs {todo} credit{} and the team has {have}. Add X credits to post.",
-                    if todo == 1 { "" } else { "s" }
-                );
-                return fail_target(db, id, &msg).await;
+        if todo > 0 {
+            let reference = format!("{id}:{}", Uuid::now_v7());
+            let kind = billing::Kind::X;
+            match billing::spend(db, post.team_id, kind, todo, "x post", Some(&reference)).await? {
+                billing::Spent::Taken | billing::Spent::Repeated => {
+                    *hold = Some(XHold {
+                        reference,
+                        amount: todo,
+                        root_before: resumed.is_some(),
+                        parts_before: saved.len(),
+                    });
+                }
+                billing::Spent::Short(have) => {
+                    let msg = format!(
+                        "Posting to X needs {todo} credit{} and the team has {have}. Add X credits to post.",
+                        if todo == 1 { "" } else { "s" }
+                    );
+                    return fail_target(db, id, &msg).await;
+                }
             }
-            Err(e) => return Err(e),
         }
     }
     let root = match resumed {
@@ -2043,9 +2072,6 @@ async fn publish_target(
                 ],
             );
             db.execute_raw(stmt).await?;
-            if x_credits {
-                charge_x(app, post.team_id, &id.to_string()).await;
-            }
             root
         }
     };
@@ -2107,9 +2133,6 @@ async fn publish_target(
             "UPDATE post_targets SET parts = parts || $2, updated_at = now() WHERE id = $1",
             vec![id.into(), saved.into()],
         );
-        if x_credits {
-            charge_x(app, post.team_id, &format!("{id}:{}", i + 1)).await;
-        }
         if let Err(e) = db.execute_raw(stmt).await {
             let msg = unsaved_part(i + 1, thread.len());
             // Best effort: with the database down, recovery fails it later with a like message.
