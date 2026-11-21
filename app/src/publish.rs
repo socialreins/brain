@@ -1709,41 +1709,24 @@ async fn load(
 struct XHold {
     reference: String,
     amount: i64,
-    root_before: bool,
-    parts_before: usize,
+    /// Posts the platform took in this attempt, counted as each `send` returns, before anything
+    /// is saved: a post that is out but not recorded is still paid for.
+    sent: i64,
 }
 
-/// Gives back the credits held for X posts that did not go out: what was held minus the root and
-/// parts this attempt saved. A failure here is logged; the team is then charged for posts that
-/// never went out, which is the safe side for us.
+/// Gives back the credits held for X posts that did not go out. A failure here is logged; the
+/// team is then charged for posts that never went out, which is the safe side for us.
 async fn release_x(app: &AppState, post: &posts::Model, id: Uuid, hold: XHold) {
-    let read = async {
-        let t = post_targets::Entity::find_by_id(id).one(&app.db).await?;
-        let root = t.as_ref().is_some_and(|t| t.remote_id.is_some());
-        let parts = t
-            .and_then(|t| t.parts.as_array().map(Vec::len))
-            .unwrap_or_default();
-        Ok::<_, DbErr>((root, parts))
-    };
-    let back = match read.await {
-        Ok((root, parts)) => {
-            let sent = i64::from(root && !hold.root_before)
-                + i64::try_from(parts.saturating_sub(hold.parts_before)).unwrap_or(i64::MAX);
-            hold.amount - sent
-        }
-        Err(e) => {
-            tracing::error!(error = %e, %id, "x credits not released: target unreadable");
-            return;
-        }
-    };
+    let back = hold.amount - hold.sent;
     if back <= 0 {
         return;
     }
     let reference = Some(hold.reference.as_str());
+    let kind = billing::Kind::X;
     if let Err(e) = billing::grant(
         &app.db,
         post.team_id,
-        billing::Kind::X,
+        kind,
         back,
         "x post unsent",
         reference,
@@ -2021,8 +2004,7 @@ async fn publish_target_held(
                     *hold = Some(XHold {
                         reference,
                         amount: todo,
-                        root_before: resumed.is_some(),
-                        parts_before: saved.len(),
+                        sent: 0,
                     });
                 }
                 billing::Spent::Short(have) => {
@@ -2054,7 +2036,12 @@ async fn publish_target_held(
             )
             .await
             {
-                Ok(remote) => remote,
+                Ok(remote) => {
+                    if let Some(h) = hold.as_mut() {
+                        h.sent += 1;
+                    }
+                    remote
+                }
                 Err(msg) => return fail_target(db, id, &msg).await,
             };
             // The remote id first: whatever fails after this, the post is known to be live.
@@ -2114,7 +2101,12 @@ async fn publish_target_held(
         )
         .await
         {
-            Ok(remote) => remote,
+            Ok(remote) => {
+                if let Some(h) = hold.as_mut() {
+                    h.sent += 1;
+                }
+                remote
+            }
             Err(msg) => {
                 let msg = format!(
                     "Thread post {} of {}: {msg} The posts before it are up.",
