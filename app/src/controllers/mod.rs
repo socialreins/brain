@@ -8,6 +8,7 @@ pub mod analytics;
 pub mod api_tokens;
 pub mod auth;
 pub mod automations;
+pub mod billing;
 pub mod broadcasts;
 pub mod connections;
 pub mod contact;
@@ -96,6 +97,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(contact::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
         .merge(teams::api())
         .merge(api_tokens::api())
+        .merge(billing::api())
         .merge(webhooks::api())
         .merge(connections::api())
         .merge(meta::api())

@@ -50,6 +50,9 @@ pub struct Config {
     /// `REGISTRATION_DISABLED=true`: magic links create only `OWNER_EMAIL`'s account (or, with
     /// no `OWNER_EMAIL`, the first account) and invited ones; existing users still sign in.
     pub registration_disabled: bool,
+    /// `BILLING_ENABLED=true`: Cloud billing. A team's plan then caps what it may use
+    /// (`GET /v1/team/billing`). Off by default and on a self-hosted install, where nothing is capped.
+    pub billing_enabled: bool,
     /// `OWNER_EMAIL`, normalized: the one stranger a closed install still lets sign up.
     pub owner_email: Option<String>,
     /// `SIGNUP_DOMAINS`, lowercased domains and normalized emails: when not empty, a new account's
@@ -185,6 +188,7 @@ impl Config {
             brain_url: base_url("BRAIN_URL", var("BRAIN_URL"), "http://localhost:8080")?,
             web_url,
             registration_disabled: flag("REGISTRATION_DISABLED")?,
+            billing_enabled: flag("BILLING_ENABLED")?,
             owner_email: owner_email(var("OWNER_EMAIL"))?,
             signup_domains: signup_domains(var("SIGNUP_DOMAINS"))?,
             mailer,

@@ -28036,6 +28036,141 @@ mod teams {
             }
         }
     }
+
+    mod billing_api {
+        use super::*;
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        use socialreins_brain::billing::{self, Kind, Spent};
+
+        async fn team_of(s: &TestServer, cookie: &str) -> uuid::Uuid {
+            current(s, cookie).await["id"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        }
+
+        async fn subscribe(db: &DatabaseConnection, team: uuid::Uuid, plan: &str, status: &str) {
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO subscriptions (team_id, plan_id, status) VALUES ($1, $2, $3)
+                 ON CONFLICT (team_id) DO UPDATE SET plan_id = $2, status = $3",
+                [team.into(), plan.into(), status.into()],
+            ))
+            .await
+            .unwrap();
+        }
+
+        async fn billing_of(s: &TestServer, cookie: &str) -> Value {
+            let res = s
+                .get("/v1/team/billing")
+                .add_header("cookie", cookie.to_owned())
+                .await;
+            res.assert_status_ok();
+            res.json()
+        }
+
+        /// A self-hosted install is never capped, and says so.
+        #[tokio::test]
+        #[serial]
+        async fn billing_off_caps_nothing() {
+            let (s, db) = server_where(|_| {}).await;
+            let (_, cookie, _) = user(&s, &db).await;
+            let b = billing_of(&s, &cookie).await;
+            assert_eq!(b["enabled"], false);
+            assert_eq!(b["plan"], Value::Null);
+            assert_eq!(b["limits"]["accounts"], Value::Null);
+            assert_eq!(b["limits"]["automation"], true);
+            assert_eq!(b["usage"], json!({"accounts": 0, "members": 1}));
+            let c = s
+                .get("/v1/team/credits")
+                .add_header("cookie", cookie.clone())
+                .await;
+            c.assert_status_ok();
+            c.assert_json(&json!({"x": 0, "ai": 0}));
+            assert_eq!(s.get("/v1/team/billing").await.status_code(), 401);
+        }
+
+        /// With billing on, the plan decides: none or canceled allows nothing, a live one its
+        /// limits.
+        #[tokio::test]
+        #[serial]
+        async fn billing_on_follows_the_subscription() {
+            let (s, db) = server_where(|c| c.billing_enabled = true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = team_of(&s, &owner).await;
+            let none = billing_of(&s, &owner).await;
+            assert_eq!(none["enabled"], true);
+            assert_eq!(none["plan"], Value::Null);
+            assert_eq!(none["limits"]["accounts"], 0);
+            assert_eq!(none["limits"]["automation"], false);
+            subscribe(&db, team, "scheduler", "trialing").await;
+            let b = billing_of(&s, &owner).await;
+            assert_eq!(b["plan"]["id"], "scheduler");
+            assert_eq!(b["plan"]["status"], "trialing");
+            assert_eq!(
+                b["limits"],
+                json!({"accounts": 10, "members": 3, "automation": false, "contacts": null})
+            );
+            subscribe(&db, team, "automation", "active").await;
+            let b = billing_of(&s, &owner).await;
+            assert_eq!(b["limits"]["automation"], true);
+            assert_eq!(b["limits"]["members"], Value::Null);
+            assert_eq!(b["limits"]["contacts"], 2500);
+            subscribe(&db, team, "automation", "canceled").await;
+            let b = billing_of(&s, &owner).await;
+            assert_eq!(b["plan"]["status"], "canceled");
+            assert_eq!(b["limits"]["accounts"], 0);
+        }
+
+        /// A grant with a used reference counts once, a spend never takes the balance below 0, a
+        /// repeated reference spends once, and two spends at once cannot both pass.
+        #[tokio::test]
+        #[serial]
+        async fn credits_never_go_below_zero_or_count_twice() {
+            let (s, db) = server_where(|_| {}).await;
+            let (_, cookie, _) = user(&s, &db).await;
+            let team = team_of(&s, &cookie).await;
+            assert!(billing::grant(&db, team, Kind::X, 5, "pack", Some("evt_1"))
+                .await
+                .unwrap());
+            assert!(
+                !billing::grant(&db, team, Kind::X, 5, "pack", Some("evt_1"))
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 5);
+            assert_eq!(billing::balance(&db, team, Kind::Ai).await.unwrap(), 0);
+            assert_eq!(
+                billing::spend(&db, team, Kind::X, 2, "post", Some("p1"))
+                    .await
+                    .unwrap(),
+                Spent::Taken
+            );
+            assert_eq!(
+                billing::spend(&db, team, Kind::X, 2, "post", Some("p1"))
+                    .await
+                    .unwrap(),
+                Spent::Repeated
+            );
+            assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 3);
+            assert_eq!(
+                billing::spend(&db, team, Kind::X, 4, "post", Some("p2"))
+                    .await
+                    .unwrap(),
+                Spent::Short(3)
+            );
+            let (a, b) = tokio::join!(
+                billing::spend(&db, team, Kind::X, 3, "post", Some("p3")),
+                billing::spend(&db, team, Kind::X, 3, "post", Some("p4")),
+            );
+            let mut got = [a.unwrap(), b.unwrap()];
+            got.sort_by_key(|g| matches!(g, Spent::Short(_)));
+            assert_eq!(got, [Spent::Taken, Spent::Short(0)]);
+            let c = s.get("/v1/team/credits").add_header("cookie", cookie).await;
+            c.assert_json(&json!({"x": 0, "ai": 0}));
+        }
+    }
 }
 
 /// Turnstile on the public forms and `POST /v1/contact`, against a local fake siteverify (it

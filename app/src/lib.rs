@@ -1,4 +1,5 @@
 pub mod automations;
+pub mod billing;
 pub mod broadcasts;
 pub mod config;
 pub mod connectors;
