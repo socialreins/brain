@@ -148,6 +148,13 @@ pub fn is_account_limit(e: &DbErr) -> bool {
     matches!(e, DbErr::Custom(m) if m == ACCOUNT_LIMIT)
 }
 
+/// Like `ACCOUNT_LIMIT`, for an invitation that would take the last seat too many.
+pub const MEMBER_LIMIT: &str = "plan_limit:members";
+
+pub fn is_member_limit(e: &DbErr) -> bool {
+    matches!(e, DbErr::Custom(m) if m == MEMBER_LIMIT)
+}
+
 /// What the team may use now (everything when billing is off).
 pub async fn limits_of(
     enabled: bool,
@@ -162,12 +169,12 @@ pub async fn limits_of(
 }
 
 /// Whether the team has no seat left for one more member. `pending` counts open invitations
-/// as seats.
+/// as seats, except the one for `except_email`, which a new invitation to it would replace.
 pub async fn members_full(
     enabled: bool,
     db: &impl ConnectionTrait,
     team: Uuid,
-    pending: bool,
+    pending: Option<&str>,
 ) -> Result<bool, DbErr> {
     let Some(max) = limits_of(enabled, db, team).await?.members else {
         return Ok(false);
@@ -176,8 +183,13 @@ pub async fn members_full(
         .query_one_raw(stmt(
             "SELECT (SELECT count(*) FROM team_user WHERE team_id = $1)
                   + (SELECT CASE WHEN $2 THEN count(*) ELSE 0 END
-                     FROM team_invitations WHERE team_id = $1 AND expires_at > now()) AS n",
-            vec![team.into(), pending.into()],
+                     FROM team_invitations WHERE team_id = $1 AND expires_at > now()
+                       AND email <> $3) AS n",
+            vec![
+                team.into(),
+                pending.is_some().into(),
+                pending.unwrap_or_default().into(),
+            ],
         ))
         .await?;
     let n: i64 = row.map_or(Ok(0), |r| r.try_get("", "n"))?;

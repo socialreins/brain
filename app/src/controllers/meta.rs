@@ -481,6 +481,9 @@ async fn pick(
     match done.await {
         Ok(Ok(saved)) => (StatusCode::CREATED, Json(saved)).into_response(),
         Ok(Err(res)) => res,
+        Err(e) if crate::billing::is_account_limit(&e) => {
+            super::billing::plan_limit(crate::billing::Limit::Accounts)
+        }
         Err(e) => internal(e, "meta pick save"),
     }
 }

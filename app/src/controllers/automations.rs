@@ -419,6 +419,11 @@ async fn update(
     if !t.role.manages() {
         return forbidden();
     }
+    if input.active {
+        if let Some(res) = super::billing::needs_automation(&app, t.team.id).await {
+            return res;
+        }
+    }
     let saved = async {
         let (name, input) = match checked(&app.db, t.team.id, input).await? {
             Ok(v) => v,

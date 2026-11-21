@@ -28396,6 +28396,24 @@ mod teams {
                 let (code, _) = post(&s, &owner, path, body.clone()).await;
                 assert_ne!(code, 402, "{path}");
             }
+            // A downgraded team cannot switch an automation on again by saving it.
+            let body = json!({
+                "name": "keep", "trigger": "dm_received", "active": false,
+                "actions": [{"type": "send_dm", "text": "hi"}],
+            });
+            let (code, made) = post(&s, &owner, "/v1/automations", body.clone()).await;
+            assert_eq!(code, 201, "{made}");
+            let path = format!("/v1/automations/{}", made["id"].as_str().unwrap());
+            subscribe(&db, &team, "scheduler").await;
+            let put = |body: Value| req(&s, Method::PUT, &path, &owner).json(&body);
+            let on = put(json!({
+                "name": "keep", "trigger": "dm_received", "active": true,
+                "actions": [{"type": "send_dm", "text": "hi"}],
+            }))
+            .await;
+            assert_eq!(on.status_code(), 402);
+            on.assert_json(&refused);
+            assert_eq!(put(body).await.status_code(), 200);
             // Self-hosted: never capped.
             let (s, db) = server_where(|_| {}).await;
             let (_, owner, _) = user(&s, &db).await;
@@ -28431,13 +28449,16 @@ mod teams {
                 (402, json!({"error": "plan_limit", "limit": "members"}))
             );
             subscribe(&db, &team, "scheduler").await;
-            assert_eq!(invite(unique_email()).await.0, 201);
+            let first = unique_email();
+            assert_eq!(invite(first.clone()).await.0, 201);
             assert_eq!(invite(unique_email()).await.0, 201);
             let (code, body) = invite(unique_email()).await;
             assert_eq!(
                 (code, body),
                 (402, json!({"error": "plan_limit", "limit": "members"}))
             );
+            // Sending a pending address its link again takes no new seat.
+            assert_eq!(invite(first).await.0, 201);
             // The upgrade frees seats.
             subscribe(&db, &team, "automation").await;
             assert_eq!(invite(unique_email()).await.0, 201);

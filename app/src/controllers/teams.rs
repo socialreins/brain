@@ -1043,11 +1043,6 @@ async fn invite(
 /// Stores the invitation (replacing a pending one for the address) and emails its link; `201`
 /// with the invitation, or the error reply.
 async fn send_invitation(app: &AppState, t: &InTeam, email: String, role: Role) -> Response {
-    match crate::billing::members_full(app.billing_enabled, &app.db, t.team.id, true).await {
-        Ok(false) => {}
-        Ok(true) => return super::billing::plan_limit(crate::billing::Limit::Members),
-        Err(e) => return internal(e, "plan read"),
-    }
     let now = Utc::now().fixed_offset();
     let swept = team_invitations::Entity::delete_many()
         .filter(team_invitations::Column::ExpiresAt.lt(now))
@@ -1070,6 +1065,18 @@ async fn send_invitation(app: &AppState, t: &InTeam, email: String, role: Role) 
     // Re-inviting a pending address replaces its invitation, so the old link stops working.
     let replaced = async {
         let txn = app.db.begin().await?;
+        if app.billing_enabled {
+            // One invitation at a time per team, so two cannot both take the last seat.
+            txn.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT 1 FROM teams WHERE id = $1 FOR NO KEY UPDATE",
+                [t.team.id.into()],
+            ))
+            .await?;
+            if crate::billing::members_full(true, &txn, t.team.id, Some(&email)).await? {
+                return Err(DbErr::Custom(crate::billing::MEMBER_LIMIT.into()));
+            }
+        }
         team_invitations::Entity::delete_many()
             .filter(team_invitations::Column::TeamId.eq(t.team.id))
             .filter(team_invitations::Column::Email.eq(&email))
@@ -1084,6 +1091,9 @@ async fn send_invitation(app: &AppState, t: &InTeam, email: String, role: Role) 
         Ok(row) => row,
         Err(e) if matches!(e.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) => {
             return reply(StatusCode::CONFLICT, "already_invited")
+        }
+        Err(e) if crate::billing::is_member_limit(&e) => {
+            return super::billing::plan_limit(crate::billing::Limit::Members)
         }
         Err(e) => return internal(e, "invitation insert"),
     };
@@ -1243,7 +1253,7 @@ async fn accept(
     match membership(&app.db, inv.team_id, user.id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
-            match crate::billing::members_full(app.billing_enabled, &app.db, inv.team_id, false)
+            match crate::billing::members_full(app.billing_enabled, &app.db, inv.team_id, None)
                 .await
             {
                 Ok(false) => {}
