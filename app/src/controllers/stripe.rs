@@ -256,11 +256,16 @@ async fn apply_subscription(
         tracing::warn!(subscription = id, "stripe subscription of an unknown team");
         return Ok(Outcome::Ignored);
     }
-    // The row is locked while it is read, so two events for one team take turns.
+    // The team row is locked (a subscription row may not exist yet), so two events for one
+    // team take turns and the second sees what the first wrote.
+    db.execute_raw(stmt(
+        "SELECT 1 FROM teams WHERE id = $1 FOR NO KEY UPDATE",
+        vec![team.into()],
+    ))
+    .await?;
     let current = db
         .query_one_raw(stmt(
-            "SELECT status, provider_subscription_id FROM subscriptions \
-             WHERE team_id = $1 FOR UPDATE",
+            "SELECT status, provider_subscription_id FROM subscriptions WHERE team_id = $1",
             vec![team.into()],
         ))
         .await?;

@@ -29104,6 +29104,33 @@ mod teams {
             assert_eq!(plan_of(&s, &owner).await["id"], "scheduler");
         }
 
+        /// Two first subscriptions arriving together, with no row yet to lock: one is kept, the
+        /// other cancelled.
+        #[tokio::test]
+        #[serial]
+        async fn two_first_subscriptions_at_once_keep_one() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let now = Utc::now().timestamp();
+            let a = sub_event("evt_r1", now, "sub_r1", &team, "active", "price_s");
+            let b = sub_event("evt_r2", now, "sub_r2", &team, "active", "price_a");
+            let (x, y) = tokio::join!(deliver(&s, &a, WHSEC, now), deliver(&s, &b, WHSEC, now));
+            assert_eq!(
+                (x.status_code().as_u16(), y.status_code().as_u16()),
+                (200, 200)
+            );
+            let cancelled = [
+                format!("/cancel/sub_r1_{}", *RUN),
+                format!("/cancel/sub_r2_{}", *RUN),
+            ]
+            .iter()
+            .map(|p| count(p))
+            .sum::<usize>();
+            assert_eq!(cancelled, 1);
+            assert_eq!(plan_of(&s, &owner).await["status"], "active");
+        }
+
         #[tokio::test]
         #[serial]
         async fn events_for_nobody_unknown_prices_unstarted_or_other_kinds_change_nothing() {
