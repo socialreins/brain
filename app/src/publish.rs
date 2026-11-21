@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 pub use crate::connectors::bluesky::PostError as PublishError;
 use crate::{
+    billing,
     connectors::{
         bluesky::{self, Bluesky},
         linkedin::{self, LinkedIn},
@@ -1704,6 +1705,27 @@ async fn load(
     Ok(files)
 }
 
+/// Takes the credit for one X post that is already out, once per `reference`. A refused or
+/// failed spend is logged and does not undo the post.
+async fn charge_x(app: &AppState, team: Uuid, reference: &str) {
+    match billing::spend(
+        &app.db,
+        team,
+        billing::Kind::X,
+        1,
+        "x post",
+        Some(reference),
+    )
+    .await
+    {
+        Ok(billing::Spent::Taken | billing::Spent::Repeated) => {}
+        Ok(billing::Spent::Short(_)) => {
+            tracing::warn!(%team, reference, "x post went out without a credit")
+        }
+        Err(e) => tracing::error!(error = %e, %team, reference, "x credit spend failed"),
+    }
+}
+
 async fn fail_target(db: &DatabaseConnection, id: Uuid, msg: &str) -> Result<(), DbErr> {
     let stmt = sql(
         &with_event(
@@ -1943,6 +1965,26 @@ async fn publish_target(
             url: t.remote_url.clone(),
         })
     });
+    // On Cloud an X post costs the team one credit each, the root and every thread part. Taken
+    // after each post is out (a failed post costs nothing); this only stops a team that cannot
+    // pay for the whole thread before it starts.
+    // shortcut: two posts racing for the last credit can both go out, the later spend is then
+    // refused and logged; fine while a credit costs us less than the support it would take.
+    let x_credits = post.platform == "x" && app.billing_enabled;
+    if x_credits {
+        let todo = i64::from(resumed.is_none()) + thread.len().saturating_sub(saved.len()) as i64;
+        match billing::balance(db, post.team_id, billing::Kind::X).await {
+            Ok(have) if have >= todo => {}
+            Ok(have) => {
+                let msg = format!(
+                    "Posting to X needs {todo} credit{} and the team has {have}. Buy X credits to post.",
+                    if todo == 1 { "" } else { "s" }
+                );
+                return fail_target(db, id, &msg).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
     let root = match resumed {
         Some(root) => root,
         None => {
@@ -1980,6 +2022,9 @@ async fn publish_target(
                 ],
             );
             db.execute_raw(stmt).await?;
+            if x_credits {
+                charge_x(app, post.team_id, &id.to_string()).await;
+            }
             root
         }
     };
@@ -2041,6 +2086,9 @@ async fn publish_target(
             "UPDATE post_targets SET parts = parts || $2, updated_at = now() WHERE id = $1",
             vec![id.into(), saved.into()],
         );
+        if x_credits {
+            charge_x(app, post.team_id, &format!("{id}:{}", i + 1)).await;
+        }
         if let Err(e) = db.execute_raw(stmt).await {
             let msg = unsaved_part(i + 1, thread.len());
             // Best effort: with the database down, recovery fails it later with a like message.

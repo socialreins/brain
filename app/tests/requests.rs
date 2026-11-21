@@ -14155,6 +14155,58 @@ mod teams {
                     }
                 }
 
+                /// On Cloud an X post spends a credit once it is out; a team short of credits for the
+                /// whole thread is stopped before anything goes out.
+                #[tokio::test]
+                #[serial]
+                async fn x_posts_spend_credits_when_billing_is_on() {
+                    use socialreins_brain::billing::{self, Kind};
+                    let (s, db, mut state, _, mock, cookie, team_id, set) = team().await;
+                    state.billing_enabled = true;
+                    let team: uuid::Uuid = team_id.parse().unwrap();
+                    let before = mock.tweets.lock().unwrap().len();
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "No credit")).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    let why = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(why.contains("needs 1 credit and the team has 0"), "{why}");
+                    assert_eq!(mock.tweets.lock().unwrap().len(), before);
+
+                    // Two credits are not enough for a thread of three.
+                    billing::grant(&db, team, Kind::X, 2, "test", None)
+                        .await
+                        .unwrap();
+                    let id =
+                        id_of(&create(&s, &cookie, thread(&set, "one", &["two", "three"])).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    assert!(p["targets"][0]["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("needs 3 credits"));
+                    assert_eq!(mock.tweets.lock().unwrap().len(), before);
+                    assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 2);
+
+                    // Enough for a post: one credit goes, once.
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "Paid")).await);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                    assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 1);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 1);
+
+                    // Add two more: the thread of three now goes out and takes all three.
+                    billing::grant(&db, team, Kind::X, 2, "test", None)
+                        .await
+                        .unwrap();
+                    let id = id_of(&create(&s, &cookie, thread(&set, "a", &["b", "c"])).await);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                    assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 0);
+                }
+
                 #[tokio::test]
                 #[serial]
                 async fn a_thread_goes_out_as_replies_and_comes_down_children_first() {
@@ -29445,6 +29497,10 @@ mod admin_console {
             (Method::DELETE, format!("/v1/admin/waitlist/{id}")),
             (Method::GET, "/v1/admin/settings/signup".to_owned()),
             (Method::PUT, "/v1/admin/settings/signup".to_owned()),
+            (
+                Method::POST,
+                format!("/v1/admin/teams/{}/credits", uuid::Uuid::nil()),
+            ),
         ];
         for (method, path) in routes {
             let call = || {
@@ -29792,6 +29848,41 @@ mod admin_console {
         assert_eq!(body["mail"], "failed");
         assert!(body["signup"]["approved_at"].is_string());
         assert!(c.sign_in(&email).await.is_some(), "approved all the same");
+        c.done().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_admin_adds_credits_to_a_team() {
+        let c = console(|_| {}).await;
+        let admin = c.admin().await;
+        let team = c.get("/v1/team", &admin).await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let path = format!("/v1/admin/teams/{team}/credits");
+        let post = |path: &str, body: Value| c.req(Method::POST, path, &admin).json(&body);
+        let res = post(&path, json!({"kind": "x", "amount": 5})).await;
+        assert_eq!(res.status_code(), 201);
+        res.assert_json(&json!({"balance": 5}));
+        // Each call adds again, and the member sees it.
+        let res = post(&path, json!({"kind": "x", "amount": 3})).await;
+        res.assert_json(&json!({"balance": 8}));
+        assert_eq!(
+            c.get("/v1/team/credits", &admin).await,
+            json!({"x": 8, "ai": 0})
+        );
+        for (kind, amount) in [("x", 0), ("x", -2), ("x", 1_000_001), ("gold", 1)] {
+            let res = post(&path, json!({"kind": kind, "amount": amount})).await;
+            assert_eq!(error_of(&res), (422, "invalid_credits".into()));
+        }
+        let unknown = format!("/v1/admin/teams/{}/credits", uuid::Uuid::now_v7());
+        let res = post(&unknown, json!({"kind": "ai", "amount": 1})).await;
+        assert_eq!(error_of(&res), (404, "not_found".into()));
+        c.sql("UPDATE sessions SET created_at = now() - interval '11 minutes'")
+            .await;
+        let res = post(&path, json!({"kind": "x", "amount": 1})).await;
+        assert_eq!(error_of(&res), (403, "reauth_required".into()));
         c.done().await;
     }
 
