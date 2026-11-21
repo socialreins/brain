@@ -1705,6 +1705,21 @@ async fn load(
     Ok(files)
 }
 
+/// One lock per team, for its X posts while billing is on. The map only grows by a team's entry.
+static X_TURNS: LazyLock<
+    std::sync::Mutex<std::collections::HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+> = LazyLock::new(Default::default);
+
+async fn x_turn(team: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = X_TURNS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(team)
+        .or_default()
+        .clone();
+    lock.lock_owned().await
+}
+
 /// Takes the credit for one X post that is already out, once per `reference`. A refused or
 /// failed spend is logged and does not undo the post.
 async fn charge_x(app: &AppState, team: Uuid, reference: &str) {
@@ -1968,9 +1983,15 @@ async fn publish_target(
     // On Cloud an X post costs the team one credit each, the root and every thread part. Taken
     // after each post is out (a failed post costs nothing); this only stops a team that cannot
     // pay for the whole thread before it starts.
-    // shortcut: two posts racing for the last credit can both go out, the later spend is then
-    // refused and logged; fine while a credit costs us less than the support it would take.
+    // A team's X posts go one at a time here, so two cannot both pass the check on the last
+    // credit. shortcut: this holds inside one process only; with several brain instances a race
+    // can still let a post out, and the later spend is refused and logged.
     let x_credits = post.platform == "x" && app.billing_enabled;
+    let _one_at_a_time = if x_credits {
+        Some(x_turn(post.team_id).await)
+    } else {
+        None
+    };
     if x_credits {
         let todo = i64::from(resumed.is_none()) + thread.len().saturating_sub(saved.len()) as i64;
         match billing::balance(db, post.team_id, billing::Kind::X).await {

@@ -14207,6 +14207,35 @@ mod teams {
                     assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 0);
                 }
 
+                /// Several X posts due at once for a team with one credit: one goes out, not all.
+                #[tokio::test]
+                #[serial]
+                async fn the_last_x_credit_pays_for_one_post_even_when_posts_are_due_together() {
+                    use socialreins_brain::billing::{self, Kind};
+                    let (s, db, mut state, _, mock, cookie, team_id, set) = team().await;
+                    state.billing_enabled = true;
+                    let team: uuid::Uuid = team_id.parse().unwrap();
+                    billing::grant(&db, team, Kind::X, 1, "test", None)
+                        .await
+                        .unwrap();
+                    let before = mock.tweets.lock().unwrap().len();
+                    let mut ids = Vec::new();
+                    for n in 0..4 {
+                        ids.push(id_of(
+                            &create(&s, &cookie, x_post(&set, &format!("Race {n}"))).await,
+                        ));
+                    }
+                    publish::tick(&state).await.unwrap();
+                    let mut out = 0;
+                    for id in &ids {
+                        out +=
+                            usize::from(get_post(&s, &cookie, id).await["status"] == "published");
+                    }
+                    assert_eq!(out, 1);
+                    assert_eq!(mock.tweets.lock().unwrap().len(), before + 1);
+                    assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 0);
+                }
+
                 #[tokio::test]
                 #[serial]
                 async fn a_thread_goes_out_as_replies_and_comes_down_children_first() {
