@@ -4,7 +4,7 @@
 //! `effective` answers from the team's subscription; a team with no live subscription may do
 //! nothing. Credits cover what costs money per use (`x` posts, `ai` calls). `credit_ledger` holds
 //! signed amounts; a balance is their sum. `grant` and `spend` take a `reference`, an idempotency
-//! key unique per team and kind, so a retry after a lost answer never counts twice.
+//! key unique per team, kind and direction (a refund may reuse the ref of its spend), so a retry after a lost answer never counts twice.
 use sea_orm::{
     ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, TransactionTrait, Value,
 };
@@ -134,8 +134,9 @@ pub async fn balance(db: &impl ConnectionTrait, team: Uuid, kind: Kind) -> Resul
     row.map_or(Ok(0), |r| r.try_get("", "n"))
 }
 
-/// Adds `amount` (more than 0) credits. `false` when `reference` was already used by this team
-/// for this kind, so a webhook delivered twice grants once.
+/// Adds `amount` (more than 0) credits. `false` when `reference` was already used for a grant of
+/// this kind by this team, so a webhook delivered twice grants once. A grant may reuse the
+/// reference of a spend, which is how a refund names the spend it undoes.
 pub async fn grant(
     db: &impl ConnectionTrait,
     team: Uuid,
@@ -144,7 +145,9 @@ pub async fn grant(
     reason: &str,
     reference: Option<&str>,
 ) -> Result<bool, DbErr> {
-    assert!(amount > 0, "a grant adds credits");
+    if amount <= 0 {
+        return Err(DbErr::Custom("a grant adds credits".into()));
+    }
     let done = db
         .execute_raw(stmt(
             "INSERT INTO credit_ledger (id, team_id, kind, amount, reason, ref)
@@ -174,7 +177,8 @@ pub enum Spent {
 }
 
 /// Takes `amount` (more than 0) credits, never taking the balance below 0. The team row is
-/// locked for the check and the insert, so two spends at once cannot both pass.
+/// locked (`FOR NO KEY UPDATE`, which does not block rows that point at the team) for the check
+/// and the insert, so two spends at once cannot both pass.
 pub async fn spend(
     db: &DatabaseConnection,
     team: Uuid,
@@ -183,17 +187,20 @@ pub async fn spend(
     reason: &str,
     reference: Option<&str>,
 ) -> Result<Spent, DbErr> {
-    assert!(amount > 0, "a spend takes credits");
+    if amount <= 0 {
+        return Err(DbErr::Custom("a spend takes credits".into()));
+    }
     let tx = db.begin().await?;
     tx.execute_raw(stmt(
-        "SELECT id FROM teams WHERE id = $1 FOR UPDATE",
+        "SELECT id FROM teams WHERE id = $1 FOR NO KEY UPDATE",
         vec![team.into()],
     ))
     .await?;
     if let Some(r) = reference {
         let seen = tx
             .query_one_raw(stmt(
-                "SELECT 1 AS one FROM credit_ledger WHERE team_id = $1 AND kind = $2 AND ref = $3",
+                "SELECT 1 AS one FROM credit_ledger
+                 WHERE team_id = $1 AND kind = $2 AND ref = $3 AND amount < 0",
                 vec![team.into(), kind.as_str().into(), r.into()],
             ))
             .await?;

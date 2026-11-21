@@ -28074,7 +28074,7 @@ mod teams {
         #[tokio::test]
         #[serial]
         async fn billing_off_caps_nothing() {
-            let (s, db) = server_where(|_| {}).await;
+            let (s, db) = server_where(|c| c.billing_enabled = false).await;
             let (_, cookie, _) = user(&s, &db).await;
             let b = billing_of(&s, &cookie).await;
             assert_eq!(b["enabled"], false);
@@ -28167,8 +28167,19 @@ mod teams {
             let mut got = [a.unwrap(), b.unwrap()];
             got.sort_by_key(|g| matches!(g, Spent::Short(_)));
             assert_eq!(got, [Spent::Taken, Spent::Short(0)]);
+            // A refund may reuse the spend's reference, and bad amounts are errors, not panics.
+            assert!(billing::grant(&db, team, Kind::X, 3, "refund", Some("p3"))
+                .await
+                .unwrap());
+            assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 3);
+            assert!(billing::grant(&db, team, Kind::X, 0, "bad", None)
+                .await
+                .is_err());
+            assert!(billing::spend(&db, team, Kind::X, -1, "bad", None)
+                .await
+                .is_err());
             let c = s.get("/v1/team/credits").add_header("cookie", cookie).await;
-            c.assert_json(&json!({"x": 0, "ai": 0}));
+            c.assert_json(&json!({"x": 3, "ai": 0}));
         }
     }
 }

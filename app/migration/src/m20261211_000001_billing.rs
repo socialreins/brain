@@ -10,7 +10,8 @@ pub struct Migration;
 // `subscriptions`: one row per team, written by the provider's webhook.
 // `credit_ledger`: prepaid credits for what costs per use (`x` posts, `ai` calls). A positive
 // amount is a grant, a negative one a spend; a team's balance is the sum. `ref` is an
-// idempotency key, unique per team and kind, so a retried grant or spend never counts twice.
+// idempotency key, unique per team, kind and direction, so a retried grant or spend never counts
+// twice and a refund may reuse the ref of the spend it undoes.
 const UP: &str = r#"CREATE TABLE plans (
   id text PRIMARY KEY,
   name text NOT NULL,
@@ -45,7 +46,7 @@ CREATE TABLE credit_ledger (
   ref text,
   created_at timestamptz NOT NULL DEFAULT now());
 CREATE INDEX credit_ledger_team_kind_idx ON credit_ledger (team_id, kind);
-CREATE UNIQUE INDEX credit_ledger_ref_idx ON credit_ledger (team_id, kind, ref) WHERE ref IS NOT NULL;"#;
+CREATE UNIQUE INDEX credit_ledger_ref_idx ON credit_ledger (team_id, kind, ref, (amount > 0)) WHERE ref IS NOT NULL;"#;
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
