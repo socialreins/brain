@@ -409,6 +409,65 @@ async fn remove(
     }
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct NewCredits {
+    /// `x` or `ai`.
+    pub kind: String,
+    /// 1 to 1,000,000.
+    pub amount: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct CreditsGranted {
+    /// The team's balance of that kind now.
+    pub balance: i64,
+}
+
+/// Adds credits to a team by hand (until purchases exist). Each call adds them again. Needs a
+/// sign-in from the last 10 minutes (else `403 reauth_required`). `422 invalid_credits` for
+/// another kind or an amount outside 1 to 1,000,000; `404` for an unknown team.
+#[utoipa::path(post, path = "/admin/teams/{id}/credits", tag = "admin",
+    security(("session" = [])), params(("id" = Uuid, Path,)), request_body = NewCredits,
+    responses((status = 201, body = CreditsGranted), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 404, body = Error), (status = 422, body = Error),
+        (status = 500, body = Error)))]
+async fn grant_credits(
+    _: FromWeb,
+    State(app): State<AppState>,
+    Admin(current): Admin,
+    Path(id): Path<Uuid>,
+    Body(body): Body<NewCredits>,
+) -> Response {
+    if !current.recent() {
+        return reply(StatusCode::FORBIDDEN, "reauth_required");
+    }
+    let kind = match body.kind.as_str() {
+        "x" => crate::billing::Kind::X,
+        "ai" => crate::billing::Kind::Ai,
+        _ => return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_credits"),
+    };
+    if !(1..=1_000_000).contains(&body.amount) {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_credits");
+    }
+    let found = app
+        .db
+        .query_one_raw(stmt("SELECT 1 FROM teams WHERE id = $1", [id.into()]))
+        .await;
+    match found {
+        Ok(Some(_)) => {}
+        Ok(None) => return reply(StatusCode::NOT_FOUND, "not_found"),
+        Err(e) => return internal(e, "credit grant"),
+    }
+    let granted = async {
+        crate::billing::grant(&app.db, id, kind, body.amount, "admin grant", None).await?;
+        crate::billing::balance(&app.db, id, kind).await
+    };
+    match granted.await {
+        Ok(balance) => (StatusCode::CREATED, Json(CreditsGranted { balance })).into_response(),
+        Err(e) => internal(e, "credit grant"),
+    }
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct SignupSettings {
     /// `open`: anyone may sign up. `closed`: nobody new. `domains`: only the listed domains and
@@ -502,6 +561,7 @@ pub fn api() -> OpenApiRouter<AppState> {
         .routes(routes!(users))
         .routes(routes!(teams))
         .routes(routes!(approve))
+        .routes(routes!(grant_credits))
         .routes(routes!(remove))
         .routes(routes!(signup_settings, save_signup_settings))
 }

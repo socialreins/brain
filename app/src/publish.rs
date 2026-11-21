@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 pub use crate::connectors::bluesky::PostError as PublishError;
 use crate::{
+    billing,
     connectors::{
         bluesky::{self, Bluesky},
         linkedin::{self, LinkedIn},
@@ -1704,6 +1705,55 @@ async fn load(
     Ok(files)
 }
 
+/// Credits held for the X posts of one target, until it is known how many went out.
+struct XHold {
+    reference: String,
+    amount: i64,
+    root_before: bool,
+    parts_before: usize,
+}
+
+/// Gives back the credits held for X posts that did not go out: what was held minus the root and
+/// parts this attempt saved. A failure here is logged; the team is then charged for posts that
+/// never went out, which is the safe side for us.
+async fn release_x(app: &AppState, post: &posts::Model, id: Uuid, hold: XHold) {
+    let read = async {
+        let t = post_targets::Entity::find_by_id(id).one(&app.db).await?;
+        let root = t.as_ref().is_some_and(|t| t.remote_id.is_some());
+        let parts = t
+            .and_then(|t| t.parts.as_array().map(Vec::len))
+            .unwrap_or_default();
+        Ok::<_, DbErr>((root, parts))
+    };
+    let back = match read.await {
+        Ok((root, parts)) => {
+            let sent = i64::from(root && !hold.root_before)
+                + i64::try_from(parts.saturating_sub(hold.parts_before)).unwrap_or(i64::MAX);
+            hold.amount - sent
+        }
+        Err(e) => {
+            tracing::error!(error = %e, %id, "x credits not released: target unreadable");
+            return;
+        }
+    };
+    if back <= 0 {
+        return;
+    }
+    let reference = Some(hold.reference.as_str());
+    if let Err(e) = billing::grant(
+        &app.db,
+        post.team_id,
+        billing::Kind::X,
+        back,
+        "x post unsent",
+        reference,
+    )
+    .await
+    {
+        tracing::error!(error = %e, %id, back, "x credits not released");
+    }
+}
+
 async fn fail_target(db: &DatabaseConnection, id: Uuid, msg: &str) -> Result<(), DbErr> {
     let stmt = sql(
         &with_event(
@@ -1865,6 +1915,21 @@ async fn publish_target(
     id: Uuid,
     stored: &Media,
 ) -> Result<(), DbErr> {
+    let mut hold = None;
+    let done = publish_target_held(app, post, id, stored, &mut hold).await;
+    if let Some(hold) = hold {
+        release_x(app, post, id, hold).await;
+    }
+    done
+}
+
+async fn publish_target_held(
+    app: &AppState,
+    post: &posts::Model,
+    id: Uuid,
+    stored: &Media,
+    hold: &mut Option<XHold>,
+) -> Result<(), DbErr> {
     let Ok(_slot) = TARGET_SLOTS.acquire().await else {
         return Ok(());
     };
@@ -1943,6 +2008,33 @@ async fn publish_target(
             url: t.remote_url.clone(),
         })
     });
+    // On Cloud an X post costs the team one credit each, the root and every thread part. They
+    // are taken here, before anything is sent, so posts due together cannot spend the same
+    // credit; `publish_target` gives back what did not go out. A crash in between keeps them.
+    if post.platform == "x" && app.billing_enabled {
+        let todo = i64::from(resumed.is_none()) + thread.len().saturating_sub(saved.len()) as i64;
+        if todo > 0 {
+            let reference = format!("{id}:{}", Uuid::now_v7());
+            let kind = billing::Kind::X;
+            match billing::spend(db, post.team_id, kind, todo, "x post", Some(&reference)).await? {
+                billing::Spent::Taken | billing::Spent::Repeated => {
+                    *hold = Some(XHold {
+                        reference,
+                        amount: todo,
+                        root_before: resumed.is_some(),
+                        parts_before: saved.len(),
+                    });
+                }
+                billing::Spent::Short(have) => {
+                    let msg = format!(
+                        "Posting to X needs {todo} credit{} and the team has {have}. Add X credits to post.",
+                        if todo == 1 { "" } else { "s" }
+                    );
+                    return fail_target(db, id, &msg).await;
+                }
+            }
+        }
+    }
     let root = match resumed {
         Some(root) => root,
         None => {
