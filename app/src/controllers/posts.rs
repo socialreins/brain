@@ -166,6 +166,9 @@ pub struct Target {
     /// posted nothing (a rate limit, or the platform out of reach). A waiting retry is `pending`
     /// with that error.
     pub retried: bool,
+    /// When the waiting retry is due: set only while the target is `pending` for it, `null`
+    /// once the retry has run (or there is none).
+    pub retry_at: Option<DateTime<FixedOffset>>,
     /// The post's counts on the platform, read every hour for two days and twice a day up to
     /// 30 days; `null` before the first read and on platforms that give none (`GET /analytics`).
     pub metrics: Option<Metrics>,
@@ -573,6 +576,7 @@ async fn targets_of(
         map.entry(t.post_id).or_default().push(Target {
             id: t.id,
             social_account_id: t.social_account_id,
+            retry_at: t.retry_at.filter(|_| t.status == "pending"),
             status: t.status,
             remote_id: t.remote_id,
             remote_url: t.remote_url,
