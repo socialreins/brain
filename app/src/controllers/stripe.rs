@@ -36,6 +36,13 @@ const TRIAL_DAYS: u32 = 7;
 pub struct CheckoutInput {
     /// `scheduler` or `automation`.
     pub plan: String,
+    /// `year` (the default, two months free) or `month`.
+    #[serde(default = "yearly")]
+    pub interval: String,
+}
+
+fn yearly() -> String {
+    "year".into()
 }
 
 #[derive(Serialize, ToSchema)]
@@ -107,7 +114,7 @@ async fn checkout(
     if let Some(res) = gate(&app, &t) {
         return res;
     }
-    let Some(price) = app.stripe.price_of(&body.plan) else {
+    let Some(price) = app.stripe.price_of(&body.plan, &body.interval) else {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_plan");
     };
     let sub = match held(&app, t.team.id).await {
@@ -129,6 +136,8 @@ async fn checkout(
         ("client_reference_id".to_owned(), team.clone()),
         ("subscription_data[metadata][team_id]".to_owned(), team),
         ("allow_promotion_codes".to_owned(), "true".to_owned()),
+        // USD only (decision 0006): the price matches the pricing page, no conversion fee.
+        ("adaptive_pricing[enabled]".to_owned(), "false".to_owned()),
         (
             "success_url".to_owned(),
             format!("{web}/billing?checkout=success"),

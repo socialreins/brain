@@ -28802,8 +28802,10 @@ mod teams {
                     Some("sk_test_mock".into()),
                     webhook.then(|| WHSEC.into()),
                     [
-                        ("scheduler", Some("price_s".into())),
-                        ("automation", Some("price_a".into())),
+                        ("scheduler", "month", Some("price_s".into())),
+                        ("automation", "month", Some("price_a".into())),
+                        ("scheduler", "year", Some("price_sy".into())),
+                        ("automation", "year", Some("price_ay".into())),
                     ],
                 )
                 .unwrap();
@@ -28863,7 +28865,9 @@ mod teams {
             res.assert_json(&json!({"url": "https://stripe.test/checkout/s1"}));
             let f = form_of("/checkout", before);
             assert_eq!(f["mode"], "subscription");
-            assert_eq!(f["line_items[0][price]"], "price_s");
+            assert_eq!(f["adaptive_pricing[enabled]"], "false");
+            // Yearly unless the owner picks monthly.
+            assert_eq!(f["line_items[0][price]"], "price_sy");
             assert_eq!(f["client_reference_id"], team);
             assert_eq!(f["subscription_data[metadata][team_id]"], team);
             assert_eq!(f["subscription_data[trial_period_days]"], "7");
@@ -28876,6 +28880,16 @@ mod teams {
                 assert_eq!(res.status_code(), 422);
                 res.assert_json(&json!({"error": "invalid_plan"}));
             }
+            let monthly = |interval: &str| {
+                req(&s, Method::POST, "/v1/team/billing/checkout", &owner)
+                    .json(&json!({"plan": "scheduler", "interval": interval}))
+            };
+            let at = count("/checkout");
+            monthly("month").await.assert_status_ok();
+            assert_eq!(form_of("/checkout", at)["line_items[0][price]"], "price_s");
+            let res = monthly("week").await;
+            assert_eq!(res.status_code(), 422);
+            res.assert_json(&json!({"error": "invalid_plan"}));
             // A live plan is changed in the portal, not bought again.
             put_sub(&db, &team, "active", Some("cus_1")).await;
             let res = checkout(&s, &owner, "automation").await;
@@ -28886,7 +28900,7 @@ mod teams {
             let n = count("/checkout");
             checkout(&s, &owner, "automation").await.assert_status_ok();
             let f = form_of("/checkout", n);
-            assert_eq!(f["line_items[0][price]"], "price_a");
+            assert_eq!(f["line_items[0][price]"], "price_ay");
             assert_eq!(f["customer"], "cus_1");
             assert!(!f.contains_key("subscription_data[trial_period_days]"));
             assert!(!f.contains_key("customer_email"));
@@ -29234,8 +29248,10 @@ mod teams {
                     Some("sk_test_mock".into()),
                     Some(WHSEC.into()),
                     [
-                        ("scheduler", Some(price)),
-                        ("automation", Some("price_a".into())),
+                        ("scheduler", "month", Some(price)),
+                        ("automation", "month", Some("price_a".into())),
+                        ("scheduler", "year", Some("price_sy".into())),
+                        ("automation", "year", Some("price_ay".into())),
                     ],
                 )
                 .unwrap();
