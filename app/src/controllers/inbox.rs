@@ -1,6 +1,8 @@
 //! Inboxes and their items, for the current team. Members read inboxes, reply to items,
 //! mark them done and assign them; owners and admins create, change and delete inboxes, as with sets. Every
-//! team has an "All" inbox (made on first list) that cannot be changed or deleted.
+//! team has an "All" inbox (made on first list) that holds every item and cannot be changed or
+//! deleted. A custom inbox holds the items of its accounts (`inbox_accounts`; an account may be
+//! in several), narrowed by its `filters`.
 use std::collections::HashMap;
 
 use axum::{
@@ -46,6 +48,8 @@ pub struct Inbox {
     pub name: String,
     /// The team's "All" inbox: every item, cannot be changed or deleted.
     pub is_all: bool,
+    /// The accounts whose items it holds; empty for "All", which holds every account.
+    pub account_ids: Vec<Uuid>,
     pub filters: Filters,
     pub created_at: DateTime<FixedOffset>,
     pub updated_at: DateTime<FixedOffset>,
@@ -59,6 +63,9 @@ pub struct Inbox {
 pub struct InboxInput {
     /// 1 to 60 characters after trimming.
     pub name: String,
+    /// 1 to 100 of the team's Bluesky, Facebook and Instagram accounts.
+    #[serde(default)]
+    pub account_ids: Vec<Uuid>,
     #[serde(default)]
     pub filters: Filters,
 }
@@ -240,16 +247,71 @@ fn not_found() -> Response {
     reply(StatusCode::NOT_FOUND, "not_found")
 }
 
-fn inbox_json(i: inboxes::Model) -> Inbox {
+fn inbox_json(i: inboxes::Model, account_ids: Vec<Uuid>) -> Inbox {
     Inbox {
         id: i.id,
         name: i.name,
         is_all: i.is_all,
+        account_ids,
         filters: serde_json::from_value(i.filters).unwrap_or_default(),
         created_at: i.created_at,
         updated_at: i.updated_at,
         open_count: None,
     }
+}
+
+/// The inbox whose accounts hold its items: `None` for "All", which holds every one.
+fn accounts_of(i: &inboxes::Model) -> Option<Uuid> {
+    (!i.is_all).then_some(i.id)
+}
+
+fn sql(sql: &str, values: Vec<Value>) -> Statement {
+    Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
+}
+
+/// The accounts of each of the team's inboxes, sorted.
+async fn accounts_by_inbox(
+    db: &impl ConnectionTrait,
+    team_id: Uuid,
+) -> Result<HashMap<Uuid, Vec<Uuid>>, DbErr> {
+    let rows = db
+        .query_all_raw(sql(
+            "SELECT ia.inbox_id, ia.social_account_id FROM inbox_accounts ia \
+             JOIN inboxes b ON b.id = ia.inbox_id WHERE b.team_id = $1 \
+             ORDER BY ia.social_account_id",
+            vec![team_id.into()],
+        ))
+        .await?;
+    let mut out: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for r in rows {
+        let (inbox, account) = (
+            r.try_get("", "inbox_id")?,
+            r.try_get("", "social_account_id")?,
+        );
+        out.entry(inbox).or_default().push(account);
+    }
+    Ok(out)
+}
+
+/// Makes `accounts` (checked by `checked`) the inbox's accounts.
+async fn set_accounts(
+    db: &impl ConnectionTrait,
+    inbox: Uuid,
+    accounts: &[Uuid],
+) -> Result<(), DbErr> {
+    db.execute_raw(sql(
+        "DELETE FROM inbox_accounts WHERE inbox_id = $1",
+        vec![inbox.into()],
+    ))
+    .await?;
+    let mut values: Vec<Value> = vec![inbox.into()];
+    let p = inbox::placeholders(&mut values, accounts.iter().map(|&a| a.into()));
+    let insert = format!(
+        "INSERT INTO inbox_accounts (inbox_id, social_account_id) \
+         SELECT $1, id FROM social_accounts WHERE id IN ({p})"
+    );
+    db.execute_raw(sql(&insert, values)).await?;
+    Ok(())
 }
 
 fn url_of(remote_id: &str) -> Option<String> {
@@ -391,38 +453,62 @@ fn conversation_of(item: &inbox_items::Model) -> sea_orm::Condition {
     }
 }
 
-/// The input's name and filters, checked; `Err` holds the 422 reply.
+/// A checked inbox input.
+struct Checked {
+    name: String,
+    /// Sorted, no repeats.
+    account_ids: Vec<Uuid>,
+    filters: Filters,
+}
+
+/// The input, checked; `Err` holds the 422 reply (`invalid_name`, `invalid_accounts` for none,
+/// over 100, or one that is not the team's or has no inbox, `invalid_filters`).
 async fn checked(
     db: &impl ConnectionTrait,
     team_id: Uuid,
     input: InboxInput,
-) -> Result<Result<(String, Filters), Response>, DbErr> {
+) -> Result<Result<Checked, Response>, DbErr> {
+    let refuse = |code| Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, code)));
     let Some(name) = team::name(&input.name) else {
-        return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name")));
+        return refuse("invalid_name");
     };
     let filters = match input.filters.checked() {
         Ok(f) => f,
-        Err(code) => return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, code))),
+        Err(code) => return refuse(code),
     };
-    if !inbox::owned(db, team_id, filters.social_set_id, &filters.account_ids).await? {
-        return Ok(Err(reply(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_filters",
-        )));
+    let mut account_ids = input.account_ids;
+    account_ids.sort();
+    account_ids.dedup();
+    if account_ids.is_empty() || account_ids.len() > inbox::MAX_INBOX_ACCOUNTS {
+        return refuse("invalid_accounts");
     }
-    Ok(Ok((name, filters)))
+    let found = social_accounts::Entity::find()
+        .filter(social_accounts::Column::TeamId.eq(team_id))
+        .filter(social_accounts::Column::Id.is_in(account_ids.iter().copied()))
+        .filter(social_accounts::Column::Provider.is_in(inbox::INBOX_PLATFORMS))
+        .count(db)
+        .await?;
+    if found != account_ids.len() as u64 {
+        return refuse("invalid_accounts");
+    }
+    Ok(Ok(Checked {
+        name,
+        account_ids,
+        filters,
+    }))
 }
 
-/// Each inbox's `open_count`, in one query that reads the team's open items once.
-pub fn open_counts_sql(team_id: Uuid, inboxes: &[(Uuid, Filters)]) -> Statement {
+/// Each inbox's `open_count`, in one query that reads the team's open items once. Each inbox is
+/// its `accounts_of` and its filters.
+pub fn open_counts_sql(team_id: Uuid, inboxes: &[(Option<Uuid>, Filters)]) -> Statement {
     let mut values: Vec<Value> = vec![team_id.into()];
     let counts: Vec<String> = inboxes
         .iter()
         .enumerate()
-        .map(|(n, (_, f))| {
+        .map(|(n, (accounts, f))| {
             format!(
                 "COUNT(*) FILTER (WHERE TRUE{}) AS c{n}",
-                filter_sql(f, &mut values)
+                filter_sql(*accounts, f, &mut values)
             )
         })
         .collect();
@@ -438,8 +524,8 @@ pub fn open_counts_sql(team_id: Uuid, inboxes: &[(Uuid, Filters)]) -> Statement 
     Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
 }
 
-/// The team's inboxes, "All" first, then oldest first, each with its `open_count`. Makes "All"
-/// when it is missing.
+/// The team's inboxes, "All" first, then oldest first, each with its `account_ids` and
+/// `open_count`. Makes "All" when it is missing.
 #[utoipa::path(get, path = "/inboxes", tag = "inbox",
     responses((status = 200, body = [Inbox]), (status = 401, body = Error)))]
 async fn list(State(app): State<AppState>, t: InTeam) -> Response {
@@ -458,9 +544,21 @@ async fn list(State(app): State<AppState>, t: InTeam) -> Response {
             .order_by_asc(inboxes::Column::Id)
             .all(&app.db)
             .await?;
-        let list: Vec<Inbox> = rows.into_iter().map(inbox_json).collect();
-        let filtered: Vec<(Uuid, Filters)> =
-            list.iter().map(|i| (i.id, i.filters.clone())).collect();
+        let mut accounts = accounts_by_inbox(&app.db, t.team.id).await?;
+        let filtered: Vec<(Option<Uuid>, Filters)> = rows
+            .iter()
+            .map(|i| {
+                let f = serde_json::from_value(i.filters.clone()).unwrap_or_default();
+                (accounts_of(i), f)
+            })
+            .collect();
+        let list: Vec<Inbox> = rows
+            .into_iter()
+            .map(|i| {
+                let ids = accounts.remove(&i.id).unwrap_or_default();
+                inbox_json(i, ids)
+            })
+            .collect();
         let counts = app
             .db
             .query_one_raw(open_counts_sql(t.team.id, &filtered))
@@ -485,9 +583,9 @@ async fn list(State(app): State<AppState>, t: InTeam) -> Response {
     }
 }
 
-/// Creates an inbox. Owners and admins; at most 50 per team ("All" included), and with billing on
-/// at most the plan's `inboxes` besides "All" (`402 plan_limit`). Account and set ids must be the
-/// team's.
+/// Creates an inbox of 1 to 100 of the team's Bluesky, Facebook and Instagram accounts. Owners
+/// and admins; at most 50 per team ("All" included), and with billing on at most the plan's
+/// `inboxes` besides "All" (`402 plan_limit`).
 #[utoipa::path(post, path = "/inboxes", tag = "inbox", request_body = InboxInput,
     responses((status = 201, body = Inbox), (status = 401, body = Error),
         (status = 402, body = Error), (status = 403, body = Error), (status = 409, body = Error),
@@ -502,7 +600,7 @@ async fn create(
         return forbidden();
     }
     let made = async {
-        let (name, filters) = match checked(&app.db, t.team.id, input).await? {
+        let c = match checked(&app.db, t.team.id, input).await? {
             Ok(v) => v,
             Err(res) => return Ok(Err(res)),
         };
@@ -528,16 +626,17 @@ async fn create(
         let row = inboxes::ActiveModel {
             id: Set(Uuid::now_v7()),
             team_id: Set(t.team.id),
-            name: Set(name),
+            name: Set(c.name),
             is_all: Set(false),
-            filters: Set(serde_json::json!(filters)),
+            filters: Set(serde_json::json!(c.filters)),
             ..Default::default()
         };
         let made = inboxes::Entity::insert(row)
             .exec_with_returning(&txn)
             .await?;
+        set_accounts(&txn, made.id, &c.account_ids).await?;
         txn.commit().await?;
-        Ok::<_, DbErr>(Ok(inbox_json(made)))
+        Ok::<_, DbErr>(Ok(inbox_json(made, c.account_ids)))
     };
     match made.await {
         Ok(Ok(i)) => (StatusCode::CREATED, Json(i)).into_response(),
@@ -546,7 +645,7 @@ async fn create(
     }
 }
 
-/// Replaces an inbox's name and filters. Owners and admins; "All" is `409 all_inbox`.
+/// Replaces an inbox's name, accounts and filters. Owners and admins; "All" is `409 all_inbox`.
 #[utoipa::path(put, path = "/inboxes/{id}", tag = "inbox", request_body = InboxInput,
     params(("id" = Uuid, Path)),
     responses((status = 200, body = Inbox), (status = 401, body = Error),
@@ -569,19 +668,22 @@ async fn update(
         if found.is_all {
             return Ok(Err(reply(StatusCode::CONFLICT, "all_inbox")));
         }
-        let (name, filters) = match checked(&app.db, t.team.id, input).await? {
+        let c = match checked(&app.db, t.team.id, input).await? {
             Ok(v) => v,
             Err(res) => return Ok(Err(res)),
         };
         let row = inboxes::ActiveModel {
             id: Set(id),
-            name: Set(name),
-            filters: Set(serde_json::json!(filters)),
+            name: Set(c.name),
+            filters: Set(serde_json::json!(c.filters)),
             updated_at: Set(Utc::now().fixed_offset()),
             ..Default::default()
         };
-        let saved = inboxes::Entity::update(row).exec(&app.db).await?;
-        Ok::<_, DbErr>(Ok(inbox_json(saved)))
+        let txn = app.db.begin().await?;
+        let saved = inboxes::Entity::update(row).exec(&txn).await?;
+        set_accounts(&txn, id, &c.account_ids).await?;
+        txn.commit().await?;
+        Ok::<_, DbErr>(Ok(inbox_json(saved, c.account_ids)))
     };
     match saved.await {
         Ok(Ok(i)) => Json(i).into_response(),
@@ -641,6 +743,7 @@ pub struct Narrow<'a> {
 /// groups, not the items.
 pub fn items_sql(
     team_id: Uuid,
+    accounts_of: Option<Uuid>,
     filters: &Filters,
     n: &Narrow<'_>,
     limit: u64,
@@ -656,7 +759,7 @@ pub fn items_sql(
     } = *n;
     let mut values: Vec<Value> = vec![team_id.into()];
     // What an item must be to be in scope, then what narrows the rows that are listed.
-    let mut scope = filter_sql(filters, &mut values);
+    let mut scope = filter_sql(accounts_of, filters, &mut values);
     let mut rest = String::new();
     let mut hit = String::from("TRUE");
     if let Some(kind) = kind {
@@ -781,7 +884,7 @@ async fn items(
         let Some(found) = find_inbox(&app.db, t.team.id, id).await? else {
             return Ok(None);
         };
-        let filters: Filters = serde_json::from_value(found.filters).unwrap_or_default();
+        let filters: Filters = serde_json::from_value(found.filters.clone()).unwrap_or_default();
         let narrow = Narrow {
             state: q.state.as_deref(),
             kind: q.kind.as_deref(),
@@ -790,7 +893,14 @@ async fn items(
             assigned,
             cursor: q.cursor,
         };
-        let stmt = items_sql(t.team.id, &filters, &narrow, limit, grouped);
+        let stmt = items_sql(
+            t.team.id,
+            accounts_of(&found),
+            &filters,
+            &narrow,
+            limit,
+            grouped,
+        );
         let mut found = app.db.query_all_raw(stmt).await?;
         let more = found.len() as u64 > limit;
         found.truncate(limit as usize);
@@ -1105,23 +1215,24 @@ mod tests {
             cursor: Some(Uuid::nil()),
             ..Narrow::default()
         };
-        let stmt = items_sql(team, &f, &n, 50, false);
+        let stmt = items_sql(team, Some(Uuid::nil()), &f, &n, 50, false);
         assert_eq!(
             stmt.sql,
-            "SELECT i.* FROM inbox_items i WHERE i.team_id = $1 AND i.kind IN ($2) \
-             AND i.kind = $3 AND i.state = $4 AND (i.received_at, i.id) < (SELECT c.received_at, c.id \
-             FROM inbox_items c WHERE c.id = $5 AND c.team_id = $1) \
-             ORDER BY i.received_at DESC, i.id DESC LIMIT $6"
+            "SELECT i.* FROM inbox_items i WHERE i.team_id = $1 AND EXISTS (SELECT 1 FROM \
+             inbox_accounts ia WHERE ia.inbox_id = $2 AND ia.social_account_id = i.social_account_id) \
+             AND i.kind IN ($3) AND i.kind = $4 AND i.state = $5 AND (i.received_at, i.id) < \
+             (SELECT c.received_at, c.id FROM inbox_items c WHERE c.id = $6 AND c.team_id = $1) \
+             ORDER BY i.received_at DESC, i.id DESC LIMIT $7"
         );
         let values = stmt.values.unwrap().0;
-        assert_eq!(values.len(), 6);
-        assert_eq!(values[5], Value::from(51i64));
+        assert_eq!(values.len(), 7);
+        assert_eq!(values[6], Value::from(51i64));
         // No kind: follows are left out. A search is one bound, escaped pattern.
         let n = Narrow {
             q: Some("50%_off"),
             ..Narrow::default()
         };
-        let stmt = items_sql(team, &Filters::default(), &n, 10, false);
+        let stmt = items_sql(team, None, &Filters::default(), &n, 10, false);
         assert_eq!(
             stmt.sql,
             "SELECT i.* FROM inbox_items i WHERE i.team_id = $1 AND i.kind <> 'follow' \
@@ -1138,7 +1249,7 @@ mod tests {
             assigned: Some(None),
             ..Narrow::default()
         };
-        let stmt = items_sql(team, &Filters::default(), &n, 10, false);
+        let stmt = items_sql(team, None, &Filters::default(), &n, 10, false);
         assert!(stmt.sql.contains(
             " AND EXISTS (SELECT 1 FROM contact_tags ct WHERE ct.contact_id = i.contact_id \
              AND ct.tag = $2) AND i.assigned_to IS NULL ORDER BY"
@@ -1147,7 +1258,7 @@ mod tests {
             assigned: Some(Some(Uuid::nil())),
             ..Narrow::default()
         };
-        let stmt = items_sql(team, &Filters::default(), &n, 10, false);
+        let stmt = items_sql(team, None, &Filters::default(), &n, 10, false);
         assert!(stmt.sql.contains(" AND i.assigned_to = $2 ORDER BY"));
     }
 
@@ -1159,12 +1270,14 @@ mod tests {
         };
         let stmt = open_counts_sql(
             Uuid::nil(),
-            &[(Uuid::nil(), Filters::default()), (Uuid::nil(), f)],
+            &[(None, Filters::default()), (Some(Uuid::nil()), f)],
         );
         assert_eq!(
             stmt.sql,
             "SELECT COUNT(*) FILTER (WHERE TRUE) AS c0, \
-             COUNT(*) FILTER (WHERE TRUE AND i.kind IN ($2)) AS c1 \
+             COUNT(*) FILTER (WHERE TRUE AND EXISTS (SELECT 1 FROM inbox_accounts ia \
+             WHERE ia.inbox_id = $2 AND ia.social_account_id = i.social_account_id) \
+             AND i.kind IN ($3)) AS c1 \
              FROM inbox_items i WHERE i.team_id = $1 AND i.state = 'open' AND i.kind <> 'follow'"
         );
     }
