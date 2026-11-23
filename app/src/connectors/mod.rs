@@ -36,7 +36,38 @@ pub fn unsent(msg: String, sure: bool) -> String {
     }
 }
 
+/// `e` without the `UNSENT` mark: for a failure once the platform may already hold the post,
+/// such as a token renewal after the last bytes of an upload went out.
+pub fn maybe_sent(e: bluesky::PostError) -> bluesky::PostError {
+    match e {
+        bluesky::PostError::Failed(msg) => {
+            bluesky::PostError::Failed(msg.replace(&format!(" {UNSENT}"), ""))
+        }
+        other => other,
+    }
+}
+
 /// A request that failed before its connection opened sent nothing.
 pub fn never_sent(e: &reqwest::Error) -> bool {
     e.is_connect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_unsent_mark_comes_and_goes() {
+        let marked = unsent("Publish: X could not be reached.".into(), true);
+        assert_eq!(
+            marked,
+            "Publish: X could not be reached. Nothing was posted."
+        );
+        assert_eq!(unsent("Timed out.".into(), false), "Timed out.");
+        let bluesky::PostError::Failed(kept) = maybe_sent(bluesky::PostError::Failed(marked))
+        else {
+            panic!("still a failure");
+        };
+        assert_eq!(kept, "Publish: X could not be reached.");
+    }
 }
