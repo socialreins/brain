@@ -344,12 +344,11 @@ pub(super) async fn tags_of(
     Ok(tags)
 }
 
-/// The team's custom inboxes, each with its accounts and filters, oldest first.
+/// The team's custom inboxes, each with its filters, oldest first.
 async fn custom_inboxes(
     db: &impl ConnectionTrait,
     team_id: Uuid,
-) -> Result<Vec<(Uuid, Vec<Uuid>, Filters)>, DbErr> {
-    let mut accounts = accounts_by_inbox(db, team_id).await?;
+) -> Result<Vec<(Uuid, Filters)>, DbErr> {
     let rows = inboxes::Entity::find()
         .filter(inboxes::Column::TeamId.eq(team_id))
         .filter(inboxes::Column::IsAll.eq(false))
@@ -361,19 +360,59 @@ async fn custom_inboxes(
         .into_iter()
         .map(|i| {
             let f = serde_json::from_value(i.filters).unwrap_or_default();
-            (i.id, accounts.remove(&i.id).unwrap_or_default(), f)
+            (i.id, f)
         })
         .collect())
+}
+
+/// For each of `items`, a column `c<n>` telling whether the n-th of `inboxes` holds it, decided
+/// by `filter_sql` (ILIKE included) exactly as the inbox's list decides it.
+pub fn held_sql(items: &[Uuid], inboxes: &[(Uuid, Filters)]) -> Statement {
+    let mut values: Vec<Value> = Vec::new();
+    let ids = inbox::placeholders(&mut values, items.iter().map(|&i| i.into()));
+    let cols: String = inboxes
+        .iter()
+        .enumerate()
+        .map(|(n, (id, f))| {
+            let cond = filter_sql(Some(*id), f, &mut values);
+            format!(", COALESCE(TRUE{cond}, false) AS c{n}")
+        })
+        .collect();
+    let sql = format!("SELECT i.id{cols} FROM inbox_items i WHERE i.id IN ({ids})");
+    Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
+}
+
+/// The custom inboxes that hold each of `items`.
+async fn held_by(
+    db: &impl ConnectionTrait,
+    items: &[inbox_items::Model],
+) -> Result<HashMap<Uuid, Vec<Uuid>>, DbErr> {
+    let mut out: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    let Some(first) = items.first() else {
+        return Ok(out);
+    };
+    let inboxes = custom_inboxes(db, first.team_id).await?;
+    if inboxes.is_empty() {
+        return Ok(out);
+    }
+    let ids: Vec<Uuid> = items.iter().map(|i| i.id).collect();
+    for r in db.query_all_raw(held_sql(&ids, &inboxes)).await? {
+        let mut held = Vec::new();
+        for (n, (id, _)) in inboxes.iter().enumerate() {
+            if r.try_get::<bool>("", &format!("c{n}"))? {
+                held.push(*id);
+            }
+        }
+        out.insert(r.try_get("", "id")?, held);
+    }
+    Ok(out)
 }
 
 pub(super) async fn items_json(
     db: &impl ConnectionTrait,
     rows: Vec<inbox_items::Model>,
 ) -> Result<Vec<Item>, DbErr> {
-    let inboxes = match rows.first() {
-        Some(r) => custom_inboxes(db, r.team_id).await?,
-        None => Vec::new(),
-    };
+    let mut held = held_by(db, &rows).await?;
     let tags = tags_of(db, rows.iter().filter_map(|i| i.contact_id)).await?;
     let names: HashMap<Uuid, String> = users::Entity::find()
         .filter(users::Column::Id.is_in(rows.iter().filter_map(|i| i.assigned_to)))
@@ -404,14 +443,7 @@ pub(super) async fn items_json(
     Ok(rows
         .into_iter()
         .map(|i| Item {
-            inbox_ids: inboxes
-                .iter()
-                .filter(|(_, accounts, f)| {
-                    accounts.contains(&i.social_account_id)
-                        && f.matches(&i.kind, &i.text, i.replied_at.is_some())
-                })
-                .map(|(id, _, _)| *id)
-                .collect(),
+            inbox_ids: held.remove(&i.id).unwrap_or_default(),
             replies: by_item.remove(&i.id).unwrap_or_default(),
             id: i.id,
             social_account_id: i.social_account_id,
@@ -1318,6 +1350,21 @@ mod tests {
                 .contains(" AND i.kind <> 'follow' AND i.social_account_id = $2 ORDER BY"),
             "{}",
             stmt.sql
+        );
+    }
+
+    #[test]
+    fn held_sql_decides_each_inbox_like_its_list() {
+        let f = Filters {
+            keywords: vec!["Grüße".into()],
+            ..Filters::default()
+        };
+        let stmt = held_sql(&[Uuid::nil()], &[(Uuid::nil(), f)]);
+        assert_eq!(
+            stmt.sql,
+            "SELECT i.id, COALESCE(TRUE AND EXISTS (SELECT 1 FROM inbox_accounts ia \
+             WHERE ia.inbox_id = $2 AND ia.social_account_id = i.social_account_id) \
+             AND (i.text ILIKE $3), false) AS c0 FROM inbox_items i WHERE i.id IN ($1)"
         );
     }
 

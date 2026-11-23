@@ -18715,6 +18715,21 @@ mod teams {
                 let both = json!([dms, everything]);
                 let one = json!([everything]);
                 assert_eq!(chips, [("dm", &one), ("comment", &both), ("mention", &one)]);
+                // The chips agree with each inbox's own list (both decided in SQL, ILIKE included).
+                for inbox in [&dms, everything.as_str().unwrap()] {
+                    let listed = items(&s, &cookie, inbox, "").await["items"].clone();
+                    let chipped: Vec<&Value> = got["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|i| i["inbox_ids"].as_array().unwrap().contains(&json!(inbox)))
+                        .collect();
+                    let listed: Vec<&Value> = listed.as_array().unwrap().iter().collect();
+                    assert_eq!(chipped.len(), listed.len(), "{inbox}");
+                    for (a, b) in chipped.iter().zip(listed) {
+                        assert_eq!(a["id"], b["id"], "{inbox}");
+                    }
+                }
                 // `account_id` narrows to one account.
                 let got = items(&s, &cookie, all_id, &format!("?account_id={account}")).await;
                 assert_eq!(got["items"].as_array().unwrap().len(), 3);
