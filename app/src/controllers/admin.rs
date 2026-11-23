@@ -260,6 +260,12 @@ pub struct AdminTeam {
     pub posts: i64,
     /// The owner's email (the longest-standing one when there are several).
     pub owner_email: Option<String>,
+    /// The plan id (`scheduler`, `automation`), `null` when the team never had one.
+    pub plan: Option<String>,
+    /// `trialing`, `active`, `past_due` or `canceled`.
+    pub plan_status: Option<String>,
+    /// `stripe`, or `comp` for a free plan an admin gave.
+    pub plan_provider: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -276,8 +282,9 @@ const TEAMS: &str = "SELECT t.id, t.name, t.created_at, \
     (SELECT count(*) FROM posts p WHERE p.team_id = t.id AND p.status <> 'deleted') AS posts, \
     (SELECT u.email FROM team_user m JOIN users u ON u.id = m.user_id \
       WHERE m.team_id = t.id AND m.role = 'owner' \
-      ORDER BY m.created_at, u.id LIMIT 1) AS owner_email \
-    FROM teams t WHERE t.name ILIKE $1 \
+      ORDER BY m.created_at, u.id LIMIT 1) AS owner_email, \
+    s.plan_id AS plan, s.status AS plan_status, s.provider AS plan_provider \
+    FROM teams t LEFT JOIN subscriptions s ON s.team_id = t.id WHERE t.name ILIKE $1 \
     ORDER BY t.created_at DESC, t.id DESC LIMIT $2 OFFSET $3";
 
 /// Every team with its sizes. `q` matches the team name.
@@ -309,6 +316,9 @@ async fn teams(
                     accounts: r.try_get("", "accounts")?,
                     posts: r.try_get("", "posts")?,
                     owner_email: r.try_get("", "owner_email")?,
+                    plan: r.try_get("", "plan")?,
+                    plan_status: r.try_get("", "plan_status")?,
+                    plan_provider: r.try_get("", "plan_provider")?,
                 })
             })
             .collect::<Result<_, DbErr>>()?;
