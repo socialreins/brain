@@ -23,13 +23,15 @@ use uuid::Uuid;
 
 use super::{
     auth::{internal, Body, FromWeb},
+    billing::plan_limit,
     teams::{present, InTeam},
     waitlist::{error, Error},
 };
 use crate::{
+    billing::{self, Limit},
     connectors::bluesky::{self, InboxError},
     inbox::{self, filter_sql, Filters, Via},
-    models::{inbox_items, inbox_replies, inboxes, social_accounts, team_user, teams, users},
+    models::{inbox_items, inbox_replies, inboxes, social_accounts, team_user, users},
     state::AppState,
 };
 
@@ -483,11 +485,13 @@ async fn list(State(app): State<AppState>, t: InTeam) -> Response {
     }
 }
 
-/// Creates an inbox. Owners and admins; at most 50 per team. Account and set ids must be the
+/// Creates an inbox. Owners and admins; at most 50 per team ("All" included), and with billing on
+/// at most the plan's `inboxes` besides "All" (`402 plan_limit`). Account and set ids must be the
 /// team's.
 #[utoipa::path(post, path = "/inboxes", tag = "inbox", request_body = InboxInput,
     responses((status = 201, body = Inbox), (status = 401, body = Error),
-        (status = 403, body = Error), (status = 409, body = Error), (status = 422, body = Error)))]
+        (status = 402, body = Error), (status = 403, body = Error), (status = 409, body = Error),
+        (status = 422, body = Error)))]
 async fn create(
     _: FromWeb,
     State(app): State<AppState>,
@@ -497,25 +501,28 @@ async fn create(
     if !t.role.manages() {
         return forbidden();
     }
-    if let Some(res) = super::billing::needs_automation(&app, t.team.id).await {
-        return res;
-    }
     let made = async {
         let (name, filters) = match checked(&app.db, t.team.id, input).await? {
             Ok(v) => v,
             Err(res) => return Ok(Err(res)),
         };
         let txn = app.db.begin().await?;
-        // The team row lock keeps concurrent creates under the cap.
-        teams::Entity::find_by_id(t.team.id)
-            .lock_exclusive()
-            .one(&txn)
-            .await?;
-        let n = inboxes::Entity::find()
-            .filter(inboxes::Column::TeamId.eq(t.team.id))
-            .count(&txn)
-            .await?;
-        if n >= MAX_INBOXES {
+        // The team row lock keeps concurrent creates under the caps.
+        txn.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT 1 FROM teams WHERE id = $1 FOR NO KEY UPDATE",
+            [t.team.id.into()],
+        ))
+        .await?;
+        let all = inboxes::Entity::find().filter(inboxes::Column::TeamId.eq(t.team.id));
+        let custom = all.clone().filter(inboxes::Column::IsAll.eq(false));
+        let limits = billing::limits_of(app.billing_enabled, &txn, t.team.id).await?;
+        if let Some(max) = limits.inboxes {
+            if custom.count(&txn).await? as i64 >= max {
+                return Ok(Err(plan_limit(Limit::Inboxes)));
+            }
+        }
+        if all.count(&txn).await? >= MAX_INBOXES {
             return Ok(Err(reply(StatusCode::CONFLICT, "too_many_inboxes")));
         }
         let row = inboxes::ActiveModel {
