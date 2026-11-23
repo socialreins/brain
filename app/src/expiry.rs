@@ -71,7 +71,7 @@ pub async fn flag_reconnect(db: &impl ConnectionTrait, id: Uuid) {
     }
 }
 
-fn label(provider: &str) -> &str {
+pub(crate) fn label(provider: &str) -> &str {
     match provider {
         "bluesky" => "Bluesky",
         "facebook" => "Facebook",

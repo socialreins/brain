@@ -15,6 +15,7 @@ pub mod meta_inbox;
 pub mod metrics;
 pub mod models;
 pub mod newsletters;
+pub mod post_mail;
 pub mod publish;
 pub mod rate_limit;
 pub mod repeat;

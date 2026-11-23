@@ -7915,6 +7915,123 @@ mod teams {
                     assert!(publish::retry_safe(t["error"].as_str().unwrap()));
                 }
 
+                /// `state` with its mailer pointed at a fake Resend, and what that took.
+                async fn mail_to_fake(
+                    state: &AppState,
+                ) -> (AppState, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+                    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let log = seen.clone();
+                    let app = axum::Router::new().route(
+                        "/emails",
+                        axum::routing::post(move |Json(body): Json<Value>| async move {
+                            log.lock().unwrap().push(body);
+                            Json(json!({"id": "x"}))
+                        }),
+                    );
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let url = format!("http://{}/emails", listener.local_addr().unwrap());
+                    tokio::spawn(async move { axum::serve(listener, app).await });
+                    let mut state = state.clone();
+                    state.mailer = socialreins_brain::mail::Mailer::resend_at(
+                        &url,
+                        "re_test",
+                        "b@example.com",
+                    )
+                    .unwrap();
+                    (state, seen)
+                }
+
+                /// The mail sent to `to`: `(subject, text)`.
+                fn mail_for(seen: &[Value], to: &str) -> Vec<(String, String)> {
+                    seen.iter()
+                        .filter(|m| m["to"] == json!([to]))
+                        .map(|m| {
+                            let field = |k: &str| m[k].as_str().unwrap_or_default().to_owned();
+                            (field("subject"), field("text"))
+                        })
+                        .collect()
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn the_author_and_owners_are_mailed_ten_times_a_day_at_most() {
+                    let (s, db, state) = on_mock().await;
+                    let (state, seen) = mail_to_fake(&state).await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let one = |sql: String| {
+                        let db = &db;
+                        async move {
+                            let row = db
+                                .query_one_raw(sea_orm::Statement::from_string(
+                                    sea_orm::DbBackend::Postgres,
+                                    sql,
+                                ))
+                                .await
+                                .unwrap()
+                                .unwrap();
+                            row.try_get::<String>("", "v").unwrap()
+                        }
+                    };
+                    let owner = one(format!(
+                        "SELECT u.email AS v FROM team_user m JOIN users u ON u.id = m.user_id \
+                         WHERE m.team_id = '{team_id}' AND m.role = 'owner'"
+                    ))
+                    .await;
+                    let code = one(format!(
+                        "SELECT code AS v FROM teams WHERE id = '{team_id}'"
+                    ))
+                    .await;
+                    // Notices other tests left unsent would go first.
+                    exec(
+                        &db,
+                        "UPDATE post_notices SET sent_at = now() WHERE sent_at IS NULL".into(),
+                    )
+                    .await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let id =
+                        id_of(&create(&s, &cookie, input(&set, "REJECT me", Some(&past()))).await);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "failed");
+                    publish::tick(&state).await.unwrap();
+                    let mails = mail_for(&seen.lock().unwrap(), &owner);
+                    assert_eq!(mails.len(), 1, "{mails:?}");
+                    let (subject, text) = &mails[0];
+                    assert_eq!(subject, "Your Bluesky post failed");
+                    assert!(text.contains("\"REJECT me\""), "{text}");
+                    assert!(
+                        text.contains("Bluesky refused it (InvalidRequest)."),
+                        "{text}"
+                    );
+                    assert!(text.contains(&format!("/t/{code}/posts/{id}")), "{text}");
+                    // Mailed once: another round sends nothing new.
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(mail_for(&seen.lock().unwrap(), &owner).len(), 1);
+
+                    // Late: "not posted", not "failed".
+                    let late =
+                        due_ago(&s, &db, &cookie, input(&set, "late", Some(&past())), 61).await;
+                    publish::tick(&state).await.unwrap();
+                    publish::tick(&state).await.unwrap();
+                    let mails = mail_for(&seen.lock().unwrap(), &owner);
+                    assert_eq!(mails.len(), 2, "{mails:?}");
+                    assert_eq!(mails[1].0, "Your Bluesky post was not posted");
+                    assert!(
+                        mails[1].1.contains("more than an hour late"),
+                        "{}",
+                        mails[1].1
+                    );
+                    assert!(mails[1].1.contains(&format!("/posts/{late}")));
+
+                    // Ten notices a team a day: the eleventh and after are not mailed.
+                    for i in 0..10 {
+                        let body = input(&set, &format!("REJECT {i}"), Some(&past()));
+                        create(&s, &cookie, body).await;
+                    }
+                    publish::tick(&state).await.unwrap();
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(mail_for(&seen.lock().unwrap(), &owner).len(), 10);
+                }
+
                 #[test]
                 fn only_errors_that_sent_nothing_are_retry_safe() {
                     assert!(publish::retry_safe(
