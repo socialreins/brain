@@ -7266,7 +7266,7 @@ mod teams {
 
             #[tokio::test]
             #[serial]
-            async fn deleted_sets_hold_posts_back() {
+            async fn deleted_sets_fail_their_posts() {
                 let (s, db, state) = on_mock().await;
                 let (cookie, _, _) = owner_with_account(&s, &db).await;
                 let other = id_of(
@@ -7289,14 +7289,13 @@ mod teams {
                     .await
                     .unwrap()
                     .unwrap();
-                assert_eq!(
-                    p.status, "scheduled",
-                    "not claimed while its set is deleted"
-                );
-                // A set deleted after the claim sends the post back to scheduled.
+                assert_eq!(p.status, "failed", "failed by the delete, never claimed");
+                assert_eq!(p.error.as_deref(), Some(publish::SET_DELETED));
+                // A set deleted after the claim fails the post the same way.
                 let row = posts::ActiveModel {
                     id: Set(p.id),
                     status: Set("queued".into()),
+                    error: Set(None),
                     ..Default::default()
                 };
                 posts::Entity::update(row).exec(&db).await.unwrap();
@@ -7306,20 +7305,17 @@ mod teams {
                     .await
                     .unwrap()
                     .unwrap();
-                assert_eq!(p.status, "scheduled");
-                assert!(!p.quota_reserved, "it reserves again when claimed next");
-                // An empty set fails the post with a message.
-                req(
-                    &s,
-                    Method::POST,
-                    &format!("/v1/social-sets/{other}/restore"),
-                    &cookie,
-                )
-                .await;
-                publish::tick(&state).await.unwrap();
-                let p = get_post(&s, &cookie, &id).await;
-                assert_eq!(p["status"], "failed");
-                assert_eq!(p["error"], "No bluesky account is in this post's set.");
+                assert_eq!(p.status, "failed");
+                assert_eq!(p.error.as_deref(), Some(publish::SET_DELETED));
+                assert_eq!(
+                    RECORDS
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|r| r["record"]["text"] == "held")
+                        .count(),
+                    0
+                );
             }
 
             /// Publishes a text post with one image to the real Bluesky test account and deletes
@@ -8069,7 +8065,13 @@ mod teams {
                     // Started, or holding its quota (another instance underway): left alone.
                     assert_eq!(status_of(&db, &started).await, "queued");
                     assert_eq!(status_of(&db, &paid).await, "queued");
-                    publish::tick(&state).await.unwrap();
+                    // Other tests' posts it released may fill a round first.
+                    for _ in 0..10 {
+                        publish::tick(&state).await.unwrap();
+                        if status_of(&db, &idle).await != "scheduled" {
+                            break;
+                        }
+                    }
                     assert_eq!(status_of(&db, &idle).await, "published");
                     exec(
                         &db,
