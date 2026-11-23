@@ -1132,10 +1132,7 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
 /// Claims up to 50 due `scheduled` posts, oldest first, `scheduled` to `queued`: only posts of
 /// a live set, of a team under its daily publish cap (and with `billing`, on a live plan), and none `rejected`, nor `pending` while its
 /// team requires approval. Returns `(post, team)`.
-pub async fn claim_due(
-    db: &DatabaseConnection,
-    billing: bool,
-) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
+pub async fn claim_due(db: &DatabaseConnection, billing: bool) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
     claim(db, CLAIM_BATCH, billing).await
 }
 

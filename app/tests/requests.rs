@@ -5986,7 +5986,10 @@ mod teams {
                         create(&s, &cookie, input(&set, &format!("due {i}"), Some(&past()))).await;
                     mine.push(id_of(&res).parse::<uuid::Uuid>().unwrap());
                 }
-                let (a, b) = tokio::join!(publish::claim_due(&db, false), publish::claim_due(&db, false));
+                let (a, b) = tokio::join!(
+                    publish::claim_due(&db, false),
+                    publish::claim_due(&db, false)
+                );
                 let (a, b) = (a.unwrap(), b.unwrap());
                 assert!(a.len() <= 50 && b.len() <= 50, "batches are capped");
                 for id in &mine {
@@ -28535,9 +28538,15 @@ mod teams {
             let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
             // Publishing now or retrying waits for a plan, before the post is even looked up.
             let some = uuid::Uuid::now_v7();
-            for path in [format!("/v1/posts/{some}/publish"), format!("/v1/posts/{some}/retry")] {
+            for path in [
+                format!("/v1/posts/{some}/publish"),
+                format!("/v1/posts/{some}/retry"),
+            ] {
                 let (code, body) = post(&s, &owner, &path, json!({})).await;
-                assert_eq!((code, body), (402, json!({"error": "plan_limit", "limit": "plan"})));
+                assert_eq!(
+                    (code, body),
+                    (402, json!({"error": "plan_limit", "limit": "plan"}))
+                );
             }
             let refused = json!({"error": "plan_limit", "limit": "automation"});
             // No plan at all.
