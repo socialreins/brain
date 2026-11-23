@@ -28781,6 +28781,7 @@ mod teams {
             res.assert_json(&json!({"url": "https://stripe.test/checkout/s1"}));
             let f = form_of("/checkout", before);
             assert_eq!(f["mode"], "subscription");
+            assert_eq!(f["adaptive_pricing[enabled]"], "false");
             // Yearly unless the owner picks monthly.
             assert_eq!(f["line_items[0][price]"], "price_sy");
             assert_eq!(f["client_reference_id"], team);
