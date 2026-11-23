@@ -142,19 +142,21 @@ fn compose(
     link: &str,
 ) -> (String, String) {
     let network = crate::expiry::label(platform);
-    let snippet: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    let snippet = match snippet.char_indices().nth(120) {
-        Some((i, _)) => format!("{}...", &snippet[..i]),
-        None => snippet,
-    };
+    let snippet = one_line(body, 120);
     let quoted = if snippet.is_empty() {
         String::new()
     } else {
         format!("\"{snippet}\"\n\n")
     };
     let why = error.unwrap_or("No reason was given.");
-    // `settle` joins the accounts with "; ": one line each.
-    let lines = why.split("; ").collect::<Vec<_>>().join("\n");
+    // `settle` joins the accounts with "; ": one line each. Each starts with "- " and is one
+    // line, so text from a platform or a post never reads as a link the mail makes a button of.
+    let lines = why
+        .split("; ")
+        .take(10)
+        .map(|l| format!("- {}", one_line(l, 300)))
+        .collect::<Vec<_>>()
+        .join("\n");
     let (subject, lead) = match kind {
         Kind::Failed => (
             format!("Your {network} post failed"),
@@ -176,6 +178,15 @@ fn compose(
     (subject, text)
 }
 
+/// `text` on one line, its whitespace collapsed, cut at `max` characters.
+fn one_line(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(max) {
+        Some((i, _)) => format!("{}...", &flat[..i]),
+        None => flat,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,7 +202,12 @@ mod tests {
         );
         assert_eq!(subject, "Your Bluesky post partly failed");
         assert!(text.contains("\"Hello world\""), "{text}");
-        assert!(text.contains("@a.test: Bluesky refused it (InvalidRequest).\n@b.test: Timed out"));
+        assert!(
+            text.contains("- @a.test: Bluesky refused it (InvalidRequest).\n- @b.test: Timed out")
+        );
+        // A link in a platform's message stays text.
+        let (_, text) = compose(Kind::Failed, "x", "", Some("https://evil.test\nx"), "l");
+        assert!(text.contains("\n- https://evil.test x\n"), "{text}");
         assert!(text.ends_with("https://app.test/t/abc234/posts/1\n"));
         let (subject, text) = compose(Kind::Late, "x", &"a".repeat(300), None, "l");
         assert_eq!(subject, "Your X post was not posted");
