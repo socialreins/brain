@@ -18894,6 +18894,52 @@ mod teams {
                 res.json::<Value>()["runs"].as_array().unwrap().clone()
             }
 
+            /// An item automations never finished (a crash between storing and running) is run by
+            /// the sweep once, and only while it is recent.
+            #[tokio::test]
+            #[serial]
+            async fn the_sweep_runs_items_automations_never_finished() {
+                use sea_orm::ConnectionTrait;
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                set_inbox(
+                    &me,
+                    json!({"notifications": [
+                        note("reply", "did:plc:late2", "s2", "guide please", &at(-2), &me),
+                        note("reply", "did:plc:late1", "s1", "guide please", &at(-1), &me),
+                    ]}),
+                );
+                // Stored with no automation yet: done, nothing to run.
+                ingest(&db, &state, &account).await;
+                let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                    .json(&comment_to_dm())
+                    .await;
+                assert_eq!(res.status_code(), 201);
+                let id = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                // As if both had been stored and the process died before running them: one
+                // 3 minutes ago, one 2 days ago.
+                let sql = |q: String| {
+                    let db = db.clone();
+                    async move { db.execute_unprepared(&q).await.unwrap() }
+                };
+                sql(format!(
+                    "UPDATE automations SET activated_at = now() - interval '3 days' WHERE id = '{id}'; \
+                     UPDATE social_accounts SET created_at = now() - interval '3 days' WHERE id = '{account}'; \
+                     UPDATE inbox_items SET automated_at = NULL, received_at = now() - interval '3 minutes' \
+                       WHERE social_account_id = '{account}' AND author_id = 'did:plc:late1'; \
+                     UPDATE inbox_items SET automated_at = NULL, received_at = now() - interval '2 days' \
+                       WHERE social_account_id = '{account}' AND author_id = 'did:plc:late2'"
+                ))
+                .await;
+                let before = SENT.lock().unwrap().len();
+                socialreins_brain::automations::sweep(&state).await.unwrap();
+                socialreins_brain::automations::sweep(&state).await.unwrap();
+                let sent = SENT.lock().unwrap().clone();
+                assert_eq!(sent.len(), before + 1, "the recent one, once");
+                assert_eq!(sent.last().unwrap()["convoId"], "convo-did:plc:late1");
+                assert_eq!(runs(&s, &cookie, &id).await.len(), 1);
+            }
+
             #[tokio::test]
             #[serial]
             async fn automations_are_strict_and_run_once_per_comment() {

@@ -20,7 +20,7 @@
 //! a send beside it.
 use sea_orm::{
     sea_query::Query, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, DbErr,
-    EntityTrait, QueryFilter, QueryOrder, Statement, TransactionTrait, Value,
+    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait, Value,
 };
 use std::{
     ops::Range,
@@ -504,6 +504,60 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
 /// Runs every active automation of the item's team for the item's trigger (`trigger_of`) that
 /// was on when the item came.
 pub async fn run(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+) -> Result<(), DbErr> {
+    run_matching(app, account, item).await?;
+    // Done to the end: the sweep leaves it alone from now on.
+    app.db
+        .execute_raw(sql(
+            "UPDATE inbox_items SET automated_at = now() WHERE id = $1",
+            vec![item.id.into()],
+        ))
+        .await
+        .map(|_| ())
+}
+
+/// Items automations never finished (a crash, a restart, a database error) are older than this
+/// before the sweep takes them, so it never races the round that stored them.
+const SWEEP_AFTER_MINUTES: i64 = 2;
+/// Older items are left alone: a reply days late does more harm than none.
+const SWEEP_WITHIN_HOURS: i64 = 24;
+const SWEEP_BATCH: u64 = 50;
+
+/// Runs automations again over recent items they never finished, oldest first. A run that did
+/// happen is not repeated (`claim` is unique per automation and item).
+pub async fn sweep(app: &AppState) -> Result<(), DbErr> {
+    let items = inbox_items::Entity::find()
+        .filter(inbox_items::Column::AutomatedAt.is_null())
+        .filter(inbox_items::Column::ReceivedAt.lt(
+            (chrono::Utc::now() - chrono::Duration::minutes(SWEEP_AFTER_MINUTES)).fixed_offset(),
+        ))
+        .filter(
+            inbox_items::Column::ReceivedAt.gt((chrono::Utc::now()
+                - chrono::Duration::hours(SWEEP_WITHIN_HOURS))
+            .fixed_offset()),
+        )
+        .order_by_asc(inbox_items::Column::ReceivedAt)
+        .limit(SWEEP_BATCH)
+        .all(&app.db)
+        .await?;
+    for item in items {
+        let Some(account) = social_accounts::Entity::find_by_id(item.social_account_id)
+            .one(&app.db)
+            .await?
+        else {
+            continue;
+        };
+        if let Err(e) = run(app, &account, &item).await {
+            tracing::warn!(error = %e, item = %item.id, "automation sweep failed");
+        }
+    }
+    Ok(())
+}
+
+async fn run_matching(
     app: &AppState,
     account: &social_accounts::Model,
     item: &inbox_items::Model,

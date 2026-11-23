@@ -296,33 +296,75 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
         )
         .all(&app.db)
         .await?;
-    let runs: Vec<_> = accounts
+    let reads: Vec<_> = accounts
         .into_iter()
         .map(|a| {
             let app = app.clone();
             tokio::spawn(async move {
                 let id = a.id;
-                if let Err(e) = ingest(&app, a).await {
-                    tracing::error!(error = %e, account = %id, "inbox ingest failed");
+                match store_new(&app, a).await {
+                    Ok(stored) => stored,
+                    Err(e) => {
+                        tracing::error!(error = %e, account = %id, "inbox ingest failed");
+                        None
+                    }
                 }
             })
+        })
+        .collect();
+    let mut stored = Vec::new();
+    for read in reads {
+        if let Ok(Some(s)) = read.await {
+            stored.push(s);
+        }
+    }
+    // The lock covers reading and storing only: sends to the platforms, which can be slow, must
+    // not hold up the next round. A second instance running these too sends nothing twice.
+    lock.commit().await?;
+    let runs: Vec<_> = stored
+        .into_iter()
+        .map(|(account, fresh)| {
+            let app = app.clone();
+            tokio::spawn(async move { run_fresh(&app, &account, &fresh).await })
         })
         .collect();
     for run in runs {
         let _ = run.await;
     }
-    lock.commit().await
+    automations::sweep(app).await
+}
+
+/// Automations over one account's new items, oldest first. An item whose run fails keeps no
+/// `automated_at`, so the sweep tries it again; the others still run.
+async fn run_fresh(app: &AppState, account: &social_accounts::Model, fresh: &[inbox_items::Model]) {
+    for item in fresh {
+        if let Err(e) = automations::run(app, account, item).await {
+            tracing::error!(error = %e, item = %item.id, "automations failed");
+        }
+    }
 }
 
 /// Reads one account's new notifications (follows included) and DMs, stores them, moves its
 /// cursors and runs automations on the new items.
 pub async fn ingest(app: &AppState, account: social_accounts::Model) -> Result<(), DbErr> {
+    if let Some((account, fresh)) = store_new(app, account).await? {
+        run_fresh(app, &account, &fresh).await;
+    }
+    Ok(())
+}
+
+/// The storing half of `ingest`: the account as it now is and its new items, or `None` when
+/// nothing was read (no slot, no secret, a refused token).
+async fn store_new(
+    app: &AppState,
+    account: social_accounts::Model,
+) -> Result<Option<(social_accounts::Model, Vec<inbox_items::Model>)>, DbErr> {
     let Ok(_slot) = ACCOUNT_SLOTS.acquire().await else {
-        return Ok(());
+        return Ok(None);
     };
     let db = &app.db;
     let Some(secret) = secret(app, &account) else {
-        return Ok(());
+        return Ok(None);
     };
     let c = Creds {
         pds: pds(&account),
@@ -359,7 +401,7 @@ pub async fn ingest(app: &AppState, account: social_accounts::Model) -> Result<(
             );
             db.execute_raw(stmt).await?;
             crate::expiry::flag_reconnect(db, account.id).await;
-            return Ok(());
+            return Ok(None);
         }
         Err(e) => tracing::warn!(code = e.code(), account = %account.id, "notifications failed"),
     }
@@ -405,12 +447,7 @@ pub async fn ingest(app: &AppState, account: social_accounts::Model) -> Result<(
             ..account
         }
     };
-    // shortcut: automations run only on items stored in this round, so a crash between the
-    // insert and the run skips them; sweep recent unrun items if that ever matters.
-    for item in &fresh {
-        automations::run(app, &account, item).await?;
-    }
-    Ok(())
+    Ok(Some((account, fresh)))
 }
 
 fn clip(text: &str) -> String {
