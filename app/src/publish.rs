@@ -1091,7 +1091,7 @@ pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, D
     let left = ids(&app.db, stmt, "id").await?;
     // The quota is reserved per post in `publish_post`, together with marking it reserved.
     let mut flights = Vec::new();
-    for (id, _) in claim(&app.db, room).await? {
+    for (id, _) in claim(&app.db, room, app.billing_enabled).await? {
         if in_flight(|flying| flying.insert(id)) {
             flights.push(Flight(id));
         // Put back by a task that has not ended yet and claimed again here: nothing would run
@@ -1130,15 +1130,22 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
 }
 
 /// Claims up to 50 due `scheduled` posts, oldest first, `scheduled` to `queued`: only posts of
-/// a live set, of a team under its daily publish cap, and none `rejected`, nor `pending` while its
+/// a live set, of a team under its daily publish cap (and with `billing`, on a live plan), and none `rejected`, nor `pending` while its
 /// team requires approval. Returns `(post, team)`.
-pub async fn claim_due(db: &DatabaseConnection) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
-    claim(db, CLAIM_BATCH).await
+pub async fn claim_due(
+    db: &DatabaseConnection,
+    billing: bool,
+) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
+    claim(db, CLAIM_BATCH, billing).await
 }
 
 /// `claim_due` of at most `limit` posts. A claimed post with a repeat rule yields its next copy
 /// in the same transaction (`repeat::spawn`), so it does once.
-async fn claim(db: &DatabaseConnection, limit: i64) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
+async fn claim(
+    db: &DatabaseConnection,
+    limit: i64,
+    billing: bool,
+) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
     // A CTE runs once; a LIMIT inside `IN (...)` may be re-run and claim more.
     let stmt = sql(
         "WITH due AS ( \
@@ -1149,6 +1156,8 @@ async fn claim(db: &DatabaseConnection, limit: i64) -> Result<Vec<(Uuid, Uuid)>,
                 SELECT 1 FROM teams t WHERE t.id = d.team_id AND t.require_approval)) \
            AND EXISTS (SELECT 1 FROM social_sets s \
                        WHERE s.id = d.social_set_id AND s.deleted_at IS NULL) \
+           AND (NOT $3 OR EXISTS (SELECT 1 FROM subscriptions b WHERE b.team_id = d.team_id \
+                AND b.status IN ('trialing', 'active', 'past_due'))) \
            AND (SELECT count(*) FROM rate_limit_hits h \
                 WHERE h.bucket = 'publish:team:' || d.team_id::text \
                 AND h.created_at > now() - interval '1 day') < $1 \
@@ -1157,7 +1166,7 @@ async fn claim(db: &DatabaseConnection, limit: i64) -> Result<Vec<(Uuid, Uuid)>,
          UPDATE posts p SET status = 'queued', updated_at = now() FROM due \
          WHERE p.id = due.id AND p.status = 'scheduled' \
          RETURNING p.id, p.team_id",
-        vec![PUBLISHES_PER_DAY.into(), limit.into()],
+        vec![PUBLISHES_PER_DAY.into(), limit.into(), billing.into()],
     );
     let txn = db.begin().await?;
     let rows = txn.query_all_raw(stmt).await?;
@@ -1340,7 +1349,7 @@ async fn fail_post(db: &DatabaseConnection, id: Uuid, msg: &str) -> Result<(), D
 }
 
 const PLAN_ENDED: &str =
-    "The team's plan has ended. Choose a plan on the Billing page, then publish this post again.";
+    "The team's plan has ended. The post goes out once a plan is chosen on the Billing page.";
 
 /// Publishes a `queued` post: one target per account of its platform in its set, each
 /// published at most once, then the post settles.
@@ -1355,9 +1364,9 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
     if post.status != "queued" {
         return Ok(());
     }
-    // A team whose plan ended keeps its posts but publishes nothing; it can retry once it pays.
+    // A team whose plan ended keeps its posts, scheduled, and the claim skips them until it pays.
     if app.billing_enabled && !crate::billing::has_plan(db, post.team_id).await? {
-        return fail_post(db, id, PLAN_ENDED).await;
+        return unclaim(db, id, Some(PLAN_ENDED)).await;
     }
     // Whatever queued it (a tick, publish now, recovery), nothing publishes without its hit.
     if !post.quota_reserved {

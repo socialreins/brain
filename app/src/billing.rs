@@ -133,6 +133,8 @@ pub enum Limit {
     Accounts,
     Members,
     Automation,
+    /// No live plan at all: publishing waits for one.
+    Plan,
 }
 
 impl Limit {
@@ -141,6 +143,7 @@ impl Limit {
             Self::Accounts => "accounts",
             Self::Members => "members",
             Self::Automation => "automation",
+            Self::Plan => "plan",
         }
     }
 }

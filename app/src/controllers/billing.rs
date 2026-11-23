@@ -108,6 +108,19 @@ pub(crate) async fn needs_automation(app: &AppState, team: uuid::Uuid) -> Option
     }
 }
 
+/// `Some(402 plan_limit "plan")` when billing is on and the team has no live plan: publishing
+/// now or retrying waits for one. `None` otherwise.
+pub(crate) async fn needs_plan(app: &AppState, team: uuid::Uuid) -> Option<Response> {
+    if !app.billing_enabled {
+        return None;
+    }
+    match billing::has_plan(&app.db, team).await {
+        Ok(true) => None,
+        Ok(false) => Some(plan_limit(Limit::Plan)),
+        Err(e) => Some(internal(e, "plan read")),
+    }
+}
+
 /// The current team's plan, what it allows and what it uses. Any member.
 #[utoipa::path(get, path = "/team/billing", tag = "billing",
     responses((status = 200, body = Billing), (status = 401, body = Error)))]

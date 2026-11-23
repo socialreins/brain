@@ -5986,7 +5986,7 @@ mod teams {
                         create(&s, &cookie, input(&set, &format!("due {i}"), Some(&past()))).await;
                     mine.push(id_of(&res).parse::<uuid::Uuid>().unwrap());
                 }
-                let (a, b) = tokio::join!(publish::claim_due(&db), publish::claim_due(&db));
+                let (a, b) = tokio::join!(publish::claim_due(&db, false), publish::claim_due(&db, false));
                 let (a, b) = (a.unwrap(), b.unwrap());
                 assert!(a.len() <= 50 && b.len() <= 50, "batches are capped");
                 for id in &mine {
@@ -7137,11 +7137,11 @@ mod teams {
                     posts::Entity::update(row).exec(&db).await.unwrap();
                     mine.push(id);
                 }
-                let first = publish::claim_due(&db).await.unwrap();
+                let first = publish::claim_due(&db, false).await.unwrap();
                 assert_eq!(first.len(), 50);
                 let mut claimed: Vec<uuid::Uuid> = first.iter().map(|c| c.0).collect();
                 loop {
-                    let next = publish::claim_due(&db).await.unwrap();
+                    let next = publish::claim_due(&db, false).await.unwrap();
                     if next.is_empty() {
                         break;
                     }
@@ -14168,8 +14168,9 @@ mod teams {
                     .unwrap();
                 }
 
-                /// With billing on, a team whose plan ended publishes nothing and keeps the post,
-                /// failed with the reason; a live plan (here `past_due`, still retrying) publishes.
+                /// With billing on, a team whose plan ended publishes nothing: the due post stays
+                /// scheduled with the reason, publish now answers 402, and once the team is on a
+                /// live plan again (here `past_due`, still retrying) the post goes out.
                 #[tokio::test]
                 #[serial]
                 async fn posts_stop_when_the_plan_ends() {
@@ -14184,16 +14185,13 @@ mod teams {
                     on_plan(&db, team, "canceled").await;
                     let id = id_of(&create(&s, &cookie, x_post(&set, "Ended")).await);
                     publish::tick(&state).await.unwrap();
-                    let p = get_post(&s, &cookie, &id).await;
-                    assert_eq!(p["status"], "failed", "{p}");
-                    assert!(p["error"].as_str().unwrap().contains("plan has ended"), "{p}");
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "scheduled");
                     assert_eq!(mock.tweets.lock().unwrap().len(), before);
                     assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 5);
-
                     on_plan(&db, team, "past_due").await;
-                    let id = id_of(&create(&s, &cookie, x_post(&set, "Retrying")).await);
                     publish::tick(&state).await.unwrap();
                     assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                    assert_eq!(mock.tweets.lock().unwrap().len(), before + 1);
                 }
 
                 /// On Cloud an X post spends a credit once it is out; a team short of credits for the
@@ -28535,6 +28533,12 @@ mod teams {
             let (s, db) = server_where(|c| c.billing_enabled = true).await;
             let (_, owner, _) = user(&s, &db).await;
             let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            // Publishing now or retrying waits for a plan, before the post is even looked up.
+            let some = uuid::Uuid::now_v7();
+            for path in [format!("/v1/posts/{some}/publish"), format!("/v1/posts/{some}/retry")] {
+                let (code, body) = post(&s, &owner, &path, json!({})).await;
+                assert_eq!((code, body), (402, json!({"error": "plan_limit", "limit": "plan"})));
+            }
             let refused = json!({"error": "plan_limit", "limit": "automation"});
             // No plan at all.
             let (code, body) = post(&s, &owner, creates[0].0, creates[0].1.clone()).await;
