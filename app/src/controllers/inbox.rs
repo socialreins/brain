@@ -144,6 +144,9 @@ pub struct Item {
     pub contact_tags: Vec<String>,
     /// The member it is assigned to; `null` for nobody.
     pub assigned_to: Option<Assignee>,
+    /// The custom inboxes that hold it (its account is in them and it passes their filters);
+    /// "All" is left out.
+    pub inbox_ids: Vec<Uuid>,
     /// Only with `group=conversations`: the DM conversation this item is the latest of; `null`
     /// for a comment or mention.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -183,6 +186,8 @@ pub struct ItemQuery {
     pub tag: Option<String>,
     /// Only items assigned to `me`, to nobody (`none`) or to the member with this user id.
     pub assigned: Option<String>,
+    /// Only items of this account.
+    pub account_id: Option<Uuid>,
     /// `next_cursor` of the previous page.
     pub cursor: Option<Uuid>,
     /// 1 to 100, default 50.
@@ -339,10 +344,36 @@ pub(super) async fn tags_of(
     Ok(tags)
 }
 
+/// The team's custom inboxes, each with its accounts and filters, oldest first.
+async fn custom_inboxes(
+    db: &impl ConnectionTrait,
+    team_id: Uuid,
+) -> Result<Vec<(Uuid, Vec<Uuid>, Filters)>, DbErr> {
+    let mut accounts = accounts_by_inbox(db, team_id).await?;
+    let rows = inboxes::Entity::find()
+        .filter(inboxes::Column::TeamId.eq(team_id))
+        .filter(inboxes::Column::IsAll.eq(false))
+        .order_by_asc(inboxes::Column::CreatedAt)
+        .order_by_asc(inboxes::Column::Id)
+        .all(db)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|i| {
+            let f = serde_json::from_value(i.filters).unwrap_or_default();
+            (i.id, accounts.remove(&i.id).unwrap_or_default(), f)
+        })
+        .collect())
+}
+
 pub(super) async fn items_json(
     db: &impl ConnectionTrait,
     rows: Vec<inbox_items::Model>,
 ) -> Result<Vec<Item>, DbErr> {
+    let inboxes = match rows.first() {
+        Some(r) => custom_inboxes(db, r.team_id).await?,
+        None => Vec::new(),
+    };
     let tags = tags_of(db, rows.iter().filter_map(|i| i.contact_id)).await?;
     let names: HashMap<Uuid, String> = users::Entity::find()
         .filter(users::Column::Id.is_in(rows.iter().filter_map(|i| i.assigned_to)))
@@ -373,6 +404,14 @@ pub(super) async fn items_json(
     Ok(rows
         .into_iter()
         .map(|i| Item {
+            inbox_ids: inboxes
+                .iter()
+                .filter(|(_, accounts, f)| {
+                    accounts.contains(&i.social_account_id)
+                        && f.matches(&i.kind, &i.text, i.replied_at.is_some())
+                })
+                .map(|(id, _, _)| *id)
+                .collect(),
             replies: by_item.remove(&i.id).unwrap_or_default(),
             id: i.id,
             social_account_id: i.social_account_id,
@@ -731,6 +770,8 @@ pub struct Narrow<'a> {
     pub tag: Option<&'a str>,
     /// Assigned to this member, or (`Some(None)`) to nobody.
     pub assigned: Option<Option<Uuid>>,
+    /// Of this account.
+    pub account: Option<Uuid>,
     pub cursor: Option<Uuid>,
 }
 
@@ -755,6 +796,7 @@ pub fn items_sql(
         q,
         tag,
         assigned,
+        account,
         cursor,
     } = *n;
     let mut values: Vec<Value> = vec![team_id.into()];
@@ -767,6 +809,10 @@ pub fn items_sql(
         scope += &format!(" AND i.kind = ${}", values.len());
     } else {
         scope += " AND i.kind <> 'follow'";
+    }
+    if let Some(account) = account {
+        values.push(account.into());
+        scope += &format!(" AND i.social_account_id = ${}", values.len());
     }
     if let Some(tag) = tag {
         values.push(tag.to_owned().into());
@@ -891,6 +937,7 @@ async fn items(
             q: search,
             tag: tag.as_deref(),
             assigned,
+            account: q.account_id,
             cursor: q.cursor,
         };
         let stmt = items_sql(
@@ -1260,6 +1307,18 @@ mod tests {
         };
         let stmt = items_sql(team, None, &Filters::default(), &n, 10, false);
         assert!(stmt.sql.contains(" AND i.assigned_to = $2 ORDER BY"));
+        // One account, within the inbox's.
+        let n = Narrow {
+            account: Some(Uuid::nil()),
+            ..Narrow::default()
+        };
+        let stmt = items_sql(team, None, &Filters::default(), &n, 10, false);
+        assert!(
+            stmt.sql
+                .contains(" AND i.kind <> 'follow' AND i.social_account_id = $2 ORDER BY"),
+            "{}",
+            stmt.sql
+        );
     }
 
     #[test]

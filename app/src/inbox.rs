@@ -98,6 +98,19 @@ impl Filters {
         self.kinds.dedup();
         Ok(self)
     }
+
+    /// Whether an item of `kind` with `text` (`replied`: someone answered it) passes the filters,
+    /// as `filter_sql` would decide.
+    pub fn matches(&self, kind: &str, text: &str, replied: bool) -> bool {
+        let text = text.to_lowercase();
+        (self.kinds.is_empty() || self.kinds.iter().any(|k| k == kind))
+            && (self.keywords.is_empty()
+                || self
+                    .keywords
+                    .iter()
+                    .any(|k| text.contains(&k.to_lowercase())))
+            && !(self.unanswered && replied)
+    }
 }
 
 /// Most tags one contact holds.
@@ -811,6 +824,20 @@ mod tests {
         let mut values = Vec::new();
         assert_eq!(filter_sql(None, &Filters::default(), &mut values), "");
         assert!(values.is_empty());
+    }
+
+    #[test]
+    fn filters_match_items_like_their_sql() {
+        let f = Filters {
+            kinds: vec!["comment".into()],
+            keywords: vec!["Guide".into(), "price".into()],
+            unanswered: true,
+        };
+        assert!(f.matches("comment", "the GUIDE please", false));
+        assert!(!f.matches("dm", "the guide", false));
+        assert!(!f.matches("comment", "hello", false));
+        assert!(!f.matches("comment", "price?", true));
+        assert!(Filters::default().matches("dm", "", true));
     }
 
     #[test]
