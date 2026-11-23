@@ -6783,7 +6783,6 @@ mod teams {
                 // None chosen, an unknown id, and an account of another platform are refused.
                 let stranger = uuid::Uuid::now_v7().to_string();
                 for (ids, platform, bad) in [
-                    (json!([]), "bluesky", Value::Null),
                     (json!([a1, stranger]), "bluesky", json!(stranger)),
                     (json!([a1]), "x", json!(a1)),
                 ] {
@@ -6821,6 +6820,23 @@ mod teams {
                 assert_eq!(res.json::<Value>()["accounts"].as_array().unwrap().len(), 3);
                 let res = req(&s, Method::PUT, &path, &cookie)
                     .json(&with(json!([a1, a2, a3])))
+                    .await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                let mut three = vec![a1.clone(), a2.clone(), a3.clone()];
+                three.sort();
+                // An edit without the field (a calendar move) keeps the choice; `[]` clears it.
+                let mut moved = with(Value::Null);
+                moved.as_object_mut().unwrap().remove("account_ids");
+                let res = req(&s, Method::PUT, &path, &cookie).json(&moved).await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                assert_eq!(res.json::<Value>()["account_ids"], json!(three));
+                let res = req(&s, Method::PUT, &path, &cookie)
+                    .json(&with(json!([])))
+                    .await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                assert_eq!(res.json::<Value>()["account_ids"], Value::Null);
+                let res = req(&s, Method::PUT, &path, &cookie)
+                    .json(&with(json!(three)))
                     .await;
                 assert_eq!(res.status_code(), 200, "{}", res.text());
                 // A post with no choice goes to every account.
@@ -6884,6 +6900,17 @@ mod teams {
                 ];
                 want.sort_by_key(|t| t.0.to_string());
                 assert_eq!(targets, want);
+                // A fan-out run again (a crash before it was marked) adds no target.
+                db.execute_unprepared(&format!(
+                    "UPDATE posts SET status = 'queued', fanned_out = false WHERE id = '{chosen}'"
+                ))
+                .await
+                .unwrap();
+                publish::publish_post(&state, chosen.parse().unwrap())
+                    .await
+                    .unwrap();
+                let again = settled(&s, &cookie, &chosen).await;
+                assert_eq!(again["targets"].as_array().unwrap().len(), 3, "{again}");
                 assert!(
                     p["error"]
                         .as_str()
