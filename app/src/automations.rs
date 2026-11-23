@@ -1504,9 +1504,20 @@ async fn ai_send(
     let public = via == Via::Public;
     let limit = ai::budget(&account.provider, via);
     let name = safe_name(item.author_name.as_deref());
+    // A message of only a photo or sticker: the AI is told what came, not handed nothing.
+    let said = if item.text.trim().is_empty() {
+        let kinds: Vec<inbox::Attachment> =
+            serde_json::from_value(item.attachments.clone()).unwrap_or_default();
+        match kinds.first().map(|k| k.kind.as_str()) {
+            Some(kind) => format!("[{kind}]"),
+            None => String::new(),
+        }
+    } else {
+        item.text.clone()
+    };
     let (system, user) = ai::prompt(
         prompt,
-        &item.text,
+        &said,
         name.as_deref(),
         &account.provider,
         public,

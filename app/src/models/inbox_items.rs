@@ -64,6 +64,9 @@ pub struct Model {
     pub assigned_to: Option<Uuid>,
     /// When automations last ran over the item to the end; `None` until then (the sweep retries).
     pub automated_at: Option<DateTimeWithTimeZone>,
+    /// What the item carries besides text: `inbox::Attachment`s, https links only.
+    #[sea_orm(column_type = "JsonBinary")]
+    pub attachments: Json,
     pub created_at: DateTimeWithTimeZone,
 }
 
