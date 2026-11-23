@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 use crate::{
     ai,
-    billing::{self, Kind, Spent},
+    billing::{self, AiSpent},
     connectors::bluesky::InboxError,
     controllers::ai_key::key_of,
     controllers::{connections::live_sets, pages},
@@ -138,9 +138,11 @@ pub enum Action {
     SendDm { text: String },
     /// A reply under the comment or mention, at most 300 graphemes.
     ReplyPublicly { text: String },
-    /// A DM as `SendDm`, its text written by AI from `prompt` (1 to 2000 characters, no
-    /// `{page}`) and the item's text. It uses the team's own AI key, else 1 `ai` credit on
-    /// Cloud. A reply that is empty, too long or holds a link the prompt does not is not sent.
+    /// A DM as `SendDm`, its text written by AI from `prompt` (1 to 2000 characters, no `{name}` or
+    /// `{page}`), the item's text and the person's name. It uses the team's own AI key, else
+    /// ours, paid on Cloud from the plan's monthly allowance, then 1 `ai` credit. A reply that is
+    /// empty, too long, repeats the prompt or holds a link or @handle the prompt does not is not
+    /// sent.
     AiSendDm { prompt: String },
     /// A reply under the comment or mention as `ReplyPublicly`, written by AI as `AiSendDm`.
     AiReplyPublicly { prompt: String },
@@ -245,11 +247,13 @@ impl Step {
     }
 }
 
-/// An AI send's prompt: 1 to 2000 characters, and no `{page}`, which it never fills in.
+/// An AI send's prompt: 1 to 2000 characters, and no `{name}` or `{page}`, which it never fills
+/// in (the model is given the person's name as data instead).
 fn prompt_ok(prompt: &str) -> bool {
     !prompt.trim().is_empty()
         && prompt.chars().count() <= ai::MAX_PROMPT_CHARS
         && !prompt.contains("{page}")
+        && !prompt.contains("{name}")
 }
 
 /// The trigger a new item runs: by its kind, and a button click and a story reply apart from
@@ -1222,8 +1226,10 @@ pub struct ActionResult {
     /// `no_public_page` for a fallback reply holding `{page}` when the post has no live page; on Facebook
     /// and Instagram `outside_window` (a private reply works within 7 days of the comment),
     /// `already_replied` (once per comment) and `dm_unavailable`. For an AI send also
-    /// `no_ai_key` (no team key and none of ours), `no_ai_credits`, `ai_failed` (the provider
-    /// gave no reply), `ai_empty`, `ai_too_long` and `ai_link` (a link the prompt does not hold).
+    /// `no_ai_key` (no team key and none of ours), `no_ai_credits` (the monthly allowance and the
+    /// `ai` credits are used up), `ai_failed` (the provider gave no reply), `ai_empty`,
+    /// `ai_too_long`, `ai_link` (a link, domain or @handle the prompt does not hold) and
+    /// `ai_leak` (it repeats the prompt).
     pub reason: Option<String>,
     pub remote_id: Option<String>,
     /// An AI send: `anthropic` or `openai`.
@@ -1358,10 +1364,13 @@ async fn act(
 }
 
 /// Writes a reply with AI from the owner's `prompt` and the item's text, and sends it as
-/// `kind`. The team's own key goes first, else ours, which on Cloud takes 1 `ai` credit under
-/// `reference` and gives it back when nothing usable came of the call. `skipped` with
+/// `kind`. The team's own key goes first, free and unmetered; else ours, which with billing on
+/// is paid under `reference` from the plan's monthly allowance, then an `ai` credit
+/// (`billing::spend_ai`), and given back when nothing usable came of the call. `skipped` with
 /// `no_ai_key` (no key at all) or `no_ai_credits`; `failed` with `ai_failed`, `ai_empty`,
-/// `ai_too_long` or `ai_link`, and then nothing is sent. Neither key nor prompt is logged.
+/// `ai_too_long`, `ai_link` or `ai_leak` (it repeats the prompt), and then nothing is sent. A
+/// reference given back before is never paid or written again (`ai_failed`). Neither key nor
+/// prompt is logged.
 #[allow(clippy::too_many_arguments)]
 async fn ai_send(
     app: &AppState,
@@ -1386,38 +1395,50 @@ async fn ai_send(
             return ended("failed", "internal");
         }
     };
-    let paid = team_key.is_none() && app.billing_enabled;
+    let metered = team_key.is_none() && app.billing_enabled;
     let ours = || app.ai.own_key.clone().map(|k| ("anthropic".to_owned(), k));
     let Some((provider, key)) = team_key.or_else(ours) else {
         return ended("skipped", "no_ai_key");
     };
-    if paid {
-        let spent = billing::spend(
-            &app.db,
-            item.team_id,
-            Kind::Ai,
-            1,
-            "ai reply",
-            Some(reference),
-        );
-        match spent.await {
-            Ok(Spent::Taken | Spent::Repeated) => {}
-            Ok(Spent::Short(_)) => return ended("skipped", "no_ai_credits"),
+    let mut paid = None;
+    if metered {
+        let monthly = billing::limits_of(true, &app.db, item.team_id)
+            .await
+            .map(|l| l.ai_monthly.unwrap_or(0));
+        let spent = match monthly {
+            Ok(monthly) => {
+                billing::spend_ai(
+                    &app.db,
+                    item.team_id,
+                    monthly,
+                    reference,
+                    chrono::Utc::now(),
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+        match spent {
+            Ok(AiSpent::Paid(kind)) => paid = Some(kind),
+            Ok(AiSpent::Short) => return ended("skipped", "no_ai_credits"),
+            Ok(AiSpent::Refunded) => return ended("failed", "ai_failed"),
             Err(e) => {
-                tracing::error!(error = %e, item = %item.id, "ai credit not taken");
+                tracing::error!(error = %e, item = %item.id, "ai reply not paid");
                 return ended("failed", "internal");
             }
         }
     }
     let public = via == Via::Public;
-    // Room to spare under each network's limit; `fits_on` still checks the answer.
-    let limit = if public && account.provider == "bluesky" {
-        280
-    } else {
-        500
-    };
-    let name = safe_name(item.author_name.as_deref()).unwrap_or_else(|| "there".to_owned());
-    let (system, user) = ai::prompt(prompt, &item.text, &name, &account.provider, public, limit);
+    let limit = ai::budget(&account.provider, via);
+    let name = safe_name(item.author_name.as_deref());
+    let (system, user) = ai::prompt(
+        prompt,
+        &item.text,
+        name.as_deref(),
+        &account.provider,
+        public,
+        limit,
+    );
     let mut model = None;
     let text = match app.ai.write(&provider, &key, &system, &user).await {
         Err(status) => {
@@ -1431,6 +1452,8 @@ async fn ai_send(
                 Err("ai_empty")
             } else if ai::invents_link(&text, prompt) {
                 Err("ai_link")
+            } else if ai::repeats_prompt(&text, prompt) {
+                Err("ai_leak")
             } else if !inbox::fits_on(&account.provider, via, &text) {
                 Err("ai_too_long")
             } else {
@@ -1441,17 +1464,17 @@ async fn ai_send(
     let text = match text {
         Ok(t) => t,
         Err(reason) => {
-            if paid {
+            if let Some(kind) = paid {
                 let back = billing::grant(
                     &app.db,
                     item.team_id,
-                    Kind::Ai,
+                    kind,
                     1,
                     "ai reply unsent",
                     Some(reference),
                 );
                 if let Err(e) = back.await {
-                    tracing::error!(error = %e, item = %item.id, "ai credit not given back");
+                    tracing::error!(error = %e, item = %item.id, "ai reply not given back");
                 }
             }
             return ActionResult {

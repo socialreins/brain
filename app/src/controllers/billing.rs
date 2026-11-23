@@ -30,12 +30,17 @@ pub struct PlanLimits {
     pub automation: bool,
     /// Contacts the automations may keep; `null` is unlimited.
     pub contacts: Option<i64>,
+    /// AI replies a calendar month (UTC) on our key, before `ai` credits; `null` when nothing
+    /// is metered (billing off). A team's own AI key is never counted.
+    pub ai_monthly: Option<i64>,
 }
 
 #[derive(Serialize, ToSchema)]
 pub struct Usage {
     pub accounts: i64,
     pub members: i64,
+    /// AI replies on our key this calendar month (UTC) paid from the monthly allowance.
+    pub ai_replies: i64,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -77,6 +82,7 @@ fn limits(l: Limits) -> PlanLimits {
         members: l.members,
         automation: l.automation,
         contacts: l.contacts,
+        ai_monthly: l.ai_monthly,
     }
 }
 
@@ -131,12 +137,13 @@ async fn show(State(app): State<AppState>, t: InTeam) -> Response {
         Ok(s) => s,
         Err(e) => return internal(e, "billing read"),
     };
-    let (accounts, members) = match (
+    let (accounts, members, ai_replies) = match (
         count(&app, "social_accounts", t.team.id).await,
         count(&app, "team_user", t.team.id).await,
+        billing::ai_used(&app.db, t.team.id, Utc::now()).await,
     ) {
-        (Ok(a), Ok(m)) => (a, m),
-        (Err(e), _) | (_, Err(e)) => return internal(e, "billing usage"),
+        (Ok(a), Ok(m), Ok(ai)) => (a, m, ai),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return internal(e, "billing usage"),
     };
     Json(Billing {
         enabled: app.billing_enabled,
@@ -150,7 +157,11 @@ async fn show(State(app): State<AppState>, t: InTeam) -> Response {
             cancel_at_period_end: s.cancel_at_period_end,
             comped: s.provider.as_deref() == Some("comp"),
         }),
-        usage: Usage { accounts, members },
+        usage: Usage {
+            accounts,
+            members,
+            ai_replies,
+        },
     })
     .into_response()
 }

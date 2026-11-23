@@ -37,11 +37,15 @@ cargo run -p socialreins-brain
   `openai`, plus `last4`); `/v1/team/ai-key` is owner and admin only and never answers the key. `key_of` gives
   the clear key to the AI steps, which use it before any credit is spent.
 - `app/src/ai.rs`: AI steps in automations (`ai_send_dm`, `ai_reply_publicly`, as actions or flow steps;
-  `automations::ai_send`). The team's key first; else `ANTHROPIC_API_KEY` (ours), which with billing on
-  spends 1 `ai` credit per reply under the ref `ai:{run}:{step or kind}` and gives it back when nothing
-  usable came back. Models live only in `ai.rs` (`ANTHROPIC_MODEL`, `OPENAI_MODEL`); `anthropic_url` and
+  `automations::ai_send`). The team's key first (free, unmetered); else `ANTHROPIC_API_KEY` (ours), which
+  with billing on is paid by `billing::spend_ai` under the ref `ai:{run}:{step or kind}`: the plan's
+  `plans.ai_monthly` allowance per calendar month (UTC, `ai_plan` ledger rows) first, then 1 `ai` credit,
+  given back when nothing usable came back; a ref given back is never paid or written again. The stranger's
+  name and message go to the model capped, escaped and fenced in `<incoming_message>`. A reply that repeats
+  12 words of the prompt in a row (`ai_leak`) is never sent. Models live only in `ai.rs` (`ANTHROPIC_MODEL`, `OPENAI_MODEL`); `anthropic_url` and
   `openai_url` are overridable for tests. A reply that is empty, too long for the network (`inbox::fits_on`)
-  or holds a link or domain that is not in the owner's prompt is never sent. Keys and prompts are never logged.
+  or holds a link, domain, email or @handle that is not in the owner's prompt (exact normalised hosts, after
+  NFKC, zero-width characters and look-alike or spelled-out dots) is never sent. Keys and prompts are never logged.
 - `app/src/controllers/waitlist.rs`: the public waitlist. No captcha: each new or unverified
   email gets a confirmation link to the web app, which posts the token to
   `POST /v1/waitlist/verify` (never a state-changing GET: mail scanners open links). Mail goes

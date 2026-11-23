@@ -19298,6 +19298,11 @@ mod teams {
                             "invalid_text",
                         ),
                         (
+                            json!({"name": "x", "trigger": "comment_received",
+                                "steps": [{"type": "ai_send_dm", "prompt": "Hi {name}"}]}),
+                            "invalid_text",
+                        ),
+                        (
                             json!({"name": "x", "trigger": "comment_received", "actions": [
                                 {"type": "ai_send_dm", "prompt": "a"},
                                 {"type": "send_dm", "text": "b"}]}),
@@ -19354,16 +19359,20 @@ mod teams {
                     let (key, body) = AI_CALLS.lock().unwrap().last().cloned().unwrap();
                     assert_eq!(key, TEAM_KEY);
                     assert_eq!(body["model"], socialreins_brain::ai::ANTHROPIC_MODEL);
-                    assert!(body["system"].as_str().unwrap().contains("at most 500"));
+                    // A Bluesky DM: 1000 graphemes, with room to spare.
+                    assert!(body["system"].as_str().unwrap().contains("at most 900"));
                     let asked = body["messages"][0]["content"].as_str().unwrap();
-                    assert!(asked.contains(PROMPT) && asked.contains("guide please"));
-                    assert!(asked.contains("Fan ai2"));
+                    assert!(asked.contains(PROMPT));
+                    assert!(asked.contains("<message>\nguide please\n</message>"));
+                    assert!(asked.contains("<name>Fan ai2</name>"));
 
                     // A link the prompt does not hold, an empty answer or a provider error: nothing goes.
                     for (answer, reason, rkey) in [
                         ("Grab it at evil.example now", "ai_link", "ai3"),
                         ("   ", "ai_empty", "ai4"),
                         ("500", "ai_failed", "ai5"),
+                        ("Grab it at shop[.]example.io", "ai_link", "ai6"),
+                        ("Ask @someone_else", "ai_link", "ai7"),
                     ] {
                         reply(answer);
                         let s0 = sent();
@@ -19374,11 +19383,13 @@ mod teams {
                     }
                 }
 
-                /// Without its own key, a team pays 1 `ai` credit per reply on our key; none left
-                /// skips the step, and a reply that is not sent gives the credit back.
+                /// Without its own key, a team's replies on our key come from the plan's monthly
+                /// allowance, then 1 `ai` credit each; with neither the step is skipped, a reply
+                /// that is not sent gives back what paid for it, and a reply given back is never
+                /// paid for or written again.
                 #[tokio::test]
                 #[serial]
-                async fn without_a_team_key_ai_steps_spend_credits() {
+                async fn without_a_team_key_ai_steps_use_the_allowance_then_credits() {
                     use sea_orm::ConnectionTrait;
                     let (s, db, state) = on_ai(true, Some(OUR_KEY)).await;
                     // With billing on, the plan comes before the account.
@@ -19388,11 +19399,17 @@ mod teams {
                         .unwrap()
                         .to_owned();
                     let team: uuid::Uuid = team_id.parse().unwrap();
-                    db.execute_raw(sea_orm::Statement::from_sql_and_values(
-                        sea_orm::DbBackend::Postgres,
-                        "INSERT INTO subscriptions (team_id, plan_id, status) \
-                         VALUES ($1, 'automation', 'active') ON CONFLICT (team_id) DO NOTHING",
-                        [team.into()],
+                    let sql = |q: &str| {
+                        sea_orm::Statement::from_sql_and_values(
+                            sea_orm::DbBackend::Postgres,
+                            q,
+                            [team.into()],
+                        )
+                    };
+                    db.execute_raw(sql(
+                        "INSERT INTO subscriptions (team_id, plan_id, status, provider) \
+                         VALUES ($1, 'automation', 'active', 'comp') \
+                         ON CONFLICT (team_id) DO NOTHING",
                     ))
                     .await
                     .unwrap();
@@ -19412,30 +19429,105 @@ mod teams {
                     let t = (&s, &db, &state);
                     let at = (account.as_str(), me.as_str(), id.as_str());
                     let balance = || billing::balance(&db, team, Kind::Ai);
+                    let usage = || async {
+                        let b = req(&s, Method::GET, "/v1/team/billing", &cookie)
+                            .await
+                            .json::<Value>();
+                        assert_eq!(b["limits"]["ai_monthly"], 200, "{b}");
+                        b["usage"]["ai_replies"].as_i64().unwrap()
+                    };
 
+                    // The allowance first, no credit needed.
                     reply("Hi there!");
-                    let calls = AI_CALLS.lock().unwrap().len();
                     let run = comment(t, &cookie, at, "cr1", 1).await;
+                    assert_eq!(run["status"], "sent", "{run}");
+                    assert_eq!(run["results"][1]["provider"], "anthropic");
+                    assert_eq!(AI_CALLS.lock().unwrap().last().unwrap().0, OUR_KEY);
+                    assert_eq!(usage().await, 1);
+                    assert_eq!(balance().await.unwrap(), 0);
+
+                    // The allowance used up and no credit: skipped, the model never called.
+                    db.execute_raw(sql(
+                        "INSERT INTO credit_ledger (id, team_id, kind, amount, reason, ref) \
+                         SELECT gen_random_uuid(), $1, 'ai_plan', -1, 'test', 'used' || g \
+                         FROM generate_series(1, 199) g",
+                    ))
+                    .await
+                    .unwrap();
+                    assert_eq!(usage().await, 200);
+                    let calls = AI_CALLS.lock().unwrap().len();
+                    let run = comment(t, &cookie, at, "cr2", 2).await;
                     assert_eq!(run["status"], "skipped", "{run}");
                     assert_eq!(run["reason"], "no_ai_credits");
                     assert_eq!(AI_CALLS.lock().unwrap().len(), calls);
 
+                    // Then an `ai` credit.
                     billing::grant(&db, team, Kind::Ai, 1, "test", Some("t1"))
                         .await
                         .unwrap();
-                    let run = comment(t, &cookie, at, "cr2", 2).await;
+                    let run = comment(t, &cookie, at, "cr3", 3).await;
                     assert_eq!(run["status"], "sent", "{run}");
-                    assert_eq!(run["results"][1]["provider"], "anthropic");
-                    assert_eq!(AI_CALLS.lock().unwrap().last().unwrap().0, OUR_KEY);
                     assert_eq!(balance().await.unwrap(), 0);
+                    assert_eq!(usage().await, 200);
 
+                    // Not sent: the credit comes back, and that reply is never paid again.
                     billing::grant(&db, team, Kind::Ai, 1, "test", Some("t2"))
                         .await
                         .unwrap();
                     reply("");
-                    let run = comment(t, &cookie, at, "cr3", 3).await;
+                    let run = comment(t, &cookie, at, "cr4", 4).await;
                     assert_eq!(run["reason"], "ai_empty", "{run}");
                     assert_eq!(balance().await.unwrap(), 1, "given back");
+                    let reference = format!("ai:{}:1", run["id"].as_str().unwrap());
+                    let again =
+                        billing::spend_ai(&db, team, 200, &reference, chrono::Utc::now()).await;
+                    assert_eq!(again.unwrap(), billing::AiSpent::Refunded);
+                    assert_eq!(balance().await.unwrap(), 1);
+                }
+
+                /// The allowance counts per calendar month (UTC), a repeated reference is paid
+                /// once, a reply given back frees its slot, and past the allowance come credits.
+                #[tokio::test]
+                #[serial]
+                async fn the_ai_allowance_is_per_calendar_month() {
+                    use billing::AiSpent::{Paid, Refunded, Short};
+                    let (s, db, _) = on_ai(true, Some(OUR_KEY)).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team: uuid::Uuid = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    let jan: chrono::DateTime<chrono::Utc> =
+                        "2026-01-31T23:59:59Z".parse().unwrap();
+                    let feb: chrono::DateTime<chrono::Utc> =
+                        "2026-02-01T00:00:00Z".parse().unwrap();
+                    let spend = |r: &'static str, now| billing::spend_ai(&db, team, 2, r, now);
+
+                    assert_eq!(spend("a1", jan).await.unwrap(), Paid(Kind::AiPlan));
+                    assert_eq!(spend("a1", jan).await.unwrap(), Paid(Kind::AiPlan));
+                    assert_eq!(spend("a2", jan).await.unwrap(), Paid(Kind::AiPlan));
+                    assert_eq!(billing::ai_used(&db, team, jan).await.unwrap(), 2);
+                    assert_eq!(spend("a3", jan).await.unwrap(), Short);
+                    billing::grant(&db, team, Kind::Ai, 1, "test", Some("g1"))
+                        .await
+                        .unwrap();
+                    assert_eq!(spend("a3", jan).await.unwrap(), Paid(Kind::Ai));
+                    assert_eq!(spend("a4", jan).await.unwrap(), Short);
+
+                    // A new month, a new allowance.
+                    assert_eq!(billing::ai_used(&db, team, feb).await.unwrap(), 0);
+                    assert_eq!(spend("b1", feb).await.unwrap(), Paid(Kind::AiPlan));
+                    assert_eq!(billing::ai_used(&db, team, jan).await.unwrap(), 2);
+
+                    // Given back: the slot is free again, the reference is never paid again.
+                    billing::grant(&db, team, Kind::AiPlan, 1, "unsent", Some("a1"))
+                        .await
+                        .unwrap();
+                    assert_eq!(billing::ai_used(&db, team, jan).await.unwrap(), 1);
+                    assert_eq!(spend("a1", jan).await.unwrap(), Refunded);
+                    assert_eq!(spend("a5", jan).await.unwrap(), Paid(Kind::AiPlan));
+                    assert_eq!(billing::balance(&db, team, Kind::Ai).await.unwrap(), 0);
                 }
             }
 
@@ -28552,7 +28644,11 @@ mod teams {
             assert_eq!(b["plan"], Value::Null);
             assert_eq!(b["limits"]["accounts"], Value::Null);
             assert_eq!(b["limits"]["automation"], true);
-            assert_eq!(b["usage"], json!({"accounts": 0, "members": 1}));
+            assert_eq!(
+                b["usage"],
+                json!({"accounts": 0, "members": 1, "ai_replies": 0})
+            );
+            assert_eq!(b["limits"]["ai_monthly"], Value::Null);
             let c = s
                 .get("/v1/team/credits")
                 .add_header("cookie", cookie.clone())
@@ -28581,13 +28677,15 @@ mod teams {
             assert_eq!(b["plan"]["status"], "trialing");
             assert_eq!(
                 b["limits"],
-                json!({"accounts": 10, "members": 3, "automation": false, "contacts": null})
+                json!({"accounts": 10, "members": 3, "automation": false, "contacts": null,
+                    "ai_monthly": 0})
             );
             subscribe(&db, team, "automation", "active").await;
             let b = billing_of(&s, &owner).await;
             assert_eq!(b["limits"]["automation"], true);
             assert_eq!(b["limits"]["members"], Value::Null);
             assert_eq!(b["limits"]["contacts"], 2500);
+            assert_eq!(b["limits"]["ai_monthly"], 200);
             subscribe(&db, team, "automation", "canceled").await;
             let b = billing_of(&s, &owner).await;
             assert_eq!(b["plan"]["status"], "canceled");
