@@ -25,7 +25,7 @@ use super::{
     teams::InTeam,
     waitlist::{error, Error},
 };
-use crate::{billing, state::AppState};
+use crate::{billing, state::AppState, stripe::PACKS};
 
 /// Largest delivery taken; a subscription event is a few KB.
 pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024;
@@ -43,6 +43,12 @@ pub struct CheckoutInput {
 
 fn yearly() -> String {
     "year".into()
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct CreditsInput {
+    /// `x100` (100 X posts) or `x500` (500 X posts).
+    pub pack: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -164,6 +170,75 @@ async fn checkout(
     }
 }
 
+/// Buys a pack of X credits: answers a Stripe Checkout page for a one-time payment. The credits
+/// are granted when Stripe reports the payment (`checkout.session.completed`), once. `422
+/// invalid_pack`, `503 billing_unavailable` when billing, Stripe or the pack prices are off, `502
+/// stripe_failed`. Same checks as checkout.
+#[utoipa::path(post, path = "/team/billing/credits", tag = "billing",
+    request_body = CreditsInput,
+    responses((status = 200, body = Redirect), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 422, body = Error), (status = 502, body = Error),
+        (status = 503, body = Error)))]
+async fn buy_credits(
+    _: FromWeb,
+    State(app): State<AppState>,
+    t: InTeam,
+    Body(body): Body<CreditsInput>,
+) -> Response {
+    if let Some(res) = gate(&app, &t) {
+        return res;
+    }
+    if !app.stripe.packs_on() {
+        return reply(StatusCode::SERVICE_UNAVAILABLE, "billing_unavailable");
+    }
+    let Some(price) = app.stripe.pack_price(&body.pack) else {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_pack");
+    };
+    let customer = match held(&app, t.team.id).await {
+        Ok(s) => s.and_then(|(_, customer)| customer),
+        Err(e) => return internal(e, "billing read"),
+    };
+    let team = t.team.id.to_string();
+    let web = &app.web_url;
+    let mut form = vec![
+        ("mode".to_owned(), "payment".to_owned()),
+        ("line_items[0][price]".to_owned(), price.to_owned()),
+        ("line_items[0][quantity]".to_owned(), "1".to_owned()),
+        ("client_reference_id".to_owned(), team.clone()),
+        ("metadata[team_id]".to_owned(), team),
+        ("metadata[pack]".to_owned(), body.pack.clone()),
+        // On the payment too, so a refund or dispute (charge events) names the team and pack.
+        (
+            "payment_intent_data[metadata][team_id]".to_owned(),
+            t.team.id.to_string(),
+        ),
+        (
+            "payment_intent_data[metadata][pack]".to_owned(),
+            body.pack.clone(),
+        ),
+        ("adaptive_pricing[enabled]".to_owned(), "false".to_owned()),
+        (
+            "success_url".to_owned(),
+            format!("{web}/billing?credits=success"),
+        ),
+        (
+            "cancel_url".to_owned(),
+            format!("{web}/billing?credits=canceled"),
+        ),
+    ];
+    match customer {
+        Some(customer) => form.push(("customer".to_owned(), customer)),
+        None => form.push(("customer_email".to_owned(), t.current.0.email.clone())),
+    }
+    match app.stripe.checkout(&form).await {
+        Ok(url) => Json(Redirect { url }).into_response(),
+        Err(e) => {
+            tracing::error!(status = ?e.0, code = %e.1, "stripe credits checkout failed");
+            reply(StatusCode::BAD_GATEWAY, "stripe_failed")
+        }
+    }
+}
+
 /// Answers the Stripe customer portal page, where the owner changes the card, switches plan or
 /// cancels. `409 no_customer` before any subscription. Same checks as checkout.
 #[utoipa::path(post, path = "/team/billing/portal", tag = "billing",
@@ -195,6 +270,7 @@ pub fn api() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(checkout))
         .routes(routes!(portal))
+        .routes(routes!(buy_credits))
 }
 
 /// Stripe's subscription status as ours; `None` for one that has not started (`incomplete`).
@@ -329,11 +405,45 @@ async fn apply_subscription(
     Ok(Outcome::Applied)
 }
 
+/// Grants the credits of a paid one-time Checkout: the team and pack come only from the metadata
+/// brain put on the session, and the session id keeps the grant to once. A subscription
+/// checkout, or one not paid yet (an async payment follows with its own event), is taken and
+/// changes nothing. `false` (ignored) for no known team or pack.
+async fn apply_purchase(db: &impl ConnectionTrait, session: &Value) -> Result<bool, DbErr> {
+    if session["mode"] != "payment" || session["payment_status"] != "paid" {
+        return Ok(true);
+    }
+    let (Some(id), Some(team), Some(credits)) = (
+        session["id"].as_str(),
+        session["metadata"]["team_id"]
+            .as_str()
+            .and_then(|t| t.parse::<Uuid>().ok()),
+        session["metadata"]["pack"]
+            .as_str()
+            .and_then(|p| PACKS.iter().find(|(id, _)| *id == p))
+            .map(|(_, n)| *n),
+    ) else {
+        // Charged with nothing granted: a person must grant or refund it.
+        tracing::error!(session = ?session["id"].as_str(), "paid stripe session with no team or pack");
+        return Ok(false);
+    };
+    let known = db
+        .query_one_raw(stmt("SELECT 1 FROM teams WHERE id = $1", vec![team.into()]))
+        .await?;
+    if known.is_none() {
+        tracing::error!(%team, "paid stripe session for an unknown team");
+        return Ok(false);
+    }
+    billing::grant(db, team, billing::Kind::X, credits, "x pack", Some(id)).await?;
+    Ok(true)
+}
+
 /// `POST /webhooks/stripe`: `403` unless `Stripe-Signature` signs the raw body (timestamp within
 /// 5 minutes), `404` while `STRIPE_WEBHOOK_SECRET` is unset. The event id is stored with the
 /// change in one transaction, so a delivery seen before changes nothing and a failure is a
 /// `500` that Stripe retries. Handled: `customer.subscription.created`, `.updated` and
-/// `.deleted`; every other event is taken and ignored.
+/// `.deleted`, and `checkout.session.completed` and `.async_payment_succeeded` (credit packs);
+/// every other event is taken and ignored.
 async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if !app.stripe.webhook_on() {
         return reply(StatusCode::NOT_FOUND, "not_found");
@@ -369,6 +479,20 @@ async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -
                 | "customer.subscription.updated"
                 | "customer.subscription.deleted"
         );
+        let paid = matches!(
+            kind,
+            "checkout.session.completed" | "checkout.session.async_payment_succeeded"
+        );
+        // shortcut: a refunded or disputed pack keeps its credits; a person takes them back with
+        // the admin tools. Automate it if refunds become common.
+        if matches!(kind, "charge.refunded" | "charge.dispute.created") {
+            let meta = &event["data"]["object"]["metadata"];
+            tracing::error!(kind, team = ?meta["team_id"].as_str(), pack = ?meta["pack"].as_str(),
+                "stripe pack payment refunded or disputed: review its credits");
+        }
+        if fresh && paid && !apply_purchase(&txn, &event["data"]["object"]).await? {
+            return Ok(None);
+        }
         let mut extra = None;
         if fresh && subscription {
             match apply_subscription(&app, &txn, &event["data"]["object"], at).await? {

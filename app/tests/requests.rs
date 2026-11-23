@@ -28807,6 +28807,10 @@ mod teams {
                         ("scheduler", "year", Some("price_sy".into())),
                         ("automation", "year", Some("price_ay".into())),
                     ],
+                    [
+                        ("x100", Some("price_p1".into())),
+                        ("x500", Some("price_p5".into())),
+                    ],
                 )
                 .unwrap();
                 s.api_url = base;
@@ -29001,6 +29005,93 @@ mod teams {
                 .add_header("stripe-signature", sig)
                 .bytes(body.to_owned().into())
                 .await
+        }
+
+        fn paid_event(id: &str, session: &str, team: &str, pack: &str, status: &str) -> String {
+            json!({
+                "id": format!("{id}_{}", *RUN), "type": "checkout.session.completed",
+                "created": Utc::now().timestamp(),
+                "data": {"object": {
+                    "id": format!("{session}_{}", *RUN), "mode": "payment", "payment_status": status,
+                    "metadata": {"team_id": team, "pack": pack}
+                }}
+            })
+            .to_string()
+        }
+
+        async fn x_credits(s: &TestServer, cookie: &str) -> Value {
+            let c = s
+                .get("/v1/team/credits")
+                .add_header("cookie", cookie.to_owned())
+                .await;
+            c.json::<Value>()["x"].clone()
+        }
+
+        /// A pack is a one-time Checkout carrying the team and pack; its paid event grants the
+        /// credits once, whatever Stripe sends again.
+        #[tokio::test]
+        #[serial]
+        async fn a_credit_pack_is_bought_once_and_granted_once() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let at = count("/checkout");
+            let res = req(&s, Method::POST, "/v1/team/billing/credits", &owner)
+                .json(&json!({"pack": "x500"}))
+                .await;
+            res.assert_status_ok();
+            let f = form_of("/checkout", at);
+            assert_eq!(f["mode"], "payment");
+            assert_eq!(f["line_items[0][price]"], "price_p5");
+            assert_eq!(f["metadata[team_id]"], team);
+            assert_eq!(f["metadata[pack]"], "x500");
+            assert_eq!(f["payment_intent_data[metadata][team_id]"], team);
+            assert_eq!(f["adaptive_pricing[enabled]"], "false");
+            assert!(f["success_url"].ends_with("/billing?credits=success"));
+            let res = req(&s, Method::POST, "/v1/team/billing/credits", &owner)
+                .json(&json!({"pack": "x9"}))
+                .await;
+            assert_eq!(res.status_code(), 422);
+            res.assert_json(&json!({"error": "invalid_pack"}));
+
+            let now = Utc::now().timestamp();
+            // Not paid yet (an async payment): nothing.
+            let unpaid = paid_event("evt_p0", "cs_0", &team, "x100", "unpaid");
+            assert_eq!(deliver(&s, &unpaid, WHSEC, now).await.status_code(), 200);
+            assert_eq!(x_credits(&s, &owner).await, 0);
+            let paid = paid_event("evt_p1", "cs_1", &team, "x500", "paid");
+            assert_eq!(deliver(&s, &paid, WHSEC, now).await.status_code(), 200);
+            assert_eq!(x_credits(&s, &owner).await, 500);
+            // The same delivery again, and a second event for the same session: still once.
+            assert_eq!(deliver(&s, &paid, WHSEC, now).await.status_code(), 200);
+            let again = paid_event("evt_p2", "cs_1", &team, "x500", "paid").replace(
+                "checkout.session.completed",
+                "checkout.session.async_payment_succeeded",
+            );
+            assert_eq!(deliver(&s, &again, WHSEC, now).await.status_code(), 200);
+            assert_eq!(x_credits(&s, &owner).await, 500);
+            // Another pack adds up.
+            let more = paid_event("evt_p3", "cs_3", &team, "x100", "paid");
+            assert_eq!(deliver(&s, &more, WHSEC, now).await.status_code(), 200);
+            assert_eq!(x_credits(&s, &owner).await, 600);
+            // Unknown pack or team: nothing, and the event id is not kept.
+            let nobody = uuid::Uuid::now_v7().to_string();
+            for bad in [
+                paid_event("evt_p4", "cs_4", &team, "x9", "paid"),
+                paid_event("evt_p5", "cs_5", &nobody, "x100", "paid"),
+            ] {
+                assert_eq!(deliver(&s, &bad, WHSEC, now).await.status_code(), 200);
+            }
+            assert_eq!(x_credits(&s, &owner).await, 600);
+            let kept: Option<sea_orm::QueryResult> = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT 1 FROM stripe_events WHERE id = $1",
+                    [format!("evt_p4_{}", *RUN).into()],
+                ))
+                .await
+                .unwrap();
+            assert!(kept.is_none());
         }
 
         async fn plan_of(s: &TestServer, cookie: &str) -> Value {
@@ -29252,6 +29343,10 @@ mod teams {
                         ("automation", "month", Some("price_a".into())),
                         ("scheduler", "year", Some("price_sy".into())),
                         ("automation", "year", Some("price_ay".into())),
+                    ],
+                    [
+                        ("x100", Some("price_p1".into())),
+                        ("x500", Some("price_p5".into())),
                     ],
                 )
                 .unwrap();

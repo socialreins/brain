@@ -118,7 +118,8 @@ pub struct Config {
     /// is registered in the Meta app); `POST /webhooks/meta` is signed with `META_APP_SECRET`.
     pub meta: meta::Meta,
     /// `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` and `STRIPE_PRICE_SCHEDULER`,
-    /// `STRIPE_PRICE_AUTOMATION` with their `_YEARLY` twins: Cloud checkout, the customer portal and `POST /webhooks/stripe`.
+    /// `STRIPE_PRICE_AUTOMATION` with their `_YEARLY` twins, and `STRIPE_PRICE_X100`,
+    /// `STRIPE_PRICE_X500` (credit packs): Cloud checkout, the customer portal and `POST /webhooks/stripe`.
     /// Needed only with `BILLING_ENABLED`.
     pub stripe: crate::stripe::Stripe,
 }
@@ -232,6 +233,10 @@ impl Config {
                     ("automation", "month", var("STRIPE_PRICE_AUTOMATION")),
                     ("scheduler", "year", var("STRIPE_PRICE_SCHEDULER_YEARLY")),
                     ("automation", "year", var("STRIPE_PRICE_AUTOMATION_YEARLY")),
+                ],
+                [
+                    ("x100", var("STRIPE_PRICE_X100")),
+                    ("x500", var("STRIPE_PRICE_X500")),
                 ],
             )?,
         })
