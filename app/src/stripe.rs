@@ -9,6 +9,8 @@ use serde_json::Value;
 pub const DEFAULT_API_URL: &str = "https://api.stripe.com";
 /// How far a webhook's timestamp may be from now, the same as Stripe's own libraries.
 pub const TOLERANCE_SECONDS: i64 = 300;
+/// X credit packs (decision 0006): `(pack id, credits)`, one-time, never expire.
+pub const PACKS: [(&str, i64); 2] = [("x100", 100), ("x500", 500)];
 
 /// `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` and a monthly and a yearly price per plan. No
 /// `Debug`: it holds the keys.
@@ -18,6 +20,8 @@ pub struct Stripe {
     webhook_secret: Option<String>,
     /// `(plan id, interval, Stripe price id)`, the interval `month` or `year`.
     prices: Vec<(String, String, String)>,
+    /// `(pack id, Stripe price id)` of the X credit packs.
+    packs: Vec<(String, String)>,
     /// Tests point this at a mock.
     pub api_url: String,
     client: reqwest::Client,
@@ -34,6 +38,7 @@ impl Stripe {
         secret: Option<String>,
         webhook_secret: Option<String>,
         prices: [(&str, &str, Option<String>); 4],
+        packs: [(&str, Option<String>); 2],
     ) -> Result<Self, &'static str> {
         let shaped = |v: &Option<String>, prefixes: &[&str]| {
             v.as_deref()
@@ -57,6 +62,20 @@ impl Stripe {
                 have.push((plan.to_owned(), interval.to_owned(), p));
             }
         }
+        let mut sold: Vec<(String, String)> = Vec::new();
+        for (pack, price) in packs {
+            if !shaped(&price, &["price_"]) {
+                return Err("STRIPE_PRICE_X*: not a Stripe price id (price_...)");
+            }
+            if let Some(p) = price {
+                if have.iter().any(|(_, _, q)| *q == p) || sold.iter().any(|(_, q)| *q == p) {
+                    return Err(
+                        "STRIPE_PRICE_*: two plans, intervals or packs have the same price",
+                    );
+                }
+                sold.push((pack.to_owned(), p));
+            }
+        }
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(30))
@@ -66,6 +85,7 @@ impl Stripe {
             secret,
             webhook_secret,
             prices: have,
+            packs: sold,
             api_url: DEFAULT_API_URL.into(),
             client,
         })
@@ -74,6 +94,18 @@ impl Stripe {
     /// Whether sessions can be made: the key and both prices of every plan.
     pub fn configured(&self) -> bool {
         self.secret.is_some() && self.prices.len() == 4
+    }
+
+    /// Whether credit packs can be sold: the key and both pack prices.
+    pub fn packs_on(&self) -> bool {
+        self.secret.is_some() && self.packs.len() == PACKS.len()
+    }
+
+    pub fn pack_price(&self, pack: &str) -> Option<&str> {
+        self.packs
+            .iter()
+            .find(|(p, _)| p == pack)
+            .map(|(_, price)| price.as_str())
     }
 
     /// Whether the webhook can be checked.
@@ -197,6 +229,10 @@ mod tests {
                 ("scheduler", "year", Some("price_sy".into())),
                 ("automation", "year", Some("price_ay".into())),
             ],
+            [
+                ("x100", Some("price_p1".into())),
+                ("x500", Some("price_p5".into())),
+            ],
         )
         .unwrap()
     }
@@ -211,6 +247,10 @@ mod tests {
         assert_eq!(s.plan_of("price_s"), Some("scheduler"));
         assert_eq!(s.plan_of("price_sy"), Some("scheduler"));
         assert_eq!(s.plan_of("price_x"), None);
+        assert!(s.packs_on());
+        assert_eq!(s.pack_price("x500"), Some("price_p5"));
+        assert_eq!(s.pack_price("x1"), None);
+        let nopacks = || [("x100", None), ("x500", None)];
         let none = || {
             [
                 ("scheduler", "month", None),
@@ -219,20 +259,31 @@ mod tests {
                 ("automation", "year", None),
             ]
         };
-        assert!(!Stripe::new(None, None, none()).unwrap().configured());
+        assert!(!Stripe::new(None, None, none(), nopacks())
+            .unwrap()
+            .configured());
         let mut monthly_only = none();
         monthly_only[0].2 = Some("price_1".into());
         monthly_only[1].2 = Some("price_2".into());
-        let half = Stripe::new(Some("sk_test_1".into()), None, monthly_only).unwrap();
+        let half = Stripe::new(Some("sk_test_1".into()), None, monthly_only, nopacks()).unwrap();
         assert!(!half.configured());
         let mut same = none();
         same[0].2 = Some("price_1".into());
         same[3].2 = Some("price_1".into());
-        assert!(Stripe::new(None, None, same).is_err());
-        assert!(Stripe::new(Some("nope".into()), None, none()).is_err());
-        assert!(Stripe::new(None, Some("sk_test_x".into()), none()).is_err());
+        assert!(Stripe::new(None, None, same, nopacks()).is_err());
+        assert!(Stripe::new(Some("nope".into()), None, none(), nopacks()).is_err());
+        assert!(Stripe::new(None, Some("sk_test_x".into()), none(), nopacks()).is_err());
         let mut bad = none();
         bad[0].2 = Some("prod_1".into());
-        assert!(Stripe::new(None, None, bad).is_err());
+        assert!(Stripe::new(None, None, bad, nopacks()).is_err());
+        let mut taken = none();
+        taken[0].2 = Some("price_1".into());
+        assert!(Stripe::new(
+            None,
+            None,
+            taken,
+            [("x100", Some("price_1".into())), ("x500", None)]
+        )
+        .is_err());
     }
 }
