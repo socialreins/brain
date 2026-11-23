@@ -2,7 +2,9 @@
 //! a model from the owner's prompt and the incoming comment or DM. The team's own key
 //! (`controllers::ai_key::key_of`) goes first; without one, our `ANTHROPIC_API_KEY`, which on
 //! Cloud costs the team 1 `ai` credit a reply. Keys and prompts are never logged.
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, sync::LazyLock, time::Duration};
+
+use regex::Regex;
 
 use serde_json::{json, Value};
 use unicode_normalization::UnicodeNormalization;
@@ -196,10 +198,31 @@ pub fn prompt(
     (system, user)
 }
 
+/// A spelled-out dot with any whitespace around it: `[.]`, `( dot )`, ` dot `, ` . `.
+static SPELLED_DOT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\s*[\[({]\s*(?:dot|\.)\s*[\])}]\s*|\s+dot\s+|\s+\.\s+").expect("regex")
+});
+/// A spelled-out at: `[at]`, `( at )`.
+static SPELLED_AT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\s*[\[({]\s*at\s*[\])}]\s*").expect("regex"));
+/// "evil .com": a space before a dot that is followed by a TLD-like word.
+static SPACE_BEFORE_DOT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(\w)\s+\.(xn--[a-z0-9-]+|[a-z]{2,24})\b").expect("regex"));
+/// "evil. com": a space after a dot, then a common TLD that is not an English word, so
+/// "Hi. Thanks" stays a sentence.
+/// shortcut: a fixed TLD list, upgrade to the public suffix list if a rarer TLD gets through.
+static SPACE_AFTER_DOT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(\w)\.\s+(com|net|org|io|xyz|info|biz|ru|cn|uk|de|fr|ly|gg|tk|ml|cf|ga|gq|co|xn--[a-z0-9-]+)\b",
+    )
+    .expect("regex")
+});
+
 /// `text` as a reader would take it: NFKC, no zero-width characters, every look-alike or
-/// spelled-out dot (`。`, `[.]`, `(.)`, ` dot `, ` . `) a plain `.`, lowercase.
+/// spelled-out dot (`。`, `·`, `[.]`, `(dot)`, ` dot `, ` . `, "evil .com") a plain `.`,
+/// lowercase.
 fn normalise(text: &str) -> String {
-    let mut s: String = text
+    let s: String = text
         .nfkc()
         .filter(|c| {
             !matches!(
@@ -208,32 +231,25 @@ fn normalise(text: &str) -> String {
             )
         })
         .map(|c| match c {
-            '\u{3002}' | '\u{FF0E}' | '\u{FF61}' => '.',
+            '\u{00B7}' | '\u{06D4}' | '\u{2024}' | '\u{2027}' | '\u{FE52}' | '\u{FF0E}'
+            | '\u{3002}' | '\u{FF61}' => '.',
             '\u{FF20}' => '@',
             c => c,
         })
         .collect::<String>()
         .to_lowercase();
-    for (from, to) in [
-        ("[.]", "."),
-        ("(.)", "."),
-        ("{.}", "."),
-        ("[dot]", "."),
-        ("(dot)", "."),
-        ("{dot}", "."),
-        ("[at]", "@"),
-        ("(at)", "@"),
-        (" dot ", "."),
-        (" . ", "."),
-    ] {
-        // In order: "evil [dot] com" becomes "evil . com", then "evil.com".
-        s = s.replace(from, to);
-    }
-    s
+    let s = SPELLED_DOT.replace_all(&s, ".");
+    let s = SPELLED_AT.replace_all(&s, "@");
+    let s = SPACE_BEFORE_DOT.replace_all(&s, "${1}.${2}");
+    SPACE_AFTER_DOT.replace_all(&s, "${1}.${2}").into_owned()
 }
 
+/// Schemes that run code or carry content instead of pointing at a site.
+const BAD_SCHEMES: [&str; 3] = ["javascript:", "data:", "vbscript:"];
+
 /// The links, domains, emails and @handles in `text`, normalised: a URL or email by its host
-/// (an email also whole), a handle as `@name`.
+/// (an email also whole), a handle as `@name`, every domain inside a token ("a/evil.com",
+/// "?to=evil.com") by itself, and a `javascript:` or `data:` scheme as the scheme.
 fn addresses(text: &str) -> HashSet<String> {
     let s = normalise(text);
     let mut found = HashSet::new();
@@ -243,16 +259,27 @@ fn addresses(text: &str) -> HashSet<String> {
         if t.is_empty() {
             continue;
         }
+        for scheme in BAD_SCHEMES {
+            if t.starts_with(scheme) {
+                found.insert(scheme.to_owned());
+            }
+        }
         let rest = t.split_once("://").map_or(t, |(_, r)| r);
         let host = rest.split(['/', '?', '#']).next().unwrap_or("");
         let host = host.rsplit('@').next().unwrap_or("");
-        let host = host.split(':').next().unwrap_or("");
+        let host = host.split(':').next().unwrap_or("").trim_end_matches('.');
         if t.contains("://") || domain(host) {
             found.insert(host.trim_start_matches("www.").to_owned());
         }
+        for piece in t.split(['/', '?', '#', '=', '&', ':', '+', '~', '%']) {
+            let h = piece.rsplit('@').next().unwrap_or("").trim_matches('.');
+            if domain(h) {
+                found.insert(h.trim_start_matches("www.").to_owned());
+            }
+        }
         if let Some((user, h)) = t.split_once('@') {
-            if !user.is_empty() && domain(h) {
-                found.insert(t.to_owned());
+            if !user.is_empty() && domain(h.trim_end_matches('.')) {
+                found.insert(t.trim_end_matches('.').to_owned());
             } else if user.is_empty() {
                 let handle: String = h
                     .chars()
@@ -268,17 +295,22 @@ fn addresses(text: &str) -> HashSet<String> {
     found
 }
 
-/// A domain: labels of letters, digits or `-` between dots, the last one 2 or more letters
-/// ("shop.io", "例え.jp"), but not "3.5" or "e.g".
+/// A domain: two or more non-empty labels of letters, digits or `-` between dots, the last one
+/// 2 or more characters and not all digits ("shop.io", "例え.jp", "evil.xn--p1ai"), but not
+/// "3.5", "10.25" or "e.g". Also an IPv4 address ("10.0.0.1").
 fn domain(host: &str) -> bool {
     let labels: Vec<&str> = host.split('.').collect();
     let tld = labels.last().copied().unwrap_or("");
-    labels.len() >= 2
-        && tld.chars().count() >= 2
-        && tld.chars().all(char::is_alphabetic)
+    let ipv4 = labels.len() == 4
         && labels
             .iter()
-            .all(|l| !l.is_empty() && l.chars().all(|c| c.is_alphanumeric() || c == '-'))
+            .all(|l| (1..=3).contains(&l.len()) && l.chars().all(|c| c.is_ascii_digit()));
+    ipv4 || (labels.len() >= 2
+        && tld.chars().count() >= 2
+        && !tld.chars().all(|c| c.is_ascii_digit())
+        && labels
+            .iter()
+            .all(|l| !l.is_empty() && l.chars().all(|c| c.is_alphanumeric() || c == '-')))
 }
 
 /// Whether `text` holds a link, domain, email or @handle that is not in `allowed` (the owner's
@@ -357,6 +389,73 @@ mod tests {
         ] {
             assert!(invents_link(text, PROMPT), "{text}");
         }
+    }
+
+    #[test]
+    fn digit_and_punycode_tlds_and_ips_are_domains() {
+        assert!(invents_link("go to evil.xn--p1ai", PROMPT));
+        assert!(invents_link("go to evil.co2", PROMPT));
+        assert!(invents_link("go to 10.0.0.1 now", PROMPT));
+        assert!(invents_link("go to http://10.0.0.1/x", PROMPT));
+        assert!(!invents_link("It costs 10.25 and v2.0 ships soon", PROMPT));
+        assert!(!invents_link(
+            "See evil.xn--p1ai",
+            "Send them to evil.xn--p1ai"
+        ));
+    }
+
+    #[test]
+    fn a_trailing_dot_in_the_host_is_caught() {
+        for text in [
+            "evil.com./promo",
+            "evil.com.?q=1",
+            "evil.com.#x",
+            "https://evil.com./a",
+        ] {
+            assert!(invents_link(text, PROMPT), "{text}");
+        }
+        assert!(!invents_link(
+            "See notevil.com./a",
+            "Our shop is notevil.com"
+        ));
+    }
+
+    #[test]
+    fn more_dot_look_alikes_and_spaced_dots_are_caught() {
+        for c in ['\u{00B7}', '\u{06D4}', '\u{2027}', '\u{2024}', '\u{FE52}'] {
+            let text = format!("go to evil{c}com");
+            assert!(invents_link(&text, PROMPT), "{text}");
+        }
+        for text in [
+            "go to evil\tdot\tcom",
+            "go to evil\n DOT \ncom",
+            "go to evil   dot   com",
+            "go to evil ( DOT ) com",
+            "go to evil\t[dot]\tcom",
+            "go to evil .com",
+            "go to evil. com",
+            "go to evil .xn--p1ai",
+            "go to a/evil.com",
+            "go to x?to=evil.com",
+            "write me at a ( at ) evil.com",
+        ] {
+            assert!(invents_link(text, PROMPT), "{text}");
+        }
+        assert!(!invents_link(
+            "Hi Ada. Thanks for asking. Come back soon. We are open. Me too!",
+            PROMPT
+        ));
+    }
+
+    #[test]
+    fn code_and_data_schemes_are_refused() {
+        assert!(invents_link("click javascript:alert(1)", PROMPT));
+        assert!(invents_link(
+            "open data:text/html;base64,PHNjcmlwdD4=",
+            PROMPT
+        ));
+        assert!(invents_link("JavaScript:void(0)", PROMPT));
+        assert!(!invents_link("Note: we are open daily.", PROMPT));
     }
 
     #[test]

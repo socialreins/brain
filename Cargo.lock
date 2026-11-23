@@ -3440,6 +3440,7 @@ dependencies = [
  "lettre",
  "migration",
  "object_store",
+ "regex",
  "reqwest",
  "rmcp",
  "schemars",

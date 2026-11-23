@@ -53,7 +53,7 @@ mod m20261212_000001_team_ai_keys;
 mod m20261213_000001_stripe_events;
 mod m20261214_000001_comp_plans;
 mod m20261215_000001_inbox_automated;
-mod m20261216_000001_ai_monthly;
+mod m20261218_000001_ai_monthly;
 
 pub struct Migrator;
 
@@ -114,7 +114,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261213_000001_stripe_events::Migration),
             Box::new(m20261214_000001_comp_plans::Migration),
             Box::new(m20261215_000001_inbox_automated::Migration),
-            Box::new(m20261216_000001_ai_monthly::Migration),
+            Box::new(m20261218_000001_ai_monthly::Migration),
             // inject-above (do not remove this comment)
         ]
     }
