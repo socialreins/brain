@@ -50,6 +50,47 @@ const MAX_TEXT_CHARS: usize = 10_000;
 pub const DM_MAX_GRAPHEMES: usize = 1000;
 const DM_MAX_BYTES: usize = 10_000;
 
+/// Most attachments kept on one item.
+pub const MAX_ATTACHMENTS: usize = 10;
+/// Longest attachment link kept.
+const MAX_URL_CHARS: usize = 2048;
+
+/// A photo, video, sticker, file or link an item carries, as the platform linked it. Meta's
+/// CDN links expire after a while, so a client shows them while they load and falls back to
+/// the kind's label.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq, Eq)]
+pub struct Attachment {
+    /// `image`, `video`, `sticker`, `gif`, `audio`, `file` or `link`.
+    pub kind: String,
+    /// The file itself, or the page a `link` points to.
+    pub url: String,
+    /// A still to show for it (a video's thumbnail), when the platform gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_url: Option<String>,
+}
+
+/// `url` when it is an https link of a sane length; nothing else is stored or shown.
+fn https(url: Option<&str>) -> Option<String> {
+    let url = url?.trim();
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let ok = parsed.scheme() == "https" && parsed.host_str().is_some();
+    // The cap is on what is stored: percent-encoding can make the normalised form longer.
+    let stored = parsed.to_string();
+    (ok && stored.chars().count() <= MAX_URL_CHARS).then_some(stored)
+}
+
+impl Attachment {
+    /// An attachment of `kind`, or `None` when `url` is not https. A preview that is not https
+    /// is dropped.
+    pub fn new(kind: &str, url: Option<&str>, preview: Option<&str>) -> Option<Self> {
+        Some(Self {
+            kind: kind.to_owned(),
+            url: https(url)?,
+            preview_url: https(preview),
+        })
+    }
+}
+
 /// Platforms whose accounts have an inbox.
 pub const INBOX_PLATFORMS: [&str; 3] = ["bluesky", "facebook", "instagram"];
 /// Most accounts one inbox holds.
@@ -454,9 +495,9 @@ const INSERT: &str = "WITH c AS (INSERT INTO contacts AS k (id, team_id, platfor
     INSERT INTO inbox_items (id, team_id, social_account_id, platform, kind, \
     remote_id, remote_cid, parent_remote_id, root_remote_id, root_remote_cid, convo_id, \
     author_id, author_handle, author_name, author_avatar, text, received_at, permalink, \
-    story_reply, story_id, story_url, state, button_payload, post_id, contact_id) \
+    story_reply, story_id, story_url, state, button_payload, attachments, post_id, contact_id) \
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
-    $19, $20, $21, $22, $23, (SELECT t.post_id FROM post_targets t WHERE t.social_account_id = $3 \
+    $19, $20, $21, $22, $23, $25, (SELECT t.post_id FROM post_targets t WHERE t.social_account_id = $3 \
      AND t.remote_id IN ($8, $9) LIMIT 1), (SELECT id FROM c)) \
     ON CONFLICT (social_account_id, remote_id) DO NOTHING RETURNING *";
 
@@ -479,6 +520,8 @@ pub struct Fresh {
     pub story: Option<(Option<String>, Option<String>)>,
     /// For a DM that is a click on a quick reply button (Meta): the button's payload.
     pub button_payload: Option<String>,
+    /// Kept up to `MAX_ATTACHMENTS`.
+    pub attachments: Vec<Attachment>,
 }
 
 /// A button under a DM: a quick reply on Messenger and Instagram, whose click comes back as a
@@ -539,6 +582,7 @@ pub async fn store(
         (if f.kind == "follow" { "done" } else { "open" }).into(),
         f.button_payload.into(),
         Uuid::now_v7().into(),
+        serde_json::json!(f.attachments[..f.attachments.len().min(MAX_ATTACHMENTS)]).into(),
     ];
     let item = inbox_items::Entity::find()
         .from_raw_sql(sql(INSERT, values))
@@ -596,6 +640,7 @@ async fn store_notification(
         permalink: None,
         story: None,
         button_payload: None,
+        attachments: n.attachments.clone(),
     };
     store(db, account, fresh).await
 }
@@ -618,6 +663,7 @@ async fn store_message(
         permalink: None,
         story: None,
         button_payload: None,
+        attachments: Vec::new(),
     };
     store(db, account, fresh).await
 }
