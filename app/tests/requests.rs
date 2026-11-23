@@ -7996,6 +7996,9 @@ mod teams {
                     let t = &p["targets"][0];
                     assert_eq!(t["status"], "pending", "{p}");
                     assert_eq!(t["retried"], true);
+                    let due: chrono::DateTime<Utc> =
+                        t["retry_at"].as_str().unwrap().parse().unwrap();
+                    assert!(due > Utc::now() + Duration::minutes(4), "{t}");
                     let why = t["error"].as_str().unwrap();
                     assert!(why.ends_with("Nothing was posted."), "{why}");
                     let wait = post_targets::Entity::find_by_id(
@@ -8025,6 +8028,11 @@ mod teams {
                     assert_eq!(p["status"], "failed", "{p}");
                     assert_eq!(p["targets"][0]["status"], "failed");
                     assert_eq!(p["targets"][0]["retried"], true);
+                    assert_eq!(
+                        p["targets"][0]["retry_at"],
+                        Value::Null,
+                        "only while waiting"
+                    );
 
                     // Once is enough when the platform takes it the second time.
                     BUSY_ONCE.store(true, std::sync::atomic::Ordering::SeqCst);
