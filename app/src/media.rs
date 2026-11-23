@@ -131,6 +131,9 @@ pub struct Media {
     /// Tests only: a probe of a URL starting with `.0` asks `.1` instead (a mock on loopback,
     /// which saved media URLs, always https, cannot name).
     pub probe_rewrite: Option<(String, String)>,
+    /// Brain's `/media/` URL and the cipher of its links, so a media URL that is brain's link
+    /// to an upload is read from the store, never fetched (`linked`).
+    links: Option<(String, Arc<socialreins_core::crypto::Cipher>)>,
 }
 
 /// Longest the probes of one post's media may take together when it is saved. A probe not
@@ -302,7 +305,172 @@ impl Media {
             stall: STALL,
             probe_deadline: PROBE_DEADLINE,
             probe_rewrite: None,
+            links: None,
         }
+    }
+
+    /// This store knowing brain's links (`link`) at `brain_url`, sealed with `cipher`.
+    pub fn linked(
+        mut self,
+        brain_url: &str,
+        cipher: Arc<socialreins_core::crypto::Cipher>,
+    ) -> Self {
+        self.links = Some((format!("{brain_url}/media/"), cipher));
+        self
+    }
+
+    /// Brain's link to the upload `file` (`link`); none before `linked`.
+    pub fn upload_link(&self, file: &Stored) -> Option<String> {
+        let (base, cipher) = self.links.as_ref()?;
+        Some(sealed_link(base, cipher, file))
+    }
+
+    /// The storage key of the upload `url` names, when it is brain's own link to one.
+    pub fn upload_key(&self, url: &str) -> Option<String> {
+        let (base, cipher) = self.links.as_ref()?;
+        let key = unsealed(cipher, url.strip_prefix(base.as_str())?)?;
+        key.starts_with("uploads/").then_some(key)
+    }
+
+    /// `probe` of an upload: its first bytes and size, from the store.
+    async fn probe_upload(&self, key: &str) -> Option<Probed> {
+        let path = Path::from(key);
+        let size = self.store.head(&path).await.ok()?.size;
+        let head = self
+            .store
+            .get_range(&path, 0..size.min(PROBE_LEN as u64))
+            .await;
+        let head = head.ok()?;
+        Some(Probed {
+            content_type: sniff(&head)?,
+            size: Some(size),
+            animated: animated(&head),
+        })
+    }
+
+    /// A copy for `post`, made inside the store, of the upload at `key` if `post`'s team owns it:
+    /// its key, type and size. `Http(404)` when the upload is gone or not the team's.
+    async fn copied_upload(
+        &self,
+        db: &DatabaseConnection,
+        post: Uuid,
+        key: &str,
+    ) -> Result<(String, String, usize), Fail> {
+        let stmt = sql(
+            "SELECT u.storage_key, u.content_type, u.size FROM media_uploads u \
+             JOIN posts p ON p.team_id = u.team_id WHERE p.id = $1 AND u.storage_key = $2",
+            vec![post.into(), key.into()],
+        );
+        let found = db.query_one_raw(stmt).await.map_err(|e| {
+            tracing::warn!(error = %e, post = %post, "upload lookup failed");
+            Fail::Storage
+        })?;
+        let from = found
+            .as_ref()
+            .and_then(|r| stored(r).ok())
+            .ok_or(Fail::Http(404))?;
+        let to = format!("posts/{post}/{}", Uuid::now_v7());
+        let (from_path, to_path) = (Path::from(key), Path::from(to.as_str()));
+        match self.store.copy(&from_path, &to_path).await {
+            Ok(()) => Ok((to, from.content_type, from.size.max(0) as usize)),
+            Err(object_store::Error::NotFound { .. }) => Err(Fail::Http(404)),
+            Err(e) => {
+                self.delete(&to).await;
+                Err(storage(e))
+            }
+        }
+    }
+
+    /// Streams `body`, a file uploaded from a device, into a new object at `key`, and returns its
+    /// type and size. The type comes from its first bytes (`sniff`: JPEG, PNG, WebP, GIF, MP4,
+    /// MOV or PDF); a video may take `max_bytes`, anything else `MAX_STILL_BYTES`. A body silent
+    /// for `stall` fails; whatever stops it, the partial upload is aborted.
+    pub async fn put_stream<S, E>(
+        &self,
+        key: &str,
+        mut body: S,
+    ) -> Result<(&'static str, usize), Fail>
+    where
+        S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    {
+        let stall = self.stall;
+        let mut head = Vec::new();
+        while head.len() < SNIFF_LEN {
+            match next_chunk(&mut body, stall).await? {
+                Some(chunk) => head.extend_from_slice(&chunk),
+                None => break,
+            }
+        }
+        let content_type = sniff(&head).ok_or(Fail::Unsupported)?;
+        let (cap, over) = if content_type.starts_with("video/") {
+            (self.max_bytes, Fail::TooLarge)
+        } else {
+            (MAX_STILL_BYTES, Fail::TooLargeStill)
+        };
+        let mut size = head.len();
+        if size > cap {
+            return Err(over);
+        }
+        let upload = self
+            .store
+            .put_multipart(&Path::from(key))
+            .await
+            .map_err(storage)?;
+        let mut upload = Upload(Arc::new(tokio::sync::Mutex::new(upload)));
+        let mut file = WriteMultipart::new_with_chunk_size(Box::new(upload.clone()), PART_BYTES);
+        file.write(&head);
+        let streamed = async {
+            while let Some(chunk) = next_chunk(&mut body, stall).await? {
+                size += chunk.len();
+                if size > cap {
+                    return Err(over);
+                }
+                file.wait_for_capacity(PARTS_IN_FLIGHT)
+                    .await
+                    .map_err(storage)?;
+                file.write(&chunk);
+            }
+            Ok(())
+        };
+        match streamed.await {
+            Ok(()) => {
+                if let Err(e) = file.finish().await {
+                    let _ = upload.abort().await;
+                    return Err(storage(e));
+                }
+            }
+            Err(e) => {
+                let _ = file.abort().await;
+                return Err(e);
+            }
+        }
+        Ok((content_type, size))
+    }
+
+    /// Deletes the uploads at least `hours` old that no `draft`, `scheduled` or `queued` post of
+    /// their team names, file first; a file that will not go keeps its row for the next sweep.
+    /// Returns how many went.
+    pub async fn release_uploads(&self, db: &DatabaseConnection, hours: i32) -> Result<u64, DbErr> {
+        let stmt = sql(
+            "SELECT u.id, u.storage_key FROM media_uploads u \
+             WHERE u.created_at <= now() - make_interval(hours => $1) \
+             AND NOT EXISTS (SELECT 1 FROM posts p WHERE p.team_id = u.team_id \
+               AND p.status IN ('draft', 'scheduled', 'queued') \
+               AND strpos(p.media::text || p.thread::text || coalesce(p.cover, ''), u.url) > 0) \
+             LIMIT 1000",
+            vec![hours.into()],
+        );
+        let mut gone = 0;
+        for row in db.query_all_raw(stmt).await? {
+            let id: Uuid = row.try_get("", "id")?;
+            let key: String = row.try_get("", "storage_key")?;
+            if self.delete(&key).await {
+                let stmt = sql("DELETE FROM media_uploads WHERE id = $1", vec![id.into()]);
+                db.execute_raw(stmt).await?;
+                gone += 1;
+            }
+        }
+        Ok(gone)
     }
 
     /// `probe` of every URL, `PARALLEL` at a time, all within `probe_deadline`; only the URLs
@@ -342,6 +510,9 @@ impl Media {
     /// when there is no clear answer: blocked, unreachable, not 200 or 206, or bytes of no type
     /// brain stores (a sign-in page, say). Nothing is stored.
     pub async fn probe(&self, url: &str) -> Option<Probed> {
+        if let Some(key) = self.upload_key(url) {
+            return self.probe_upload(&key).await;
+        }
         let first = Instant::now() + self.probe_deadline;
         let mut res = self.open(url, true, first).await.ok()?;
         let size = match res.status() {
@@ -460,9 +631,12 @@ impl Media {
             let video_cap = cap.min(self.max_bytes);
             copy = self.copied(db, post, url, video_cap, until).await;
         }
-        let (key, content_type, size) = match copy {
-            Some(copy) => copy,
-            None => {
+        let upload = self.upload_key(url);
+        let (key, content_type, size) = match (copy, upload) {
+            (Some(copy), _) => copy,
+            // An upload is already in the store: copied there, never downloaded.
+            (None, Some(upload)) => self.copied_upload(db, post, &upload).await?,
+            (None, None) => {
                 let got = self.download(post, url, cap, until, &mut turn).await;
                 got.map(|(key, content_type, size)| (key, content_type.to_owned(), size))?
             }
@@ -944,6 +1118,7 @@ pub async fn sweep(app: &AppState) -> Result<u64, DbErr> {
         return Ok(0);
     }
     let mut gone = app.media.release(&app.db, None, SWEEP_DAYS).await?;
+    gone += app.media.release_uploads(&app.db, UPLOAD_HOURS).await?;
     if let Some(dir) = app.media.dir.clone() {
         let swept = tokio::task::spawn_blocking(move || sweep_temp(&dir, TEMP_AGE));
         gone += swept.await.unwrap_or(0);
@@ -951,6 +1126,23 @@ pub async fn sweep(app: &AppState) -> Result<u64, DbErr> {
     lock.commit().await?;
     Ok(gone)
 }
+
+/// The next chunk of an uploaded body; `Stalled` when none comes for `stall`.
+async fn next_chunk<S, E>(body: &mut S, stall: Duration) -> Result<Option<bytes::Bytes>, Fail>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+{
+    use futures_util::StreamExt;
+    match tokio::time::timeout(stall, body.next()).await {
+        Err(_) => Err(Fail::Stalled),
+        Ok(Some(Ok(chunk))) => Ok(Some(chunk)),
+        Ok(Some(Err(_))) => Err(Fail::Unreachable),
+        Ok(None) => Ok(None),
+    }
+}
+
+/// An upload lives at least this long, then as long as a waiting post names it.
+pub const UPLOAD_HOURS: i32 = 24;
 
 /// A temp file on local disk this old belongs to no download still running: several times
 /// `INGEST_CEILING`.
@@ -993,7 +1185,12 @@ fn sweep_temp(dir: &std::path::Path, older: Duration) -> u64 {
 /// (Threads): its storage key sealed with `ENCRYPTION_KEY`, plus an extension for its type. It
 /// serves the file only while the file is stored, which ends once its post settles.
 pub fn link(app: &AppState, file: &Stored) -> String {
-    let sealed = URL_SAFE_NO_PAD.encode(app.cipher.encrypt(file.key.as_bytes()));
+    sealed_link(&format!("{}/media/", app.brain_url), &app.cipher, file)
+}
+
+/// `link` under `base`, brain's `/media/` URL.
+fn sealed_link(base: &str, cipher: &socialreins_core::crypto::Cipher, file: &Stored) -> String {
+    let sealed = URL_SAFE_NO_PAD.encode(cipher.encrypt(file.key.as_bytes()));
     let ext = match file.content_type.as_str() {
         "image/jpeg" => "jpg",
         "image/png" => "png",
@@ -1001,17 +1198,23 @@ pub fn link(app: &AppState, file: &Stored) -> String {
         "image/webp" => "webp",
         "video/mp4" => "mp4",
         "video/quicktime" => "mov",
+        "application/pdf" => "pdf",
         _ => "bin",
     };
-    format!("{}/media/{sealed}.{ext}", app.brain_url)
+    format!("{base}{sealed}.{ext}")
 }
 
-/// The storage key a `link` names, when brain sealed it and it is a post file.
+/// The storage key a `link` names, when brain sealed it and it is a post file or an upload.
 pub fn unseal(app: &AppState, name: &str) -> Option<String> {
+    let key = unsealed(&app.cipher, name)?;
+    (key.starts_with("posts/") || key.starts_with("uploads/")).then_some(key)
+}
+
+/// The storage key sealed in a link's `name` (`<sealed>.<ext>`).
+fn unsealed(cipher: &socialreins_core::crypto::Cipher, name: &str) -> Option<String> {
     let token = name.split('.').next()?;
     let sealed = URL_SAFE_NO_PAD.decode(token).ok()?;
-    let key = String::from_utf8(app.cipher.decrypt(&sealed)?).ok()?;
-    key.starts_with("posts/").then_some(key)
+    String::from_utf8(cipher.decrypt(&sealed)?).ok()
 }
 
 fn sql(sql: &str, values: Vec<Value>) -> Statement {

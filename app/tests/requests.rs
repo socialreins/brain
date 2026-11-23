@@ -4818,8 +4818,17 @@ mod teams {
 
             /// `on_mock` with `MEDIA_MAX_BYTES` set to `cap`.
             async fn on_mock_capped(cap: usize) -> (TestServer, DatabaseConnection, AppState) {
+                on_mock_at(cap, None).await
+            }
+
+            /// `on_mock_capped`, with brain at `brain_url` when given.
+            async fn on_mock_at(
+                cap: usize,
+                brain_url: Option<&str>,
+            ) -> (TestServer, DatabaseConnection, AppState) {
                 let base = mock_bluesky().await;
                 let mut config = Config::from_env().expect("test config");
+
                 config.trust_proxy = true;
                 config.bluesky.appview = base.clone();
                 config.bluesky.plc = base.clone();
@@ -4835,7 +4844,11 @@ mod teams {
                 let db = socialreins_brain::connect(&config)
                     .await
                     .expect("database reachable");
-                let state = AppState::new(db.clone(), &config);
+                let mut state = AppState::new(db.clone(), &config);
+                // Upload links only: sign-in still checks the real brain URL.
+                if let Some(url) = brain_url {
+                    state.media = state.media.clone().linked(url, state.cipher.clone());
+                }
                 let app = controllers::router(state.clone(), &config);
                 (TestServer::new(app).unwrap(), db, state)
             }
@@ -5568,6 +5581,138 @@ mod teams {
                 assert_eq!(images[1]["image"]["mimeType"], "image/png");
                 assert_eq!(images[1]["image"]["size"], 64);
                 assert!(!media_dir().join("posts").join(&id).exists());
+            }
+
+            /// A file of `len` bytes that starts like `head`.
+            fn file(head: &[u8], len: usize) -> Vec<u8> {
+                let mut bytes = vec![7u8; len];
+                bytes[..head.len()].copy_from_slice(head);
+                bytes
+            }
+
+            async fn upload(
+                s: &TestServer,
+                cookie: &str,
+                bytes: Vec<u8>,
+            ) -> axum_test::TestResponse {
+                req(s, Method::POST, "/v1/uploads", cookie)
+                    .content_type("application/octet-stream")
+                    .bytes(bytes.into())
+                    .await
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn uploads_are_typed_capped_owned_and_published_without_a_download() {
+                use sea_orm::ConnectionTrait;
+                const BRAIN: &str = "https://brain.test";
+                let (s, db, state) = on_mock_at(1000, Some(BRAIN)).await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+                const MP4: &[u8] = b"\0\0\0\x18ftypmp42\0\0\0\0";
+                // The type comes from the bytes; a video over MEDIA_MAX_BYTES is refused.
+                let res = upload(&s, &cookie, b"just some text, not media".to_vec()).await;
+                assert_eq!(res.status_code(), 422, "{}", res.text());
+                res.assert_json(&json!({"error": "media_type_not_supported"}));
+                let res = upload(&s, &cookie, Vec::new()).await;
+                assert_eq!(res.status_code(), 422, "{}", res.text());
+                let res = upload(&s, &cookie, file(MP4, 1001)).await;
+                assert_eq!(res.status_code(), 413, "{}", res.text());
+                res.assert_json(&json!({"error": "media_too_large"}));
+                let res = s
+                    .post("/v1/uploads")
+                    .add_header("origin", WEB)
+                    .bytes(file(PNG, 64).into())
+                    .await;
+                assert_eq!(res.status_code(), 401, "signed out");
+                let res = upload(&s, &cookie, file(PNG, 64)).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let up = res.json::<Value>();
+                assert_eq!(up["content_type"], "image/png");
+                assert_eq!(up["size"], 64);
+                let url = up["url"].as_str().unwrap().to_owned();
+                assert!(url.starts_with("https://brain.test/media/") && url.ends_with(".png"));
+                // Nothing of the refused ones stayed; the link serves the file for a preview.
+                let rows = |db: &DatabaseConnection| {
+                    let db = db.clone();
+                    async move {
+                        let row = db
+                            .query_one_raw(sea_orm::Statement::from_string(
+                                sea_orm::DbBackend::Postgres,
+                                "SELECT count(*) AS n FROM media_uploads",
+                            ))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        row.try_get::<i64>("", "n").unwrap()
+                    }
+                };
+                assert_eq!(rows(&db).await, 1);
+                let res = s.get(url.strip_prefix(BRAIN).unwrap()).await;
+                res.assert_status_ok();
+                assert_eq!(res.header("content-type"), "image/png");
+                assert_eq!(res.as_bytes().len(), 64);
+
+                // Another team cannot use the link.
+                let (other, other_team, _) = owner_with_account(&s, &db).await;
+                let other_set = default_set(&db, &other_team).await.to_string();
+                let mut stolen = input(&other_set, "mine now", None);
+                stolen["media"] = json!([url]);
+                let res = create(&s, &other, stolen).await;
+                assert_eq!(res.status_code(), 422, "{}", res.text());
+                assert_eq!(res.json::<Value>()["error"], "invalid_upload");
+                assert_eq!(res.json::<Value>()["field"], "media");
+
+                // The team's post takes it, and publishing copies it in the store.
+                let mut with = input(&set, "uploaded", Some(&past()));
+                with["media"] = json!([url]);
+                let res = create(&s, &cookie, with).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let id = id_of(&res);
+                let draft = id_of(
+                    &create(&s, &cookie, {
+                        let mut d = input(&set, "draft", None);
+                        d["media"] = json!([url]);
+                        d
+                    })
+                    .await,
+                );
+                publish::tick(&state).await.unwrap();
+                let p = get_post(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "published", "{p}");
+                let record = RECORDS.lock().unwrap().last().cloned().unwrap();
+                let images = &record["record"]["embed"]["images"];
+                assert_eq!(images[0]["image"]["mimeType"], "image/png");
+                assert_eq!(images[0]["image"]["size"], 64);
+                assert!(
+                    !media_dir().join("posts").join(&id).exists(),
+                    "its copy went"
+                );
+
+                // A day on, the upload stays while the draft names it, then goes.
+                db.execute_unprepared(
+                    "UPDATE media_uploads SET created_at = now() - interval '25 hours'",
+                )
+                .await
+                .unwrap();
+                let unattached = upload(&s, &cookie, file(PNG, 64)).await;
+                assert_eq!(unattached.status_code(), 201);
+                assert_eq!(state.media.release_uploads(&db, 24).await.unwrap(), 0);
+                assert_eq!(rows(&db).await, 2);
+                let res = req(&s, Method::DELETE, &format!("/v1/posts/{draft}"), &cookie).await;
+                assert!(res.status_code().is_success(), "{}", res.text());
+                assert_eq!(state.media.release_uploads(&db, 24).await.unwrap(), 1);
+                assert_eq!(rows(&db).await, 1, "the young unattached one stays");
+                s.get(url.strip_prefix(BRAIN).unwrap())
+                    .await
+                    .assert_status_not_found();
+                // A post saved with a gone upload is refused.
+                let mut gone = input(&set, "late", None);
+                gone["media"] = json!([url]);
+                let res = create(&s, &cookie, gone).await;
+                assert_eq!(res.status_code(), 422, "{}", res.text());
+                assert_eq!(res.json::<Value>()["error"], "invalid_upload");
             }
 
             #[tokio::test]

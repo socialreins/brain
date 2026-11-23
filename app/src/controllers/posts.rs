@@ -1104,6 +1104,9 @@ async fn checked_fully(
         Ok(set) => set,
         Err(res) => return Ok(Err(res)),
     };
+    if let Some(p) = upload_problem(app, a, input).await? {
+        return Ok(Err(refusal(&input.platform, &p)));
+    }
     let only = input.account_ids.as_deref();
     Ok(match preflight(app, a, set, input.into(), only).await? {
         Some(res) => Err(res),
@@ -1202,6 +1205,35 @@ async fn account_problem(
         }));
     }
     Ok(None)
+}
+
+/// The problem when a media link of the post (its own, a thread part's or the cover) is brain's
+/// link to an upload that is not the team's: another team's, or one deleted since.
+async fn upload_problem(
+    app: &AppState,
+    a: &Actor,
+    input: &PostInput,
+) -> Result<Option<Problem>, DbErr> {
+    let urls: Vec<&str> = input
+        .media
+        .iter()
+        .chain(input.thread.iter().flat_map(|p| &p.media))
+        .map(String::as_str)
+        .chain(input.cover.as_deref())
+        .collect();
+    let bad = super::uploads::foreign(app, &app.db, a.team.id, &urls).await?;
+    Ok(bad.map(|url| Problem {
+        code: "invalid_upload".into(),
+        field: Some(if input.cover.as_deref() == Some(url.as_str()) {
+            "cover".into()
+        } else {
+            "media".into()
+        }),
+        detail: Some(
+            "A file was uploaded by another team or is no longer kept. Upload it again.".into(),
+        ),
+        ..Default::default()
+    }))
 }
 
 /// The cover as saved: blank is none.
@@ -1422,6 +1454,7 @@ async fn examine(
     for c in &mut checks {
         c.rules
             .extend(account_problem(&app.db, a.team.id, set, &c.input).await?);
+        c.rules.extend(upload_problem(app, a, &c.input).await?);
     }
     let failed = |checks: &[Check]| checks.iter().any(|c| !c.ok());
     if !all && failed(&checks) {

@@ -123,6 +123,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | PUT | `/v1/lists/{id}/order` | Reorder (`{"post_ids"}`: every post of the list once, else `422 invalid_order`) |
 | GET, POST | `/v1/media-library` | The team's media library, newest first: `{"items":[{"id","url","name","created_at","created_by"}],"next_cursor"}` (`?q=&cursor=&limit=`: `q` searches name and URL in any case, wildcards matched as typed; `limit` 1 to 100, default 50; `created_by` is `null` for a token). Add one (`{"url","name"}`, `201`): `url` a public `https://` URL up to 2048 bytes with no user or password, `name` trimmed up to 100 characters, by default the URL's last path segment decoded. `422 {"error":"invalid_media","field"}`, `409 {"error":"already_in_library","id"}` for a URL the team has, `422 library_full` past 1000 items |
 | PATCH, DELETE | `/v1/media-library/{id}` | Rename (`{"name"}`, `200` with the item); remove (`204`). Posts keep their media URLs |
+| POST | `/v1/uploads` | A file from the device for a post: the raw file as the body (any member, any token that may write). Typed by its bytes: JPEG, PNG, WebP, GIF or PDF up to 100 MB, MP4 or MOV up to `MEDIA_MAX_BYTES`. `201 {"id","url","content_type","size"}`; `422 media_type_not_supported`, `413 media_too_large`, `409 too_many_uploads` (200 uploads or 10 GiB kept per team). Put `url` in a post's `media` or `cover`: another team's (or a deleted) upload is `422 invalid_upload` |
 | GET, POST | `/v1/feeds` | The team's RSS and Atom feeds, oldest first, as an array of `{"id","url","social_set_id","platforms":[..],"template","mode":"draft"\|"queue"\|"now","active","last_checked_at","last_error","items_posted","created_at"}`. Add one (`{"url","social_set_id","platforms","template","mode"}`, `201`; owner, admin or a full token): see [Feeds](#feeds). `422 {"error":"invalid_feed","field"}`, `422 {"error":"platform_not_supported","platform"}` for TikTok and YouTube, `422 {"error":"feed_unreadable","reason"}`, `422 too_many_feeds` past 20 |
 | GET, PUT, DELETE | `/v1/feeds/{id}` | One feed; replace it (the same fields and `active`, `200`); remove it (`204`, its posts stay). Another team's id is `404` |
 | POST | `/v1/feeds/{id}/check` | Check the feed now and answer it (`200`). At most once a minute per feed, every other check included: `429 checked_recently` |
@@ -992,6 +993,15 @@ your own teams: the cleanup revokes the tokens and invitations of every team it 
 A post's `media` are URLs: public `https://` links, Google Drive share links
 (`/file/d/<id>/view`, `open?id=`, `uc?id=`) or Dropbox share links to one file (`/s/<id>/<name>`,
 `/scl/fi/<id>/<name>`); the file must be shared with anyone with the link.
+**Uploads.** A file uploaded with `POST /v1/uploads` is streamed into the same storage under
+`uploads/<team>/<id>`, typed by its first bytes (never by its name or `Content-Type`), and
+answered with brain's unguessable link to it (`/media/<sealed>.<ext>`, served with its real type
+and `nosniff`, for the composer's preview). A post holds that link like any other: saving checks
+that it is an upload of the post's team, probing reads the stored file, and publishing copies it
+inside the storage to the post's own files, so it is never downloaded. An upload is kept a day,
+then for as long as a draft, scheduled or queued post of its team names it; the hourly sweep
+deletes the rest, file and row. Publishing an upload deleted since fails that target (`HTTP 404`).
+
 Nothing is fetched when a post is saved. When it publishes, brain downloads each URL once into
 its storage (`MEDIA_DIR` or the `S3_*` bucket): names must resolve to public addresses, at most 3
 redirects, each to a public https URL, 4 at a time, streamed to storage in 5 MB parts (a download

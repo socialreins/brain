@@ -119,7 +119,10 @@ impl AppState {
             admin_emails: config.admin_emails.clone(),
             review_login_token: config.review_login_token.clone(),
             waitlist_count: Arc::default(),
-            media: config.media.clone(),
+            media: config
+                .media
+                .clone()
+                .linked(&config.brain_url, config.cipher.clone()),
             feeds: crate::feeds::Fetcher::new(None),
             threads: config.threads.clone(),
             linkedin: config.linkedin.clone(),
