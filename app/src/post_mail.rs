@@ -205,10 +205,10 @@ mod tests {
         assert!(
             text.contains("- @a.test: Bluesky refused it (InvalidRequest).\n- @b.test: Timed out")
         );
+        assert!(text.ends_with("https://app.test/t/abc234/posts/1\n"));
         // A link in a platform's message stays text.
         let (_, text) = compose(Kind::Failed, "x", "", Some("https://evil.test\nx"), "l");
         assert!(text.contains("\n- https://evil.test x\n"), "{text}");
-        assert!(text.ends_with("https://app.test/t/abc234/posts/1\n"));
         let (subject, text) = compose(Kind::Late, "x", &"a".repeat(300), None, "l");
         assert_eq!(subject, "Your X post was not posted");
         assert!(text.contains(&format!("\"{}...\"", "a".repeat(120))));
