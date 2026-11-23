@@ -19195,6 +19195,250 @@ mod teams {
                 })
             }
 
+            mod ai_steps {
+                use super::*;
+                use socialreins_brain::billing::{self, Kind};
+
+                const TEAM_KEY: &str = "sk-ant-api03-teamteamteamteamteamteam";
+                const OUR_KEY: &str = "sk-ant-api03-oursoursoursoursoursours";
+                const PROMPT: &str =
+                    "Thank them warmly. Our guide is at https://shop.example/guide";
+
+                /// What the mock model answers next (`"500"`: an error), and every call it took
+                /// as (key, body).
+                static AI_REPLY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+                static AI_CALLS: std::sync::Mutex<Vec<(String, Value)>> =
+                    std::sync::Mutex::new(Vec::new());
+
+                async fn mock_ai() -> String {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let base = format!("http://{}", listener.local_addr().unwrap());
+                    let messages = |headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
+                        let key = headers
+                            .get("x-api-key")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned();
+                        AI_CALLS.lock().unwrap().push((key, body));
+                        let text = AI_REPLY.lock().unwrap().clone();
+                        if text == "500" {
+                            return (
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({"type": "error"})),
+                            );
+                        }
+                        let content = json!([{"type": "text", "text": text}]);
+                        (
+                            axum::http::StatusCode::OK,
+                            Json(json!({"content": content})),
+                        )
+                    };
+                    let app = Router::new().route("/v1/messages", post(messages));
+                    tokio::spawn(async move { axum::serve(listener, app).await });
+                    base
+                }
+
+                async fn on_ai(
+                    billing: bool,
+                    own_key: Option<&str>,
+                ) -> (TestServer, DatabaseConnection, AppState) {
+                    let base = mock_bluesky().await;
+                    let ai = mock_ai().await;
+                    let mut config = Config::from_env().expect("test config");
+                    config.trust_proxy = true;
+                    config.bluesky.appview = base.clone();
+                    config.bluesky.plc = base;
+                    config.bluesky.allow_insecure_pds = true;
+                    config.billing_enabled = billing;
+                    config.ai.own_key = own_key.map(Into::into);
+                    config.ai.anthropic_url = ai;
+                    let db = socialreins_brain::connect(&config)
+                        .await
+                        .expect("database reachable");
+                    let state = AppState::new(db.clone(), &config);
+                    let app = controllers::router(state.clone(), &config);
+                    (TestServer::new(app).unwrap(), db, state)
+                }
+
+                /// One new comment from `did:plc:<rkey>` is ingested; the latest run of `id`.
+                async fn comment(
+                    t: (&TestServer, &DatabaseConnection, &AppState),
+                    cookie: &str,
+                    (account, me, id): (&str, &str, &str),
+                    rkey: &str,
+                    secs: i64,
+                ) -> Value {
+                    let from = format!("did:plc:{rkey}");
+                    let n = note("reply", &from, rkey, "guide please", &at(-secs), me);
+                    set_inbox(me, json!({"notifications": [n]}));
+                    ingest(t.1, t.2, account).await;
+                    runs(t.0, cookie, id).await[0].clone()
+                }
+
+                fn reply(text: &str) {
+                    *AI_REPLY.lock().unwrap() = text.to_owned();
+                }
+
+                /// AI sends are checked on save, use the team's key, record the provider and
+                /// model, and never send a link the prompt does not hold.
+                #[tokio::test]
+                #[serial]
+                async fn ai_steps_write_with_the_team_key_and_never_invent_links() {
+                    let (s, db, state) = on_ai(false, None).await;
+                    let (cookie, _, account, me) = owner(&s, &db).await;
+                    for (body, code) in [
+                        (
+                            json!({"name": "x", "trigger": "comment_received",
+                                "actions": [{"type": "ai_send_dm", "prompt": "  "}]}),
+                            "invalid_text",
+                        ),
+                        (
+                            json!({"name": "x", "trigger": "comment_received",
+                                "actions": [{"type": "ai_send_dm", "prompt": "See {page}"}]}),
+                            "invalid_text",
+                        ),
+                        (
+                            json!({"name": "x", "trigger": "comment_received", "actions": [
+                                {"type": "ai_send_dm", "prompt": "a"},
+                                {"type": "send_dm", "text": "b"}]}),
+                            "invalid_actions",
+                        ),
+                        (
+                            json!({"name": "x", "trigger": "dm_received",
+                                "steps": [{"type": "ai_reply_publicly", "prompt": "a"}]}),
+                            "invalid_steps",
+                        ),
+                    ] {
+                        let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                            .json(&body)
+                            .await;
+                        assert_eq!(res.status_code(), 422, "{body}");
+                        assert_eq!(res.json::<Value>()["error"], code, "{body}");
+                    }
+                    let id = automation(
+                        &s,
+                        &cookie,
+                        json!({"name": "AI guide", "trigger": "comment_received",
+                            "actions": [{"type": "ai_send_dm", "prompt": PROMPT}]}),
+                    )
+                    .await;
+                    let t = (&s, &db, &state);
+                    let at = (account.as_str(), me.as_str(), id.as_str());
+                    let calls = || AI_CALLS.lock().unwrap().len();
+                    let sent = || SENT.lock().unwrap().len();
+
+                    // No team key and none of ours: skipped, the model is never called.
+                    let (c0, s0) = (calls(), sent());
+                    let run = comment(t, &cookie, at, "ai1", 1).await;
+                    assert_eq!(run["status"], "skipped", "{run}");
+                    assert_eq!(run["reason"], "no_ai_key");
+                    assert_eq!((calls(), sent()), (c0, s0));
+
+                    // The team's key: the reply goes out, the run names provider and model.
+                    let res = req(&s, Method::PUT, "/v1/team/ai-key", &cookie)
+                        .json(&json!({"provider": "anthropic", "key": TEAM_KEY}))
+                        .await;
+                    res.assert_status_ok();
+                    let text = "Thanks Fan ai2! The guide: https://shop.example/guide";
+                    reply(text);
+                    let run = comment(t, &cookie, at, "ai2", 2).await;
+                    assert_eq!(run["status"], "sent", "{run}");
+                    let result = &run["results"][0];
+                    assert_eq!(result["type"], "ai_send_dm");
+                    assert_eq!(result["provider"], "anthropic");
+                    assert_eq!(result["model"], socialreins_brain::ai::ANTHROPIC_MODEL);
+                    assert!(!run.to_string().contains("sk-ant"));
+                    let last = SENT.lock().unwrap().last().cloned().unwrap();
+                    assert_eq!(last["message"]["text"], text);
+                    assert_eq!(last["convoId"], "convo-did:plc:ai2");
+                    let (key, body) = AI_CALLS.lock().unwrap().last().cloned().unwrap();
+                    assert_eq!(key, TEAM_KEY);
+                    assert_eq!(body["model"], socialreins_brain::ai::ANTHROPIC_MODEL);
+                    assert!(body["system"].as_str().unwrap().contains("at most 500"));
+                    let asked = body["messages"][0]["content"].as_str().unwrap();
+                    assert!(asked.contains(PROMPT) && asked.contains("guide please"));
+                    assert!(asked.contains("Fan ai2"));
+
+                    // A link the prompt does not hold, an empty answer or a provider error: nothing goes.
+                    for (answer, reason, rkey) in [
+                        ("Grab it at evil.example now", "ai_link", "ai3"),
+                        ("   ", "ai_empty", "ai4"),
+                        ("500", "ai_failed", "ai5"),
+                    ] {
+                        reply(answer);
+                        let s0 = sent();
+                        let run = comment(t, &cookie, at, rkey, 3).await;
+                        assert_eq!(run["status"], "failed", "{run}");
+                        assert_eq!(run["reason"], reason, "{run}");
+                        assert_eq!(sent(), s0, "{reason}");
+                    }
+                }
+
+                /// Without its own key, a team pays 1 `ai` credit per reply on our key; none left
+                /// skips the step, and a reply that is not sent gives the credit back.
+                #[tokio::test]
+                #[serial]
+                async fn without_a_team_key_ai_steps_spend_credits() {
+                    use sea_orm::ConnectionTrait;
+                    let (s, db, state) = on_ai(true, Some(OUR_KEY)).await;
+                    // With billing on, the plan comes before the account.
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let team: uuid::Uuid = team_id.parse().unwrap();
+                    db.execute_raw(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Postgres,
+                        "INSERT INTO subscriptions (team_id, plan_id, status) \
+                         VALUES ($1, 'automation', 'active') ON CONFLICT (team_id) DO NOTHING",
+                        [team.into()],
+                    ))
+                    .await
+                    .unwrap();
+                    let res = connect(&s, &cookie, &new_handle(), DM_APP_PASSWORD).await;
+                    assert_eq!(res.status_code(), 201);
+                    let body = res.json::<Value>();
+                    let account = body["id"].as_str().unwrap().to_owned();
+                    let me = body["external_id"].as_str().unwrap().to_owned();
+                    let id = automation(
+                        &s,
+                        &cookie,
+                        json!({"name": "AI flow", "trigger": "comment_received", "steps": [
+                            {"type": "tag_contact", "tag": "ai"},
+                            {"type": "ai_send_dm", "prompt": "Say hi"}]}),
+                    )
+                    .await;
+                    let t = (&s, &db, &state);
+                    let at = (account.as_str(), me.as_str(), id.as_str());
+                    let balance = || billing::balance(&db, team, Kind::Ai);
+
+                    reply("Hi there!");
+                    let calls = AI_CALLS.lock().unwrap().len();
+                    let run = comment(t, &cookie, at, "cr1", 1).await;
+                    assert_eq!(run["status"], "skipped", "{run}");
+                    assert_eq!(run["reason"], "no_ai_credits");
+                    assert_eq!(AI_CALLS.lock().unwrap().len(), calls);
+
+                    billing::grant(&db, team, Kind::Ai, 1, "test", Some("t1"))
+                        .await
+                        .unwrap();
+                    let run = comment(t, &cookie, at, "cr2", 2).await;
+                    assert_eq!(run["status"], "sent", "{run}");
+                    assert_eq!(run["results"][1]["provider"], "anthropic");
+                    assert_eq!(AI_CALLS.lock().unwrap().last().unwrap().0, OUR_KEY);
+                    assert_eq!(balance().await.unwrap(), 0);
+
+                    billing::grant(&db, team, Kind::Ai, 1, "test", Some("t2"))
+                        .await
+                        .unwrap();
+                    reply("");
+                    let run = comment(t, &cookie, at, "cr3", 3).await;
+                    assert_eq!(run["reason"], "ai_empty", "{run}");
+                    assert_eq!(balance().await.unwrap(), 1, "given back");
+                }
+            }
+
             fn dm(id: &str, from: &str, text: &str, when: &str) -> Value {
                 json!({"$type": "chat.bsky.convo.defs#messageView", "id": id, "text": text,
                     "sender": {"did": from}, "sentAt": when})

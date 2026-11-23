@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod automations;
 pub mod billing;
 pub mod broadcasts;

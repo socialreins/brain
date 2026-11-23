@@ -122,6 +122,9 @@ pub struct Config {
     /// `STRIPE_PRICE_X500` (credit packs): Cloud checkout, the customer portal and `POST /webhooks/stripe`.
     /// Needed only with `BILLING_ENABLED`.
     pub stripe: crate::stripe::Stripe,
+    /// `ANTHROPIC_API_KEY`: our key for AI steps in automations when a team has none of its
+    /// own. On Cloud each such reply costs 1 `ai` credit; unset, only teams with a key get them.
+    pub ai: crate::ai::Ai,
 }
 
 impl Config {
@@ -239,6 +242,7 @@ impl Config {
                     ("x500", var("STRIPE_PRICE_X500")),
                 ],
             )?,
+            ai: crate::ai::Ai::new(var("ANTHROPIC_API_KEY"))?,
         })
     }
 }

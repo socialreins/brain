@@ -15,6 +15,10 @@
 //! claim and park checks it (`UNCHANGED`): once the automation is off, gone or has other
 //! steps, the run ends `skipped: automation_changed` instead of going on.
 //!
+//! `ai_send_dm` and `ai_reply_publicly`, actions and steps, send a text an AI model writes from
+//! the owner's prompt and the item's text (`ai_send`, `crate::ai`). They are sends like the others:
+//! the same claim, daily cap and run results, which name the provider and model.
+//!
 //! `tag_contact`, an action and a step, sends nothing: it adds a tag to the contact of the
 //! item's author (`inbox::add_tag`) and takes no hit of the daily cap. An automation still needs
 //! a send beside it.
@@ -32,7 +36,10 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
+    ai,
+    billing::{self, Kind, Spent},
     connectors::bluesky::InboxError,
+    controllers::ai_key::key_of,
     controllers::{connections::live_sets, pages},
     inbox::{self, Button, Via},
     models::{
@@ -131,6 +138,12 @@ pub enum Action {
     SendDm { text: String },
     /// A reply under the comment or mention, at most 300 graphemes.
     ReplyPublicly { text: String },
+    /// A DM as `SendDm`, its text written by AI from `prompt` (1 to 2000 characters, no
+    /// `{page}`) and the item's text. It uses the team's own AI key, else 1 `ai` credit on
+    /// Cloud. A reply that is empty, too long or holds a link the prompt does not is not sent.
+    AiSendDm { prompt: String },
+    /// A reply under the comment or mention as `ReplyPublicly`, written by AI as `AiSendDm`.
+    AiReplyPublicly { prompt: String },
     /// Adds `tag` (1 to 30 characters, no commas; trimmed and lowercased) to the contact of
     /// the item's author. Every trigger takes it. It sends nothing and costs no daily hit, and
     /// does nothing when the contact has the tag or holds 20 already.
@@ -154,17 +167,25 @@ impl Action {
         match self {
             Self::SendDm { .. } => "send_dm",
             Self::ReplyPublicly { .. } => "reply_publicly",
+            Self::AiSendDm { .. } => "ai_send_dm",
+            Self::AiReplyPublicly { .. } => "ai_reply_publicly",
             Self::TagContact { .. } => "tag_contact",
         }
     }
 
-    /// How a send goes out and its text; `None` for a `tag_contact`.
+    /// How a send goes out and its text (an AI send's prompt); `None` for a `tag_contact`.
     fn via_text(&self) -> Option<(Via, &str)> {
         match self {
             Self::SendDm { text } => Some((Via::Dm, text)),
             Self::ReplyPublicly { text } => Some((Via::Public, text)),
+            Self::AiSendDm { prompt } => Some((Via::Dm, prompt)),
+            Self::AiReplyPublicly { prompt } => Some((Via::Public, prompt)),
             Self::TagContact { .. } => None,
         }
+    }
+
+    fn ai(&self) -> bool {
+        matches!(self, Self::AiSendDm { .. } | Self::AiReplyPublicly { .. })
     }
 }
 
@@ -181,6 +202,10 @@ pub enum Step {
     },
     /// A reply under the comment or mention, at most 300 graphemes.
     ReplyPublicly { text: String },
+    /// A DM written by AI, as `Action::AiSendDm`. No buttons.
+    AiSendDm { prompt: String },
+    /// A public reply written by AI, as `Action::AiReplyPublicly`.
+    AiReplyPublicly { prompt: String },
     /// The run stops here for 1 to 10080 minutes (7 days). Never the first or last step.
     Wait { minutes: u32 },
     /// Adds `tag` to the contact of the item's author, as `Action::TagContact` does, and goes
@@ -196,19 +221,35 @@ impl Step {
         match self {
             Self::SendDm { .. } => "send_dm",
             Self::ReplyPublicly { .. } => "reply_publicly",
+            Self::AiSendDm { .. } => "ai_send_dm",
+            Self::AiReplyPublicly { .. } => "ai_reply_publicly",
             Self::Wait { .. } => "wait",
             Self::TagContact { .. } => "tag_contact",
         }
     }
 
-    /// How a send step goes out, its text and its buttons; `None` for a wait or a tag.
+    /// How a send step goes out, its text (an AI step's prompt) and its buttons; `None` for a
+    /// wait or a tag.
     fn sends(&self) -> Option<(Via, &str, &[Button])> {
         match self {
             Self::SendDm { text, buttons } => Some((Via::Dm, text, buttons)),
             Self::ReplyPublicly { text } => Some((Via::Public, text, &[])),
+            Self::AiSendDm { prompt } => Some((Via::Dm, prompt, &[])),
+            Self::AiReplyPublicly { prompt } => Some((Via::Public, prompt, &[])),
             Self::Wait { .. } | Self::TagContact { .. } => None,
         }
     }
+
+    fn ai(&self) -> bool {
+        matches!(self, Self::AiSendDm { .. } | Self::AiReplyPublicly { .. })
+    }
+}
+
+/// An AI send's prompt: 1 to 2000 characters, and no `{page}`, which it never fills in.
+fn prompt_ok(prompt: &str) -> bool {
+    !prompt.trim().is_empty()
+        && prompt.chars().count() <= ai::MAX_PROMPT_CHARS
+        && !prompt.contains("{page}")
 }
 
 /// The trigger a new item runs: by its kind, and a button click and a story reply apart from
@@ -295,7 +336,9 @@ pub fn validate_steps(
             Step::Wait { minutes } if !(1..=MAX_WAIT_MINUTES).contains(minutes) => {
                 return Err("invalid_steps");
             }
-            Step::ReplyPublicly { .. } if !public(trigger) => return Err("invalid_steps"),
+            Step::ReplyPublicly { .. } | Step::AiReplyPublicly { .. } if !public(trigger) => {
+                return Err("invalid_steps");
+            }
             Step::TagContact { tag } if !tag_ok(tag) => return Err("invalid_steps"),
             Step::SendDm { buttons, .. } => {
                 for b in buttons.iter_mut() {
@@ -312,7 +355,11 @@ pub fn validate_steps(
             }
             _ => {}
         }
-        if let Some((via, text, buttons)) = step.sends() {
+        if let (true, Some((_, prompt, _))) = (step.ai(), step.sends()) {
+            if !prompt_ok(prompt) {
+                return Err("invalid_text");
+            }
+        } else if let Some((via, text, buttons)) = step.sends() {
             // Checked with the labels as lines, the longest form it goes out in.
             let fits = inbox::fits(via, &longest(&inbox::numbered(text, buttons)));
             let paged = !public(trigger) && text.contains("{page}");
@@ -337,7 +384,7 @@ pub fn validate(
     if !public
         && actions
             .iter()
-            .any(|a| matches!(a, Action::ReplyPublicly { .. }))
+            .any(|a| a.via_text().is_some_and(|s| s.0 == Via::Public))
     {
         return Err("invalid_actions");
     }
@@ -366,13 +413,18 @@ pub fn validate(
     if tagged > MAX_TAG_ACTIONS || tags.len() != tagged || !tags.iter().all(|t| tag_ok(t)) {
         return Err("invalid_actions");
     }
-    for (via, text) in sends() {
-        if !inbox::fits(via, &longest(text)) || !page_stands_alone(text) {
+    for action in actions {
+        let fine = match action.via_text() {
+            Some((_, prompt)) if action.ai() => prompt_ok(prompt),
+            Some((via, text)) => inbox::fits(via, &longest(text)) && page_stands_alone(text),
+            None => true,
+        };
+        if !fine {
             return Err("invalid_text");
         }
     }
     if let Some(f) = fallback {
-        let dm = actions.iter().any(|a| matches!(a, Action::SendDm { .. }));
+        let dm = sends().any(|s| s.0 == Via::Dm);
         if !dm || !inbox::fits(Via::Public, &longest(f)) || !page_stands_alone(f) {
             return Err("invalid_fallback");
         }
@@ -737,7 +789,7 @@ async fn run_matching(
             flow.advance(run_id, 0, Vec::new()).await?;
             continue;
         }
-        let results = act(app, account, item, &a, &actions, page.as_deref()).await;
+        let results = act(app, account, item, &a, &actions, page.as_deref(), run_id).await;
         finish(db, run_id, results).await?;
     }
     Ok(())
@@ -780,9 +832,19 @@ impl Flow<'_> {
                 }
                 Step::SendDm { text, buttons } => (Via::Dm, text, buttons),
                 Step::ReplyPublicly { text } => (Via::Public, text, &[]),
+                Step::AiSendDm { prompt } => (Via::Dm, prompt, &[]),
+                Step::AiReplyPublicly { prompt } => (Via::Public, prompt, &[]),
             };
             let kind = self.steps[i].kind();
             let result = match with_page(template, self.page) {
+                _ if self.steps[i].ai() => {
+                    let reference = format!("ai:{run}:{i}");
+                    let (app, account, item) = (self.app, self.account, self.item);
+                    ai_send(
+                        app, account, item, self.a.id, kind, via, template, &reference,
+                    )
+                    .await
+                }
                 None => no_page(kind),
                 Some(template) => {
                     let (text, filled) = render(&template, self.item.author_name.as_deref());
@@ -851,7 +913,7 @@ async fn tag_contact(
         kind: "tag_contact".into(),
         status: status.into(),
         reason,
-        remote_id: None,
+        ..Default::default()
     }
 }
 
@@ -1146,9 +1208,10 @@ async fn claim(
 }
 
 /// One action's outcome, as stored in a run's `results`.
-#[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq, Eq, Default)]
 pub struct ActionResult {
-    /// `send_dm`, `reply_publicly`, `fallback_public_reply` or `tag_contact`. A flow's run
+    /// `send_dm`, `reply_publicly`, `ai_send_dm`, `ai_reply_publicly`, `fallback_public_reply`
+    /// or `tag_contact`. A flow's run
     /// holds one per send and tag step tried, in order; waits leave none.
     #[serde(rename = "type")]
     pub kind: String,
@@ -1158,9 +1221,17 @@ pub struct ActionResult {
     /// Why it was not sent, e.g. `dm_not_allowed`, `no_dm_access`, `rate_limited`;
     /// `no_public_page` for a fallback reply holding `{page}` when the post has no live page; on Facebook
     /// and Instagram `outside_window` (a private reply works within 7 days of the comment),
-    /// `already_replied` (once per comment) and `dm_unavailable`.
+    /// `already_replied` (once per comment) and `dm_unavailable`. For an AI send also
+    /// `no_ai_key` (no team key and none of ours), `no_ai_credits`, `ai_failed` (the provider
+    /// gave no reply), `ai_empty`, `ai_too_long` and `ai_link` (a link the prompt does not hold).
     pub reason: Option<String>,
     pub remote_id: Option<String>,
+    /// An AI send: `anthropic` or `openai`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// An AI send: the model that wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 fn outcome(kind: &str, sent: Result<Result<String, InboxError>, DbErr>) -> ActionResult {
@@ -1183,6 +1254,7 @@ fn outcome(kind: &str, sent: Result<Result<String, InboxError>, DbErr>) -> Actio
         status: status.into(),
         reason,
         remote_id,
+        ..Default::default()
     }
 }
 
@@ -1200,7 +1272,7 @@ fn no_page(kind: &str) -> ActionResult {
         kind: kind.into(),
         status: "skipped".into(),
         reason: Some("no_public_page".into()),
-        remote_id: None,
+        ..Default::default()
     }
 }
 
@@ -1215,6 +1287,7 @@ async fn act(
     a: &automations::Model,
     actions: &[Action],
     page: Option<&str>,
+    run: Uuid,
 ) -> Vec<ActionResult> {
     let name = item.author_name.as_deref();
     let fallback = a.fallback_public_reply.as_deref();
@@ -1226,6 +1299,11 @@ async fn act(
             }
             continue;
         };
+        if action.ai() {
+            let (kind, reference) = (action.kind(), format!("ai:{run}:{}", action.kind()));
+            results.push(ai_send(app, account, item, a.id, kind, via, template, &reference).await);
+            continue;
+        }
         // Filled in before `render`, outside its ranges: the address must become a link.
         let Some(template) = with_page(template, page) else {
             results.push(no_page(action.kind()));
@@ -1239,7 +1317,7 @@ async fn act(
         ));
     }
     let dm_refused = results.iter().any(|r| {
-        r.kind == "send_dm"
+        matches!(r.kind.as_str(), "send_dm" | "ai_send_dm")
             && matches!(
                 r.reason.as_deref(),
                 Some(
@@ -1251,9 +1329,9 @@ async fn act(
                 )
             )
     });
-    let replied = results
-        .iter()
-        .any(|r| r.kind == "reply_publicly" && r.status == "sent");
+    let replied = results.iter().any(|r| {
+        matches!(r.kind.as_str(), "reply_publicly" | "ai_reply_publicly") && r.status == "sent"
+    });
     if let (true, false, Some(f)) = (dm_refused, replied, fallback) {
         let Some(f) = with_page(f, page) else {
             results.push(no_page("fallback_public_reply"));
@@ -1277,6 +1355,122 @@ async fn act(
         ));
     }
     results
+}
+
+/// Writes a reply with AI from the owner's `prompt` and the item's text, and sends it as
+/// `kind`. The team's own key goes first, else ours, which on Cloud takes 1 `ai` credit under
+/// `reference` and gives it back when nothing usable came of the call. `skipped` with
+/// `no_ai_key` (no key at all) or `no_ai_credits`; `failed` with `ai_failed`, `ai_empty`,
+/// `ai_too_long` or `ai_link`, and then nothing is sent. Neither key nor prompt is logged.
+#[allow(clippy::too_many_arguments)]
+async fn ai_send(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    automation: Uuid,
+    kind: &str,
+    via: Via,
+    prompt: &str,
+    reference: &str,
+) -> ActionResult {
+    let ended = |status: &str, reason: &str| ActionResult {
+        kind: kind.into(),
+        status: status.into(),
+        reason: Some(reason.into()),
+        ..Default::default()
+    };
+    let team_key = match key_of(app, item.team_id).await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(error = %e, item = %item.id, "ai key unreadable");
+            return ended("failed", "internal");
+        }
+    };
+    let paid = team_key.is_none() && app.billing_enabled;
+    let ours = || app.ai.own_key.clone().map(|k| ("anthropic".to_owned(), k));
+    let Some((provider, key)) = team_key.or_else(ours) else {
+        return ended("skipped", "no_ai_key");
+    };
+    if paid {
+        let spent = billing::spend(
+            &app.db,
+            item.team_id,
+            Kind::Ai,
+            1,
+            "ai reply",
+            Some(reference),
+        );
+        match spent.await {
+            Ok(Spent::Taken | Spent::Repeated) => {}
+            Ok(Spent::Short(_)) => return ended("skipped", "no_ai_credits"),
+            Err(e) => {
+                tracing::error!(error = %e, item = %item.id, "ai credit not taken");
+                return ended("failed", "internal");
+            }
+        }
+    }
+    let public = via == Via::Public;
+    // Room to spare under each network's limit; `fits_on` still checks the answer.
+    let limit = if public && account.provider == "bluesky" {
+        280
+    } else {
+        500
+    };
+    let name = safe_name(item.author_name.as_deref()).unwrap_or_else(|| "there".to_owned());
+    let (system, user) = ai::prompt(prompt, &item.text, &name, &account.provider, public, limit);
+    let mut model = None;
+    let text = match app.ai.write(&provider, &key, &system, &user).await {
+        Err(status) => {
+            tracing::warn!(?status, %provider, item = %item.id, "ai reply not written");
+            Err("ai_failed")
+        }
+        Ok((text, m)) => {
+            model = Some(m.to_owned());
+            let text = text.trim().to_owned();
+            if text.is_empty() {
+                Err("ai_empty")
+            } else if ai::invents_link(&text, prompt) {
+                Err("ai_link")
+            } else if !inbox::fits_on(&account.provider, via, &text) {
+                Err("ai_too_long")
+            } else {
+                Ok(text)
+            }
+        }
+    };
+    let text = match text {
+        Ok(t) => t,
+        Err(reason) => {
+            if paid {
+                let back = billing::grant(
+                    &app.db,
+                    item.team_id,
+                    Kind::Ai,
+                    1,
+                    "ai reply unsent",
+                    Some(reference),
+                );
+                if let Err(e) = back.await {
+                    tracing::error!(error = %e, item = %item.id, "ai credit not given back");
+                }
+            }
+            return ActionResult {
+                provider: Some(provider),
+                model,
+                ..ended("failed", reason)
+            };
+        }
+    };
+    let from = (None, Some(automation));
+    let sent = inbox::send_with(app, account, item, via, &text, &[], from, &[]).await;
+    ActionResult {
+        provider: Some(provider),
+        model,
+        ..outcome(
+            kind,
+            sent.map(|r| r.map(|m| m.remote_id.unwrap_or_default())),
+        )
+    }
 }
 
 /// The run's status from its sends (a `tag_contact` result says nothing of them): `sent` when
@@ -1663,7 +1857,7 @@ mod tests {
             kind: kind.into(),
             status: status.into(),
             reason: reason.map(Into::into),
-            remote_id: None,
+            ..Default::default()
         };
         let fallback = [
             r("send_dm", "skipped", Some("dm_not_allowed")),
