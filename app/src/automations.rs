@@ -529,17 +529,20 @@ const SWEEP_BATCH: u64 = 50;
 /// Runs automations again over recent items they never finished, oldest first. A run that did
 /// happen is not repeated (`claim` is unique per automation and item).
 pub async fn sweep(app: &AppState) -> Result<(), DbErr> {
+    // Ages count from when brain stored the item (`created_at`), not the platform's time, so a
+    // round still running over late items is never raced.
+    let now = chrono::Utc::now();
     let items = inbox_items::Entity::find()
         .filter(inbox_items::Column::AutomatedAt.is_null())
-        .filter(inbox_items::Column::ReceivedAt.lt(
-            (chrono::Utc::now() - chrono::Duration::minutes(SWEEP_AFTER_MINUTES)).fixed_offset(),
-        ))
         .filter(
-            inbox_items::Column::ReceivedAt.gt((chrono::Utc::now()
-                - chrono::Duration::hours(SWEEP_WITHIN_HOURS))
-            .fixed_offset()),
+            inbox_items::Column::CreatedAt
+                .lt((now - chrono::Duration::minutes(SWEEP_AFTER_MINUTES)).fixed_offset()),
         )
-        .order_by_asc(inbox_items::Column::ReceivedAt)
+        .filter(
+            inbox_items::Column::CreatedAt
+                .gt((now - chrono::Duration::hours(SWEEP_WITHIN_HOURS)).fixed_offset()),
+        )
+        .order_by_asc(inbox_items::Column::CreatedAt)
         .limit(SWEEP_BATCH)
         .all(&app.db)
         .await?;
@@ -550,8 +553,23 @@ pub async fn sweep(app: &AppState) -> Result<(), DbErr> {
         else {
             continue;
         };
-        if let Err(e) = run(app, &account, &item).await {
-            tracing::warn!(error = %e, item = %item.id, "automation sweep failed");
+        let id = item.id;
+        // A Meta item is filled in first (the author's name, a Reel's post), as the webhook does.
+        let ran = if matches!(account.provider.as_str(), "facebook" | "instagram") {
+            crate::meta_inbox::enrich_and_run(app, &account, item).await
+        } else {
+            run(app, &account, &item).await
+        };
+        // One second chance only: an item that fails again is given up, so it cannot hold the
+        // batch for a day.
+        if let Err(e) = ran {
+            tracing::error!(error = %e, item = %id, "automation sweep failed, given up");
+            app.db
+                .execute_raw(sql(
+                    "UPDATE inbox_items SET automated_at = now() WHERE id = $1",
+                    vec![id.into()],
+                ))
+                .await?;
         }
     }
     Ok(())
@@ -702,7 +720,8 @@ async fn run_matching(
         let sends = steps
             .as_ref()
             .is_none_or(|s| s.first().is_some_and(|x| x.sends().is_some()));
-        let Some(run_id) = claim(db, &a, item, steps.is_some(), sends).await? else {
+        let once = cond.first_per_author;
+        let Some(run_id) = claim(db, &a, item, steps.is_some(), sends, once).await? else {
             continue;
         };
         if let Some(steps) = &steps {
@@ -1069,9 +1088,33 @@ async fn claim(
     item: &inbox_items::Model,
     flow: bool,
     sends: bool,
+    first_per_author: bool,
 ) -> Result<Option<Uuid>, DbErr> {
     let txn = db.begin().await?;
     let id = Uuid::now_v7();
+    // Two items by one author run at once (the round and the sweep, two instances): the check
+    // `run_matching` made is taken again under a lock on the automation and author, so only one
+    // becomes the author's first.
+    if first_per_author {
+        let held = sql(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1::text || ':' || $2, 0))",
+            vec![a.id.into(), item.author_id.clone().into()],
+        );
+        txn.execute_raw(held).await?;
+        let taken = sql(
+            "SELECT EXISTS (SELECT 1 FROM automation_runs r \
+             JOIN inbox_items i ON i.id = r.inbox_item_id \
+             WHERE r.automation_id = $1 AND i.author_id = $2 AND i.id <> $3) AS taken",
+            vec![a.id.into(), item.author_id.clone().into(), item.id.into()],
+        );
+        let taken: bool = match txn.query_one_raw(taken).await? {
+            Some(r) => r.try_get("", "taken")?,
+            None => false,
+        };
+        if taken {
+            return Ok(None);
+        }
+    }
     let stmt = sql(
         "INSERT INTO automation_runs (id, automation_id, inbox_item_id, team_id, status, \
          step_index, steps_hash) VALUES ($1, $2, $3, $4, 'running', $5, md5($6::jsonb::text)) \

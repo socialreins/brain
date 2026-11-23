@@ -18925,9 +18925,9 @@ mod teams {
                 sql(format!(
                     "UPDATE automations SET activated_at = now() - interval '3 days' WHERE id = '{id}'; \
                      UPDATE social_accounts SET created_at = now() - interval '3 days' WHERE id = '{account}'; \
-                     UPDATE inbox_items SET automated_at = NULL, received_at = now() - interval '3 minutes' \
+                     UPDATE inbox_items SET automated_at = NULL, created_at = now() - interval '3 minutes' \
                        WHERE social_account_id = '{account}' AND author_id = 'did:plc:late1'; \
-                     UPDATE inbox_items SET automated_at = NULL, received_at = now() - interval '2 days' \
+                     UPDATE inbox_items SET automated_at = NULL, created_at = now() - interval '2 days' \
                        WHERE social_account_id = '{account}' AND author_id = 'did:plc:late2'"
                 ))
                 .await;

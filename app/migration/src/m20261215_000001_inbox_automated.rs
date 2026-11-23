@@ -10,7 +10,7 @@ pub struct Migration;
 const UP: &str = r#"
 ALTER TABLE inbox_items ADD COLUMN automated_at timestamptz;
 UPDATE inbox_items SET automated_at = now();
-CREATE INDEX inbox_items_unautomated_idx ON inbox_items (received_at) WHERE automated_at IS NULL;"#;
+CREATE INDEX inbox_items_unautomated_idx ON inbox_items (created_at) WHERE automated_at IS NULL;"#;
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
