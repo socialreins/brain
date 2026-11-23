@@ -63,7 +63,8 @@ async fn serve(
         .query_one_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "SELECT content_type FROM post_media WHERE storage_key = $1 \
-             UNION ALL SELECT content_type FROM media_uploads WHERE storage_key = $1 LIMIT 1",
+             UNION ALL SELECT content_type FROM media_uploads WHERE storage_key = $1 AND NOT pending \
+             LIMIT 1",
             [key.clone().into()],
         ))
         .await;

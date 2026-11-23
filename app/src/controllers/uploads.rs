@@ -4,7 +4,8 @@
 //! a thread part's, or `cover`) like any link: saving a post checks that each upload link is the
 //! team's, and publishing copies the file inside the store instead of downloading it. The link
 //! also serves the file (`GET /media/{name}`) for the composer's preview. An upload lives a day,
-//! then as long as a draft, scheduled or queued post of the team names it (`media::sweep`).
+//! then as long as a post of the team that may still publish names it: one not published yet,
+//! or published with a failed target to retry (`media::sweep`).
 use axum::{
     body::Body,
     extract::State,
@@ -25,7 +26,7 @@ use super::{
     waitlist::{error, Error},
 };
 use crate::{
-    media::{Fail, Stored},
+    media::{Fail, Stored, MAX_STILL_BYTES},
     state::AppState,
 };
 
@@ -33,6 +34,8 @@ use crate::{
 pub const MAX_UPLOADS: i64 = 200;
 /// Most bytes of uploads a team keeps at once: 10 GiB.
 pub const MAX_UPLOAD_BYTES: i64 = 10 * 1024 * 1024 * 1024;
+/// Most uploads of a team in progress at once.
+pub const MAX_IN_PROGRESS: i64 = 3;
 
 /// A stored upload.
 #[derive(Serialize, ToSchema)]
@@ -55,16 +58,58 @@ fn sql(sql: &str, values: Vec<sea_orm::Value>) -> Statement {
     Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
 }
 
-/// The team's uploads: how many, and their bytes.
-async fn usage(db: &impl ConnectionTrait, team: Uuid) -> Result<(i64, i64), DbErr> {
+/// The team's uploads: how many, their bytes (an upload in progress counts the most it may
+/// take), and how many are in progress.
+async fn usage(db: &impl ConnectionTrait, team: Uuid) -> Result<(i64, i64, i64), DbErr> {
     let stmt = sql(
-        "SELECT count(*) AS n, coalesce(sum(size), 0)::bigint AS bytes FROM media_uploads \
-         WHERE team_id = $1",
+        "SELECT count(*) AS n, coalesce(sum(size), 0)::bigint AS bytes, \
+         count(*) FILTER (WHERE pending) AS busy FROM media_uploads WHERE team_id = $1",
         vec![team.into()],
     );
     match db.query_one_raw(stmt).await? {
-        Some(r) => Ok((r.try_get("", "n")?, r.try_get("", "bytes")?)),
-        None => Ok((0, 0)),
+        Some(r) => Ok((
+            r.try_get("", "n")?,
+            r.try_get("", "bytes")?,
+            r.try_get("", "busy")?,
+        )),
+        None => Ok((0, 0, 0)),
+    }
+}
+
+/// An upload's `pending` row, deleted with its file unless the upload finished: on an error,
+/// or when the client goes away and the request is dropped.
+struct Pending {
+    app: AppState,
+    id: Uuid,
+    key: String,
+    done: bool,
+}
+
+impl Pending {
+    /// Deletes the file and the row now.
+    async fn clear(mut self) {
+        self.done = true;
+        clear(&self.app, self.id, &self.key).await;
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if !self.done {
+            let (app, id, key) = (self.app.clone(), self.id, self.key.clone());
+            tokio::spawn(async move { clear(&app, id, &key).await });
+        }
+    }
+}
+
+async fn clear(app: &AppState, id: Uuid, key: &str) {
+    let _ = app.media.store.delete(&key.into()).await;
+    let stmt = sql(
+        "DELETE FROM media_uploads WHERE id = $1 AND pending",
+        vec![id.into()],
+    );
+    if let Err(e) = app.db.execute_raw(stmt).await {
+        tracing::warn!(error = %e, upload = %id, "pending upload not cleared");
     }
 }
 
@@ -72,24 +117,80 @@ async fn usage(db: &impl ConnectionTrait, team: Uuid) -> Result<(i64, i64), DbEr
 /// a PDF up to 100 MB, or an MP4 or MOV video up to `MEDIA_MAX_BYTES`, told by its bytes. Any
 /// member, and any token that may write. `422 media_type_not_supported` for another type (or an
 /// empty body), `413 media_too_large` over the size, `409 too_many_uploads` when the team keeps
-/// 200 uploads or 10 GiB already. Each platform's own media rules apply when a post is saved.
-/// Not idempotent: an `Idempotency-Key` on a body over 64 KiB is `413`.
+/// 200 uploads, or would pass 10 GiB counting `MEDIA_MAX_BYTES` for this one until it is in.
+/// `429 uploads_in_progress` while 3 of the team's uploads are running, `429 rate_limited` past
+/// 60 a minute. `402 plan_limit` with billing on and no live plan. Each platform's own media
+/// rules apply when a post is saved. Not idempotent: an `Idempotency-Key` on a body over 64 KiB
+/// is `413`.
 #[utoipa::path(post, path = "/uploads", tag = "posts",
     security(("session" = []), ("api_token" = [])),
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
     responses((status = 201, body = Upload), (status = 401, body = Error),
-        (status = 403, body = Error), (status = 409, body = Error), (status = 413, body = Error),
-        (status = 422, body = Error)))]
+        (status = 402, body = Error), (status = 403, body = Error), (status = 409, body = Error),
+        (status = 413, body = Error), (status = 422, body = Error), (status = 429, body = Error)))]
 async fn create(State(app): State<AppState>, a: Actor, body: Body) -> Response {
-    let full = || reply(StatusCode::CONFLICT, "too_many_uploads");
-    match usage(&app.db, a.team.id).await {
-        Ok((n, bytes)) if n >= MAX_UPLOADS || bytes >= MAX_UPLOAD_BYTES => return full(),
-        Ok(_) => {}
-        Err(e) => return internal(e, "upload usage"),
+    if let Some(res) = super::billing::needs_plan(&app, a.team.id).await {
+        return res;
+    }
+    if !app.upload_limiter.hit(a.team.id) {
+        return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let id = Uuid::now_v7();
     // Made here from ids only, so no part of the request reaches the path.
     let key = format!("uploads/{}/{id}", a.team.id);
+    // Held in the quota until the file is in, so parallel uploads cannot all stream to disk.
+    let reserve = app.media.max_bytes.max(MAX_STILL_BYTES) as i64;
+    let reserved = async {
+        let txn = app.db.begin().await?;
+        lock(&txn, "uploads", a.team.id).await?;
+        let (n, bytes, busy) = usage(&txn, a.team.id).await?;
+        if busy >= MAX_IN_PROGRESS {
+            return Ok(Err(reply(
+                StatusCode::TOO_MANY_REQUESTS,
+                "uploads_in_progress",
+            )));
+        }
+        if n >= MAX_UPLOADS || bytes + reserve > MAX_UPLOAD_BYTES {
+            return Ok(Err(reply(StatusCode::CONFLICT, "too_many_uploads")));
+        }
+        txn.execute_raw(sql(
+            "INSERT INTO media_uploads (id, team_id, storage_key, url, content_type, size, \
+             pending, created_by) VALUES ($1, $2, $3, '', '', $4, true, $5)",
+            vec![
+                id.into(),
+                a.team.id.into(),
+                key.clone().into(),
+                reserve.into(),
+                a.user_id.into(),
+            ],
+        ))
+        .await?;
+        txn.commit().await?;
+        Ok::<_, DbErr>(Ok(()))
+    };
+    match reserved.await {
+        Ok(Ok(())) => {}
+        Ok(Err(res)) => return res,
+        Err(e) => return internal(e, "upload reserve"),
+    }
+    let pending = Pending {
+        app: app.clone(),
+        id,
+        key: key.clone(),
+        done: false,
+    };
+    let res = stream(&app, id, key, body).await;
+    if res.status() == StatusCode::CREATED {
+        let mut pending = pending;
+        pending.done = true;
+    } else {
+        pending.clear().await;
+    }
+    res
+}
+
+/// Streams the file into the store and marks its row done: the `201`, or the error.
+async fn stream(app: &AppState, id: Uuid, key: String, body: Body) -> Response {
     let (content_type, size) = match app.media.put_stream(&key, body.into_data_stream()).await {
         Ok(stored) => stored,
         Err(Fail::Unsupported) => {
@@ -107,39 +208,28 @@ async fn create(State(app): State<AppState>, a: Actor, body: Body) -> Response {
         }
     };
     let file = Stored {
-        key: key.clone(),
+        key,
         content_type: content_type.into(),
         size: size as i64,
     };
     let Some(url) = app.media.upload_link(&file) else {
         return reply(StatusCode::INTERNAL_SERVER_ERROR, "internal");
     };
-    let saved = async {
-        let txn = app.db.begin().await?;
-        lock(&txn, "uploads", a.team.id).await?;
-        let (n, bytes) = usage(&txn, a.team.id).await?;
-        if n >= MAX_UPLOADS || bytes + file.size > MAX_UPLOAD_BYTES {
-            return Ok(false);
-        }
-        txn.execute_raw(sql(
-            "INSERT INTO media_uploads (id, team_id, storage_key, url, content_type, size, \
-             created_by) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    let done = app
+        .db
+        .execute_raw(sql(
+            "UPDATE media_uploads SET url = $2, content_type = $3, size = $4, pending = false \
+             WHERE id = $1 AND pending",
             vec![
                 id.into(),
-                a.team.id.into(),
-                key.clone().into(),
                 url.clone().into(),
                 content_type.into(),
                 file.size.into(),
-                a.user_id.into(),
             ],
         ))
-        .await?;
-        txn.commit().await?;
-        Ok::<_, DbErr>(true)
-    };
-    match saved.await {
-        Ok(true) => {
+        .await;
+    match done {
+        Ok(r) if r.rows_affected() == 1 => {
             let body = Upload {
                 id,
                 url,
@@ -148,17 +238,15 @@ async fn create(State(app): State<AppState>, a: Actor, body: Body) -> Response {
             };
             (StatusCode::CREATED, Json(body)).into_response()
         }
-        other => {
-            let _ = app.media.store.delete(&key.as_str().into()).await;
-            match other {
-                Err(e) => internal(e, "upload insert"),
-                _ => full(),
-            }
-        }
+        // Swept as lost while it streamed.
+        Ok(_) => reply(StatusCode::BAD_REQUEST, "upload_interrupted"),
+        Err(e) => internal(e, "upload insert"),
     }
 }
 
-/// The upload links among `urls` that are not uploads of `team`: another team's, or gone.
+/// The first upload link among `urls` that is not an upload of `team`: another team's, or
+/// gone. In a transaction the uploads found stay locked `FOR SHARE` until it ends, so the
+/// sweep cannot delete one under a post being saved (`media::release_uploads`).
 pub async fn foreign(
     app: &AppState,
     db: &impl ConnectionTrait,
@@ -170,7 +258,8 @@ pub async fn foreign(
             continue;
         };
         let stmt = sql(
-            "SELECT 1 AS ok FROM media_uploads WHERE storage_key = $1 AND team_id = $2",
+            "SELECT 1 AS ok FROM media_uploads WHERE storage_key = $1 AND team_id = $2 \
+             AND NOT pending FOR SHARE",
             vec![key.into(), team.into()],
         );
         if db.query_one_raw(stmt).await?.is_none() {

@@ -325,10 +325,14 @@ impl Media {
         Some(sealed_link(base, cipher, file))
     }
 
-    /// The storage key of the upload `url` names, when it is brain's own link to one.
+    /// The storage key of the upload `url` names, when it is brain's own link to one. Matched by
+    /// its decoded path under brain's `/media/` path, whatever its host, port or query, so no
+    /// spelling of a link of another team's upload passes as an outside URL and is fetched.
     pub fn upload_key(&self, url: &str) -> Option<String> {
         let (base, cipher) = self.links.as_ref()?;
-        let key = unsealed(cipher, url.strip_prefix(base.as_str())?)?;
+        let base = Url::parse(base).ok()?;
+        let path = crate::controllers::library::percent_decode(Url::parse(url).ok()?.path());
+        let key = unsealed(cipher, path.strip_prefix(base.path())?)?;
         key.starts_with("uploads/").then_some(key)
     }
 
@@ -358,7 +362,8 @@ impl Media {
     ) -> Result<(String, String, usize), Fail> {
         let stmt = sql(
             "SELECT u.storage_key, u.content_type, u.size FROM media_uploads u \
-             JOIN posts p ON p.team_id = u.team_id WHERE p.id = $1 AND u.storage_key = $2",
+             JOIN posts p ON p.team_id = u.team_id WHERE p.id = $1 AND u.storage_key = $2 \
+             AND NOT u.pending",
             vec![post.into(), key.into()],
         );
         let found = db.query_one_raw(stmt).await.map_err(|e| {
@@ -447,26 +452,72 @@ impl Media {
         Ok((content_type, size))
     }
 
-    /// Deletes the uploads at least `hours` old that no `draft`, `scheduled` or `queued` post of
-    /// their team names, file first; a file that will not go keeps its row for the next sweep.
-    /// Returns how many went.
+    /// Deletes the uploads at least `hours` old that no post of their team still needs (one
+    /// not published yet, or published with a target that failed and may be retried), and
+    /// uploads still in progress after `PENDING_HOURS` (a restart or a lost request). Each row
+    /// goes in its own transaction: locked first, so a post being saved with it (which holds it
+    /// `FOR SHARE`) commits before the re-check. The file goes after the row; one that will not
+    /// go is an orphan for `release_orphans`. Returns how many went.
     pub async fn release_uploads(&self, db: &DatabaseConnection, hours: i32) -> Result<u64, DbErr> {
         let stmt = sql(
-            "SELECT u.id, u.storage_key FROM media_uploads u \
-             WHERE u.created_at <= now() - make_interval(hours => $1) \
-             AND NOT EXISTS (SELECT 1 FROM posts p WHERE p.team_id = u.team_id \
-               AND p.status IN ('draft', 'scheduled', 'queued') \
-               AND strpos(p.media::text || p.thread::text || coalesce(p.cover, ''), u.url) > 0) \
-             LIMIT 1000",
-            vec![hours.into()],
+            &format!("SELECT u.id FROM media_uploads u WHERE {RELEASABLE} LIMIT 1000"),
+            vec![hours.into(), PENDING_HOURS.into()],
         );
         let mut gone = 0;
         for row in db.query_all_raw(stmt).await? {
             let id: Uuid = row.try_get("", "id")?;
-            let key: String = row.try_get("", "storage_key")?;
-            if self.delete(&key).await {
-                let stmt = sql("DELETE FROM media_uploads WHERE id = $1", vec![id.into()]);
-                db.execute_raw(stmt).await?;
+            let txn = db.begin().await?;
+            let lock = sql(
+                "SELECT 1 FROM media_uploads WHERE id = $1 FOR UPDATE",
+                vec![id.into()],
+            );
+            txn.query_one_raw(lock).await?;
+            let stmt = sql(
+                &format!(
+                    "DELETE FROM media_uploads u WHERE u.id = $3 AND ({RELEASABLE}) \
+                     RETURNING storage_key"
+                ),
+                vec![hours.into(), PENDING_HOURS.into(), id.into()],
+            );
+            let deleted = txn.query_one_raw(stmt).await?;
+            txn.commit().await?;
+            if let Some(row) = deleted {
+                let key: String = row.try_get("", "storage_key")?;
+                self.delete(&key).await;
+                gone += 1;
+            }
+        }
+        Ok(gone)
+    }
+
+    /// Deletes stored uploads at least `older` old that have no row: a file stored by a request
+    /// that died before its row went, or whose delete failed. Returns how many went.
+    pub async fn release_orphans(
+        &self,
+        db: &DatabaseConnection,
+        older: Duration,
+    ) -> Result<u64, DbErr> {
+        use futures_util::StreamExt;
+        let cutoff = chrono::Utc::now() - older;
+        let mut old = Vec::new();
+        let mut listed = self.store.list(Some(&Path::from("uploads")));
+        while let Some(meta) = listed.next().await {
+            match meta {
+                Ok(m) if m.last_modified <= cutoff => old.push(m.location.to_string()),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "upload listing failed");
+                    break;
+                }
+            }
+        }
+        let mut gone = 0;
+        for key in old {
+            let stmt = sql(
+                "SELECT 1 AS ok FROM media_uploads WHERE storage_key = $1",
+                vec![key.clone().into()],
+            );
+            if db.query_one_raw(stmt).await?.is_none() && self.delete(&key).await {
                 gone += 1;
             }
         }
@@ -1119,6 +1170,7 @@ pub async fn sweep(app: &AppState) -> Result<u64, DbErr> {
     }
     let mut gone = app.media.release(&app.db, None, SWEEP_DAYS).await?;
     gone += app.media.release_uploads(&app.db, UPLOAD_HOURS).await?;
+    gone += app.media.release_orphans(&app.db, TEMP_AGE).await?;
     if let Some(dir) = app.media.dir.clone() {
         let swept = tokio::task::spawn_blocking(move || sweep_temp(&dir, TEMP_AGE));
         gone += swept.await.unwrap_or(0);
@@ -1141,8 +1193,23 @@ where
     }
 }
 
-/// An upload lives at least this long, then as long as a waiting post names it.
+/// An upload lives at least this long, then as long as a post that may still publish names it.
 pub const UPLOAD_HOURS: i32 = 24;
+
+/// An upload still in progress this long is a lost one (a restart, a dropped request): long
+/// enough for 1 GiB on a slow link, short enough to free the team's slot the same day.
+pub const PENDING_HOURS: i32 = 6;
+
+/// Which uploads `release_uploads` deletes, of `u`: `$1` hours old and needed by no post, or
+/// in progress for `$2` hours. A post names an upload by its sealed token, whatever the link's
+/// host or query.
+const RELEASABLE: &str = "(NOT u.pending AND u.created_at <= now() - make_interval(hours => $1) \
+   AND NOT EXISTS (SELECT 1 FROM posts p WHERE p.team_id = u.team_id \
+     AND (p.status NOT IN ('published', 'deleted') OR EXISTS (SELECT 1 FROM post_targets t \
+       WHERE t.post_id = p.id AND t.status = 'failed')) \
+     AND strpos(p.media::text || p.thread::text || coalesce(p.cover, ''), \
+       split_part(split_part(u.url, '/media/', 2), '.', 1)) > 0)) \
+ OR (u.pending AND u.created_at <= now() - make_interval(hours => $2))";
 
 /// A temp file on local disk this old belongs to no download still running: several times
 /// `INGEST_CEILING`.
@@ -1150,15 +1217,14 @@ const TEMP_AGE: Duration = Duration::from_secs(3600);
 
 /// Deletes the temp files under `dir` older than `older`, and returns how many went. The local
 /// store writes a file as `<key>#<n>` and renames it when done, so a process killed
-/// mid-download leaves one (up to `MAX_BYTES`) that no listing shows and `release` never sees.
+/// mid-download or mid-upload leaves one (up to `MAX_BYTES`, under `posts/` or `uploads/`) that
+/// no listing shows and `release` or `release_orphans` never sees.
 /// In a bucket the same leftovers are parts of a multipart upload, which its lifecycle rule
 /// aborts (README).
 fn sweep_temp(dir: &std::path::Path, older: Duration) -> u64 {
     let mut gone = 0;
-    let Ok(posts) = std::fs::read_dir(dir.join("posts")) else {
-        return 0;
-    };
-    for post in posts.flatten() {
+    let dirs = ["posts", "uploads"].map(|d| std::fs::read_dir(dir.join(d)));
+    for post in dirs.into_iter().flatten().flatten().flatten() {
         let Ok(files) = std::fs::read_dir(post.path()) else {
             continue;
         };
@@ -1837,6 +1903,11 @@ mod tests {
         let post = dir.join("posts").join(Uuid::now_v7().to_string());
         std::fs::create_dir_all(&post).unwrap();
         let long_ago = std::time::SystemTime::now() - 2 * TEMP_AGE;
+        // An upload's partial file, cut off by a restart, goes too.
+        let team = dir.join("uploads").join(Uuid::now_v7().to_string());
+        std::fs::create_dir_all(&team).unwrap();
+        let partial = std::fs::File::create(team.join("u#3")).unwrap();
+        partial.set_modified(long_ago).unwrap();
         // A download cut off long ago, one still running, and a stored file as old as the first.
         for (name, old) in [("a#1", true), ("b#12", false), ("c", true), ("d#x", true)] {
             let file = std::fs::File::create(post.join(name)).unwrap();
@@ -1844,7 +1915,8 @@ mod tests {
                 file.set_modified(long_ago).unwrap();
             }
         }
-        assert_eq!(sweep_temp(&dir, TEMP_AGE), 1);
+        assert_eq!(sweep_temp(&dir, TEMP_AGE), 2);
+        assert!(!team.join("u#3").exists());
         let mut left: Vec<_> = std::fs::read_dir(&post)
             .unwrap()
             .map(|f| f.unwrap().file_name().into_string().unwrap())
