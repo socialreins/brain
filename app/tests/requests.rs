@@ -8789,6 +8789,19 @@ mod teams {
                         .await
                         .json::<Vec<Value>>();
                     assert_eq!(all.len(), 1, "no copy was made: {all:?}");
+                    let notices = db
+                        .query_one_raw(sea_orm::Statement::from_string(
+                            sea_orm::DbBackend::Postgres,
+                            format!(
+                                "SELECT count(*) AS n FROM post_notices WHERE post_id = '{id}'"
+                            ),
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .try_get::<i64>("", "n")
+                        .unwrap();
+                    assert_eq!(notices, 0, "a rejected post is not mailed as late");
                 }
 
                 #[tokio::test]
