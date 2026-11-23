@@ -291,7 +291,8 @@ fn time(v: &Value) -> Option<DateTime<Utc>> {
 
 /// What a subscription event came to.
 enum Outcome {
-    Applied,
+    /// Written; `true` when it ended a live plan (the owners are told).
+    Applied(bool),
     /// Not ours to apply (no team, no plan, not started): nothing is stored, not even the event
     /// id, so sending it again from the Stripe dashboard works once the cause is mended.
     Ignored,
@@ -354,9 +355,11 @@ async fn apply_subscription(
             vec![team.into()],
         ))
         .await?;
+    let mut was_live = false;
     if let Some(row) = current {
         let status_now: String = row.try_get("", "status")?;
         let sub_now: Option<String> = row.try_get("", "provider_subscription_id")?;
+        was_live = billing::live(&status_now);
         if billing::live(&status_now)
             && billing::live(status)
             && sub_now.as_deref().is_some_and(|s| s != id)
@@ -384,25 +387,144 @@ async fn apply_subscription(
                  AND (subscriptions.provider_subscription_id IS NOT DISTINCT FROM \
                         EXCLUDED.provider_subscription_id \
                       OR subscriptions.status NOT IN ('trialing', 'active', 'past_due'))";
-    db.execute_raw(stmt(
-        sql,
-        vec![
-            team.into(),
-            plan.into(),
-            status.into(),
-            sub["customer"].as_str().map(str::to_owned).into(),
-            id.into(),
-            time(&sub["trial_end"]).into(),
-            period_end.into(),
-            sub["cancel_at_period_end"]
-                .as_bool()
-                .unwrap_or(false)
-                .into(),
-            at.into(),
-        ],
+    let written = db
+        .execute_raw(stmt(
+            sql,
+            vec![
+                team.into(),
+                plan.into(),
+                status.into(),
+                sub["customer"].as_str().map(str::to_owned).into(),
+                id.into(),
+                time(&sub["trial_end"]).into(),
+                period_end.into(),
+                sub["cancel_at_period_end"]
+                    .as_bool()
+                    .unwrap_or(false)
+                    .into(),
+                at.into(),
+            ],
+        ))
+        .await?
+        .rows_affected()
+        == 1;
+    Ok(Outcome::Applied(
+        written && was_live && !billing::live(status),
     ))
-    .await?;
-    Ok(Outcome::Applied)
+}
+
+/// A billing email to a team's owners, sent after the event is committed.
+enum Notice {
+    /// The trial ends at this time (`customer.subscription.trial_will_end`, 3 days before).
+    TrialEnds(DateTime<Utc>),
+    /// The first failed renewal (`invoice.payment_failed`); Stripe retries for 7 days.
+    PaymentFailed,
+    /// A live plan ended (cancelled, or the retries ran out).
+    Ended,
+}
+
+/// The team whose subscription row holds this Stripe subscription id, only while `live` (when
+/// asked): a mail goes to the team brain itself recorded, never to one named in the event.
+async fn team_holding(
+    db: &impl ConnectionTrait,
+    sub: Option<&str>,
+    live: bool,
+) -> Result<Option<Uuid>, DbErr> {
+    let Some(sub) = sub else { return Ok(None) };
+    db.query_one_raw(stmt(
+        "SELECT team_id FROM subscriptions WHERE provider = 'stripe' \
+         AND provider_subscription_id = $1 \
+         AND (NOT $2 OR status IN ('trialing', 'active', 'past_due'))",
+        vec![sub.into(), live.into()],
+    ))
+    .await?
+    .map(|r| r.try_get("", "team_id"))
+    .transpose()
+}
+
+/// The team of a failed invoice's subscription, on its first attempt only: Stripe sends the
+/// event for every retry, and the owner needs telling once.
+async fn first_failure(db: &impl ConnectionTrait, invoice: &Value) -> Result<Option<Uuid>, DbErr> {
+    if invoice["attempt_count"].as_i64() != Some(1) {
+        return Ok(None);
+    }
+    // Newer API versions moved the subscription under `parent`.
+    let sub = invoice["subscription"]
+        .as_str()
+        .or_else(|| invoice["parent"]["subscription_details"]["subscription"].as_str());
+    // Only a live plan: "your team keeps working" would be wrong for one already ended.
+    team_holding(db, sub, true).await
+}
+
+/// Mails the team's owners (billing is theirs). A failed send is logged, never retried: the
+/// event is already taken.
+async fn tell_owners(app: &AppState, team: Uuid, notice: Notice) {
+    let found = async {
+        let rows = app
+            .db
+            .query_all_raw(stmt(
+                "SELECT u.email FROM team_user t JOIN users u ON u.id = t.user_id \
+                 WHERE t.team_id = $1 AND t.role = 'owner' ORDER BY u.email",
+                vec![team.into()],
+            ))
+            .await?;
+        let plan = app
+            .db
+            .query_one_raw(stmt(
+                "SELECT p.name FROM subscriptions s JOIN plans p ON p.id = s.plan_id WHERE s.team_id = $1",
+                vec![team.into()],
+            ))
+            .await?
+            .map(|r| r.try_get::<String>("", "name"))
+            .transpose()?;
+        let emails = rows
+            .iter()
+            .map(|r| r.try_get::<String>("", "email"))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok::<_, DbErr>((emails, plan.unwrap_or_else(|| "your plan".into())))
+    };
+    let (to, plan) = match found.await {
+        Ok(f) => f,
+        Err(e) => return tracing::error!(error = %e, %team, "billing mail: owners not read"),
+    };
+    let billing = format!("{}/billing", app.web_url);
+    let (subject, text) = match notice {
+        Notice::TrialEnds(at) => (
+            format!("Your SocialReins trial ends on {}", at.format("%Y-%m-%d")),
+            format!(
+                "Your free trial of {plan} ends on {}. After that, {plan} is charged to the card you \
+                 gave at checkout, and renews until you cancel.\n\nTo change the plan or cancel before \
+                 then, open Billing and choose Manage billing:\n\n{billing}\n",
+                at.format("%Y-%m-%d")
+            ),
+        ),
+        Notice::PaymentFailed => (
+            "Your SocialReins payment failed".to_owned(),
+            format!(
+                "We couldn't charge your card for {plan}. Your team keeps working while the card is \
+                 tried again over the next 7 days. If it still fails, the plan ends and scheduled \
+                 posts stop publishing; nothing is deleted.\n\nTo update the card, open Billing and \
+                 choose Manage billing:\n\n{billing}\n"
+            ),
+        ),
+        Notice::Ended => (
+            "Your SocialReins plan has ended".to_owned(),
+            format!(
+                "{plan} has ended for your team, so scheduled posts no longer publish. Nothing is \
+                 deleted: your posts, accounts and settings are kept.\n\nChoose a plan again to \
+                 pick up where you left off:\n\n{billing}\n"
+            ),
+        ),
+    };
+    for email in to {
+        if let Err(e) = app
+            .mailer
+            .send(&email, &subject, text.clone(), &app.web_url)
+            .await
+        {
+            tracing::warn!(error = %e, %team, "billing mail not sent");
+        }
+    }
 }
 
 /// Grants the credits of a paid one-time Checkout: the team and pack come only from the metadata
@@ -442,8 +564,9 @@ async fn apply_purchase(db: &impl ConnectionTrait, session: &Value) -> Result<bo
 /// 5 minutes), `404` while `STRIPE_WEBHOOK_SECRET` is unset. The event id is stored with the
 /// change in one transaction, so a delivery seen before changes nothing and a failure is a
 /// `500` that Stripe retries. Handled: `customer.subscription.created`, `.updated` and
-/// `.deleted`, and `checkout.session.completed` and `.async_payment_succeeded` (credit packs);
-/// every other event is taken and ignored.
+/// `.deleted`, and `checkout.session.completed` and `.async_payment_succeeded` (credit packs).
+/// The owners are mailed when a live plan ends, on `customer.subscription.trial_will_end` and on
+/// the first `invoice.payment_failed` of an invoice. Every other event is taken and ignored.
 async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if !app.stripe.webhook_on() {
         return reply(StatusCode::NOT_FOUND, "not_found");
@@ -491,30 +614,59 @@ async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -
                 "stripe pack payment refunded or disputed: review its credits");
         }
         if fresh && paid && !apply_purchase(&txn, &event["data"]["object"]).await? {
-            return Ok(None);
+            return Ok((None, None));
         }
+        let object = &event["data"]["object"];
         let mut extra = None;
+        let mut notice = None;
         if fresh && subscription {
-            match apply_subscription(&app, &txn, &event["data"]["object"], at).await? {
-                Outcome::Applied => {}
+            match apply_subscription(&app, &txn, object, at).await? {
+                Outcome::Applied(ended) => {
+                    if ended {
+                        notice = team_holding(&txn, object["id"].as_str(), false)
+                            .await?
+                            .map(|t| (t, Notice::Ended));
+                    }
+                }
                 // Dropping the transaction takes the event id back with it.
-                Outcome::Ignored => return Ok::<_, DbErr>(None),
+                Outcome::Ignored => return Ok::<_, DbErr>((None, None)),
                 Outcome::Extra(sub) => extra = Some(sub),
             }
         }
+        // A trial already cancelled is not charged: the plan-ended mail follows instead.
+        let cancelling = object["cancel_at_period_end"].as_bool() == Some(true)
+            || object["cancel_at"].as_i64().is_some();
+        if fresh && kind == "customer.subscription.trial_will_end" && !cancelling {
+            if let Some(end) = time(&object["trial_end"]) {
+                notice = team_holding(&txn, object["id"].as_str(), true)
+                    .await?
+                    .map(|t| (t, Notice::TrialEnds(end)));
+            }
+        }
+        if fresh && kind == "invoice.payment_failed" {
+            notice = first_failure(&txn, object)
+                .await?
+                .map(|t| (t, Notice::PaymentFailed));
+        }
         txn.commit().await?;
-        Ok(extra)
+        Ok((extra, notice))
     };
     match handled.await {
-        Ok(Some(sub)) => {
+        Ok((extra, notice)) => {
             // After the commit, so a failed call leaves the event taken; it is logged for a
             // person to cancel (and refund) in Stripe.
-            if let Err(e) = app.stripe.cancel(&sub).await {
-                tracing::error!(subscription = %sub, status = ?e.0, code = %e.1, "extra stripe subscription not cancelled");
+            if let Some(sub) = extra {
+                if let Err(e) = app.stripe.cancel(&sub).await {
+                    tracing::error!(subscription = %sub, status = ?e.0, code = %e.1, "extra stripe subscription not cancelled");
+                }
+            }
+            // In the background: a slow mail service must not hold Stripe's answer.
+            if let Some((team, notice)) = notice {
+                let app = app.clone();
+                tokio::spawn(async move { tell_owners(&app, team, notice).await });
             }
             StatusCode::OK.into_response()
         }
-        Ok(None) => StatusCode::OK.into_response(),
         Err(e) => internal(e, "stripe webhook"),
     }
 }

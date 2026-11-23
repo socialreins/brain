@@ -29094,6 +29094,160 @@ mod teams {
             assert!(kept.is_none());
         }
 
+        /// The owners hear when a trial is about to end, on the first failed renewal (not each
+        /// retry), and once when a live plan ends; a cancelled trial gets no "you'll be charged".
+        #[tokio::test]
+        #[serial]
+        async fn owners_are_mailed_about_the_trial_a_failed_payment_and_the_end() {
+            let base = mock().await;
+            let (url, seen) = crate::captcha_and_contact::resend().await;
+            let (s, db) = server_where(|c| {
+                c.billing_enabled = true;
+                let mut st = Stripe::new(
+                    Some("sk_test_mock".into()),
+                    Some(WHSEC.into()),
+                    [
+                        ("scheduler", "month", Some("price_s".into())),
+                        ("automation", "month", Some("price_a".into())),
+                        ("scheduler", "year", Some("price_sy".into())),
+                        ("automation", "year", Some("price_ay".into())),
+                    ],
+                    [
+                        ("x100", Some("price_p1".into())),
+                        ("x500", Some("price_p5".into())),
+                    ],
+                )
+                .unwrap();
+                st.api_url = base;
+                c.stripe = st;
+                c.mailer = socialreins_brain::mail::Mailer::resend_at(
+                    &url,
+                    "re_test",
+                    "brain@example.com",
+                )
+                .unwrap();
+            })
+            .await;
+            let (owner_email, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let now = Utc::now().timestamp();
+            let send = |body: String| {
+                let s = &s;
+                async move { deliver(s, &body, WHSEC, now).await.status_code() }
+            };
+            // Mail goes out in the background: wait until `want` arrived, then a moment more so an
+            // extra one would show too.
+            let to_owner = |want: usize| {
+                let seen = seen.clone();
+                let owner_email = owner_email.clone();
+                async move {
+                    let read = || {
+                        seen.lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|m| m["to"] == json!([owner_email]))
+                            .map(|m| {
+                                (
+                                    m["subject"].as_str().unwrap().to_owned(),
+                                    m["text"].as_str().unwrap().to_owned(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    for _ in 0..50 {
+                        if read().len() >= want {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    read()
+                }
+            };
+            assert_eq!(
+                send(sub_event(
+                    "evt_m1",
+                    now - 60,
+                    "sub_m",
+                    &team,
+                    "trialing",
+                    "price_sy"
+                ))
+                .await,
+                200
+            );
+            assert!(to_owner(0).await.is_empty());
+
+            // Three days before the trial ends.
+            let sub = format!("sub_m_{}", *RUN);
+            let trial = |id: &str, cancel: bool| {
+                json!({
+                    "id": format!("{id}_{}", *RUN), "type": "customer.subscription.trial_will_end",
+                    "created": now,
+                    "data": {"object": {"id": sub, "status": "trialing", "trial_end": 1_800_000_000,
+                        "cancel_at_period_end": cancel, "metadata": {"team_id": team}}}
+                })
+                .to_string()
+            };
+            assert_eq!(send(trial("evt_m2", true)).await, 200);
+            assert!(
+                to_owner(0).await.is_empty(),
+                "a cancelled trial is not charged"
+            );
+            assert_eq!(send(trial("evt_m3", false)).await, 200);
+            let mails = to_owner(1).await;
+            assert_eq!(mails.len(), 1, "{mails:?}");
+            assert_eq!(mails[0].0, "Your SocialReins trial ends on 2027-01-15");
+            assert!(mails[0].1.contains("/billing"), "{}", mails[0].1);
+            assert_eq!(send(trial("evt_m3", false)).await, 200);
+            assert_eq!(to_owner(1).await.len(), 1, "a redelivery mails nothing");
+
+            // A failed renewal: mailed on the first attempt only.
+            let failed = |id: &str, attempt: i64| {
+                json!({
+                    "id": format!("{id}_{}", *RUN), "type": "invoice.payment_failed", "created": now,
+                    "data": {"object": {"id": format!("in_{id}"), "attempt_count": attempt,
+                        "parent": {"subscription_details": {"subscription": sub}}}}
+                })
+                .to_string()
+            };
+            assert_eq!(send(failed("evt_m4", 1)).await, 200);
+            assert_eq!(send(failed("evt_m5", 2)).await, 200);
+            let mails = to_owner(2).await;
+            assert_eq!(mails.len(), 2, "{mails:?}");
+            assert_eq!(mails[1].0, "Your SocialReins payment failed");
+
+            // The plan ends once; a later event for the ended plan mails nothing more.
+            assert_eq!(
+                send(sub_event(
+                    "evt_m6",
+                    now - 30,
+                    "sub_m",
+                    &team,
+                    "canceled",
+                    "price_sy"
+                ))
+                .await,
+                200
+            );
+            assert_eq!(
+                send(sub_event(
+                    "evt_m7",
+                    now - 20,
+                    "sub_m",
+                    &team,
+                    "canceled",
+                    "price_sy"
+                ))
+                .await,
+                200
+            );
+            let mails = to_owner(3).await;
+            assert_eq!(mails.len(), 3, "{mails:?}");
+            assert_eq!(mails[2].0, "Your SocialReins plan has ended");
+            assert!(mails[2].1.contains("Nothing is deleted"));
+        }
+
         async fn plan_of(s: &TestServer, cookie: &str) -> Value {
             let res = s
                 .get("/v1/team/billing")
