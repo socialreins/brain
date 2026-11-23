@@ -1362,8 +1362,21 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         return Ok(());
     }
     // A team whose plan ended keeps its posts, scheduled, and the claim skips them until it pays.
+    // A post already fanned out (a retry) never goes back to `scheduled`: its pending targets
+    // fail with the reason and it settles as `published` or `failed` again.
     if app.billing_enabled && !crate::billing::has_plan(db, post.team_id).await? {
-        return unclaim(db, id, Some(PLAN_ENDED)).await;
+        if !post.fanned_out {
+            return unclaim(db, id, Some(PLAN_ENDED)).await;
+        }
+        let stmt = sql(
+            &with_event(
+                "UPDATE post_targets SET status = 'failed', error = $2, updated_at = now() \
+                 WHERE post_id = $1 AND status = 'pending'",
+            ),
+            vec![id.into(), PLAN_ENDED.into()],
+        );
+        db.execute_raw(stmt).await?;
+        return settle(db, id).await;
     }
     // Whatever queued it (a tick, publish now, recovery), nothing publishes without its hit.
     if !post.quota_reserved {

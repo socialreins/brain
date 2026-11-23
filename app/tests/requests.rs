@@ -14195,6 +14195,33 @@ mod teams {
                     publish::tick(&state).await.unwrap();
                     assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
                     assert_eq!(mock.tweets.lock().unwrap().len(), before + 1);
+
+                    // A retry the plan ends under (here forced back to queued) settles with the
+                    // reason on its pending target: it never becomes `scheduled` again.
+                    let rejected = id_of(&create(&s, &cookie, x_post(&set, "REJECT it")).await);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &rejected).await["status"], "failed");
+                    on_plan(&db, team, "canceled").await;
+                    use sea_orm::ConnectionTrait;
+                    for q in [
+                        "UPDATE post_targets SET status = 'pending', error = NULL WHERE post_id = $1",
+                        "UPDATE posts SET status = 'queued' WHERE id = $1",
+                    ] {
+                        db.execute_raw(sea_orm::Statement::from_sql_and_values(
+                            sea_orm::DbBackend::Postgres,
+                            q,
+                            [rejected.parse::<uuid::Uuid>().unwrap().into()],
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    publish::publish_post(&state, rejected.parse().unwrap())
+                        .await
+                        .unwrap();
+                    let p = get_post(&s, &cookie, &rejected).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    let why = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(why.contains("plan has ended"), "{why}");
                 }
 
                 /// On Cloud an X post spends a credit once it is out; a team short of credits for the
