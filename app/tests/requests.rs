@@ -16636,6 +16636,130 @@ mod teams {
                     assert_eq!(res.status_code(), 404);
                 }
 
+                #[tokio::test]
+                #[serial]
+                async fn photos_stickers_and_files_come_with_their_items() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    let when = now();
+                    // Meta's `feed` shapes: a photo comment, a sticker comment (no text).
+                    let mut photo = page_comment("101_9_31", "look", "777", when);
+                    photo["entry"][0]["changes"][0]["value"]["photo"] =
+                        json!("https://scontent.xx.fbcdn.net/v/t39/p.jpg?oh=1&oe=2");
+                    let mut sticker = page_comment("101_9_32", "", "777", when);
+                    sticker["entry"][0]["changes"][0]["value"]["message"] = Value::Null;
+                    sticker["entry"][0]["changes"][0]["value"]["attachment"] = json!({
+                        "type": "sticker", "url": "https://www.facebook.com/s/1",
+                        "media": {"image": {"src": "https://scontent.xx.fbcdn.net/s.png",
+                            "height": 240, "width": 240}}});
+                    // `messaging` shapes: a Messenger sticker, a photo and a file over http,
+                    // and an Instagram reel share and audio note.
+                    let mut dm = page_message("101", "m_att", "777", "");
+                    dm["entry"][0]["messaging"][0]["message"] = json!({"mid": "m_att",
+                        "attachments": [
+                            {"type": "image", "payload": {"url": "https://scontent.xx.fbcdn.net/st.png",
+                                "sticker_id": 369239263222822i64}},
+                            {"type": "image", "payload": {"url": "https://scontent.xx.fbcdn.net/i.jpg"}},
+                            {"type": "file", "payload": {"url": "http://cdn.example/f.pdf"}}]});
+                    let mut ig = ig_message("1784", "ig_att", "555");
+                    ig["entry"][0]["messaging"][0]["message"] = json!({"mid": "ig_att",
+                        "attachments": [
+                            {"type": "ig_reel", "payload": {"url": "https://lookaside.fbsbx.com/r.mp4",
+                                "title": "reel", "reel_video_id": "1"}},
+                            {"type": "audio", "payload": {"url": "https://cdn.fbsbx.com/a.mp4"}}]});
+                    for payload in [&photo, &sticker, &dm, &ig] {
+                        assert_eq!(deliver(&s, payload).await.status_code(), 200);
+                    }
+
+                    let all = all_inbox_id(&s, &cookie).await;
+                    let items = until(|| {
+                        let (s, cookie, all) = (&s, &cookie, &all);
+                        async move {
+                            let items = inbox_items_of(s, cookie, all).await;
+                            (items.len() == 4).then_some(items)
+                        }
+                    })
+                    .await;
+                    let by = |remote: &str| {
+                        items
+                            .iter()
+                            .find(|i| i["remote_id"] == remote)
+                            .unwrap()
+                            .clone()
+                    };
+                    let photo = by("101_9_31");
+                    assert_eq!(photo["text"], "look");
+                    assert_eq!(
+                        photo["attachments"],
+                        json!([{"kind": "image",
+                            "url": "https://scontent.xx.fbcdn.net/v/t39/p.jpg?oh=1&oe=2"}])
+                    );
+                    let sticker = by("101_9_32");
+                    assert_eq!(sticker["text"], "");
+                    assert_eq!(
+                        sticker["attachments"],
+                        json!([{"kind": "sticker", "url": "https://scontent.xx.fbcdn.net/s.png",
+                            "preview_url": "https://scontent.xx.fbcdn.net/s.png"}])
+                    );
+                    let dm = by("m_att");
+                    assert_eq!(dm["text"], "", "a shown attachment needs no stand-in text");
+                    let kinds: Vec<_> = dm["attachments"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|a| a["kind"].as_str().unwrap())
+                        .collect();
+                    assert_eq!(kinds, ["sticker", "image"], "the http file is dropped");
+                    let ig = by("ig_att");
+                    assert_eq!(ig["attachments"][0]["kind"], "video");
+                    assert_eq!(ig["attachments"][1]["kind"], "audio");
+
+                    // Only https links of a few kinds are kept, at most 10 an item.
+                    let mut many = page_message("101", "m_many", "777", "");
+                    let files: Vec<Value> = (0..12)
+                        .map(|n| {
+                            json!({"type": "image",
+                            "payload": {"url": format!("https://scontent.xx.fbcdn.net/{n}.jpg")}})
+                        })
+                        .chain([
+                            json!({"type": "image", "payload": {"url": "javascript:alert(1)"}}),
+                        ])
+                        .collect();
+                    many["entry"][0]["messaging"][0]["message"] =
+                        json!({"mid": "m_many", "text": "lots", "attachments": files});
+                    assert_eq!(deliver(&s, &many).await.status_code(), 200);
+                    let row = until(|| {
+                        let db = &db;
+                        let team_id = &team_id;
+                        async move {
+                            stored(db, team_id)
+                                .await
+                                .into_iter()
+                                .find(|i| i.remote_id == "m_many")
+                        }
+                    })
+                    .await;
+                    assert_eq!(row.attachments.as_array().unwrap().len(), 10);
+                    // A file with no link to show still says something came.
+                    let mut bare = page_message("101", "m_bare", "777", "");
+                    bare["entry"][0]["messaging"][0]["message"] = json!({"mid": "m_bare", "attachments": [{"type": "fallback", "payload": {}}]});
+                    assert_eq!(deliver(&s, &bare).await.status_code(), 200);
+                    let row = until(|| {
+                        let db = &db;
+                        let team_id = &team_id;
+                        async move {
+                            stored(db, team_id)
+                                .await
+                                .into_iter()
+                                .find(|i| i.remote_id == "m_bare")
+                        }
+                    })
+                    .await;
+                    assert_eq!(row.text, "[attachment]");
+                    assert_eq!(row.attachments, json!([]));
+                }
+
                 /// A published Facebook post whose target keeps the bare id `video`.
                 async fn reel_post(
                     s: &TestServer,
@@ -17716,6 +17840,7 @@ mod teams {
                             permalink: None,
                             story: None,
                             button_payload: None,
+                            attachments: Vec::new(),
                         };
                         let item = inbox::store(db, account, fresh).await.unwrap().unwrap();
                         item.contact_id.unwrap()
