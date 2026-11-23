@@ -29045,6 +29045,7 @@ mod teams {
             assert_eq!(f["line_items[0][price]"], "price_p5");
             assert_eq!(f["metadata[team_id]"], team);
             assert_eq!(f["metadata[pack]"], "x500");
+            assert_eq!(f["payment_intent_data[metadata][team_id]"], team);
             assert_eq!(f["adaptive_pricing[enabled]"], "false");
             assert!(f["success_url"].ends_with("/billing?credits=success"));
             let res = req(&s, Method::POST, "/v1/team/billing/credits", &owner)

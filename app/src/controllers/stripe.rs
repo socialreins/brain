@@ -207,6 +207,15 @@ async fn buy_credits(
         ("client_reference_id".to_owned(), team.clone()),
         ("metadata[team_id]".to_owned(), team),
         ("metadata[pack]".to_owned(), body.pack.clone()),
+        // On the payment too, so a refund or dispute (charge events) names the team and pack.
+        (
+            "payment_intent_data[metadata][team_id]".to_owned(),
+            t.team.id.to_string(),
+        ),
+        (
+            "payment_intent_data[metadata][pack]".to_owned(),
+            body.pack.clone(),
+        ),
         ("adaptive_pricing[enabled]".to_owned(), "false".to_owned()),
         (
             "success_url".to_owned(),
@@ -414,14 +423,15 @@ async fn apply_purchase(db: &impl ConnectionTrait, session: &Value) -> Result<bo
             .and_then(|p| PACKS.iter().find(|(id, _)| *id == p))
             .map(|(_, n)| *n),
     ) else {
-        tracing::warn!("stripe payment ignored: no team or pack");
+        // Charged with nothing granted: a person must grant or refund it.
+        tracing::error!(session = ?session["id"].as_str(), "paid stripe session with no team or pack");
         return Ok(false);
     };
     let known = db
         .query_one_raw(stmt("SELECT 1 FROM teams WHERE id = $1", vec![team.into()]))
         .await?;
     if known.is_none() {
-        tracing::warn!(%team, "stripe payment for an unknown team ignored");
+        tracing::error!(%team, "paid stripe session for an unknown team");
         return Ok(false);
     }
     billing::grant(db, team, billing::Kind::X, credits, "x pack", Some(id)).await?;
@@ -473,6 +483,13 @@ async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -
             kind,
             "checkout.session.completed" | "checkout.session.async_payment_succeeded"
         );
+        // shortcut: a refunded or disputed pack keeps its credits; a person takes them back with
+        // the admin tools. Automate it if refunds become common.
+        if matches!(kind, "charge.refunded" | "charge.dispute.created") {
+            let meta = &event["data"]["object"]["metadata"];
+            tracing::error!(kind, team = ?meta["team_id"].as_str(), pack = ?meta["pack"].as_str(),
+                "stripe pack payment refunded or disputed: review its credits");
+        }
         if fresh && paid && !apply_purchase(&txn, &event["data"]["object"]).await? {
             return Ok(None);
         }
