@@ -6043,8 +6043,8 @@ mod teams {
                 let (cookie, team_id, _) = owner_with_account(&s, &db).await;
                 let set = default_set(&db, &team_id).await.to_string();
                 let t0 = Utc::now() - Duration::seconds(1);
-                let hour_ago = (Utc::now() - Duration::hours(1)).to_rfc3339();
-                let res = create(&s, &cookie, input(&set, "past", Some(&hour_ago))).await;
+                let half_hour_ago = (Utc::now() - Duration::hours(1)).to_rfc3339();
+                let res = create(&s, &cookie, input(&set, "past", Some(&half_hour_ago))).await;
                 let p = res.json::<Value>();
                 let at: chrono::DateTime<Utc> =
                     p["scheduled_at"].as_str().unwrap().parse().unwrap();
@@ -8629,7 +8629,7 @@ mod teams {
                         .assert_status_ok();
                     assert_eq!(rule(a.clone()).await, Value::Null);
                     repeating(&s, &cookie, &b, daily()).await;
-                    let due = Utc::now().trunc_subsecs(0) - Duration::hours(1);
+                    let due = Utc::now().trunc_subsecs(0) - Duration::minutes(30);
                     at(&db, &a, due).await;
                     at(&db, &b, due).await;
                     publish::tick(&state).await.unwrap();
@@ -8650,7 +8650,7 @@ mod teams {
                 async fn the_tick_schedules_one_copy_a_day_a_week_or_a_month_on() {
                     let (s, db, state) = on_mock().await;
                     let now = Utc::now().trunc_subsecs(0);
-                    let hour_ago = now - Duration::hours(1);
+                    let half_hour_ago = now - Duration::minutes(30);
                     // The last 31st at or before now: its next month may be a shorter one.
                     let last_31st = (0..)
                         .map(|back| now - Duration::days(back))
@@ -8661,15 +8661,16 @@ mod teams {
                         .find(|t| *t > now)
                         .unwrap();
                     for (every, interval, from, next) in [
-                        ("day", 1, hour_ago, hour_ago + Duration::days(1)),
-                        ("day", 3, hour_ago, hour_ago + Duration::days(3)),
-                        ("week", 2, hour_ago, hour_ago + Duration::days(14)),
-                        // Late by more than a day: the first time still ahead.
+                        ("day", 1, half_hour_ago, half_hour_ago + Duration::days(1)),
+                        ("day", 3, half_hour_ago, half_hour_ago + Duration::days(3)),
+                        ("week", 2, half_hour_ago, half_hour_ago + Duration::days(14)),
+                        // Late by more than a day: drafted, and the next copy is the first time
+                        // still ahead.
                         (
                             "day",
                             1,
-                            hour_ago - Duration::days(2),
-                            hour_ago + Duration::days(1),
+                            half_hour_ago - Duration::days(2),
+                            half_hour_ago + Duration::days(1),
                         ),
                         ("month", 1, last_31st, month_on),
                     ] {
@@ -8681,7 +8682,12 @@ mod teams {
                         at(&db, &id, from).await;
                         publish::tick(&state).await.unwrap();
                         let source = get_post(&s, &cookie, &id).await;
-                        assert_eq!(source["status"], "published", "{every}: {source}");
+                        let went = if from < now - Duration::hours(1) {
+                            "draft"
+                        } else {
+                            "published"
+                        };
+                        assert_eq!(source["status"], went, "{every}: {source}");
                         assert_eq!(source["repeat"], Value::Null);
                         let copies = with_rule(&s, &cookie).await;
                         assert_eq!(copies.len(), 1, "{every}: {copies:?}");
@@ -8709,7 +8715,7 @@ mod teams {
                 #[serial]
                 async fn remaining_and_until_end_the_series() {
                     let (s, db, state) = on_mock().await;
-                    let due = Utc::now().trunc_subsecs(0) - Duration::hours(1);
+                    let due = Utc::now().trunc_subsecs(0) - Duration::minutes(30);
                     let count = |cookie: String| {
                         let s = &s;
                         async move {
@@ -8780,7 +8786,7 @@ mod teams {
                     let refused = id_of(&res);
                     let garbled = scheduled(&s, &cookie, &set).await;
                     let sound = scheduled(&s, &cookie, &set).await;
-                    let due = Utc::now().trunc_subsecs(0) - Duration::hours(1);
+                    let due = Utc::now().trunc_subsecs(0) - Duration::minutes(30);
                     for id in [&refused, &garbled, &sound] {
                         repeating(&s, &cookie, id, daily()).await;
                         at(&db, id, due).await;
@@ -8851,7 +8857,7 @@ mod teams {
                     assert_eq!(p["approval"], "approved", "{p}");
                     assert_eq!(p["approval_by"], by);
 
-                    let due = Utc::now().trunc_subsecs(0) - Duration::hours(1);
+                    let due = Utc::now().trunc_subsecs(0) - Duration::minutes(30);
                     at(&db, &id, due).await;
                     publish::tick(&state).await.unwrap();
                     assert_eq!(get_post(&s, &owner, &id).await["status"], "published");
@@ -14695,7 +14701,7 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
-                async fn out_of_credits_and_rate_limits_say_so_and_are_not_retried() {
+                async fn out_of_credits_fails_and_a_rate_limit_is_retried_once() {
                     let (s, _, state, _, mock, cookie, _, set) = team().await;
                     let attempts = mock.attempts.load(Ordering::SeqCst);
                     let id = id_of(&create(&s, &cookie, x_post(&set, "CREDITS please")).await);
@@ -14707,16 +14713,30 @@ mod teams {
                     assert!(why.contains("Add credits"), "{why}");
                     assert_eq!(mock.attempts.load(Ordering::SeqCst), attempts + 1);
 
+                    // A rate limit sent nothing: retried once, 5 minutes on, then failed.
                     let id = id_of(&create(&s, &cookie, x_post(&set, "LIMIT me")).await);
                     publish::tick(&state).await.unwrap();
                     let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "queued");
+                    assert_eq!(p["targets"][0]["status"], "pending");
+                    assert_eq!(mock.attempts.load(Ordering::SeqCst), attempts + 2);
+                    let db = &state.db;
+                    sea_orm::ConnectionTrait::execute_unprepared(
+                        db,
+                        &format!("UPDATE post_targets SET retry_at = now() WHERE post_id = '{id}'"),
+                    )
+                    .await
+                    .unwrap();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
                     assert_eq!(p["status"], "failed");
+                    assert_eq!(p["targets"][0]["retried"], true);
                     assert_eq!(
                         p["targets"][0]["error"],
-                        "Publish: X rate limit reached; it resets at 2026-11-04 12:30 UTC. It \
-                         was not retried."
+                        "Publish: X rate limit reached; it resets at 2026-11-04 12:30 UTC. \
+                         Nothing was posted."
                     );
-                    assert_eq!(mock.attempts.load(Ordering::SeqCst), attempts + 2);
+                    assert_eq!(mock.attempts.load(Ordering::SeqCst), attempts + 3);
 
                     // Credits run out midway through a thread: the posts before it stay up.
                     let body = thread(&set, "one", &["CREDITS two"]);
