@@ -26,7 +26,7 @@ use super::{
 use crate::{
     automations::{self as rules, Action, ActionResult, Conditions, Step},
     inbox,
-    models::{automation_runs, automations, teams},
+    models::{automation_runs, automations, social_accounts, teams},
     state::AppState,
 };
 
@@ -220,6 +220,23 @@ async fn checked(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_conditions",
         )));
+    }
+    if !c.account_ids.is_empty() {
+        let providers: Vec<String> = social_accounts::Entity::find()
+            .select_only()
+            .column(social_accounts::Column::Provider)
+            .filter(social_accounts::Column::TeamId.eq(team_id))
+            .filter(social_accounts::Column::Id.is_in(c.account_ids.iter().copied()))
+            .into_tuple()
+            .all(db)
+            .await?;
+        let providers: Vec<&str> = providers.iter().map(String::as_str).collect();
+        let actions = input.actions.as_deref().unwrap_or_default();
+        let limits =
+            rules::network_limits(&input.trigger, &providers, actions, input.steps.as_deref());
+        if let Err(code) = limits {
+            return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, code)));
+        }
     }
     Ok(Ok((name, input)))
 }

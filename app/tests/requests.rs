@@ -18894,6 +18894,37 @@ mod teams {
                 res.json::<Value>()["runs"].as_array().unwrap().clone()
             }
 
+            /// An automation limited to an account on a network with no inbox could never fire,
+            /// so it is refused; a Bluesky account is fine.
+            #[tokio::test]
+            #[serial]
+            async fn automations_refuse_accounts_that_cannot_fire_them() {
+                use sea_orm::ConnectionTrait;
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, account, _) = owner(&s, &db).await;
+                let x = uuid::Uuid::now_v7();
+                db.execute_unprepared(&format!(
+                    "INSERT INTO social_accounts (id, team_id, provider, external_id, access_token) \
+                     VALUES ('{x}', '{team_id}', 'x', 'x-{x}', '\\\\x00')"
+                ))
+                .await
+                .unwrap();
+                let scoped = |ids: Vec<String>| {
+                    let mut body = comment_to_dm();
+                    body["conditions"]["account_ids"] = json!(ids);
+                    body
+                };
+                let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                    .json(&scoped(vec![x.to_string()]))
+                    .await;
+                assert_eq!(res.status_code(), 422);
+                assert_eq!(res.json::<Value>()["error"], "unsupported_account");
+                let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                    .json(&scoped(vec![account]))
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+            }
+
             #[tokio::test]
             #[serial]
             async fn automations_are_strict_and_run_once_per_comment() {
