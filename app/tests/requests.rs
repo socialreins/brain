@@ -5635,12 +5635,12 @@ mod teams {
                 assert!(url.starts_with("https://brain.test/media/") && url.ends_with(".png"));
                 // Nothing of the refused ones stayed; the link serves the file for a preview.
                 let rows = |db: &DatabaseConnection| {
-                    let db = db.clone();
+                    let (db, team) = (db.clone(), team_id.clone());
                     async move {
                         let row = db
                             .query_one_raw(sea_orm::Statement::from_string(
                                 sea_orm::DbBackend::Postgres,
-                                "SELECT count(*) AS n FROM media_uploads",
+                                format!("SELECT count(*) AS n FROM media_uploads WHERE team_id = '{team}'"),
                             ))
                             .await
                             .unwrap()
@@ -5691,9 +5691,16 @@ mod teams {
                 );
 
                 // A day on, the upload stays while the draft names it, then goes.
-                db.execute_unprepared(
-                    "UPDATE media_uploads SET created_at = now() - interval '25 hours'",
-                )
+                db.execute_unprepared(&format!(
+                    "UPDATE media_uploads SET created_at = now() - interval '25 hours' \
+                     WHERE team_id = '{team_id}'"
+                ))
+                .await
+                .unwrap();
+                // Other runs' leftovers would count in the sweep below.
+                db.execute_unprepared(&format!(
+                    "DELETE FROM media_uploads WHERE team_id <> '{team_id}'"
+                ))
                 .await
                 .unwrap();
                 let unattached = upload(&s, &cookie, file(PNG, 64)).await;
