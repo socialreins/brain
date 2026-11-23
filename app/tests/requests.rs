@@ -6611,6 +6611,146 @@ mod teams {
 
             #[tokio::test]
             #[serial]
+            async fn chosen_accounts_are_checked_and_only_they_get_the_post() {
+                use sea_orm::ConnectionTrait;
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, a1) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let mut more = Vec::new();
+                for _ in 0..2 {
+                    let res = connect(&s, &cookie, &new_handle(), APP_PASSWORD).await;
+                    assert_eq!(res.status_code(), 201);
+                    more.push(res.json::<Value>()["id"].as_str().unwrap().to_owned());
+                }
+                let (a2, a3) = (more[0].clone(), more[1].clone());
+                let with = |ids: Value| {
+                    let mut v = input(&set, "hi", Some(&past()));
+                    v["account_ids"] = ids;
+                    v
+                };
+                // None chosen, an unknown id, and an account of another platform are refused.
+                let stranger = uuid::Uuid::now_v7().to_string();
+                for (ids, platform, bad) in [
+                    (json!([]), "bluesky", Value::Null),
+                    (json!([a1, stranger]), "bluesky", json!(stranger)),
+                    (json!([a1]), "x", json!(a1)),
+                ] {
+                    let mut body = with(ids.clone());
+                    body["platform"] = json!(platform);
+                    let res = create(&s, &cookie, body).await;
+                    assert_eq!(res.status_code(), 422, "{ids}: {}", res.text());
+                    let v = res.json::<Value>();
+                    assert_eq!(v["error"], "invalid_accounts", "{v}");
+                    assert_eq!(v["field"], "account_ids");
+                    assert_eq!(v.get("social_account_id").cloned().unwrap_or_default(), bad);
+                }
+                // Saved once each and listed as the post's accounts.
+                let res = create(&s, &cookie, with(json!([a2, a1, a1]))).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let mut want = vec![a1.clone(), a2.clone()];
+                want.sort();
+                let chosen = res.json::<Value>();
+                assert_eq!(chosen["account_ids"], json!(want));
+                let listed: Vec<&str> = chosen["accounts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|a| a["social_account_id"].as_str().unwrap())
+                    .collect();
+                assert_eq!(listed, want);
+                let chosen = chosen["id"].as_str().unwrap().to_owned();
+                // An edit can change the choice, and clear it back to every account.
+                let path = format!("/v1/posts/{chosen}");
+                let res = req(&s, Method::PUT, &path, &cookie)
+                    .json(&with(Value::Null))
+                    .await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                assert_eq!(res.json::<Value>()["account_ids"], Value::Null);
+                assert_eq!(res.json::<Value>()["accounts"].as_array().unwrap().len(), 3);
+                let res = req(&s, Method::PUT, &path, &cookie)
+                    .json(&with(json!([a1, a2, a3])))
+                    .await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                // A post with no choice goes to every account.
+                let all = id_of(&create(&s, &cookie, with(Value::Null)).await);
+                // A group picks its platforms from the accounts and each post gets its own.
+                let mut group = with(json!([a3]));
+                group.as_object_mut().unwrap().remove("platform");
+                let res = req(&s, Method::POST, "/v1/post-groups", &cookie)
+                    .json(&group)
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let g = res.json::<Value>();
+                assert_eq!(g["posts"].as_array().unwrap().len(), 1, "{g}");
+                assert_eq!(g["posts"][0]["account_ids"], json!([a3]));
+                assert_eq!(g["expected_targets"], 1);
+                let grouped = g["posts"][0]["id"].as_str().unwrap().to_owned();
+                group["account_ids"] = json!([stranger]);
+                let res = req(&s, Method::POST, "/v1/post-groups", &cookie)
+                    .json(&group)
+                    .await;
+                assert_eq!(res.status_code(), 422, "{}", res.text());
+                assert_eq!(res.json::<Value>()["error"], "invalid_accounts");
+
+                // Before it goes out, a2 leaves the set and a3 is disconnected.
+                db.execute_unprepared(&format!(
+                    "DELETE FROM social_account_social_set WHERE social_account_id = '{a2}'"
+                ))
+                .await
+                .unwrap();
+                db.execute_unprepared(&format!("DELETE FROM social_accounts WHERE id = '{a3}'"))
+                    .await
+                    .unwrap();
+                publish::tick(&state).await.unwrap();
+                let p = settled(&s, &cookie, &chosen).await;
+                assert_eq!(p["status"], "published", "{p}");
+                let mut targets: Vec<(Value, Value, Value)> = p["targets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|t| {
+                        (
+                            t["social_account_id"].clone(),
+                            t["status"].clone(),
+                            t["error"].clone(),
+                        )
+                    })
+                    .collect();
+                targets.sort_by_key(|t| t.0.to_string());
+                let mut want = vec![
+                    (json!(a1), json!("published"), Value::Null),
+                    (
+                        json!(a2),
+                        json!("failed"),
+                        json!("Not sent: the account left this post's set."),
+                    ),
+                    (
+                        Value::Null,
+                        json!("failed"),
+                        json!("Not sent: the account was disconnected."),
+                    ),
+                ];
+                want.sort_by_key(|t| t.0.to_string());
+                assert_eq!(targets, want);
+                assert!(
+                    p["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("left this post's set"),
+                    "{p}"
+                );
+                // Every account left in the set got the post without a choice: a1 only now.
+                let p = settled(&s, &cookie, &all).await;
+                assert_eq!(p["status"], "published", "{p}");
+                assert_eq!(p["targets"].as_array().unwrap().len(), 1, "{p}");
+                // A post whose only account is gone fails, saying why.
+                let p = settled(&s, &cookie, &grouped).await;
+                assert_eq!(p["status"], "failed", "{p}");
+                assert!(p["error"].as_str().unwrap().contains("disconnected"), "{p}");
+            }
+
+            #[tokio::test]
+            #[serial]
             async fn a_group_reads_with_its_expected_targets_and_retries_as_one() {
                 let (s, db, state) = on_mock().await;
                 let (cookie, team_id, _) = owner_with_account(&s, &db).await;

@@ -1428,6 +1428,47 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
             .into_tuple()
             .all(db)
             .await?;
+        // Only the accounts the post was given, when it names them. One gone since (left the
+        // set, or disconnected) gets a failed target saying so, never a silent skip.
+        let chosen: Option<Vec<Uuid>> = post
+            .account_ids
+            .clone()
+            .and_then(|v| serde_json::from_value(v).ok());
+        let mut gone = Vec::new();
+        let accounts = match chosen {
+            None => accounts,
+            Some(chosen) => {
+                for c in chosen.iter().filter(|c| !accounts.contains(c)) {
+                    gone.push(
+                        match social_accounts::Entity::find_by_id(*c).one(db).await? {
+                            Some(_) => (Some(*c), "Not sent: the account left this post's set."),
+                            None => (None, "Not sent: the account was disconnected."),
+                        },
+                    );
+                }
+                accounts
+                    .into_iter()
+                    .filter(|a| chosen.contains(a))
+                    .collect()
+            }
+        };
+        for (account, why) in gone {
+            let target = Uuid::now_v7();
+            let stmt = sql(
+                "INSERT INTO post_targets (id, post_id, social_account_id, status) \
+                 VALUES ($1, $2, $3, 'pending') ON CONFLICT (post_id, social_account_id) DO NOTHING",
+                vec![target.into(), id.into(), account.into()],
+            );
+            db.execute_raw(stmt).await?;
+            let stmt = sql(
+                &with_event(
+                    "UPDATE post_targets SET status = 'failed', error = $2, updated_at = now() \
+                     WHERE id = $1",
+                ),
+                vec![target.into(), why.into()],
+            );
+            db.execute_raw(stmt).await?;
+        }
         for account in &accounts {
             let stmt = sql(
                 "INSERT INTO post_targets (id, post_id, social_account_id, status) \
