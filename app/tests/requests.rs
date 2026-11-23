@@ -18729,6 +18729,23 @@ mod teams {
 
                 // Shapes and ids are checked; "All" stays. An X account has no inbox.
                 let x = uuid::Uuid::now_v7();
+                // A real Bluesky account, of another team.
+                let (_, outsider, _) = user(&s, &db).await;
+                let outsider = current(&s, &outsider).await["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let theirs = uuid::Uuid::now_v7();
+                sea_orm::ConnectionTrait::execute_unprepared(
+                    &db,
+                    &format!(
+                        "INSERT INTO social_accounts (id, team_id, provider, external_id, \
+                         access_token) VALUES ('{theirs}', '{outsider}', 'bluesky', \
+                         'did:plc:{theirs}', '\\\\x00')"
+                    ),
+                )
+                .await
+                .unwrap();
                 sea_orm::ConnectionTrait::execute_unprepared(
                     &db,
                     &format!(
@@ -18741,6 +18758,10 @@ mod teams {
                 for (body, code) in [
                     (
                         json!({"name": "x", "account_ids": [account, x]}),
+                        "invalid_accounts",
+                    ),
+                    (
+                        json!({"name": "x", "account_ids": [account, theirs]}),
                         "invalid_accounts",
                     ),
                     (
@@ -18787,6 +18808,12 @@ mod teams {
                 let res = req(&s, Method::POST, "/v1/inboxes", &member)
                     .json(&json!({"name": "Nope"}))
                     .await;
+                assert_eq!(res.status_code(), 403);
+                let res = req(&s, Method::PUT, &format!("/v1/inboxes/{dms}"), &member)
+                    .json(&json!({"name": "Nope", "account_ids": [account]}))
+                    .await;
+                assert_eq!(res.status_code(), 403);
+                let res = req(&s, Method::DELETE, &format!("/v1/inboxes/{dms}"), &member).await;
                 assert_eq!(res.status_code(), 403);
                 let item = comment["id"].as_str().unwrap();
                 let res = req(
@@ -20983,7 +21010,7 @@ mod teams {
             #[serial]
             async fn dms_of_one_person_list_as_one_conversation() {
                 let (s, db, state) = on_mock().await;
-                let (cookie, _, account, me) = owner(&s, &db).await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
                 let (ids, all) = two_conversations(&s, &db, &state, &cookie, &account, &me).await;
                 let patch = |item: &str, body: Value| {
                     req(
@@ -21120,6 +21147,20 @@ mod teams {
                 let page = items(&s, &cookie, &refunds, "?group=conversations").await;
                 assert_eq!(texts(&page), ["ann one"]);
                 assert_eq!(page["items"][0]["conversation"]["count"], 1);
+                // An inbox of another account holds none of these conversations.
+                let other = uuid::Uuid::now_v7();
+                let sql = format!(
+                    "INSERT INTO social_accounts (id, team_id, provider, external_id, access_token) \
+                     VALUES ('{other}', '{team_id}', 'bluesky', 'did:plc:{other}', '\\\\x00')"
+                );
+                exec(&db, &sql).await;
+                let res = req(&s, Method::POST, "/v1/inboxes", &cookie)
+                    .json(&json!({"name": "Other", "account_ids": [other]}))
+                    .await;
+                assert_eq!(res.status_code(), 201);
+                let other = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                let page = items(&s, &cookie, &other, "?group=conversations").await;
+                assert!(texts(&page).is_empty());
 
                 // A DM without a contact is a conversation of its own.
                 let sql = format!(
