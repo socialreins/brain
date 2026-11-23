@@ -117,8 +117,8 @@ pub struct Config {
     /// `META_WEBHOOK_VERIFY_TOKEN` turns on `GET /webhooks/meta` (the handshake when the webhook
     /// is registered in the Meta app); `POST /webhooks/meta` is signed with `META_APP_SECRET`.
     pub meta: meta::Meta,
-    /// `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_SCHEDULER` and
-    /// `STRIPE_PRICE_AUTOMATION`: Cloud checkout, the customer portal and `POST /webhooks/stripe`.
+    /// `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` and `STRIPE_PRICE_SCHEDULER`,
+    /// `STRIPE_PRICE_AUTOMATION` with their `_YEARLY` twins: Cloud checkout, the customer portal and `POST /webhooks/stripe`.
     /// Needed only with `BILLING_ENABLED`.
     pub stripe: crate::stripe::Stripe,
 }
@@ -228,8 +228,10 @@ impl Config {
                 var("STRIPE_SECRET_KEY"),
                 var("STRIPE_WEBHOOK_SECRET"),
                 [
-                    ("scheduler", var("STRIPE_PRICE_SCHEDULER")),
-                    ("automation", var("STRIPE_PRICE_AUTOMATION")),
+                    ("scheduler", "month", var("STRIPE_PRICE_SCHEDULER")),
+                    ("automation", "month", var("STRIPE_PRICE_AUTOMATION")),
+                    ("scheduler", "year", var("STRIPE_PRICE_SCHEDULER_YEARLY")),
+                    ("automation", "year", var("STRIPE_PRICE_AUTOMATION_YEARLY")),
                 ],
             )?,
         })
