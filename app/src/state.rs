@@ -38,6 +38,8 @@ pub struct AppState {
     pub registration_disabled: bool,
     pub billing_enabled: bool,
     pub stripe: crate::stripe::Stripe,
+    /// AI steps in automations (`ai.rs`).
+    pub ai: crate::ai::Ai,
     pub owner_email: Option<String>,
     pub signup_domains: Vec<String>,
     pub mailer: Mailer,
@@ -96,6 +98,7 @@ impl AppState {
             registration_disabled: config.registration_disabled,
             billing_enabled: config.billing_enabled,
             stripe: config.stripe.clone(),
+            ai: config.ai.clone(),
             owner_email: config.owner_email.clone(),
             signup_domains: config.signup_domains.clone(),
             mailer: config.mailer.clone(),

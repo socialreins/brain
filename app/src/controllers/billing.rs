@@ -32,6 +32,9 @@ pub struct PlanLimits {
     pub contacts: Option<i64>,
     /// Custom inboxes ("All" never counts); `null` is unlimited.
     pub inboxes: Option<i64>,
+    /// AI replies a calendar month (UTC) on our key, before `ai` credits; `null` when nothing
+    /// is metered (billing off). A team's own AI key is never counted.
+    pub ai_monthly: Option<i64>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -40,6 +43,8 @@ pub struct Usage {
     pub members: i64,
     /// Custom inboxes ("All" left out).
     pub inboxes: i64,
+    /// AI replies on our key this calendar month (UTC) paid from the monthly allowance.
+    pub ai_replies: i64,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -82,6 +87,7 @@ fn limits(l: Limits) -> PlanLimits {
         automation: l.automation,
         contacts: l.contacts,
         inboxes: l.inboxes,
+        ai_monthly: l.ai_monthly,
     }
 }
 
@@ -136,7 +142,7 @@ async fn show(State(app): State<AppState>, t: InTeam) -> Response {
         Ok(s) => s,
         Err(e) => return internal(e, "billing read"),
     };
-    let (accounts, members, inboxes) = match (
+    let (accounts, members, inboxes, ai_replies) = match (
         count(&app, "social_accounts", t.team.id).await,
         count(&app, "team_user", t.team.id).await,
         count(
@@ -145,9 +151,12 @@ async fn show(State(app): State<AppState>, t: InTeam) -> Response {
             t.team.id,
         )
         .await,
+        billing::ai_used(&app.db, t.team.id, Utc::now()).await,
     ) {
-        (Ok(a), Ok(m), Ok(i)) => (a, m, i),
-        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return internal(e, "billing usage"),
+        (Ok(a), Ok(m), Ok(i), Ok(ai)) => (a, m, i, ai),
+        (Err(e), _, _, _) | (_, Err(e), _, _) | (_, _, Err(e), _) | (_, _, _, Err(e)) => {
+            return internal(e, "billing usage")
+        }
     };
     Json(Billing {
         enabled: app.billing_enabled,
@@ -165,6 +174,7 @@ async fn show(State(app): State<AppState>, t: InTeam) -> Response {
             accounts,
             members,
             inboxes,
+            ai_replies,
         },
     })
     .into_response()

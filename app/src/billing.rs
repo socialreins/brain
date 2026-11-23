@@ -17,6 +17,9 @@ pub enum Kind {
     X,
     /// A call to an AI model that runs on our key.
     Ai,
+    /// A use of the plan's monthly AI allowance (`spend_ai`). Never sold or granted, and never a
+    /// balance: only its uses this month are counted.
+    AiPlan,
 }
 
 impl Kind {
@@ -24,6 +27,7 @@ impl Kind {
         match self {
             Self::X => "x",
             Self::Ai => "ai",
+            Self::AiPlan => "ai_plan",
         }
     }
 }
@@ -38,6 +42,9 @@ pub struct Limits {
     pub contacts: Option<i64>,
     /// Custom inboxes ("All" never counts).
     pub inboxes: Option<i64>,
+    /// AI replies a calendar month (UTC) on our key before `ai` credits are used; `None` when
+    /// nothing is metered (billing off).
+    pub ai_monthly: Option<i64>,
 }
 
 impl Limits {
@@ -48,6 +55,7 @@ impl Limits {
             automation: true,
             contacts: None,
             inboxes: None,
+            ai_monthly: None,
         }
     }
 
@@ -59,6 +67,7 @@ impl Limits {
             automation: false,
             contacts: Some(0),
             inboxes: Some(0),
+            ai_monthly: Some(0),
         }
     }
 }
@@ -95,7 +104,7 @@ pub async fn subscription(
         .query_one_raw(stmt(
             "SELECT s.status, s.trial_ends_at, s.current_period_end, s.cancel_at_period_end, s.provider,
                     p.id, p.name, p.max_accounts, p.max_members, p.automation, p.max_contacts,
-                    p.max_inboxes
+                    p.max_inboxes, p.ai_monthly
              FROM subscriptions s JOIN plans p ON p.id = s.plan_id WHERE s.team_id = $1",
             vec![team.into()],
         ))
@@ -118,6 +127,7 @@ pub async fn subscription(
             automation: r.try_get("", "automation")?,
             contacts: count("max_contacts")?,
             inboxes: count("max_inboxes")?,
+            ai_monthly: Some(r.try_get::<i32>("", "ai_monthly")?.into()),
         },
     }))
 }
@@ -326,6 +336,113 @@ pub async fn spend(
     Ok(Spent::Taken)
 }
 
+/// The start of the calendar month (UTC) `now` is in, as SQL on the parameter `$n`.
+fn month_of(n: usize) -> String {
+    format!("date_trunc('month', ${n}::timestamptz AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'")
+}
+
+/// The team's AI replies on our key in the calendar month (UTC) of `now` that the allowance paid
+/// for and did not give back.
+pub async fn ai_used(
+    db: &impl ConnectionTrait,
+    team: Uuid,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<i64, DbErr> {
+    let sql = format!(
+        "SELECT count(*)::bigint AS n FROM credit_ledger l
+         WHERE l.team_id = $1 AND l.kind = 'ai_plan' AND l.amount < 0
+           AND l.created_at >= {m} AND l.created_at < {m} + interval '1 month'
+           AND NOT EXISTS (SELECT 1 FROM credit_ledger b WHERE b.team_id = l.team_id
+             AND b.kind = l.kind AND b.ref = l.ref AND b.amount > 0)",
+        m = month_of(2)
+    );
+    let row = db
+        .query_one_raw(stmt(&sql, vec![team.into(), now.into()]))
+        .await?;
+    row.map_or(Ok(0), |r| r.try_get("", "n"))
+}
+
+/// How a spend for one AI reply on our key ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AiSpent {
+    /// Paid from the monthly allowance (`Kind::AiPlan`) or an `ai` credit (`Kind::Ai`); a refund
+    /// gives it back with `grant` of that kind under the same reference. Also the answer when
+    /// the reference was paid before and not given back.
+    Paid(Kind),
+    /// The reference was paid and given back: that reply was given up, never written again.
+    Refunded,
+    /// The allowance is used up and no `ai` credit is left.
+    Short,
+}
+
+/// Pays for one AI reply under `reference`: the plan's `monthly` allowance for the calendar
+/// month (UTC) of `now` first, then an `ai` credit. Under the team row lock, as `spend`, so two
+/// replies at once never both take the last one. A reference seen before is never paid twice,
+/// and one given back is never paid again (`Refunded`).
+pub async fn spend_ai(
+    db: &DatabaseConnection,
+    team: Uuid,
+    monthly: i64,
+    reference: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<AiSpent, DbErr> {
+    let tx = db.begin().await?;
+    tx.execute_raw(stmt(
+        "SELECT id FROM teams WHERE id = $1 FOR NO KEY UPDATE",
+        vec![team.into()],
+    ))
+    .await?;
+    let seen = tx
+        .query_one_raw(stmt(
+            "SELECT bool_or(amount > 0) AS back, min(kind) AS kind FROM credit_ledger
+             WHERE team_id = $1 AND kind IN ('ai', 'ai_plan') AND ref = $2",
+            vec![team.into(), reference.into()],
+        ))
+        .await?;
+    if let Some(r) = seen {
+        let back: Option<bool> = r.try_get("", "back")?;
+        let kind: Option<String> = r.try_get("", "kind")?;
+        let paid = match kind.as_deref() {
+            Some("ai") => Some(Kind::Ai),
+            Some(_) => Some(Kind::AiPlan),
+            None => None,
+        };
+        match (back, paid) {
+            (Some(true), _) => {
+                tx.commit().await?;
+                return Ok(AiSpent::Refunded);
+            }
+            (_, Some(kind)) => {
+                tx.commit().await?;
+                return Ok(AiSpent::Paid(kind));
+            }
+            _ => {}
+        }
+    }
+    let kind = if ai_used(&tx, team, now).await? < monthly {
+        Kind::AiPlan
+    } else if balance(&tx, team, Kind::Ai).await? >= 1 {
+        Kind::Ai
+    } else {
+        tx.commit().await?;
+        return Ok(AiSpent::Short);
+    };
+    tx.execute_raw(stmt(
+        "INSERT INTO credit_ledger (id, team_id, kind, amount, reason, ref, created_at)
+         VALUES ($1, $2, $3, -1, 'ai reply', $4, $5)",
+        vec![
+            Uuid::now_v7().into(),
+            team.into(),
+            kind.as_str().into(),
+            reference.into(),
+            now.into(),
+        ],
+    ))
+    .await?;
+    tx.commit().await?;
+    Ok(AiSpent::Paid(kind))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +462,7 @@ mod tests {
                 automation: false,
                 contacts: None,
                 inboxes: Some(1),
+                ai_monthly: Some(0),
             },
         }
     }
