@@ -1339,6 +1339,9 @@ async fn fail_post(db: &DatabaseConnection, id: Uuid, msg: &str) -> Result<(), D
     db.execute_raw(stmt).await.map(|_| ())
 }
 
+const PLAN_ENDED: &str =
+    "The team's plan has ended. Choose a plan on the Billing page, then publish this post again.";
+
 /// Publishes a `queued` post: one target per account of its platform in its set, each
 /// published at most once, then the post settles.
 pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
@@ -1351,6 +1354,10 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
     };
     if post.status != "queued" {
         return Ok(());
+    }
+    // A team whose plan ended keeps its posts but publishes nothing; it can retry once it pays.
+    if app.billing_enabled && !crate::billing::has_plan(db, post.team_id).await? {
+        return fail_post(db, id, PLAN_ENDED).await;
     }
     // Whatever queued it (a tick, publish now, recovery), nothing publishes without its hit.
     if !post.quota_reserved {

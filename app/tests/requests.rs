@@ -14155,6 +14155,47 @@ mod teams {
                     }
                 }
 
+                /// Gives the team a plan in `status`.
+                async fn on_plan(db: &sea_orm::DatabaseConnection, team: uuid::Uuid, status: &str) {
+                    use sea_orm::ConnectionTrait;
+                    db.execute_raw(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Postgres,
+                        "INSERT INTO subscriptions (team_id, plan_id, status) VALUES ($1, 'automation', $2)
+                         ON CONFLICT (team_id) DO UPDATE SET status = $2",
+                        [team.into(), status.into()],
+                    ))
+                    .await
+                    .unwrap();
+                }
+
+                /// With billing on, a team whose plan ended publishes nothing and keeps the post,
+                /// failed with the reason; a live plan (here `past_due`, still retrying) publishes.
+                #[tokio::test]
+                #[serial]
+                async fn posts_stop_when_the_plan_ends() {
+                    use socialreins_brain::billing::{self, Kind};
+                    let (s, db, mut state, _, mock, cookie, team_id, set) = team().await;
+                    state.billing_enabled = true;
+                    let team: uuid::Uuid = team_id.parse().unwrap();
+                    billing::grant(&db, team, Kind::X, 5, "test", None)
+                        .await
+                        .unwrap();
+                    let before = mock.tweets.lock().unwrap().len();
+                    on_plan(&db, team, "canceled").await;
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "Ended")).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    assert!(p["error"].as_str().unwrap().contains("plan has ended"), "{p}");
+                    assert_eq!(mock.tweets.lock().unwrap().len(), before);
+                    assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 5);
+
+                    on_plan(&db, team, "past_due").await;
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "Retrying")).await);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                }
+
                 /// On Cloud an X post spends a credit once it is out; a team short of credits for the
                 /// whole thread is stopped before anything goes out.
                 #[tokio::test]
@@ -14164,6 +14205,7 @@ mod teams {
                     let (s, db, mut state, _, mock, cookie, team_id, set) = team().await;
                     state.billing_enabled = true;
                     let team: uuid::Uuid = team_id.parse().unwrap();
+                    on_plan(&db, team, "active").await;
                     let before = mock.tweets.lock().unwrap().len();
                     let id = id_of(&create(&s, &cookie, x_post(&set, "No credit")).await);
                     publish::tick(&state).await.unwrap();
@@ -14215,6 +14257,7 @@ mod teams {
                     let (s, db, mut state, _, _, cookie, team_id, set) = team().await;
                     state.billing_enabled = true;
                     let team: uuid::Uuid = team_id.parse().unwrap();
+                    on_plan(&db, team, "active").await;
                     billing::grant(&db, team, Kind::X, 6, "test", None)
                         .await
                         .unwrap();
@@ -14243,6 +14286,7 @@ mod teams {
                     let (s, db, mut state, _, mock, cookie, team_id, set) = team().await;
                     state.billing_enabled = true;
                     let team: uuid::Uuid = team_id.parse().unwrap();
+                    on_plan(&db, team, "active").await;
                     billing::grant(&db, team, Kind::X, 1, "test", None)
                         .await
                         .unwrap();

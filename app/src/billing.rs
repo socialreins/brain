@@ -113,6 +113,11 @@ pub async fn subscription(
     }))
 }
 
+/// Whether the team has a plan that keeps it working (trial, paid or retrying a payment).
+pub async fn has_plan(db: &impl ConnectionTrait, team: Uuid) -> Result<bool, DbErr> {
+    Ok(subscription(db, team).await?.is_some_and(|s| live(&s.status)))
+}
+
 /// What the team may use right now.
 pub fn effective(enabled: bool, sub: Option<&Subscription>) -> Limits {
     match (enabled, sub) {
