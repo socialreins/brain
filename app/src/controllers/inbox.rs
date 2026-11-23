@@ -138,6 +138,9 @@ pub struct Item {
     pub story_url: Option<String>,
     /// A DM that is a click on a quick reply button (Facebook, Instagram): its payload.
     pub button_payload: Option<String>,
+    /// Photos, videos, stickers, files and links it carries, https only, at most 10. Meta's
+    /// links expire after a while; `remote_url` keeps working.
+    pub attachments: Vec<inbox::Attachment>,
     /// The author's contact (`GET /contacts/{id}`).
     pub contact_id: Option<Uuid>,
     /// The contact's tags, by name.
@@ -469,6 +472,7 @@ pub(super) async fn items_json(
             story_id: i.story_id,
             story_url: i.story_url,
             button_payload: i.button_payload,
+            attachments: serde_json::from_value(i.attachments).unwrap_or_default(),
             contact_tags: i
                 .contact_id
                 .and_then(|c| tags.get(&c).cloned())
