@@ -26,16 +26,20 @@ pub struct PlanLimits {
     pub accounts: Option<i64>,
     /// Members allowed; `null` is unlimited.
     pub members: Option<i64>,
-    /// The inbox, automations, broadcasts and newsletters.
+    /// Automations, broadcasts and newsletters.
     pub automation: bool,
     /// Contacts the automations may keep; `null` is unlimited.
     pub contacts: Option<i64>,
+    /// Custom inboxes ("All" never counts); `null` is unlimited.
+    pub inboxes: Option<i64>,
 }
 
 #[derive(Serialize, ToSchema)]
 pub struct Usage {
     pub accounts: i64,
     pub members: i64,
+    /// Custom inboxes ("All" left out).
+    pub inboxes: i64,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -77,11 +81,12 @@ fn limits(l: Limits) -> PlanLimits {
         members: l.members,
         automation: l.automation,
         contacts: l.contacts,
+        inboxes: l.inboxes,
     }
 }
 
 async fn count(app: &AppState, table: &str, team: uuid::Uuid) -> Result<i64, sea_orm::DbErr> {
-    // `table` is one of two literals below, never input.
+    // `table` is one of the literals below, never input.
     let sql = format!("SELECT count(*)::bigint AS n FROM {table} WHERE team_id = $1");
     let row = app
         .db
@@ -100,7 +105,7 @@ pub(crate) fn plan_limit(limit: Limit) -> Response {
     (StatusCode::PAYMENT_REQUIRED, Json(body)).into_response()
 }
 
-/// `Some(reply)` when the team's plan has no automation (the inbox, automations, broadcasts and
+/// `Some(reply)` when the team's plan has no automation (automations, broadcasts and
 /// newsletters); `None` when it does, or billing is off.
 pub(crate) async fn needs_automation(app: &AppState, team: uuid::Uuid) -> Option<Response> {
     match billing::limits_of(app.billing_enabled, &app.db, team).await {
@@ -131,12 +136,18 @@ async fn show(State(app): State<AppState>, t: InTeam) -> Response {
         Ok(s) => s,
         Err(e) => return internal(e, "billing read"),
     };
-    let (accounts, members) = match (
+    let (accounts, members, inboxes) = match (
         count(&app, "social_accounts", t.team.id).await,
         count(&app, "team_user", t.team.id).await,
+        count(
+            &app,
+            "(SELECT team_id FROM inboxes WHERE NOT is_all) i",
+            t.team.id,
+        )
+        .await,
     ) {
-        (Ok(a), Ok(m)) => (a, m),
-        (Err(e), _) | (_, Err(e)) => return internal(e, "billing usage"),
+        (Ok(a), Ok(m), Ok(i)) => (a, m, i),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return internal(e, "billing usage"),
     };
     Json(Billing {
         enabled: app.billing_enabled,
@@ -150,7 +161,11 @@ async fn show(State(app): State<AppState>, t: InTeam) -> Response {
             cancel_at_period_end: s.cancel_at_period_end,
             comped: s.provider.as_deref() == Some("comp"),
         }),
-        usage: Usage { accounts, members },
+        usage: Usage {
+            accounts,
+            members,
+            inboxes,
+        },
     })
     .into_response()
 }

@@ -28340,7 +28340,11 @@ mod teams {
             assert_eq!(b["plan"], Value::Null);
             assert_eq!(b["limits"]["accounts"], Value::Null);
             assert_eq!(b["limits"]["automation"], true);
-            assert_eq!(b["usage"], json!({"accounts": 0, "members": 1}));
+            assert_eq!(
+                b["usage"],
+                json!({"accounts": 0, "members": 1, "inboxes": 0})
+            );
+            assert_eq!(b["limits"]["inboxes"], Value::Null);
             let c = s
                 .get("/v1/team/credits")
                 .add_header("cookie", cookie.clone())
@@ -28369,7 +28373,7 @@ mod teams {
             assert_eq!(b["plan"]["status"], "trialing");
             assert_eq!(
                 b["limits"],
-                json!({"accounts": 10, "members": 3, "automation": false, "contacts": null})
+                json!({"accounts": 10, "members": 3, "automation": false, "contacts": null, "inboxes": 1})
             );
             subscribe(&db, team, "automation", "active").await;
             let b = billing_of(&s, &owner).await;
@@ -28636,7 +28640,6 @@ mod teams {
                     json!({"name": "b", "text": "hi", "tag": "t"}),
                 ),
                 ("/v1/newsletters", json!({"subject": "s", "body": "b"})),
-                ("/v1/inboxes", json!({"name": "i"})),
             ];
             let (s, db) = server_where(|c| c.billing_enabled = true).await;
             let (_, owner, _) = user(&s, &db).await;
@@ -28692,6 +28695,64 @@ mod teams {
                 let (code, _) = post(&s, &owner, path, body.clone()).await;
                 assert_ne!(code, 402, "{path}");
             }
+        }
+
+        /// Inboxes stop at the plan's number, "All" left out; a downgrade keeps the ones made and
+        /// only refuses new ones; billing off caps nothing but the hard 50.
+        #[tokio::test]
+        #[serial]
+        async fn inboxes_stop_at_the_plan() {
+            let (s, db) = server_where(|c| c.billing_enabled = true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let refused = json!({"error": "plan_limit", "limit": "inboxes"});
+            let make = |n: usize| post(&s, &owner, "/v1/inboxes", json!({"name": format!("i{n}")}));
+            // "All" exists before any create, and never counts.
+            let list = s.get("/v1/inboxes").add_header("cookie", &owner).await;
+            assert_eq!(list.json::<Value>().as_array().unwrap().len(), 1);
+            assert_eq!(make(0).await, (402, refused.clone()), "no plan");
+            subscribe(&db, &team, "scheduler").await;
+            assert_eq!(make(1).await.0, 201);
+            assert_eq!(make(2).await, (402, refused.clone()));
+            let billing = s.get("/v1/team/billing").add_header("cookie", &owner).await;
+            let b: Value = billing.json();
+            assert_eq!(
+                (
+                    b["usage"]["inboxes"].clone(),
+                    b["limits"]["inboxes"].clone()
+                ),
+                (json!(1), json!(1))
+            );
+            subscribe(&db, &team, "automation").await;
+            for n in 2..=10 {
+                assert_eq!(make(n).await.0, 201, "{n}");
+            }
+            assert_eq!(make(11).await, (402, refused.clone()));
+            // A comped plan is the automation plan.
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE subscriptions SET provider = 'comp' WHERE team_id = $1",
+                [team.parse::<uuid::Uuid>().unwrap().into()],
+            ))
+            .await
+            .unwrap();
+            assert_eq!(make(11).await, (402, refused.clone()));
+            // A downgrade keeps all 10.
+            subscribe(&db, &team, "scheduler").await;
+            assert_eq!(make(12).await, (402, refused));
+            let list = s.get("/v1/inboxes").add_header("cookie", &owner).await;
+            assert_eq!(list.json::<Value>().as_array().unwrap().len(), 11);
+            // Self-hosted: no plan cap, the hard cap of 50 ("All" included) stays.
+            let (s, db) = server_where(|_| {}).await;
+            let (_, owner, _) = user(&s, &db).await;
+            s.get("/v1/inboxes").add_header("cookie", &owner).await;
+            for n in 1..50 {
+                let (code, _) =
+                    post(&s, &owner, "/v1/inboxes", json!({"name": format!("i{n}")})).await;
+                assert_eq!(code, 201, "{n}");
+            }
+            let (code, body) = post(&s, &owner, "/v1/inboxes", json!({"name": "last"})).await;
+            assert_eq!((code, body), (409, json!({"error": "too_many_inboxes"})));
         }
 
         /// Open invitations hold a seat: a plan of 3 members takes 2 invitations beside the owner.

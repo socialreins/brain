@@ -33,9 +33,11 @@ impl Kind {
 pub struct Limits {
     pub accounts: Option<i64>,
     pub members: Option<i64>,
-    /// The inbox, automations, broadcasts and newsletters.
+    /// Automations, broadcasts and newsletters.
     pub automation: bool,
     pub contacts: Option<i64>,
+    /// Custom inboxes ("All" never counts).
+    pub inboxes: Option<i64>,
 }
 
 impl Limits {
@@ -45,6 +47,7 @@ impl Limits {
             members: None,
             automation: true,
             contacts: None,
+            inboxes: None,
         }
     }
 
@@ -55,6 +58,7 @@ impl Limits {
             members: Some(0),
             automation: false,
             contacts: Some(0),
+            inboxes: Some(0),
         }
     }
 }
@@ -90,7 +94,8 @@ pub async fn subscription(
     let row = db
         .query_one_raw(stmt(
             "SELECT s.status, s.trial_ends_at, s.current_period_end, s.cancel_at_period_end, s.provider,
-                    p.id, p.name, p.max_accounts, p.max_members, p.automation, p.max_contacts
+                    p.id, p.name, p.max_accounts, p.max_members, p.automation, p.max_contacts,
+                    p.max_inboxes
              FROM subscriptions s JOIN plans p ON p.id = s.plan_id WHERE s.team_id = $1",
             vec![team.into()],
         ))
@@ -112,6 +117,7 @@ pub async fn subscription(
             members: count("max_members")?,
             automation: r.try_get("", "automation")?,
             contacts: count("max_contacts")?,
+            inboxes: count("max_inboxes")?,
         },
     }))
 }
@@ -138,6 +144,7 @@ pub enum Limit {
     Accounts,
     Members,
     Automation,
+    Inboxes,
     /// No live plan at all: publishing waits for one.
     Plan,
 }
@@ -148,6 +155,7 @@ impl Limit {
             Self::Accounts => "accounts",
             Self::Members => "members",
             Self::Automation => "automation",
+            Self::Inboxes => "inboxes",
             Self::Plan => "plan",
         }
     }
@@ -336,6 +344,7 @@ mod tests {
                 members: Some(3),
                 automation: false,
                 contacts: None,
+                inboxes: Some(1),
             },
         }
     }
@@ -354,7 +363,10 @@ mod tests {
         for s in ["trialing", "active", "past_due"] {
             assert_eq!(effective(true, Some(&sub(s))).accounts, Some(10), "{s}");
         }
+        assert_eq!(effective(true, Some(&sub("active"))).inboxes, Some(1));
         assert_eq!(effective(true, Some(&sub("canceled"))), Limits::none());
+        assert_eq!(Limits::none().inboxes, Some(0));
+        assert_eq!(Limits::unlimited().inboxes, None);
         assert_eq!(effective(true, None), Limits::none());
     }
 }
