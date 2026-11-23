@@ -74,7 +74,9 @@ fn https(url: Option<&str>) -> Option<String> {
     let url = url?.trim();
     let parsed = reqwest::Url::parse(url).ok()?;
     let ok = parsed.scheme() == "https" && parsed.host_str().is_some();
-    (ok && url.chars().count() <= MAX_URL_CHARS).then(|| parsed.to_string())
+    // The cap is on what is stored: percent-encoding can make the normalised form longer.
+    let stored = parsed.to_string();
+    (ok && stored.chars().count() <= MAX_URL_CHARS).then_some(stored)
 }
 
 impl Attachment {

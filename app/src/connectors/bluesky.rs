@@ -932,7 +932,8 @@ fn blob_cid(b: &Value) -> Option<&str> {
 }
 
 /// What a post record's `embed` shows, as Bluesky's CDN serves it for `did`'s blobs.
-fn embed_attachments(did: &str, embed: &Value) -> Vec<Attachment> {
+/// `post` is the post's page on bsky.app, which a video opens (its stream does not play in a tab).
+fn embed_attachments(did: &str, embed: &Value, post: Option<&str>) -> Vec<Attachment> {
     let did_ok = did.starts_with("did:")
         && did
             .chars()
@@ -956,7 +957,7 @@ fn embed_attachments(did: &str, embed: &Value) -> Vec<Attachment> {
             .and_then(|cid| {
                 // The stream is HLS, which a browser tab does not play: the still stands for it.
                 let thumb = format!("https://video.bsky.app/watch/{did}/{cid}/thumbnail.jpg");
-                Attachment::new("video", Some(&thumb), Some(&thumb))
+                Attachment::new("video", Some(post.unwrap_or(&thumb)), Some(&thumb))
             })
             .into_iter()
             .collect(),
@@ -969,7 +970,7 @@ fn embed_attachments(did: &str, embed: &Value) -> Vec<Attachment> {
                 .into_iter()
                 .collect()
         }
-        "app.bsky.embed.recordWithMedia" => embed_attachments(did, &embed["media"]),
+        "app.bsky.embed.recordWithMedia" => embed_attachments(did, &embed["media"], post),
         _ => Vec::new(),
     }
 }
@@ -1000,7 +1001,11 @@ pub fn notification(n: &Value) -> Option<Notification> {
     Some(Notification {
         kind,
         cid,
-        attachments: embed_attachments(&author.did, &n["record"]["embed"]),
+        attachments: embed_attachments(
+            &author.did,
+            &n["record"]["embed"],
+            post_url(&uri).as_deref(),
+        ),
         author,
         text: n["record"]["text"].as_str().unwrap_or_default().to_owned(),
         parent_uri: reply["parent"]["uri"].as_str().map(str::to_owned),
@@ -1750,10 +1755,12 @@ mod tests {
             serde_json::json!({"$type": "app.bsky.embed.recordWithMedia",
             "record": {}, "media": {"$type": "app.bsky.embed.video", "video": blob("bafv")}}),
         );
+        // The stream does not play in a tab: the video opens its post, its still is the preview.
         assert_eq!(video[0].kind, "video");
+        assert_eq!(video[0].url, "https://bsky.app/profile/did:plc:fan/post/r1");
         assert_eq!(
-            video[0].url,
-            "https://video.bsky.app/watch/did:plc:fan/bafv/thumbnail.jpg"
+            video[0].preview_url.as_deref(),
+            Some("https://video.bsky.app/watch/did:plc:fan/bafv/thumbnail.jpg")
         );
         let link = n(serde_json::json!({"$type": "app.bsky.embed.external",
             "external": {"uri": "https://example.com/a", "title": "A"}}));

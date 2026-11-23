@@ -90,7 +90,8 @@ fn message_attachments(msg: &Value) -> Vec<Attachment> {
                 "video" | "ig_reel" | "reel" => "video",
                 "audio" => "audio",
                 "file" => "file",
-                "share" | "story_mention" | "fallback" | "template" => "link",
+                "story_mention" => "image",
+                "share" | "fallback" | "template" => "link",
                 _ => return None,
             };
             Attachment::new(kind, p["url"].as_str(), None)
