@@ -210,11 +210,15 @@ pub struct PostInput {
     /// `account_ids` picks some.
     pub platform: String,
     /// The accounts to post to: ids of the team's accounts of `platform` in the set
-    /// (`GET /connections`). Absent or `null`: every one, including an account added to the set
-    /// later. An empty list, or an id that is not such an account, is `422 invalid_accounts`
-    /// (`field: "account_ids"`, `social_account_id` the first bad one). An account that leaves
-    /// the set or is disconnected before the post goes out gets a `failed` target saying so.
-    pub account_ids: Option<Vec<Uuid>>,
+    /// (`GET /connections`). `null` or `[]`: every one, including an account added to the set
+    /// later. Absent: every one on a create, and unchanged on an update. An id that is not such
+    /// an account is `422 invalid_accounts` (`field: "account_ids"`, `social_account_id` the
+    /// first bad one). An account that leaves the set or is disconnected before the post goes
+    /// out gets a `failed` target saying so.
+    #[serde(default, deserialize_with = "super::teams::present")]
+    #[schema(value_type = Option<Vec<Uuid>>)]
+    #[schemars(with = "Option<Vec<Uuid>>")]
+    pub account_ids: Option<Option<Vec<Uuid>>>,
     /// At most 300 graphemes on Bluesky, 500 characters on Threads, 3000 on LinkedIn, 63206 on Facebook, 2200 on
     /// Instagram, 280 on X as X counts them (a link is 23, a CJK character or emoji 2; 25,000 when every X account of the set has a paid X plan, its connection's `long_posts`). On YouTube the first line is the video's title (required, at most 100 characters)
     /// and the rest its description (at most 5000 bytes); neither may hold `<` or `>`
@@ -338,8 +342,8 @@ pub struct PostGroupInput {
     /// connected account in the set (`422 no_accounts` when there is none), which includes
     /// TikTok, so then `tiktok` is required too.
     pub platforms: Option<Vec<String>>,
-    /// The accounts to post to, of any platform: each post gets those of its platform. Absent
-    /// or `null`: every account of each platform. With it and no `platforms`, the platforms are
+    /// The accounts to post to, of any platform: each post gets those of its platform. Absent,
+    /// `null` or `[]`: every account of each platform. With it and no `platforms`, the platforms are
     /// those of these accounts. An id that is not the team's account in the set, or a platform
     /// none of them is on, is `422 invalid_accounts`.
     pub account_ids: Option<Vec<Uuid>>,
@@ -1104,7 +1108,7 @@ async fn checked_fully(
         Ok(set) => set,
         Err(res) => return Ok(Err(res)),
     };
-    let only = input.account_ids.as_deref();
+    let only = input.chosen();
     Ok(match preflight(app, a, set, input.into(), only).await? {
         Some(res) => Err(res),
         None => Ok(set),
@@ -1164,35 +1168,40 @@ fn stored_youtube(input: &PostInput) -> Option<serde_json::Value> {
         .and_then(|y| serde_json::to_value(y).ok())
 }
 
+impl PostInput {
+    /// The accounts chosen; `None` for every one (absent, `null` or `[]`).
+    fn chosen(&self) -> Option<&[Uuid]> {
+        let ids = self.account_ids.as_ref()?.as_deref()?;
+        (!ids.is_empty()).then_some(ids)
+    }
+}
+
 /// The chosen accounts as saved, each once.
 fn stored_accounts(input: &PostInput) -> Option<serde_json::Value> {
-    input.account_ids.as_ref().map(|ids| {
-        let mut ids = ids.clone();
+    input.chosen().map(|ids| {
+        let mut ids = ids.to_vec();
         ids.sort();
         ids.dedup();
         serde_json::json!(ids)
     })
 }
 
-/// The problem with a post's `account_ids`: none chosen, or one that is not the team's account
-/// of the post's platform in `set`.
+/// The problem with a post's `account_ids`: one that is not the team's account of the post's
+/// platform in `set`.
 async fn account_problem(
     db: &impl ConnectionTrait,
     team: Uuid,
     set: Uuid,
     input: &PostInput,
 ) -> Result<Option<Problem>, DbErr> {
-    let Some(ids) = &input.account_ids else {
+    let Some(ids) = input.chosen() else {
         return Ok(None);
     };
     let found = accounts_in(db, team, set).await?;
     let fits = |id: &Uuid| found.iter().any(|(p, a)| a == id && *p == input.platform);
     let bad = ids.iter().find(|id| !fits(id));
-    if ids.is_empty() || bad.is_some() {
-        let detail = format!(
-            "Pick at least one {} account of this set; a picked account must be one.",
-            input.platform
-        );
+    if bad.is_some() {
+        let detail = format!("Pick {} accounts of this set only.", input.platform);
         return Ok(Some(Problem {
             code: "invalid_accounts".into(),
             field: Some("account_ids".into()),
@@ -1382,12 +1391,7 @@ impl Check {
                 .iter()
                 .filter(|(provider, _)| *provider == self.input.platform)
                 .map(|(_, id)| *id)
-                .filter(|id| {
-                    self.input
-                        .account_ids
-                        .as_ref()
-                        .is_none_or(|c| c.contains(id))
-                })
+                .filter(|id| self.input.chosen().is_none_or(|c| c.contains(id)))
                 .collect(),
             ok: problems.is_empty(),
             problems,
@@ -1457,7 +1461,7 @@ async fn examine(
     }
     for c in &mut checks {
         let level = tiktok_level(&Draft::from(&c.input)).map(str::to_owned);
-        let only = c.input.account_ids.clone();
+        let only = c.input.chosen().map(<[Uuid]>::to_vec);
         if let Some(level) = level.filter(|_| !has(c, "tiktok")) {
             c.account = tiktok_offered(app, a, set, &level, only.as_deref()).await?;
         }
@@ -1851,7 +1855,7 @@ pub(crate) async fn create_group_guarded(
         if input.queue && !queue::has_slots(&app.db, set).await? {
             return Ok(queue_empty());
         }
-        let chosen = match &input.account_ids {
+        let chosen = match input.account_ids.as_ref().filter(|ids| !ids.is_empty()) {
             Some(ids) => {
                 let found = accounts_in(&app.db, a.team.id, set).await?;
                 let of = |id: &Uuid| {
@@ -1882,6 +1886,13 @@ pub(crate) async fn create_group_guarded(
         platforms.retain(|p| seen.insert(p.clone()));
         if platforms.is_empty() {
             return Ok(stop(reply(StatusCode::UNPROCESSABLE_ENTITY, "no_accounts")).await);
+        }
+        // A platform none of the chosen accounts is on: an empty pick would mean every account.
+        if let Some(c) = &chosen {
+            if platforms.iter().any(|p| !c.iter().any(|(cp, _)| cp == p)) {
+                let res = reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_accounts");
+                return Ok(stop(res).await);
+            }
         }
         let mut problems = Vec::new();
         if input.overrides.keys().any(|p| !platforms.contains(p)) {
@@ -1923,7 +1934,7 @@ pub(crate) async fn create_group_guarded(
                         .or_else(|| input.youtube.clone().filter(|_| platform == "youtube")),
                     account_ids: chosen.as_ref().map(|c| {
                         let mine = c.iter().filter(|(p, _)| *p == platform);
-                        mine.map(|(_, id)| *id).collect()
+                        Some(mine.map(|(_, id)| *id).collect())
                     }),
                     platform,
                     scheduled_at: input.scheduled_at,
@@ -2113,7 +2124,7 @@ async fn update(
 }
 
 /// The body of `PUT /posts/{id}`, shared with the MCP `update-post` tool.
-pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) -> Response {
+pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, mut input: PostInput) -> Response {
     if input.queue {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "queue_not_supported");
     }
@@ -2123,6 +2134,15 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, input: PostInput) 
         };
         if !editable(&found.status) {
             return Ok(Err(reply(StatusCode::CONFLICT, "not_editable")));
+        }
+        // Absent keeps the accounts chosen before; only `null` or `[]` resets to every one.
+        if input.account_ids.is_none() {
+            input.account_ids = Some(
+                found
+                    .account_ids
+                    .clone()
+                    .and_then(|v| serde_json::from_value(v).ok()),
+            );
         }
         let set = match checked_fully(app, a, &input).await? {
             Ok(set) => set,
