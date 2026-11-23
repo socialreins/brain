@@ -56,6 +56,7 @@ mod m20261215_000001_inbox_automated;
 mod m20261216_000001_plan_inboxes;
 mod m20261217_000001_inbox_accounts;
 mod m20261218_000001_ai_monthly;
+mod m20261219_000001_inbox_attachments;
 mod m20261220_000001_post_account_ids;
 
 pub struct Migrator;
@@ -120,6 +121,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261216_000001_plan_inboxes::Migration),
             Box::new(m20261217_000001_inbox_accounts::Migration),
             Box::new(m20261218_000001_ai_monthly::Migration),
+            Box::new(m20261219_000001_inbox_attachments::Migration),
             Box::new(m20261220_000001_post_account_ids::Migration),
             // inject-above (do not remove this comment)
         ]
