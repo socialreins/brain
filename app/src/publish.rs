@@ -876,6 +876,26 @@ const CLAIM_BATCH: i64 = 50;
 const POSTS_AT_ONCE: usize = 8;
 static POST_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(POSTS_AT_ONCE));
 static TARGET_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(8));
+/// Posts, and targets, one team publishes at once in this process, taken before the shared
+/// slots above: a team with many large videos waits for its own, and never holds all of those.
+pub const TEAM_AT_ONCE: usize = 3;
+type TeamSlots = std::sync::Mutex<HashMap<Uuid, Arc<Semaphore>>>;
+static TEAM_POSTS: LazyLock<TeamSlots> = LazyLock::new(TeamSlots::default);
+static TEAM_TARGETS: LazyLock<TeamSlots> = LazyLock::new(TeamSlots::default);
+
+/// The team's semaphore in `slots`. shortcut: one small entry per team ever seen, never removed;
+/// prune idle ones if a process ever serves very many teams.
+fn team_slot(slots: &TeamSlots, team: Uuid) -> Arc<Semaphore> {
+    let mut map = slots.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(team)
+        .or_insert_with(|| Arc::new(Semaphore::new(TEAM_AT_ONCE)))
+        .clone()
+}
+
+/// What a post fails with when its set is deleted before it goes out.
+pub const SET_DELETED: &str =
+    "Not posted: its account set was deleted before it was due. Restoring the set does not \
+     schedule it again.";
 /// How long a stopping process (`stop`) waits for the posts it is publishing before it exits
 /// (`drain`). Keep it under the grace the platform gives between SIGTERM and the kill (on
 /// Railway `RAILWAY_DEPLOYMENT_DRAINING_SECONDS`, which has to be set above this to matter).
@@ -1294,13 +1314,27 @@ async fn unclaim(db: &DatabaseConnection, id: Uuid, error: Option<&str>) -> Resu
 /// claimed and nothing touched: one with its quota reserved (publish now, or underway) or any
 /// target (a retry, or underway) stays `queued`.
 async fn release(db: &DatabaseConnection, id: Uuid) -> Result<(), DbErr> {
+    release_where(db, Some(id)).await.map(|_| ())
+}
+
+/// On start: `release` for every post, so the posts a killed process had claimed and not started
+/// go out at the next round, not `STUCK_MINUTES` later. Safe beside other instances: a post one
+/// of them claimed is only put back while it has no quota reserved, and that instance's run then
+/// fails to reserve it (`Quota::Lost`, the post is no longer `queued`) and leaves it to the
+/// round that claims it again; one it already started is never touched. Returns how many.
+pub async fn release_unstarted(db: &DatabaseConnection) -> Result<u64, DbErr> {
+    release_where(db, None).await
+}
+
+async fn release_where(db: &DatabaseConnection, id: Option<Uuid>) -> Result<u64, DbErr> {
     let stmt = sql(
         "UPDATE posts SET status = 'scheduled', updated_at = now() \
-         WHERE id = $1 AND status = 'queued' AND NOT quota_reserved AND NOT fanned_out \
+         WHERE ($1::uuid IS NULL OR id = $1) AND status = 'queued' AND NOT quota_reserved \
+         AND NOT fanned_out \
          AND NOT EXISTS (SELECT 1 FROM post_targets t WHERE t.post_id = posts.id)",
         vec![id.into()],
     );
-    db.execute_raw(stmt).await.map(|_| ())
+    Ok(db.execute_raw(stmt).await?.rows_affected())
 }
 
 /// Targets cut off mid-publish become `failed` and are never sent again; their posts settle.
@@ -1420,6 +1454,17 @@ const PLAN_ENDED: &str = "The team's plan has ended. The post goes out if a plan
 /// published at most once, then the post settles.
 pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
     let db = &app.db;
+    // The team's own slot first, so posts waiting on it never hold a shared one.
+    let team = posts::Entity::find_by_id(id)
+        .select_only()
+        .column(posts::Column::TeamId)
+        .into_tuple::<Uuid>()
+        .one(db)
+        .await?;
+    let Some(team) = team else {
+        return Ok(());
+    };
+    let _team_slot = team_slot(&TEAM_POSTS, team).acquire_owned().await;
     let Ok(_slot) = POST_SLOTS.acquire().await else {
         return release(db, id).await;
     };
@@ -1472,8 +1517,8 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         .await?
         .is_some();
     if !set_live {
-        // The set was deleted after the claim: back to `scheduled`, to go out if it returns.
-        return unclaim(db, id, None).await;
+        // The set was deleted after the claim: as the delete fails its scheduled posts.
+        return fail_post(db, id, SET_DELETED).await;
     }
     if publisher(app, &post.platform).is_none() {
         let msg = format!("Publishing to {} is not available yet.", post.platform);
@@ -2044,6 +2089,7 @@ async fn publish_target_held(
     stored: &Media,
     hold: &mut Option<XHold>,
 ) -> Result<(), DbErr> {
+    let _team_slot = team_slot(&TEAM_TARGETS, post.team_id).acquire_owned().await;
     let Ok(_slot) = TARGET_SLOTS.acquire().await else {
         return Ok(());
     };

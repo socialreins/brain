@@ -30,7 +30,7 @@ use super::{
     waitlist::{error, Error},
 };
 use crate::{
-    models::{api_tokens, social_account_social_set as membership, social_sets, teams},
+    models::{api_tokens, posts, social_account_social_set as membership, social_sets, teams},
     scheduler::RESTORE_DAYS,
     state::AppState,
 };
@@ -289,7 +289,9 @@ async fn rename(
 
 /// Deletes a set, restorable for 30 days. Owners and admins, with a sign-in from the last 10
 /// minutes (else `403 reauth_required`). The default set cannot go (`409 default_set`). Revokes
-/// the API tokens limited to the set; a restore does not bring them back. Any body is ignored.
+/// the API tokens limited to the set; a restore does not bring them back. Its scheduled posts
+/// fail, saying the set was deleted, and a restore does not schedule them again. Thirty days on,
+/// the purge deletes the set with all its posts. Any body is ignored.
 #[utoipa::path(delete, path = "/social-sets/{id}", tag = "social-sets",
     params(("id" = Uuid, Path)),
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
@@ -326,6 +328,21 @@ async fn destroy(
         if r.rows_affected != 1 {
             return Ok(false);
         }
+        posts::Entity::update_many()
+            .col_expr(posts::Column::Status, "failed".into())
+            .col_expr(
+                posts::Column::Error,
+                Some(crate::publish::SET_DELETED.to_owned()).into(),
+            )
+            .col_expr(
+                posts::Column::Repeat,
+                Option::<serde_json::Value>::None.into(),
+            )
+            .col_expr(posts::Column::UpdatedAt, now.into())
+            .filter(posts::Column::SocialSetId.eq(id))
+            .filter(posts::Column::Status.eq("scheduled"))
+            .exec(&txn)
+            .await?;
         api_tokens::Entity::update_many()
             .col_expr(api_tokens::Column::RevokedAt, now.into())
             .filter(api_tokens::Column::SocialSetId.eq(id))

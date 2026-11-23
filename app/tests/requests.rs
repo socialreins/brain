@@ -8032,6 +8032,162 @@ mod teams {
                     assert_eq!(mail_for(&seen.lock().unwrap(), &owner).len(), 10);
                 }
 
+                async fn status_of(db: &DatabaseConnection, id: &str) -> String {
+                    posts::Entity::find_by_id(id.parse::<uuid::Uuid>().unwrap())
+                        .one(db)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn posts_claimed_and_not_started_are_released_on_start() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let soon = (Utc::now() + Duration::hours(1)).to_rfc3339();
+                    let idle = id_of(&create(&s, &cookie, input(&set, "idle", Some(&soon))).await);
+                    let started =
+                        id_of(&create(&s, &cookie, input(&set, "started", Some(&soon))).await);
+                    let paid = id_of(&create(&s, &cookie, input(&set, "paid", Some(&soon))).await);
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE posts SET status = 'queued', scheduled_at = now() \
+                             WHERE id IN ('{idle}', '{started}', '{paid}'); \
+                             UPDATE posts SET quota_reserved = true WHERE id = '{paid}'; \
+                             INSERT INTO post_targets (id, post_id, status) \
+                             VALUES (gen_random_uuid(), '{started}', 'publishing')"
+                        ),
+                    )
+                    .await;
+                    let n = publish::release_unstarted(&db).await.unwrap();
+                    assert!(n >= 1);
+                    assert_eq!(status_of(&db, &idle).await, "scheduled");
+                    // Started, or holding its quota (another instance underway): left alone.
+                    assert_eq!(status_of(&db, &started).await, "queued");
+                    assert_eq!(status_of(&db, &paid).await, "queued");
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(status_of(&db, &idle).await, "published");
+                    exec(
+                        &db,
+                        format!(
+                            "DELETE FROM post_targets WHERE post_id = '{started}'; \
+                             UPDATE posts SET status = 'draft' WHERE id IN ('{started}', '{paid}')"
+                        ),
+                    )
+                    .await;
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_daily_post_keeps_its_time_in_the_queue_zone_across_dst() {
+                    let (s, db, _) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    exec(
+                        &db,
+                        format!(
+                            "INSERT INTO queue_schedules (social_set_id, team_id, time_zone) \
+                             VALUES ('{set}', '{team_id}', 'America/New_York')"
+                        ),
+                    )
+                    .await;
+                    // 9:00 in New York the day before clocks spring forward (EST, 14:00 UTC).
+                    let at = "2027-03-13T14:00:00Z";
+                    let id = id_of(&create(&s, &cookie, input(&set, "nine", Some(at))).await);
+                    let rule =
+                        json!({"every": "day", "interval": 1, "until": null, "remaining": 2});
+                    let res = req(&s, Method::PUT, &format!("/v1/posts/{id}/repeat"), &cookie)
+                        .json(&rule)
+                        .await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let res = req(
+                        &s,
+                        Method::POST,
+                        &format!("/v1/posts/{id}/publish"),
+                        &cookie,
+                    )
+                    .await;
+                    assert_eq!(res.status_code(), 202, "{}", res.text());
+                    settled(&s, &cookie, &id).await;
+                    let copies = posts::Entity::find()
+                        .filter(posts::Column::TeamId.eq(team_id.parse::<uuid::Uuid>().unwrap()))
+                        .filter(posts::Column::Status.eq("scheduled"))
+                        .all(&db)
+                        .await
+                        .unwrap();
+                    assert_eq!(copies.len(), 1);
+                    // 9:00 EDT is 13:00 UTC.
+                    let next = copies[0].scheduled_at.unwrap().to_utc();
+                    assert_eq!(next.to_rfc3339(), "2027-03-14T13:00:00+00:00");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn deleting_a_set_fails_its_scheduled_posts() {
+                    let (s, db, _) = on_mock().await;
+                    let (cookie, _, _) = owner_with_account(&s, &db).await;
+                    let res = req(&s, Method::POST, "/v1/social-sets", &cookie)
+                        .json(&json!({"name": format!("Gone {}", uuid::Uuid::now_v7())}))
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let set = id_of(&res);
+                    let soon = (Utc::now() + Duration::hours(1)).to_rfc3339();
+                    let res = create(&s, &cookie, input(&set, "planned", Some(&soon))).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let id = id_of(&res);
+                    let draft = id_of(&create(&s, &cookie, input(&set, "draft", None)).await);
+                    req(
+                        &s,
+                        Method::DELETE,
+                        &format!("/v1/social-sets/{set}"),
+                        &cookie,
+                    )
+                    .json(&json!({}))
+                    .await
+                    .assert_status(axum::http::StatusCode::NO_CONTENT);
+                    let p = posts::Entity::find_by_id(id.parse::<uuid::Uuid>().unwrap())
+                        .one(&db)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(p.status, "failed");
+                    assert_eq!(p.error.as_deref(), Some(publish::SET_DELETED));
+                    assert_eq!(status_of(&db, &draft).await, "draft");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_repeat_copy_that_cannot_be_made_is_mailed_about() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let id = id_of(&create(&s, &cookie, input(&set, "rule", Some(&past()))).await);
+                    // A rule that cannot be read: the copy fails, the post still goes out.
+                    exec(
+                        &db,
+                        format!("UPDATE posts SET repeat = '{{\"every\": 5}}' WHERE id = '{id}'"),
+                    )
+                    .await;
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(status_of(&db, &id).await, "published");
+                    let row = db
+                        .query_one_raw(sea_orm::Statement::from_string(
+                            sea_orm::DbBackend::Postgres,
+                            format!(
+                                "SELECT count(*) AS n FROM post_notices \
+                                 WHERE post_id = '{id}' AND kind = 'repeat_ended'"
+                            ),
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(row.try_get::<i64>("", "n").unwrap(), 1);
+                }
+
                 #[test]
                 fn only_errors_that_sent_nothing_are_retry_safe() {
                     assert!(publish::retry_safe(

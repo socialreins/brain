@@ -58,6 +58,7 @@ mod m20261217_000001_inbox_accounts;
 mod m20261218_000001_ai_monthly;
 mod m20261219_000001_target_retry;
 mod m20261220_000001_post_notices;
+mod m20261221_000001_repeat_ended_notice;
 
 pub struct Migrator;
 
@@ -123,6 +124,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261218_000001_ai_monthly::Migration),
             Box::new(m20261219_000001_target_retry::Migration),
             Box::new(m20261220_000001_post_notices::Migration),
+            Box::new(m20261221_000001_repeat_ended_notice::Migration),
             // inject-above (do not remove this comment)
         ]
     }

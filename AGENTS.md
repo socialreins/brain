@@ -104,6 +104,11 @@ cargo run -p socialreins-brain
   copy is still made. A target retries once by itself, 5 minutes on (`post_targets.retry_at`,
   `retried`), only after an error a connector marked `connectors::UNSENT` (a rate limit, a
   connection that never opened) and never once its remote id is saved.
+- `app/src/publish.rs`: on start, `release_unstarted` hands posts claimed and never started back to
+  `scheduled`. A team publishes at most `TEAM_AT_ONCE` (3) posts and 3 targets at once in a
+  process, taken before the shared slots. Deleting a set fails its scheduled posts
+  (`SET_DELETED`); the 30-day purge deletes the set with all its posts (cascade). Repeats step
+  in the set's queue time zone (`repeat.rs`), and a copy that cannot be made is mailed about.
 - `app/src/post_mail.rs`: a post that settles as failed or partly failed, or goes back to draft
   for being late, queues a `post_notices` row in the same transaction; each publish round mails
   the queued ones in the background to the post's author and the team's owners, once, at most
