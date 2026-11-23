@@ -267,8 +267,10 @@ impl YouTube {
         step: &str,
     ) -> Result<(StatusCode, HeaderMap, Value), PostError> {
         let res = req.send().await.map_err(|e| {
+            let sure = crate::connectors::never_sent(&e);
             tracing::warn!(error = %e.without_url(), step, "youtube call failed");
-            failed(format!("{step}: YouTube could not be reached."))
+            let msg = format!("{step}: YouTube could not be reached.");
+            failed(super::unsent(msg, sure))
         })?;
         let status = res.status();
         let headers = res.headers().clone();

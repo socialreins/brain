@@ -98,6 +98,8 @@ type Params<'a> = &'a [(&'a str, &'a str)];
 /// A call that did not succeed: not reached, or Graph's status and error body.
 enum Refused {
     Unreachable,
+    /// Not reached, and the connection never opened: nothing was sent.
+    NeverSent,
     Graph(reqwest::StatusCode, Value),
 }
 
@@ -106,10 +108,22 @@ enum Refused {
 fn post_error(refused: Refused, step: &str) -> PostError {
     match refused {
         Refused::Unreachable => failed(format!("{step}: Meta could not be reached.")),
+        Refused::NeverSent => failed(super::unsent(
+            format!("{step}: Meta could not be reached."),
+            true,
+        )),
         Refused::Graph(_, body) if dead_or_denied(&body).is_some() => {
             dead_or_denied(&body).unwrap_or(PostError::Reconnect)
         }
-        Refused::Graph(status, body) => failed(format!("{step}: {}", reason(&body, status))),
+        Refused::Graph(status, body) => {
+            // A throttle (codes 4, 17, 32 and 613, or a `429`) refused the call outright.
+            let code = body["error"]["code"].as_i64();
+            let throttled = status.as_u16() == 429 || matches!(code, Some(4 | 17 | 32 | 613));
+            failed(super::unsent(
+                format!("{step}: {}", reason(&body, status)),
+                throttled,
+            ))
+        }
     }
 }
 
@@ -286,8 +300,13 @@ impl Meta {
             req = req.form(f);
         }
         let res = req.send().await.map_err(|e| {
+            let sure = crate::connectors::never_sent(&e);
             tracing::warn!(error = %e.without_url(), step, "meta call failed");
-            Refused::Unreachable
+            if sure {
+                Refused::NeverSent
+            } else {
+                Refused::Unreachable
+            }
         })?;
         let status = res.status();
         let body: Value = res.json().await.unwrap_or(Value::Null);

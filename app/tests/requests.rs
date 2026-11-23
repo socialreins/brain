@@ -3706,6 +3706,8 @@ mod teams {
         /// Set: the next `createRecord` is refused as an expired session.
         static EXPIRE_NEXT: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
+        /// Set: the next `createRecord` of a text with `BUSYONCE` is refused for the rate limit.
+        static BUSY_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         /// The record key of every `deleteRecord` the mock took, newest last.
         static DELETED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -3867,6 +3869,11 @@ mod teams {
                 return (axum::http::StatusCode::BAD_REQUEST, Json(err));
             }
             let text = b["record"]["text"].as_str().unwrap_or_default().to_owned();
+            let busy_once = text.contains("BUSYONCE")
+                && BUSY_ONCE.swap(false, std::sync::atomic::Ordering::SeqCst);
+            if busy_once || (text.contains("BUSY") && !text.contains("BUSYONCE")) {
+                return refused(429, "RateLimitExceeded");
+            }
             if text.contains("REJECT") {
                 let leak = json!({"error": "InvalidRequest",
                     "message": "see https://secret.example/?token=abc"});
@@ -7739,6 +7746,191 @@ mod teams {
                 assert_eq!(count().await, before);
             }
 
+            mod schedule_rules {
+                use super::*;
+                use sea_orm::ConnectionTrait;
+
+                async fn exec(db: &DatabaseConnection, sql: String) {
+                    db.execute_unprepared(&sql).await.unwrap();
+                }
+
+                /// A scheduled post due `minutes` ago.
+                async fn due_ago(
+                    s: &TestServer,
+                    db: &DatabaseConnection,
+                    cookie: &str,
+                    body: Value,
+                    minutes: i64,
+                ) -> String {
+                    let res = create(s, cookie, body).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let id = id_of(&res);
+                    let at = (Utc::now() - Duration::minutes(minutes)).to_rfc3339();
+                    exec(
+                        db,
+                        format!("UPDATE posts SET scheduled_at = '{at}' WHERE id = '{id}'"),
+                    )
+                    .await;
+                    id
+                }
+
+                /// Makes every waiting retry of the post due now.
+                async fn retry_now(db: &DatabaseConnection, id: &str) {
+                    exec(
+                        db,
+                        format!(
+                            "UPDATE post_targets SET retry_at = now() - interval '1 second' \
+                             WHERE post_id = '{id}' AND retry_at IS NOT NULL"
+                        ),
+                    )
+                    .await;
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_post_over_an_hour_late_goes_back_to_draft() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let soon = Some(past());
+                    let records = RECORDS.lock().unwrap().len();
+                    let late =
+                        due_ago(&s, &db, &cookie, input(&set, "late", soon.as_deref()), 61).await;
+                    let fine =
+                        due_ago(&s, &db, &cookie, input(&set, "fine", soon.as_deref()), 59).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &late).await;
+                    assert_eq!(p["status"], "draft", "{p}");
+                    let why = p["error"].as_str().unwrap();
+                    assert!(why.starts_with("Not posted: it was due at "), "{why}");
+                    assert!(
+                        why.ends_with(" UTC and is more than an hour late. Schedule it again."),
+                        "{why}"
+                    );
+                    assert_eq!(p["targets"], json!([]), "{p}");
+                    assert_eq!(get_post(&s, &cookie, &fine).await["status"], "published");
+                    assert_eq!(
+                        RECORDS.lock().unwrap().len(),
+                        records + 1,
+                        "only one went out"
+                    );
+
+                    // A post left queued by a crash before any target started, now late: draft too.
+                    let left =
+                        due_ago(&s, &db, &cookie, input(&set, "left", soon.as_deref()), 90).await;
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE posts SET status = 'queued', \
+                             updated_at = now() - interval '40 minutes' WHERE id = '{left}'"
+                        ),
+                    )
+                    .await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &left).await;
+                    assert_eq!(p["status"], "draft", "{p}");
+                    assert_eq!(RECORDS.lock().unwrap().len(), records + 1);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_rate_limit_is_retried_once_five_minutes_later() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let id = id_of(&create(&s, &cookie, input(&set, "BUSY", Some(&past()))).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "queued", "{p}");
+                    let t = &p["targets"][0];
+                    assert_eq!(t["status"], "pending", "{p}");
+                    assert_eq!(t["retried"], true);
+                    let why = t["error"].as_str().unwrap();
+                    assert!(why.ends_with("Nothing was posted."), "{why}");
+                    let wait = post_targets::Entity::find_by_id(
+                        t["id"].as_str().unwrap().parse::<uuid::Uuid>().unwrap(),
+                    )
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .retry_at
+                    .unwrap();
+                    let left = wait.to_utc() - Utc::now();
+                    assert!(left > Duration::minutes(4) && left <= Duration::minutes(5));
+                    // Not before its time, and a manual retry waits for it.
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(
+                        get_post(&s, &cookie, &id).await["targets"][0]["status"],
+                        "pending"
+                    );
+                    let res =
+                        req(&s, Method::POST, &format!("/v1/posts/{id}/retry"), &cookie).await;
+                    assert_eq!(res.status_code(), 409);
+                    // Due: sent again, refused again, and failed for good.
+                    retry_now(&db, &id).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    assert_eq!(p["targets"][0]["status"], "failed");
+                    assert_eq!(p["targets"][0]["retried"], true);
+
+                    // Once is enough when the platform takes it the second time.
+                    BUSY_ONCE.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let id =
+                        id_of(&create(&s, &cookie, input(&set, "BUSYONCE", Some(&past()))).await);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "queued");
+                    retry_now(&db, &id).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(p["targets"][0]["retried"], true);
+                    assert_eq!(p["targets"][0]["error"], Value::Null);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn other_failures_and_a_started_thread_are_never_retried() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let id =
+                        id_of(&create(&s, &cookie, input(&set, "REJECT", Some(&past()))).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    assert_eq!(p["targets"][0]["retried"], false);
+                    // The root is up (a remote id), so a rate limit on part 2 fails the target.
+                    let mut thread = input(&set, "root", Some(&past()));
+                    thread["thread"] = json!([{"body": "BUSY part", "media": []}]);
+                    let id = id_of(&create(&s, &cookie, thread).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let t = &p["targets"][0];
+                    assert_eq!(t["status"], "failed", "{p}");
+                    assert_eq!(t["retried"], false);
+                    assert!(t["remote_id"].is_string());
+                    assert!(publish::retry_safe(t["error"].as_str().unwrap()));
+                }
+
+                #[test]
+                fn only_errors_that_sent_nothing_are_retry_safe() {
+                    assert!(publish::retry_safe(
+                        "Bluesky is rate limiting this account. Nothing was posted."
+                    ));
+                    assert!(publish::retry_safe(
+                        "Publish: X could not be reached. Nothing was posted."
+                    ));
+                    assert!(!publish::retry_safe("Publish: X could not be reached."));
+                    assert!(!publish::retry_safe(
+                        "Timed out; it may have posted, check the account. Nothing was posted."
+                    ));
+                    assert!(!publish::retry_safe("Bluesky refused it (InvalidRequest)."));
+                }
+            }
+
             mod approvals {
                 use super::*;
 
@@ -8273,6 +8465,29 @@ mod teams {
 
                 fn time(p: &Value) -> DateTime<Utc> {
                     p["scheduled_at"].as_str().unwrap().parse().unwrap()
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_late_post_goes_to_draft_and_its_series_goes_on() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, _, set) = team(&s, &db).await;
+                    let id = scheduled(&s, &cookie, &set).await;
+                    repeating(&s, &cookie, &id, daily()).await;
+                    let due = (Utc::now() - Duration::hours(2)).trunc_subsecs(0);
+                    at(&db, &id, due).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "draft", "{p}");
+                    assert_eq!(p["repeat"], Value::Null, "the copy carries the rule");
+                    let copies: Vec<Value> = with_rule(&s, &cookie)
+                        .await
+                        .into_iter()
+                        .filter(|c| c["body"] == "again" && time(c) == due + Duration::days(1))
+                        .collect();
+                    assert_eq!(copies.len(), 1, "{copies:?}");
+                    assert_eq!(copies[0]["status"], "scheduled");
+                    assert_eq!(copies[0]["repeat"]["every"], "day");
                 }
 
                 #[tokio::test]

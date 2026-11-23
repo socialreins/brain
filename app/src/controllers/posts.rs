@@ -162,6 +162,10 @@ pub struct Target {
     pub comment_error: Option<String>,
     /// Why the cover could not be set on the published video; a warning, the post is up.
     pub cover_error: Option<String>,
+    /// The target was sent again once by itself, about 5 minutes after an error that certainly
+    /// posted nothing (a rate limit, or the platform out of reach). A waiting retry is `pending`
+    /// with that error.
+    pub retried: bool,
     /// The post's counts on the platform, read every hour for two days and twice a day up to
     /// 30 days; `null` before the first read and on platforms that give none (`GET /analytics`).
     pub metrics: Option<Metrics>,
@@ -579,6 +583,7 @@ async fn targets_of(
             comment_id: t.comment_id,
             comment_error: t.comment_error,
             cover_error: t.cover_error,
+            retried: t.retried,
             metrics: read.map(|m| Metrics {
                 likes: m.likes,
                 comments: m.comments,

@@ -519,8 +519,10 @@ impl Bluesky {
             .send()
             .await
             .map_err(|e| {
+                let sure = crate::connectors::never_sent(&e);
                 tracing::warn!(error = %e.without_url(), method, "bluesky call failed");
-                failed("Bluesky could not be reached.")
+                let msg = "Bluesky could not be reached.".to_owned();
+                failed(crate::connectors::unsent(msg, sure))
             })?;
         let status = res.status();
         let answer: Value = json_body(res, method).await.unwrap_or_default();
@@ -532,7 +534,10 @@ impl Bluesky {
             StatusCode::OK => Ok(answer),
             StatusCode::UNAUTHORIZED => Err(PostError::Reconnect),
             _ if expired => Err(PostError::Reconnect),
-            StatusCode::TOO_MANY_REQUESTS => Err(failed("Bluesky is rate limiting this account.")),
+            StatusCode::TOO_MANY_REQUESTS => Err(failed(crate::connectors::unsent(
+                "Bluesky is rate limiting this account.".into(),
+                true,
+            ))),
             _ => Err(failed(format!("Bluesky refused it ({code})."))),
         }
     }
@@ -560,7 +565,10 @@ impl Bluesky {
         for fresh in [false, true] {
             let s = self.live(c, fresh).await.map_err(|e| match e {
                 InboxError::Reconnect => PostError::Reconnect,
-                InboxError::RateLimited => failed("Bluesky is rate limiting this account."),
+                InboxError::RateLimited => failed(crate::connectors::unsent(
+                    "Bluesky is rate limiting this account.".into(),
+                    true,
+                )),
                 InboxError::Invalid(_) => failed("The account's Bluesky server is not supported."),
                 _ => failed("Bluesky could not be reached."),
             })?;

@@ -162,13 +162,14 @@ fn describe(status: StatusCode, headers: &HeaderMap, body: &Value) -> String {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<i64>().ok())
             .and_then(|s| DateTime::from_timestamp(s, 0));
-        return match reset {
+        let msg = match reset {
             Some(at) => format!(
-                "X rate limit reached; it resets at {} UTC. It was not retried.",
+                "X rate limit reached; it resets at {} UTC.",
                 at.format("%Y-%m-%d %H:%M")
             ),
-            None => "X rate limit reached. It was not retried.".into(),
+            None => "X rate limit reached.".into(),
         };
+        return super::unsent(msg, true);
     }
     reason(body, status)
 }
@@ -281,8 +282,10 @@ impl X {
         step: &str,
     ) -> Result<(StatusCode, HeaderMap, Value), PostError> {
         let res = req.send().await.map_err(|e| {
+            let sure = crate::connectors::never_sent(&e);
             tracing::warn!(error = %e.without_url(), step, "x call failed");
-            failed(format!("{step}: X could not be reached."))
+            let msg = format!("{step}: X could not be reached.");
+            failed(super::unsent(msg, sure))
         })?;
         let status = res.status();
         let headers = res.headers().clone();
@@ -651,11 +654,11 @@ mod tests {
         );
         assert_eq!(
             said,
-            "X rate limit reached; it resets at 2026-11-04 12:30 UTC. It was not retried."
+            "X rate limit reached; it resets at 2026-11-04 12:30 UTC. Nothing was posted."
         );
         assert_eq!(
             describe(StatusCode::TOO_MANY_REQUESTS, &headers(None), &busy),
-            "X rate limit reached. It was not retried."
+            "X rate limit reached. Nothing was posted."
         );
         let capped = json!({"type": "https://api.x.com/2/problems/usage-capped"});
         assert_eq!(

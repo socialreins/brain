@@ -249,9 +249,10 @@ fn refusal(status: StatusCode, body: &Value, step: &str) -> PostError {
         (_, "scope_not_authorized" | "scope_permission_missed") => PostError::Denied,
         // A revoked or expired refresh token, or a code that was already used.
         (_, "invalid_grant") => PostError::Reconnect,
-        (_, "rate_limit_exceeded") => {
-            failed("TikTok is limiting this account for now. Try again in a little while.")
-        }
+        (_, "rate_limit_exceeded") => failed(super::unsent(
+            "TikTok is limiting this account for now. Try again in a little while.".into(),
+            true,
+        )),
         (_, "spam_risk_too_many_posts") => {
             failed("This TikTok account reached its limit of posts for the day.")
         }
@@ -329,8 +330,10 @@ impl TikTok {
     /// an error.
     async fn raw(&self, req: RequestBuilder, step: &str) -> Result<(StatusCode, Value), PostError> {
         let res = req.send().await.map_err(|e| {
+            let sure = crate::connectors::never_sent(&e);
             tracing::warn!(error = %e.without_url(), step, "tiktok call failed");
-            failed(format!("{step}: TikTok could not be reached."))
+            let msg = format!("{step}: TikTok could not be reached.");
+            failed(super::unsent(msg, sure))
         })?;
         let status = res.status();
         let body: Value = res.json().await.unwrap_or(Value::Null);
