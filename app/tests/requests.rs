@@ -7748,7 +7748,7 @@ mod teams {
 
             mod schedule_rules {
                 use super::*;
-                use sea_orm::ConnectionTrait;
+                use sea_orm::{ConnectionTrait, TransactionTrait};
 
                 async fn exec(db: &DatabaseConnection, sql: String) {
                     db.execute_unprepared(&sql).await.unwrap();
@@ -7830,6 +7830,157 @@ mod teams {
                     let p = get_post(&s, &cookie, &left).await;
                     assert_eq!(p["status"], "draft", "{p}");
                     assert_eq!(RECORDS.lock().unwrap().len(), records + 1);
+                }
+
+                /// A queued post due long ago with one pending target, as a crash leaves it.
+                async fn stale_queued(
+                    s: &TestServer,
+                    db: &DatabaseConnection,
+                    cookie: &str,
+                    set: &str,
+                    team: &str,
+                ) -> (String, uuid::Uuid) {
+                    let id = due_ago(s, db, cookie, input(set, "stale", Some(&past())), 90).await;
+                    let target = uuid::Uuid::new_v4();
+                    exec(
+                        db,
+                        format!(
+                            "UPDATE posts SET status = 'queued', fanned_out = true, \
+                             updated_at = now() - interval '40 minutes' WHERE id = '{id}'; \
+                             INSERT INTO post_targets (id, post_id, social_account_id, status) \
+                             VALUES ('{target}', '{id}', (SELECT id FROM social_accounts \
+                               WHERE team_id = '{team}' LIMIT 1), 'pending')"
+                        ),
+                    )
+                    .await;
+                    (id, target)
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_post_never_turns_draft_while_a_target_starts() {
+                    let (s, db, _) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let wait = std::time::Duration::from_millis(400);
+
+                    // The drafting holds the post: a target cannot start meanwhile, and once the
+                    // post is a draft it never does.
+                    let (id, target) = stale_queued(&s, &db, &cookie, &set, &team_id).await;
+                    let txn = db.begin().await.unwrap();
+                    txn.execute_unprepared(&format!(
+                        "SELECT 1 FROM posts WHERE id = '{id}' FOR UPDATE"
+                    ))
+                    .await
+                    .unwrap();
+                    let claim = tokio::spawn({
+                        let db = db.clone();
+                        async move { publish::claim_target(&db, target).await.unwrap() }
+                    });
+                    tokio::time::sleep(wait).await;
+                    assert!(!claim.is_finished(), "the claim waits for the post lock");
+                    txn.execute_unprepared(&format!(
+                        "UPDATE posts SET status = 'draft' WHERE id = '{id}'"
+                    ))
+                    .await
+                    .unwrap();
+                    txn.commit().await.unwrap();
+                    assert!(!claim.await.unwrap(), "a draft's target is never claimed");
+                    let status: String = db
+                        .query_one_raw(sea_orm::Statement::from_string(
+                            sea_orm::DbBackend::Postgres,
+                            format!("SELECT status FROM post_targets WHERE id = '{target}'"),
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .try_get("", "status")
+                        .unwrap();
+                    assert_eq!(status, "pending");
+
+                    // A target that started first is seen by the drafting, which then leaves the
+                    // post queued: it waits for the claim's lock, then looks at the targets.
+                    let (id, target) = stale_queued(&s, &db, &cookie, &set, &team_id).await;
+                    let txn = db.begin().await.unwrap();
+                    txn.execute_unprepared(&format!(
+                        "SELECT 1 FROM posts WHERE id = '{id}' FOR SHARE; \
+                         UPDATE post_targets SET status = 'publishing' WHERE id = '{target}'"
+                    ))
+                    .await
+                    .unwrap();
+                    let drafting = tokio::spawn({
+                        let db = db.clone();
+                        async move { publish::draft_late(&db, &[]).await.unwrap() }
+                    });
+                    tokio::time::sleep(wait).await;
+                    assert!(!drafting.is_finished(), "the drafting waits for the claim");
+                    txn.commit().await.unwrap();
+                    let drafted = drafting.await.unwrap();
+                    assert!(!drafted.iter().any(|d| d.to_string() == id), "{drafted:?}");
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "queued");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_post_this_process_is_publishing_is_not_drafted() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let (id, _) = stale_queued(&s, &db, &cookie, &set, &team_id).await;
+                    let held = publish::hold(id.parse().unwrap());
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "queued");
+                    drop(held);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "draft");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_group_is_claimed_whole_or_not_at_all() {
+                    let (s, db, _) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    // 49 older posts fill all but one place of the batch of 50.
+                    for i in 0..49 {
+                        due_ago(
+                            &s,
+                            &db,
+                            &cookie,
+                            input(&set, &format!("old {i}"), Some(&past())),
+                            30,
+                        )
+                        .await;
+                    }
+                    let group = uuid::Uuid::new_v4();
+                    let mut pair = Vec::new();
+                    for i in 0..2 {
+                        let id = due_ago(
+                            &s,
+                            &db,
+                            &cookie,
+                            input(&set, &format!("pair {i}"), Some(&past())),
+                            5,
+                        )
+                        .await;
+                        exec(
+                            &db,
+                            format!("UPDATE posts SET group_id = '{group}' WHERE id = '{id}'"),
+                        )
+                        .await;
+                        pair.push(id);
+                    }
+                    let claimed = publish::claim_due(&db, false).await.unwrap();
+                    let mine = claimed
+                        .iter()
+                        .filter(|c| pair.contains(&c.0.to_string()))
+                        .count();
+                    assert_eq!(mine, 2, "both of the group, or neither: {}", claimed.len());
+                    assert_eq!(
+                        claimed.len(),
+                        51,
+                        "the group goes in whole on top of the batch"
+                    );
                 }
 
                 #[tokio::test]
@@ -8488,6 +8639,31 @@ mod teams {
                     assert_eq!(copies.len(), 1, "{copies:?}");
                     assert_eq!(copies[0]["status"], "scheduled");
                     assert_eq!(copies[0]["repeat"]["every"], "day");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_rejected_post_is_not_drafted_late_and_its_series_ends() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, _, set) = team(&s, &db).await;
+                    let id = scheduled(&s, &cookie, &set).await;
+                    repeating(&s, &cookie, &id, daily()).await;
+                    sql(
+                        &db,
+                        format!("UPDATE posts SET approval = 'rejected' WHERE id = '{id}'"),
+                    )
+                    .await;
+                    at(&db, &id, (Utc::now() - Duration::hours(2)).trunc_subsecs(0)).await;
+                    for _ in 0..2 {
+                        publish::tick(&state).await.unwrap();
+                    }
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "scheduled", "{p}");
+                    assert_eq!(p["error"], Value::Null, "{p}");
+                    let all = req(&s, Method::GET, "/v1/posts", &cookie)
+                        .await
+                        .json::<Vec<Value>>();
+                    assert_eq!(all.len(), 1, "no copy was made: {all:?}");
                 }
 
                 #[tokio::test]
