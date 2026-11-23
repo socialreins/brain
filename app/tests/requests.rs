@@ -16376,10 +16376,11 @@ mod teams {
                     assert_eq!(named.author_name.as_deref(), Some("Ivy"));
                     assert_eq!(named.convo_id.as_deref(), Some("555"));
 
-                    // An inbox for Instagram only shows these; one for Facebook, nothing.
-                    for (platform, want) in [("instagram", 2), ("facebook", 0)] {
+                    // An inbox of the Instagram account shows these; one of the Page, nothing.
+                    let fb = account(&db, &team_id, "facebook", "101").await;
+                    for (platform, id, want) in [("instagram", ig.id, 2), ("facebook", fb.id, 0)] {
                         let res = req(&s, Method::POST, "/v1/inboxes", &cookie)
-                            .json(&json!({"name": platform, "filters": {"platforms": [platform]}}))
+                            .json(&json!({"name": platform, "account_ids": [id]}))
                             .await;
                         assert_eq!(res.status_code(), 201, "{}", res.text());
                         let id = res.json::<Value>()["id"].as_str().unwrap().to_owned();
@@ -18657,30 +18658,140 @@ mod teams {
 
                 // A filtered inbox: DMs and keyword matches only show where they match.
                 let res = req(&s, Method::POST, "/v1/inboxes", &cookie)
-                    .json(&json!({"name": "DMs", "filters": {"kinds": ["dm"],
-                        "account_ids": [account]}}))
+                    .json(&json!({"name": "DMs", "account_ids": [account, account],
+                        "filters": {"kinds": ["dm"]}}))
                     .await;
                 assert_eq!(res.status_code(), 201, "{}", res.text());
-                let dms = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                let made = res.json::<Value>();
+                assert_eq!(made["account_ids"], json!([account]));
+                let dms = made["id"].as_str().unwrap().to_owned();
                 let got = items(&s, &cookie, &dms, "").await;
                 assert_eq!(got["items"].as_array().unwrap().len(), 1);
                 let res = req(&s, Method::PUT, &format!("/v1/inboxes/{dms}"), &cookie)
-                    .json(&json!({"name": "Guides", "filters": {"keywords": ["guide"]}}))
+                    .json(&json!({"name": "Guides", "account_ids": [account],
+                        "filters": {"keywords": ["guide"]}}))
                     .await;
                 assert_eq!(res.status_code(), 200);
                 let got = items(&s, &cookie, &dms, "").await;
                 assert_eq!(got["items"][0]["text"], "Love it, GUIDE please");
                 assert_eq!(got["items"].as_array().unwrap().len(), 1);
 
-                // Shapes and ids are checked; "All" stays.
+                // An account may be in several inboxes; "All" holds every account and lists each
+                // item once.
+                let res = req(&s, Method::POST, "/v1/inboxes", &cookie)
+                    .json(&json!({"name": "Everything", "account_ids": [account]}))
+                    .await;
+                assert_eq!(res.status_code(), 201);
+                let everything = res.json::<Value>()["id"].clone();
+                let list = s.get("/v1/inboxes").add_header("cookie", &cookie).await;
+                let list: Vec<Value> = list.json();
+                let accounts: Vec<(&str, &Value, &Value)> = list
+                    .iter()
+                    .map(|i| {
+                        (
+                            i["name"].as_str().unwrap(),
+                            &i["account_ids"],
+                            &i["open_count"],
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    accounts,
+                    [
+                        ("All", &json!([]), &json!(3)),
+                        ("Guides", &json!([account]), &json!(1)),
+                        ("Everything", &json!([account]), &json!(3)),
+                    ]
+                );
+                let got = items(&s, &cookie, all_id, "").await;
+                assert_eq!(got["items"].as_array().unwrap().len(), 3);
+                // Each item names the custom inboxes that hold it, filters included.
+                let chips: Vec<(&str, &Value)> = got["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| (i["kind"].as_str().unwrap(), &i["inbox_ids"]))
+                    .collect();
+                let both = json!([dms, everything]);
+                let one = json!([everything]);
+                assert_eq!(chips, [("dm", &one), ("comment", &both), ("mention", &one)]);
+                // The chips agree with each inbox's own list (both decided in SQL, ILIKE included).
+                for inbox in [&dms, everything.as_str().unwrap()] {
+                    let listed = items(&s, &cookie, inbox, "").await["items"].clone();
+                    let chipped: Vec<&Value> = got["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|i| i["inbox_ids"].as_array().unwrap().contains(&json!(inbox)))
+                        .collect();
+                    let listed: Vec<&Value> = listed.as_array().unwrap().iter().collect();
+                    assert_eq!(chipped.len(), listed.len(), "{inbox}");
+                    for (a, b) in chipped.iter().zip(listed) {
+                        assert_eq!(a["id"], b["id"], "{inbox}");
+                    }
+                }
+                // `account_id` narrows to one account.
+                let got = items(&s, &cookie, all_id, &format!("?account_id={account}")).await;
+                assert_eq!(got["items"].as_array().unwrap().len(), 3);
+                let other = uuid::Uuid::now_v7();
+                let got = items(&s, &cookie, all_id, &format!("?account_id={other}")).await;
+                assert_eq!(got["items"], json!([]));
+                let res = s
+                    .get(&format!("/v1/inboxes/{all_id}/items?account_id=nope"))
+                    .add_header("cookie", &cookie)
+                    .await;
+                assert_eq!(res.status_code(), 422);
+
+                // Shapes and ids are checked; "All" stays. An X account has no inbox.
+                let x = uuid::Uuid::now_v7();
+                // A real Bluesky account, of another team.
+                let (_, outsider, _) = user(&s, &db).await;
+                let outsider = current(&s, &outsider).await["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let theirs = uuid::Uuid::now_v7();
+                sea_orm::ConnectionTrait::execute_unprepared(
+                    &db,
+                    &format!(
+                        "INSERT INTO social_accounts (id, team_id, provider, external_id, \
+                         access_token) VALUES ('{theirs}', '{outsider}', 'bluesky', \
+                         'did:plc:{theirs}', '\\\\x00')"
+                    ),
+                )
+                .await
+                .unwrap();
+                sea_orm::ConnectionTrait::execute_unprepared(
+                    &db,
+                    &format!(
+                        "INSERT INTO social_accounts (id, team_id, provider, external_id, \
+                         access_token) VALUES ('{x}', '{team_id}', 'x', 'x-{x}', '\\\\x00')"
+                    ),
+                )
+                .await
+                .unwrap();
                 for (body, code) in [
+                    (
+                        json!({"name": "x", "account_ids": [account, x]}),
+                        "invalid_accounts",
+                    ),
+                    (
+                        json!({"name": "x", "account_ids": [account, theirs]}),
+                        "invalid_accounts",
+                    ),
                     (
                         json!({"name": "x", "filters": {"kinds": ["like"]}}),
                         "invalid_filters",
                     ),
                     (
-                        json!({"name": "x", "filters": {"account_ids": [uuid::Uuid::now_v7()]}}),
-                        "invalid_filters",
+                        json!({"name": "x", "account_ids": [uuid::Uuid::now_v7()]}),
+                        "invalid_accounts",
+                    ),
+                    (json!({"name": "x", "account_ids": []}), "invalid_accounts"),
+                    (json!({"name": "x"}), "invalid_accounts"),
+                    (
+                        json!({"name": "x", "filters": {"account_ids": [account]}}),
+                        "invalid_body",
                     ),
                     (json!({"name": " ", "filters": {}}), "invalid_name"),
                     (
@@ -18712,6 +18823,12 @@ mod teams {
                 let res = req(&s, Method::POST, "/v1/inboxes", &member)
                     .json(&json!({"name": "Nope"}))
                     .await;
+                assert_eq!(res.status_code(), 403);
+                let res = req(&s, Method::PUT, &format!("/v1/inboxes/{dms}"), &member)
+                    .json(&json!({"name": "Nope", "account_ids": [account]}))
+                    .await;
+                assert_eq!(res.status_code(), 403);
+                let res = req(&s, Method::DELETE, &format!("/v1/inboxes/{dms}"), &member).await;
                 assert_eq!(res.status_code(), 403);
                 let item = comment["id"].as_str().unwrap();
                 let res = req(
@@ -18799,7 +18916,8 @@ mod teams {
 
                 // Answered items drop out of an unanswered inbox.
                 let res = req(&s, Method::POST, "/v1/inboxes", &cookie)
-                    .json(&json!({"name": "Todo", "filters": {"unanswered": true}}))
+                    .json(&json!({"name": "Todo", "account_ids": [account],
+                        "filters": {"unanswered": true}}))
                     .await;
                 let todo = res.json::<Value>()["id"].as_str().unwrap().to_owned();
                 assert_eq!(items(&s, &cookie, &todo, "").await["items"], json!([]));
@@ -18894,6 +19012,37 @@ mod teams {
                 res.json::<Value>()["runs"].as_array().unwrap().clone()
             }
 
+            /// An automation limited to an account on a network with no inbox could never fire,
+            /// so it is refused; a Bluesky account is fine.
+            #[tokio::test]
+            #[serial]
+            async fn automations_refuse_accounts_that_cannot_fire_them() {
+                use sea_orm::ConnectionTrait;
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, account, _) = owner(&s, &db).await;
+                let x = uuid::Uuid::now_v7();
+                db.execute_unprepared(&format!(
+                    "INSERT INTO social_accounts (id, team_id, provider, external_id, access_token) \
+                     VALUES ('{x}', '{team_id}', 'x', 'x-{x}', '\\\\x00')"
+                ))
+                .await
+                .unwrap();
+                let scoped = |ids: Vec<String>| {
+                    let mut body = comment_to_dm();
+                    body["conditions"]["account_ids"] = json!(ids);
+                    body
+                };
+                let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                    .json(&scoped(vec![x.to_string()]))
+                    .await;
+                assert_eq!(res.status_code(), 422);
+                assert_eq!(res.json::<Value>()["error"], "unsupported_account");
+                let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                    .json(&scoped(vec![account]))
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+            }
+
             /// An item automations never finished (a crash between storing and running) is run by
             /// the sweep once, and only while it is recent.
             #[tokio::test]
@@ -18923,7 +19072,8 @@ mod teams {
                     async move { db.execute_unprepared(&q).await.unwrap() }
                 };
                 sql(format!(
-                    "UPDATE automations SET activated_at = now() - interval '3 days' WHERE id = '{id}'; \
+                    "UPDATE inbox_items SET automated_at = now() WHERE automated_at IS NULL; \
+                     UPDATE automations SET activated_at = now() - interval '3 days' WHERE id = '{id}'; \
                      UPDATE social_accounts SET created_at = now() - interval '3 days' WHERE id = '{account}'; \
                      UPDATE inbox_items SET automated_at = NULL, created_at = now() - interval '3 minutes' \
                        WHERE social_account_id = '{account}' AND author_id = 'did:plc:late1'; \
@@ -19747,7 +19897,8 @@ mod teams {
 
                 // Open counts per inbox: follows never count.
                 let res = req(&s, Method::POST, "/v1/inboxes", &cookie)
-                    .json(&json!({"name": "DMs", "filters": {"kinds": ["dm"]}}))
+                    .json(&json!({"name": "DMs", "account_ids": [account],
+                        "filters": {"kinds": ["dm"]}}))
                     .await;
                 assert_eq!(res.status_code(), 201);
                 assert!(res.json::<Value>().get("open_count").is_none());
@@ -21210,7 +21361,7 @@ mod teams {
             #[serial]
             async fn dms_of_one_person_list_as_one_conversation() {
                 let (s, db, state) = on_mock().await;
-                let (cookie, _, account, me) = owner(&s, &db).await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
                 let (ids, all) = two_conversations(&s, &db, &state, &cookie, &account, &me).await;
                 let patch = |item: &str, body: Value| {
                     req(
@@ -21340,12 +21491,27 @@ mod teams {
 
                 // The counts are of the items the inbox holds.
                 let res = req(&s, Method::POST, "/v1/inboxes", &cookie)
-                    .json(&json!({"name": "Refunds", "filters": {"keywords": ["refund"]}}))
+                    .json(&json!({"name": "Refunds", "account_ids": [account],
+                        "filters": {"keywords": ["refund"]}}))
                     .await;
                 let refunds = res.json::<Value>()["id"].as_str().unwrap().to_owned();
                 let page = items(&s, &cookie, &refunds, "?group=conversations").await;
                 assert_eq!(texts(&page), ["ann one"]);
                 assert_eq!(page["items"][0]["conversation"]["count"], 1);
+                // An inbox of another account holds none of these conversations.
+                let other = uuid::Uuid::now_v7();
+                let sql = format!(
+                    "INSERT INTO social_accounts (id, team_id, provider, external_id, access_token) \
+                     VALUES ('{other}', '{team_id}', 'bluesky', 'did:plc:{other}', '\\\\x00')"
+                );
+                exec(&db, &sql).await;
+                let res = req(&s, Method::POST, "/v1/inboxes", &cookie)
+                    .json(&json!({"name": "Other", "account_ids": [other]}))
+                    .await;
+                assert_eq!(res.status_code(), 201);
+                let other = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                let page = items(&s, &cookie, &other, "?group=conversations").await;
+                assert!(texts(&page).is_empty());
 
                 // A DM without a contact is a conversation of its own.
                 let sql = format!(
@@ -28646,8 +28812,9 @@ mod teams {
             assert_eq!(b["limits"]["automation"], true);
             assert_eq!(
                 b["usage"],
-                json!({"accounts": 0, "members": 1, "ai_replies": 0})
+                json!({"accounts": 0, "members": 1, "inboxes": 0, "ai_replies": 0})
             );
+            assert_eq!(b["limits"]["inboxes"], Value::Null);
             assert_eq!(b["limits"]["ai_monthly"], Value::Null);
             let c = s
                 .get("/v1/team/credits")
@@ -28678,7 +28845,7 @@ mod teams {
             assert_eq!(
                 b["limits"],
                 json!({"accounts": 10, "members": 3, "automation": false, "contacts": null,
-                    "ai_monthly": 0})
+                    "inboxes": 1, "ai_monthly": 0})
             );
             subscribe(&db, team, "automation", "active").await;
             let b = billing_of(&s, &owner).await;
@@ -28926,6 +29093,18 @@ mod teams {
             .unwrap();
         }
 
+        /// A Bluesky account of the team, written straight in (connecting one needs the plan).
+        async fn bluesky_account(db: &DatabaseConnection, team: &str) -> uuid::Uuid {
+            let id = uuid::Uuid::now_v7();
+            db.execute_unprepared(&format!(
+                "INSERT INTO social_accounts (id, team_id, provider, external_id, access_token) \
+                 VALUES ('{id}', '{team}', 'bluesky', 'did:plc:{id}', '\\\\x00')"
+            ))
+            .await
+            .unwrap();
+            id
+        }
+
         async fn post(s: &TestServer, cookie: &str, path: &str, body: Value) -> (u16, Value) {
             let res = req(s, Method::POST, path, cookie).json(&body).await;
             (res.status_code().as_u16(), res.json())
@@ -28946,7 +29125,6 @@ mod teams {
                     json!({"name": "b", "text": "hi", "tag": "t"}),
                 ),
                 ("/v1/newsletters", json!({"subject": "s", "body": "b"})),
-                ("/v1/inboxes", json!({"name": "i"})),
             ];
             let (s, db) = server_where(|c| c.billing_enabled = true).await;
             let (_, owner, _) = user(&s, &db).await;
@@ -29002,6 +29180,71 @@ mod teams {
                 let (code, _) = post(&s, &owner, path, body.clone()).await;
                 assert_ne!(code, 402, "{path}");
             }
+        }
+
+        /// Inboxes stop at the plan's number, "All" left out; a downgrade keeps the ones made and
+        /// only refuses new ones; billing off caps nothing but the hard 50.
+        #[tokio::test]
+        #[serial]
+        async fn inboxes_stop_at_the_plan() {
+            let (s, db) = server_where(|c| c.billing_enabled = true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let refused = json!({"error": "plan_limit", "limit": "inboxes"});
+            let account = bluesky_account(&db, &team).await;
+            let make = |n: usize| {
+                let body = json!({"name": format!("i{n}"), "account_ids": [account]});
+                post(&s, &owner, "/v1/inboxes", body)
+            };
+            // "All" exists before any create, and never counts.
+            let list = s.get("/v1/inboxes").add_header("cookie", &owner).await;
+            assert_eq!(list.json::<Value>().as_array().unwrap().len(), 1);
+            assert_eq!(make(0).await, (402, refused.clone()), "no plan");
+            subscribe(&db, &team, "scheduler").await;
+            assert_eq!(make(1).await.0, 201);
+            assert_eq!(make(2).await, (402, refused.clone()));
+            let billing = s.get("/v1/team/billing").add_header("cookie", &owner).await;
+            let b: Value = billing.json();
+            assert_eq!(
+                (
+                    b["usage"]["inboxes"].clone(),
+                    b["limits"]["inboxes"].clone()
+                ),
+                (json!(1), json!(1))
+            );
+            subscribe(&db, &team, "automation").await;
+            for n in 2..=10 {
+                assert_eq!(make(n).await.0, 201, "{n}");
+            }
+            assert_eq!(make(11).await, (402, refused.clone()));
+            // A comped plan is the automation plan.
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE subscriptions SET provider = 'comp' WHERE team_id = $1",
+                [team.parse::<uuid::Uuid>().unwrap().into()],
+            ))
+            .await
+            .unwrap();
+            assert_eq!(make(11).await, (402, refused.clone()));
+            // A downgrade keeps all 10.
+            subscribe(&db, &team, "scheduler").await;
+            assert_eq!(make(12).await, (402, refused));
+            let list = s.get("/v1/inboxes").add_header("cookie", &owner).await;
+            assert_eq!(list.json::<Value>().as_array().unwrap().len(), 11);
+            // Self-hosted: no plan cap, the hard cap of 50 ("All" included) stays.
+            let (s, db) = server_where(|_| {}).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let account = bluesky_account(&db, &team).await;
+            s.get("/v1/inboxes").add_header("cookie", &owner).await;
+            for n in 1..50 {
+                let body = json!({"name": format!("i{n}"), "account_ids": [account]});
+                let (code, _) = post(&s, &owner, "/v1/inboxes", body).await;
+                assert_eq!(code, 201, "{n}");
+            }
+            let body = json!({"name": "last", "account_ids": [account]});
+            let (code, body) = post(&s, &owner, "/v1/inboxes", body).await;
+            assert_eq!((code, body), (409, json!({"error": "too_many_inboxes"})));
         }
 
         /// Open invitations hold a seat: a plan of 3 members takes 2 invitations beside the owner.
