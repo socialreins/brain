@@ -54,6 +54,7 @@ mod m20261213_000001_stripe_events;
 mod m20261214_000001_comp_plans;
 mod m20261215_000001_inbox_automated;
 mod m20261216_000001_plan_inboxes;
+mod m20261217_000001_inbox_accounts;
 
 pub struct Migrator;
 
@@ -115,6 +116,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261214_000001_comp_plans::Migration),
             Box::new(m20261215_000001_inbox_automated::Migration),
             Box::new(m20261216_000001_plan_inboxes::Migration),
+            Box::new(m20261217_000001_inbox_accounts::Migration),
             // inject-above (do not remove this comment)
         ]
     }

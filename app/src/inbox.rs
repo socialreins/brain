@@ -50,23 +50,18 @@ const MAX_TEXT_CHARS: usize = 10_000;
 pub const DM_MAX_GRAPHEMES: usize = 1000;
 const DM_MAX_BYTES: usize = 10_000;
 
-/// Which items an inbox shows. Empty lists mean "any". At most one of `social_set_id` and
-/// `account_ids`.
+/// Platforms whose accounts have an inbox.
+pub const INBOX_PLATFORMS: [&str; 3] = ["bluesky", "facebook", "instagram"];
+/// Most accounts one inbox holds.
+pub const MAX_INBOX_ACCOUNTS: usize = 100;
+
+/// What narrows an inbox beyond its accounts (`inbox_accounts`). Empty lists mean "any".
 #[derive(Serialize, Deserialize, ToSchema, Default, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Filters {
-    /// Accounts in this live set of the team.
-    #[serde(default)]
-    pub social_set_id: Option<Uuid>,
-    /// These accounts of the team, at most 100.
-    #[serde(default)]
-    pub account_ids: Vec<Uuid>,
     /// `comment`, `mention`, `dm`.
     #[serde(default)]
     pub kinds: Vec<String>,
-    /// e.g. `bluesky`.
-    #[serde(default)]
-    pub platforms: Vec<String>,
     /// Any of these, case-insensitive, in the text; at most 20 of 1 to 100 characters.
     #[serde(default)]
     pub keywords: Vec<String>,
@@ -95,19 +90,12 @@ impl Filters {
     pub fn checked(mut self) -> Result<Self, &'static str> {
         let known =
             |list: &[String], allowed: &[&str]| list.iter().all(|k| allowed.contains(&k.as_str()));
-        if !known(&self.kinds, &KINDS) || !known(&self.platforms, &PLATFORMS) {
-            return Err("invalid_filters");
-        }
-        if self.account_ids.len() > 100
-            || (self.social_set_id.is_some() && !self.account_ids.is_empty())
-        {
+        if !known(&self.kinds, &KINDS) {
             return Err("invalid_filters");
         }
         self.keywords = keywords(&self.keywords).ok_or("invalid_filters")?;
+        self.kinds.sort();
         self.kinds.dedup();
-        self.platforms.dedup();
-        self.account_ids.sort();
-        self.account_ids.dedup();
         Ok(self)
     }
 }
@@ -182,29 +170,21 @@ pub(crate) fn placeholders(
     out.join(", ")
 }
 
-/// `filters` as SQL conditions on `inbox_items i`, each starting with ` AND `, with their
-/// values appended to `values` (numbered after those already there).
-pub fn filter_sql(f: &Filters, values: &mut Vec<Value>) -> String {
+/// An inbox as SQL conditions on `inbox_items i`, each starting with ` AND `, with their values
+/// appended to `values` (numbered after those already there). `accounts_of` is a custom inbox's
+/// id, whose accounts (`inbox_accounts`) hold its items; `None` for "All", which holds every one.
+pub fn filter_sql(accounts_of: Option<Uuid>, f: &Filters, values: &mut Vec<Value>) -> String {
     let mut sql = String::new();
-    if let Some(set) = f.social_set_id {
-        let p = placeholders(values, [set.into()]);
+    if let Some(inbox) = accounts_of {
+        let p = placeholders(values, [inbox.into()]);
         sql += &format!(
-            " AND i.social_account_id IN (SELECT m.social_account_id \
-             FROM social_account_social_set m JOIN social_sets s ON s.id = m.social_set_id \
-             WHERE m.social_set_id = {p} AND s.deleted_at IS NULL)"
+            " AND EXISTS (SELECT 1 FROM inbox_accounts ia WHERE ia.inbox_id = {p} \
+             AND ia.social_account_id = i.social_account_id)"
         );
-    }
-    if !f.account_ids.is_empty() {
-        let p = placeholders(values, f.account_ids.iter().map(|&a| a.into()));
-        sql += &format!(" AND i.social_account_id IN ({p})");
     }
     if !f.kinds.is_empty() {
         let p = placeholders(values, f.kinds.iter().map(|k| k.clone().into()));
         sql += &format!(" AND i.kind IN ({p})");
-    }
-    if !f.platforms.is_empty() {
-        let p = placeholders(values, f.platforms.iter().map(|k| k.clone().into()));
-        sql += &format!(" AND i.platform IN ({p})");
     }
     if !f.keywords.is_empty() {
         let any: Vec<String> = f
@@ -805,37 +785,32 @@ async fn send_bluesky(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn filters_become_numbered_sql() {
-        let set = Uuid::now_v7();
+        let inbox = Uuid::now_v7();
         let f = Filters {
-            social_set_id: Some(set),
             kinds: vec!["comment".into(), "dm".into()],
-            platforms: vec!["bluesky".into()],
             keywords: vec!["50%_off".into(), "Guide".into()],
             unanswered: true,
-            ..Filters::default()
         };
         let mut values: Vec<Value> = vec![Uuid::nil().into()];
-        let got = filter_sql(&f, &mut values);
-        assert!(got.contains("WHERE m.social_set_id = $2 AND s.deleted_at IS NULL)"));
+        let got = filter_sql(Some(inbox), &f, &mut values);
+        assert!(got.starts_with(
+            " AND EXISTS (SELECT 1 FROM inbox_accounts ia WHERE ia.inbox_id = $2 \
+             AND ia.social_account_id = i.social_account_id)"
+        ));
         assert!(got.contains(" AND i.kind IN ($3, $4)"));
-        assert!(got.contains(" AND i.platform IN ($5)"));
-        assert!(got.contains(" AND (i.text ILIKE $6 OR i.text ILIKE $7)"));
+        assert!(got.contains(" AND (i.text ILIKE $5 OR i.text ILIKE $6)"));
         assert!(got.ends_with(" AND i.replied_at IS NULL"));
-        assert_eq!(values.len(), 7);
-        assert_eq!(values[5], Value::from("%50\\%\\_off%".to_owned()));
-        let accounts = Filters {
-            account_ids: vec![set, Uuid::nil()],
-            ..Filters::default()
-        };
+        assert_eq!(values.len(), 6);
+        assert_eq!(values[1], Value::from(inbox));
+        assert_eq!(values[4], Value::from("%50\\%\\_off%".to_owned()));
+        // "All" holds every account.
         let mut values = Vec::new();
-        assert_eq!(
-            filter_sql(&accounts, &mut values),
-            " AND i.social_account_id IN ($1, $2)"
-        );
-        assert_eq!(filter_sql(&Filters::default(), &mut values), "");
+        assert_eq!(filter_sql(None, &Filters::default(), &mut values), "");
+        assert!(values.is_empty());
     }
 
     #[test]
@@ -854,23 +829,15 @@ mod tests {
                 ..Filters::default()
             },
             Filters {
-                platforms: vec!["myspace".into()],
-                ..Filters::default()
-            },
-            Filters {
                 keywords: vec!["  ".into()],
-                ..Filters::default()
-            },
-            Filters {
-                social_set_id: Some(Uuid::nil()),
-                account_ids: vec![Uuid::nil()],
                 ..Filters::default()
             },
         ] {
             assert_eq!(bad.checked(), Err("invalid_filters"));
         }
-        let unknown = serde_json::from_value::<Filters>(serde_json::json!({"kind": ["dm"]}));
-        assert!(unknown.is_err());
+        for unknown in [json!({"kind": ["dm"]}), json!({"account_ids": []})] {
+            assert!(serde_json::from_value::<Filters>(unknown).is_err());
+        }
     }
 
     #[test]
