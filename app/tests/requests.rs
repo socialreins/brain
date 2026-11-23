@@ -30747,7 +30747,8 @@ mod admin_console {
         assert_eq!(
             *first,
             json!({"id": acme, "name": "Acme_Rockets", "created_at": created_at, "members": 1,
-                "accounts": 1, "posts": 2, "owner_email": owner})
+                "accounts": 1, "posts": 2, "owner_email": owner, "plan": null,
+                "plan_status": null, "plan_provider": null})
         );
         let last = &all["teams"][2];
         assert_eq!(
@@ -30929,6 +30930,32 @@ mod admin_console {
         assert_eq!(b["plan"]["comped"], true);
         assert_eq!(b["plan"]["current_period_end"], Value::Null);
         assert_eq!(b["limits"]["automation"], true);
+        // The console's team list shows it.
+        let name = c.get("/v1/team", &admin).await["name"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let list = c
+            .get(
+                &format!("/v1/admin/teams?q={}", name.replace(" ", "%20")),
+                &admin,
+            )
+            .await;
+        let row = list["teams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == team.as_str())
+            .unwrap()
+            .clone();
+        assert_eq!(
+            (
+                row["plan"].clone(),
+                row["plan_status"].clone(),
+                row["plan_provider"].clone()
+            ),
+            (json!("automation"), json!("active"), json!("comp"))
+        );
         // Changing the comped plan is allowed.
         assert_eq!(put(json!({"plan": "scheduler"})).await.status_code(), 204);
         assert_eq!(

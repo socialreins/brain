@@ -641,7 +641,8 @@ async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -
         let cancelling = object["cancel_at_period_end"].as_bool() == Some(true)
             || object["cancel_at"].as_i64().is_some();
         if fresh && kind == "customer.subscription.trial_will_end" && !cancelling {
-            if let Some(end) = time(&object["trial_end"]) {
+            // A trial ended early by hand fires this too, with an end already past: no mail.
+            if let Some(end) = time(&object["trial_end"]).filter(|end| *end > Utc::now()) {
                 notice = team_holding(&txn, object["id"].as_str(), true)
                     .await?
                     .map(|t| (t, Notice::TrialEnds(end)));
