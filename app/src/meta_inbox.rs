@@ -20,7 +20,7 @@ use crate::{
         bluesky::{Author, InboxError},
         meta::To,
     },
-    inbox::{self, Button, Fresh, Via},
+    inbox::{self, Attachment, Button, Fresh, Via},
     models::{inbox_items, social_accounts},
     state::AppState,
 };
@@ -48,6 +48,58 @@ fn at(secs: Option<i64>, millis: Option<i64>) -> DateTime<FixedOffset> {
         .fixed_offset()
 }
 
+/// What a Facebook comment carries besides text: a `photo` or `video` link, or an `attachment`
+/// (a sticker or GIF comes as one, with `media.image.src`).
+fn comment_attachments(v: &Value) -> Vec<Attachment> {
+    let a = &v["attachment"];
+    let attached = a.is_object().then(|| {
+        let kind = match a["type"].as_str().unwrap_or_default() {
+            "sticker" => "sticker",
+            t if t.starts_with("animated_image") => "gif",
+            t if t.starts_with("video") => "video",
+            "photo" => "image",
+            _ => "link",
+        };
+        let src = a["media"]["image"]["src"].as_str();
+        match kind {
+            "link" => Attachment::new(kind, a["url"].as_str(), src),
+            _ => Attachment::new(kind, src.or(a["url"].as_str()), src),
+        }
+    });
+    [
+        Attachment::new("image", v["photo"].as_str(), None),
+        Attachment::new("video", v["video"].as_str(), None),
+    ]
+    .into_iter()
+    .chain(attached)
+    .flatten()
+    .collect()
+}
+
+/// A message's `attachments` (Messenger and Instagram): Messenger sends a sticker as an `image`
+/// with a `sticker_id`.
+fn message_attachments(msg: &Value) -> Vec<Attachment> {
+    let files = msg["attachments"].as_array().into_iter().flatten();
+    files
+        .filter_map(|f| {
+            let p = &f["payload"];
+            let kind = match f["type"].as_str()? {
+                "image" if !p["sticker_id"].is_null() => "sticker",
+                "image" => "image",
+                "animated_image" => "gif",
+                "video" | "ig_reel" | "reel" => "video",
+                "audio" => "audio",
+                "file" => "file",
+                "story_mention" => "image",
+                "share" | "fallback" | "template" => "link",
+                _ => return None,
+            };
+            Attachment::new(kind, p["url"].as_str(), None)
+        })
+        .take(inbox::MAX_ATTACHMENTS)
+        .collect()
+}
+
 /// A new Facebook comment (`item=comment`, `verb=add`) on a Page post, or a reply to one.
 fn facebook_comment(v: &Value, entry_time: Option<i64>) -> Option<Fresh> {
     if v["item"] != "comment" || v["verb"] != "add" {
@@ -73,6 +125,7 @@ fn facebook_comment(v: &Value, entry_time: Option<i64>) -> Option<Fresh> {
         text: v["message"].as_str().unwrap_or_default().to_owned(),
         at: at(v["created_time"].as_i64().or(entry_time), None),
         permalink: Some(format!("https://www.facebook.com/{post}")),
+        attachments: comment_attachments(v),
     })
 }
 
@@ -98,6 +151,7 @@ fn instagram_comment(v: &Value, entry_time: Option<i64>) -> Option<Fresh> {
         text: v["text"].as_str().unwrap_or_default().to_owned(),
         at: at(entry_time, None),
         permalink: None,
+        attachments: Vec::new(),
     })
 }
 
@@ -109,13 +163,16 @@ fn message(m: &Value, entry_time: Option<i64>) -> Option<Fresh> {
         return None;
     }
     let (mid, sender) = (sid(&msg["mid"])?, sid(&m["sender"]["id"])?);
+    let attachments = message_attachments(msg);
+    // A file we cannot show (no https link, an unknown type) still says something came.
     let text = msg["text"]
         .as_str()
         .filter(|t| !t.is_empty())
         .map(str::to_owned)
         .or_else(|| {
             let files = msg["attachments"].as_array()?;
-            (!files.is_empty()).then(|| "[attachment]".to_owned())
+            let shown = !attachments.is_empty();
+            (!files.is_empty()).then(|| if shown { "" } else { "[attachment]" }.to_owned())
         })?;
     let story = &msg["reply_to"]["story"];
     let story = story
@@ -142,6 +199,7 @@ fn message(m: &Value, entry_time: Option<i64>) -> Option<Fresh> {
         text,
         at: at(entry_time, m["timestamp"].as_i64()),
         permalink: None,
+        attachments,
     })
 }
 
