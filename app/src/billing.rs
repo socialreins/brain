@@ -77,6 +77,8 @@ pub struct Subscription {
     pub trial_ends_at: Option<chrono::DateTime<chrono::Utc>>,
     pub current_period_end: Option<chrono::DateTime<chrono::Utc>>,
     pub cancel_at_period_end: bool,
+    /// `stripe`, or `comp` for a free plan an admin gave.
+    pub provider: Option<String>,
     pub limits: Limits,
 }
 
@@ -87,7 +89,7 @@ pub async fn subscription(
 ) -> Result<Option<Subscription>, DbErr> {
     let row = db
         .query_one_raw(stmt(
-            "SELECT s.status, s.trial_ends_at, s.current_period_end, s.cancel_at_period_end,
+            "SELECT s.status, s.trial_ends_at, s.current_period_end, s.cancel_at_period_end, s.provider,
                     p.id, p.name, p.max_accounts, p.max_members, p.automation, p.max_contacts
              FROM subscriptions s JOIN plans p ON p.id = s.plan_id WHERE s.team_id = $1",
             vec![team.into()],
@@ -102,6 +104,7 @@ pub async fn subscription(
         trial_ends_at: r.try_get("", "trial_ends_at")?,
         current_period_end: r.try_get("", "current_period_end")?,
         cancel_at_period_end: r.try_get("", "cancel_at_period_end")?,
+        provider: r.try_get("", "provider")?,
         plan_id: r.try_get("", "id")?,
         plan_name: r.try_get("", "name")?,
         limits: Limits {
@@ -327,6 +330,7 @@ mod tests {
             trial_ends_at: None,
             current_period_end: None,
             cancel_at_period_end: false,
+            provider: None,
             limits: Limits {
                 accounts: Some(10),
                 members: Some(3),

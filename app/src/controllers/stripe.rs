@@ -386,7 +386,11 @@ async fn apply_subscription(
                       OR subscriptions.provider_event_at <= EXCLUDED.provider_event_at) \
                  AND (subscriptions.provider_subscription_id IS NOT DISTINCT FROM \
                         EXCLUDED.provider_subscription_id \
-                      OR subscriptions.status NOT IN ('trialing', 'active', 'past_due'))";
+                      OR subscriptions.status NOT IN ('trialing', 'active', 'past_due') \
+                      OR (subscriptions.provider = 'comp' \
+                          AND EXCLUDED.status IN ('trialing', 'active', 'past_due')))";
+    // A comped team that pays anyway (a checkout opened before the comp) takes the paid plan;
+    // a late event that ends some older subscription never ends the comp.
     let written = db
         .execute_raw(stmt(
             sql,

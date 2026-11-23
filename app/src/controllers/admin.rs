@@ -423,6 +423,96 @@ pub struct CreditsGranted {
     pub balance: i64,
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct CompPlan {
+    /// `scheduler` or `automation`.
+    pub plan: String,
+}
+
+/// Gives a team a comped plan: free, no Stripe, no end (`provider = 'comp'`, `active`). For the
+/// early teams billing must not lock out. Never over a live paid (Stripe) plan: `409
+/// has_paid_plan`. `422 invalid_plan`, `404` for an unknown team. Recent sign-in.
+#[utoipa::path(put, path = "/admin/teams/{id}/plan", tag = "admin",
+    security(("session" = [])), params(("id" = Uuid, Path,)), request_body = CompPlan,
+    responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
+        (status = 404, body = Error), (status = 409, body = Error), (status = 422, body = Error),
+        (status = 500, body = Error)))]
+async fn comp_plan(
+    _: FromWeb,
+    State(app): State<AppState>,
+    Admin(current): Admin,
+    Path(id): Path<Uuid>,
+    Body(body): Body<CompPlan>,
+) -> Response {
+    if !current.recent() {
+        return reply(StatusCode::FORBIDDEN, "reauth_required");
+    }
+    if !matches!(body.plan.as_str(), "scheduler" | "automation") {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_plan");
+    }
+    let done = async {
+        let known = app
+            .db
+            .query_one_raw(stmt("SELECT 1 FROM teams WHERE id = $1", [id.into()]))
+            .await?;
+        if known.is_none() {
+            return Ok(Some(reply(StatusCode::NOT_FOUND, "not_found")));
+        }
+        // A live Stripe plan is left alone: the team pays for it.
+        let written = app
+            .db
+            .execute_raw(stmt(
+                "INSERT INTO subscriptions (team_id, plan_id, status, provider) \
+                 VALUES ($1, $2, 'active', 'comp') \
+                 ON CONFLICT (team_id) DO UPDATE SET plan_id = EXCLUDED.plan_id, status = 'active', \
+                   provider = 'comp', provider_customer_id = subscriptions.provider_customer_id, \
+                   provider_subscription_id = NULL, trial_ends_at = NULL, current_period_end = NULL, \
+                   cancel_at_period_end = false, updated_at = now() \
+                 WHERE subscriptions.provider IS DISTINCT FROM 'stripe' \
+                   OR subscriptions.status NOT IN ('trialing', 'active', 'past_due')",
+                [id.into(), body.plan.clone().into()],
+            ))
+            .await?
+            .rows_affected();
+        Ok::<_, DbErr>((written == 0).then(|| reply(StatusCode::CONFLICT, "has_paid_plan")))
+    };
+    match done.await {
+        Ok(Some(res)) => res,
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => internal(e, "comp plan"),
+    }
+}
+
+/// Ends a team's comped plan (a paid one is ended in Stripe, not here). `404` when the team has
+/// no live comped plan. Recent sign-in.
+#[utoipa::path(delete, path = "/admin/teams/{id}/plan", tag = "admin",
+    security(("session" = [])), params(("id" = Uuid, Path,)),
+    responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
+        (status = 404, body = Error), (status = 500, body = Error)))]
+async fn end_comp_plan(
+    _: FromWeb,
+    State(app): State<AppState>,
+    Admin(current): Admin,
+    Path(id): Path<Uuid>,
+) -> Response {
+    if !current.recent() {
+        return reply(StatusCode::FORBIDDEN, "reauth_required");
+    }
+    let ended = app
+        .db
+        .execute_raw(stmt(
+            "UPDATE subscriptions SET status = 'canceled', updated_at = now() \
+             WHERE team_id = $1 AND provider = 'comp' AND status = 'active'",
+            [id.into()],
+        ))
+        .await;
+    match ended {
+        Ok(r) if r.rows_affected() == 1 => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => reply(StatusCode::NOT_FOUND, "not_found"),
+        Err(e) => internal(e, "comp plan end"),
+    }
+}
+
 /// Adds credits to a team by hand (until purchases exist). Each call adds them again. Needs a
 /// sign-in from the last 10 minutes (else `403 reauth_required`). `422 invalid_credits` for
 /// another kind or an amount outside 1 to 1,000,000; `404` for an unknown team.
@@ -562,6 +652,7 @@ pub fn api() -> OpenApiRouter<AppState> {
         .routes(routes!(teams))
         .routes(routes!(approve))
         .routes(routes!(grant_credits))
+        .routes(routes!(comp_plan, end_comp_plan))
         .routes(routes!(remove))
         .routes(routes!(signup_settings, save_signup_settings))
 }

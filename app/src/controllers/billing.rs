@@ -48,6 +48,8 @@ pub struct Plan {
     pub current_period_end: Option<DateTime<Utc>>,
     /// The plan ends at the period's end and does not renew.
     pub cancel_at_period_end: bool,
+    /// A free plan an admin gave: nothing to pay, nothing to manage in Stripe.
+    pub comped: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -146,6 +148,7 @@ async fn show(State(app): State<AppState>, t: InTeam) -> Response {
             trial_ends_at: s.trial_ends_at,
             current_period_end: s.current_period_end,
             cancel_at_period_end: s.cancel_at_period_end,
+            comped: s.provider.as_deref() == Some("comp"),
         }),
         usage: Usage { accounts, members },
     })

@@ -29248,6 +29248,44 @@ mod teams {
             assert!(mails[2].1.contains("Nothing is deleted"));
         }
 
+        /// A comped team that pays anyway takes the paid plan; an event ending some other, older
+        /// subscription never ends a comp.
+        #[tokio::test]
+        #[serial]
+        async fn a_paid_plan_replaces_a_comp_and_stray_ends_do_not_end_it() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO subscriptions (team_id, plan_id, status, provider) \
+                     VALUES ($1, 'automation', 'active', 'comp') \
+                     ON CONFLICT (team_id) DO UPDATE SET status = 'active', provider = 'comp', \
+                       provider_subscription_id = NULL, provider_event_at = NULL",
+                [team.parse::<uuid::Uuid>().unwrap().into()],
+            ))
+            .await
+            .unwrap();
+            let now = Utc::now().timestamp();
+            // A stray end of an unrelated subscription for this team: the comp stays.
+            let stray = sub_event("evt_c1", now - 40, "sub_old", &team, "canceled", "price_s");
+            assert_eq!(deliver(&s, &stray, WHSEC, now).await.status_code(), 200);
+            let p = plan_of(&s, &owner).await;
+            assert_eq!(
+                (p["comped"].clone(), p["status"].clone()),
+                (json!(true), json!("active"))
+            );
+            // A paid subscription takes over.
+            let paid = sub_event("evt_c2", now - 30, "sub_paid", &team, "active", "price_sy");
+            assert_eq!(deliver(&s, &paid, WHSEC, now).await.status_code(), 200);
+            let p = plan_of(&s, &owner).await;
+            assert_eq!(
+                (p["comped"].clone(), p["id"].clone()),
+                (json!(false), json!("scheduler"))
+            );
+            assert_eq!(count("/cancel/sub_paid"), 0);
+        }
+
         async fn plan_of(s: &TestServer, cookie: &str) -> Value {
             let res = s
                 .get("/v1/team/billing")
@@ -30867,6 +30905,71 @@ mod admin_console {
         c.sql("UPDATE sessions SET created_at = now() - interval '11 minutes'")
             .await;
         let res = post(&path, json!({"kind": "x", "amount": 1})).await;
+        assert_eq!(error_of(&res), (403, "reauth_required".into()));
+        c.done().await;
+    }
+
+    /// A comped plan is free and has no end; it never replaces a live paid plan, and ending it
+    /// leaves the team with nothing (with billing on).
+    #[tokio::test]
+    #[serial]
+    async fn the_admin_comps_a_plan_and_ends_it() {
+        let c = console(|c| c.billing_enabled = true).await;
+        let admin = c.admin().await;
+        let team = c.get("/v1/team", &admin).await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let path = format!("/v1/admin/teams/{team}/plan");
+        let put = |body: Value| c.req(Method::PUT, &path, &admin).json(&body);
+        assert_eq!(put(json!({"plan": "automation"})).await.status_code(), 204);
+        let b = c.get("/v1/team/billing", &admin).await;
+        assert_eq!(b["plan"]["id"], "automation");
+        assert_eq!(b["plan"]["status"], "active");
+        assert_eq!(b["plan"]["comped"], true);
+        assert_eq!(b["plan"]["current_period_end"], Value::Null);
+        assert_eq!(b["limits"]["automation"], true);
+        // Changing the comped plan is allowed.
+        assert_eq!(put(json!({"plan": "scheduler"})).await.status_code(), 204);
+        assert_eq!(
+            c.get("/v1/team/billing", &admin).await["plan"]["id"],
+            "scheduler"
+        );
+        let res = put(json!({"plan": "gold"})).await;
+        assert_eq!(error_of(&res), (422, "invalid_plan".into()));
+        let unknown = format!("/v1/admin/teams/{}/plan", uuid::Uuid::now_v7());
+        let res = c
+            .req(Method::PUT, &unknown, &admin)
+            .json(&json!({"plan": "scheduler"}))
+            .await;
+        assert_eq!(error_of(&res), (404, "not_found".into()));
+
+        // Ending it: the team has no live plan, so nothing is allowed.
+        let end = || c.req(Method::DELETE, &path, &admin);
+        assert_eq!(end().await.status_code(), 204);
+        let b = c.get("/v1/team/billing", &admin).await;
+        assert_eq!(b["plan"]["status"], "canceled");
+        assert_eq!(b["limits"]["accounts"], 0);
+        assert_eq!(error_of(&end().await), (404, "not_found".into()));
+
+        // A live paid plan is never overwritten, and is not ended here.
+        c.sql(&format!(
+            "UPDATE subscriptions SET provider = 'stripe', status = 'active', \
+             provider_subscription_id = 'sub_paid_{}' WHERE team_id = '{team}'",
+            uuid::Uuid::now_v7().simple()
+        ))
+        .await;
+        let res = put(json!({"plan": "automation"})).await;
+        assert_eq!(error_of(&res), (409, "has_paid_plan".into()));
+        assert_eq!(error_of(&end().await), (404, "not_found".into()));
+        let b = c.get("/v1/team/billing", &admin).await;
+        assert_eq!(
+            (b["plan"]["comped"].clone(), b["plan"]["status"].clone()),
+            (json!(false), json!("active"))
+        );
+        c.sql("UPDATE sessions SET created_at = now() - interval '11 minutes'")
+            .await;
+        let res = put(json!({"plan": "automation"})).await;
         assert_eq!(error_of(&res), (403, "reauth_required".into()));
         c.done().await;
     }
