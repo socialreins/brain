@@ -51,6 +51,7 @@ mod m20261210_000001_newsletter_sender_logo;
 mod m20261211_000001_billing;
 mod m20261212_000001_team_ai_keys;
 mod m20261213_000001_stripe_events;
+mod m20261214_000001_comp_plans;
 
 pub struct Migrator;
 
@@ -109,6 +110,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261211_000001_billing::Migration),
             Box::new(m20261212_000001_team_ai_keys::Migration),
             Box::new(m20261213_000001_stripe_events::Migration),
+            Box::new(m20261214_000001_comp_plans::Migration),
             // inject-above (do not remove this comment)
         ]
     }
