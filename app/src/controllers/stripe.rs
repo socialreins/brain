@@ -423,23 +423,19 @@ enum Notice {
     Ended,
 }
 
-/// The team a subscription belongs to: brain's metadata, else the row holding its id.
-async fn team_of_subscription(
+/// The team whose subscription row holds this Stripe subscription id, only while `live` (when
+/// asked): a mail goes to the team brain itself recorded, never to one named in the event.
+async fn team_holding(
     db: &impl ConnectionTrait,
-    sub: &Value,
+    sub: Option<&str>,
+    live: bool,
 ) -> Result<Option<Uuid>, DbErr> {
-    if let Some(team) = sub["metadata"]["team_id"]
-        .as_str()
-        .and_then(|t| t.parse().ok())
-    {
-        return Ok(Some(team));
-    }
-    let Some(id) = sub["id"].as_str() else {
-        return Ok(None);
-    };
+    let Some(sub) = sub else { return Ok(None) };
     db.query_one_raw(stmt(
-        "SELECT team_id FROM subscriptions WHERE provider = 'stripe' AND provider_subscription_id = $1",
-        vec![id.into()],
+        "SELECT team_id FROM subscriptions WHERE provider = 'stripe' \
+         AND provider_subscription_id = $1 \
+         AND (NOT $2 OR status IN ('trialing', 'active', 'past_due'))",
+        vec![sub.into(), live.into()],
     ))
     .await?
     .map(|r| r.try_get("", "team_id"))
@@ -456,14 +452,8 @@ async fn first_failure(db: &impl ConnectionTrait, invoice: &Value) -> Result<Opt
     let sub = invoice["subscription"]
         .as_str()
         .or_else(|| invoice["parent"]["subscription_details"]["subscription"].as_str());
-    let Some(sub) = sub else { return Ok(None) };
-    db.query_one_raw(stmt(
-        "SELECT team_id FROM subscriptions WHERE provider = 'stripe' AND provider_subscription_id = $1",
-        vec![sub.into()],
-    ))
-    .await?
-    .map(|r| r.try_get("", "team_id"))
-    .transpose()
+    // Only a live plan: "your team keeps working" would be wrong for one already ended.
+    team_holding(db, sub, true).await
 }
 
 /// Mails the team's owners (billing is theirs). A failed send is logged, never retried: the
@@ -633,7 +623,7 @@ async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -
             match apply_subscription(&app, &txn, object, at).await? {
                 Outcome::Applied(ended) => {
                     if ended {
-                        notice = team_of_subscription(&txn, object)
+                        notice = team_holding(&txn, object["id"].as_str(), false)
                             .await?
                             .map(|t| (t, Notice::Ended));
                     }
@@ -648,7 +638,7 @@ async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -
             || object["cancel_at"].as_i64().is_some();
         if fresh && kind == "customer.subscription.trial_will_end" && !cancelling {
             if let Some(end) = time(&object["trial_end"]) {
-                notice = team_of_subscription(&txn, object)
+                notice = team_holding(&txn, object["id"].as_str(), true)
                     .await?
                     .map(|t| (t, Notice::TrialEnds(end)));
             }
@@ -670,8 +660,10 @@ async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -
                     tracing::error!(subscription = %sub, status = ?e.0, code = %e.1, "extra stripe subscription not cancelled");
                 }
             }
+            // In the background: a slow mail service must not hold Stripe's answer.
             if let Some((team, notice)) = notice {
-                tell_owners(&app, team, notice).await;
+                let app = app.clone();
+                tokio::spawn(async move { tell_owners(&app, team, notice).await });
             }
             StatusCode::OK.into_response()
         }

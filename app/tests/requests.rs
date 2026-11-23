@@ -29135,19 +29135,34 @@ mod teams {
                 let s = &s;
                 async move { deliver(s, &body, WHSEC, now).await.status_code() }
             };
-            // The webhook mails before it answers, so what the mock saw is complete.
-            let to_owner = || {
-                seen.lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|m| m["to"] == json!([owner_email]))
-                    .map(|m| {
-                        (
-                            m["subject"].as_str().unwrap().to_owned(),
-                            m["text"].as_str().unwrap().to_owned(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
+            // Mail goes out in the background: wait until `want` arrived, then a moment more so an
+            // extra one would show too.
+            let to_owner = |want: usize| {
+                let seen = seen.clone();
+                let owner_email = owner_email.clone();
+                async move {
+                    let read = || {
+                        seen.lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|m| m["to"] == json!([owner_email]))
+                            .map(|m| {
+                                (
+                                    m["subject"].as_str().unwrap().to_owned(),
+                                    m["text"].as_str().unwrap().to_owned(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    for _ in 0..50 {
+                        if read().len() >= want {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    read()
+                }
             };
             assert_eq!(
                 send(sub_event(
@@ -29161,7 +29176,7 @@ mod teams {
                 .await,
                 200
             );
-            assert!(to_owner().is_empty());
+            assert!(to_owner(0).await.is_empty());
 
             // Three days before the trial ends.
             let sub = format!("sub_m_{}", *RUN);
@@ -29175,14 +29190,17 @@ mod teams {
                 .to_string()
             };
             assert_eq!(send(trial("evt_m2", true)).await, 200);
-            assert!(to_owner().is_empty(), "a cancelled trial is not charged");
+            assert!(
+                to_owner(0).await.is_empty(),
+                "a cancelled trial is not charged"
+            );
             assert_eq!(send(trial("evt_m3", false)).await, 200);
-            let mails = to_owner();
+            let mails = to_owner(1).await;
             assert_eq!(mails.len(), 1, "{mails:?}");
             assert_eq!(mails[0].0, "Your SocialReins trial ends on 2027-01-15");
             assert!(mails[0].1.contains("/billing"), "{}", mails[0].1);
             assert_eq!(send(trial("evt_m3", false)).await, 200);
-            assert_eq!(to_owner().len(), 1, "a redelivery mails nothing");
+            assert_eq!(to_owner(1).await.len(), 1, "a redelivery mails nothing");
 
             // A failed renewal: mailed on the first attempt only.
             let failed = |id: &str, attempt: i64| {
@@ -29195,7 +29213,7 @@ mod teams {
             };
             assert_eq!(send(failed("evt_m4", 1)).await, 200);
             assert_eq!(send(failed("evt_m5", 2)).await, 200);
-            let mails = to_owner();
+            let mails = to_owner(2).await;
             assert_eq!(mails.len(), 2, "{mails:?}");
             assert_eq!(mails[1].0, "Your SocialReins payment failed");
 
@@ -29224,7 +29242,7 @@ mod teams {
                 .await,
                 200
             );
-            let mails = to_owner();
+            let mails = to_owner(3).await;
             assert_eq!(mails.len(), 3, "{mails:?}");
             assert_eq!(mails[2].0, "Your SocialReins plan has ended");
             assert!(mails[2].1.contains("Nothing is deleted"));
