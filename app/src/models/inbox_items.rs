@@ -62,6 +62,8 @@ pub struct Model {
     pub contact_id: Option<Uuid>,
     /// The member the item is assigned to.
     pub assigned_to: Option<Uuid>,
+    /// When automations last ran over the item to the end; `None` until then (the sweep retries).
+    pub automated_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
 }
 

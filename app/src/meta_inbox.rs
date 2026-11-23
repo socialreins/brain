@@ -253,7 +253,7 @@ pub async fn follow_up(app: &AppState, fresh: Vec<(social_accounts::Model, inbox
     }
 }
 
-async fn enrich_and_run(
+pub(crate) async fn enrich_and_run(
     app: &AppState,
     account: &social_accounts::Model,
     mut item: inbox_items::Model,
