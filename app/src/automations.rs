@@ -324,6 +324,79 @@ pub fn validate_steps(
     Ok(())
 }
 
+/// Networks whose inbox can fire an automation.
+pub const AUTOMATED: [&str; 3] = ["bluesky", "facebook", "instagram"];
+/// Meta allows a message to a person only within 24 hours of their last one.
+const META_WINDOW_MINUTES: u32 = 24 * 60;
+/// And a private reply to a comment only within 7 days of it.
+const META_PRIVATE_REPLY_MINUTES: u32 = 7 * 24 * 60;
+
+/// What the networks of the accounts an automation is limited to allow, checked when it is
+/// limited to accounts by name (`providers`, one per account). An account on a network with no
+/// inbox can never fire it (`unsupported_account`). Only when every account is Facebook or
+/// Instagram, the rules there are checked too, as a flow that breaks them could never finish:
+/// a comment gets one private reply, so one DM (`meta_one_private_reply`); a DM trigger's DM
+/// must go within 24 hours of the person's message (`meta_reply_window`); an Instagram DM is at
+/// most 1000 bytes (`invalid_text`). A mixed scope is left to fail item by item.
+pub fn network_limits(
+    trigger: &str,
+    providers: &[&str],
+    actions: &[Action],
+    steps: Option<&[Step]>,
+) -> Result<(), &'static str> {
+    if providers.iter().any(|p| !AUTOMATED.contains(p)) {
+        return Err("unsupported_account");
+    }
+    if providers.is_empty()
+        || !providers
+            .iter()
+            .all(|p| matches!(*p, "facebook" | "instagram"))
+    {
+        return Ok(());
+    }
+    let mut dms: Vec<&str> = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::SendDm { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut waited = 0u32;
+    for step in steps.unwrap_or_default() {
+        match step {
+            Step::Wait { minutes } => waited += minutes,
+            Step::SendDm { text, .. } => {
+                let dm_trigger = !public(trigger) && trigger != "new_follower";
+                if dm_trigger && waited >= META_WINDOW_MINUTES {
+                    return Err("meta_reply_window");
+                }
+                if trigger == "comment_received" && waited >= META_PRIVATE_REPLY_MINUTES {
+                    return Err("meta_reply_window");
+                }
+                dms.push(text);
+            }
+            _ => {}
+        }
+    }
+    if trigger == "comment_received" && dms.len() > 1 {
+        return Err("meta_one_private_reply");
+    }
+    // A name may be in any script: each of its letters counted at 4 bytes, the most UTF-8 takes.
+    let widest = |t: &str| {
+        t.replace("{name}", &"\u{10348}".repeat(MAX_NAME_CHARS))
+            .replace("{page}", &"p".repeat(MAX_PAGE_CHARS))
+    };
+    let instagram = providers.contains(&"instagram");
+    if instagram
+        && dms
+            .iter()
+            .any(|t| !inbox::fits_on("instagram", Via::Dm, &widest(t)))
+    {
+        return Err("invalid_text");
+    }
+    Ok(())
+}
+
 /// Checks an automation's shape; the error code otherwise. Account and set ids are checked
 /// against the team by the caller.
 pub fn validate(
@@ -1683,5 +1756,103 @@ mod tests {
             r("send_dm", "skipped", Some("no_dm_access")),
         ];
         assert_eq!(summary(&tagged), ("skipped", Some("no_dm_access".into())));
+    }
+
+    #[test]
+    fn network_limits_follow_what_each_network_allows() {
+        let dm = |t: &str| Step::SendDm {
+            text: t.into(),
+            buttons: vec![],
+        };
+        let wait = |m: u32| Step::Wait { minutes: m };
+        let two = [dm("hi"), wait(5), dm("again")];
+        let none: [Action; 0] = [];
+        // Networks with no inbox can never fire it.
+        assert_eq!(
+            network_limits("comment_received", &["x"], &none, Some(&[dm("hi")])),
+            Err("unsupported_account")
+        );
+        assert_eq!(
+            network_limits(
+                "dm_received",
+                &["bluesky", "linkedin"],
+                &none,
+                Some(&[dm("hi")])
+            ),
+            Err("unsupported_account")
+        );
+        // A comment gets one private reply on Facebook and Instagram, any number on Bluesky,
+        // and a mixed scope is left to fail item by item.
+        assert_eq!(
+            network_limits("comment_received", &["facebook"], &none, Some(&two)),
+            Err("meta_one_private_reply")
+        );
+        assert_eq!(
+            network_limits("comment_received", &["bluesky"], &none, Some(&two)),
+            Ok(())
+        );
+        assert_eq!(
+            network_limits(
+                "comment_received",
+                &["bluesky", "instagram"],
+                &none,
+                Some(&two)
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            network_limits("dm_received", &["facebook"], &none, Some(&two)),
+            Ok(())
+        );
+        // A DM trigger's message must go within 24 hours of the person's.
+        let late = [dm("hi"), wait(23 * 60), wait(60), dm("later")];
+        assert_eq!(
+            network_limits("dm_received", &["instagram"], &none, Some(&late)),
+            Err("meta_reply_window")
+        );
+        let soon = [dm("hi"), wait(23 * 60), dm("later")];
+        assert_eq!(
+            network_limits("dm_received", &["instagram"], &none, Some(&soon)),
+            Ok(())
+        );
+        // Instagram counts a DM in bytes: 400 Bengali letters are 1200.
+        let bengali = "\u{0995}".repeat(400);
+        assert_eq!(
+            network_limits("dm_received", &["instagram"], &none, Some(&[dm(&bengali)])),
+            Err("invalid_text")
+        );
+        assert_eq!(
+            network_limits("dm_received", &["facebook"], &none, Some(&[dm(&bengali)])),
+            Ok(())
+        );
+        // A private reply 7 days after the comment is too late.
+        let week = [
+            Step::ReplyPublicly { text: "hi".into() },
+            wait(10080),
+            dm("later"),
+        ];
+        assert_eq!(
+            network_limits("comment_received", &["facebook"], &none, Some(&week)),
+            Err("meta_reply_window")
+        );
+        // A {name} may be 64 letters of 4 bytes: 760 ASCII bytes plus it is over 1000.
+        let named = format!("Hi {{name}} {}", "a".repeat(760));
+        assert_eq!(
+            network_limits("dm_received", &["instagram"], &none, Some(&[dm(&named)])),
+            Err("invalid_text")
+        );
+        for trigger in ["button_clicked", "story_reply"] {
+            assert_eq!(
+                network_limits(trigger, &["instagram"], &none, Some(&late)),
+                Err("meta_reply_window")
+            );
+        }
+        let action = [Action::SendDm {
+            text: bengali.clone(),
+        }];
+        assert_eq!(
+            network_limits("comment_received", &["instagram"], &action, None),
+            Err("invalid_text")
+        );
     }
 }

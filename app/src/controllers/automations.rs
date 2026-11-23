@@ -26,7 +26,7 @@ use super::{
 use crate::{
     automations::{self as rules, Action, ActionResult, Conditions, Step},
     inbox,
-    models::{automation_runs, automations, teams},
+    models::{automation_runs, automations, social_accounts, teams},
     state::AppState,
 };
 
@@ -221,7 +221,36 @@ async fn checked(
             "invalid_conditions",
         )));
     }
+    let actions = input.actions.as_deref().unwrap_or_default();
+    let steps = input.steps.as_deref();
+    if let Some(code) = scope_limits(db, team_id, &input.trigger, c, actions, steps).await? {
+        return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, code)));
+    }
     Ok(Ok((name, input)))
+}
+
+/// `rules::network_limits` for an automation limited to accounts by name; `None` otherwise.
+async fn scope_limits(
+    db: &impl ConnectionTrait,
+    team_id: Uuid,
+    trigger: &str,
+    c: &Conditions,
+    actions: &[Action],
+    steps: Option<&[Step]>,
+) -> Result<Option<&'static str>, DbErr> {
+    if c.account_ids.is_empty() {
+        return Ok(None);
+    }
+    let providers: Vec<String> = social_accounts::Entity::find()
+        .select_only()
+        .column(social_accounts::Column::Provider)
+        .filter(social_accounts::Column::TeamId.eq(team_id))
+        .filter(social_accounts::Column::Id.is_in(c.account_ids.iter().copied()))
+        .into_tuple()
+        .all(db)
+        .await?;
+    let providers: Vec<&str> = providers.iter().map(String::as_str).collect();
+    Ok(rules::network_limits(trigger, &providers, actions, steps).err())
 }
 
 /// Run counts by status and the last run, per automation of the team (or of `only` that one).
@@ -478,6 +507,37 @@ async fn set_active(app: &AppState, t: &InTeam, id: Uuid, active: bool) -> Respo
     if active {
         if let Some(res) = super::billing::needs_automation(app, t.team.id).await {
             return res;
+        }
+        // One saved before a rule existed is checked again before it may run.
+        let refused = async {
+            let Some(a) = find(&app.db, t.team.id, id).await? else {
+                return Ok(None);
+            };
+            let parsed = (
+                serde_json::from_value::<Conditions>(a.conditions.clone()),
+                serde_json::from_value::<Vec<Action>>(a.actions.clone()),
+                a.steps
+                    .clone()
+                    .map(serde_json::from_value::<Vec<Step>>)
+                    .transpose(),
+            );
+            let (Ok(c), Ok(actions), Ok(steps)) = parsed else {
+                return Ok(None);
+            };
+            scope_limits(
+                &app.db,
+                t.team.id,
+                &a.trigger,
+                &c,
+                &actions,
+                steps.as_deref(),
+            )
+            .await
+        };
+        match refused.await {
+            Ok(Some(code)) => return reply(StatusCode::UNPROCESSABLE_ENTITY, code),
+            Ok(None) => {}
+            Err(e) => return internal(e, "automation switch"),
         }
     }
     match switch(&app.db, t.team.id, id, active).await {
