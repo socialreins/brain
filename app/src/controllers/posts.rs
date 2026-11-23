@@ -2102,6 +2102,9 @@ async fn publish_now(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>
     if !app.post_limiter.hit(a.key()) {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
+    if let Some(res) = crate::controllers::billing::needs_plan(&app, a.team.id).await {
+        return res;
+    }
     let claimed = async {
         let Some(post) = find(&app.db, &a, id).await? else {
             return Ok(Err(not_found()));
@@ -2517,6 +2520,9 @@ async fn retry_post(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>)
     if !app.post_limiter.hit(a.key()) {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
+    if let Some(res) = crate::controllers::billing::needs_plan(&app, a.team.id).await {
+        return res;
+    }
     let done = async {
         let Some(found) = find(&app.db, &a, id).await? else {
             return Ok(not_found());
@@ -2560,6 +2566,9 @@ async fn retry_group(
 ) -> Response {
     if !app.post_limiter.hit(a.key()) {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    }
+    if let Some(res) = crate::controllers::billing::needs_plan(&app, a.team.id).await {
+        return res;
     }
     let done = async {
         let found = group_rows(&app.db, &a, group_id).await?;

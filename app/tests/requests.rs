@@ -5986,7 +5986,10 @@ mod teams {
                         create(&s, &cookie, input(&set, &format!("due {i}"), Some(&past()))).await;
                     mine.push(id_of(&res).parse::<uuid::Uuid>().unwrap());
                 }
-                let (a, b) = tokio::join!(publish::claim_due(&db), publish::claim_due(&db));
+                let (a, b) = tokio::join!(
+                    publish::claim_due(&db, false),
+                    publish::claim_due(&db, false)
+                );
                 let (a, b) = (a.unwrap(), b.unwrap());
                 assert!(a.len() <= 50 && b.len() <= 50, "batches are capped");
                 for id in &mine {
@@ -7137,11 +7140,11 @@ mod teams {
                     posts::Entity::update(row).exec(&db).await.unwrap();
                     mine.push(id);
                 }
-                let first = publish::claim_due(&db).await.unwrap();
+                let first = publish::claim_due(&db, false).await.unwrap();
                 assert_eq!(first.len(), 50);
                 let mut claimed: Vec<uuid::Uuid> = first.iter().map(|c| c.0).collect();
                 loop {
-                    let next = publish::claim_due(&db).await.unwrap();
+                    let next = publish::claim_due(&db, false).await.unwrap();
                     if next.is_empty() {
                         break;
                     }
@@ -14155,6 +14158,72 @@ mod teams {
                     }
                 }
 
+                /// Gives the team a plan in `status`.
+                async fn on_plan(db: &sea_orm::DatabaseConnection, team: uuid::Uuid, status: &str) {
+                    use sea_orm::ConnectionTrait;
+                    db.execute_raw(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Postgres,
+                        "INSERT INTO subscriptions (team_id, plan_id, status) VALUES ($1, 'automation', $2)
+                         ON CONFLICT (team_id) DO UPDATE SET status = $2",
+                        [team.into(), status.into()],
+                    ))
+                    .await
+                    .unwrap();
+                }
+
+                /// With billing on, a team whose plan ended publishes nothing: the due post stays
+                /// scheduled with the reason, publish now answers 402, and once the team is on a
+                /// live plan again (here `past_due`, still retrying) the post goes out.
+                #[tokio::test]
+                #[serial]
+                async fn posts_stop_when_the_plan_ends() {
+                    use socialreins_brain::billing::{self, Kind};
+                    let (s, db, mut state, _, mock, cookie, team_id, set) = team().await;
+                    state.billing_enabled = true;
+                    let team: uuid::Uuid = team_id.parse().unwrap();
+                    billing::grant(&db, team, Kind::X, 5, "test", None)
+                        .await
+                        .unwrap();
+                    let before = mock.tweets.lock().unwrap().len();
+                    on_plan(&db, team, "canceled").await;
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "Ended")).await);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "scheduled");
+                    assert_eq!(mock.tweets.lock().unwrap().len(), before);
+                    assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 5);
+                    on_plan(&db, team, "past_due").await;
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                    assert_eq!(mock.tweets.lock().unwrap().len(), before + 1);
+
+                    // A retry the plan ends under (here forced back to queued) settles with the
+                    // reason on its pending target: it never becomes `scheduled` again.
+                    let rejected = id_of(&create(&s, &cookie, x_post(&set, "REJECT it")).await);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &rejected).await["status"], "failed");
+                    on_plan(&db, team, "canceled").await;
+                    use sea_orm::ConnectionTrait;
+                    for q in [
+                        "UPDATE post_targets SET status = 'pending', error = NULL WHERE post_id = $1",
+                        "UPDATE posts SET status = 'queued' WHERE id = $1",
+                    ] {
+                        db.execute_raw(sea_orm::Statement::from_sql_and_values(
+                            sea_orm::DbBackend::Postgres,
+                            q,
+                            [rejected.parse::<uuid::Uuid>().unwrap().into()],
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    publish::publish_post(&state, rejected.parse().unwrap())
+                        .await
+                        .unwrap();
+                    let p = get_post(&s, &cookie, &rejected).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    let why = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(why.contains("plan has ended"), "{why}");
+                }
+
                 /// On Cloud an X post spends a credit once it is out; a team short of credits for the
                 /// whole thread is stopped before anything goes out.
                 #[tokio::test]
@@ -14164,6 +14233,7 @@ mod teams {
                     let (s, db, mut state, _, mock, cookie, team_id, set) = team().await;
                     state.billing_enabled = true;
                     let team: uuid::Uuid = team_id.parse().unwrap();
+                    on_plan(&db, team, "active").await;
                     let before = mock.tweets.lock().unwrap().len();
                     let id = id_of(&create(&s, &cookie, x_post(&set, "No credit")).await);
                     publish::tick(&state).await.unwrap();
@@ -14215,6 +14285,7 @@ mod teams {
                     let (s, db, mut state, _, _, cookie, team_id, set) = team().await;
                     state.billing_enabled = true;
                     let team: uuid::Uuid = team_id.parse().unwrap();
+                    on_plan(&db, team, "active").await;
                     billing::grant(&db, team, Kind::X, 6, "test", None)
                         .await
                         .unwrap();
@@ -14243,6 +14314,7 @@ mod teams {
                     let (s, db, mut state, _, mock, cookie, team_id, set) = team().await;
                     state.billing_enabled = true;
                     let team: uuid::Uuid = team_id.parse().unwrap();
+                    on_plan(&db, team, "active").await;
                     billing::grant(&db, team, Kind::X, 1, "test", None)
                         .await
                         .unwrap();
@@ -28491,6 +28563,18 @@ mod teams {
             let (s, db) = server_where(|c| c.billing_enabled = true).await;
             let (_, owner, _) = user(&s, &db).await;
             let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            // Publishing now or retrying waits for a plan, before the post is even looked up.
+            let some = uuid::Uuid::now_v7();
+            for path in [
+                format!("/v1/posts/{some}/publish"),
+                format!("/v1/posts/{some}/retry"),
+            ] {
+                let (code, body) = post(&s, &owner, &path, json!({})).await;
+                assert_eq!(
+                    (code, body),
+                    (402, json!({"error": "plan_limit", "limit": "plan"}))
+                );
+            }
             let refused = json!({"error": "plan_limit", "limit": "automation"});
             // No plan at all.
             let (code, body) = post(&s, &owner, creates[0].0, creates[0].1.clone()).await;
