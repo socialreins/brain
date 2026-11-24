@@ -7845,7 +7845,7 @@ mod teams {
                     exec(
                         db,
                         format!(
-                            "UPDATE posts SET status = 'queued', fanned_out = true, \
+                            "UPDATE posts SET status = 'queued', fanned_out = false, \
                              updated_at = now() - interval '40 minutes' WHERE id = '{id}'; \
                              INSERT INTO post_targets (id, post_id, social_account_id, status) \
                              VALUES ('{target}', '{id}', (SELECT id FROM social_accounts \
@@ -7918,6 +7918,77 @@ mod teams {
                     let drafted = drafting.await.unwrap();
                     assert!(!drafted.iter().any(|d| d.to_string() == id), "{drafted:?}");
                     assert_eq!(get_post(&s, &cookie, &id).await["status"], "queued");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_retried_post_is_never_drafted_as_late() {
+                    let (s, db, _) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    // As a manual retry leaves it when the process restarts mid-way: queued, an
+                    // old `scheduled_at`, fanned out, its target pending with the live root.
+                    let (id, target) = stale_queued(&s, &db, &cookie, &set, &team_id).await;
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE post_targets SET remote_id = 'at://live/root', \
+                             error = 'part 2 failed' WHERE id = '{target}'; \
+                             UPDATE posts SET fanned_out = true WHERE id = '{id}'"
+                        ),
+                    )
+                    .await;
+                    let drafted = publish::draft_late(&db, &[]).await.unwrap();
+                    assert!(!drafted.iter().any(|d| d.to_string() == id), "{drafted:?}");
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "queued");
+                    let kept: Option<String> = db
+                        .query_one_raw(sea_orm::Statement::from_string(
+                            sea_orm::DbBackend::Postgres,
+                            format!("SELECT remote_id FROM post_targets WHERE id = '{target}'"),
+                        ))
+                        .await
+                        .unwrap()
+                        .expect("the target is kept")
+                        .try_get("", "remote_id")
+                        .unwrap();
+                    assert_eq!(kept.as_deref(), Some("at://live/root"));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_manual_retry_clears_the_old_retry_time() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let id = id_of(&create(&s, &cookie, input(&set, "BUSY", Some(&past()))).await);
+                    publish::tick(&state).await.unwrap();
+                    retry_now(&db, &id).await;
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "failed");
+                    let res =
+                        req(&s, Method::POST, &format!("/v1/posts/{id}/retry"), &cookie).await;
+                    assert_eq!(res.status_code(), 202, "{}", res.text());
+                    let left: i64 = db
+                        .query_one_raw(sea_orm::Statement::from_string(
+                            sea_orm::DbBackend::Postgres,
+                            format!(
+                                "SELECT count(*) AS n FROM post_targets \
+                                 WHERE post_id = '{id}' AND retry_at IS NOT NULL"
+                            ),
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .try_get("", "n")
+                        .unwrap();
+                    assert_eq!(left, 0, "no stale retry time");
+                    // Let the retry run its course before the next test.
+                    for _ in 0..50 {
+                        if get_post(&s, &cookie, &id).await["status"] != "queued" {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
                 }
 
                 #[tokio::test]
