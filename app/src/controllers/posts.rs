@@ -211,7 +211,8 @@ pub struct PostInput {
     pub platform: String,
     /// The accounts to post to: ids of the team's accounts of `platform` in the set
     /// (`GET /connections`). `null` or `[]`: every one, including an account added to the set
-    /// later. Absent: every one on a create, and unchanged on an update. An id that is not such
+    /// later. Absent: every one on a create, and unchanged on an update (not checked again, so
+    /// an account gone since stays and fails at publish). An id that is not such
     /// an account is `422 invalid_accounts` (`field: "account_ids"`, `social_account_id` the
     /// first bad one). An account that leaves the set or is disconnected before the post goes
     /// out gets a `failed` target saying so.
@@ -342,10 +343,11 @@ pub struct PostGroupInput {
     /// connected account in the set (`422 no_accounts` when there is none), which includes
     /// TikTok, so then `tiktok` is required too.
     pub platforms: Option<Vec<String>>,
-    /// The accounts to post to, of any platform: each post gets those of its platform. Absent,
-    /// `null` or `[]`: every account of each platform. With it and no `platforms`, the platforms are
-    /// those of these accounts. An id that is not the team's account in the set, or a platform
-    /// none of them is on, is `422 invalid_accounts`.
+    /// The accounts to post to, of any platform: each post gets those of its platform, and a post
+    /// of a platform none of them is on goes to every account of it (`account_ids: null`).
+    /// Absent, `null` or `[]`: every account of each platform. With it and no `platforms`, the
+    /// platforms are those of these accounts. An id that is not the team's account in the set is
+    /// `422 invalid_accounts`.
     pub account_ids: Option<Vec<Uuid>>,
     /// Each post's body, unless its override has one.
     #[serde(default)]
@@ -1928,13 +1930,6 @@ pub(crate) async fn create_group_guarded(
         if platforms.is_empty() {
             return Ok(stop(reply(StatusCode::UNPROCESSABLE_ENTITY, "no_accounts")).await);
         }
-        // A platform none of the chosen accounts is on: an empty pick would mean every account.
-        if let Some(c) = &chosen {
-            if platforms.iter().any(|p| !c.iter().any(|(cp, _)| cp == p)) {
-                let res = reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_accounts");
-                return Ok(stop(res).await);
-            }
-        }
         let mut problems = Vec::new();
         if input.overrides.keys().any(|p| !platforms.contains(p)) {
             if !validate_only {
@@ -1973,9 +1968,14 @@ pub(crate) async fn create_group_guarded(
                     youtube: o
                         .and_then(|o| o.youtube.clone())
                         .or_else(|| input.youtube.clone().filter(|_| platform == "youtube")),
-                    account_ids: chosen.as_ref().map(|c| {
-                        let mine = c.iter().filter(|(p, _)| *p == platform);
-                        Some(mine.map(|(_, id)| *id).collect())
+                    // A platform none of the chosen accounts is on goes to every account of it.
+                    account_ids: chosen.as_ref().and_then(|c| {
+                        let mine: Vec<Uuid> = c
+                            .iter()
+                            .filter(|(p, _)| *p == platform)
+                            .map(|(_, id)| *id)
+                            .collect();
+                        (!mine.is_empty()).then_some(Some(mine))
                     }),
                     platform,
                     scheduled_at: input.scheduled_at,
@@ -2176,14 +2176,22 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, mut input: PostInp
         if !editable(&found.status) {
             return Ok(Err(reply(StatusCode::CONFLICT, "not_editable")));
         }
-        // Absent keeps the accounts chosen before; only `null` or `[]` resets to every one.
-        if input.account_ids.is_none() {
-            input.account_ids = Some(
-                found
-                    .account_ids
-                    .clone()
-                    .and_then(|v| serde_json::from_value(v).ok()),
-            );
+        // Absent keeps the stored list as it is, gone accounts included (publishing gives each a
+        // failed target); only `null` or `[]` resets to every one. The checks see the accounts of
+        // the list still in the set, or every account when none is.
+        let kept = input
+            .account_ids
+            .is_none()
+            .then(|| found.account_ids.clone());
+        if kept.is_some() {
+            let stored: Option<Vec<Uuid>> = found
+                .account_ids
+                .clone()
+                .and_then(|v| serde_json::from_value(v).ok());
+            let set = input.social_set_id.unwrap_or(found.social_set_id);
+            let live = accounts_in(&app.db, a.team.id, set).await?;
+            let fits = |id: &Uuid| live.iter().any(|(p, l)| l == id && *p == input.platform);
+            input.account_ids = Some(stored.map(|ids| ids.into_iter().filter(fits).collect()));
         }
         let set = match checked_fully(app, a, &input).await? {
             Ok(set) => set,
@@ -2215,7 +2223,10 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, mut input: PostInp
             .col_expr(posts::Column::Cover, stored_cover(&input).into())
             .col_expr(posts::Column::Tiktok, stored_tiktok(&input).into())
             .col_expr(posts::Column::Youtube, stored_youtube(&input).into())
-            .col_expr(posts::Column::AccountIds, stored_accounts(&input).into())
+            .col_expr(
+                posts::Column::AccountIds,
+                kept.unwrap_or_else(|| stored_accounts(&input)).into(),
+            )
             .col_expr(posts::Column::Status, status_for(&input).into())
             .col_expr(posts::Column::ScheduledAt, when(&input).into())
             .col_expr(posts::Column::Approval, approval.into())
