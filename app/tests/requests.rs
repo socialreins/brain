@@ -6701,6 +6701,21 @@ mod teams {
                 assert_eq!(g["posts"][0]["account_ids"], json!([a3]));
                 assert_eq!(g["expected_targets"], 1);
                 let grouped = g["posts"][0]["id"].as_str().unwrap().to_owned();
+                // A platform none of the picks is on goes to every account of it, later ones too.
+                let mut both = group.clone();
+                both["platforms"] = json!(["bluesky", "linkedin"]);
+                let res = req(&s, Method::POST, "/v1/post-groups", &cookie)
+                    .json(&both)
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let g = res.json::<Value>();
+                assert_eq!(g["posts"][0]["account_ids"], json!([a3]), "{g}");
+                assert_eq!(g["posts"][1]["platform"], "linkedin");
+                assert_eq!(g["posts"][1]["account_ids"], Value::Null);
+                for p in g["posts"].as_array().unwrap() {
+                    let path = format!("/v1/posts/{}", p["id"].as_str().unwrap());
+                    req(&s, Method::DELETE, &path, &cookie).await;
+                }
                 group["account_ids"] = json!([stranger]);
                 let res = req(&s, Method::POST, "/v1/post-groups", &cookie)
                     .json(&group)
@@ -6717,6 +6732,10 @@ mod teams {
                 db.execute_unprepared(&format!("DELETE FROM social_accounts WHERE id = '{a3}'"))
                     .await
                     .unwrap();
+                // A move (no account_ids) still saves, keeping the gone ones for publish to report.
+                let res = req(&s, Method::PUT, &path, &cookie).json(&moved).await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                assert_eq!(res.json::<Value>()["account_ids"], json!(three));
                 publish::tick(&state).await.unwrap();
                 let p = settled(&s, &cookie, &chosen).await;
                 assert_eq!(p["status"], "published", "{p}");
