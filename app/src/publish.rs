@@ -1105,7 +1105,6 @@ pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, D
     if let Err(e) = draft_late(&app.db, &running).await {
         tracing::warn!(error = %e, "late posts not put back to draft");
     }
-    let room = (CLAIM_BATCH - in_flight(|flying| flying.len()) as i64).max(0);
     // Posts left `queued` by a crash between claim and settle: fan-out and claims are
     // idempotent, so running them again only finishes the job. Also posts with a target whose
     // automatic retry is due.
@@ -1118,8 +1117,7 @@ pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, D
     );
     let left = ids(&app.db, stmt, "id").await?;
     // The quota is reserved per post in `publish_post`, together with marking it reserved.
-    let busy = busy_teams(&app.db, &running).await?;
-    let mut flights: Vec<(Flight, Option<Uuid>)> = claim_flights(app, room, &busy, None)
+    let mut flights: Vec<(Flight, Option<Uuid>)> = claim_flights(app, None)
         .await?
         .into_iter()
         .map(|(f, team)| (f, Some(team)))
@@ -1147,15 +1145,15 @@ pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, D
 
 /// Claims for `claim` and marks each post in flight; one already in flight here (a task that has
 /// not ended yet, claimed again) goes back to `scheduled` for the next round, never left `queued`
-/// with nothing to run it.
-async fn claim_flights(
-    app: &AppState,
-    room: i64,
-    busy: &HashMap<Uuid, i32>,
-    only: Option<Uuid>,
-) -> Result<Vec<(Flight, Uuid)>, DbErr> {
+/// with nothing to run it. One claim at a time (`CLAIM_GATE`), with what is in flight read inside
+/// it, so a team's places are counted once however many posts end together.
+async fn claim_flights(app: &AppState, only: Option<Uuid>) -> Result<Vec<(Flight, Uuid)>, DbErr> {
+    let _gate = CLAIM_GATE.lock().await;
+    let running: Vec<Uuid> = in_flight(|flying| flying.iter().copied().collect());
+    let room = (CLAIM_BATCH - running.len() as i64).max(0);
+    let busy = busy_teams(&app.db, &running).await?;
     let mut flights = Vec::new();
-    for (id, team) in claim(&app.db, room, app.billing_enabled, busy, only).await? {
+    for (id, team) in claim(&app.db, room, app.billing_enabled, &busy, only).await? {
         if in_flight(|flying| flying.insert(id)) {
             flights.push((Flight(id), team));
         } else if let Err(e) = unclaim(&app.db, id, None).await {
@@ -1163,6 +1161,16 @@ async fn claim_flights(
         }
     }
     Ok(flights)
+}
+
+/// Serialises `claim_flights` in this process.
+static CLAIM_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Whether a post that `publish_post` returned from freed its team's place for the next one:
+/// not after an error, and not for a post it put back to `scheduled` (the plan ended, the daily
+/// cap, a quota error), which a refill would only claim again at once.
+fn frees_a_place(published: bool, status: &str) -> bool {
+    published && status != "scheduled"
 }
 
 /// Publishes a claimed post, then fills the place it frees for its team (`refill`), so a team's
@@ -1175,12 +1183,27 @@ fn run(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     Box::pin(async move {
         let id = flight.0;
-        if let Err(e) = publish_post(&app, id).await {
-            tracing::error!(error = %e, post = %id, "publish failed");
-        }
+        let published = match publish_post(&app, id).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(error = %e, post = %id, "publish failed");
+                false
+            }
+        };
         drop(flight);
         if let Some(team) = team {
-            refill(&app, team).await;
+            let status = posts::Entity::find_by_id(id)
+                .select_only()
+                .column(posts::Column::Status)
+                .into_tuple::<String>()
+                .one(&app.db)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            if frees_a_place(published, &status) {
+                refill(&app, team).await;
+            }
         }
     })
 }
@@ -1191,13 +1214,7 @@ async fn refill(app: &AppState, team: Uuid) {
     if POST_SLOTS.is_closed() {
         return;
     }
-    let running: Vec<Uuid> = in_flight(|flying| flying.iter().copied().collect());
-    let room = (CLAIM_BATCH - running.len() as i64).max(0);
-    let claimed = async {
-        let busy = busy_teams(&app.db, &running).await?;
-        claim_flights(app, room, &busy, Some(team)).await
-    }
-    .await;
+    let claimed = claim_flights(app, Some(team)).await;
     let runs: Vec<_> = match claimed {
         Ok(flights) => flights
             .into_iter()
@@ -1681,19 +1698,30 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
             .into_tuple()
             .all(db)
             .await?;
+        // Under a shared lock on the post, which must still be `queued`: `draft_late` takes the
+        // same lock, so it never drafts a post whose targets are being made.
+        let txn = db.begin().await?;
+        let live = sql(
+            "SELECT 1 AS n FROM posts WHERE id = $1 AND status = 'queued' FOR SHARE",
+            vec![id.into()],
+        );
+        if txn.query_one_raw(live).await?.is_none() {
+            return txn.commit().await;
+        }
         for account in &accounts {
             let stmt = sql(
                 "INSERT INTO post_targets (id, post_id, social_account_id, status) \
                  VALUES ($1, $2, $3, 'pending') ON CONFLICT (post_id, social_account_id) DO NOTHING",
                 vec![Uuid::now_v7().into(), id.into(), (*account).into()],
             );
-            db.execute_raw(stmt).await?;
+            txn.execute_raw(stmt).await?;
         }
         let mark = sql(
             "UPDATE posts SET fanned_out = true WHERE id = $1",
             vec![id.into()],
         );
-        db.execute_raw(mark).await?;
+        txn.execute_raw(mark).await?;
+        txn.commit().await?;
     }
     let targets = post_targets::Entity::find()
         .filter(post_targets::Column::PostId.eq(id))
@@ -2795,6 +2823,20 @@ async fn delete_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_post_that_ran_frees_its_place_for_the_next() {
+        assert!(frees_a_place(true, "published"));
+        assert!(frees_a_place(true, "failed"));
+        assert!(
+            frees_a_place(true, "queued"),
+            "a retry waiting five minutes"
+        );
+        // Put back to scheduled (plan ended, daily cap), or an error: a refill would claim the
+        // same post again at once, round and round until it is an hour late.
+        assert!(!frees_a_place(true, "scheduled"));
+        assert!(!frees_a_place(false, "queued"));
+    }
 
     #[test]
     fn a_large_video_gets_more_time_and_a_small_file_none() {

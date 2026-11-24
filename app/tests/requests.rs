@@ -8077,6 +8077,89 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
+                async fn a_team_never_has_more_claimed_than_its_places_when_posts_end_together() {
+                    use sea_orm::ConnectionTrait as _;
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    for i in 0..18 {
+                        due_ago(
+                            &s,
+                            &db,
+                            &cookie,
+                            input(&set, &format!("SLOW {i}"), Some(&past())),
+                            10,
+                        )
+                        .await;
+                    }
+                    let tick = tokio::spawn({
+                        let state = state.clone();
+                        async move { publish::tick(&state).await.unwrap() }
+                    });
+                    let mut most = 0;
+                    while !tick.is_finished() {
+                        let n: i64 = db
+                            .query_one_raw(sea_orm::Statement::from_string(
+                                sea_orm::DbBackend::Postgres,
+                                format!(
+                                    "SELECT count(*) AS n FROM posts \
+                                     WHERE team_id = '{team_id}' AND status = 'queued'"
+                                ),
+                            ))
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .try_get("", "n")
+                            .unwrap();
+                        most = most.max(n);
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    tick.await.unwrap();
+                    assert!(
+                        most as usize <= publish::TEAM_AT_ONCE,
+                        "claimed at once: {most}"
+                    );
+                    assert!(most >= 2, "and the places are used: {most}");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_post_drafted_while_it_is_fanned_out_gets_no_targets() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let id =
+                        due_ago(&s, &db, &cookie, input(&set, "late", Some(&past())), 90).await;
+                    // Claimed, quota held, not fanned out yet; another instance's drafting holds it.
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE posts SET status = 'queued', quota_reserved = true, \
+                             fanned_out = false WHERE id = '{id}'"
+                        ),
+                    )
+                    .await;
+                    let txn = db.begin().await.unwrap();
+                    txn.execute_unprepared(&format!(
+                        "UPDATE posts SET status = 'draft', quota_reserved = false WHERE id = '{id}'"
+                    ))
+                    .await
+                    .unwrap();
+                    let run = tokio::spawn({
+                        let (state, id) = (state.clone(), id.parse().unwrap());
+                        async move { publish::publish_post(&state, id).await.unwrap() }
+                    });
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    assert!(!run.is_finished(), "the fan-out waits for the lock");
+                    txn.commit().await.unwrap();
+                    run.await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "draft", "{p}");
+                    assert_eq!(p["targets"], json!([]), "no targets for a draft: {p}");
+                }
+
+                #[tokio::test]
+                #[serial]
                 async fn a_team_with_a_backlog_does_not_hold_up_another_team() {
                     let (s, db, state) = on_mock().await;
                     let (a_cookie, a_team, _) = owner_with_account(&s, &db).await;
