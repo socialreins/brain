@@ -8252,6 +8252,24 @@ mod teams {
                     );
                     assert!(mails[1].1.contains(&format!("/posts/{late}")));
 
+                    // Scheduled again, as time passes it goes late a second time: mailed again, once.
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE post_notices SET created_at = now() - interval '3 hours' \
+                             WHERE post_id = '{late}'; \
+                             UPDATE posts SET status = 'scheduled', error = NULL, \
+                             scheduled_at = now() - interval '90 minutes' WHERE id = '{late}'"
+                        ),
+                    )
+                    .await;
+                    for _ in 0..3 {
+                        publish::tick(&state).await.unwrap();
+                    }
+                    let mails = mail_for(&seen.lock().unwrap(), &owner);
+                    assert_eq!(mails.len(), 3, "{mails:?}");
+                    assert_eq!(mails[2].0, "Your Bluesky post was not posted");
+
                     // Ten notices a team a day: the eleventh and after are not mailed.
                     for i in 0..10 {
                         let body = input(&set, &format!("REJECT {i}"), Some(&past()));
