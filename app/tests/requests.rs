@@ -3708,6 +3708,11 @@ mod teams {
             std::sync::atomic::AtomicBool::new(false);
         /// Set: the next `createRecord` of a text with `BUSYONCE` is refused for the rate limit.
         static BUSY_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        /// Text with `SLOW` takes this long to answer; `SLOW_NOW` and `SLOW_MOST` count how many
+        /// such calls are in progress, and the most there were at once.
+        const SLOW_FOR: std::time::Duration = std::time::Duration::from_millis(400);
+        static SLOW_NOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static SLOW_MOST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         /// The record key of every `deleteRecord` the mock took, newest last.
         static DELETED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -3873,6 +3878,13 @@ mod teams {
                 && BUSY_ONCE.swap(false, std::sync::atomic::Ordering::SeqCst);
             if busy_once || (text.contains("BUSY") && !text.contains("BUSYONCE")) {
                 return refused(429, "RateLimitExceeded");
+            }
+            if text.contains("SLOW") {
+                use std::sync::atomic::Ordering::SeqCst;
+                let now = SLOW_NOW.fetch_add(1, SeqCst) + 1;
+                SLOW_MOST.fetch_max(now, SeqCst);
+                tokio::time::sleep(SLOW_FOR).await;
+                SLOW_NOW.fetch_sub(1, SeqCst);
             }
             if text.contains("REJECT") {
                 let leak = json!({"error": "InvalidRequest",
@@ -8024,6 +8036,43 @@ mod teams {
                     drop(held);
                     publish::tick(&state).await.unwrap();
                     assert_eq!(get_post(&s, &cookie, &id).await["status"], "draft");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_burst_of_one_teams_posts_is_not_limited_to_one_claim_a_tick() {
+                    use std::sync::atomic::Ordering::SeqCst;
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let mut ids = Vec::new();
+                    for i in 0..30 {
+                        ids.push(
+                            due_ago(
+                                &s,
+                                &db,
+                                &cookie,
+                                input(&set, &format!("SLOW {i}"), Some(&past())),
+                                10,
+                            )
+                            .await,
+                        );
+                    }
+                    SLOW_MOST.store(0, SeqCst);
+                    let started = std::time::Instant::now();
+                    // One tick: each post that ends claims the team's next one at once.
+                    publish::tick(&state).await.unwrap();
+                    let took = started.elapsed();
+                    for id in &ids {
+                        assert_eq!(get_post(&s, &cookie, id).await["status"], "published");
+                    }
+                    // 30 posts of 0.4 seconds, 3 at once: about 4 seconds, not 10 ticks of a minute.
+                    assert!(took < std::time::Duration::from_secs(12), "{took:?}");
+                    let most = SLOW_MOST.load(SeqCst);
+                    assert!(
+                        (2..=publish::TEAM_AT_ONCE).contains(&most),
+                        "never more than the team's places at once, and they are used: {most}"
+                    );
                 }
 
                 #[tokio::test]

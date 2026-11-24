@@ -112,7 +112,10 @@ cargo run -p socialreins-brain
   `scheduled`. A team publishes at most `TEAM_AT_ONCE` (3) posts and 3 targets at once in a
   process, taken before the shared slots, and a round claims a team no more posts than it has
   places left (counted from `IN_FLIGHT`, whole groups at a time), so a team's backlog stays
-  `scheduled` and never fills the batch, goes stuck or counts as late while it only waits. The
+  `scheduled` and never fills the batch or sits `queued` long enough to look stuck (so another
+  instance's `draft_late` leaves a claimed post alone); each post that ends claims its team's
+  next at once (`refill`), so throughput is the places and the time a post takes, not one claim a
+  tick. The
   cap is per process: with several instances a team gets 3 on each (a shortcut, noted in the
   README). Deleting a set fails its scheduled posts
   (`SET_DELETED`), and one already claimed the same way, with no mail either: the user did it; the 30-day purge deletes the set with all its posts (cascade). Repeats step

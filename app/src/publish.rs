@@ -1118,40 +1118,96 @@ pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, D
     );
     let left = ids(&app.db, stmt, "id").await?;
     // The quota is reserved per post in `publish_post`, together with marking it reserved.
-    let mut flights = Vec::new();
     let busy = busy_teams(&app.db, &running).await?;
-    for (id, _) in claim(&app.db, room, app.billing_enabled, &busy).await? {
-        if in_flight(|flying| flying.insert(id)) {
-            flights.push(Flight(id));
-        // Put back by a task that has not ended yet and claimed again here: nothing would run
-        // it, so it goes back to `scheduled` for the next round, never left `queued`.
-        } else if let Err(e) = unclaim(&app.db, id, None).await {
-            tracing::warn!(error = %e, post = %id, "returning a claimed post failed");
-        }
-    }
+    let mut flights: Vec<(Flight, Option<Uuid>)> = claim_flights(app, room, &busy, None)
+        .await?
+        .into_iter()
+        .map(|(f, team)| (f, Some(team)))
+        .collect();
     // Never picked up as left behind while this process still runs it.
     let left = left
         .into_iter()
         .filter(|id| in_flight(|flying| flying.insert(*id)));
-    flights.extend(left.map(Flight));
+    flights.extend(left.map(|id| (Flight(id), None)));
     // Mail about posts that did not go out, queued by earlier rounds (`post_mail`).
     let mail = {
         let app = app.clone();
         tokio::spawn(async move { crate::post_mail::send_due(&app).await })
     };
     let runs = std::iter::once(mail)
-        .chain(flights.into_iter().map(|flight| {
-            let (app, id) = (app.clone(), flight.0);
-            tokio::spawn(async move {
-                let _flight = flight;
-                if let Err(e) = publish_post(&app, id).await {
-                    tracing::error!(error = %e, post = %id, "publish failed");
-                }
-            })
-        }))
+        .chain(
+            flights
+                .into_iter()
+                .map(|(flight, team)| tokio::spawn(run(app.clone(), flight, team))),
+        )
         .collect();
     lock.commit().await?;
     Ok(runs)
+}
+
+/// Claims for `claim` and marks each post in flight; one already in flight here (a task that has
+/// not ended yet, claimed again) goes back to `scheduled` for the next round, never left `queued`
+/// with nothing to run it.
+async fn claim_flights(
+    app: &AppState,
+    room: i64,
+    busy: &HashMap<Uuid, i32>,
+    only: Option<Uuid>,
+) -> Result<Vec<(Flight, Uuid)>, DbErr> {
+    let mut flights = Vec::new();
+    for (id, team) in claim(&app.db, room, app.billing_enabled, busy, only).await? {
+        if in_flight(|flying| flying.insert(id)) {
+            flights.push((Flight(id), team));
+        } else if let Err(e) = unclaim(&app.db, id, None).await {
+            tracing::warn!(error = %e, post = %id, "returning a claimed post failed");
+        }
+    }
+    Ok(flights)
+}
+
+/// Publishes a claimed post, then fills the place it frees for its team (`refill`), so a team's
+/// throughput is its places and how long a post takes, never one claim a tick. Returns when the
+/// posts it started in turn have ended too.
+fn run(
+    app: AppState,
+    flight: Flight,
+    team: Option<Uuid>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        let id = flight.0;
+        if let Err(e) = publish_post(&app, id).await {
+            tracing::error!(error = %e, post = %id, "publish failed");
+        }
+        drop(flight);
+        if let Some(team) = team {
+            refill(&app, team).await;
+        }
+    })
+}
+
+/// Claims `team`'s next due posts, as many as it has places left in this process, and runs them.
+/// A stopping process claims nothing.
+async fn refill(app: &AppState, team: Uuid) {
+    if POST_SLOTS.is_closed() {
+        return;
+    }
+    let running: Vec<Uuid> = in_flight(|flying| flying.iter().copied().collect());
+    let room = (CLAIM_BATCH - running.len() as i64).max(0);
+    let claimed = async {
+        let busy = busy_teams(&app.db, &running).await?;
+        claim_flights(app, room, &busy, Some(team)).await
+    }
+    .await;
+    let runs: Vec<_> = match claimed {
+        Ok(flights) => flights
+            .into_iter()
+            .map(|(flight, team)| tokio::spawn(run(app.clone(), flight, Some(team))))
+            .collect(),
+        Err(e) => return tracing::warn!(error = %e, "a team's next posts not claimed"),
+    };
+    for r in runs {
+        let _ = r.await;
+    }
 }
 
 /// `begin`, then waits for the posts it started: what tests and one-off runs want.
@@ -1166,7 +1222,7 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
 /// a live set, of a team under its daily publish cap (and with `billing`, on a live plan), and none `rejected`, nor `pending` while its
 /// team requires approval. Returns `(post, team)`.
 pub async fn claim_due(db: &DatabaseConnection, billing: bool) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
-    claim(db, CLAIM_BATCH, billing, &HashMap::new()).await
+    claim(db, CLAIM_BATCH, billing, &HashMap::new(), None).await
 }
 
 /// How many of `posts` each team has in flight in this process.
@@ -1185,15 +1241,19 @@ async fn busy_teams(db: &DatabaseConnection, posts: &[Uuid]) -> Result<HashMap<U
 
 /// `claim_due` of at most `limit` posts. A claimed post with a repeat rule yields its next copy
 /// in the same transaction (`repeat::spawn`), so it does once. A team is claimed no more posts
-/// than it has places left (`TEAM_AT_ONCE` less its posts in `busy`, in flight here): a post
-/// that could only wait for its team's places stays `scheduled`, counts nowhere against the
-/// batch and is neither stuck nor late until it gets one, so one team's backlog never keeps
-/// another team's post from going out on time.
+/// than it has places left (`TEAM_AT_ONCE` less its posts in `busy`, in flight here), `only`
+/// that team when set: a post that could only wait for its team's places stays `scheduled`, so
+/// it counts nowhere against the batch, is not `queued` long enough to be called stuck, and no
+/// other instance mistakes it for left behind. A team's backlog never keeps another team's post
+/// from going out, and each post that ends claims the team's next one at once (`refill`), so the
+/// tick is not the team's throughput. A post still `scheduled` an hour past its time is late
+/// (`draft_late`) as any other.
 async fn claim(
     db: &DatabaseConnection,
     limit: i64,
     billing: bool,
     busy: &HashMap<Uuid, i32>,
+    only: Option<Uuid>,
 ) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
     // A CTE runs once; a LIMIT inside `IN (...)` may be re-run and claim more. The posts of one
     // group (`group_id`, one per platform) are claimed together or not at all, so they are all
@@ -1204,6 +1264,7 @@ async fn claim(
            SELECT d.id, d.team_id, COALESCE(d.group_id, d.id) AS gk, d.scheduled_at \
            FROM posts d \
            WHERE d.status = 'scheduled' AND d.scheduled_at <= now() \
+           AND ($8::uuid IS NULL OR d.team_id = $8) \
            AND d.scheduled_at >= now() - make_interval(mins => $4) \
            AND d.approval IS DISTINCT FROM 'rejected' \
            AND (d.approval IS DISTINCT FROM 'pending' OR NOT EXISTS ( \
@@ -1239,6 +1300,7 @@ async fn claim(
             busy.keys().copied().collect::<Vec<_>>().into(),
             busy.values().copied().collect::<Vec<_>>().into(),
             (TEAM_AT_ONCE as i32).into(),
+            only.into(),
         ],
     );
     let txn = db.begin().await?;
