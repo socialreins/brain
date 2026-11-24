@@ -1113,9 +1113,13 @@ pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, D
         .into_iter()
         .filter(|id| in_flight(|flying| flying.insert(*id)));
     flights.extend(left.map(Flight));
-    let runs = flights
-        .into_iter()
-        .map(|flight| {
+    // Mail about posts that did not go out, queued by earlier rounds (`post_mail`).
+    let mail = {
+        let app = app.clone();
+        tokio::spawn(async move { crate::post_mail::send_due(&app).await })
+    };
+    let runs = std::iter::once(mail)
+        .chain(flights.into_iter().map(|flight| {
             let (app, id) = (app.clone(), flight.0);
             tokio::spawn(async move {
                 let _flight = flight;
@@ -1123,7 +1127,7 @@ pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, D
                     tracing::error!(error = %e, post = %id, "publish failed");
                 }
             })
-        })
+        }))
         .collect();
     lock.commit().await?;
     Ok(runs)
@@ -1265,6 +1269,9 @@ pub async fn draft_late(db: &DatabaseConnection, running: &[Uuid]) -> Result<Vec
         .exec(&txn)
         .await?;
     crate::repeat::spawn(&txn, &late, None).await?;
+    for id in &late {
+        crate::post_mail::queue(&txn, *id, crate::post_mail::Kind::Late).await?;
+    }
     txn.commit().await?;
     tracing::info!(posts = late.len(), "late posts put back to draft");
     Ok(late)
@@ -1435,7 +1442,11 @@ async fn fail_post(db: &DatabaseConnection, id: Uuid, msg: &str) -> Result<(), D
          WHERE id = $1 AND status = 'queued'",
         vec![id.into(), msg.into()],
     );
-    db.execute_raw(stmt).await.map(|_| ())
+    let txn = db.begin().await?;
+    if txn.execute_raw(stmt).await?.rows_affected() == 1 {
+        crate::post_mail::queue(&txn, id, crate::post_mail::Kind::Failed).await?;
+    }
+    txn.commit().await
 }
 
 const PLAN_ENDED: &str = "The team's plan has ended. The post goes out if a plan is chosen on the \
@@ -2534,6 +2545,13 @@ pub async fn settle(db: &DatabaseConnection, id: Uuid) -> Result<(), DbErr> {
         vec![id.into(), status.into(), error.into()],
     );
     txn.execute_raw(stmt).await?;
+    if !failed.is_empty() {
+        let kind = match status {
+            "failed" => crate::post_mail::Kind::Failed,
+            _ => crate::post_mail::Kind::Partial,
+        };
+        crate::post_mail::queue(&txn, id, kind).await?;
+    }
     txn.commit().await
 }
 

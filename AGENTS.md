@@ -108,6 +108,10 @@ cargo run -p socialreins-brain
   all judged by the same clock. A target retries once by itself, 5 minutes on (`post_targets.retry_at`,
   `retried`), only after an error a connector marked `connectors::UNSENT` (a rate limit, a
   connection that never opened) and never once its remote id is saved.
+- `app/src/post_mail.rs`: a post that settles as failed or partly failed, or goes back to draft
+  for being late, queues a `post_notices` row in the same transaction; each publish round mails
+  the queued ones in the background to the post's author and the team's owners, once, at most
+  10 a team a day (`rate_limit::daily_reserve`).
 - `app/src/publish.rs`: a post's `first_comment` (Facebook, Instagram, LinkedIn, YouTube) goes out
   once, after its target is saved as `published`: `post_targets.comment_status` is claimed
   (`posting`) before the call and never reset, so it is never retried; a failure only sets

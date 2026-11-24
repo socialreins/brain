@@ -60,6 +60,7 @@ mod m20261219_000001_inbox_attachments;
 mod m20261220_000001_post_account_ids;
 mod m20261220_000001_target_retry;
 mod m20261221_000001_media_uploads;
+mod m20261221_000001_post_notices;
 
 pub struct Migrator;
 
@@ -127,6 +128,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261220_000001_post_account_ids::Migration),
             Box::new(m20261221_000001_media_uploads::Migration),
             Box::new(m20261220_000001_target_retry::Migration),
+            Box::new(m20261221_000001_post_notices::Migration),
             // inject-above (do not remove this comment)
         ]
     }
