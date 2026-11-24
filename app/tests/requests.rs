@@ -5398,6 +5398,7 @@ mod teams {
                 assert!(doc["paths"]["/post-groups"]["post"].is_object());
                 assert!(doc["paths"]["/post-groups/{group_id}"]["get"].is_object());
                 assert!(doc["paths"]["/post-groups/{group_id}/retry"]["post"].is_object());
+                assert!(doc["paths"]["/post-groups/{group_id}/takedown"]["post"].is_object());
                 assert!(doc["paths"]["/posts/{id}/retry"]["post"].is_object());
                 assert!(doc["paths"]["/idempotency/{key}"]["get"].is_object());
             }
@@ -7090,6 +7091,88 @@ mod teams {
                 let draft = id_of(&create(&s, &cookie, input(&set, "d", None)).await);
                 let res = req(&s, Method::POST, &retry_url(&draft), &cookie).await;
                 res.assert_json(&json!({"error": "nothing_to_retry"}));
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_group_takes_down_per_platform_and_never_repeats_a_delete_that_worked() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let fine = id_of(&create(&s, &cookie, input(&set, "fine", Some(&past()))).await);
+                let sticky =
+                    id_of(&create(&s, &cookie, input(&set, "STICKY", Some(&past()))).await);
+                publish::tick(&state).await.unwrap();
+                let draft = id_of(&create(&s, &cookie, input(&set, "draft", None)).await);
+                // The mock has one platform, so tie three posts into one group by hand.
+                let gid = uuid::Uuid::now_v7();
+                let ids: Vec<uuid::Uuid> = [&fine, &sticky, &draft]
+                    .iter()
+                    .map(|i| i.parse().unwrap())
+                    .collect();
+                posts::Entity::update_many()
+                    .col_expr(posts::Column::GroupId, gid.into())
+                    .filter(posts::Column::Id.is_in(ids))
+                    .exec(&db)
+                    .await
+                    .unwrap();
+                let url = format!("/v1/post-groups/{gid}/takedown");
+                let state_of = |body: &Value, id: &str| {
+                    let r = body["results"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|r| r["post_id"] == id)
+                        .unwrap()
+                        .clone();
+                    (
+                        r["state"].as_str().unwrap().to_owned(),
+                        r["message"].clone(),
+                    )
+                };
+
+                let before = DELETED.lock().unwrap().len();
+                let res = req(&s, Method::POST, &url, &cookie).await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                let body = res.json::<Value>();
+                assert_eq!(body["group_id"], gid.to_string());
+                assert_eq!(state_of(&body, &fine).0, "taken_down");
+                let (st, msg) = state_of(&body, &sticky);
+                assert_eq!(st, "failed");
+                assert!(msg.as_str().unwrap().contains("Bluesky app"), "{msg}");
+                assert_eq!(state_of(&body, &draft).0, "not_published");
+                assert_eq!(DELETED.lock().unwrap().len(), before + 1);
+                assert_eq!(get_post(&s, &cookie, &fine).await["status"], "deleted");
+                assert_eq!(get_post(&s, &cookie, &sticky).await["status"], "published");
+                assert_eq!(get_post(&s, &cookie, &draft).await["status"], "draft");
+
+                // Again: the post that came down is not called, the stuck one is tried once more.
+                let res = req(&s, Method::POST, &url, &cookie).await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                let body = res.json::<Value>();
+                assert_eq!(state_of(&body, &fine).0, "already_gone");
+                assert_eq!(state_of(&body, &sticky).0, "failed");
+                assert_eq!(
+                    DELETED.lock().unwrap().len(),
+                    before + 1,
+                    "no second delete"
+                );
+
+                let nobody = uuid::Uuid::now_v7();
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/post-groups/{nobody}/takedown"),
+                    &cookie,
+                )
+                .await;
+                assert_eq!(res.status_code(), 404);
+
+                // Another team's member gets 404 and nothing is called.
+                let (_, stranger, _) = user(&s, &db).await;
+                let res = req(&s, Method::POST, &url, &stranger).await;
+                assert_eq!(res.status_code(), 404);
+                assert_eq!(DELETED.lock().unwrap().len(), before + 1);
             }
 
             #[tokio::test]
