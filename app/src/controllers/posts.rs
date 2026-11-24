@@ -2480,6 +2480,12 @@ async fn requeue(
     post_targets::Entity::update_many()
         .col_expr(post_targets::Column::Status, "pending".into())
         .col_expr(post_targets::Column::Error, Option::<String>::None.into())
+        // A stale time of the automatic retry would show "Retrying at" for a time gone, and
+        // make `begin` start a second run of the post at once.
+        .col_expr(
+            post_targets::Column::RetryAt,
+            Option::<chrono::DateTime<chrono::FixedOffset>>::None.into(),
+        )
         .col_expr(post_targets::Column::UpdatedAt, now.into())
         .filter(post_targets::Column::Id.is_in(again))
         .exec(&txn)

@@ -1210,8 +1210,10 @@ pub const LATE: &str = "Not posted: it was due at";
 
 /// Puts every post more than `LATE_MINUTES` past its time back to `draft`, saying why: a
 /// `scheduled` one (held up by approval, an ended plan, the daily cap or an outage), and one
-/// left `queued` by a crash before any target started (`STUCK_MINUTES`), whose pending targets
-/// are dropped. A `rejected` post is left alone: it is not going out and its series ends, as it
+/// left `queued` by a crash before it was fanned out into targets (`STUCK_MINUTES`). A post that
+/// was fanned out is never drafted, whatever its age: it may be a retry (a manual retry keeps
+/// the old `scheduled_at`, and a thread's pending target holds its live root), and `begin`
+/// picks it up as left behind, as before. A `rejected` post is left alone: it is not going out and its series ends, as it
 /// did before this. Posts in `running` (this process is publishing them, maybe waiting for a
 /// slot) are left alone too. A post with a repeat rule yields its next copy here
 /// (`repeat::spawn`), so a late post never ends its series. Returns the posts.
@@ -1227,7 +1229,7 @@ pub async fn draft_late(db: &DatabaseConnection, running: &[Uuid]) -> Result<Vec
             "SELECT p.id FROM posts p \
              WHERE p.scheduled_at < now() - make_interval(mins => $1) \
              AND p.approval IS DISTINCT FROM 'rejected' AND p.id <> ALL($3::uuid[]) \
-             AND (p.status = 'scheduled' OR (p.status = 'queued' \
+             AND (p.status = 'scheduled' OR (p.status = 'queued' AND NOT p.fanned_out \
                AND p.updated_at < now() - make_interval(mins => $2))) \
              ORDER BY p.id FOR UPDATE OF p",
             vec![
@@ -1250,8 +1252,8 @@ pub async fn draft_late(db: &DatabaseConnection, running: &[Uuid]) -> Result<Vec
                'YYYY-MM-DD HH24:MI') || ' UTC and is more than an hour late. Schedule it again.', \
              updated_at = now() \
              WHERE p.id = ANY($1::uuid[]) \
-             AND (p.status = 'scheduled' OR NOT EXISTS (SELECT 1 FROM post_targets t \
-                 WHERE t.post_id = p.id AND t.status <> 'pending')) \
+             AND (p.status = 'scheduled' OR (NOT p.fanned_out AND NOT EXISTS (SELECT 1 \
+                 FROM post_targets t WHERE t.post_id = p.id AND t.status <> 'pending'))) \
              RETURNING p.id"
         ),
         vec![locked.into()],
@@ -1580,14 +1582,14 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         }
     }
     let settled = settle(db, id).await;
-    // The retry reads the same stored media; whatever is left goes once the post settles.
-    let retrying = post_targets::Entity::find()
-        .filter(post_targets::Column::PostId.eq(id))
-        .filter(post_targets::Column::Status.eq("pending"))
+    // The retry reads the same stored media; whatever is left goes once the post settles. A run
+    // that lost the claim of every target (another run has them) never settles the post, so it
+    // never releases the media the other is using.
+    let done = posts::Entity::find_by_id(id)
         .one(db)
         .await?
-        .is_some();
-    if !retrying {
+        .is_some_and(|p| p.status != "queued");
+    if done {
         app.media.release_post(db, id).await;
     }
     settled
