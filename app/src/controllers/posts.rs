@@ -5,7 +5,8 @@
 //! takes an API token too (`Actor`); a set token only sees and writes its set's posts. Token
 //! writes take an optional `Idempotency-Key` header (see `idempotency`). `POST /post-groups`
 //! creates one post per platform in one go, tied by a `group_id`; `POST /posts/{id}/retry` and
-//! `POST /post-groups/{group_id}/retry` publish the targets that failed again.
+//! `POST /post-groups/{group_id}/retry` publish the targets that failed again, and
+//! `POST /post-groups/{group_id}/takedown` takes the whole group down.
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use axum::{
@@ -2598,6 +2599,87 @@ async fn destroy(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) ->
     delete_post(&app, &a, id).await
 }
 
+/// Takes a `published` post down and frees its media once it is gone. `Ok(Err(message))` says
+/// what stayed up and what to do about it; a retry only tries what is still up.
+async fn take_down(app: &AppState, post: &posts::Model) -> Result<Result<(), String>, DbErr> {
+    let problems = publish::takedown(app, post).await?;
+    if !problems.is_empty() {
+        return Ok(Err(problems.join(" ")));
+    }
+    app.media.release_post(&app.db, post.id).await;
+    Ok(Ok(()))
+}
+
+/// What `POST /post-groups/{group_id}/takedown` did to one post of the group.
+#[derive(Serialize, ToSchema)]
+pub struct TakedownResult {
+    pub post_id: Uuid,
+    pub platform: String,
+    /// `taken_down` (now gone from every account), `already_gone` (taken down before; nothing
+    /// was called), `failed` (see `message`) or `not_published` (a draft, scheduled, queued or
+    /// failed post has nothing to take down).
+    pub state: String,
+    /// For `failed`: what stayed up and what to do, e.g. TikTok has no delete call.
+    pub message: Option<String>,
+}
+
+/// `POST /post-groups/{group_id}/takedown`: the group, and one `results` entry per post.
+#[derive(Serialize, ToSchema)]
+pub struct GroupTakedown {
+    #[serde(flatten)]
+    pub group: PostGroup,
+    pub results: Vec<TakedownResult>,
+}
+
+/// Takes down every `published` post of a group, one after another, and answers `200` with
+/// what happened to each platform in `results`, failures included: one platform that cannot
+/// be taken down (TikTok has no delete call) does not stop the others. A post already taken
+/// down is not called again, and a target that came down stays down, so calling this again
+/// only tries what is still up. At most 10 publish, retry or take-down calls a minute per user;
+/// the whole group counts as one.
+#[utoipa::path(post, path = "/post-groups/{group_id}/takedown", tag = "posts",
+    security(("session" = []), ("api_token" = [])),
+    params(("group_id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    responses((status = 200, body = GroupTakedown), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 404, body = Error), (status = 429, body = Error)))]
+async fn takedown_group(
+    State(app): State<AppState>,
+    a: Actor,
+    Path(group_id): Path<Uuid>,
+) -> Response {
+    let done = async {
+        let found = group_rows(&app.db, &a, group_id).await?;
+        if found.is_empty() {
+            return Ok(not_found());
+        }
+        if found.iter().any(|p| p.status == "published") && !app.post_limiter.hit(a.key()) {
+            return Ok(reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
+        }
+        let mut results = Vec::new();
+        for p in &found {
+            let (state, message) = match p.status.as_str() {
+                "published" => match take_down(&app, p).await? {
+                    Ok(()) => ("taken_down", None),
+                    Err(message) => ("failed", Some(message)),
+                },
+                "deleted" => ("already_gone", None),
+                _ => ("not_published", None),
+            };
+            results.push(TakedownResult {
+                post_id: p.id,
+                platform: p.platform.clone(),
+                state: state.into(),
+                message,
+            });
+        }
+        let rows = group_rows(&app.db, &a, group_id).await?;
+        let group = group_json(&app.db, &a, group_id, rows).await?;
+        Ok::<_, DbErr>(Json(GroupTakedown { group, results }).into_response())
+    };
+    done.await
+        .unwrap_or_else(|e| internal(e, "post group takedown"))
+}
+
 /// The body of `DELETE /posts/{id}`, shared with the MCP `delete-post` tool.
 pub async fn delete_post(app: &AppState, a: &Actor, id: Uuid) -> Response {
     let found = match find(&app.db, a, id).await {
@@ -2627,15 +2709,13 @@ pub async fn delete_post(app: &AppState, a: &Actor, id: Uuid) -> Response {
                 if !app.post_limiter.hit(a.key()) {
                     return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
                 }
-                match publish::takedown(app, &found).await {
-                    Ok(problems) if problems.is_empty() => {
-                        app.media.release_post(&app.db, id).await;
-                    }
+                match take_down(app, &found).await {
+                    Ok(Ok(())) => {}
                     // 422, never 502: a proxy may swap a 502 body for its own page.
-                    Ok(problems) => {
+                    Ok(Err(message)) => {
                         let body = serde_json::json!({
                             "error": "takedown_failed",
-                            "message": problems.join(" "),
+                            "message": message,
                         });
                         return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
                     }
@@ -3139,6 +3219,7 @@ pub fn groups_api() -> OpenApiRouter<AppState> {
         .routes(routes!(create_group))
         .routes(routes!(show_group))
         .routes(routes!(retry_group))
+        .routes(routes!(takedown_group))
         .routes(routes!(approve_group))
         .routes(routes!(reject_group))
 }
