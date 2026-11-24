@@ -8643,6 +8643,59 @@ mod teams {
                     assert_eq!(RECORDS.lock().unwrap().len(), records + 1);
                 }
 
+                #[tokio::test]
+                #[serial]
+                async fn the_late_reason_names_the_due_time_in_the_sets_queue_zone() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    exec(
+                        &db,
+                        format!(
+                            "INSERT INTO queue_schedules (social_set_id, team_id, time_zone) \
+                             VALUES ('{set}', '{team_id}', 'Asia/Dhaka')"
+                        ),
+                    )
+                    .await;
+                    let soon = Some(past());
+                    let late =
+                        due_ago(&s, &db, &cookie, input(&set, "late", soon.as_deref()), 90).await;
+                    // Dhaka is UTC+6 all year: the stored time, six hours on.
+                    let due: chrono::DateTime<Utc> = get_post(&s, &cookie, &late).await
+                        ["scheduled_at"]
+                        .as_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &late).await;
+                    assert_eq!(p["status"], "draft", "{p}");
+                    assert_eq!(
+                        p["error"].as_str().unwrap(),
+                        format!(
+                            "Not posted: it was due at {} Asia/Dhaka and is more than an hour late. \
+                             Schedule it again.",
+                            (due + Duration::hours(6)).format("%Y-%m-%d %H:%M")
+                        )
+                    );
+
+                    // A zone Postgres does not know falls back to UTC; the post is still put back.
+                    exec(
+                        &db,
+                        format!("UPDATE queue_schedules SET time_zone = 'Not/AZone' WHERE social_set_id = '{set}'"),
+                    )
+                    .await;
+                    let odd =
+                        due_ago(&s, &db, &cookie, input(&set, "odd", soon.as_deref()), 90).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &odd).await;
+                    assert_eq!(p["status"], "draft", "{p}");
+                    assert!(
+                        p["error"].as_str().unwrap().contains(" UTC and is more"),
+                        "{p}"
+                    );
+                }
+
                 /// A queued post due long ago with one pending target, as a crash leaves it.
                 async fn stale_queued(
                     s: &TestServer,

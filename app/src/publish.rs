@@ -1343,7 +1343,8 @@ async fn claim(
 
 /// A scheduled post this many minutes past its time is never published (decision 0008).
 pub const LATE_MINUTES: i64 = 60;
-/// Starts the `error` of a post `draft_late` put back.
+/// Starts the `error` of a post `draft_late` put back. It names the due time in the set's queue
+/// zone (UTC without one, or with a zone Postgres does not know), the zone the web shows the post in.
 pub const LATE: &str = "Not posted: it was due at";
 
 /// Puts every post more than `LATE_MINUTES` past its time back to `draft`, saying why: a
@@ -1386,10 +1387,14 @@ pub async fn draft_late(db: &DatabaseConnection, running: &[Uuid]) -> Result<Vec
     let stmt = sql(
         &format!(
             "UPDATE posts p SET status = 'draft', quota_reserved = false, fanned_out = false, \
-             error = '{LATE} ' || to_char(p.scheduled_at AT TIME ZONE 'UTC', \
-               'YYYY-MM-DD HH24:MI') || ' UTC and is more than an hour late. Schedule it again.', \
+             error = '{LATE} ' || to_char(p.scheduled_at AT TIME ZONE z.name, \
+               'YYYY-MM-DD HH24:MI') || ' ' || z.name || ' and is more than an hour late. \
+               Schedule it again.', \
              updated_at = now() \
-             WHERE p.id = ANY($1::uuid[]) \
+             FROM (SELECT p2.id, COALESCE(n.name, 'UTC') AS name FROM posts p2 \
+               LEFT JOIN queue_schedules q ON q.social_set_id = p2.social_set_id \
+               LEFT JOIN pg_timezone_names n ON n.name = q.time_zone) z \
+             WHERE z.id = p.id AND p.id = ANY($1::uuid[]) \
              AND (p.status = 'scheduled' OR (NOT p.fanned_out AND NOT EXISTS (SELECT 1 \
                  FROM post_targets t WHERE t.post_id = p.id AND t.status <> 'pending'))) \
              RETURNING p.id"
