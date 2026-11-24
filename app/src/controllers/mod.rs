@@ -38,6 +38,7 @@ pub mod subscribers;
 pub mod teams;
 pub mod threads;
 pub mod tiktok;
+pub mod uploads;
 pub mod waitlist;
 pub mod webhooks;
 pub mod x;
@@ -116,6 +117,8 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(idempotency::api())
         .merge(lists::api())
         .merge(library::media_api())
+        // A raw file body, streamed and capped by `Media::put_stream`, not by a body limit.
+        .merge(uploads::api())
         .merge(library::snippets_api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
         // A URL of 2048 characters and a template of 2000 can pass 4 KiB.
         .merge(feeds::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
