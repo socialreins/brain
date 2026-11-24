@@ -181,7 +181,7 @@ pub(super) async fn lock(txn: &impl ConnectionTrait, what: &str, team: Uuid) -> 
 }
 
 /// `%XX` escapes decoded; a bad escape stays as it is, invalid UTF-8 becomes U+FFFD.
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;

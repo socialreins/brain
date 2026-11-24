@@ -10,6 +10,7 @@ async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
 bytes = "1"
+futures-util = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # IANA zones of posting queues.
 chrono-tz = "0.10"
@@ -46,7 +47,6 @@ path = "src/bin/main.rs"
 
 [dev-dependencies]
 axum-test = "17"
-futures-util = "0.3"
 serial_test = "3.1.1"
 webauthn-authenticator-rs = { version = "0.5.5", features = ["softpasskey"] }
 

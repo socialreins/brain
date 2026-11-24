@@ -1,5 +1,5 @@
 //! `GET /media/{name}`: a stored post file at its unguessable link (`media::link`), for platforms
-//! that download media themselves (Threads). It answers only while the file is stored: once its
+//! that download media themselves (Threads), or an upload (`/v1/uploads`), for the composer's preview. It answers only while the file is stored: once its
 //! post settles the file and its row go, and the link answers `404`. The file is streamed from
 //! storage, never held whole, and a `Range` request (video pullers send them) gets just its
 //! bytes: `206` with `Content-Range`, or `416` for a range past the end.
@@ -62,7 +62,9 @@ async fn serve(
         .db
         .query_one_raw(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "SELECT content_type FROM post_media WHERE storage_key = $1 LIMIT 1",
+            "SELECT content_type FROM post_media WHERE storage_key = $1 \
+             UNION ALL SELECT content_type FROM media_uploads WHERE storage_key = $1 AND NOT pending \
+             LIMIT 1",
             [key.clone().into()],
         ))
         .await;

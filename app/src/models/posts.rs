@@ -57,6 +57,10 @@ pub struct Model {
     /// The repeat rule (`repeat::Repeat`); null for none. Only a `scheduled` post has one.
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub repeat: Option<Json>,
+    /// The social accounts it goes to, a JSON list of ids of its platform in its set; null for
+    /// every one of them.
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub account_ids: Option<Json>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }
