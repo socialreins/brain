@@ -166,7 +166,25 @@ fn compose(
         .map(|l| format!("- {}", one_line(l, 300)))
         .collect::<Vec<_>>()
         .join("\n");
+    // A target cut off mid-publish (a restart, a crash) is not known to have failed: it may have
+    // posted. Saying "did not go out" would be wrong, and posting it again could post it twice.
+    let unsure = error.is_some_and(|e| e.contains("Unknown, check the account"));
     let (subject, lead) = match kind {
+        Kind::Failed if unsure => (
+            format!("Check your {network} post"),
+            format!(
+                "Your {network} post may or may not have gone out: publishing was cut off. \
+                 Look at the account before you post it again, so it is not posted twice."
+            ),
+        ),
+        Kind::Partial if unsure => (
+            format!("Check your {network} post"),
+            format!(
+                "Your {network} post went out on some accounts, and on others publishing was cut \
+                 off, so it may or may not have gone out there. Look at those accounts before you \
+                 post it again."
+            ),
+        ),
         Kind::Failed => (
             format!("Your {network} post failed"),
             format!("Your {network} post did not go out on any account."),
@@ -230,6 +248,19 @@ mod tests {
         // A link in a platform's message stays text.
         let (_, text) = compose(Kind::Failed, "x", "", Some("https://evil.test\nx"), "l");
         assert!(text.contains("\n- https://evil.test x\n"), "{text}");
+        // A publish cut off mid-way is not "did not go out": it may have posted.
+        let (subject, text) = compose(
+            Kind::Failed,
+            "threads",
+            "Hi",
+            Some(
+                "@a: Unknown, check the account: publishing stopped midway and it may have posted.",
+            ),
+            "l",
+        );
+        assert_eq!(subject, "Check your Threads post");
+        assert!(text.contains("may or may not have gone out"), "{text}");
+        assert!(!text.contains("did not go out"), "{text}");
         let (subject, text) = compose(Kind::Late, "x", &"a".repeat(300), None, "l");
         assert_eq!(subject, "Your X post was not posted");
         assert!(text.contains(&format!("\"{}...\"", "a".repeat(120))));
