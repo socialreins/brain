@@ -58,8 +58,8 @@ mod m20261217_000001_inbox_accounts;
 mod m20261218_000001_ai_monthly;
 mod m20261219_000001_inbox_attachments;
 mod m20261220_000001_post_account_ids;
-mod m20261221_000001_media_uploads;
 mod m20261220_000001_target_retry;
+mod m20261221_000001_media_uploads;
 
 pub struct Migrator;
 
