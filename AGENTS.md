@@ -129,6 +129,12 @@ cargo run -p socialreins-brain
   once, after its target is saved as `published`: `post_targets.comment_status` is claimed
   (`posting`) before the call and never reset, so it is never retried; a failure only sets
   `comment_error`. Take down deletes the post alone, the platform removes its comments.
+- `app/src/publish.rs`: image alt text (`posts.media_alt`, parallel to `media`; a thread part's in its
+  `media_alt`; `post::check_alt` and `post::normal_alt` in core) goes to Bluesky, X, Threads, Instagram and
+  LinkedIn through `Attachment::alt`. A step that fails never fails the post: connectors call
+  `connectors::alt_note`, which `publish::send` collects into `post_targets.alt_error`. Only calls that
+  cannot have posted are retried without the text (Threads and Instagram containers, a LinkedIn `400`/`422`).
+  Facebook is left out on purpose (its photo alt text parameter is unconfirmed).
 - `app/src/publish.rs`: a post's `cover` (one video; Instagram, Facebook, YouTube) is downloaded
   with the media and checked before any target is posted (a bad one fails the target, nothing
   goes out). Instagram gets it as `cover_url` in the publish call; Facebook and YouTube get it

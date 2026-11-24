@@ -43,6 +43,9 @@ pub const FACEBOOK_COMMENT_MAX_CHARS: usize = 8000;
 pub const INSTAGRAM_COMMENT_MAX_CHARS: usize = 2200;
 pub const LINKEDIN_COMMENT_MAX_CHARS: usize = 1250;
 pub const YOUTUBE_COMMENT_MAX_CHARS: usize = 10_000;
+/// Most characters of one image's alt text. Instagram, Threads and X take 1000 and Bluesky 2000
+/// graphemes; Facebook and LinkedIn take more, so the strictest of the networks that get it.
+pub const MAX_ALT_CHARS: usize = 1000;
 /// Follow-up parts a thread may have after its first post.
 pub const MAX_THREAD_PARTS: usize = 25;
 const MAX_URL_LEN: usize = 2048;
@@ -98,6 +101,10 @@ pub enum Invalid {
     CoverTooLarge,
     /// The TikTok account is not offered the chosen privacy level.
     TikTokPrivacyNotOffered,
+    /// More alt texts than media, or one with a control character.
+    InvalidAlt,
+    /// An alt text over `MAX_ALT_CHARS`.
+    AltTooLong,
 }
 
 impl Invalid {
@@ -131,6 +138,8 @@ impl Invalid {
             Self::InvalidCoverType => "invalid_cover_type",
             Self::CoverTooLarge => "cover_too_large",
             Self::TikTokPrivacyNotOffered => "tiktok_privacy_not_offered",
+            Self::InvalidAlt => "invalid_alt_text",
+            Self::AltTooLong => "alt_text_too_long",
         }
     }
 }
@@ -162,6 +171,7 @@ impl Invalid {
             | Self::TikTokBrandedPrivate
             | Self::TikTokPrivacyNotOffered => "tiktok",
             Self::YouTubeUnsupported | Self::InvalidYouTubePrivacy => "youtube",
+            Self::InvalidAlt | Self::AltTooLong => "media_alt",
         }
     }
 }
@@ -786,6 +796,64 @@ pub fn check_x_short<'a>(bodies: impl IntoIterator<Item = &'a str>) -> Option<Pr
     })
 }
 
+/// The problems of the alt texts `alt` of `media` (parallel lists, a shorter `alt` leaves the
+/// last images without): more texts than media, a control character other than a line break,
+/// or a text over `MAX_ALT_CHARS` once trimmed.
+pub fn check_alt(media: &[String], alt: &[String]) -> Vec<Problem> {
+    if alt.len() > media.len() {
+        let detail = format!(
+            "{} alt texts for {} media items; send at most one per item, in order.",
+            alt.len(),
+            media.len()
+        );
+        return vec![Problem {
+            detail: Some(detail),
+            ..Problem::new(Invalid::InvalidAlt)
+        }];
+    }
+    let mut found = Vec::new();
+    for (i, text) in alt.iter().enumerate() {
+        let n = text.trim().chars().count();
+        if text
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r'))
+        {
+            let detail = format!("The alt text of image {} has a control character.", i + 1);
+            found.push(Problem {
+                detail: Some(detail),
+                ..Problem::new(Invalid::InvalidAlt)
+            });
+        } else if n > MAX_ALT_CHARS {
+            let detail = format!(
+                "The alt text of image {} has {n} characters; the limit is {MAX_ALT_CHARS}.",
+                i + 1
+            );
+            found.push(Problem::over(
+                Invalid::AltTooLong,
+                MAX_ALT_CHARS as u64,
+                n as u64,
+                detail,
+            ));
+        }
+    }
+    found
+}
+
+/// The alt texts as saved: trimmed, line breaks as `\n`, padded with empty texts to the media's
+/// length, and none at all when every text is empty.
+pub fn normal_alt(media_len: usize, alt: &[String]) -> Vec<String> {
+    let mut alt: Vec<String> = alt
+        .iter()
+        .take(media_len)
+        .map(|t| t.replace("\r\n", "\n").trim().to_owned())
+        .collect();
+    if alt.iter().all(String::is_empty) {
+        return Vec::new();
+    }
+    alt.resize(media_len, String::new());
+    alt
+}
+
 /// Checks a thread's follow-up parts `(body, media)` for `platform`, each as a post of its own.
 /// A part's error comes with its 1-based number.
 pub fn validate_thread(
@@ -879,6 +947,35 @@ fn next_scheme(text: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn alt_texts_are_checked_against_their_media() {
+        let media = strs(&["https://a/1.png", "https://a/2.png"]);
+        assert!(check_alt(&media, &[]).is_empty());
+        assert!(check_alt(&media, &strs(&["a cat", ""])).is_empty());
+        let long = "x".repeat(MAX_ALT_CHARS);
+        assert!(check_alt(&media, &[format!("  {long}  ")]).is_empty());
+        let too = check_alt(&media, &[String::new(), "y".repeat(MAX_ALT_CHARS + 1)]);
+        assert_eq!(too[0].invalid, Invalid::AltTooLong);
+        assert_eq!((too[0].limit, too[0].actual), (Some(1000), Some(1001)));
+        let more = check_alt(&media, &strs(&["a", "b", "c"]));
+        assert_eq!(more[0].invalid, Invalid::InvalidAlt);
+        let ctrl = check_alt(&media, &strs(&["bad\u{7}"]));
+        assert_eq!(ctrl[0].invalid, Invalid::InvalidAlt);
+        assert!(check_alt(&media, &strs(&["two\nlines\r\n"])).is_empty());
+    }
+
+    #[test]
+    fn alt_texts_are_saved_trimmed_and_aligned() {
+        assert!(normal_alt(2, &[]).is_empty());
+        assert!(normal_alt(2, &strs(&["  ", ""])).is_empty());
+        assert_eq!(normal_alt(3, &strs(&[" a ", ""])), strs(&["a", "", ""]));
+        assert_eq!(normal_alt(1, &strs(&["a\r\nb"])), strs(&["a\nb"]));
+    }
 
     #[test]
     fn bluesky_limits() {

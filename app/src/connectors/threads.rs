@@ -63,6 +63,8 @@ struct TokenAnswer {
 pub struct Item<'a> {
     pub url: &'a str,
     pub video: bool,
+    /// An image's alt text; empty for none, and ignored for a video.
+    pub alt: &'a str,
 }
 
 fn failed(msg: impl Into<String>) -> PostError {
@@ -284,14 +286,14 @@ impl Threads {
             }
             [one] => {
                 top.extend(item(one));
-                self.container(user, token, &top).await?
+                self.container_alt(user, token, &top, (1, one)).await?
             }
             many => {
                 let mut children = Vec::new();
-                for m in many {
+                for (i, m) in many.iter().enumerate() {
                     let mut p = item(m);
                     p.push(("is_carousel_item", "true".into()));
-                    children.push(self.container(user, token, &p).await?);
+                    children.push(self.container_alt(user, token, &p, (i + 1, m)).await?);
                 }
                 self.finished(token, &children).await?;
                 top.push(("media_type", "CAROUSEL".into()));
@@ -333,6 +335,30 @@ impl Threads {
                 .map(str::to_owned)
         });
         Ok((id, link))
+    }
+
+    /// `container` for image number `n` with its alt text (`alt_text`). A container is not a
+    /// post, so one Threads refuses with the alt text is made again without it, and the target
+    /// says so.
+    async fn container_alt(
+        &self,
+        user: &str,
+        token: &str,
+        params: &[(&str, String)],
+        (n, m): (usize, &Item<'_>),
+    ) -> Result<String, PostError> {
+        if m.alt.is_empty() || m.video {
+            return self.container(user, token, params).await;
+        }
+        let mut with = params.to_vec();
+        with.push(("alt_text", m.alt.to_owned()));
+        match self.container(user, token, &with).await {
+            Err(e @ PostError::Failed(_)) => {
+                super::alt_note(n, &e);
+                self.container(user, token, params).await
+            }
+            done => done,
+        }
     }
 
     async fn container(

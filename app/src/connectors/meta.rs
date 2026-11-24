@@ -649,11 +649,12 @@ impl Meta {
                 } else {
                     top.push(("image_url", one.url));
                 }
-                (self.container(&path, token, &top).await?, POLLS)
+                let made = self.container_alt(&path, token, &top, (1, one)).await?;
+                (made, POLLS)
             }
             many => {
                 let mut children = Vec::new();
-                for m in many {
+                for (i, m) in many.iter().enumerate() {
                     let item = if m.video {
                         [("media_type", "VIDEO"), ("video_url", m.url)]
                     } else {
@@ -661,7 +662,7 @@ impl Meta {
                     };
                     let mut form = item.to_vec();
                     form.push(("is_carousel_item", "true"));
-                    children.push(self.container(&path, token, &form).await?);
+                    children.push(self.container_alt(&path, token, &form, (i + 1, m)).await?);
                 }
                 self.finished(token, &children, POLLS).await?;
                 let children = children.join(",");
@@ -686,6 +687,30 @@ impl Meta {
             .and_then(|v| text(&v["permalink"]))
             .filter(|l| l.starts_with("https://"));
         Ok((id, link))
+    }
+
+    /// `container` for image number `n` with its alt text (`alt_text`, images only, Reels and
+    /// videos have none). A container is not a post, so one Meta refuses with the alt text is
+    /// made again without it, and the target says so.
+    async fn container_alt(
+        &self,
+        path: &str,
+        token: &str,
+        form: &[(&str, &str)],
+        (n, m): (usize, &Item<'_>),
+    ) -> Result<String, PostError> {
+        if m.alt.is_empty() || m.video {
+            return self.container(path, token, form).await;
+        }
+        let mut with = form.to_vec();
+        with.push(("alt_text", m.alt));
+        match self.container(path, token, &with).await {
+            Err(e @ PostError::Failed(_)) => {
+                super::alt_note(n, &e);
+                self.container(path, token, form).await
+            }
+            done => done,
+        }
     }
 
     async fn container(

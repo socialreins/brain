@@ -14,6 +14,24 @@ tokio::task_local! {
     pub static PATIENCE: u32;
 }
 
+tokio::task_local! {
+    /// What the publish running in this task could not do for the post's images' alt text, one
+    /// line each: `publish::send` collects them for the target's `alt_error`. An alt text step
+    /// that fails never fails the post.
+    pub static ALT_NOTES: std::cell::RefCell<Vec<String>>;
+}
+
+/// Records that the alt text of image `n` (1-based) was not sent, and `why`.
+pub fn alt_note(n: usize, why: &bluesky::PostError) {
+    let why = match why {
+        bluesky::PostError::Failed(msg) => msg.replace(&format!(" {UNSENT}"), ""),
+        bluesky::PostError::Reconnect => "the account needs to be reconnected.".to_owned(),
+        bluesky::PostError::Denied => "the platform denied it.".to_owned(),
+    };
+    let note = format!("Alt text of image {n} was not added: {why}");
+    let _ = ALT_NOTES.try_with(|notes| notes.borrow_mut().push(note));
+}
+
 /// Status checks a processing poll adds to its own for a large video (`publish::patience`: one
 /// per 100 MB, at most 10); none outside a publish and for a small file.
 pub fn extra_polls() -> u32 {

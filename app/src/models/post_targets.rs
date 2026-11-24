@@ -36,6 +36,9 @@ pub struct Model {
     /// Why the cover image could not be set on the published video (a warning).
     #[sea_orm(column_type = "Text", nullable)]
     pub cover_error: Option<String>,
+    /// Why a network did not get the images' alt text (a warning; the post went out without it).
+    #[sea_orm(column_type = "Text", nullable)]
+    pub alt_error: Option<String>,
     /// A target waiting for its one automatic retry is not claimed before this.
     pub retry_at: Option<DateTimeWithTimeZone>,
     /// The target was sent again once automatically, after an error that sent nothing.

@@ -78,6 +78,9 @@ pub struct Post {
     /// shared with anyone with the link. Downloaded when the post publishes (JPEG, PNG, WebP or GIF; a
     /// still image over 1 MB is shrunk to fit Bluesky, an animated one is not) and deleted once it settles.
     pub media: Vec<String>,
+    /// Alt text of each image, in the order of `media`; empty when none has one, else as long as
+    /// `media` (an empty string for an image without).
+    pub media_alt: Vec<String>,
     /// Follow-up posts, each a reply to the one before.
     pub thread: Vec<ThreadPart>,
     /// Text the same account comments on the post right after it is published (Facebook,
@@ -164,6 +167,9 @@ pub struct Target {
     pub comment_error: Option<String>,
     /// Why the cover could not be set on the published video; a warning, the post is up.
     pub cover_error: Option<String>,
+    /// Why the images' alt text was not sent to this account's network; the post went out
+    /// without it.
+    pub alt_error: Option<String>,
     /// The target was sent again once by itself, about 5 minutes after an error that certainly
     /// posted nothing (a rate limit, or the platform out of reach). A waiting retry is `pending`
     /// with that error.
@@ -197,6 +203,10 @@ pub struct ThreadPart {
     /// The same limits as a post's media.
     #[serde(default)]
     pub media: Vec<String>,
+    /// The same as a post's `media_alt`. Empty (or absent) on an update keeps the alt texts the
+    /// post has for the same links; send a list of empty strings to clear them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media_alt: Vec<String>,
 }
 
 /// A thread post published on one account.
@@ -256,6 +266,14 @@ pub struct PostInput {
     /// answer for is not refused; publishing checks it.
     #[serde(default)]
     pub media: Vec<String>,
+    /// Alt text for each image, in the order of `media`: at most 1000 characters each (trimmed,
+    /// no control characters; `invalid_alt_text`, `alt_text_too_long` on `media_alt`) and no more
+    /// items than `media` (a shorter list leaves the last images without). Sent to Bluesky, X,
+    /// Threads, Instagram and LinkedIn with the images; Facebook, TikTok and YouTube have none,
+    /// and a video's is ignored. A network that refuses it still gets the post, and the target's
+    /// `alt_error` says so. Absent on `PUT /posts/{id}`: the alt texts stored for the same links
+    /// stay; `[]` clears them.
+    pub media_alt: Option<Vec<String>>,
     /// Follow-up posts of a thread (at most 25), each a reply to the one before and checked
     /// like `body` and `media`. Platforms that cannot post threads yet answer
     /// `thread_not_supported`; a bad part answers its 1-based `part` with the error.
@@ -362,6 +380,8 @@ pub struct PostGroupInput {
     /// Each post's media, unless its override has some.
     #[serde(default)]
     pub media: Vec<String>,
+    /// Each post's alt texts, as in `POST /posts`, unless its override has media or alt texts.
+    pub media_alt: Option<Vec<String>>,
     /// Each post's thread, unless its override has one.
     #[serde(default)]
     pub thread: Vec<ThreadPart>,
@@ -506,6 +526,8 @@ pub struct CreatedGroup {
 pub struct Override {
     pub body: Option<String>,
     pub media: Option<Vec<String>>,
+    /// With `media`, that media's alt texts; without them, none.
+    pub media_alt: Option<Vec<String>>,
     pub thread: Option<Vec<ThreadPart>>,
     pub first_comment: Option<String>,
     pub cover: Option<String>,
@@ -606,6 +628,7 @@ async fn targets_of(
             comment_id: t.comment_id,
             comment_error: t.comment_error,
             cover_error: t.cover_error,
+            alt_error: t.alt_error,
             retried: t.retried,
             metrics: read.map(|m| Metrics {
                 likes: m.likes,
@@ -631,6 +654,10 @@ fn post_json(
         platform: p.platform,
         body: p.body,
         media: serde_json::from_value(p.media).unwrap_or_default(),
+        media_alt: p
+            .media_alt
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default(),
         thread: serde_json::from_value(p.thread).unwrap_or_default(),
         first_comment: p.first_comment,
         cover: p.cover,
@@ -833,6 +860,14 @@ fn rule_problems(input: &PostInput) -> Vec<Problem> {
             .map(|p| (p.body.as_str(), p.media.as_slice()))
             .collect();
         found.extend(post::check_thread(platform, &parts));
+        found.extend(post::check_alt(&input.media, alt_of(input)));
+        for (i, p) in input.thread.iter().enumerate() {
+            let part = post::check_alt(&p.media, &p.media_alt);
+            found.extend(part.into_iter().map(|x| post::Problem {
+                part: Some(i + 1),
+                ..x
+            }));
+        }
         let comment = post::first_comment(input.first_comment.as_deref());
         found.extend(post::check_first_comment(platform, comment));
         let cover = post::cover(input.cover.as_deref());
@@ -1187,6 +1222,63 @@ impl PostInput {
     fn chosen(&self) -> Option<&[Uuid]> {
         let ids = self.account_ids.as_ref()?.as_deref()?;
         (!ids.is_empty()).then_some(ids)
+    }
+}
+
+/// The alt texts a post asks to save, none when absent.
+fn alt_of(input: &PostInput) -> &[String] {
+    input.media_alt.as_deref().unwrap_or_default()
+}
+
+/// The post's alt texts as saved (`post::normal_alt`): null when no image has one.
+fn stored_alt(input: &PostInput) -> Option<serde_json::Value> {
+    let alt = post::normal_alt(input.media.len(), alt_of(input));
+    (!alt.is_empty()).then(|| serde_json::json!(alt))
+}
+
+/// The thread as saved, each part's alt texts normalized like the post's.
+fn stored_thread(input: &PostInput) -> serde_json::Value {
+    let parts: Vec<ThreadPart> = input
+        .thread
+        .iter()
+        .map(|p| ThreadPart {
+            media_alt: post::normal_alt(p.media.len(), &p.media_alt),
+            ..p.clone()
+        })
+        .collect();
+    serde_json::json!(parts)
+}
+
+/// An edit that sends no alt texts keeps those stored for the same links: the post's, then each
+/// thread part's that sent none, by link, so adding, removing or reordering images keeps each
+/// text with its image.
+fn keep_alts(input: &mut PostInput, found: &posts::Model) {
+    let stored =
+        |media: &serde_json::Value, alt: &Option<serde_json::Value>| -> Vec<(String, String)> {
+            let media: Vec<String> = serde_json::from_value(media.clone()).unwrap_or_default();
+            let alt: Vec<String> = alt
+                .clone()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            media.into_iter().zip(alt).collect()
+        };
+    let mut known = stored(&found.media, &found.media_alt);
+    let parts: Vec<ThreadPart> = serde_json::from_value(found.thread.clone()).unwrap_or_default();
+    for p in parts {
+        known.extend(p.media.into_iter().zip(p.media_alt));
+    }
+    let carry = |media: &[String]| -> Vec<String> {
+        let alt = |u: &String| {
+            let hit = known.iter().find(|(k, a)| k == u && !a.is_empty());
+            hit.map(|(_, a)| a.clone()).unwrap_or_default()
+        };
+        media.iter().map(alt).collect()
+    };
+    if input.media_alt.is_none() {
+        input.media_alt = Some(carry(&input.media));
+    }
+    for p in input.thread.iter_mut().filter(|p| p.media_alt.is_empty()) {
+        p.media_alt = carry(&p.media);
     }
 }
 
@@ -1776,6 +1868,7 @@ fn stand_in(input: &PostInput) -> PostInput {
         account_ids: None,
         body: String::new(),
         media: Vec::new(),
+        media_alt: None,
         thread: Vec::new(),
         first_comment: None,
         cover: None,
@@ -1812,7 +1905,8 @@ async fn store(
         platform: Set(input.platform.clone()),
         body: Set(input.body.clone()),
         media: Set(serde_json::json!(input.media)),
-        thread: Set(serde_json::json!(input.thread)),
+        media_alt: Set(stored_alt(input)),
+        thread: Set(stored_thread(input)),
         first_comment: Set(stored_comment(input)),
         cover: Set(stored_cover(input)),
         tiktok: Set(stored_tiktok(input)),
@@ -1962,6 +2056,13 @@ pub(crate) async fn create_group_guarded(
                     media: o
                         .and_then(|o| o.media.clone())
                         .unwrap_or_else(|| input.media.clone()),
+                    // An override with its own media has its own alt texts, never the group's.
+                    media_alt: match o.and_then(|o| o.media.as_ref().map(|_| &o.media_alt)) {
+                        Some(own) => own.clone(),
+                        None => o
+                            .and_then(|o| o.media_alt.clone())
+                            .or_else(|| input.media_alt.clone()),
+                    },
                     thread: o
                         .and_then(|o| o.thread.clone())
                         .unwrap_or_else(|| input.thread.clone()),
@@ -2188,6 +2289,7 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, mut input: PostInp
         // Absent keeps the stored list as it is, gone accounts included (publishing gives each a
         // failed target); only `null` or `[]` resets to every one. The checks see the accounts of
         // the list still in the set, or every account when none is.
+        keep_alts(&mut input, &found);
         let kept = input
             .account_ids
             .is_none()
@@ -2224,10 +2326,8 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, mut input: PostInp
             .col_expr(posts::Column::Platform, input.platform.clone().into())
             .col_expr(posts::Column::Body, input.body.clone().into())
             .col_expr(posts::Column::Media, serde_json::json!(input.media).into())
-            .col_expr(
-                posts::Column::Thread,
-                serde_json::json!(input.thread).into(),
-            )
+            .col_expr(posts::Column::MediaAlt, stored_alt(&input).into())
+            .col_expr(posts::Column::Thread, stored_thread(&input).into())
             .col_expr(posts::Column::FirstComment, stored_comment(&input).into())
             .col_expr(posts::Column::Cover, stored_cover(&input).into())
             .col_expr(posts::Column::Tiktok, stored_tiktok(&input).into())

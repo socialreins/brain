@@ -108,6 +108,8 @@ struct TokenAnswer {
 pub struct File<'a> {
     pub bytes: &'a crate::media::Blob,
     pub content_type: &'a str,
+    /// The image's alt text; empty for none.
+    pub alt: &'a str,
 }
 
 fn failed(msg: impl Into<String>) -> PostError {
@@ -397,8 +399,15 @@ impl X {
             ));
         }
         let mut ids = Vec::new();
-        for m in media {
-            ids.push(self.upload(token, m).await?);
+        for (i, m) in media.iter().enumerate() {
+            let id = self.upload(token, m).await?;
+            // The tweet is not made yet, and a refusal only costs the description.
+            if !m.alt.is_empty() && !VIDEO_TYPES.contains(&m.content_type) {
+                if let Err(e) = self.describe(token, &id, m.alt).await {
+                    super::alt_note(i + 1, &e);
+                }
+            }
+            ids.push(id);
         }
         let mut body = json!({});
         if !text.is_empty() {
@@ -417,6 +426,15 @@ impl X {
             .and_then(plain_id)
             .map(str::to_owned)
             .ok_or_else(|| failed("Publish: X sent no post id."))
+    }
+
+    /// Sets the alt text of an uploaded image (`POST /2/media/metadata`, up to 1000 characters).
+    async fn describe(&self, token: &str, id: &str, alt: &str) -> Result<(), PostError> {
+        let body = json!({"id": id, "metadata": {"alt_text": {"text": alt}}});
+        let req = self
+            .api(Method::POST, "/2/media/metadata", token)
+            .json(&body);
+        self.send(req, "Alt text", false).await.map(|_| ())
     }
 
     /// Uploads one file in chunks and waits until X has processed it. Returns the media id.

@@ -580,13 +580,13 @@ impl Bluesky {
         Err(PostError::Reconnect)
     }
 
-    /// Publishes a post with up to 4 images or one video `(bytes, type)`, a reply when `reply` holds `(parent, root)`;
+    /// Publishes a post with up to 4 images or one video `(bytes, type, alt text)`, a reply when `reply` holds `(parent, root)`;
     /// returns its `(at:// uri, cid)`.
     pub async fn publish_post(
         &self,
         c: &Creds<'_>,
         text: &str,
-        media: &[(&Blob, &str)],
+        media: &[(&Blob, &str, &str)],
         reply: Option<(Ref<'_>, Ref<'_>)>,
     ) -> Result<(String, String), PostError> {
         self.with_session(c, |s| self.create_post(s, c.did, text, media, reply))
@@ -598,19 +598,19 @@ impl Bluesky {
         s: Live,
         did: &str,
         text: &str,
-        media: &[(&Blob, &str)],
+        media: &[(&Blob, &str, &str)],
         reply: Option<(Ref<'_>, Ref<'_>)>,
     ) -> Result<(String, String), PostError> {
         let (pds, jwt) = (&s.pds, &s.jwt);
         let mut record = post_record(text, &[], reply);
-        if media.iter().any(|(_, mime)| mime.starts_with("video/")) {
-            let [(bytes, mime)] = media else {
+        if media.iter().any(|(_, mime, _)| mime.starts_with("video/")) {
+            let [(bytes, mime, _)] = media else {
                 return Err(failed(MIXED_MEDIA));
             };
             record["embed"] = self.video_embed(&s, did, bytes, mime).await?;
         } else {
             let mut images = Vec::new();
-            for (i, (bytes, mime)) in media.iter().enumerate() {
+            for (i, (bytes, mime, alt)) in media.iter().enumerate() {
                 if !IMAGE_TYPES.contains(mime) {
                     let n = i + 1;
                     return Err(failed(format!(
@@ -629,7 +629,7 @@ impl Bluesky {
                 if !up["blob"].is_object() {
                     return Err(failed("Bluesky did not take an image."));
                 }
-                images.push(serde_json::json!({ "alt": "", "image": up["blob"] }));
+                images.push(serde_json::json!({ "alt": alt, "image": up["blob"] }));
             }
             if !images.is_empty() {
                 record["embed"] =
