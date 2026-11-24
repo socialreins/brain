@@ -107,6 +107,20 @@ impl MultipartUpload for Upload {
     }
 }
 
+/// Aborts a multipart upload dropped before it ended (an upload request that went away), so no
+/// partial `<key>#n` file or unfinished bucket upload is left behind.
+struct Unfinished(Option<Upload>);
+
+impl Drop for Unfinished {
+    fn drop(&mut self) {
+        if let Some(mut upload) = self.0.take() {
+            tokio::spawn(async move {
+                let _ = upload.abort().await;
+            });
+        }
+    }
+}
+
 const SWEEP_LOCK: i64 = 0x004d_4544_4941_5357;
 
 /// The store and the client that downloads into it.
@@ -131,6 +145,9 @@ pub struct Media {
     /// Tests only: a probe of a URL starting with `.0` asks `.1` instead (a mock on loopback,
     /// which saved media URLs, always https, cannot name).
     pub probe_rewrite: Option<(String, String)>,
+    /// Brain's `/media/` URL and the cipher of its links, so a media URL that is brain's link
+    /// to an upload is read from the store, never fetched (`linked`).
+    links: Option<(String, Arc<socialreins_core::crypto::Cipher>)>,
 }
 
 /// Longest the probes of one post's media may take together when it is saved. A probe not
@@ -302,7 +319,226 @@ impl Media {
             stall: STALL,
             probe_deadline: PROBE_DEADLINE,
             probe_rewrite: None,
+            links: None,
         }
+    }
+
+    /// This store knowing brain's links (`link`) at `brain_url`, sealed with `cipher`.
+    pub fn linked(
+        mut self,
+        brain_url: &str,
+        cipher: Arc<socialreins_core::crypto::Cipher>,
+    ) -> Self {
+        self.links = Some((format!("{brain_url}/media/"), cipher));
+        self
+    }
+
+    /// Brain's link to the upload `file` (`link`); none before `linked`.
+    pub fn upload_link(&self, file: &Stored) -> Option<String> {
+        let (base, cipher) = self.links.as_ref()?;
+        Some(sealed_link(base, cipher, file))
+    }
+
+    /// The storage key of the upload `url` names, when it is brain's own link to one. Matched by
+    /// its decoded path under brain's `/media/` path, whatever its host, port or query, so no
+    /// spelling of a link of another team's upload passes as an outside URL and is fetched.
+    pub fn upload_key(&self, url: &str) -> Option<String> {
+        let (base, cipher) = self.links.as_ref()?;
+        let base = Url::parse(base).ok()?;
+        let path = crate::controllers::library::percent_decode(Url::parse(url).ok()?.path());
+        let key = unsealed(cipher, path.strip_prefix(base.path())?)?;
+        key.starts_with("uploads/").then_some(key)
+    }
+
+    /// `probe` of an upload: its first bytes and size, from the store.
+    async fn probe_upload(&self, key: &str) -> Option<Probed> {
+        let path = Path::from(key);
+        let size = self.store.head(&path).await.ok()?.size;
+        let head = self
+            .store
+            .get_range(&path, 0..size.min(PROBE_LEN as u64))
+            .await;
+        let head = head.ok()?;
+        Some(Probed {
+            content_type: sniff(&head)?,
+            size: Some(size),
+            animated: animated(&head),
+        })
+    }
+
+    /// A copy for `post`, made inside the store, of the upload at `key` if `post`'s team owns it:
+    /// its key, type and size. `Http(404)` when the upload is gone or not the team's.
+    async fn copied_upload(
+        &self,
+        db: &DatabaseConnection,
+        post: Uuid,
+        key: &str,
+    ) -> Result<(String, String, usize), Fail> {
+        let stmt = sql(
+            "SELECT u.storage_key, u.content_type, u.size FROM media_uploads u \
+             JOIN posts p ON p.team_id = u.team_id WHERE p.id = $1 AND u.storage_key = $2 \
+             AND NOT u.pending",
+            vec![post.into(), key.into()],
+        );
+        let found = db.query_one_raw(stmt).await.map_err(|e| {
+            tracing::warn!(error = %e, post = %post, "upload lookup failed");
+            Fail::Storage
+        })?;
+        let from = found
+            .as_ref()
+            .and_then(|r| stored(r).ok())
+            .ok_or(Fail::Http(404))?;
+        let to = format!("posts/{post}/{}", Uuid::now_v7());
+        let (from_path, to_path) = (Path::from(key), Path::from(to.as_str()));
+        match self.store.copy(&from_path, &to_path).await {
+            Ok(()) => Ok((to, from.content_type, from.size.max(0) as usize)),
+            Err(object_store::Error::NotFound { .. }) => Err(Fail::Http(404)),
+            Err(e) => {
+                self.delete(&to).await;
+                Err(storage(e))
+            }
+        }
+    }
+
+    /// Streams `body`, a file uploaded from a device, into a new object at `key`, and returns its
+    /// type and size. The type comes from its first bytes (`sniff`: JPEG, PNG, WebP, GIF, MP4,
+    /// MOV or PDF); a video may take `max_bytes`, anything else `MAX_STILL_BYTES`. A body silent
+    /// for `stall` fails; whatever stops it, the partial upload is aborted.
+    pub async fn put_stream<S, E>(
+        &self,
+        key: &str,
+        mut body: S,
+    ) -> Result<(&'static str, usize), Fail>
+    where
+        S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    {
+        let stall = self.stall;
+        let mut head = Vec::new();
+        while head.len() < SNIFF_LEN {
+            match next_chunk(&mut body, stall).await? {
+                Some(chunk) => head.extend_from_slice(&chunk),
+                None => break,
+            }
+        }
+        let content_type = sniff(&head).ok_or(Fail::Unsupported)?;
+        let (cap, over) = if content_type.starts_with("video/") {
+            (self.max_bytes, Fail::TooLarge)
+        } else {
+            (MAX_STILL_BYTES, Fail::TooLargeStill)
+        };
+        let mut size = head.len();
+        if size > cap {
+            return Err(over);
+        }
+        let upload = self
+            .store
+            .put_multipart(&Path::from(key))
+            .await
+            .map_err(storage)?;
+        let mut upload = Upload(Arc::new(tokio::sync::Mutex::new(upload)));
+        let mut unfinished = Unfinished(Some(upload.clone()));
+        let mut file = WriteMultipart::new_with_chunk_size(Box::new(upload.clone()), PART_BYTES);
+        file.write(&head);
+        let streamed = async {
+            while let Some(chunk) = next_chunk(&mut body, stall).await? {
+                size += chunk.len();
+                if size > cap {
+                    return Err(over);
+                }
+                file.wait_for_capacity(PARTS_IN_FLIGHT)
+                    .await
+                    .map_err(storage)?;
+                file.write(&chunk);
+            }
+            Ok(())
+        };
+        let ended = match streamed.await {
+            Ok(()) => match file.finish().await {
+                Ok(_) => Ok((content_type, size)),
+                Err(e) => {
+                    let _ = upload.abort().await;
+                    Err(storage(e))
+                }
+            },
+            Err(e) => {
+                let _ = file.abort().await;
+                Err(e)
+            }
+        };
+        unfinished.0 = None;
+        ended
+    }
+
+    /// Deletes the uploads at least `hours` old that no post of their team still needs (one
+    /// not published yet, or published with a target that failed and may be retried), and
+    /// uploads still in progress after `PENDING_HOURS` (a restart or a lost request). Each row
+    /// goes in its own transaction: locked first, so a post being saved with it (which holds it
+    /// `FOR SHARE`) commits before the re-check. The file goes after the row; one that will not
+    /// go is an orphan for `release_orphans`. Returns how many went.
+    pub async fn release_uploads(&self, db: &DatabaseConnection, hours: i32) -> Result<u64, DbErr> {
+        let stmt = sql(
+            &format!("SELECT u.id FROM media_uploads u WHERE {RELEASABLE} LIMIT 1000"),
+            vec![hours.into(), PENDING_HOURS.into()],
+        );
+        let mut gone = 0;
+        for row in db.query_all_raw(stmt).await? {
+            let id: Uuid = row.try_get("", "id")?;
+            let txn = db.begin().await?;
+            let lock = sql(
+                "SELECT 1 FROM media_uploads WHERE id = $1 FOR UPDATE",
+                vec![id.into()],
+            );
+            txn.query_one_raw(lock).await?;
+            let stmt = sql(
+                &format!(
+                    "DELETE FROM media_uploads u WHERE u.id = $3 AND ({RELEASABLE}) \
+                     RETURNING storage_key"
+                ),
+                vec![hours.into(), PENDING_HOURS.into(), id.into()],
+            );
+            let deleted = txn.query_one_raw(stmt).await?;
+            txn.commit().await?;
+            if let Some(row) = deleted {
+                let key: String = row.try_get("", "storage_key")?;
+                self.delete(&key).await;
+                gone += 1;
+            }
+        }
+        Ok(gone)
+    }
+
+    /// Deletes stored uploads at least `older` old that have no row: a file stored by a request
+    /// that died before its row went, or whose delete failed. Returns how many went.
+    pub async fn release_orphans(
+        &self,
+        db: &DatabaseConnection,
+        older: Duration,
+    ) -> Result<u64, DbErr> {
+        use futures_util::StreamExt;
+        let cutoff = chrono::Utc::now() - older;
+        let mut old = Vec::new();
+        let mut listed = self.store.list(Some(&Path::from("uploads")));
+        while let Some(meta) = listed.next().await {
+            match meta {
+                Ok(m) if m.last_modified <= cutoff => old.push(m.location.to_string()),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "upload listing failed");
+                    break;
+                }
+            }
+        }
+        let mut gone = 0;
+        for key in old {
+            let stmt = sql(
+                "SELECT 1 AS ok FROM media_uploads WHERE storage_key = $1",
+                vec![key.clone().into()],
+            );
+            if db.query_one_raw(stmt).await?.is_none() && self.delete(&key).await {
+                gone += 1;
+            }
+        }
+        Ok(gone)
     }
 
     /// `probe` of every URL, `PARALLEL` at a time, all within `probe_deadline`; only the URLs
@@ -342,6 +578,9 @@ impl Media {
     /// when there is no clear answer: blocked, unreachable, not 200 or 206, or bytes of no type
     /// brain stores (a sign-in page, say). Nothing is stored.
     pub async fn probe(&self, url: &str) -> Option<Probed> {
+        if let Some(key) = self.upload_key(url) {
+            return self.probe_upload(&key).await;
+        }
         let first = Instant::now() + self.probe_deadline;
         let mut res = self.open(url, true, first).await.ok()?;
         let size = match res.status() {
@@ -460,9 +699,12 @@ impl Media {
             let video_cap = cap.min(self.max_bytes);
             copy = self.copied(db, post, url, video_cap, until).await;
         }
-        let (key, content_type, size) = match copy {
-            Some(copy) => copy,
-            None => {
+        let upload = self.upload_key(url);
+        let (key, content_type, size) = match (copy, upload) {
+            (Some(copy), _) => copy,
+            // An upload is already in the store: copied there, never downloaded.
+            (None, Some(upload)) => self.copied_upload(db, post, &upload).await?,
+            (None, None) => {
                 let got = self.download(post, url, cap, until, &mut turn).await;
                 got.map(|(key, content_type, size)| (key, content_type.to_owned(), size))?
             }
@@ -944,6 +1186,8 @@ pub async fn sweep(app: &AppState) -> Result<u64, DbErr> {
         return Ok(0);
     }
     let mut gone = app.media.release(&app.db, None, SWEEP_DAYS).await?;
+    gone += app.media.release_uploads(&app.db, UPLOAD_HOURS).await?;
+    gone += app.media.release_orphans(&app.db, TEMP_AGE).await?;
     if let Some(dir) = app.media.dir.clone() {
         let swept = tokio::task::spawn_blocking(move || sweep_temp(&dir, TEMP_AGE));
         gone += swept.await.unwrap_or(0);
@@ -952,21 +1196,62 @@ pub async fn sweep(app: &AppState) -> Result<u64, DbErr> {
     Ok(gone)
 }
 
+/// The next chunk of an uploaded body; `Stalled` when none comes for `stall`.
+async fn next_chunk<S, E>(body: &mut S, stall: Duration) -> Result<Option<bytes::Bytes>, Fail>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+{
+    use futures_util::StreamExt;
+    match tokio::time::timeout(stall, body.next()).await {
+        Err(_) => Err(Fail::Stalled),
+        Ok(Some(Ok(chunk))) => Ok(Some(chunk)),
+        Ok(Some(Err(_))) => Err(Fail::Unreachable),
+        Ok(None) => Ok(None),
+    }
+}
+
+/// An upload lives at least this long, then as long as a post that may still publish names it.
+pub const UPLOAD_HOURS: i32 = 24;
+
+/// An upload still in progress this long is a lost one (a restart, a dropped request): long
+/// enough for 1 GiB on a slow link, short enough to free the team's slot the same day.
+pub const PENDING_HOURS: i32 = 6;
+
+/// Which uploads `release_uploads` deletes, of `u`: `$1` hours old and needed by no post, or
+/// in progress for `$2` hours. A post names an upload by its exact link (`uploads::foreign`
+/// refuses any other spelling), so its sealed token is in the post's text as is.
+const RELEASABLE: &str = "(NOT u.pending AND u.created_at <= now() - make_interval(hours => $1) \
+   AND NOT EXISTS (SELECT 1 FROM posts p WHERE p.team_id = u.team_id \
+     AND (p.status NOT IN ('published', 'deleted') OR EXISTS (SELECT 1 FROM post_targets t \
+       WHERE t.post_id = p.id AND t.status = 'failed')) \
+     AND strpos(p.media::text || p.thread::text || coalesce(p.cover, ''), \
+       split_part(split_part(u.url, '/media/', 2), '.', 1)) > 0)) \
+ OR (u.pending AND u.created_at <= now() - make_interval(hours => $2))";
+
 /// A temp file on local disk this old belongs to no download still running: several times
 /// `INGEST_CEILING`.
 const TEMP_AGE: Duration = Duration::from_secs(3600);
 
+/// An upload's partial file this old belongs to no running upload.
+const UPLOAD_TEMP_AGE: Duration = Duration::from_secs(15 * 60);
+
 /// Deletes the temp files under `dir` older than `older`, and returns how many went. The local
 /// store writes a file as `<key>#<n>` and renames it when done, so a process killed
-/// mid-download leaves one (up to `MAX_BYTES`) that no listing shows and `release` never sees.
+/// mid-download or mid-upload leaves one (up to `MAX_BYTES`, under `posts/` or `uploads/`) that
+/// no listing shows and `release` or `release_orphans` never sees.
 /// In a bucket the same leftovers are parts of a multipart upload, which its lifecycle rule
 /// aborts (README).
 fn sweep_temp(dir: &std::path::Path, older: Duration) -> u64 {
     let mut gone = 0;
-    let Ok(posts) = std::fs::read_dir(dir.join("posts")) else {
-        return 0;
-    };
-    for post in posts.flatten() {
+    // An upload's file is written as its bytes arrive, so one untouched for `UPLOAD_TEMP_AGE`
+    // (many times `STALL`) is dead.
+    let dirs = [("posts", older), ("uploads", older.min(UPLOAD_TEMP_AGE))]
+        .map(|(d, age)| (std::fs::read_dir(dir.join(d)), age));
+    for (post, older) in dirs
+        .into_iter()
+        .filter_map(|(d, age)| d.ok().map(|d| (d, age)))
+        .flat_map(|(d, age)| d.flatten().map(move |e| (e, age)))
+    {
         let Ok(files) = std::fs::read_dir(post.path()) else {
             continue;
         };
@@ -993,7 +1278,12 @@ fn sweep_temp(dir: &std::path::Path, older: Duration) -> u64 {
 /// (Threads): its storage key sealed with `ENCRYPTION_KEY`, plus an extension for its type. It
 /// serves the file only while the file is stored, which ends once its post settles.
 pub fn link(app: &AppState, file: &Stored) -> String {
-    let sealed = URL_SAFE_NO_PAD.encode(app.cipher.encrypt(file.key.as_bytes()));
+    sealed_link(&format!("{}/media/", app.brain_url), &app.cipher, file)
+}
+
+/// `link` under `base`, brain's `/media/` URL.
+fn sealed_link(base: &str, cipher: &socialreins_core::crypto::Cipher, file: &Stored) -> String {
+    let sealed = URL_SAFE_NO_PAD.encode(cipher.encrypt(file.key.as_bytes()));
     let ext = match file.content_type.as_str() {
         "image/jpeg" => "jpg",
         "image/png" => "png",
@@ -1001,17 +1291,23 @@ pub fn link(app: &AppState, file: &Stored) -> String {
         "image/webp" => "webp",
         "video/mp4" => "mp4",
         "video/quicktime" => "mov",
+        "application/pdf" => "pdf",
         _ => "bin",
     };
-    format!("{}/media/{sealed}.{ext}", app.brain_url)
+    format!("{base}{sealed}.{ext}")
 }
 
-/// The storage key a `link` names, when brain sealed it and it is a post file.
+/// The storage key a `link` names, when brain sealed it and it is a post file or an upload.
 pub fn unseal(app: &AppState, name: &str) -> Option<String> {
+    let key = unsealed(&app.cipher, name)?;
+    (key.starts_with("posts/") || key.starts_with("uploads/")).then_some(key)
+}
+
+/// The storage key sealed in a link's `name` (`<sealed>.<ext>`).
+fn unsealed(cipher: &socialreins_core::crypto::Cipher, name: &str) -> Option<String> {
     let token = name.split('.').next()?;
     let sealed = URL_SAFE_NO_PAD.decode(token).ok()?;
-    let key = String::from_utf8(app.cipher.decrypt(&sealed)?).ok()?;
-    key.starts_with("posts/").then_some(key)
+    String::from_utf8(cipher.decrypt(&sealed)?).ok()
 }
 
 fn sql(sql: &str, values: Vec<Value>) -> Statement {
@@ -1634,6 +1930,21 @@ mod tests {
         let post = dir.join("posts").join(Uuid::now_v7().to_string());
         std::fs::create_dir_all(&post).unwrap();
         let long_ago = std::time::SystemTime::now() - 2 * TEMP_AGE;
+        // An upload's partial file, cut off by a restart, goes too.
+        let team = dir.join("uploads").join(Uuid::now_v7().to_string());
+        std::fs::create_dir_all(&team).unwrap();
+        let partial = std::fs::File::create(team.join("u#3")).unwrap();
+        partial.set_modified(long_ago).unwrap();
+        // One untouched for 20 minutes is dead too; a download's is not yet.
+        let lately = std::time::SystemTime::now() - Duration::from_secs(20 * 60);
+        std::fs::File::create(team.join("v#1"))
+            .unwrap()
+            .set_modified(lately)
+            .unwrap();
+        std::fs::File::create(post.join("e#2"))
+            .unwrap()
+            .set_modified(lately)
+            .unwrap();
         // A download cut off long ago, one still running, and a stored file as old as the first.
         for (name, old) in [("a#1", true), ("b#12", false), ("c", true), ("d#x", true)] {
             let file = std::fs::File::create(post.join(name)).unwrap();
@@ -1641,13 +1952,14 @@ mod tests {
                 file.set_modified(long_ago).unwrap();
             }
         }
-        assert_eq!(sweep_temp(&dir, TEMP_AGE), 1);
+        assert_eq!(sweep_temp(&dir, TEMP_AGE), 3);
+        assert!(!team.join("u#3").exists() && !team.join("v#1").exists());
         let mut left: Vec<_> = std::fs::read_dir(&post)
             .unwrap()
             .map(|f| f.unwrap().file_name().into_string().unwrap())
             .collect();
         left.sort();
-        assert_eq!(left, ["b#12", "c", "d#x"]);
+        assert_eq!(left, ["b#12", "c", "d#x", "e#2"]);
         assert_eq!(sweep_temp(&dir.join("none"), TEMP_AGE), 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2099,6 +2411,31 @@ mod tests {
             .unwrap_or_default();
         assert!(left.is_empty(), "{left:?}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_upload_dropped_mid_stream_aborts_its_multipart_upload() {
+        use futures_util::StreamExt;
+        let store = Arc::new(Counting::default());
+        let media = Media::new(store.clone(), true);
+        // A first chunk, then the request goes away.
+        let mut first = b"\x89PNG\r\n\x1a\n".to_vec();
+        first.resize(4096, 7);
+        let body = stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from(first))])
+            .chain(stream::pending());
+        let put = media.put_stream("uploads/t/u", body);
+        assert!(tokio::time::timeout(Duration::from_millis(200), put)
+            .await
+            .is_err());
+        for _ in 0..50 {
+            if store.aborted.load(SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(store.aborted.load(SeqCst), 1, "aborted on drop");
+        let stored = store.inner.list_with_delimiter(None).await.unwrap();
+        assert!(stored.objects.is_empty() && stored.common_prefixes.is_empty());
     }
 
     #[tokio::test]
