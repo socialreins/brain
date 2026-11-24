@@ -898,8 +898,9 @@ pub const SET_DELETED: &str =
      schedule it again.";
 /// How long a stopping process (`stop`) waits for the posts it is publishing before it exits
 /// (`drain`). Keep it under the grace the platform gives between SIGTERM and the kill (on
-/// Railway `RAILWAY_DEPLOYMENT_DRAINING_SECONDS`, which has to be set above this to matter).
-pub const DRAIN: Duration = Duration::from_secs(25);
+/// Railway `RAILWAY_DEPLOYMENT_DRAINING_SECONDS`, which has to be set above this to matter: 180
+/// on SocialReins). A Threads post, which waits for its media to process, can take a minute or two.
+pub const DRAIN: Duration = Duration::from_secs(120);
 static STOPPED: std::sync::OnceLock<tokio::time::Instant> = std::sync::OnceLock::new();
 
 /// The process is about to exit (SIGTERM): no round claims a post any more (`begin`), and a post
