@@ -46,12 +46,15 @@ fn sql(sql: &str, values: Vec<Value>) -> Statement {
     Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
 }
 
-/// Queues a notice about `post`, in the caller's transaction. One per post and kind: a post that
-/// fails again after a retry is not mailed twice.
+/// Queues a notice about `post`, in the caller's transaction. One per post, kind and attempt: a
+/// post that fails again after a retry is not mailed twice, but one scheduled again (its time is
+/// later than the old notice) and failing or late again is mailed again, the old notice made new.
 pub async fn queue(db: &impl ConnectionTrait, post: Uuid, kind: Kind) -> Result<(), DbErr> {
     let stmt = sql(
         "INSERT INTO post_notices (post_id, team_id, kind) \
-         SELECT id, team_id, $2 FROM posts WHERE id = $1 ON CONFLICT DO NOTHING",
+         SELECT id, team_id, $2 FROM posts WHERE id = $1 \
+         ON CONFLICT (post_id, kind) DO UPDATE SET created_at = now(), sent_at = NULL \
+         WHERE post_notices.created_at < (SELECT scheduled_at FROM posts WHERE id = $1)",
         vec![post.into(), kind.as_str().into()],
     );
     db.execute_raw(stmt).await.map(|_| ())
