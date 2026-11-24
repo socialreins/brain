@@ -1110,6 +1110,9 @@ async fn checked_fully(
         Ok(set) => set,
         Err(res) => return Ok(Err(res)),
     };
+    if let Some(p) = upload_problem(app, &app.db, a, input).await? {
+        return Ok(Err(refusal(&input.platform, &p)));
+    }
     let only = input.chosen();
     Ok(match preflight(app, a, set, input.into(), only).await? {
         Some(res) => Err(res),
@@ -1213,6 +1216,36 @@ async fn account_problem(
         }));
     }
     Ok(None)
+}
+
+/// The problem when a media link of the post (its own, a thread part's or the cover) is brain's
+/// link to an upload that is not the team's: another team's, or one deleted since.
+async fn upload_problem(
+    app: &AppState,
+    db: &impl ConnectionTrait,
+    a: &Actor,
+    input: &PostInput,
+) -> Result<Option<Problem>, DbErr> {
+    let urls: Vec<&str> = input
+        .media
+        .iter()
+        .chain(input.thread.iter().flat_map(|p| &p.media))
+        .map(String::as_str)
+        .chain(input.cover.as_deref())
+        .collect();
+    let bad = super::uploads::foreign(app, db, a.team.id, &urls).await?;
+    Ok(bad.map(|url| Problem {
+        code: "invalid_upload".into(),
+        field: Some(if input.cover.as_deref() == Some(url.as_str()) {
+            "cover".into()
+        } else {
+            "media".into()
+        }),
+        detail: Some(
+            "A file was uploaded by another team or is no longer kept. Upload it again.".into(),
+        ),
+        ..Default::default()
+    }))
 }
 
 /// The cover as saved: blank is none.
@@ -1428,6 +1461,8 @@ async fn examine(
     for c in &mut checks {
         c.rules
             .extend(account_problem(&app.db, a.team.id, set, &c.input).await?);
+        c.rules
+            .extend(upload_problem(app, &app.db, a, &c.input).await?);
     }
     let failed = |checks: &[Check]| checks.iter().any(|c| !c.ok());
     if !all && failed(&checks) {
@@ -1514,6 +1549,7 @@ pub(crate) async fn accounts_in(
 /// `insert` for each of `inputs`, in order; a group's refusal names its platform. The caller
 /// commits.
 async fn insert_all(
+    app: &AppState,
     txn: &DatabaseTransaction,
     a: &Actor,
     inputs: &[&PostInput],
@@ -1521,7 +1557,7 @@ async fn insert_all(
 ) -> Result<Result<Vec<posts::Model>, Response>, DbErr> {
     let mut rows = Vec::with_capacity(inputs.len());
     for one in inputs {
-        match insert(txn, a, one, group).await? {
+        match insert(app, txn, a, one, group).await? {
             Ok(p) => rows.push(p),
             Err(res) if group.is_some() => return Ok(Err(naming(res, &one.platform).await)),
             Err(res) => return Ok(Err(res)),
@@ -1686,7 +1722,7 @@ pub async fn create_post(
             checks[0].input.scheduled_at = Some(at.fixed_offset());
         }
         let inputs: Vec<&PostInput> = checks.iter().map(|c| &c.input).collect();
-        let rows = match insert_all(&txn, a, &inputs, None).await? {
+        let rows = match insert_all(app, &txn, a, &inputs, None).await? {
             Ok(rows) => rows,
             Err(res) => return Ok(res),
         };
@@ -1700,6 +1736,7 @@ pub async fn create_post(
 /// Checks and inserts one new post in `txn`, then puts it in its list. Every create runs this:
 /// `POST /posts` and each post of a group. The caller commits.
 async fn insert(
+    app: &AppState,
     txn: &DatabaseTransaction,
     a: &Actor,
     input: &PostInput,
@@ -1709,6 +1746,10 @@ async fn insert(
         Ok(set) => set,
         Err(res) => return Ok(Err(res)),
     };
+    // Again in the transaction, holding the uploads until it commits.
+    if let Some(p) = upload_problem(app, txn, a, input).await? {
+        return Ok(Err(refusal(&input.platform, &p)));
+    }
     // The team row lock keeps concurrent creates under the cap.
     teams::Entity::find_by_id(a.team.id)
         .lock_exclusive()
@@ -1976,7 +2017,7 @@ pub(crate) async fn create_group_guarded(
             }
         }
         let valid: Vec<&PostInput> = checks.iter().filter(|c| c.ok()).map(|c| &c.input).collect();
-        let rows = match insert_all(&txn, a, &valid, Some(group)).await? {
+        let rows = match insert_all(app, &txn, a, &valid, Some(group)).await? {
             Ok(rows) => rows,
             Err(res) => return Ok(res),
         };
@@ -2159,6 +2200,10 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, mut input: PostInp
         // An edit is a new version: a member's goes back to `pending`, a manager's is approved.
         let (approval, approval_by, approval_at) = approval_for(a, input.scheduled_at.is_some());
         let txn = app.db.begin().await?;
+        // Again in the transaction, holding the uploads until it commits.
+        if let Some(p) = upload_problem(app, &txn, a, &input).await? {
+            return Ok(Err(refusal(&input.platform, &p)));
+        }
         // One conditional statement, so a tick claiming the post cannot interleave.
         let mut change = posts::Entity::update_many();
         // Only a scheduled post that is not TikTok's repeats.

@@ -4818,8 +4818,17 @@ mod teams {
 
             /// `on_mock` with `MEDIA_MAX_BYTES` set to `cap`.
             async fn on_mock_capped(cap: usize) -> (TestServer, DatabaseConnection, AppState) {
+                on_mock_at(cap, None).await
+            }
+
+            /// `on_mock_capped`, with brain at `brain_url` when given.
+            async fn on_mock_at(
+                cap: usize,
+                brain_url: Option<&str>,
+            ) -> (TestServer, DatabaseConnection, AppState) {
                 let base = mock_bluesky().await;
                 let mut config = Config::from_env().expect("test config");
+
                 config.trust_proxy = true;
                 config.bluesky.appview = base.clone();
                 config.bluesky.plc = base.clone();
@@ -4835,7 +4844,11 @@ mod teams {
                 let db = socialreins_brain::connect(&config)
                     .await
                     .expect("database reachable");
-                let state = AppState::new(db.clone(), &config);
+                let mut state = AppState::new(db.clone(), &config);
+                // Upload links only: sign-in still checks the real brain URL.
+                if let Some(url) = brain_url {
+                    state.media = state.media.clone().linked(url, state.cipher.clone());
+                }
                 let app = controllers::router(state.clone(), &config);
                 (TestServer::new(app).unwrap(), db, state)
             }
@@ -5568,6 +5581,382 @@ mod teams {
                 assert_eq!(images[1]["image"]["mimeType"], "image/png");
                 assert_eq!(images[1]["image"]["size"], 64);
                 assert!(!media_dir().join("posts").join(&id).exists());
+            }
+
+            /// A file of `len` bytes that starts like `head`.
+            fn file(head: &[u8], len: usize) -> Vec<u8> {
+                let mut bytes = vec![7u8; len];
+                bytes[..head.len()].copy_from_slice(head);
+                bytes
+            }
+
+            async fn upload(
+                s: &TestServer,
+                cookie: &str,
+                bytes: Vec<u8>,
+            ) -> axum_test::TestResponse {
+                req(s, Method::POST, "/v1/uploads", cookie)
+                    .content_type("application/octet-stream")
+                    .bytes(bytes.into())
+                    .await
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn uploads_are_typed_capped_owned_and_published_without_a_download() {
+                use sea_orm::ConnectionTrait;
+                const BRAIN: &str = "https://brain.test";
+                let (s, db, state) = on_mock_at(1000, Some(BRAIN)).await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+                const MP4: &[u8] = b"\0\0\0\x18ftypmp42\0\0\0\0";
+                // The type comes from the bytes; a video over MEDIA_MAX_BYTES is refused.
+                let res = upload(&s, &cookie, b"just some text, not media".to_vec()).await;
+                assert_eq!(res.status_code(), 422, "{}", res.text());
+                res.assert_json(&json!({"error": "media_type_not_supported"}));
+                let res = upload(&s, &cookie, Vec::new()).await;
+                assert_eq!(res.status_code(), 422, "{}", res.text());
+                let res = upload(&s, &cookie, file(MP4, 1001)).await;
+                assert_eq!(res.status_code(), 413, "{}", res.text());
+                res.assert_json(&json!({"error": "media_too_large"}));
+                let res = s
+                    .post("/v1/uploads")
+                    .add_header("origin", WEB)
+                    .bytes(file(PNG, 64).into())
+                    .await;
+                assert_eq!(res.status_code(), 401, "signed out");
+                let res = upload(&s, &cookie, file(PNG, 64)).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let up = res.json::<Value>();
+                assert_eq!(up["content_type"], "image/png");
+                assert_eq!(up["size"], 64);
+                let url = up["url"].as_str().unwrap().to_owned();
+                assert!(url.starts_with("https://brain.test/media/") && url.ends_with(".png"));
+                // Nothing of the refused ones stayed; the link serves the file for a preview.
+                let rows = |db: &DatabaseConnection| {
+                    let (db, team) = (db.clone(), team_id.clone());
+                    async move {
+                        let row = db
+                            .query_one_raw(sea_orm::Statement::from_string(
+                                sea_orm::DbBackend::Postgres,
+                                format!("SELECT count(*) AS n FROM media_uploads WHERE team_id = '{team}'"),
+                            ))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        row.try_get::<i64>("", "n").unwrap()
+                    }
+                };
+                assert_eq!(rows(&db).await, 1);
+                let res = s.get(url.strip_prefix(BRAIN).unwrap()).await;
+                res.assert_status_ok();
+                assert_eq!(res.header("content-type"), "image/png");
+                assert_eq!(res.as_bytes().len(), 64);
+
+                // Another team cannot use the link.
+                let (other, other_team, _) = owner_with_account(&s, &db).await;
+                let other_set = default_set(&db, &other_team).await.to_string();
+                let mut stolen = input(&other_set, "mine now", None);
+                stolen["media"] = json!([url]);
+                let res = create(&s, &other, stolen).await;
+                assert_eq!(res.status_code(), 422, "{}", res.text());
+                assert_eq!(res.json::<Value>()["error"], "invalid_upload");
+                assert_eq!(res.json::<Value>()["field"], "media");
+
+                // The team's post takes it, and publishing copies it in the store.
+                let mut with = input(&set, "uploaded", Some(&past()));
+                with["media"] = json!([url]);
+                let res = create(&s, &cookie, with).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let id = id_of(&res);
+                let draft = id_of(
+                    &create(&s, &cookie, {
+                        let mut d = input(&set, "draft", None);
+                        d["media"] = json!([url]);
+                        d
+                    })
+                    .await,
+                );
+                publish::tick(&state).await.unwrap();
+                let p = get_post(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "published", "{p}");
+                let record = RECORDS.lock().unwrap().last().cloned().unwrap();
+                let images = &record["record"]["embed"]["images"];
+                assert_eq!(images[0]["image"]["mimeType"], "image/png");
+                assert_eq!(images[0]["image"]["size"], 64);
+                assert!(
+                    !media_dir().join("posts").join(&id).exists(),
+                    "its copy went"
+                );
+
+                // A day on, the upload stays while the draft names it, then goes.
+                db.execute_unprepared(&format!(
+                    "UPDATE media_uploads SET created_at = now() - interval '25 hours' \
+                     WHERE team_id = '{team_id}'"
+                ))
+                .await
+                .unwrap();
+                // Other runs' leftovers would count in the sweep below.
+                db.execute_unprepared(&format!(
+                    "DELETE FROM media_uploads WHERE team_id <> '{team_id}'"
+                ))
+                .await
+                .unwrap();
+                let unattached = upload(&s, &cookie, file(PNG, 64)).await;
+                assert_eq!(unattached.status_code(), 201);
+                assert_eq!(state.media.release_uploads(&db, 24).await.unwrap(), 0);
+                assert_eq!(rows(&db).await, 2);
+                let res = req(&s, Method::DELETE, &format!("/v1/posts/{draft}"), &cookie).await;
+                assert!(res.status_code().is_success(), "{}", res.text());
+                assert_eq!(state.media.release_uploads(&db, 24).await.unwrap(), 1);
+                assert_eq!(rows(&db).await, 1, "the young unattached one stays");
+                s.get(url.strip_prefix(BRAIN).unwrap())
+                    .await
+                    .assert_status_not_found();
+                // A post saved with a gone upload is refused.
+                let mut gone = input(&set, "late", None);
+                gone["media"] = json!([url]);
+                let res = create(&s, &cookie, gone).await;
+                assert_eq!(res.status_code(), 422, "{}", res.text());
+                assert_eq!(res.json::<Value>()["error"], "invalid_upload");
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn uploads_outlive_failed_posts_count_running_ones_and_are_swept_safely() {
+                use sea_orm::{ConnectionTrait, TransactionTrait};
+                const BRAIN: &str = "https://brain.test";
+                const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+                let (s, db, state) = on_mock_at(media::MAX_BYTES, Some(BRAIN)).await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let run = |q: String| {
+                    let db = db.clone();
+                    async move {
+                        db.execute_unprepared(&q).await.unwrap();
+                    }
+                };
+                let kept = |url: String| {
+                    let db = db.clone();
+                    async move {
+                        let q = format!("SELECT 1 AS ok FROM media_uploads WHERE url = '{url}'");
+                        db.query_one_raw(sea_orm::Statement::from_string(
+                            sea_orm::DbBackend::Postgres,
+                            q,
+                        ))
+                        .await
+                        .unwrap()
+                        .is_some()
+                    }
+                };
+                let made = upload(&s, &cookie, file(PNG, 64)).await;
+                assert_eq!(made.status_code(), 201, "{}", made.text());
+                let url = made.json::<Value>()["url"].as_str().unwrap().to_owned();
+
+                // Any spelling of the link is still another team's upload.
+                let (other, other_team, _) = owner_with_account(&s, &db).await;
+                let other_set = default_set(&db, &other_team).await.to_string();
+                let name = url.strip_prefix("https://brain.test/media/").unwrap();
+                let escaped = format!(
+                    "https://brain.test/media/%{:02X}{}",
+                    name.as_bytes()[0],
+                    &name[1..]
+                );
+                for variant in [
+                    format!("{url}?x=1"),
+                    url.replace("https://brain.test", "https://BRAIN.test:443"),
+                    url.replace("https://brain.test", "https://elsewhere.test"),
+                    escaped,
+                ] {
+                    let mut stolen = input(&other_set, "mine", None);
+                    stolen["media"] = json!([variant]);
+                    let res = create(&s, &other, stolen).await;
+                    assert_eq!(res.status_code(), 422, "{variant}: {}", res.text());
+                    assert_eq!(res.json::<Value>()["error"], "invalid_upload", "{variant}");
+                }
+
+                // The team's own upload by another spelling is refused too: posts name the exact
+                // link, which the sweep matches.
+                let mut own = input(&set, "mine", None);
+                own["media"] = json!([format!(
+                    "https://brain.test/media/%{:02X}{}",
+                    name.as_bytes()[0],
+                    &name[1..]
+                )]);
+                let res = create(&s, &cookie, own).await;
+                assert_eq!(res.status_code(), 422, "{}", res.text());
+                assert_eq!(res.json::<Value>()["error"], "invalid_upload");
+
+                // A failed post keeps its upload past the day, so its retry finds the file.
+                let mut failing = input(&set, "REJECT me", Some(&past()));
+                failing["media"] = json!([url]);
+                let id = id_of(&create(&s, &cookie, failing).await);
+                publish::tick(&state).await.unwrap();
+                assert_eq!(get_post(&s, &cookie, &id).await["status"], "failed");
+                let old = format!(
+                    "UPDATE media_uploads SET created_at = now() - interval '25 hours' \
+                     WHERE team_id = '{team_id}'"
+                );
+                run(old.clone()).await;
+                state.media.release_uploads(&db, 24).await.unwrap();
+                assert!(kept(url.clone()).await, "kept for the retry");
+                set_body(&db, &id, "fine", json!([])).await;
+                let res = req(&s, Method::POST, &retry_url(&id), &cookie).await;
+                assert_eq!(res.status_code(), 202, "{}", res.text());
+                let p = settled(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "published", "{p}");
+                state.media.release_uploads(&db, 24).await.unwrap();
+                assert!(!kept(url).await, "gone once nothing may need it");
+
+                // A save holding an upload keeps the sweep off it until it commits.
+                let made = upload(&s, &cookie, file(PNG, 64)).await;
+                let url = made.json::<Value>()["url"].as_str().unwrap().to_owned();
+                let draft = id_of(&create(&s, &cookie, input(&set, "later", None)).await);
+                run(old.clone()).await;
+                let txn = db.begin().await.unwrap();
+                txn.execute_unprepared(&format!(
+                    "SELECT 1 FROM media_uploads WHERE url = '{url}' FOR SHARE"
+                ))
+                .await
+                .unwrap();
+                txn.execute_unprepared(&format!(
+                    "UPDATE posts SET media = '[\"{url}\"]' WHERE id = '{draft}'"
+                ))
+                .await
+                .unwrap();
+                let sweep = tokio::spawn({
+                    let (m, db) = (state.media.clone(), db.clone());
+                    async move { m.release_uploads(&db, 24).await.unwrap() }
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                txn.commit().await.unwrap();
+                sweep.await.unwrap();
+                assert!(
+                    kept(url.clone()).await,
+                    "the draft saved meanwhile holds it"
+                );
+
+                // Three running uploads take the team's slots.
+                let pending = |hours: i32| {
+                    let id = uuid::Uuid::now_v7();
+                    format!(
+                        "INSERT INTO media_uploads (id, team_id, storage_key, url, content_type, \
+                         size, pending, created_at) VALUES ('{id}', '{team_id}', \
+                         'uploads/{team_id}/{id}', '', '', 1, true, \
+                         now() - make_interval(hours => {hours}))"
+                    )
+                };
+                for _ in 0..3 {
+                    run(pending(0)).await;
+                }
+                let res = upload(&s, &cookie, file(PNG, 64)).await;
+                assert_eq!(res.status_code(), 429, "{}", res.text());
+                res.assert_json(&json!({"error": "uploads_in_progress"}));
+                run(format!(
+                    "DELETE FROM media_uploads WHERE team_id = '{team_id}' AND pending"
+                ))
+                .await;
+                // A running upload counts the most it may take, so a nearly full team waits.
+                run(format!(
+                    "UPDATE media_uploads SET size = {} WHERE url = '{url}'",
+                    10i64 * 1024 * 1024 * 1024 - 1000
+                ))
+                .await;
+                let res = upload(&s, &cookie, file(PNG, 64)).await;
+                assert_eq!(res.status_code(), 409, "{}", res.text());
+                res.assert_json(&json!({"error": "too_many_uploads"}));
+                run(format!(
+                    "UPDATE media_uploads SET size = 64 WHERE url = '{url}'"
+                ))
+                .await;
+
+                // A lost running upload goes after its hours; a stored file with no row too.
+                run(pending(media::PENDING_HOURS + 1)).await;
+                state.media.release_uploads(&db, 24).await.unwrap();
+                let left = db
+                    .query_one_raw(sea_orm::Statement::from_string(
+                        sea_orm::DbBackend::Postgres,
+                        format!(
+                            "SELECT count(*) AS n FROM media_uploads \
+                             WHERE team_id = '{team_id}' AND pending"
+                        ),
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(left.try_get::<i64>("", "n").unwrap(), 0);
+                let orphan = object_store::path::Path::from(format!(
+                    "uploads/{team_id}/{}",
+                    uuid::Uuid::now_v7()
+                ));
+                state
+                    .media
+                    .store
+                    .put(&orphan, bytes::Bytes::from_static(PNG).into())
+                    .await
+                    .unwrap();
+                state
+                    .media
+                    .release_orphans(&db, std::time::Duration::ZERO)
+                    .await
+                    .unwrap();
+                assert!(
+                    state.media.store.head(&orphan).await.is_err(),
+                    "orphan swept"
+                );
+                let res = s.get(url.strip_prefix(BRAIN).unwrap()).await;
+                res.assert_status_ok();
+
+                // A team's uploads are rate limited.
+                let mut limited = false;
+                for _ in 0..70 {
+                    let res = upload(&s, &cookie, Vec::new()).await;
+                    if res.status_code() == 429 {
+                        res.assert_json(&json!({"error": "rate_limited"}));
+                        limited = true;
+                        break;
+                    }
+                }
+                assert!(limited);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_dropped_uploads_cleanup_spares_one_that_finished() {
+                use sea_orm::ConnectionTrait;
+                const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+                let (s, db, state) = on_mock_at(media::MAX_BYTES, Some("https://brain.test")).await;
+                let (_, team_id, _) = owner_with_account(&s, &db).await;
+                // The cleanup of a dropped request deletes a pending row and its file, and leaves
+                // an upload whose last update committed meanwhile whole.
+                let put = |key: String| {
+                    let store = state.media.store.clone();
+                    async move {
+                        store
+                            .put(&key.as_str().into(), bytes::Bytes::from_static(PNG).into())
+                            .await
+                            .unwrap();
+                    }
+                };
+                let row = |pending: bool| {
+                    let id = uuid::Uuid::now_v7();
+                    let key = format!("uploads/{team_id}/{id}");
+                    let q = format!(
+                        "INSERT INTO media_uploads (id, team_id, storage_key, url, content_type, \
+                         size, pending) VALUES ('{id}', '{team_id}', '{key}', 'u-{id}', \
+                         'image/png', 8, {pending})"
+                    );
+                    (id, key, q)
+                };
+                for pending in [true, false] {
+                    let (id, key, q) = row(pending);
+                    db.execute_unprepared(&q).await.unwrap();
+                    put(key.clone()).await;
+                    socialreins_brain::controllers::uploads::release_pending(&state, id).await;
+                    let kept = state.media.store.head(&key.as_str().into()).await.is_ok();
+                    assert_eq!(kept, !pending, "pending {pending}");
+                }
             }
 
             #[tokio::test]
@@ -29134,6 +29523,20 @@ mod teams {
             c.assert_status_ok();
             c.assert_json(&json!({"x": 0, "ai": 0}));
             assert_eq!(s.get("/v1/team/billing").await.status_code(), 401);
+        }
+
+        /// With billing on, a team with no live plan cannot store files.
+        #[tokio::test]
+        #[serial]
+        async fn uploads_need_a_live_plan() {
+            let (s, db) = server_where(|c| c.billing_enabled = true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let res = req(&s, Method::POST, "/v1/uploads", &owner)
+                .content_type("application/octet-stream")
+                .bytes(b"\x89PNG\r\n\x1a\n".to_vec().into())
+                .await;
+            assert_eq!(res.status_code(), 402, "{}", res.text());
+            assert_eq!(res.json::<Value>()["error"], "plan_limit");
         }
 
         /// With billing on, the plan decides: none or canceled allows nothing, a live one its
