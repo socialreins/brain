@@ -2617,7 +2617,8 @@ pub struct TakedownResult {
     pub platform: String,
     /// `taken_down` (now gone from every account), `already_gone` (taken down before; nothing
     /// was called), `failed` (see `message`) or `not_published` (a draft, scheduled, queued or
-    /// failed post has nothing to take down).
+    /// failed post has nothing to take down and is left alone: a scheduled or queued one still
+    /// goes out unless it is deleted or edited).
     pub state: String,
     /// For `failed`: what stayed up and what to do, e.g. TikTok has no delete call.
     pub message: Option<String>,

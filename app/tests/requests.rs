@@ -7167,6 +7167,12 @@ mod teams {
                 )
                 .await;
                 assert_eq!(res.status_code(), 404);
+
+                // Another team's member gets 404 and nothing is called.
+                let (_, stranger, _) = user(&s, &db).await;
+                let res = req(&s, Method::POST, &url, &stranger).await;
+                assert_eq!(res.status_code(), 404);
+                assert_eq!(DELETED.lock().unwrap().len(), before + 1);
             }
 
             #[tokio::test]
