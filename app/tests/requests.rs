@@ -7149,7 +7149,14 @@ mod teams {
                 }
                 // A team gets its places a round (`TEAM_AT_ONCE`), never more than 50 in all.
                 let first = publish::claim_due(&db, false).await.unwrap();
-                assert_eq!(first.len(), publish::TEAM_AT_ONCE);
+                let own = |claimed: &[(uuid::Uuid, uuid::Uuid)]| {
+                    claimed
+                        .iter()
+                        .filter(|c| c.1.to_string() == team_id)
+                        .count()
+                };
+                assert_eq!(own(&first), publish::TEAM_AT_ONCE);
+                assert!(first.len() <= 50);
                 let mut claimed: Vec<uuid::Uuid> = first.iter().map(|c| c.0).collect();
                 loop {
                     let next = publish::claim_due(&db, false).await.unwrap();
