@@ -3706,6 +3706,8 @@ mod teams {
         /// Set: the next `createRecord` is refused as an expired session.
         static EXPIRE_NEXT: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
+        /// Set: the next `createRecord` of a text with `BUSYONCE` is refused for the rate limit.
+        static BUSY_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         /// The record key of every `deleteRecord` the mock took, newest last.
         static DELETED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -3867,6 +3869,11 @@ mod teams {
                 return (axum::http::StatusCode::BAD_REQUEST, Json(err));
             }
             let text = b["record"]["text"].as_str().unwrap_or_default().to_owned();
+            let busy_once = text.contains("BUSYONCE")
+                && BUSY_ONCE.swap(false, std::sync::atomic::Ordering::SeqCst);
+            if busy_once || (text.contains("BUSY") && !text.contains("BUSYONCE")) {
+                return refused(429, "RateLimitExceeded");
+            }
             if text.contains("REJECT") {
                 let leak = json!({"error": "InvalidRequest",
                     "message": "see https://secret.example/?token=abc"});
@@ -6425,8 +6432,8 @@ mod teams {
                 let (cookie, team_id, _) = owner_with_account(&s, &db).await;
                 let set = default_set(&db, &team_id).await.to_string();
                 let t0 = Utc::now() - Duration::seconds(1);
-                let hour_ago = (Utc::now() - Duration::hours(1)).to_rfc3339();
-                let res = create(&s, &cookie, input(&set, "past", Some(&hour_ago))).await;
+                let half_hour_ago = (Utc::now() - Duration::hours(1)).to_rfc3339();
+                let res = create(&s, &cookie, input(&set, "past", Some(&half_hour_ago))).await;
                 let p = res.json::<Value>();
                 let at: chrono::DateTime<Utc> =
                     p["scheduled_at"].as_str().unwrap().parse().unwrap();
@@ -8314,6 +8321,421 @@ mod teams {
                 assert_eq!(count().await, before);
             }
 
+            mod schedule_rules {
+                use super::*;
+                use sea_orm::{ConnectionTrait, TransactionTrait};
+
+                async fn exec(db: &DatabaseConnection, sql: String) {
+                    db.execute_unprepared(&sql).await.unwrap();
+                }
+
+                /// A scheduled post due `minutes` ago.
+                async fn due_ago(
+                    s: &TestServer,
+                    db: &DatabaseConnection,
+                    cookie: &str,
+                    body: Value,
+                    minutes: i64,
+                ) -> String {
+                    let res = create(s, cookie, body).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let id = id_of(&res);
+                    let at = (Utc::now() - Duration::minutes(minutes)).to_rfc3339();
+                    exec(
+                        db,
+                        format!("UPDATE posts SET scheduled_at = '{at}' WHERE id = '{id}'"),
+                    )
+                    .await;
+                    id
+                }
+
+                /// Makes every waiting retry of the post due now.
+                async fn retry_now(db: &DatabaseConnection, id: &str) {
+                    exec(
+                        db,
+                        format!(
+                            "UPDATE post_targets SET retry_at = now() - interval '1 second' \
+                             WHERE post_id = '{id}' AND retry_at IS NOT NULL"
+                        ),
+                    )
+                    .await;
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_post_over_an_hour_late_goes_back_to_draft() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let soon = Some(past());
+                    let records = RECORDS.lock().unwrap().len();
+                    let late =
+                        due_ago(&s, &db, &cookie, input(&set, "late", soon.as_deref()), 61).await;
+                    let fine =
+                        due_ago(&s, &db, &cookie, input(&set, "fine", soon.as_deref()), 59).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &late).await;
+                    assert_eq!(p["status"], "draft", "{p}");
+                    let why = p["error"].as_str().unwrap();
+                    assert!(why.starts_with("Not posted: it was due at "), "{why}");
+                    assert!(
+                        why.ends_with(" UTC and is more than an hour late. Schedule it again."),
+                        "{why}"
+                    );
+                    assert_eq!(p["targets"], json!([]), "{p}");
+                    assert_eq!(get_post(&s, &cookie, &fine).await["status"], "published");
+                    assert_eq!(
+                        RECORDS.lock().unwrap().len(),
+                        records + 1,
+                        "only one went out"
+                    );
+
+                    // A post left queued by a crash before any target started, now late: draft too.
+                    let left =
+                        due_ago(&s, &db, &cookie, input(&set, "left", soon.as_deref()), 90).await;
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE posts SET status = 'queued', \
+                             updated_at = now() - interval '40 minutes' WHERE id = '{left}'"
+                        ),
+                    )
+                    .await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &left).await;
+                    assert_eq!(p["status"], "draft", "{p}");
+                    assert_eq!(RECORDS.lock().unwrap().len(), records + 1);
+                }
+
+                /// A queued post due long ago with one pending target, as a crash leaves it.
+                async fn stale_queued(
+                    s: &TestServer,
+                    db: &DatabaseConnection,
+                    cookie: &str,
+                    set: &str,
+                    team: &str,
+                ) -> (String, uuid::Uuid) {
+                    let id = due_ago(s, db, cookie, input(set, "stale", Some(&past())), 90).await;
+                    let target = uuid::Uuid::new_v4();
+                    exec(
+                        db,
+                        format!(
+                            "UPDATE posts SET status = 'queued', fanned_out = false, \
+                             updated_at = now() - interval '40 minutes' WHERE id = '{id}'; \
+                             INSERT INTO post_targets (id, post_id, social_account_id, status) \
+                             VALUES ('{target}', '{id}', (SELECT id FROM social_accounts \
+                               WHERE team_id = '{team}' LIMIT 1), 'pending')"
+                        ),
+                    )
+                    .await;
+                    (id, target)
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_post_never_turns_draft_while_a_target_starts() {
+                    let (s, db, _) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let wait = std::time::Duration::from_millis(400);
+
+                    // The drafting holds the post: a target cannot start meanwhile, and once the
+                    // post is a draft it never does.
+                    let (id, target) = stale_queued(&s, &db, &cookie, &set, &team_id).await;
+                    let txn = db.begin().await.unwrap();
+                    txn.execute_unprepared(&format!(
+                        "SELECT 1 FROM posts WHERE id = '{id}' FOR UPDATE"
+                    ))
+                    .await
+                    .unwrap();
+                    let claim = tokio::spawn({
+                        let db = db.clone();
+                        async move { publish::claim_target(&db, target).await.unwrap() }
+                    });
+                    tokio::time::sleep(wait).await;
+                    assert!(!claim.is_finished(), "the claim waits for the post lock");
+                    txn.execute_unprepared(&format!(
+                        "UPDATE posts SET status = 'draft' WHERE id = '{id}'"
+                    ))
+                    .await
+                    .unwrap();
+                    txn.commit().await.unwrap();
+                    assert!(!claim.await.unwrap(), "a draft's target is never claimed");
+                    let status: String = db
+                        .query_one_raw(sea_orm::Statement::from_string(
+                            sea_orm::DbBackend::Postgres,
+                            format!("SELECT status FROM post_targets WHERE id = '{target}'"),
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .try_get("", "status")
+                        .unwrap();
+                    assert_eq!(status, "pending");
+
+                    // A target that started first is seen by the drafting, which then leaves the
+                    // post queued: it waits for the claim's lock, then looks at the targets.
+                    let (id, target) = stale_queued(&s, &db, &cookie, &set, &team_id).await;
+                    let txn = db.begin().await.unwrap();
+                    txn.execute_unprepared(&format!(
+                        "SELECT 1 FROM posts WHERE id = '{id}' FOR SHARE; \
+                         UPDATE post_targets SET status = 'publishing' WHERE id = '{target}'"
+                    ))
+                    .await
+                    .unwrap();
+                    let drafting = tokio::spawn({
+                        let db = db.clone();
+                        async move { publish::draft_late(&db, &[]).await.unwrap() }
+                    });
+                    tokio::time::sleep(wait).await;
+                    assert!(!drafting.is_finished(), "the drafting waits for the claim");
+                    txn.commit().await.unwrap();
+                    let drafted = drafting.await.unwrap();
+                    assert!(!drafted.iter().any(|d| d.to_string() == id), "{drafted:?}");
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "queued");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_retried_post_is_never_drafted_as_late() {
+                    let (s, db, _) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    // As a manual retry leaves it when the process restarts mid-way: queued, an
+                    // old `scheduled_at`, fanned out, its target pending with the live root.
+                    let (id, target) = stale_queued(&s, &db, &cookie, &set, &team_id).await;
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE post_targets SET remote_id = 'at://live/root', \
+                             error = 'part 2 failed' WHERE id = '{target}'; \
+                             UPDATE posts SET fanned_out = true WHERE id = '{id}'"
+                        ),
+                    )
+                    .await;
+                    let drafted = publish::draft_late(&db, &[]).await.unwrap();
+                    assert!(!drafted.iter().any(|d| d.to_string() == id), "{drafted:?}");
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "queued");
+                    let kept: Option<String> = db
+                        .query_one_raw(sea_orm::Statement::from_string(
+                            sea_orm::DbBackend::Postgres,
+                            format!("SELECT remote_id FROM post_targets WHERE id = '{target}'"),
+                        ))
+                        .await
+                        .unwrap()
+                        .expect("the target is kept")
+                        .try_get("", "remote_id")
+                        .unwrap();
+                    assert_eq!(kept.as_deref(), Some("at://live/root"));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_manual_retry_clears_the_old_retry_time() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let id = id_of(&create(&s, &cookie, input(&set, "BUSY", Some(&past()))).await);
+                    publish::tick(&state).await.unwrap();
+                    retry_now(&db, &id).await;
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "failed");
+                    let res =
+                        req(&s, Method::POST, &format!("/v1/posts/{id}/retry"), &cookie).await;
+                    assert_eq!(res.status_code(), 202, "{}", res.text());
+                    let left: i64 = db
+                        .query_one_raw(sea_orm::Statement::from_string(
+                            sea_orm::DbBackend::Postgres,
+                            format!(
+                                "SELECT count(*) AS n FROM post_targets \
+                                 WHERE post_id = '{id}' AND retry_at IS NOT NULL"
+                            ),
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .try_get("", "n")
+                        .unwrap();
+                    assert_eq!(left, 0, "no stale retry time");
+                    // Let the retry run its course before the next test.
+                    for _ in 0..50 {
+                        if get_post(&s, &cookie, &id).await["status"] != "queued" {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_post_this_process_is_publishing_is_not_drafted() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let (id, _) = stale_queued(&s, &db, &cookie, &set, &team_id).await;
+                    let held = publish::hold(id.parse().unwrap());
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "queued");
+                    drop(held);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "draft");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_group_is_claimed_whole_or_not_at_all() {
+                    let (s, db, _) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    // 49 older posts fill all but one place of the batch of 50.
+                    for i in 0..49 {
+                        due_ago(
+                            &s,
+                            &db,
+                            &cookie,
+                            input(&set, &format!("old {i}"), Some(&past())),
+                            30,
+                        )
+                        .await;
+                    }
+                    let group = uuid::Uuid::new_v4();
+                    let mut pair = Vec::new();
+                    for i in 0..2 {
+                        let id = due_ago(
+                            &s,
+                            &db,
+                            &cookie,
+                            input(&set, &format!("pair {i}"), Some(&past())),
+                            5,
+                        )
+                        .await;
+                        exec(
+                            &db,
+                            format!("UPDATE posts SET group_id = '{group}' WHERE id = '{id}'"),
+                        )
+                        .await;
+                        pair.push(id);
+                    }
+                    let claimed = publish::claim_due(&db, false).await.unwrap();
+                    let mine = claimed
+                        .iter()
+                        .filter(|c| pair.contains(&c.0.to_string()))
+                        .count();
+                    assert_eq!(mine, 2, "both of the group, or neither: {}", claimed.len());
+                    assert_eq!(
+                        claimed.len(),
+                        51,
+                        "the group goes in whole on top of the batch"
+                    );
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_rate_limit_is_retried_once_five_minutes_later() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let id = id_of(&create(&s, &cookie, input(&set, "BUSY", Some(&past()))).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "queued", "{p}");
+                    let t = &p["targets"][0];
+                    assert_eq!(t["status"], "pending", "{p}");
+                    assert_eq!(t["retried"], true);
+                    let due: chrono::DateTime<Utc> =
+                        t["retry_at"].as_str().unwrap().parse().unwrap();
+                    assert!(due > Utc::now() + Duration::minutes(4), "{t}");
+                    let why = t["error"].as_str().unwrap();
+                    assert!(why.ends_with("Nothing was posted."), "{why}");
+                    let wait = post_targets::Entity::find_by_id(
+                        t["id"].as_str().unwrap().parse::<uuid::Uuid>().unwrap(),
+                    )
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .retry_at
+                    .unwrap();
+                    let left = wait.to_utc() - Utc::now();
+                    assert!(left > Duration::minutes(4) && left <= Duration::minutes(5));
+                    // Not before its time, and a manual retry waits for it.
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(
+                        get_post(&s, &cookie, &id).await["targets"][0]["status"],
+                        "pending"
+                    );
+                    let res =
+                        req(&s, Method::POST, &format!("/v1/posts/{id}/retry"), &cookie).await;
+                    assert_eq!(res.status_code(), 409);
+                    // Due: sent again, refused again, and failed for good.
+                    retry_now(&db, &id).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    assert_eq!(p["targets"][0]["status"], "failed");
+                    assert_eq!(p["targets"][0]["retried"], true);
+                    assert_eq!(
+                        p["targets"][0]["retry_at"],
+                        Value::Null,
+                        "only while waiting"
+                    );
+
+                    // Once is enough when the platform takes it the second time.
+                    BUSY_ONCE.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let id =
+                        id_of(&create(&s, &cookie, input(&set, "BUSYONCE", Some(&past()))).await);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "queued");
+                    retry_now(&db, &id).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(p["targets"][0]["retried"], true);
+                    assert_eq!(p["targets"][0]["error"], Value::Null);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn other_failures_and_a_started_thread_are_never_retried() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let id =
+                        id_of(&create(&s, &cookie, input(&set, "REJECT", Some(&past()))).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    assert_eq!(p["targets"][0]["retried"], false);
+                    // The root is up (a remote id), so a rate limit on part 2 fails the target.
+                    let mut thread = input(&set, "root", Some(&past()));
+                    thread["thread"] = json!([{"body": "BUSY part", "media": []}]);
+                    let id = id_of(&create(&s, &cookie, thread).await);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let t = &p["targets"][0];
+                    assert_eq!(t["status"], "failed", "{p}");
+                    assert_eq!(t["retried"], false);
+                    assert!(t["remote_id"].is_string());
+                    assert!(publish::retry_safe(t["error"].as_str().unwrap()));
+                }
+
+                #[test]
+                fn only_errors_that_sent_nothing_are_retry_safe() {
+                    assert!(publish::retry_safe(
+                        "Bluesky is rate limiting this account. Nothing was posted."
+                    ));
+                    assert!(publish::retry_safe(
+                        "Publish: X could not be reached. Nothing was posted."
+                    ));
+                    assert!(!publish::retry_safe("Publish: X could not be reached."));
+                    assert!(!publish::retry_safe(
+                        "Timed out; it may have posted, check the account. Nothing was posted."
+                    ));
+                    assert!(!publish::retry_safe("Bluesky refused it (InvalidRequest)."));
+                }
+            }
+
             mod approvals {
                 use super::*;
 
@@ -8852,6 +9274,54 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
+                async fn a_late_post_goes_to_draft_and_its_series_goes_on() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, _, set) = team(&s, &db).await;
+                    let id = scheduled(&s, &cookie, &set).await;
+                    repeating(&s, &cookie, &id, daily()).await;
+                    let due = (Utc::now() - Duration::hours(2)).trunc_subsecs(0);
+                    at(&db, &id, due).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "draft", "{p}");
+                    assert_eq!(p["repeat"], Value::Null, "the copy carries the rule");
+                    let copies: Vec<Value> = with_rule(&s, &cookie)
+                        .await
+                        .into_iter()
+                        .filter(|c| c["body"] == "again" && time(c) == due + Duration::days(1))
+                        .collect();
+                    assert_eq!(copies.len(), 1, "{copies:?}");
+                    assert_eq!(copies[0]["status"], "scheduled");
+                    assert_eq!(copies[0]["repeat"]["every"], "day");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_rejected_post_is_not_drafted_late_and_its_series_ends() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, _, set) = team(&s, &db).await;
+                    let id = scheduled(&s, &cookie, &set).await;
+                    repeating(&s, &cookie, &id, daily()).await;
+                    sql(
+                        &db,
+                        format!("UPDATE posts SET approval = 'rejected' WHERE id = '{id}'"),
+                    )
+                    .await;
+                    at(&db, &id, (Utc::now() - Duration::hours(2)).trunc_subsecs(0)).await;
+                    for _ in 0..2 {
+                        publish::tick(&state).await.unwrap();
+                    }
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "scheduled", "{p}");
+                    assert_eq!(p["error"], Value::Null, "{p}");
+                    let all = req(&s, Method::GET, "/v1/posts", &cookie)
+                        .await
+                        .json::<Vec<Value>>();
+                    assert_eq!(all.len(), 1, "no copy was made: {all:?}");
+                }
+
+                #[tokio::test]
+                #[serial]
                 async fn a_rule_is_validated_set_listed_and_cleared() {
                     let (s, db, _) = on_mock().await;
                     let (cookie, _, set) = team(&s, &db).await;
@@ -8989,7 +9459,7 @@ mod teams {
                         .assert_status_ok();
                     assert_eq!(rule(a.clone()).await, Value::Null);
                     repeating(&s, &cookie, &b, daily()).await;
-                    let due = Utc::now().trunc_subsecs(0) - Duration::hours(1);
+                    let due = Utc::now().trunc_subsecs(0) - Duration::minutes(30);
                     at(&db, &a, due).await;
                     at(&db, &b, due).await;
                     publish::tick(&state).await.unwrap();
@@ -9010,7 +9480,7 @@ mod teams {
                 async fn the_tick_schedules_one_copy_a_day_a_week_or_a_month_on() {
                     let (s, db, state) = on_mock().await;
                     let now = Utc::now().trunc_subsecs(0);
-                    let hour_ago = now - Duration::hours(1);
+                    let half_hour_ago = now - Duration::minutes(30);
                     // The last 31st at or before now: its next month may be a shorter one.
                     let last_31st = (0..)
                         .map(|back| now - Duration::days(back))
@@ -9021,15 +9491,16 @@ mod teams {
                         .find(|t| *t > now)
                         .unwrap();
                     for (every, interval, from, next) in [
-                        ("day", 1, hour_ago, hour_ago + Duration::days(1)),
-                        ("day", 3, hour_ago, hour_ago + Duration::days(3)),
-                        ("week", 2, hour_ago, hour_ago + Duration::days(14)),
-                        // Late by more than a day: the first time still ahead.
+                        ("day", 1, half_hour_ago, half_hour_ago + Duration::days(1)),
+                        ("day", 3, half_hour_ago, half_hour_ago + Duration::days(3)),
+                        ("week", 2, half_hour_ago, half_hour_ago + Duration::days(14)),
+                        // Late by more than a day: drafted, and the next copy is the first time
+                        // still ahead.
                         (
                             "day",
                             1,
-                            hour_ago - Duration::days(2),
-                            hour_ago + Duration::days(1),
+                            half_hour_ago - Duration::days(2),
+                            half_hour_ago + Duration::days(1),
                         ),
                         ("month", 1, last_31st, month_on),
                     ] {
@@ -9041,7 +9512,12 @@ mod teams {
                         at(&db, &id, from).await;
                         publish::tick(&state).await.unwrap();
                         let source = get_post(&s, &cookie, &id).await;
-                        assert_eq!(source["status"], "published", "{every}: {source}");
+                        let went = if from < now - Duration::hours(1) {
+                            "draft"
+                        } else {
+                            "published"
+                        };
+                        assert_eq!(source["status"], went, "{every}: {source}");
                         assert_eq!(source["repeat"], Value::Null);
                         let copies = with_rule(&s, &cookie).await;
                         assert_eq!(copies.len(), 1, "{every}: {copies:?}");
@@ -9069,7 +9545,7 @@ mod teams {
                 #[serial]
                 async fn remaining_and_until_end_the_series() {
                     let (s, db, state) = on_mock().await;
-                    let due = Utc::now().trunc_subsecs(0) - Duration::hours(1);
+                    let due = Utc::now().trunc_subsecs(0) - Duration::minutes(30);
                     let count = |cookie: String| {
                         let s = &s;
                         async move {
@@ -9140,7 +9616,7 @@ mod teams {
                     let refused = id_of(&res);
                     let garbled = scheduled(&s, &cookie, &set).await;
                     let sound = scheduled(&s, &cookie, &set).await;
-                    let due = Utc::now().trunc_subsecs(0) - Duration::hours(1);
+                    let due = Utc::now().trunc_subsecs(0) - Duration::minutes(30);
                     for id in [&refused, &garbled, &sound] {
                         repeating(&s, &cookie, id, daily()).await;
                         at(&db, id, due).await;
@@ -9211,7 +9687,7 @@ mod teams {
                     assert_eq!(p["approval"], "approved", "{p}");
                     assert_eq!(p["approval_by"], by);
 
-                    let due = Utc::now().trunc_subsecs(0) - Duration::hours(1);
+                    let due = Utc::now().trunc_subsecs(0) - Duration::minutes(30);
                     at(&db, &id, due).await;
                     publish::tick(&state).await.unwrap();
                     assert_eq!(get_post(&s, &owner, &id).await["status"], "published");
@@ -14495,7 +14971,11 @@ mod teams {
                     let row = x_account(&db, &team_id).await;
                     assert_eq!(access_of(&row), "xtok");
                     assert!(refresh_of(&row).starts_with("xr-"));
-                    assert!(!row.meta.to_string().contains("xr-"), "sealed at rest");
+                    // The whole token: the sealed text is base64 and may hold "xr-" by chance.
+                    assert!(
+                        !row.meta.to_string().contains(&refresh_of(&row)),
+                        "sealed at rest"
+                    );
                     let left = row.token_expires_at.unwrap().timestamp() - Utc::now().timestamp();
                     assert!((7100..=7200).contains(&left), "{left}");
 
@@ -15055,7 +15535,7 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
-                async fn out_of_credits_and_rate_limits_say_so_and_are_not_retried() {
+                async fn out_of_credits_fails_and_a_rate_limit_is_retried_once() {
                     let (s, _, state, _, mock, cookie, _, set) = team().await;
                     let attempts = mock.attempts.load(Ordering::SeqCst);
                     let id = id_of(&create(&s, &cookie, x_post(&set, "CREDITS please")).await);
@@ -15067,16 +15547,30 @@ mod teams {
                     assert!(why.contains("Add credits"), "{why}");
                     assert_eq!(mock.attempts.load(Ordering::SeqCst), attempts + 1);
 
+                    // A rate limit sent nothing: retried once, 5 minutes on, then failed.
                     let id = id_of(&create(&s, &cookie, x_post(&set, "LIMIT me")).await);
                     publish::tick(&state).await.unwrap();
                     let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "queued");
+                    assert_eq!(p["targets"][0]["status"], "pending");
+                    assert_eq!(mock.attempts.load(Ordering::SeqCst), attempts + 2);
+                    let db = &state.db;
+                    sea_orm::ConnectionTrait::execute_unprepared(
+                        db,
+                        &format!("UPDATE post_targets SET retry_at = now() WHERE post_id = '{id}'"),
+                    )
+                    .await
+                    .unwrap();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
                     assert_eq!(p["status"], "failed");
+                    assert_eq!(p["targets"][0]["retried"], true);
                     assert_eq!(
                         p["targets"][0]["error"],
-                        "Publish: X rate limit reached; it resets at 2026-11-04 12:30 UTC. It \
-                         was not retried."
+                        "Publish: X rate limit reached; it resets at 2026-11-04 12:30 UTC. \
+                         Nothing was posted."
                     );
-                    assert_eq!(mock.attempts.load(Ordering::SeqCst), attempts + 2);
+                    assert_eq!(mock.attempts.load(Ordering::SeqCst), attempts + 3);
 
                     // Credits run out midway through a thread: the posts before it stay up.
                     let body = thread(&set, "one", &["CREDITS two"]);

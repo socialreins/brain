@@ -164,6 +164,13 @@ pub struct Target {
     pub comment_error: Option<String>,
     /// Why the cover could not be set on the published video; a warning, the post is up.
     pub cover_error: Option<String>,
+    /// The target was sent again once by itself, about 5 minutes after an error that certainly
+    /// posted nothing (a rate limit, or the platform out of reach). A waiting retry is `pending`
+    /// with that error.
+    pub retried: bool,
+    /// When the waiting retry is due: set only while the target is `pending` for it, `null`
+    /// once the retry has run (or there is none).
+    pub retry_at: Option<DateTime<FixedOffset>>,
     /// The post's counts on the platform, read every hour for two days and twice a day up to
     /// 30 days; `null` before the first read and on platforms that give none (`GET /analytics`).
     pub metrics: Option<Metrics>,
@@ -588,6 +595,7 @@ async fn targets_of(
         map.entry(t.post_id).or_default().push(Target {
             id: t.id,
             social_account_id: t.social_account_id,
+            retry_at: t.retry_at.filter(|_| t.status == "pending"),
             status: t.status,
             remote_id: t.remote_id,
             remote_url: t.remote_url,
@@ -598,6 +606,7 @@ async fn targets_of(
             comment_id: t.comment_id,
             comment_error: t.comment_error,
             cover_error: t.cover_error,
+            retried: t.retried,
             metrics: read.map(|m| Metrics {
                 likes: m.likes,
                 comments: m.comments,
@@ -2657,6 +2666,12 @@ async fn requeue(
     post_targets::Entity::update_many()
         .col_expr(post_targets::Column::Status, "pending".into())
         .col_expr(post_targets::Column::Error, Option::<String>::None.into())
+        // A stale time of the automatic retry would show "Retrying at" for a time gone, and
+        // make `begin` start a second run of the post at once.
+        .col_expr(
+            post_targets::Column::RetryAt,
+            Option::<chrono::DateTime<chrono::FixedOffset>>::None.into(),
+        )
         .col_expr(post_targets::Column::UpdatedAt, now.into())
         .filter(post_targets::Column::Id.is_in(again))
         .exec(&txn)

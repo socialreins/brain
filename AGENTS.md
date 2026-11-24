@@ -99,6 +99,15 @@ cargo run -p socialreins-brain
   store, so it also catches files no row names. Local disk assumes one brain instance: run
   more than one replica only with the `S3_*` bucket.
 - `app/src/publish.rs`: the scheduler's round is `publish::begin`: under the advisory lock it claims due posts, starts each as its own task and lets the lock go without waiting (`tick` waits, for tests), so a large video never delays posts due after it. `IN_FLIGHT` keeps a round from taking a post the process still runs, `POST_SLOTS` and `TARGET_SLOTS` bound what runs at once, and `STUCK_MINUTES` is derived from `media::INGEST_CEILING` and `PUBLISH_LIMIT`. On SIGTERM (`bin/main.rs`) `publish::stop` ends claiming and hands posts not yet started back to `scheduled` (`release`), and `publish::drain` waits up to `DRAIN` (25 seconds) for the ones publishing; Railway kills at once unless `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` is set (30 or more).
+- `app/src/publish.rs`: a scheduled post more than an hour past its time is never published:
+  each tick puts it back to `draft` with the reason in `error` (`draft_late`), and its repeat
+  copy is still made; a post left `queued` is drafted only if it was never fanned out into targets (a retried one keeps its old `scheduled_at` and is picked up as left behind instead); a `rejected` post is left alone, so its series ends, and so is a post the
+  process is still publishing. `draft_late` locks the posts before it reads their targets and
+  `claim_target` takes a shared lock on a still `queued` post, so a post never turns draft while
+  a target starts. A claim takes the posts of one `group_id` whole or not at all, so they are
+  all judged by the same clock. A target retries once by itself, 5 minutes on (`post_targets.retry_at`,
+  `retried`), only after an error a connector marked `connectors::UNSENT` (a rate limit, a
+  connection that never opened) and never once its remote id is saved.
 - `app/src/publish.rs`: a post's `first_comment` (Facebook, Instagram, LinkedIn, YouTube) goes out
   once, after its target is saved as `published`: `post_targets.comment_status` is claimed
   (`posting`) before the call and never reset, so it is never retried; a failure only sets

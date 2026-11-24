@@ -267,8 +267,10 @@ impl YouTube {
         step: &str,
     ) -> Result<(StatusCode, HeaderMap, Value), PostError> {
         let res = req.send().await.map_err(|e| {
+            let sure = crate::connectors::never_sent(&e);
             tracing::warn!(error = %e.without_url(), step, "youtube call failed");
-            failed(format!("{step}: YouTube could not be reached."))
+            let msg = format!("{step}: YouTube could not be reached.");
+            failed(super::unsent(msg, sure))
         })?;
         let status = res.status();
         let headers = res.headers().clone();
@@ -431,64 +433,70 @@ impl YouTube {
         // `at`: the bytes YouTube holds. `stalls`: tries in a row that did not add to them.
         let (mut at, mut stalls, mut sent_last) = (0u64, 0u32, false);
         let (mut token, mut renewed) = (token.to_owned(), false);
-        loop {
-            let end = (at + self.chunk.max(1)).min(total);
-            let bytes = video.range(at..end).await?;
-            sent_last |= end == total;
-            let range = format!("bytes {at}-{}/{total}", end.saturating_sub(1));
-            let req = put(&token)
-                .header("Content-Type", content_type)
-                .header("Content-Range", range)
-                .body(bytes);
-            let mut answer = self.raw(req, "Upload").await;
-            // Until YouTube says how far the upload is: the chunk's own answer, else a status
-            // query after each failure.
-            let held = loop {
-                match answer {
-                    Ok((status, _, body)) if status.is_success() => {
-                        return body["id"]
-                            .as_str()
-                            .filter(|id| video_id(id))
-                            .map(str::to_owned)
-                            .ok_or_else(|| failed(NO_VIDEO_ID));
+        // Bytes are in the session from here: no failure may count as having sent nothing (a
+        // token renewal or status check can follow the last chunk).
+        let uploaded: Result<String, PostError> = async {
+            loop {
+                let end = (at + self.chunk.max(1)).min(total);
+                let bytes = video.range(at..end).await?;
+                sent_last |= end == total;
+                let range = format!("bytes {at}-{}/{total}", end.saturating_sub(1));
+                let req = put(&token)
+                    .header("Content-Type", content_type)
+                    .header("Content-Range", range)
+                    .body(bytes);
+                let mut answer = self.raw(req, "Upload").await;
+                // Until YouTube says how far the upload is: the chunk's own answer, else a status
+                // query after each failure.
+                let held = loop {
+                    match answer {
+                        Ok((status, _, body)) if status.is_success() => {
+                            return body["id"]
+                                .as_str()
+                                .filter(|id| video_id(id))
+                                .map(str::to_owned)
+                                .ok_or_else(|| failed(NO_VIDEO_ID));
+                        }
+                        Ok((status, headers, _)) if status.as_u16() == 308 => break held(&headers),
+                        Ok((status, _, _)) if status.as_u16() == 401 && !renewed => {
+                            renewed = true;
+                            let refresh = REFRESH.try_with(Clone::clone).ok().flatten();
+                            let refresh = refresh.ok_or(PostError::Reconnect)?;
+                            token = self.refresh(&refresh).await?.access_token;
+                            answer = ask(&token).await;
+                            continue;
+                        }
+                        Ok((status, _, body)) if !status.is_server_error() => {
+                            return Err(refusal(status, &body, "Upload"));
+                        }
+                        _ => {}
                     }
-                    Ok((status, headers, _)) if status.as_u16() == 308 => break held(&headers),
-                    Ok((status, _, _)) if status.as_u16() == 401 && !renewed => {
-                        renewed = true;
-                        let refresh = REFRESH.try_with(Clone::clone).ok().flatten();
-                        let refresh = refresh.ok_or(PostError::Reconnect)?;
-                        token = self.refresh(&refresh).await?.access_token;
-                        answer = ask(&token).await;
-                        continue;
+                    stalls += 1;
+                    if stalls > RESUMES {
+                        return Err(match sent_last {
+                            true => failed(UNCONFIRMED),
+                            false => failed("Upload: YouTube stopped taking the video. Try again."),
+                        });
                     }
-                    Ok((status, _, body)) if !status.is_server_error() => {
-                        return Err(refusal(status, &body, "Upload"));
+                    tokio::time::sleep(self.resume_wait * stalls).await;
+                    answer = ask(&token).await;
+                };
+                if held > at && held <= total {
+                    stalls = 0;
+                } else {
+                    // No progress (or an answer that makes no sense): counted, so it cannot loop.
+                    stalls += 1;
+                    if stalls > RESUMES {
+                        return Err(failed(
+                            "Upload: YouTube stopped taking the video. Try again.",
+                        ));
                     }
-                    _ => {}
                 }
-                stalls += 1;
-                if stalls > RESUMES {
-                    return Err(match sent_last {
-                        true => failed(UNCONFIRMED),
-                        false => failed("Upload: YouTube stopped taking the video. Try again."),
-                    });
-                }
-                tokio::time::sleep(self.resume_wait * stalls).await;
-                answer = ask(&token).await;
-            };
-            if held > at && held <= total {
-                stalls = 0;
-            } else {
-                // No progress (or an answer that makes no sense): counted, so it cannot loop.
-                stalls += 1;
-                if stalls > RESUMES {
-                    return Err(failed(
-                        "Upload: YouTube stopped taking the video. Try again.",
-                    ));
-                }
+                at = held.min(total);
             }
-            at = held.min(total);
         }
+        .await;
+        uploaded.map_err(super::maybe_sent)
     }
 
     /// Comments `text` on video `id` of `channel` as the channel (`commentThreads.insert`, scope

@@ -2,7 +2,7 @@
 //! settle the post; and take published posts down. A thread goes out root first, then each
 //! part as a reply to the one before, each saved on its target the moment the platform takes
 //! it. Every step is a conditional update, so two instances (or a tick and "publish now") never
-//! send a post twice. Nothing retries by itself (a retry could post twice); only `POST /posts/{id}/retry` re-queues failed targets, and only on request. Each target status change queues its webhook event in the same
+//! send a post twice. A target retries by itself once, about 5 minutes later, only after an error that certainly sent nothing (`retry_safe`); anything else that failed is re-queued only by `POST /posts/{id}/retry`, on request. A scheduled post more than `LATE_MINUTES` past its time is never published: it goes back to `draft` (`draft_late`). Each target status change queues its webhook event in the same
 //! statement (`webhooks::with_event`). Media is downloaded into brain's storage before any
 //! target is claimed (`media.rs`) and deleted once the post settles.
 use std::{
@@ -912,7 +912,8 @@ pub async fn drain() {
 /// Posts a team publishes a day, scheduled or published now (`rate_limit::daily_reserve`).
 pub const PUBLISHES_PER_DAY: i64 = 100;
 const OVER_QUOTA: &str = "This team reached its limit of 100 published posts a day. It stays \
-                          scheduled and goes out once the limit frees up, within a day.";
+                          scheduled and goes out if the limit frees up within an hour of its \
+                          time; after that it goes back to drafts.";
 
 /// The daily publish bucket of a team.
 pub fn quota_bucket(team_id: Uuid) -> String {
@@ -1080,12 +1081,19 @@ pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, D
     if let Err(e) = recover_stuck(&app.db).await {
         tracing::warn!(error = %e, "stuck target recovery failed");
     }
+    let running: Vec<Uuid> = in_flight(|flying| flying.iter().copied().collect());
+    if let Err(e) = draft_late(&app.db, &running).await {
+        tracing::warn!(error = %e, "late posts not put back to draft");
+    }
     let room = (CLAIM_BATCH - in_flight(|flying| flying.len()) as i64).max(0);
     // Posts left `queued` by a crash between claim and settle: fan-out and claims are
-    // idempotent, so running them again only finishes the job.
+    // idempotent, so running them again only finishes the job. Also posts with a target whose
+    // automatic retry is due.
     let stmt = sql(
         "SELECT id FROM posts WHERE status = 'queued' \
-         AND updated_at < now() - make_interval(mins => $1) LIMIT $2",
+         AND (updated_at < now() - make_interval(mins => $1) OR EXISTS (SELECT 1 FROM \
+           post_targets t WHERE t.post_id = posts.id AND t.status = 'pending' \
+           AND t.retry_at <= now())) LIMIT $2",
         vec![(STUCK_MINUTES as i32).into(), CLAIM_BATCH.into()],
     );
     let left = ids(&app.db, stmt, "id").await?;
@@ -1143,11 +1151,15 @@ async fn claim(
     limit: i64,
     billing: bool,
 ) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
-    // A CTE runs once; a LIMIT inside `IN (...)` may be re-run and claim more.
+    // A CTE runs once; a LIMIT inside `IN (...)` may be re-run and claim more. The posts of one
+    // group (`group_id`, one per platform) are claimed together or not at all, so they are all
+    // judged by the same clock (`LATE_MINUTES`): the batch is cut between groups, never inside
+    // one, and the first group always fits.
     let stmt = sql(
-        "WITH due AS ( \
-           SELECT d.id FROM posts d \
+        "WITH cand AS ( \
+           SELECT d.id, COALESCE(d.group_id, d.id) AS gk, d.scheduled_at FROM posts d \
            WHERE d.status = 'scheduled' AND d.scheduled_at <= now() \
+           AND d.scheduled_at >= now() - make_interval(mins => $4) \
            AND d.approval IS DISTINCT FROM 'rejected' \
            AND (d.approval IS DISTINCT FROM 'pending' OR NOT EXISTS ( \
                 SELECT 1 FROM teams t WHERE t.id = d.team_id AND t.require_approval)) \
@@ -1157,13 +1169,23 @@ async fn claim(
                 AND b.status IN ('trialing', 'active', 'past_due'))) \
            AND (SELECT count(*) FROM rate_limit_hits h \
                 WHERE h.bucket = 'publish:team:' || d.team_id::text \
-                AND h.created_at > now() - interval '1 day') < $1 \
-           ORDER BY d.scheduled_at, d.id LIMIT $2 \
-           FOR UPDATE SKIP LOCKED) \
+                AND h.created_at > now() - interval '1 day') < $1), \
+         fit AS ( \
+           SELECT gk FROM (SELECT gk, sum(count(*)) OVER (ORDER BY min(scheduled_at), gk) \
+                                      - count(*) AS before \
+                           FROM cand GROUP BY gk) g WHERE before < $2), \
+         due AS ( \
+           SELECT p.id FROM posts p JOIN cand c ON c.id = p.id JOIN fit f ON f.gk = c.gk \
+           ORDER BY c.scheduled_at, p.id FOR UPDATE OF p SKIP LOCKED) \
          UPDATE posts p SET status = 'queued', updated_at = now() FROM due \
          WHERE p.id = due.id AND p.status = 'scheduled' \
          RETURNING p.id, p.team_id",
-        vec![PUBLISHES_PER_DAY.into(), limit.into(), billing.into()],
+        vec![
+            PUBLISHES_PER_DAY.into(),
+            limit.into(),
+            billing.into(),
+            (LATE_MINUTES as i32).into(),
+        ],
     );
     let txn = db.begin().await?;
     let rows = txn.query_all_raw(stmt).await?;
@@ -1175,6 +1197,77 @@ async fn claim(
     crate::repeat::spawn(&txn, &ids, None).await?;
     txn.commit().await?;
     Ok(claimed)
+}
+
+/// A scheduled post this many minutes past its time is never published (decision 0008).
+pub const LATE_MINUTES: i64 = 60;
+/// Starts the `error` of a post `draft_late` put back.
+pub const LATE: &str = "Not posted: it was due at";
+
+/// Puts every post more than `LATE_MINUTES` past its time back to `draft`, saying why: a
+/// `scheduled` one (held up by approval, an ended plan, the daily cap or an outage), and one
+/// left `queued` by a crash before it was fanned out into targets (`STUCK_MINUTES`). A post that
+/// was fanned out is never drafted, whatever its age: it may be a retry (a manual retry keeps
+/// the old `scheduled_at`, and a thread's pending target holds its live root), and `begin`
+/// picks it up as left behind, as before. A `rejected` post is left alone: it is not going out and its series ends, as it
+/// did before this. Posts in `running` (this process is publishing them, maybe waiting for a
+/// slot) are left alone too. A post with a repeat rule yields its next copy here
+/// (`repeat::spawn`), so a late post never ends its series. Returns the posts.
+///
+/// The posts are locked first, and only then are their targets looked at, in a new statement:
+/// `claim_target` takes the same lock before it starts a target, so a target that started
+/// before the lock is seen here, and one that comes after fails to claim a draft.
+pub async fn draft_late(db: &DatabaseConnection, running: &[Uuid]) -> Result<Vec<Uuid>, DbErr> {
+    let txn = db.begin().await?;
+    let locked = ids(
+        &txn,
+        sql(
+            "SELECT p.id FROM posts p \
+             WHERE p.scheduled_at < now() - make_interval(mins => $1) \
+             AND p.approval IS DISTINCT FROM 'rejected' AND p.id <> ALL($3::uuid[]) \
+             AND (p.status = 'scheduled' OR (p.status = 'queued' AND NOT p.fanned_out \
+               AND p.updated_at < now() - make_interval(mins => $2))) \
+             ORDER BY p.id FOR UPDATE OF p",
+            vec![
+                (LATE_MINUTES as i32).into(),
+                (STUCK_MINUTES as i32).into(),
+                running.to_vec().into(),
+            ],
+        ),
+        "id",
+    )
+    .await?;
+    if locked.is_empty() {
+        txn.commit().await?;
+        return Ok(locked);
+    }
+    let stmt = sql(
+        &format!(
+            "UPDATE posts p SET status = 'draft', quota_reserved = false, fanned_out = false, \
+             error = '{LATE} ' || to_char(p.scheduled_at AT TIME ZONE 'UTC', \
+               'YYYY-MM-DD HH24:MI') || ' UTC and is more than an hour late. Schedule it again.', \
+             updated_at = now() \
+             WHERE p.id = ANY($1::uuid[]) \
+             AND (p.status = 'scheduled' OR (NOT p.fanned_out AND NOT EXISTS (SELECT 1 \
+                 FROM post_targets t WHERE t.post_id = p.id AND t.status <> 'pending'))) \
+             RETURNING p.id"
+        ),
+        vec![locked.into()],
+    );
+    let late = ids(&txn, stmt, "id").await?;
+    if late.is_empty() {
+        txn.commit().await?;
+        return Ok(late);
+    }
+    post_targets::Entity::delete_many()
+        .filter(post_targets::Column::PostId.is_in(late.iter().copied()))
+        .filter(post_targets::Column::Status.eq("pending"))
+        .exec(&txn)
+        .await?;
+    crate::repeat::spawn(&txn, &late, None).await?;
+    txn.commit().await?;
+    tracing::info!(posts = late.len(), "late posts put back to draft");
+    Ok(late)
 }
 
 pub enum Quota {
@@ -1345,8 +1438,9 @@ async fn fail_post(db: &DatabaseConnection, id: Uuid, msg: &str) -> Result<(), D
     db.execute_raw(stmt).await.map(|_| ())
 }
 
-const PLAN_ENDED: &str =
-    "The team's plan has ended. The post goes out once a plan is chosen on the Billing page.";
+const PLAN_ENDED: &str = "The team's plan has ended. The post goes out if a plan is chosen on the \
+                          Billing page within an hour of its time; after that it goes back to \
+                          drafts.";
 
 /// Publishes a `queued` post: one target per account of its platform in its set, each
 /// published at most once, then the post settles.
@@ -1510,9 +1604,11 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         let msg = format!("No {} account is in this post's set.", post.platform);
         return fail_post(db, id, &msg).await;
     }
+    // A target waiting for its automatic retry runs once that is due (`begin` picks it up).
+    let now = chrono::Utc::now();
     let pending: Vec<Uuid> = targets
         .into_iter()
-        .filter(|t| t.status == "pending")
+        .filter(|t| t.status == "pending" && t.retry_at.is_none_or(|r| r <= now))
         .map(|t| t.id)
         .collect();
     let stored = if pending.is_empty() {
@@ -1535,7 +1631,16 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         }
     }
     let settled = settle(db, id).await;
-    app.media.release_post(db, id).await;
+    // The retry reads the same stored media; whatever is left goes once the post settles. A run
+    // that lost the claim of every target (another run has them) never settles the post, so it
+    // never releases the media the other is using.
+    let done = posts::Entity::find_by_id(id)
+        .one(db)
+        .await?
+        .is_some_and(|p| p.status != "queued");
+    if done {
+        app.media.release_post(db, id).await;
+    }
     settled
 }
 
@@ -1823,7 +1928,32 @@ async fn release_x(app: &AppState, post: &posts::Model, id: Uuid, hold: XHold) {
     }
 }
 
+/// How long a target waits for its one automatic retry.
+const RETRY_AFTER_MINUTES: i32 = 5;
+
+/// Whether a failure certainly sent nothing (`connectors::UNSENT`: a rate limit, or a connection
+/// that never opened), so the target may go out once more by itself.
+pub fn retry_safe(error: &str) -> bool {
+    error.contains(crate::connectors::UNSENT) && !outcome_unknown(Some(error))
+}
+
+/// Fails a target being published, saying why; or, after an error that sent nothing
+/// (`retry_safe`), puts it back to `pending` for one retry `RETRY_AFTER_MINUTES` on, while it has
+/// no remote id and was not retried yet. A waiting target keeps its post `queued`; `begin` picks
+/// the post up once the retry is due.
 async fn fail_target(db: &DatabaseConnection, id: Uuid, msg: &str) -> Result<(), DbErr> {
+    if retry_safe(msg) {
+        let again = sql(
+            "UPDATE post_targets SET status = 'pending', error = $2, retried = true, \
+             retry_at = now() + make_interval(mins => $3), updated_at = now() \
+             WHERE id = $1 AND status = 'publishing' AND remote_id IS NULL AND NOT retried",
+            vec![id.into(), msg.into(), RETRY_AFTER_MINUTES.into()],
+        );
+        if db.execute_raw(again).await?.rows_affected() == 1 {
+            tracing::info!(target = %id, "target retries in {RETRY_AFTER_MINUTES} minutes");
+            return Ok(());
+        }
+    }
     let stmt = sql(
         &with_event(
             "UPDATE post_targets SET status = 'failed', error = $2, updated_at = now() \
@@ -1882,10 +2012,18 @@ pub fn retryable(target: &post_targets::Model, post: &posts::Model) -> bool {
 /// Claims a target (`pending`, to `publishing`); false when another run has it. A target with a
 /// remote id is claimed only to finish its thread (a retry), never to send its root again.
 pub async fn claim_target(db: &DatabaseConnection, id: Uuid) -> Result<bool, DbErr> {
+    // The post is locked (shared) first and must still be `queued`: `draft_late` takes the same
+    // lock, so a post never turns draft while one of its targets starts. The CTE runs before
+    // the target row is touched, so the lock order is always post, then target.
     let stmt = sql(
         &format!(
-            "UPDATE post_targets t SET status = 'publishing', updated_at = now() \
-             WHERE t.id = $1 AND t.status = 'pending' AND (t.remote_id IS NULL OR {UNFINISHED})"
+            "WITH live AS (SELECT p.id FROM posts p \
+               WHERE p.id = (SELECT post_id FROM post_targets WHERE id = $1) \
+               AND p.status = 'queued' FOR SHARE OF p) \
+             UPDATE post_targets t SET status = 'publishing', updated_at = now() FROM live \
+             WHERE t.id = $1 AND live.id = t.post_id \
+             AND t.status = 'pending' AND (t.remote_id IS NULL OR {UNFINISHED}) \
+             AND (t.retry_at IS NULL OR t.retry_at <= now())"
         ),
         vec![id.into()],
     );

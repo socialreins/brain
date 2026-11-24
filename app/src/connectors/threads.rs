@@ -172,8 +172,10 @@ impl Threads {
             req = req.form(f);
         }
         let res = req.send().await.map_err(|e| {
+            let sure = crate::connectors::never_sent(&e);
             tracing::warn!(error = %e.without_url(), step, "threads call failed");
-            failed(format!("{step}: Threads could not be reached."))
+            let msg = format!("{step}: Threads could not be reached.");
+            failed(super::unsent(msg, sure))
         })?;
         let status = res.status();
         let body: Value = res.json().await.unwrap_or(Value::Null);
@@ -183,7 +185,8 @@ impl Threads {
         if let Some(refusal) = dead_or_denied(&body) {
             return Err(refusal);
         }
-        Err(failed(format!("{step}: {}", reason(&body, status))))
+        let msg = format!("{step}: {}", reason(&body, status));
+        Err(failed(super::unsent(msg, status.as_u16() == 429)))
     }
 
     /// Swaps an authorization code for a short-lived token, then that for a 60-day one.

@@ -188,8 +188,10 @@ impl LinkedIn {
     /// anything else not 2xx is `Failed` with `step` and LinkedIn's reason.
     async fn send(&self, req: RequestBuilder, step: &str) -> Result<(HeaderMap, Value), PostError> {
         let res = req.send().await.map_err(|e| {
+            let sure = crate::connectors::never_sent(&e);
             tracing::warn!(error = %e.without_url(), step, "linkedin call failed");
-            failed(format!("{step}: LinkedIn could not be reached."))
+            let msg = format!("{step}: LinkedIn could not be reached.");
+            failed(super::unsent(msg, sure))
         })?;
         let status = res.status();
         let headers = res.headers().clone();
@@ -203,7 +205,8 @@ impl LinkedIn {
             403 => return Err(PostError::Denied),
             _ => {}
         }
-        Err(failed(format!("{step}: {}", reason(&body, status))))
+        let msg = format!("{step}: {}", reason(&body, status));
+        Err(failed(super::unsent(msg, status.as_u16() == 429)))
     }
 
     /// A `/rest` call, pinned to `API_VERSION`.
