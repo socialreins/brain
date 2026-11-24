@@ -5923,6 +5923,44 @@ mod teams {
 
             #[tokio::test]
             #[serial]
+            async fn a_dropped_uploads_cleanup_spares_one_that_finished() {
+                use sea_orm::ConnectionTrait;
+                const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+                let (s, db, state) = on_mock_at(media::MAX_BYTES, Some("https://brain.test")).await;
+                let (_, team_id, _) = owner_with_account(&s, &db).await;
+                // The cleanup of a dropped request deletes a pending row and its file, and leaves
+                // an upload whose last update committed meanwhile whole.
+                let put = |key: String| {
+                    let store = state.media.store.clone();
+                    async move {
+                        store
+                            .put(&key.as_str().into(), bytes::Bytes::from_static(PNG).into())
+                            .await
+                            .unwrap();
+                    }
+                };
+                let row = |pending: bool| {
+                    let id = uuid::Uuid::now_v7();
+                    let key = format!("uploads/{team_id}/{id}");
+                    let q = format!(
+                        "INSERT INTO media_uploads (id, team_id, storage_key, url, content_type, \
+                         size, pending) VALUES ('{id}', '{team_id}', '{key}', 'u-{id}', \
+                         'image/png', 8, {pending})"
+                    );
+                    (id, key, q)
+                };
+                for pending in [true, false] {
+                    let (id, key, q) = row(pending);
+                    db.execute_unprepared(&q).await.unwrap();
+                    put(key.clone()).await;
+                    socialreins_brain::controllers::uploads::release_pending(&state, id).await;
+                    let kept = state.media.store.head(&key.as_str().into()).await.is_ok();
+                    assert_eq!(kept, !pending, "pending {pending}");
+                }
+            }
+
+            #[tokio::test]
+            #[serial]
             async fn slow_media_fails_the_target_once_the_deadline_passes() {
                 let (s, db, mut state) = on_mock().await;
                 state.media.deadline = std::time::Duration::from_secs(1);

@@ -107,6 +107,20 @@ impl MultipartUpload for Upload {
     }
 }
 
+/// Aborts a multipart upload dropped before it ended (an upload request that went away), so no
+/// partial `<key>#n` file or unfinished bucket upload is left behind.
+struct Unfinished(Option<Upload>);
+
+impl Drop for Unfinished {
+    fn drop(&mut self) {
+        if let Some(mut upload) = self.0.take() {
+            tokio::spawn(async move {
+                let _ = upload.abort().await;
+            });
+        }
+    }
+}
+
 const SWEEP_LOCK: i64 = 0x004d_4544_4941_5357;
 
 /// The store and the client that downloads into it.
@@ -422,6 +436,7 @@ impl Media {
             .await
             .map_err(storage)?;
         let mut upload = Upload(Arc::new(tokio::sync::Mutex::new(upload)));
+        let mut unfinished = Unfinished(Some(upload.clone()));
         let mut file = WriteMultipart::new_with_chunk_size(Box::new(upload.clone()), PART_BYTES);
         file.write(&head);
         let streamed = async {
@@ -437,19 +452,21 @@ impl Media {
             }
             Ok(())
         };
-        match streamed.await {
-            Ok(()) => {
-                if let Err(e) = file.finish().await {
+        let ended = match streamed.await {
+            Ok(()) => match file.finish().await {
+                Ok(_) => Ok((content_type, size)),
+                Err(e) => {
                     let _ = upload.abort().await;
-                    return Err(storage(e));
+                    Err(storage(e))
                 }
-            }
+            },
             Err(e) => {
                 let _ = file.abort().await;
-                return Err(e);
+                Err(e)
             }
-        }
-        Ok((content_type, size))
+        };
+        unfinished.0 = None;
+        ended
     }
 
     /// Deletes the uploads at least `hours` old that no post of their team still needs (one
@@ -1215,6 +1232,9 @@ const RELEASABLE: &str = "(NOT u.pending AND u.created_at <= now() - make_interv
 /// `INGEST_CEILING`.
 const TEMP_AGE: Duration = Duration::from_secs(3600);
 
+/// An upload's partial file this old belongs to no running upload.
+const UPLOAD_TEMP_AGE: Duration = Duration::from_secs(15 * 60);
+
 /// Deletes the temp files under `dir` older than `older`, and returns how many went. The local
 /// store writes a file as `<key>#<n>` and renames it when done, so a process killed
 /// mid-download or mid-upload leaves one (up to `MAX_BYTES`, under `posts/` or `uploads/`) that
@@ -1223,8 +1243,15 @@ const TEMP_AGE: Duration = Duration::from_secs(3600);
 /// aborts (README).
 fn sweep_temp(dir: &std::path::Path, older: Duration) -> u64 {
     let mut gone = 0;
-    let dirs = ["posts", "uploads"].map(|d| std::fs::read_dir(dir.join(d)));
-    for post in dirs.into_iter().flatten().flatten().flatten() {
+    // An upload's file is written as its bytes arrive, so one untouched for `UPLOAD_TEMP_AGE`
+    // (many times `STALL`) is dead.
+    let dirs = [("posts", older), ("uploads", older.min(UPLOAD_TEMP_AGE))]
+        .map(|(d, age)| (std::fs::read_dir(dir.join(d)), age));
+    for (post, older) in dirs
+        .into_iter()
+        .filter_map(|(d, age)| d.ok().map(|d| (d, age)))
+        .flat_map(|(d, age)| d.flatten().map(move |e| (e, age)))
+    {
         let Ok(files) = std::fs::read_dir(post.path()) else {
             continue;
         };
@@ -1908,6 +1935,16 @@ mod tests {
         std::fs::create_dir_all(&team).unwrap();
         let partial = std::fs::File::create(team.join("u#3")).unwrap();
         partial.set_modified(long_ago).unwrap();
+        // One untouched for 20 minutes is dead too; a download's is not yet.
+        let lately = std::time::SystemTime::now() - Duration::from_secs(20 * 60);
+        std::fs::File::create(team.join("v#1"))
+            .unwrap()
+            .set_modified(lately)
+            .unwrap();
+        std::fs::File::create(post.join("e#2"))
+            .unwrap()
+            .set_modified(lately)
+            .unwrap();
         // A download cut off long ago, one still running, and a stored file as old as the first.
         for (name, old) in [("a#1", true), ("b#12", false), ("c", true), ("d#x", true)] {
             let file = std::fs::File::create(post.join(name)).unwrap();
@@ -1915,14 +1952,14 @@ mod tests {
                 file.set_modified(long_ago).unwrap();
             }
         }
-        assert_eq!(sweep_temp(&dir, TEMP_AGE), 2);
-        assert!(!team.join("u#3").exists());
+        assert_eq!(sweep_temp(&dir, TEMP_AGE), 3);
+        assert!(!team.join("u#3").exists() && !team.join("v#1").exists());
         let mut left: Vec<_> = std::fs::read_dir(&post)
             .unwrap()
             .map(|f| f.unwrap().file_name().into_string().unwrap())
             .collect();
         left.sort();
-        assert_eq!(left, ["b#12", "c", "d#x"]);
+        assert_eq!(left, ["b#12", "c", "d#x", "e#2"]);
         assert_eq!(sweep_temp(&dir.join("none"), TEMP_AGE), 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2374,6 +2411,31 @@ mod tests {
             .unwrap_or_default();
         assert!(left.is_empty(), "{left:?}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_upload_dropped_mid_stream_aborts_its_multipart_upload() {
+        use futures_util::StreamExt;
+        let store = Arc::new(Counting::default());
+        let media = Media::new(store.clone(), true);
+        // A first chunk, then the request goes away.
+        let mut first = b"\x89PNG\r\n\x1a\n".to_vec();
+        first.resize(4096, 7);
+        let body = stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from(first))])
+            .chain(stream::pending());
+        let put = media.put_stream("uploads/t/u", body);
+        assert!(tokio::time::timeout(Duration::from_millis(200), put)
+            .await
+            .is_err());
+        for _ in 0..50 {
+            if store.aborted.load(SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(store.aborted.load(SeqCst), 1, "aborted on drop");
+        let stored = store.inner.list_with_delimiter(None).await.unwrap();
+        assert!(stored.objects.is_empty() && stored.common_prefixes.is_empty());
     }
 
     #[tokio::test]

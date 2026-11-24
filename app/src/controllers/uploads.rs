@@ -81,16 +81,15 @@ async fn usage(db: &impl ConnectionTrait, team: Uuid) -> Result<(i64, i64, i64),
 struct Pending {
     app: AppState,
     id: Uuid,
-    key: String,
     done: bool,
 }
 
 impl Pending {
-    /// Deletes the file and the row now.
+    /// Deletes the row and the file now.
     async fn clear(mut self) {
         // Spawned, so it finishes even if the request is dropped while it runs.
-        let (app, id, key) = (self.app.clone(), self.id, self.key.clone());
-        let cleared = tokio::spawn(async move { clear(&app, id, &key).await });
+        let (app, id) = (self.app.clone(), self.id);
+        let cleared = tokio::spawn(async move { release_pending(&app, id).await });
         self.done = true;
         let _ = cleared.await;
     }
@@ -99,20 +98,28 @@ impl Pending {
 impl Drop for Pending {
     fn drop(&mut self) {
         if !self.done {
-            let (app, id, key) = (self.app.clone(), self.id, self.key.clone());
-            tokio::spawn(async move { clear(&app, id, &key).await });
+            let (app, id) = (self.app.clone(), self.id);
+            tokio::spawn(async move { release_pending(&app, id).await });
         }
     }
 }
 
-async fn clear(app: &AppState, id: Uuid, key: &str) {
-    let _ = app.media.store.delete(&key.into()).await;
+/// Deletes upload `id` while it is still `pending`, then its file; one that finished meanwhile
+/// (its last `UPDATE` committed) keeps both. A partial file is the multipart upload's to abort,
+/// and the sweep's after `UPLOAD_TEMP_AGE`.
+pub async fn release_pending(app: &AppState, id: Uuid) {
     let stmt = sql(
-        "DELETE FROM media_uploads WHERE id = $1 AND pending",
+        "DELETE FROM media_uploads WHERE id = $1 AND pending RETURNING storage_key",
         vec![id.into()],
     );
-    if let Err(e) = app.db.execute_raw(stmt).await {
-        tracing::warn!(error = %e, upload = %id, "pending upload not cleared");
+    match app.db.query_one_raw(stmt).await {
+        Ok(Some(row)) => {
+            if let Ok(key) = row.try_get::<String>("", "storage_key") {
+                let _ = app.media.store.delete(&key.as_str().into()).await;
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, upload = %id, "pending upload not cleared"),
     }
 }
 
@@ -143,6 +150,12 @@ async fn create(State(app): State<AppState>, a: Actor, body: Body) -> Response {
     let key = format!("uploads/{}/{id}", a.team.id);
     // Held in the quota until the file is in, so parallel uploads cannot all stream to disk.
     let reserve = app.media.max_bytes.max(MAX_STILL_BYTES) as i64;
+    // Before the reservation commits, so a request dropped during the commit still clears it.
+    let mut pending = Pending {
+        app: app.clone(),
+        id,
+        done: false,
+    };
     let reserved = async {
         let txn = app.db.begin().await?;
         lock(&txn, "uploads", a.team.id).await?;
@@ -173,18 +186,17 @@ async fn create(State(app): State<AppState>, a: Actor, body: Body) -> Response {
     };
     match reserved.await {
         Ok(Ok(())) => {}
-        Ok(Err(res)) => return res,
-        Err(e) => return internal(e, "upload reserve"),
+        Ok(Err(res)) => {
+            pending.done = true;
+            return res;
+        }
+        Err(e) => {
+            pending.clear().await;
+            return internal(e, "upload reserve");
+        }
     }
-    let pending = Pending {
-        app: app.clone(),
-        id,
-        key: key.clone(),
-        done: false,
-    };
     let res = stream(&app, id, key, body).await;
     if res.status() == StatusCode::CREATED {
-        let mut pending = pending;
         pending.done = true;
     } else {
         pending.clear().await;
