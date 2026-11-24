@@ -5602,6 +5602,210 @@ mod teams {
                 assert!(!media_dir().join("posts").join(&id).exists());
             }
 
+            #[tokio::test]
+            #[serial]
+            async fn alt_text_is_checked_saved_kept_through_edits_and_sent_to_bluesky() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let base = pds_of(&db, &team_id).await;
+                let (a, b, c) = (
+                    "https://a.example/1.png",
+                    "https://a.example/2.png",
+                    "https://a.example/3.png",
+                );
+                let mut v = input(&set, "alt", Some(&past()));
+                v["media"] = json!([a, b]);
+                v["media_alt"] = json!(["  a cat on a sofa ", " "]);
+                let res = create(&s, &cookie, v.clone()).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let id = id_of(&res);
+                // Trimmed, and the list is as long as the media.
+                assert_eq!(
+                    res.json::<Value>()["media_alt"],
+                    json!(["a cat on a sofa", ""])
+                );
+                let got = get_post(&s, &cookie, &id).await;
+                assert_eq!(got["media_alt"], json!(["a cat on a sofa", ""]));
+                // A client that never sends alt text keeps working: none, an empty list.
+                let mut plain = v.clone();
+                plain.as_object_mut().unwrap().remove("media_alt");
+                let res = create(&s, &cookie, plain).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                assert_eq!(res.json::<Value>()["media_alt"], json!([]));
+                assert_eq!(res.json::<Value>()["thread"], json!([]));
+
+                // Too long, too many, a control character; a thread part's gets its number.
+                let refused = |res: axum_test::TestResponse, error: &str| {
+                    assert_eq!(res.status_code(), 422, "{}", res.text());
+                    let j = res.json::<Value>();
+                    assert_eq!(j["error"], error, "{j}");
+                    assert_eq!(j["field"], "media_alt", "{j}");
+                    j
+                };
+                let mut bad = v.clone();
+                bad["media_alt"] = json!(["x".repeat(1001)]);
+                let j = refused(create(&s, &cookie, bad.clone()).await, "alt_text_too_long");
+                assert_eq!(
+                    (j["limit"].as_u64(), j["actual"].as_u64()),
+                    (Some(1000), Some(1001))
+                );
+                // 1000 characters of two bytes each still fit.
+                bad["media_alt"] = json!(["é".repeat(1000)]);
+                assert_eq!(create(&s, &cookie, bad.clone()).await.status_code(), 201);
+                bad["media_alt"] = json!(["a", "b", "c"]);
+                refused(create(&s, &cookie, bad.clone()).await, "invalid_alt_text");
+                bad["media_alt"] = json!(["bell\u{7}"]);
+                refused(create(&s, &cookie, bad.clone()).await, "invalid_alt_text");
+                bad["media_alt"] = json!(["two\nlines"]);
+                assert_eq!(create(&s, &cookie, bad.clone()).await.status_code(), 201);
+                // Pasted tabs become spaces instead of a refusal.
+                bad["media_alt"] = json!(["a\tcat\u{b}on a\tsofa "]);
+                let res = create(&s, &cookie, bad.clone()).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                assert_eq!(
+                    res.json::<Value>()["media_alt"],
+                    json!(["a cat on a sofa", ""])
+                );
+                let mut bad = v.clone();
+                bad["thread"] =
+                    json!([{"body": "two", "media": [c], "media_alt": ["x".repeat(1001)]}]);
+                let j = refused(create(&s, &cookie, bad).await, "alt_text_too_long");
+                assert_eq!(j["part"], 1);
+                // An update is checked too, and leaves the post as it was.
+                let path = format!("/v1/posts/{id}");
+                let mut bad = v.clone();
+                bad["media_alt"] = json!(["a", "b", "c"]);
+                refused(
+                    req(&s, Method::PUT, &path, &cookie).json(&bad).await,
+                    "invalid_alt_text",
+                );
+                assert_eq!(
+                    get_post(&s, &cookie, &id).await["media_alt"],
+                    got["media_alt"]
+                );
+
+                // Editing the media keeps each text with its image when none are sent: reordered,
+                // added, removed.
+                let put = |body: Value| {
+                    let (s, cookie, path) = (&s, cookie.clone(), path.clone());
+                    async move { req(s, Method::PUT, &path, &cookie).json(&body).await }
+                };
+                let mut e = v.clone();
+                e.as_object_mut().unwrap().remove("media_alt");
+                e["media"] = json!([c, b, a]);
+                let res = put(e.clone()).await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                assert_eq!(
+                    res.json::<Value>()["media_alt"],
+                    json!(["", "", "a cat on a sofa"])
+                );
+                e["media"] = json!([a, c]);
+                let res = put(e.clone()).await;
+                assert_eq!(
+                    res.json::<Value>()["media_alt"],
+                    json!(["a cat on a sofa", ""])
+                );
+                // A thread part keeps its own the same way, and sent texts replace them.
+                e["thread"] = json!([{"body": "two", "media": [c], "media_alt": ["a dog"]}]);
+                let res = put(e.clone()).await;
+                assert_eq!(
+                    res.json::<Value>()["thread"][0]["media_alt"],
+                    json!(["a dog"])
+                );
+                e["thread"] = json!([{"body": "two", "media": [c]}]);
+                let res = put(e.clone()).await;
+                assert_eq!(
+                    res.json::<Value>()["thread"][0]["media_alt"],
+                    json!(["a dog"])
+                );
+                e["thread"] = json!([{"body": "two", "media": [c], "media_alt": [""]}]);
+                let res = put(e.clone()).await;
+                assert_eq!(res.json::<Value>()["thread"][0].get("media_alt"), None);
+                // An empty list clears; texts for other images replace.
+                e["media_alt"] = json!([]);
+                let res = put(e.clone()).await;
+                assert_eq!(res.json::<Value>()["media_alt"], json!([]));
+                e["media_alt"] = json!(["first", "second"]);
+                e["thread"] = json!([]);
+                let res = put(e.clone()).await;
+                assert_eq!(res.json::<Value>()["media_alt"], json!(["first", "second"]));
+
+                // Bluesky gets each image's text as `alt`; the post stays as sent.
+                e["media"] = json!([a, b]);
+                e["media_alt"] = json!(["a cat on a sofa", "a dog"]);
+                assert_eq!(put(e).await.status_code(), 200);
+                set_media(&db, &base, &id, &["/img.png", "/img.png"]).await;
+                publish::tick(&state).await.unwrap();
+                let p = get_post(&s, &cookie, &id).await;
+                assert_eq!(p["status"], "published", "{p}");
+                assert_eq!(p["media_alt"], json!(["a cat on a sofa", "a dog"]));
+                assert_eq!(p["targets"][0]["alt_error"], Value::Null);
+                let record = RECORDS.lock().unwrap().last().cloned().unwrap();
+                let images = &record["record"]["embed"]["images"];
+                assert_eq!(images[0]["alt"], "a cat on a sofa");
+                assert_eq!(images[1]["alt"], "a dog");
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_group_gives_every_platform_the_alt_texts_unless_its_media_differs() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let a = "https://a.example/1.png";
+                let group = |body: Value| {
+                    let (s, cookie) = (&s, cookie.clone());
+                    async move {
+                        req(s, Method::POST, "/v1/post-groups", &cookie)
+                            .json(&body)
+                            .await
+                    }
+                };
+                let res = group(
+                    json!({"social_set_id": set, "platforms": ["bluesky"], "body": "g",
+                    "media": [a], "media_alt": ["shared text"]}),
+                )
+                .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                assert_eq!(
+                    res.json::<Value>()["posts"][0]["media_alt"],
+                    json!(["shared text"])
+                );
+                // An override with its own media never takes the group's texts; with its own too, it does.
+                let res = group(
+                    json!({"social_set_id": set, "platforms": ["bluesky"], "body": "g",
+                    "media": [a], "media_alt": ["shared text"],
+                    "overrides": {"bluesky": {"media": ["https://a.example/2.png"]}}}),
+                )
+                .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                assert_eq!(res.json::<Value>()["posts"][0]["media_alt"], json!([]));
+                let res = group(
+                    json!({"social_set_id": set, "platforms": ["bluesky"], "body": "g",
+                    "media": [a], "media_alt": ["shared text"],
+                    "overrides": {"bluesky": {"media": ["https://a.example/2.png"],
+                        "media_alt": ["own text"]}}}),
+                )
+                .await;
+                assert_eq!(
+                    res.json::<Value>()["posts"][0]["media_alt"],
+                    json!(["own text"])
+                );
+                // A bad text refuses the group, naming the platform.
+                let res = group(
+                    json!({"social_set_id": set, "platforms": ["bluesky"], "body": "g",
+                    "media": [a], "media_alt": ["x".repeat(1001)]}),
+                )
+                .await;
+                assert_eq!(res.status_code(), 422, "{}", res.text());
+                let j = res.json::<Value>();
+                assert_eq!(
+                    (j["error"].as_str(), j["platform"].as_str()),
+                    (Some("alt_text_too_long"), Some("bluesky"))
+                );
+            }
+
             /// A file of `len` bytes that starts like `head`.
             fn file(head: &[u8], len: usize) -> Vec<u8> {
                 let mut bytes = vec![7u8; len];
@@ -9768,6 +9972,36 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
+                async fn a_repeat_keeps_the_alt_texts() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, _, set) = team(&s, &db).await;
+                    let id = scheduled(&s, &cookie, &set).await;
+                    repeating(&s, &cookie, &id, daily()).await;
+                    sql(
+                        &db,
+                        format!(
+                            "UPDATE posts SET media = '[\"https://a.example/1.png\"]', \
+                             media_alt = '[\"a cat\"]', thread = '[{{\"body\": \"two\", \
+                             \"media\": [\"https://a.example/2.png\"], \"media_alt\": [\"a dog\"]}}]' \
+                             WHERE id = '{id}'"
+                        ),
+                    )
+                    .await;
+                    let due = (Utc::now() - Duration::hours(2)).trunc_subsecs(0);
+                    at(&db, &id, due).await;
+                    publish::tick(&state).await.unwrap();
+                    let copies: Vec<Value> = with_rule(&s, &cookie)
+                        .await
+                        .into_iter()
+                        .filter(|c| c["body"] == "again" && time(c) == due + Duration::days(1))
+                        .collect();
+                    assert_eq!(copies.len(), 1, "{copies:?}");
+                    assert_eq!(copies[0]["media_alt"], json!(["a cat"]));
+                    assert_eq!(copies[0]["thread"][0]["media_alt"], json!(["a dog"]));
+                }
+
+                #[tokio::test]
+                #[serial]
                 async fn a_late_post_goes_to_draft_and_its_series_goes_on() {
                     let (s, db, state) = on_mock().await;
                     let (cookie, _, set) = team(&s, &db).await;
@@ -10302,6 +10536,8 @@ mod teams {
                 static PUBLISHED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
                 static REMOVED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
                 static NEXT: AtomicU64 = AtomicU64::new(1);
+                /// How many containers the mock turned away with a 429.
+                static LIMITED: AtomicU64 = AtomicU64::new(0);
 
                 type Answer = (axum::http::StatusCode, Json<Value>);
 
@@ -10371,6 +10607,14 @@ mod teams {
                          Form(f): Form<HashMap<String, String>>| async move {
                             if !token_ok(&h) {
                                 return refused(190, "Error validating access token");
+                            }
+                            if f.get("alt_text").is_some_and(|t| t.contains("REFUSE")) {
+                                return refused(100, "alt_text is not valid");
+                            }
+                            if f.get("alt_text").is_some_and(|t| t.contains("LIMIT")) {
+                                LIMITED.fetch_add(1, Ordering::SeqCst);
+                                let body = json!({"error": {"message": "slow down", "code": 4}});
+                                return (axum::http::StatusCode::TOO_MANY_REQUESTS, Json(body));
                             }
                             CONTAINERS.lock().unwrap().push((user, f));
                             ok(json!({"id": format!("c{}", NEXT.fetch_add(1, Ordering::SeqCst))}))
@@ -10787,6 +11031,89 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
+                async fn images_get_alt_text_and_a_refused_text_is_left_out_not_the_post() {
+                    let (s, db, state, base) = on_threads(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    connect_threads(&s, &cookie).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let urls = vec!["https://a.example/1.png".to_owned(); 2];
+                    // One image: its container carries the text.
+                    let mut one = threads_post(&set, "one", urls[..1].to_vec(), &[]);
+                    one["media_alt"] = json!(["a red bicycle"]);
+                    let id = id_of(&create(&s, &cookie, one).await);
+                    set_media(&db, &base, &id, &["/img.png"]).await;
+                    let before = CONTAINERS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let made = CONTAINERS.lock().unwrap()[before..].to_vec();
+                    assert_eq!(made.len(), 1);
+                    assert_eq!(made[0].1["alt_text"], "a red bicycle");
+                    assert_eq!(p["targets"][0]["alt_error"], Value::Null);
+
+                    // A carousel: each image its own; a video none. Threads refuses the second
+                    // text, so that image's container is made again without it.
+                    let mut many = threads_post(&set, "many", urls, &[]);
+                    many["media_alt"] = json!(["first", "REFUSE this one"]);
+                    let id = id_of(&create(&s, &cookie, many).await);
+                    set_media(&db, &base, &id, &["/img.png", "/img.png"]).await;
+                    let before = CONTAINERS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let made: Vec<_> = CONTAINERS.lock().unwrap()[before..]
+                        .iter()
+                        .map(|(_, f)| f.clone())
+                        .collect();
+                    assert_eq!(made.len(), 3, "{made:?}");
+                    assert_eq!(made[0]["alt_text"], "first");
+                    assert!(!made[1].contains_key("alt_text"));
+                    assert_eq!(made[2]["media_type"], "CAROUSEL");
+                    let why = p["targets"][0]["alt_error"].as_str().unwrap();
+                    assert!(
+                        why.starts_with("Alt text of image 2 was not added"),
+                        "{why}"
+                    );
+
+                    // A rate limit is no refusal of the text: it is not asked again at once.
+                    let mut busy = threads_post(
+                        &set,
+                        "busy",
+                        vec!["https://a.example/1.png".to_owned()],
+                        &[],
+                    );
+                    busy["media_alt"] = json!(["LIMIT"]);
+                    let id = id_of(&create(&s, &cookie, busy).await);
+                    set_media(&db, &base, &id, &["/img.png"]).await;
+                    let (limited, before) = (
+                        LIMITED.load(Ordering::SeqCst),
+                        CONTAINERS.lock().unwrap().len(),
+                    );
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_ne!(p["status"], "published", "{p}");
+                    assert_eq!(LIMITED.load(Ordering::SeqCst), limited + 1);
+                    assert_eq!(CONTAINERS.lock().unwrap().len(), before);
+                    assert_eq!(p["targets"][0]["alt_error"], Value::Null);
+
+                    let mut clip =
+                        threads_post(&set, "clip", vec!["https://a.example/c.mp4".into()], &[]);
+                    clip["media_alt"] = json!(["not for a video"]);
+                    let id = id_of(&create(&s, &cookie, clip).await);
+                    set_media(&db, &base, &id, &["/clip.mp4"]).await;
+                    let before = CONTAINERS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                    let made = CONTAINERS.lock().unwrap()[before..].to_vec();
+                    assert!(!made[0].1.contains_key("alt_text"));
+                }
+
+                #[tokio::test]
+                #[serial]
                 async fn carousels_videos_and_a_refused_token() {
                     let (s, db, state, base) = on_threads(true).await;
                     let (_, cookie, _) = user(&s, &db).await;
@@ -10998,6 +11325,8 @@ mod teams {
 
                 /// Every `/rest/posts` body the mock took, oldest first.
                 static POSTS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+                /// How many `/rest/posts` requests the mock refused with a 400.
+                static REFUSED_POSTS: AtomicU64 = AtomicU64::new(0);
                 /// Every upload: (path, byte count), and every finalize body.
                 static UPLOADS: std::sync::Mutex<Vec<(String, usize)>> =
                     std::sync::Mutex::new(Vec::new());
@@ -11190,6 +11519,11 @@ mod teams {
                     let create = |h: HeaderMap, Json(body): Json<Value>| async move {
                         if !rest_ok(&h) {
                             return expired().into_response();
+                        }
+                        if body.to_string().contains("REFUSE") {
+                            REFUSED_POSTS.fetch_add(1, Ordering::SeqCst);
+                            let msg = json!({"message": "altText is not valid", "status": 400});
+                            return (StatusCode::BAD_REQUEST, Json(msg)).into_response();
                         }
                         POSTS.lock().unwrap().push(body);
                         let id = format!("urn:li:share:{}", next());
@@ -11763,6 +12097,88 @@ mod teams {
                     let sizes: Vec<usize> =
                         UPLOADS.lock().unwrap()[ups..].iter().map(|u| u.1).collect();
                     assert_eq!(sizes, [64, 48]);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn images_carry_their_alt_text_and_a_refusal_posts_without_it() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let one = |texts: Value, n: usize| {
+                        let mut v = linkedin_post(&set, "pics");
+                        v["media"] = json!(vec!["https://a.example/1.png"; n]);
+                        v["media_alt"] = texts;
+                        v
+                    };
+                    // One image: `content.media.altText`.
+                    let id = id_of(&create(&s, &cookie, one(json!(["a red bicycle"]), 1)).await);
+                    set_media(&db, &base, &id, &["/img.png"]).await;
+                    let posts = POSTS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                    let sent = POSTS.lock().unwrap()[posts].clone();
+                    assert_eq!(sent["content"]["media"]["altText"], "a red bicycle");
+
+                    // Several: each image its own; one without a text has no key.
+                    let id = id_of(&create(&s, &cookie, one(json!(["first", ""]), 2)).await);
+                    set_media(&db, &base, &id, &["/img.png", "/img2.png"]).await;
+                    let posts = POSTS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                    let sent = POSTS.lock().unwrap()[posts].clone();
+                    let images = sent["content"]["multiImage"]["images"].as_array().unwrap();
+                    assert_eq!(images[0]["altText"], "first");
+                    assert!(images[1].get("altText").is_none());
+
+                    // LinkedIn answers 400 to the first request: nothing was posted, so it goes
+                    // again without the texts, once, and the target says so.
+                    let id = id_of(&create(&s, &cookie, one(json!(["REFUSE", "second"]), 2)).await);
+                    set_media(&db, &base, &id, &["/img.png", "/img2.png"]).await;
+                    let posts = POSTS.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let made = POSTS.lock().unwrap()[posts..].to_vec();
+                    assert_eq!(made.len(), 1, "{made:?}");
+                    let images = made[0]["content"]["multiImage"]["images"]
+                        .as_array()
+                        .unwrap();
+                    assert!(
+                        images.iter().all(|i| i.get("altText").is_none()),
+                        "{images:?}"
+                    );
+                    let why = p["targets"][0]["alt_error"].as_str().unwrap();
+                    assert!(
+                        why.starts_with("Alt text of image 1 was not added"),
+                        "{why}"
+                    );
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn only_a_body_that_held_alt_text_is_sent_again_without_it() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    // A PDF's text is never sent: a refused post is not repeated for it.
+                    let mut doc = linkedin_post(&set, "REFUSE doc");
+                    doc["media"] = json!(["https://a.example/doc.pdf"]);
+                    doc["media_alt"] = json!(["not sent"]);
+                    let id = id_of(&create(&s, &cookie, doc).await);
+                    set_media(&db, &base, &id, &["/doc.pdf"]).await;
+                    let refused = REFUSED_POSTS.load(Ordering::SeqCst);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_ne!(p["status"], "published", "{p}");
+                    assert_eq!(REFUSED_POSTS.load(Ordering::SeqCst), refused + 1);
+                    assert_eq!(p["targets"][0]["alt_error"], Value::Null, "{p}");
+                    // An image's is: one more request, which the mock refuses again.
+                    let mut pic = linkedin_post(&set, "REFUSE pic");
+                    pic["media"] = json!(["https://a.example/1.png"]);
+                    pic["media_alt"] = json!(["sent"]);
+                    let id = id_of(&create(&s, &cookie, pic).await);
+                    set_media(&db, &base, &id, &["/img.png"]).await;
+                    let refused = REFUSED_POSTS.load(Ordering::SeqCst);
+                    publish::tick(&state).await.unwrap();
+                    assert_ne!(get_post(&s, &cookie, &id).await["status"], "published");
+                    assert_eq!(REFUSED_POSTS.load(Ordering::SeqCst), refused + 2);
                 }
 
                 #[tokio::test]
@@ -14935,6 +15351,8 @@ mod teams {
                     verifiers: Mutex<Vec<String>>,
                     /// Each initialize body.
                     inits: Mutex<Vec<Value>>,
+                    /// Each `POST /2/media/metadata` body the mock took.
+                    metadata: Mutex<Vec<Value>>,
                     /// Each append: (media id, segment index, body length).
                     appends: Mutex<Vec<(String, String, usize)>>,
                     categories: Mutex<HashMap<String, String>>,
@@ -15088,6 +15506,27 @@ mod teams {
                     .into_response()
                 }
 
+                async fn metadata(
+                    State(m): Shared,
+                    h: HeaderMap,
+                    Json(b): Json<Value>,
+                ) -> Response {
+                    if bearer(&h).is_none() {
+                        return dead();
+                    }
+                    let text = b["metadata"]["alt_text"]["text"]
+                        .as_str()
+                        .unwrap_or_default();
+                    if text.contains("REFUSE") {
+                        let body =
+                            json!({"title": "Invalid Request", "detail": "alt_text is not valid"});
+                        return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+                    }
+                    m.metadata.lock().unwrap().push(b.clone());
+                    Json(json!({"data": {"id": b["id"], "associated_metadata": {}}}))
+                        .into_response()
+                }
+
                 async fn append(
                     State(m): Shared,
                     Path(id): Path<String>,
@@ -15227,6 +15666,7 @@ mod teams {
                         .route("/2/oauth2/token", post(token))
                         .route("/2/users/me", get(me))
                         .route("/2/media/upload/initialize", post(init))
+                        .route("/2/media/metadata", post(metadata))
                         .route("/2/media/upload/{id}/append", post(append))
                         .route("/2/media/upload/{id}/finalize", post(finalize))
                         .route("/2/media/upload", get(status))
@@ -15596,6 +16036,51 @@ mod teams {
                     res.assert_status_ok();
                     assert_eq!(res.json::<Value>()["status"], "deleted");
                     assert_eq!(mock.removed.lock().unwrap().last(), Some(&tweet));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn alt_text_is_set_on_each_image_and_a_refusal_never_fails_the_post() {
+                    let (s, db, state, base, mock, cookie, _, set) = team().await;
+                    let mut v = x_post(&set, "pics");
+                    v["media"] = json!(["https://a.example/1.png", "https://a.example/2.png"]);
+                    v["media_alt"] = json!(["a red bicycle", "REFUSE this one"]);
+                    let id = id_of(&create(&s, &cookie, v).await);
+                    set_media(&db, &base, &id, &["/img.png", "/img2.png"]).await;
+                    let (tweets, metas) = (
+                        mock.tweets.lock().unwrap().len(),
+                        mock.metadata.lock().unwrap().len(),
+                    );
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    // One post, with both images; the first got its text after its upload.
+                    assert_eq!(mock.tweets.lock().unwrap().len(), tweets + 1);
+                    let sent = mock.tweets.lock().unwrap()[tweets].1.clone();
+                    let ids = sent["media"]["media_ids"].as_array().unwrap().clone();
+                    let set_alt = mock.metadata.lock().unwrap()[metas..].to_vec();
+                    assert_eq!(
+                        set_alt,
+                        [
+                            json!({"id": ids[0], "metadata": {"alt_text": {"text": "a red bicycle"}}})
+                        ]
+                    );
+                    // The second was refused: the post says so, and went out without it.
+                    let why = p["targets"][0]["alt_error"].as_str().unwrap();
+                    assert!(
+                        why.starts_with("Alt text of image 2 was not added"),
+                        "{why}"
+                    );
+                    assert!(why.contains("alt_text is not valid"), "{why}");
+                    // A GIF and an image without a text make no call.
+                    let id = id_of(&create(&s, &cookie, x_post(&set, "gif")).await);
+                    set_media(&db, &base, &id, &["/pic.gif"]).await;
+                    let metas = mock.metadata.lock().unwrap().len();
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(mock.metadata.lock().unwrap().len(), metas);
+                    assert_eq!(p["targets"][0]["alt_error"], Value::Null);
                 }
 
                 #[tokio::test]
@@ -16505,6 +16990,8 @@ mod teams {
                 static THUMB_MODE: AtomicU64 = AtomicU64::new(0);
                 /// 1: deleting answers error code 200 (a missing permission, not a dead token).
                 static DELETE_MODE: AtomicU64 = AtomicU64::new(0);
+                /// How many calls the mock turned away with a 429.
+                static LIMITED: AtomicU64 = AtomicU64::new(0);
 
                 type Answer = (axum::http::StatusCode, Json<Value>);
 
@@ -16590,6 +17077,14 @@ mod teams {
                          Form(f): Form<HashMap<String, String>>| async move {
                             if !page_token(&h) {
                                 return refused(190, "Error validating access token");
+                            }
+                            if f.get("alt_text").is_some_and(|t| t.contains("REFUSE")) {
+                                return refused(100, "(#100) Invalid parameter: alt_text");
+                            }
+                            if f.get("alt_text").is_some_and(|t| t.contains("LIMIT")) {
+                                LIMITED.fetch_add(1, Ordering::SeqCst);
+                                let body = json!({"error": {"message": "slow down", "code": 4}});
+                                return (axum::http::StatusCode::TOO_MANY_REQUESTS, Json(body));
                             }
                             let n = next();
                             let answer = match edge.as_str() {
@@ -17385,6 +17880,61 @@ mod teams {
                         publish_covered(ctx, &cookie, post, (&["/img.jpg"], "/img.jpg")).await;
                     assert_eq!(p["status"], "failed", "{p}");
                     assert!(calls.is_empty());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn instagram_images_get_alt_text_and_facebook_none() {
+                    let (s, db, state, base) = on_meta(true).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let ctx = (&s, &db, &state, base.as_str());
+
+                    let mut post = meta_post(&set, "instagram", "pic");
+                    post["media_alt"] = json!(["a red bicycle"]);
+                    let (p, calls) = publish_one(ctx, &cookie, post, &["/img.jpg"]).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(calls[0].0, "1784/media");
+                    assert_eq!(calls[0].1["alt_text"], "a red bicycle");
+                    assert_eq!(p["targets"][0]["alt_error"], Value::Null);
+
+                    // A carousel item has its own; a video none. Meta refuses the first text:
+                    // that container is made again without it and the post goes out.
+                    let mut post = meta_post(&set, "instagram", "both");
+                    post["media_alt"] = json!(["REFUSE it", "not for a video"]);
+                    let (p, calls) =
+                        publish_one(ctx, &cookie, post, &["/img.jpg", "/clip.mp4"]).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(calls.len(), 4, "{calls:?}");
+                    assert!(!calls[0].1.contains_key("alt_text"));
+                    assert!(!calls[1].1.contains_key("alt_text"));
+                    assert_eq!(calls[3].0, "1784/media_publish");
+                    let why = p["targets"][0]["alt_error"].as_str().unwrap();
+                    assert!(
+                        why.starts_with("Alt text of image 1 was not added"),
+                        "{why}"
+                    );
+
+                    // A rate limit is no refusal of the text: it is not asked again at once.
+                    let mut post = meta_post(&set, "instagram", "busy");
+                    post["media_alt"] = json!(["LIMIT"]);
+                    let limited = LIMITED.load(Ordering::SeqCst);
+                    let (p, calls) = publish_one(ctx, &cookie, post, &["/img.jpg"]).await;
+                    assert_ne!(p["status"], "published", "{p}");
+                    assert_eq!(LIMITED.load(Ordering::SeqCst), limited + 1);
+                    assert!(calls.is_empty(), "{calls:?}");
+                    assert_eq!(p["targets"][0]["alt_error"], Value::Null);
+
+                    // Facebook's photo calls have no alt text here.
+                    let mut post = meta_post(&set, "facebook", "pic");
+                    post["media_alt"] = json!(["a red bicycle"]);
+                    let (p, calls) = publish_one(ctx, &cookie, post, &["/img.jpg"]).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert!(
+                        calls.iter().all(|c| !c.1.contains_key("alt_text")),
+                        "{calls:?}"
+                    );
+                    assert_eq!(p["targets"][0]["alt_error"], Value::Null);
                 }
 
                 #[tokio::test]

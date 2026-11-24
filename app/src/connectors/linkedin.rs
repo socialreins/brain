@@ -73,6 +73,24 @@ struct TokenAnswer {
 pub struct File<'a> {
     pub bytes: &'a crate::media::Blob,
     pub content_type: &'a str,
+    /// The image's alt text; empty for none.
+    pub alt: &'a str,
+}
+
+/// `body` of a post without the `altText` of its images.
+fn strip_alt(body: &mut Value) {
+    let Some(content) = body.get_mut("content") else {
+        return;
+    };
+    if let Some(media) = content.get_mut("media").and_then(Value::as_object_mut) {
+        media.remove("altText");
+    }
+    let images = content.pointer_mut("/multiImage/images");
+    for image in images.and_then(Value::as_array_mut).into_iter().flatten() {
+        if let Some(image) = image.as_object_mut() {
+            image.remove("altText");
+        }
+    }
 }
 
 fn failed(msg: impl Into<String>) -> PostError {
@@ -187,11 +205,20 @@ impl LinkedIn {
     /// Sends a call: its headers and JSON body. A refused token is `Reconnect`, a refused permission `Denied`,
     /// anything else not 2xx is `Failed` with `step` and LinkedIn's reason.
     async fn send(&self, req: RequestBuilder, step: &str) -> Result<(HeaderMap, Value), PostError> {
+        self.send_status(req, step).await.map_err(|(e, _)| e)
+    }
+
+    /// `send`, with the status of a refusal LinkedIn answered.
+    async fn send_status(
+        &self,
+        req: RequestBuilder,
+        step: &str,
+    ) -> Result<(HeaderMap, Value), (PostError, Option<u16>)> {
         let res = req.send().await.map_err(|e| {
             let sure = crate::connectors::never_sent(&e);
             tracing::warn!(error = %e.without_url(), step, "linkedin call failed");
             let msg = format!("{step}: LinkedIn could not be reached.");
-            failed(super::unsent(msg, sure))
+            (failed(super::unsent(msg, sure)), None)
         })?;
         let status = res.status();
         let headers = res.headers().clone();
@@ -201,12 +228,13 @@ impl LinkedIn {
         }
         // A 401 is a dead token; a 403 is a missing permission, which leaves the account alone.
         match status.as_u16() {
-            401 => return Err(PostError::Reconnect),
-            403 => return Err(PostError::Denied),
+            401 => return Err((PostError::Reconnect, Some(401))),
+            403 => return Err((PostError::Denied, Some(403))),
             _ => {}
         }
         let msg = format!("{step}: {}", reason(&body, status));
-        Err(failed(super::unsent(msg, status.as_u16() == 429)))
+        let sure = status.as_u16() == 429;
+        Err((failed(super::unsent(msg, sure)), Some(status.as_u16())))
     }
 
     /// A `/rest` call, pinned to `API_VERSION`.
@@ -314,10 +342,22 @@ impl LinkedIn {
             for m in media {
                 ids.push(self.upload_image(&author, token, m).await?);
             }
+            let alt = |i: usize| media[i].alt;
             if let [one] = ids.as_slice() {
-                Some(json!({"media": {"id": one}}))
+                let mut item = json!({"id": one});
+                if !alt(0).is_empty() {
+                    item["altText"] = json!(alt(0));
+                }
+                Some(json!({"media": item}))
             } else {
-                let images: Vec<Value> = ids.iter().map(|id| json!({"id": id})).collect();
+                let images: Vec<Value> = ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| match alt(i) {
+                        "" => json!({"id": id}),
+                        text => json!({"id": id, "altText": text}),
+                    })
+                    .collect();
                 Some(json!({"multiImage": {"images": images}}))
             }
         };
@@ -336,8 +376,25 @@ impl LinkedIn {
         if let Some(c) = content {
             body["content"] = c;
         }
+        // The images whose `altText` is in the body: not a PDF's or a video's, which have none.
+        let sent_alt: Vec<usize> = (0..media.len())
+            .filter(|&i| IMAGE_TYPES.contains(&media[i].content_type) && !media[i].alt.is_empty())
+            .collect();
         let req = self.rest(Method::POST, "posts", token).json(&body);
-        let (headers, _) = self.send(req, "Publish").await?;
+        let (headers, _) = match self.send_status(req, "Publish").await {
+            // A 400 or 422 is a refusal of the request: nothing was posted, so the post is made
+            // again without the alt texts, which may be what LinkedIn objected to.
+            Err((PostError::Failed(why), Some(400 | 422))) if !sent_alt.is_empty() => {
+                for i in sent_alt {
+                    super::alt_note(i + 1, &PostError::Failed(why.clone()));
+                }
+                strip_alt(&mut body);
+                let req = self.rest(Method::POST, "posts", token).json(&body);
+                self.send(req, "Publish").await?
+            }
+            Err((e, _)) => return Err(e),
+            Ok(done) => done,
+        };
         headers
             .get("x-restli-id")
             .and_then(|v| v.to_str().ok())
@@ -665,5 +722,22 @@ mod tests {
             reason(&Value::Null, reqwest::StatusCode::BAD_GATEWAY),
             "HTTP 502"
         );
+    }
+
+    #[test]
+    fn alt_texts_are_stripped_from_one_image_or_several() {
+        let mut one = json!({"content": {"media": {"id": "i", "altText": "a"}}});
+        strip_alt(&mut one);
+        assert_eq!(one, json!({"content": {"media": {"id": "i"}}}));
+        let mut many = json!({"content": {"multiImage": {"images": [
+            {"id": "1", "altText": "a"}, {"id": "2"}]}}});
+        strip_alt(&mut many);
+        assert_eq!(
+            many,
+            json!({"content": {"multiImage": {"images": [{"id": "1"}, {"id": "2"}]}}})
+        );
+        let mut none = json!({"commentary": "x"});
+        strip_alt(&mut none);
+        assert_eq!(none, json!({"commentary": "x"}));
     }
 }

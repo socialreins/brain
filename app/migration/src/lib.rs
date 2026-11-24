@@ -62,6 +62,7 @@ mod m20261220_000001_target_retry;
 mod m20261221_000001_media_uploads;
 mod m20261221_000001_post_notices;
 mod m20261222_000001_repeat_ended_notice;
+mod m20261223_000001_media_alt;
 
 pub struct Migrator;
 
@@ -131,6 +132,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261220_000001_target_retry::Migration),
             Box::new(m20261221_000001_post_notices::Migration),
             Box::new(m20261222_000001_repeat_ended_notice::Migration),
+            Box::new(m20261223_000001_media_alt::Migration),
             // inject-above (do not remove this comment)
         ]
     }

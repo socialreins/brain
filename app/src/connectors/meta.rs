@@ -150,7 +150,7 @@ pub enum Uncounted {
 
 /// A `4xx` that is about what was asked, not about the token, a permission or a rate limit
 /// (codes 4, 17, 32 and 613, or a `429`).
-fn about_the_request(status: reqwest::StatusCode, body: &Value) -> bool {
+pub(super) fn about_the_request(status: reqwest::StatusCode, body: &Value) -> bool {
     let limited = matches!(body["error"]["code"].as_i64(), Some(4 | 17 | 32 | 613));
     status.is_client_error()
         && status != reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -649,11 +649,12 @@ impl Meta {
                 } else {
                     top.push(("image_url", one.url));
                 }
-                (self.container(&path, token, &top).await?, POLLS)
+                let made = self.container_alt(&path, token, &top, (1, one)).await?;
+                (made, POLLS)
             }
             many => {
                 let mut children = Vec::new();
-                for m in many {
+                for (i, m) in many.iter().enumerate() {
                     let item = if m.video {
                         [("media_type", "VIDEO"), ("video_url", m.url)]
                     } else {
@@ -661,7 +662,7 @@ impl Meta {
                     };
                     let mut form = item.to_vec();
                     form.push(("is_carousel_item", "true"));
-                    children.push(self.container(&path, token, &form).await?);
+                    children.push(self.container_alt(&path, token, &form, (i + 1, m)).await?);
                 }
                 self.finished(token, &children, POLLS).await?;
                 let children = children.join(",");
@@ -686,6 +687,36 @@ impl Meta {
             .and_then(|v| text(&v["permalink"]))
             .filter(|l| l.starts_with("https://"));
         Ok((id, link))
+    }
+
+    /// `container` for image number `n` with its alt text (`alt_text`, images only, Reels and
+    /// videos have none). A container is not a post, so one Meta refuses with the alt text is
+    /// made again without it, and the target says so.
+    async fn container_alt(
+        &self,
+        path: &str,
+        token: &str,
+        form: &[(&str, &str)],
+        (n, m): (usize, &Item<'_>),
+    ) -> Result<String, PostError> {
+        if m.alt.is_empty() || m.video {
+            return self.container(path, token, form).await;
+        }
+        let mut with = form.to_vec();
+        with.push(("alt_text", m.alt));
+        let url = format!("{}/{}/{path}", self.graph_url, self.version);
+        let req = self.client.request(Method::POST, url);
+        match self.raw(req, Some(token), Some(&with), "Create").await {
+            Ok(made) => id_of(&made).ok_or_else(|| failed("Create: Meta sent no id.")),
+            // Only a refusal about the request itself (a bad parameter) is taken to be about the
+            // alt text; a rate limit, a timeout or a server error is not made again here.
+            Err(Refused::Graph(status, body)) if about_the_request(status, &body) => {
+                let why = failed(format!("Create: {}", reason(&body, status)));
+                super::alt_note(n, &why);
+                self.container(path, token, form).await
+            }
+            Err(refused) => Err(post_error(refused, "Create")),
+        }
     }
 
     async fn container(

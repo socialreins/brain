@@ -391,6 +391,21 @@ and never retried after the video is `published`: a refusal leaves the post publ
 as the target's `cover_error`. A post group takes `cover` with a per-platform override
 (`overrides.<platform>.cover`, `""` for none).
 
+**Alt text.** A post (and each thread part) may carry `media_alt`, a list of strings parallel to
+`media`: one description per image, in order, at most 1000 characters each (the strictest limit of
+the networks that take one), trimmed, no control characters. A shorter list leaves the last images
+without; a longer one is `422 invalid_alt_text` (also a control character) and a long text `422
+alt_text_too_long`, both on `media_alt` (a thread part's with its `part`). `media_alt` is saved aligned
+with `media` (empty when no image has one) and comes back on the post. Left out on `PUT /v1/posts/{id}`,
+the texts stored for the same links stay with them, so adding, removing or reordering images keeps each
+text with its image; `[]` clears them (a thread part keeps them unless it sends a list). A group takes
+`media_alt` like `media`, and an override with its own `media` has its own `media_alt` or none. Sent with
+the images to Bluesky (`alt`), X (`POST /2/media/metadata` after the upload), Threads and Instagram
+(`alt_text` on the image's container) and LinkedIn (`altText`); Facebook, TikTok and YouTube have none, and
+a video's is ignored. A network that refuses the text still gets the post without it (a Threads or
+Instagram container, or a LinkedIn post a `400` refused before anything was posted, is made again without
+it; X's call comes after the upload and before the tweet), and the target's `alt_error` says so.
+
 **First comment.** A post may carry `first_comment`, text its own account comments right after
 the post is saved as published on that target, e.g. for sources and caveats. Only Facebook,
 Instagram, LinkedIn and YouTube do; any other platform answers `422 first_comment_not_supported`

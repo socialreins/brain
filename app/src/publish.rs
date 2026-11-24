@@ -59,6 +59,8 @@ pub struct Attachment {
     pub bytes: crate::media::Blob,
     pub content_type: String,
     pub url: String,
+    /// The image's alt text; empty for none.
+    pub alt: String,
 }
 
 /// One publisher per platform.
@@ -204,9 +206,9 @@ impl Publisher for Bluesky {
         media: &[Attachment],
         reply: Option<(&Remote, &Remote)>,
     ) -> Result<Remote, PublishError> {
-        let media: Vec<(&crate::media::Blob, &str)> = media
+        let media: Vec<(&crate::media::Blob, &str, &str)> = media
             .iter()
-            .map(|a| (&a.bytes, a.content_type.as_str()))
+            .map(|a| (&a.bytes, a.content_type.as_str(), a.alt.as_str()))
             .collect();
         let reply = reply.map(|(p, r)| {
             (
@@ -318,7 +320,11 @@ fn by_type<'a>(
                 return Err(PublishError::Failed(format!("Image {n} is not {what}.")));
             }
             let video = a.content_type.starts_with("video/");
-            Ok(threads::Item { url: &a.url, video })
+            Ok(threads::Item {
+                url: &a.url,
+                video,
+                alt: &a.alt,
+            })
         })
         .collect()
 }
@@ -355,6 +361,7 @@ impl Publisher for LinkedIn {
             files.push(linkedin::File {
                 bytes: &a.bytes,
                 content_type: t,
+                alt: &a.alt,
             });
         }
         let id = self
@@ -431,6 +438,7 @@ impl Publisher for X {
             files.push(x::File {
                 bytes: &a.bytes,
                 content_type: t,
+                alt: &a.alt,
             });
         }
         let parent = reply.map(|(p, _)| p.id.as_str());
@@ -2077,6 +2085,7 @@ async fn load(
             bytes,
             content_type: s.content_type.clone(),
             url: crate::media::link(app, s),
+            alt: String::new(),
         });
     }
     Ok(files)
@@ -2216,6 +2225,16 @@ pub async fn claim_target(db: &DatabaseConnection, id: Uuid) -> Result<bool, DbE
     Ok(db.execute_raw(stmt).await?.rows_affected() == 1)
 }
 
+/// What `send` posts: the body, the media links with their alt texts, and the cover, TikTok and
+/// YouTube settings.
+type Content<'a> = (
+    &'a str,
+    (&'a [String], &'a [String]),
+    Option<&'a Attachment>,
+    Option<&'a tiktok::Options>,
+    Option<&'a youtube::Options>,
+);
+
 /// One post (or thread part), its media read from storage, with its time limit; `Err` holds what
 /// to tell the user.
 async fn send(
@@ -2223,17 +2242,14 @@ async fn send(
     publisher: &dyn Publisher,
     account: &social_accounts::Model,
     secret: &str,
-    (body, media, cover, tiktok, youtube): (
-        &str,
-        &[String],
-        Option<&Attachment>,
-        Option<&tiktok::Options>,
-        Option<&youtube::Options>,
-    ),
+    (body, (media, alt), cover, tiktok, youtube): Content<'_>,
     reply: Option<(&Remote, &Remote)>,
-) -> Result<Remote, String> {
+) -> Result<(Remote, Option<String>), String> {
     let how = (publisher.by_url(), account.provider.as_str());
-    let media = load(app, stored, media, how).await?;
+    let mut media = load(app, stored, media, how).await?;
+    for (file, text) in media.iter_mut().zip(alt) {
+        file.alt.clone_from(text);
+    }
     // Stored PDFs exist for LinkedIn's document posts; no other platform takes one.
     if let Some(n) = media
         .iter()
@@ -2272,16 +2288,23 @@ async fn send(
     };
     let (limit, extra) = patience(publisher.timeout(), &media);
     let sent = crate::connectors::PATIENCE.scope(extra, sent);
+    // What the alt text steps could not do (never a reason to fail the post).
+    let notes = std::cell::RefCell::new(Vec::new());
+    let sent = crate::connectors::ALT_NOTES.scope(notes, async {
+        let made = sent.await;
+        let notes = crate::connectors::ALT_NOTES.with(|n| n.take());
+        (made, notes)
+    });
     // YouTube's token lasts an hour and a large upload many minutes: `upload` may renew it.
     let refresh = (account.provider == "youtube")
         .then(|| crate::controllers::youtube::unseal(app, account))
         .flatten();
     let sent = youtube::REFRESH.scope(refresh, sent);
     match tokio::time::timeout(limit, sent).await {
-        Ok(Ok(remote)) => Ok(remote),
-        Ok(Err(PublishError::Reconnect)) => Err(refused(app, publisher, account).await),
-        Ok(Err(PublishError::Denied)) => Err(denied(publisher)),
-        Ok(Err(PublishError::Failed(msg))) => Err(msg),
+        Ok((Ok(remote), notes)) => Ok((remote, (!notes.is_empty()).then(|| notes.join(" ")))),
+        Ok((Err(PublishError::Reconnect), _)) => Err(refused(app, publisher, account).await),
+        Ok((Err(PublishError::Denied), _)) => Err(denied(publisher)),
+        Ok((Err(PublishError::Failed(msg)), _)) => Err(msg),
         Err(_) => Err(TIMED_OUT.to_owned()),
     }
 }
@@ -2354,6 +2377,11 @@ async fn publish_target_held(
         Err(PublishError::Failed(msg)) => return fail_target(db, id, &msg).await,
     };
     let media: Vec<String> = serde_json::from_value(post.media.clone()).unwrap_or_default();
+    let alt: Vec<String> = post
+        .media_alt
+        .clone()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
     let thread: Vec<ThreadPart> = serde_json::from_value(post.thread.clone()).unwrap_or_default();
     let limits = (post.platform.as_str(), app.media.max_bytes);
     if let Some(msg) = media_problem(stored, &media, &thread, limits) {
@@ -2438,7 +2466,7 @@ async fn publish_target_held(
                 &secret,
                 (
                     &post.body,
-                    &media,
+                    (&media, &alt),
                     in_call,
                     tiktok.as_ref(),
                     youtube.as_ref(),
@@ -2447,18 +2475,19 @@ async fn publish_target_held(
             )
             .await
             {
-                Ok(remote) => {
+                Ok((remote, note)) => {
                     if let Some(h) = hold.as_mut() {
                         h.sent += 1;
                     }
-                    remote
+                    (remote, note)
                 }
                 Err(msg) => return fail_target(db, id, &msg).await,
             };
+            let (root, alt_note) = root;
             // The remote id first: whatever fails after this, the post is known to be live.
             let stmt = sql(
                 "UPDATE post_targets SET remote_id = $2, remote_cid = $3, remote_url = $4, \
-                 published_at = now(), updated_at = now() WHERE id = $1",
+                 alt_error = $5, published_at = now(), updated_at = now() WHERE id = $1",
                 vec![
                     id.into(),
                     root.id.clone().into(),
@@ -2467,6 +2496,7 @@ async fn publish_target_held(
                         .clone()
                         .or_else(|| publisher.url(&account, &root.id))
                         .into(),
+                    alt_note.into(),
                 ],
             );
             db.execute_raw(stmt).await?;
@@ -2501,8 +2531,14 @@ async fn publish_target_held(
                 return fail_target(db, id, &msg).await;
             }
         };
-        let content = (part.body.as_str(), part.media.as_slice(), None, None, None);
-        let made = match send(
+        let content = (
+            part.body.as_str(),
+            (part.media.as_slice(), part.media_alt.as_slice()),
+            None,
+            None,
+            None,
+        );
+        let (made, alt_note) = match send(
             with,
             publisher,
             &account,
@@ -2512,11 +2548,11 @@ async fn publish_target_held(
         )
         .await
         {
-            Ok(remote) => {
+            Ok((remote, note)) => {
                 if let Some(h) = hold.as_mut() {
                     h.sent += 1;
                 }
-                remote
+                (remote, note.map(|n| format!("Thread post {}: {n}", i + 1)))
             }
             Err(msg) => {
                 let msg = format!(
@@ -2533,8 +2569,10 @@ async fn publish_target_held(
             "published_at": chrono::Utc::now().fixed_offset(),
         }]);
         let stmt = sql(
-            "UPDATE post_targets SET parts = parts || $2, updated_at = now() WHERE id = $1",
-            vec![id.into(), saved.into()],
+            "UPDATE post_targets SET parts = parts || $2, alt_error = CASE \
+             WHEN $3::text IS NULL THEN alt_error WHEN alt_error IS NULL THEN $3 \
+             ELSE alt_error || ' ' || $3 END, updated_at = now() WHERE id = $1",
+            vec![id.into(), saved.into(), alt_note.into()],
         );
         if let Err(e) = db.execute_raw(stmt).await {
             let msg = unsaved_part(i + 1, thread.len());
@@ -2907,6 +2945,7 @@ mod tests {
             },
             content_type: content_type.into(),
             url: String::new(),
+            alt: String::new(),
         };
         let base = Duration::from_secs(420);
         let limit = |files: &[Attachment]| patience(base, files);

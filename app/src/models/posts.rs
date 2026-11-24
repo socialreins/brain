@@ -15,6 +15,9 @@ pub struct Model {
     /// A JSON list of public `https://` URLs.
     #[sea_orm(column_type = "JsonBinary")]
     pub media: Json,
+    /// Alt texts parallel to `media`; null for none.
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub media_alt: Option<Json>,
     /// `draft`, `scheduled`, `queued`, `published`, `failed` or `deleted`.
     #[sea_orm(column_type = "Text")]
     pub status: String,
