@@ -88,8 +88,11 @@ struct Pending {
 impl Pending {
     /// Deletes the file and the row now.
     async fn clear(mut self) {
+        // Spawned, so it finishes even if the request is dropped while it runs.
+        let (app, id, key) = (self.app.clone(), self.id, self.key.clone());
+        let cleared = tokio::spawn(async move { clear(&app, id, &key).await });
         self.done = true;
-        clear(&self.app, self.id, &self.key).await;
+        let _ = cleared.await;
     }
 }
 
@@ -244,8 +247,9 @@ async fn stream(app: &AppState, id: Uuid, key: String, body: Body) -> Response {
     }
 }
 
-/// The first upload link among `urls` that is not an upload of `team`: another team's, or
-/// gone. In a transaction the uploads found stay locked `FOR SHARE` until it ends, so the
+/// The first upload link among `urls` that is not an upload of `team` as brain gave it: another
+/// team's, gone, or another spelling of the team's own (a query, another host, an escape), so a
+/// post only ever names an upload by its exact link, which the sweep matches. In a transaction the uploads found stay locked `FOR SHARE` until it ends, so the
 /// sweep cannot delete one under a post being saved (`media::release_uploads`).
 pub async fn foreign(
     app: &AppState,
@@ -259,8 +263,8 @@ pub async fn foreign(
         };
         let stmt = sql(
             "SELECT 1 AS ok FROM media_uploads WHERE storage_key = $1 AND team_id = $2 \
-             AND NOT pending FOR SHARE",
-            vec![key.into(), team.into()],
+             AND url = $3 AND NOT pending FOR SHARE",
+            vec![key.into(), team.into(), (*url).into()],
         );
         if db.query_one_raw(stmt).await?.is_none() {
             return Ok(Some((*url).to_owned()));

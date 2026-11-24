@@ -5776,6 +5776,18 @@ mod teams {
                     assert_eq!(res.json::<Value>()["error"], "invalid_upload", "{variant}");
                 }
 
+                // The team's own upload by another spelling is refused too: posts name the exact
+                // link, which the sweep matches.
+                let mut own = input(&set, "mine", None);
+                own["media"] = json!([format!(
+                    "https://brain.test/media/%{:02X}{}",
+                    name.as_bytes()[0],
+                    &name[1..]
+                )]);
+                let res = create(&s, &cookie, own).await;
+                assert_eq!(res.status_code(), 422, "{}", res.text());
+                assert_eq!(res.json::<Value>()["error"], "invalid_upload");
+
                 // A failed post keeps its upload past the day, so its retry finds the file.
                 let mut failing = input(&set, "REJECT me", Some(&past()));
                 failing["media"] = json!([url]);

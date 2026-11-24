@@ -1201,8 +1201,8 @@ pub const UPLOAD_HOURS: i32 = 24;
 pub const PENDING_HOURS: i32 = 6;
 
 /// Which uploads `release_uploads` deletes, of `u`: `$1` hours old and needed by no post, or
-/// in progress for `$2` hours. A post names an upload by its sealed token, whatever the link's
-/// host or query.
+/// in progress for `$2` hours. A post names an upload by its exact link (`uploads::foreign`
+/// refuses any other spelling), so its sealed token is in the post's text as is.
 const RELEASABLE: &str = "(NOT u.pending AND u.created_at <= now() - make_interval(hours => $1) \
    AND NOT EXISTS (SELECT 1 FROM posts p WHERE p.team_id = u.team_id \
      AND (p.status NOT IN ('published', 'deleted') OR EXISTS (SELECT 1 FROM post_targets t \
