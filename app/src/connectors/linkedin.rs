@@ -376,15 +376,16 @@ impl LinkedIn {
         if let Some(c) = content {
             body["content"] = c;
         }
+        // The images whose `altText` is in the body: not a PDF's or a video's, which have none.
+        let sent_alt: Vec<usize> = (0..media.len())
+            .filter(|&i| IMAGE_TYPES.contains(&media[i].content_type) && !media[i].alt.is_empty())
+            .collect();
         let req = self.rest(Method::POST, "posts", token).json(&body);
         let (headers, _) = match self.send_status(req, "Publish").await {
             // A 400 or 422 is a refusal of the request: nothing was posted, so the post is made
             // again without the alt texts, which may be what LinkedIn objected to.
-            Err((PostError::Failed(why), Some(400 | 422)))
-                if media.iter().any(|m| !m.alt.is_empty()) =>
-            {
-                let described = media.iter().enumerate().filter(|(_, m)| !m.alt.is_empty());
-                for (i, _) in described {
+            Err((PostError::Failed(why), Some(400 | 422))) if !sent_alt.is_empty() => {
+                for i in sent_alt {
                     super::alt_note(i + 1, &PostError::Failed(why.clone()));
                 }
                 strip_alt(&mut body);

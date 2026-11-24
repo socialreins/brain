@@ -163,6 +163,22 @@ impl Threads {
         form: Option<&[(&str, &str)]>,
         step: &str,
     ) -> Result<Value, PostError> {
+        self.call_status(method, path, token, query, form, step)
+            .await
+            .map_err(|(e, _)| e)
+    }
+
+    /// `call`, saying with a failure whether it is a refusal about the request itself (a bad
+    /// parameter: a `4xx` that is no token, permission or rate limit problem).
+    async fn call_status(
+        &self,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+        query: &[(&str, &str)],
+        form: Option<&[(&str, &str)]>,
+        step: &str,
+    ) -> Result<Value, (PostError, bool)> {
         let mut req = self
             .client
             .request(method, format!("{}/{path}", self.graph_url))
@@ -177,7 +193,7 @@ impl Threads {
             let sure = crate::connectors::never_sent(&e);
             tracing::warn!(error = %e.without_url(), step, "threads call failed");
             let msg = format!("{step}: Threads could not be reached.");
-            failed(super::unsent(msg, sure))
+            (failed(super::unsent(msg, sure)), false)
         })?;
         let status = res.status();
         let body: Value = res.json().await.unwrap_or(Value::Null);
@@ -185,10 +201,11 @@ impl Threads {
             return Ok(body);
         }
         if let Some(refusal) = dead_or_denied(&body) {
-            return Err(refusal);
+            return Err((refusal, false));
         }
         let msg = format!("{step}: {}", reason(&body, status));
-        Err(failed(super::unsent(msg, status.as_u16() == 429)))
+        let about = super::meta::about_the_request(status, &body);
+        Err((failed(super::unsent(msg, status.as_u16() == 429)), about))
     }
 
     /// Swaps an authorization code for a short-lived token, then that for a 60-day one.
@@ -352,12 +369,20 @@ impl Threads {
         }
         let mut with = params.to_vec();
         with.push(("alt_text", m.alt.to_owned()));
-        match self.container(user, token, &with).await {
-            Err(e @ PostError::Failed(_)) => {
+        let form: Vec<(&str, &str)> = with.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let path = format!("{VERSION}/{user}/threads");
+        let made = self
+            .call_status(Method::POST, &path, Some(token), &[], Some(&form), "Create")
+            .await;
+        match made {
+            Ok(made) => id_of(&made).ok_or_else(|| failed("Create: Threads sent no id.")),
+            // Only a refusal about the request itself (a bad parameter) is taken to be about the
+            // alt text; a rate limit, a timeout or a server error is not made again here.
+            Err((e, true)) => {
                 super::alt_note(n, &e);
                 self.container(user, token, params).await
             }
-            done => done,
+            Err((e, false)) => Err(e),
         }
     }
 

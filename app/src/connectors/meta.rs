@@ -150,7 +150,7 @@ pub enum Uncounted {
 
 /// A `4xx` that is about what was asked, not about the token, a permission or a rate limit
 /// (codes 4, 17, 32 and 613, or a `429`).
-fn about_the_request(status: reqwest::StatusCode, body: &Value) -> bool {
+pub(super) fn about_the_request(status: reqwest::StatusCode, body: &Value) -> bool {
     let limited = matches!(body["error"]["code"].as_i64(), Some(4 | 17 | 32 | 613));
     status.is_client_error()
         && status != reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -704,12 +704,18 @@ impl Meta {
         }
         let mut with = form.to_vec();
         with.push(("alt_text", m.alt));
-        match self.container(path, token, &with).await {
-            Err(e @ PostError::Failed(_)) => {
-                super::alt_note(n, &e);
+        let url = format!("{}/{}/{path}", self.graph_url, self.version);
+        let req = self.client.request(Method::POST, url);
+        match self.raw(req, Some(token), Some(&with), "Create").await {
+            Ok(made) => id_of(&made).ok_or_else(|| failed("Create: Meta sent no id.")),
+            // Only a refusal about the request itself (a bad parameter) is taken to be about the
+            // alt text; a rate limit, a timeout or a server error is not made again here.
+            Err(Refused::Graph(status, body)) if about_the_request(status, &body) => {
+                let why = failed(format!("Create: {}", reason(&body, status)));
+                super::alt_note(n, &why);
                 self.container(path, token, form).await
             }
-            done => done,
+            Err(refused) => Err(post_error(refused, "Create")),
         }
     }
 

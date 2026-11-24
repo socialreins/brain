@@ -5659,6 +5659,14 @@ mod teams {
                 refused(create(&s, &cookie, bad.clone()).await, "invalid_alt_text");
                 bad["media_alt"] = json!(["two\nlines"]);
                 assert_eq!(create(&s, &cookie, bad.clone()).await.status_code(), 201);
+                // Pasted tabs become spaces instead of a refusal.
+                bad["media_alt"] = json!(["a\tcat\u{b}on a\tsofa "]);
+                let res = create(&s, &cookie, bad.clone()).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                assert_eq!(
+                    res.json::<Value>()["media_alt"],
+                    json!(["a cat on a sofa", ""])
+                );
                 let mut bad = v.clone();
                 bad["thread"] =
                     json!([{"body": "two", "media": [c], "media_alt": ["x".repeat(1001)]}]);
@@ -10528,6 +10536,8 @@ mod teams {
                 static PUBLISHED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
                 static REMOVED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
                 static NEXT: AtomicU64 = AtomicU64::new(1);
+                /// How many containers the mock turned away with a 429.
+                static LIMITED: AtomicU64 = AtomicU64::new(0);
 
                 type Answer = (axum::http::StatusCode, Json<Value>);
 
@@ -10600,6 +10610,11 @@ mod teams {
                             }
                             if f.get("alt_text").is_some_and(|t| t.contains("REFUSE")) {
                                 return refused(100, "alt_text is not valid");
+                            }
+                            if f.get("alt_text").is_some_and(|t| t.contains("LIMIT")) {
+                                LIMITED.fetch_add(1, Ordering::SeqCst);
+                                let body = json!({"error": {"message": "slow down", "code": 4}});
+                                return (axum::http::StatusCode::TOO_MANY_REQUESTS, Json(body));
                             }
                             CONTAINERS.lock().unwrap().push((user, f));
                             ok(json!({"id": format!("c{}", NEXT.fetch_add(1, Ordering::SeqCst))}))
@@ -11064,6 +11079,27 @@ mod teams {
                         "{why}"
                     );
 
+                    // A rate limit is no refusal of the text: it is not asked again at once.
+                    let mut busy = threads_post(
+                        &set,
+                        "busy",
+                        vec!["https://a.example/1.png".to_owned()],
+                        &[],
+                    );
+                    busy["media_alt"] = json!(["LIMIT"]);
+                    let id = id_of(&create(&s, &cookie, busy).await);
+                    set_media(&db, &base, &id, &["/img.png"]).await;
+                    let (limited, before) = (
+                        LIMITED.load(Ordering::SeqCst),
+                        CONTAINERS.lock().unwrap().len(),
+                    );
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_ne!(p["status"], "published", "{p}");
+                    assert_eq!(LIMITED.load(Ordering::SeqCst), limited + 1);
+                    assert_eq!(CONTAINERS.lock().unwrap().len(), before);
+                    assert_eq!(p["targets"][0]["alt_error"], Value::Null);
+
                     let mut clip =
                         threads_post(&set, "clip", vec!["https://a.example/c.mp4".into()], &[]);
                     clip["media_alt"] = json!(["not for a video"]);
@@ -11289,6 +11325,8 @@ mod teams {
 
                 /// Every `/rest/posts` body the mock took, oldest first.
                 static POSTS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+                /// How many `/rest/posts` requests the mock refused with a 400.
+                static REFUSED_POSTS: AtomicU64 = AtomicU64::new(0);
                 /// Every upload: (path, byte count), and every finalize body.
                 static UPLOADS: std::sync::Mutex<Vec<(String, usize)>> =
                     std::sync::Mutex::new(Vec::new());
@@ -11483,6 +11521,7 @@ mod teams {
                             return expired().into_response();
                         }
                         if body.to_string().contains("REFUSE") {
+                            REFUSED_POSTS.fetch_add(1, Ordering::SeqCst);
                             let msg = json!({"message": "altText is not valid", "status": 400});
                             return (StatusCode::BAD_REQUEST, Json(msg)).into_response();
                         }
@@ -12112,6 +12151,34 @@ mod teams {
                         why.starts_with("Alt text of image 1 was not added"),
                         "{why}"
                     );
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn only_a_body_that_held_alt_text_is_sent_again_without_it() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    // A PDF's text is never sent: a refused post is not repeated for it.
+                    let mut doc = linkedin_post(&set, "REFUSE doc");
+                    doc["media"] = json!(["https://a.example/doc.pdf"]);
+                    doc["media_alt"] = json!(["not sent"]);
+                    let id = id_of(&create(&s, &cookie, doc).await);
+                    set_media(&db, &base, &id, &["/doc.pdf"]).await;
+                    let refused = REFUSED_POSTS.load(Ordering::SeqCst);
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_ne!(p["status"], "published", "{p}");
+                    assert_eq!(REFUSED_POSTS.load(Ordering::SeqCst), refused + 1);
+                    assert_eq!(p["targets"][0]["alt_error"], Value::Null, "{p}");
+                    // An image's is: one more request, which the mock refuses again.
+                    let mut pic = linkedin_post(&set, "REFUSE pic");
+                    pic["media"] = json!(["https://a.example/1.png"]);
+                    pic["media_alt"] = json!(["sent"]);
+                    let id = id_of(&create(&s, &cookie, pic).await);
+                    set_media(&db, &base, &id, &["/img.png"]).await;
+                    let refused = REFUSED_POSTS.load(Ordering::SeqCst);
+                    publish::tick(&state).await.unwrap();
+                    assert_ne!(get_post(&s, &cookie, &id).await["status"], "published");
+                    assert_eq!(REFUSED_POSTS.load(Ordering::SeqCst), refused + 2);
                 }
 
                 #[tokio::test]
@@ -16923,6 +16990,8 @@ mod teams {
                 static THUMB_MODE: AtomicU64 = AtomicU64::new(0);
                 /// 1: deleting answers error code 200 (a missing permission, not a dead token).
                 static DELETE_MODE: AtomicU64 = AtomicU64::new(0);
+                /// How many calls the mock turned away with a 429.
+                static LIMITED: AtomicU64 = AtomicU64::new(0);
 
                 type Answer = (axum::http::StatusCode, Json<Value>);
 
@@ -17011,6 +17080,11 @@ mod teams {
                             }
                             if f.get("alt_text").is_some_and(|t| t.contains("REFUSE")) {
                                 return refused(100, "(#100) Invalid parameter: alt_text");
+                            }
+                            if f.get("alt_text").is_some_and(|t| t.contains("LIMIT")) {
+                                LIMITED.fetch_add(1, Ordering::SeqCst);
+                                let body = json!({"error": {"message": "slow down", "code": 4}});
+                                return (axum::http::StatusCode::TOO_MANY_REQUESTS, Json(body));
                             }
                             let n = next();
                             let answer = match edge.as_str() {
@@ -17840,6 +17914,16 @@ mod teams {
                         why.starts_with("Alt text of image 1 was not added"),
                         "{why}"
                     );
+
+                    // A rate limit is no refusal of the text: it is not asked again at once.
+                    let mut post = meta_post(&set, "instagram", "busy");
+                    post["media_alt"] = json!(["LIMIT"]);
+                    let limited = LIMITED.load(Ordering::SeqCst);
+                    let (p, calls) = publish_one(ctx, &cookie, post, &["/img.jpg"]).await;
+                    assert_ne!(p["status"], "published", "{p}");
+                    assert_eq!(LIMITED.load(Ordering::SeqCst), limited + 1);
+                    assert!(calls.is_empty(), "{calls:?}");
+                    assert_eq!(p["targets"][0]["alt_error"], Value::Null);
 
                     // Facebook's photo calls have no alt text here.
                     let mut post = meta_post(&set, "facebook", "pic");

@@ -798,7 +798,8 @@ pub fn check_x_short<'a>(bodies: impl IntoIterator<Item = &'a str>) -> Option<Pr
 
 /// The problems of the alt texts `alt` of `media` (parallel lists, a shorter `alt` leaves the
 /// last images without): more texts than media, a control character other than a line break,
-/// or a text over `MAX_ALT_CHARS` once trimmed.
+/// or a text over `MAX_ALT_CHARS` once trimmed. A tab or another whitespace control character is
+/// not a problem: `normal_alt` turns it into a space.
 pub fn check_alt(media: &[String], alt: &[String]) -> Vec<Problem> {
     if alt.len() > media.len() {
         let detail = format!(
@@ -814,10 +815,7 @@ pub fn check_alt(media: &[String], alt: &[String]) -> Vec<Problem> {
     let mut found = Vec::new();
     for (i, text) in alt.iter().enumerate() {
         let n = text.trim().chars().count();
-        if text
-            .chars()
-            .any(|c| c.is_control() && !matches!(c, '\n' | '\r'))
-        {
+        if text.chars().any(|c| c.is_control() && !c.is_whitespace()) {
             let detail = format!("The alt text of image {} has a control character.", i + 1);
             found.push(Problem {
                 detail: Some(detail),
@@ -839,13 +837,27 @@ pub fn check_alt(media: &[String], alt: &[String]) -> Vec<Problem> {
     found
 }
 
-/// The alt texts as saved: trimmed, line breaks as `\n`, padded with empty texts to the media's
+/// The alt texts as saved: trimmed, line breaks as `\n`, a tab or other whitespace control character
+/// a space, padded with empty texts to the media's
 /// length, and none at all when every text is empty.
 pub fn normal_alt(media_len: usize, alt: &[String]) -> Vec<String> {
     let mut alt: Vec<String> = alt
         .iter()
         .take(media_len)
-        .map(|t| t.replace("\r\n", "\n").trim().to_owned())
+        .map(|t| {
+            let t = t.replace("\r\n", "\n");
+            let t: String = t
+                .chars()
+                .map(|c| {
+                    if c != '\n' && c.is_control() && c.is_whitespace() {
+                        ' '
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            t.trim().to_owned()
+        })
         .collect();
     if alt.iter().all(String::is_empty) {
         return Vec::new();
@@ -967,6 +979,11 @@ mod tests {
         let ctrl = check_alt(&media, &strs(&["bad\u{7}"]));
         assert_eq!(ctrl[0].invalid, Invalid::InvalidAlt);
         assert!(check_alt(&media, &strs(&["two\nlines\r\n"])).is_empty());
+        assert!(check_alt(&media, &strs(&["a\tb\u{b}c\u{c}d\re"])).is_empty());
+        assert_eq!(
+            check_alt(&media, &strs(&["a\tb\u{0}"]))[0].invalid,
+            Invalid::InvalidAlt
+        );
     }
 
     #[test]
@@ -975,6 +992,10 @@ mod tests {
         assert!(normal_alt(2, &strs(&["  ", ""])).is_empty());
         assert_eq!(normal_alt(3, &strs(&[" a ", ""])), strs(&["a", "", ""]));
         assert_eq!(normal_alt(1, &strs(&["a\r\nb"])), strs(&["a\nb"]));
+        assert_eq!(
+            normal_alt(1, &strs(&["\ta\tb\u{b}c\rd\n"])),
+            strs(&["a b c d"])
+        );
     }
 
     #[test]
