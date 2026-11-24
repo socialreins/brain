@@ -1,5 +1,6 @@
 //! Mail about posts that did not go out (decision 0008): a post that settled as failed or partly
-//! failed, or that went back to draft for being over an hour late. Whatever decides that queues a
+//! failed, that went back to draft for being over an hour late, or whose repeat stopped because
+//! its next copy could not be made. Whatever decides that queues a
 //! notice (`queue`) in its own transaction; the publish round sends what is queued (`send_due`)
 //! in the background, never inside a transaction. Each notice mails the post's author and the
 //! team's owners once, at most `PER_DAY` notices a team a day; the rest are only logged.
@@ -20,6 +21,8 @@ pub enum Kind {
     Partial,
     /// Over an hour late, back to draft.
     Late,
+    /// Its repeat rule could not make the next copy, so the series stopped.
+    RepeatEnded,
 }
 
 impl Kind {
@@ -28,11 +31,12 @@ impl Kind {
             Kind::Failed => "failed",
             Kind::Partial => "partial",
             Kind::Late => "late",
+            Kind::RepeatEnded => "repeat_ended",
         }
     }
 
     fn parse(s: &str) -> Option<Self> {
-        [Kind::Failed, Kind::Partial, Kind::Late]
+        [Kind::Failed, Kind::Partial, Kind::Late, Kind::RepeatEnded]
             .into_iter()
             .find(|k| k.as_str() == s)
     }
@@ -151,6 +155,8 @@ fn compose(
     } else {
         format!("\"{snippet}\"\n\n")
     };
+    // The post's own `error` is about its publish, not about the series.
+    let error = error.filter(|_| kind != Kind::RepeatEnded);
     let why = error.unwrap_or("No reason was given.");
     // `settle` joins the accounts with "; ": one line each. Each starts with "- " and is one
     // line, so text from a platform or a post never reads as a link the mail makes a button of.
@@ -176,8 +182,20 @@ fn compose(
                  back to your drafts."
             ),
         ),
+        Kind::RepeatEnded => (
+            format!("Your repeating {network} post stopped repeating"),
+            format!(
+                "The next copy of your repeating {network} post could not be made, so the \
+                 series stopped. Open the post and set it to repeat again."
+            ),
+        ),
     };
-    let text = format!("{lead}\n\n{quoted}{lines}\n\nOpen the post:\n\n{link}\n");
+    let lines = if kind == Kind::RepeatEnded {
+        String::new()
+    } else {
+        format!("{lines}\n\n")
+    };
+    let text = format!("{lead}\n\n{quoted}{lines}Open the post:\n\n{link}\n");
     (subject, text)
 }
 

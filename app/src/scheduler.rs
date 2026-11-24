@@ -140,6 +140,12 @@ pub fn spawn(app: AppState) {
         }
     });
     tokio::spawn(async move {
+        // Posts a killed process claimed and never started go out at the first round.
+        match publish::release_unstarted(&app.db).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(posts = n, "released posts claimed and not started"),
+            Err(e) => tracing::warn!(error = %e, "releasing unstarted posts failed"),
+        }
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

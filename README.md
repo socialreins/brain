@@ -423,7 +423,7 @@ Posts of a deleted set are hidden and held back until it is restored. Errors nev
 or tokens. A team keeps at most 2000 posts that are not deleted; publish now and take-down are
 10 a minute per user. A team publishes at most 100 posts a day, scheduled or now (`429
 publish_quota` on publish now); a due post over the limit stays `scheduled` and goes out once
-it frees up. A tick claims at most 50 posts; 8 posts and 8 targets publish at once. A past
+it frees up. A tick claims at most 50 posts, and a team no more than 3 at once (the rest wait `scheduled`, and each post that ends claims its team's next at once, so a burst takes minutes, not a tick each); 8 posts and 8 targets publish at once. The team limit is counted per brain process: run several instances and a team can have 3 on each. A past
 `scheduled_at` means now.
 
 A token created with `"read_only": true` (whole-team or set) only reads: every `POST`, `PUT`,

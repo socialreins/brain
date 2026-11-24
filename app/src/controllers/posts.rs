@@ -2379,7 +2379,11 @@ pub async fn set_repeat(app: &AppState, a: &Actor, id: Uuid, rule: Option<Repeat
         return (unprocessable, Json(body)).into_response();
     }
     // `day` is brain's own note on a copy, never a caller's.
-    let rule = rule.map(|r| Repeat { day: None, ..r });
+    let rule = rule.map(|r| Repeat {
+        day: None,
+        time: None,
+        ..r
+    });
     let saved = async {
         let Some(found) = find(&app.db, a, id).await? else {
             return Ok(not_found());

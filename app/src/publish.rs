@@ -876,6 +876,26 @@ const CLAIM_BATCH: i64 = 50;
 const POSTS_AT_ONCE: usize = 8;
 static POST_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(POSTS_AT_ONCE));
 static TARGET_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(8));
+/// Posts, and targets, one team publishes at once in this process, taken before the shared
+/// slots above: a team with many large videos waits for its own, and never holds all of those.
+pub const TEAM_AT_ONCE: usize = 3;
+type TeamSlots = std::sync::Mutex<HashMap<Uuid, Arc<Semaphore>>>;
+static TEAM_POSTS: LazyLock<TeamSlots> = LazyLock::new(TeamSlots::default);
+static TEAM_TARGETS: LazyLock<TeamSlots> = LazyLock::new(TeamSlots::default);
+
+/// The team's semaphore in `slots`. shortcut: one small entry per team ever seen, never removed;
+/// prune idle ones if a process ever serves very many teams.
+fn team_slot(slots: &TeamSlots, team: Uuid) -> Arc<Semaphore> {
+    let mut map = slots.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(team)
+        .or_insert_with(|| Arc::new(Semaphore::new(TEAM_AT_ONCE)))
+        .clone()
+}
+
+/// What a post fails with when its set is deleted before it goes out.
+pub const SET_DELETED: &str =
+    "Not posted: its account set was deleted before it was due. Restoring the set does not \
+     schedule it again.";
 /// How long a stopping process (`stop`) waits for the posts it is publishing before it exits
 /// (`drain`). Keep it under the grace the platform gives between SIGTERM and the kill (on
 /// Railway `RAILWAY_DEPLOYMENT_DRAINING_SECONDS`, which has to be set above this to matter).
@@ -1085,7 +1105,6 @@ pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, D
     if let Err(e) = draft_late(&app.db, &running).await {
         tracing::warn!(error = %e, "late posts not put back to draft");
     }
-    let room = (CLAIM_BATCH - in_flight(|flying| flying.len()) as i64).max(0);
     // Posts left `queued` by a crash between claim and settle: fan-out and claims are
     // idempotent, so running them again only finishes the job. Also posts with a target whose
     // automatic retry is due.
@@ -1098,39 +1117,114 @@ pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, D
     );
     let left = ids(&app.db, stmt, "id").await?;
     // The quota is reserved per post in `publish_post`, together with marking it reserved.
-    let mut flights = Vec::new();
-    for (id, _) in claim(&app.db, room, app.billing_enabled).await? {
-        if in_flight(|flying| flying.insert(id)) {
-            flights.push(Flight(id));
-        // Put back by a task that has not ended yet and claimed again here: nothing would run
-        // it, so it goes back to `scheduled` for the next round, never left `queued`.
-        } else if let Err(e) = unclaim(&app.db, id, None).await {
-            tracing::warn!(error = %e, post = %id, "returning a claimed post failed");
-        }
-    }
+    let mut flights: Vec<(Flight, Option<Uuid>)> = claim_flights(app, None)
+        .await?
+        .into_iter()
+        .map(|(f, team)| (f, Some(team)))
+        .collect();
     // Never picked up as left behind while this process still runs it.
     let left = left
         .into_iter()
         .filter(|id| in_flight(|flying| flying.insert(*id)));
-    flights.extend(left.map(Flight));
+    flights.extend(left.map(|id| (Flight(id), None)));
     // Mail about posts that did not go out, queued by earlier rounds (`post_mail`).
     let mail = {
         let app = app.clone();
         tokio::spawn(async move { crate::post_mail::send_due(&app).await })
     };
     let runs = std::iter::once(mail)
-        .chain(flights.into_iter().map(|flight| {
-            let (app, id) = (app.clone(), flight.0);
-            tokio::spawn(async move {
-                let _flight = flight;
-                if let Err(e) = publish_post(&app, id).await {
-                    tracing::error!(error = %e, post = %id, "publish failed");
-                }
-            })
-        }))
+        .chain(
+            flights
+                .into_iter()
+                .map(|(flight, team)| tokio::spawn(run(app.clone(), flight, team))),
+        )
         .collect();
     lock.commit().await?;
     Ok(runs)
+}
+
+/// Claims for `claim` and marks each post in flight; one already in flight here (a task that has
+/// not ended yet, claimed again) goes back to `scheduled` for the next round, never left `queued`
+/// with nothing to run it. One claim at a time (`CLAIM_GATE`), with what is in flight read inside
+/// it, so a team's places are counted once however many posts end together.
+async fn claim_flights(app: &AppState, only: Option<Uuid>) -> Result<Vec<(Flight, Uuid)>, DbErr> {
+    let _gate = CLAIM_GATE.lock().await;
+    let running: Vec<Uuid> = in_flight(|flying| flying.iter().copied().collect());
+    let room = (CLAIM_BATCH - running.len() as i64).max(0);
+    let busy = busy_teams(&app.db, &running).await?;
+    let mut flights = Vec::new();
+    for (id, team) in claim(&app.db, room, app.billing_enabled, &busy, only).await? {
+        if in_flight(|flying| flying.insert(id)) {
+            flights.push((Flight(id), team));
+        } else if let Err(e) = unclaim(&app.db, id, None).await {
+            tracing::warn!(error = %e, post = %id, "returning a claimed post failed");
+        }
+    }
+    Ok(flights)
+}
+
+/// Serialises `claim_flights` in this process.
+static CLAIM_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Whether a post that `publish_post` returned from freed its team's place for the next one:
+/// not after an error, and not for a post it put back to `scheduled` (the plan ended, the daily
+/// cap, a quota error), which a refill would only claim again at once.
+fn frees_a_place(published: bool, status: &str) -> bool {
+    published && status != "scheduled"
+}
+
+/// Publishes a claimed post, then fills the place it frees for its team (`refill`), so a team's
+/// throughput is its places and how long a post takes, never one claim a tick. Returns when the
+/// posts it started in turn have ended too.
+fn run(
+    app: AppState,
+    flight: Flight,
+    team: Option<Uuid>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        let id = flight.0;
+        let published = match publish_post(&app, id).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(error = %e, post = %id, "publish failed");
+                false
+            }
+        };
+        drop(flight);
+        if let Some(team) = team {
+            let status = posts::Entity::find_by_id(id)
+                .select_only()
+                .column(posts::Column::Status)
+                .into_tuple::<String>()
+                .one(&app.db)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            if frees_a_place(published, &status) {
+                refill(&app, team).await;
+            }
+        }
+    })
+}
+
+/// Claims `team`'s next due posts, as many as it has places left in this process, and runs them.
+/// A stopping process claims nothing.
+async fn refill(app: &AppState, team: Uuid) {
+    if POST_SLOTS.is_closed() {
+        return;
+    }
+    let claimed = claim_flights(app, Some(team)).await;
+    let runs: Vec<_> = match claimed {
+        Ok(flights) => flights
+            .into_iter()
+            .map(|(flight, team)| tokio::spawn(run(app.clone(), flight, Some(team))))
+            .collect(),
+        Err(e) => return tracing::warn!(error = %e, "a team's next posts not claimed"),
+    };
+    for r in runs {
+        let _ = r.await;
+    }
 }
 
 /// `begin`, then waits for the posts it started: what tests and one-off runs want.
@@ -1145,24 +1239,49 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
 /// a live set, of a team under its daily publish cap (and with `billing`, on a live plan), and none `rejected`, nor `pending` while its
 /// team requires approval. Returns `(post, team)`.
 pub async fn claim_due(db: &DatabaseConnection, billing: bool) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
-    claim(db, CLAIM_BATCH, billing).await
+    claim(db, CLAIM_BATCH, billing, &HashMap::new(), None).await
+}
+
+/// How many of `posts` each team has in flight in this process.
+async fn busy_teams(db: &DatabaseConnection, posts: &[Uuid]) -> Result<HashMap<Uuid, i32>, DbErr> {
+    let stmt = sql(
+        "SELECT team_id, count(*)::int AS n FROM posts WHERE id = ANY($1::uuid[]) \
+         GROUP BY team_id",
+        vec![posts.to_vec().into()],
+    );
+    let mut busy = HashMap::new();
+    for row in db.query_all_raw(stmt).await? {
+        busy.insert(row.try_get("", "team_id")?, row.try_get("", "n")?);
+    }
+    Ok(busy)
 }
 
 /// `claim_due` of at most `limit` posts. A claimed post with a repeat rule yields its next copy
-/// in the same transaction (`repeat::spawn`), so it does once.
+/// in the same transaction (`repeat::spawn`), so it does once. A team is claimed no more posts
+/// than it has places left (`TEAM_AT_ONCE` less its posts in `busy`, in flight here), `only`
+/// that team when set: a post that could only wait for its team's places stays `scheduled`, so
+/// it counts nowhere against the batch, is not `queued` long enough to be called stuck, and no
+/// other instance mistakes it for left behind. A team's backlog never keeps another team's post
+/// from going out, and each post that ends claims the team's next one at once (`refill`), so the
+/// tick is not the team's throughput. A post still `scheduled` an hour past its time is late
+/// (`draft_late`) as any other.
 async fn claim(
     db: &DatabaseConnection,
     limit: i64,
     billing: bool,
+    busy: &HashMap<Uuid, i32>,
+    only: Option<Uuid>,
 ) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
     // A CTE runs once; a LIMIT inside `IN (...)` may be re-run and claim more. The posts of one
     // group (`group_id`, one per platform) are claimed together or not at all, so they are all
     // judged by the same clock (`LATE_MINUTES`): the batch is cut between groups, never inside
-    // one, and the first group always fits.
+    // one, and the first group of a team and of the batch always fits.
     let stmt = sql(
         "WITH cand AS ( \
-           SELECT d.id, COALESCE(d.group_id, d.id) AS gk, d.scheduled_at FROM posts d \
+           SELECT d.id, d.team_id, COALESCE(d.group_id, d.id) AS gk, d.scheduled_at \
+           FROM posts d \
            WHERE d.status = 'scheduled' AND d.scheduled_at <= now() \
+           AND ($8::uuid IS NULL OR d.team_id = $8) \
            AND d.scheduled_at >= now() - make_interval(mins => $4) \
            AND d.approval IS DISTINCT FROM 'rejected' \
            AND (d.approval IS DISTINCT FROM 'pending' OR NOT EXISTS ( \
@@ -1174,10 +1293,16 @@ async fn claim(
            AND (SELECT count(*) FROM rate_limit_hits h \
                 WHERE h.bucket = 'publish:team:' || d.team_id::text \
                 AND h.created_at > now() - interval '1 day') < $1), \
+         grp AS (SELECT team_id, gk, min(scheduled_at) AS at, count(*) AS n \
+                 FROM cand GROUP BY team_id, gk), \
+         room AS ( \
+           SELECT g.team_id, g.gk, g.at, g.n FROM (SELECT *, sum(n) OVER (PARTITION BY team_id \
+                  ORDER BY at, gk) - n AS before FROM grp) g \
+           LEFT JOIN unnest($5::uuid[], $6::int[]) AS b(team_id, n) ON b.team_id = g.team_id \
+           WHERE g.before < $7 - COALESCE(b.n, 0)), \
          fit AS ( \
-           SELECT gk FROM (SELECT gk, sum(count(*)) OVER (ORDER BY min(scheduled_at), gk) \
-                                      - count(*) AS before \
-                           FROM cand GROUP BY gk) g WHERE before < $2), \
+           SELECT gk FROM (SELECT gk, sum(n) OVER (ORDER BY at, gk) - n AS before \
+                           FROM room) g WHERE before < $2), \
          due AS ( \
            SELECT p.id FROM posts p JOIN cand c ON c.id = p.id JOIN fit f ON f.gk = c.gk \
            ORDER BY c.scheduled_at, p.id FOR UPDATE OF p SKIP LOCKED) \
@@ -1189,6 +1314,10 @@ async fn claim(
             limit.into(),
             billing.into(),
             (LATE_MINUTES as i32).into(),
+            busy.keys().copied().collect::<Vec<_>>().into(),
+            busy.values().copied().collect::<Vec<_>>().into(),
+            (TEAM_AT_ONCE as i32).into(),
+            only.into(),
         ],
     );
     let txn = db.begin().await?;
@@ -1331,13 +1460,27 @@ async fn unclaim(db: &DatabaseConnection, id: Uuid, error: Option<&str>) -> Resu
 /// claimed and nothing touched: one with its quota reserved (publish now, or underway) or any
 /// target (a retry, or underway) stays `queued`.
 async fn release(db: &DatabaseConnection, id: Uuid) -> Result<(), DbErr> {
+    release_where(db, Some(id)).await.map(|_| ())
+}
+
+/// On start: `release` for every post, so the posts a killed process had claimed and not started
+/// go out at the next round, not `STUCK_MINUTES` later. Safe beside other instances: a post one
+/// of them claimed is only put back while it has no quota reserved, and that instance's run then
+/// fails to reserve it (`Quota::Lost`, the post is no longer `queued`) and leaves it to the
+/// round that claims it again; one it already started is never touched. Returns how many.
+pub async fn release_unstarted(db: &DatabaseConnection) -> Result<u64, DbErr> {
+    release_where(db, None).await
+}
+
+async fn release_where(db: &DatabaseConnection, id: Option<Uuid>) -> Result<u64, DbErr> {
     let stmt = sql(
         "UPDATE posts SET status = 'scheduled', updated_at = now() \
-         WHERE id = $1 AND status = 'queued' AND NOT quota_reserved AND NOT fanned_out \
+         WHERE ($1::uuid IS NULL OR id = $1) AND status = 'queued' AND NOT quota_reserved \
+         AND NOT fanned_out \
          AND NOT EXISTS (SELECT 1 FROM post_targets t WHERE t.post_id = posts.id)",
         vec![id.into()],
     );
-    db.execute_raw(stmt).await.map(|_| ())
+    Ok(db.execute_raw(stmt).await?.rows_affected())
 }
 
 /// Targets cut off mid-publish become `failed` and are never sent again; their posts settle.
@@ -1437,13 +1580,23 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
 }
 
 async fn fail_post(db: &DatabaseConnection, id: Uuid, msg: &str) -> Result<(), DbErr> {
+    fail_post_mail(db, id, msg, true).await
+}
+
+/// `fail_post`, mailing the failure only when `mail`: not for an outcome the user caused.
+async fn fail_post_mail(
+    db: &DatabaseConnection,
+    id: Uuid,
+    msg: &str,
+    mail: bool,
+) -> Result<(), DbErr> {
     let stmt = sql(
         "UPDATE posts SET status = 'failed', error = $2, updated_at = now() \
          WHERE id = $1 AND status = 'queued'",
         vec![id.into(), msg.into()],
     );
     let txn = db.begin().await?;
-    if txn.execute_raw(stmt).await?.rows_affected() == 1 {
+    if txn.execute_raw(stmt).await?.rows_affected() == 1 && mail {
         crate::post_mail::queue(&txn, id, crate::post_mail::Kind::Failed).await?;
     }
     txn.commit().await
@@ -1457,6 +1610,17 @@ const PLAN_ENDED: &str = "The team's plan has ended. The post goes out if a plan
 /// published at most once, then the post settles.
 pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
     let db = &app.db;
+    // The team's own slot first, so posts waiting on it never hold a shared one.
+    let team = posts::Entity::find_by_id(id)
+        .select_only()
+        .column(posts::Column::TeamId)
+        .into_tuple::<Uuid>()
+        .one(db)
+        .await?;
+    let Some(team) = team else {
+        return Ok(());
+    };
+    let _team_slot = team_slot(&TEAM_POSTS, team).acquire_owned().await;
     let Ok(_slot) = POST_SLOTS.acquire().await else {
         return release(db, id).await;
     };
@@ -1509,8 +1673,9 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         .await?
         .is_some();
     if !set_live {
-        // The set was deleted after the claim: back to `scheduled`, to go out if it returns.
-        return unclaim(db, id, None).await;
+        // The set was deleted after the claim: as the delete fails its scheduled posts, and
+        // as that, with no mail: the user did it.
+        return fail_post_mail(db, id, SET_DELETED, false).await;
     }
     if publisher(app, &post.platform).is_none() {
         let msg = format!("Publishing to {} is not available yet.", post.platform);
@@ -1559,7 +1724,16 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         };
         // One transaction, so a crash before `fanned_out` leaves no target behind. A gone
         // account that was disconnected has no id to conflict on: count those already there.
+        // Under a shared lock on the post, which must still be `queued`: `draft_late` takes the
+        // same lock, so it never drafts a post whose targets are being made.
         let txn = db.begin().await?;
+        let live = sql(
+            "SELECT 1 AS n FROM posts WHERE id = $1 AND status = 'queued' FOR SHARE",
+            vec![id.into()],
+        );
+        if txn.query_one_raw(live).await?.is_none() {
+            return txn.commit().await;
+        }
         let stmt = sql(
             "SELECT count(*) AS n FROM post_targets WHERE post_id = $1 AND social_account_id IS NULL",
             vec![id.into()],
@@ -2148,6 +2322,7 @@ async fn publish_target_held(
     stored: &Media,
     hold: &mut Option<XHold>,
 ) -> Result<(), DbErr> {
+    let _team_slot = team_slot(&TEAM_TARGETS, post.team_id).acquire_owned().await;
     let Ok(_slot) = TARGET_SLOTS.acquire().await else {
         return Ok(());
     };
@@ -2706,6 +2881,20 @@ async fn delete_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_post_that_ran_frees_its_place_for_the_next() {
+        assert!(frees_a_place(true, "published"));
+        assert!(frees_a_place(true, "failed"));
+        assert!(
+            frees_a_place(true, "queued"),
+            "a retry waiting five minutes"
+        );
+        // Put back to scheduled (plan ended, daily cap), or an error: a refill would claim the
+        // same post again at once, round and round until it is an hour late.
+        assert!(!frees_a_place(true, "scheduled"));
+        assert!(!frees_a_place(false, "queued"));
+    }
 
     #[test]
     fn a_large_video_gets_more_time_and_a_small_file_none() {

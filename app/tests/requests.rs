@@ -3708,6 +3708,11 @@ mod teams {
             std::sync::atomic::AtomicBool::new(false);
         /// Set: the next `createRecord` of a text with `BUSYONCE` is refused for the rate limit.
         static BUSY_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        /// Text with `SLOW` takes this long to answer; `SLOW_NOW` and `SLOW_MOST` count how many
+        /// such calls are in progress, and the most there were at once.
+        const SLOW_FOR: std::time::Duration = std::time::Duration::from_millis(400);
+        static SLOW_NOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static SLOW_MOST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         /// The record key of every `deleteRecord` the mock took, newest last.
         static DELETED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -3873,6 +3878,13 @@ mod teams {
                 && BUSY_ONCE.swap(false, std::sync::atomic::Ordering::SeqCst);
             if busy_once || (text.contains("BUSY") && !text.contains("BUSYONCE")) {
                 return refused(429, "RateLimitExceeded");
+            }
+            if text.contains("SLOW") {
+                use std::sync::atomic::Ordering::SeqCst;
+                let now = SLOW_NOW.fetch_add(1, SeqCst) + 1;
+                SLOW_MOST.fetch_max(now, SeqCst);
+                tokio::time::sleep(SLOW_FOR).await;
+                SLOW_NOW.fetch_sub(1, SeqCst);
             }
             if text.contains("REJECT") {
                 let leak = json!({"error": "InvalidRequest",
@@ -6377,7 +6389,7 @@ mod teams {
                 let (cookie, team_id, _) = owner_with_account(&s, &db).await;
                 let set = default_set(&db, &team_id).await.to_string();
                 let mut mine = Vec::new();
-                for i in 0..5 {
+                for i in 0..publish::TEAM_AT_ONCE {
                     let res =
                         create(&s, &cookie, input(&set, &format!("due {i}"), Some(&past()))).await;
                     mine.push(id_of(&res).parse::<uuid::Uuid>().unwrap());
@@ -7722,8 +7734,16 @@ mod teams {
                     posts::Entity::update(row).exec(&db).await.unwrap();
                     mine.push(id);
                 }
+                // A team gets its places a round (`TEAM_AT_ONCE`), never more than 50 in all.
                 let first = publish::claim_due(&db, false).await.unwrap();
-                assert_eq!(first.len(), 50);
+                let own = |claimed: &[(uuid::Uuid, uuid::Uuid)]| {
+                    claimed
+                        .iter()
+                        .filter(|c| c.1.to_string() == team_id)
+                        .count()
+                };
+                assert_eq!(own(&first), publish::TEAM_AT_ONCE);
+                assert!(first.len() <= 50);
                 let mut claimed: Vec<uuid::Uuid> = first.iter().map(|c| c.0).collect();
                 loop {
                     let next = publish::claim_due(&db, false).await.unwrap();
@@ -7841,7 +7861,7 @@ mod teams {
 
             #[tokio::test]
             #[serial]
-            async fn deleted_sets_hold_posts_back() {
+            async fn deleted_sets_fail_their_posts() {
                 let (s, db, state) = on_mock().await;
                 let (cookie, _, _) = owner_with_account(&s, &db).await;
                 let other = id_of(
@@ -7864,14 +7884,13 @@ mod teams {
                     .await
                     .unwrap()
                     .unwrap();
-                assert_eq!(
-                    p.status, "scheduled",
-                    "not claimed while its set is deleted"
-                );
-                // A set deleted after the claim sends the post back to scheduled.
+                assert_eq!(p.status, "failed", "failed by the delete, never claimed");
+                assert_eq!(p.error.as_deref(), Some(publish::SET_DELETED));
+                // A set deleted after the claim fails the post the same way.
                 let row = posts::ActiveModel {
                     id: Set(p.id),
                     status: Set("queued".into()),
+                    error: Set(None),
                     ..Default::default()
                 };
                 posts::Entity::update(row).exec(&db).await.unwrap();
@@ -7881,20 +7900,33 @@ mod teams {
                     .await
                     .unwrap()
                     .unwrap();
-                assert_eq!(p.status, "scheduled");
-                assert!(!p.quota_reserved, "it reserves again when claimed next");
-                // An empty set fails the post with a message.
-                req(
-                    &s,
-                    Method::POST,
-                    &format!("/v1/social-sets/{other}/restore"),
-                    &cookie,
-                )
-                .await;
-                publish::tick(&state).await.unwrap();
-                let p = get_post(&s, &cookie, &id).await;
-                assert_eq!(p["status"], "failed");
-                assert_eq!(p["error"], "No bluesky account is in this post's set.");
+                assert_eq!(p.status, "failed");
+                assert_eq!(p.error.as_deref(), Some(publish::SET_DELETED));
+                // The user's own delete is not mailed as a failure, claimed or not.
+                use sea_orm::ConnectionTrait as _;
+                let notices: i64 = db
+                    .query_one_raw(sea_orm::Statement::from_string(
+                        sea_orm::DbBackend::Postgres,
+                        format!(
+                            "SELECT count(*) AS n FROM post_notices WHERE post_id = '{}'",
+                            p.id
+                        ),
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .try_get("", "n")
+                    .unwrap();
+                assert_eq!(notices, 0);
+                assert_eq!(
+                    RECORDS
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|r| r["record"]["text"] == "held")
+                        .count(),
+                    0
+                );
             }
 
             /// Publishes a text post with one image to the real Bluesky test account and deletes
@@ -8583,12 +8615,180 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
+                async fn a_burst_of_one_teams_posts_is_not_limited_to_one_claim_a_tick() {
+                    use std::sync::atomic::Ordering::SeqCst;
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let mut ids = Vec::new();
+                    for i in 0..30 {
+                        ids.push(
+                            due_ago(
+                                &s,
+                                &db,
+                                &cookie,
+                                input(&set, &format!("SLOW {i}"), Some(&past())),
+                                10,
+                            )
+                            .await,
+                        );
+                    }
+                    SLOW_MOST.store(0, SeqCst);
+                    let started = std::time::Instant::now();
+                    // One tick: each post that ends claims the team's next one at once.
+                    publish::tick(&state).await.unwrap();
+                    let took = started.elapsed();
+                    for id in &ids {
+                        assert_eq!(get_post(&s, &cookie, id).await["status"], "published");
+                    }
+                    // 30 posts of 0.4 seconds, 3 at once: about 4 seconds, not 10 ticks of a minute.
+                    assert!(took < std::time::Duration::from_secs(12), "{took:?}");
+                    let most = SLOW_MOST.load(SeqCst);
+                    assert!(
+                        (2..=publish::TEAM_AT_ONCE).contains(&most),
+                        "never more than the team's places at once, and they are used: {most}"
+                    );
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_team_never_has_more_claimed_than_its_places_when_posts_end_together() {
+                    use sea_orm::ConnectionTrait as _;
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    for i in 0..18 {
+                        due_ago(
+                            &s,
+                            &db,
+                            &cookie,
+                            input(&set, &format!("SLOW {i}"), Some(&past())),
+                            10,
+                        )
+                        .await;
+                    }
+                    let tick = tokio::spawn({
+                        let state = state.clone();
+                        async move { publish::tick(&state).await.unwrap() }
+                    });
+                    let mut most = 0;
+                    while !tick.is_finished() {
+                        let n: i64 = db
+                            .query_one_raw(sea_orm::Statement::from_string(
+                                sea_orm::DbBackend::Postgres,
+                                format!(
+                                    "SELECT count(*) AS n FROM posts \
+                                     WHERE team_id = '{team_id}' AND status = 'queued'"
+                                ),
+                            ))
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .try_get("", "n")
+                            .unwrap();
+                        most = most.max(n);
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    tick.await.unwrap();
+                    assert!(
+                        most as usize <= publish::TEAM_AT_ONCE,
+                        "claimed at once: {most}"
+                    );
+                    assert!(most >= 2, "and the places are used: {most}");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_post_drafted_while_it_is_fanned_out_gets_no_targets() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let id =
+                        due_ago(&s, &db, &cookie, input(&set, "late", Some(&past())), 90).await;
+                    // Claimed, quota held, not fanned out yet; another instance's drafting holds it.
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE posts SET status = 'queued', quota_reserved = true, \
+                             fanned_out = false WHERE id = '{id}'"
+                        ),
+                    )
+                    .await;
+                    let txn = db.begin().await.unwrap();
+                    txn.execute_unprepared(&format!(
+                        "UPDATE posts SET status = 'draft', quota_reserved = false WHERE id = '{id}'"
+                    ))
+                    .await
+                    .unwrap();
+                    let run = tokio::spawn({
+                        let (state, id) = (state.clone(), id.parse().unwrap());
+                        async move { publish::publish_post(&state, id).await.unwrap() }
+                    });
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    assert!(!run.is_finished(), "the fan-out waits for the lock");
+                    txn.commit().await.unwrap();
+                    run.await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "draft", "{p}");
+                    assert_eq!(p["targets"], json!([]), "no targets for a draft: {p}");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_team_with_a_backlog_does_not_hold_up_another_team() {
+                    let (s, db, state) = on_mock().await;
+                    let (a_cookie, a_team, _) = owner_with_account(&s, &db).await;
+                    let a_set = default_set(&db, &a_team).await.to_string();
+                    let (b_cookie, b_team, _) = owner_with_account(&s, &db).await;
+                    let b_set = default_set(&db, &b_team).await.to_string();
+                    // Team A has 60 posts due, all older than team B's single one.
+                    let mut a = Vec::new();
+                    for i in 0..60 {
+                        let id = due_ago(
+                            &s,
+                            &db,
+                            &a_cookie,
+                            input(&a_set, &format!("a {i}"), Some(&past())),
+                            30,
+                        )
+                        .await;
+                        a.push(id);
+                    }
+                    let b = due_ago(&s, &db, &b_cookie, input(&b_set, "b", Some(&past())), 5).await;
+                    let claimed = publish::claim_due(&db, false).await.unwrap();
+                    let team_a = claimed.iter().filter(|c| c.1.to_string() == a_team).count();
+                    assert_eq!(
+                        team_a,
+                        publish::TEAM_AT_ONCE,
+                        "a team gets its places, no more"
+                    );
+                    assert!(
+                        claimed.iter().any(|c| c.0.to_string() == b),
+                        "the other team's post is claimed in the same round"
+                    );
+                    // The claimed posts go out; the rest of A waits scheduled, not late, not stuck.
+                    for (id, _) in &claimed {
+                        publish::publish_post(&state, *id).await.unwrap();
+                    }
+                    assert_eq!(get_post(&s, &b_cookie, &b).await["status"], "published");
+                    let mut waiting = 0;
+                    for id in &a {
+                        if get_post(&s, &a_cookie, id).await["status"] == "scheduled" {
+                            waiting += 1;
+                        }
+                    }
+                    assert_eq!(waiting, 60 - publish::TEAM_AT_ONCE);
+                }
+
+                #[tokio::test]
+                #[serial]
                 async fn a_group_is_claimed_whole_or_not_at_all() {
                     let (s, db, _) = on_mock().await;
                     let (cookie, team_id, _) = owner_with_account(&s, &db).await;
                     let set = default_set(&db, &team_id).await.to_string();
-                    // 49 older posts fill all but one place of the batch of 50.
-                    for i in 0..49 {
+                    // Two older posts leave one place of the team's three: the group of four
+                    // still goes in whole, never cut after its first post.
+                    for i in 0..2 {
                         due_ago(
                             &s,
                             &db,
@@ -8599,13 +8799,13 @@ mod teams {
                         .await;
                     }
                     let group = uuid::Uuid::new_v4();
-                    let mut pair = Vec::new();
-                    for i in 0..2 {
+                    let mut group_posts = Vec::new();
+                    for i in 0..4 {
                         let id = due_ago(
                             &s,
                             &db,
                             &cookie,
-                            input(&set, &format!("pair {i}"), Some(&past())),
+                            input(&set, &format!("group {i}"), Some(&past())),
                             5,
                         )
                         .await;
@@ -8614,19 +8814,14 @@ mod teams {
                             format!("UPDATE posts SET group_id = '{group}' WHERE id = '{id}'"),
                         )
                         .await;
-                        pair.push(id);
+                        group_posts.push(id);
                     }
                     let claimed = publish::claim_due(&db, false).await.unwrap();
                     let mine = claimed
                         .iter()
-                        .filter(|c| pair.contains(&c.0.to_string()))
+                        .filter(|c| group_posts.contains(&c.0.to_string()))
                         .count();
-                    assert_eq!(mine, 2, "both of the group, or neither: {}", claimed.len());
-                    assert_eq!(
-                        claimed.len(),
-                        51,
-                        "the group goes in whole on top of the batch"
-                    );
+                    assert_eq!(mine, 4, "all of the group, or none: {}", claimed.len());
                 }
 
                 #[tokio::test]
@@ -8850,9 +9045,173 @@ mod teams {
                         let body = input(&set, &format!("REJECT {i}"), Some(&past()));
                         create(&s, &cookie, body).await;
                     }
-                    publish::tick(&state).await.unwrap();
-                    publish::tick(&state).await.unwrap();
+                    // A team gets 3 places a round: 4 rounds for the 10, one more to mail them.
+                    for _ in 0..5 {
+                        publish::tick(&state).await.unwrap();
+                    }
                     assert_eq!(mail_for(&seen.lock().unwrap(), &owner).len(), 10);
+                }
+
+                async fn status_of(db: &DatabaseConnection, id: &str) -> String {
+                    posts::Entity::find_by_id(id.parse::<uuid::Uuid>().unwrap())
+                        .one(db)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn posts_claimed_and_not_started_are_released_on_start() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let soon = (Utc::now() + Duration::hours(1)).to_rfc3339();
+                    let idle = id_of(&create(&s, &cookie, input(&set, "idle", Some(&soon))).await);
+                    let started =
+                        id_of(&create(&s, &cookie, input(&set, "started", Some(&soon))).await);
+                    let paid = id_of(&create(&s, &cookie, input(&set, "paid", Some(&soon))).await);
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE posts SET status = 'queued', scheduled_at = now() \
+                             WHERE id IN ('{idle}', '{started}', '{paid}'); \
+                             UPDATE posts SET quota_reserved = true WHERE id = '{paid}'; \
+                             INSERT INTO post_targets (id, post_id, status) \
+                             VALUES (gen_random_uuid(), '{started}', 'publishing')"
+                        ),
+                    )
+                    .await;
+                    let n = publish::release_unstarted(&db).await.unwrap();
+                    assert!(n >= 1);
+                    assert_eq!(status_of(&db, &idle).await, "scheduled");
+                    // Started, or holding its quota (another instance underway): left alone.
+                    assert_eq!(status_of(&db, &started).await, "queued");
+                    assert_eq!(status_of(&db, &paid).await, "queued");
+                    // Other tests' posts it released may fill a round first.
+                    for _ in 0..10 {
+                        publish::tick(&state).await.unwrap();
+                        if status_of(&db, &idle).await != "scheduled" {
+                            break;
+                        }
+                    }
+                    assert_eq!(status_of(&db, &idle).await, "published");
+                    exec(
+                        &db,
+                        format!(
+                            "DELETE FROM post_targets WHERE post_id = '{started}'; \
+                             UPDATE posts SET status = 'draft' WHERE id IN ('{started}', '{paid}')"
+                        ),
+                    )
+                    .await;
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_daily_post_keeps_its_time_in_the_queue_zone_across_dst() {
+                    let (s, db, _) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    exec(
+                        &db,
+                        format!(
+                            "INSERT INTO queue_schedules (social_set_id, team_id, time_zone) \
+                             VALUES ('{set}', '{team_id}', 'America/New_York')"
+                        ),
+                    )
+                    .await;
+                    // 9:00 in New York the day before clocks spring forward (EST, 14:00 UTC).
+                    let at = "2027-03-13T14:00:00Z";
+                    let id = id_of(&create(&s, &cookie, input(&set, "nine", Some(at))).await);
+                    let rule =
+                        json!({"every": "day", "interval": 1, "until": null, "remaining": 2});
+                    let res = req(&s, Method::PUT, &format!("/v1/posts/{id}/repeat"), &cookie)
+                        .json(&rule)
+                        .await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let res = req(
+                        &s,
+                        Method::POST,
+                        &format!("/v1/posts/{id}/publish"),
+                        &cookie,
+                    )
+                    .await;
+                    assert_eq!(res.status_code(), 202, "{}", res.text());
+                    settled(&s, &cookie, &id).await;
+                    let copies = posts::Entity::find()
+                        .filter(posts::Column::TeamId.eq(team_id.parse::<uuid::Uuid>().unwrap()))
+                        .filter(posts::Column::Status.eq("scheduled"))
+                        .all(&db)
+                        .await
+                        .unwrap();
+                    assert_eq!(copies.len(), 1);
+                    // 9:00 EDT is 13:00 UTC.
+                    let next = copies[0].scheduled_at.unwrap().to_utc();
+                    assert_eq!(next.to_rfc3339(), "2027-03-14T13:00:00+00:00");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn deleting_a_set_fails_its_scheduled_posts() {
+                    let (s, db, _) = on_mock().await;
+                    let (cookie, _, _) = owner_with_account(&s, &db).await;
+                    let res = req(&s, Method::POST, "/v1/social-sets", &cookie)
+                        .json(&json!({"name": format!("Gone {}", uuid::Uuid::now_v7())}))
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let set = id_of(&res);
+                    let soon = (Utc::now() + Duration::hours(1)).to_rfc3339();
+                    let res = create(&s, &cookie, input(&set, "planned", Some(&soon))).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let id = id_of(&res);
+                    let draft = id_of(&create(&s, &cookie, input(&set, "draft", None)).await);
+                    req(
+                        &s,
+                        Method::DELETE,
+                        &format!("/v1/social-sets/{set}"),
+                        &cookie,
+                    )
+                    .json(&json!({}))
+                    .await
+                    .assert_status(axum::http::StatusCode::NO_CONTENT);
+                    let p = posts::Entity::find_by_id(id.parse::<uuid::Uuid>().unwrap())
+                        .one(&db)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(p.status, "failed");
+                    assert_eq!(p.error.as_deref(), Some(publish::SET_DELETED));
+                    assert_eq!(status_of(&db, &draft).await, "draft");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_repeat_copy_that_cannot_be_made_is_mailed_about() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let id = id_of(&create(&s, &cookie, input(&set, "rule", Some(&past()))).await);
+                    // A rule that cannot be read: the copy fails, the post still goes out.
+                    exec(
+                        &db,
+                        format!("UPDATE posts SET repeat = '{{\"every\": 5}}' WHERE id = '{id}'"),
+                    )
+                    .await;
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(status_of(&db, &id).await, "published");
+                    let row = db
+                        .query_one_raw(sea_orm::Statement::from_string(
+                            sea_orm::DbBackend::Postgres,
+                            format!(
+                                "SELECT count(*) AS n FROM post_notices \
+                                 WHERE post_id = '{id}' AND kind = 'repeat_ended'"
+                            ),
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(row.try_get::<i64>("", "n").unwrap(), 1);
                 }
 
                 #[test]
