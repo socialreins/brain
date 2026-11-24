@@ -110,9 +110,14 @@ cargo run -p socialreins-brain
   connection that never opened) and never once its remote id is saved.
 - `app/src/publish.rs`: on start, `release_unstarted` hands posts claimed and never started back to
   `scheduled`. A team publishes at most `TEAM_AT_ONCE` (3) posts and 3 targets at once in a
-  process, taken before the shared slots. Deleting a set fails its scheduled posts
-  (`SET_DELETED`); the 30-day purge deletes the set with all its posts (cascade). Repeats step
-  in the set's queue time zone (`repeat.rs`), and a copy that cannot be made is mailed about.
+  process, taken before the shared slots, and a round claims a team no more posts than it has
+  places left (counted from `IN_FLIGHT`, whole groups at a time), so a team's backlog stays
+  `scheduled` and never fills the batch, goes stuck or counts as late while it only waits. The
+  cap is per process: with several instances a team gets 3 on each (a shortcut, noted in the
+  README). Deleting a set fails its scheduled posts
+  (`SET_DELETED`), and one already claimed the same way, with no mail either: the user did it; the 30-day purge deletes the set with all its posts (cascade). Repeats step
+  in the set's queue time zone (`repeat.rs`; a copy a clock change moved, 2:30 to 3:30, keeps the
+  time it was meant for in the rule's hidden `time`, so the series returns to 2:30), and a copy that cannot be made is mailed about.
 - `app/src/post_mail.rs`: a post that settles as failed or partly failed, or goes back to draft
   for being late, queues a `post_notices` row in the same transaction; each publish round mails
   the queued ones in the background to the post's author and the team's owners, once, at most

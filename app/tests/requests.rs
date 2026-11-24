@@ -5988,7 +5988,7 @@ mod teams {
                 let (cookie, team_id, _) = owner_with_account(&s, &db).await;
                 let set = default_set(&db, &team_id).await.to_string();
                 let mut mine = Vec::new();
-                for i in 0..5 {
+                for i in 0..publish::TEAM_AT_ONCE {
                     let res =
                         create(&s, &cookie, input(&set, &format!("due {i}"), Some(&past()))).await;
                     mine.push(id_of(&res).parse::<uuid::Uuid>().unwrap());
@@ -7147,8 +7147,9 @@ mod teams {
                     posts::Entity::update(row).exec(&db).await.unwrap();
                     mine.push(id);
                 }
+                // A team gets its places a round (`TEAM_AT_ONCE`), never more than 50 in all.
                 let first = publish::claim_due(&db, false).await.unwrap();
-                assert_eq!(first.len(), 50);
+                assert_eq!(first.len(), publish::TEAM_AT_ONCE);
                 let mut claimed: Vec<uuid::Uuid> = first.iter().map(|c| c.0).collect();
                 loop {
                     let next = publish::claim_due(&db, false).await.unwrap();
@@ -7307,6 +7308,22 @@ mod teams {
                     .unwrap();
                 assert_eq!(p.status, "failed");
                 assert_eq!(p.error.as_deref(), Some(publish::SET_DELETED));
+                // The user's own delete is not mailed as a failure, claimed or not.
+                use sea_orm::ConnectionTrait as _;
+                let notices: i64 = db
+                    .query_one_raw(sea_orm::Statement::from_string(
+                        sea_orm::DbBackend::Postgres,
+                        format!(
+                            "SELECT count(*) AS n FROM post_notices WHERE post_id = '{}'",
+                            p.id
+                        ),
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .try_get("", "n")
+                    .unwrap();
+                assert_eq!(notices, 0);
                 assert_eq!(
                     RECORDS
                         .lock()
@@ -7933,12 +7950,60 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
+                async fn a_team_with_a_backlog_does_not_hold_up_another_team() {
+                    let (s, db, state) = on_mock().await;
+                    let (a_cookie, a_team, _) = owner_with_account(&s, &db).await;
+                    let a_set = default_set(&db, &a_team).await.to_string();
+                    let (b_cookie, b_team, _) = owner_with_account(&s, &db).await;
+                    let b_set = default_set(&db, &b_team).await.to_string();
+                    // Team A has 60 posts due, all older than team B's single one.
+                    let mut a = Vec::new();
+                    for i in 0..60 {
+                        let id = due_ago(
+                            &s,
+                            &db,
+                            &a_cookie,
+                            input(&a_set, &format!("a {i}"), Some(&past())),
+                            30,
+                        )
+                        .await;
+                        a.push(id);
+                    }
+                    let b = due_ago(&s, &db, &b_cookie, input(&b_set, "b", Some(&past())), 5).await;
+                    let claimed = publish::claim_due(&db, false).await.unwrap();
+                    let team_a = claimed.iter().filter(|c| c.1.to_string() == a_team).count();
+                    assert_eq!(
+                        team_a,
+                        publish::TEAM_AT_ONCE,
+                        "a team gets its places, no more"
+                    );
+                    assert!(
+                        claimed.iter().any(|c| c.0.to_string() == b),
+                        "the other team's post is claimed in the same round"
+                    );
+                    // The claimed posts go out; the rest of A waits scheduled, not late, not stuck.
+                    for (id, _) in &claimed {
+                        publish::publish_post(&state, *id).await.unwrap();
+                    }
+                    assert_eq!(get_post(&s, &b_cookie, &b).await["status"], "published");
+                    let mut waiting = 0;
+                    for id in &a {
+                        if get_post(&s, &a_cookie, id).await["status"] == "scheduled" {
+                            waiting += 1;
+                        }
+                    }
+                    assert_eq!(waiting, 60 - publish::TEAM_AT_ONCE);
+                }
+
+                #[tokio::test]
+                #[serial]
                 async fn a_group_is_claimed_whole_or_not_at_all() {
                     let (s, db, _) = on_mock().await;
                     let (cookie, team_id, _) = owner_with_account(&s, &db).await;
                     let set = default_set(&db, &team_id).await.to_string();
-                    // 49 older posts fill all but one place of the batch of 50.
-                    for i in 0..49 {
+                    // Two older posts leave one place of the team's three: the group of four
+                    // still goes in whole, never cut after its first post.
+                    for i in 0..2 {
                         due_ago(
                             &s,
                             &db,
@@ -7949,13 +8014,13 @@ mod teams {
                         .await;
                     }
                     let group = uuid::Uuid::new_v4();
-                    let mut pair = Vec::new();
-                    for i in 0..2 {
+                    let mut group_posts = Vec::new();
+                    for i in 0..4 {
                         let id = due_ago(
                             &s,
                             &db,
                             &cookie,
-                            input(&set, &format!("pair {i}"), Some(&past())),
+                            input(&set, &format!("group {i}"), Some(&past())),
                             5,
                         )
                         .await;
@@ -7964,19 +8029,14 @@ mod teams {
                             format!("UPDATE posts SET group_id = '{group}' WHERE id = '{id}'"),
                         )
                         .await;
-                        pair.push(id);
+                        group_posts.push(id);
                     }
                     let claimed = publish::claim_due(&db, false).await.unwrap();
                     let mine = claimed
                         .iter()
-                        .filter(|c| pair.contains(&c.0.to_string()))
+                        .filter(|c| group_posts.contains(&c.0.to_string()))
                         .count();
-                    assert_eq!(mine, 2, "both of the group, or neither: {}", claimed.len());
-                    assert_eq!(
-                        claimed.len(),
-                        51,
-                        "the group goes in whole on top of the batch"
-                    );
+                    assert_eq!(mine, 4, "all of the group, or none: {}", claimed.len());
                 }
 
                 #[tokio::test]
@@ -8182,8 +8242,10 @@ mod teams {
                         let body = input(&set, &format!("REJECT {i}"), Some(&past()));
                         create(&s, &cookie, body).await;
                     }
-                    publish::tick(&state).await.unwrap();
-                    publish::tick(&state).await.unwrap();
+                    // A team gets 3 places a round: 4 rounds for the 10, one more to mail them.
+                    for _ in 0..5 {
+                        publish::tick(&state).await.unwrap();
+                    }
                     assert_eq!(mail_for(&seen.lock().unwrap(), &owner).len(), 10);
                 }
 

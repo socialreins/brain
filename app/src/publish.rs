@@ -1119,7 +1119,8 @@ pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, D
     let left = ids(&app.db, stmt, "id").await?;
     // The quota is reserved per post in `publish_post`, together with marking it reserved.
     let mut flights = Vec::new();
-    for (id, _) in claim(&app.db, room, app.billing_enabled).await? {
+    let busy = busy_teams(&app.db, &running).await?;
+    for (id, _) in claim(&app.db, room, app.billing_enabled, &busy).await? {
         if in_flight(|flying| flying.insert(id)) {
             flights.push(Flight(id));
         // Put back by a task that has not ended yet and claimed again here: nothing would run
@@ -1165,23 +1166,43 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
 /// a live set, of a team under its daily publish cap (and with `billing`, on a live plan), and none `rejected`, nor `pending` while its
 /// team requires approval. Returns `(post, team)`.
 pub async fn claim_due(db: &DatabaseConnection, billing: bool) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
-    claim(db, CLAIM_BATCH, billing).await
+    claim(db, CLAIM_BATCH, billing, &HashMap::new()).await
+}
+
+/// How many of `posts` each team has in flight in this process.
+async fn busy_teams(db: &DatabaseConnection, posts: &[Uuid]) -> Result<HashMap<Uuid, i32>, DbErr> {
+    let stmt = sql(
+        "SELECT team_id, count(*)::int AS n FROM posts WHERE id = ANY($1::uuid[]) \
+         GROUP BY team_id",
+        vec![posts.to_vec().into()],
+    );
+    let mut busy = HashMap::new();
+    for row in db.query_all_raw(stmt).await? {
+        busy.insert(row.try_get("", "team_id")?, row.try_get("", "n")?);
+    }
+    Ok(busy)
 }
 
 /// `claim_due` of at most `limit` posts. A claimed post with a repeat rule yields its next copy
-/// in the same transaction (`repeat::spawn`), so it does once.
+/// in the same transaction (`repeat::spawn`), so it does once. A team is claimed no more posts
+/// than it has places left (`TEAM_AT_ONCE` less its posts in `busy`, in flight here): a post
+/// that could only wait for its team's places stays `scheduled`, counts nowhere against the
+/// batch and is neither stuck nor late until it gets one, so one team's backlog never keeps
+/// another team's post from going out on time.
 async fn claim(
     db: &DatabaseConnection,
     limit: i64,
     billing: bool,
+    busy: &HashMap<Uuid, i32>,
 ) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
     // A CTE runs once; a LIMIT inside `IN (...)` may be re-run and claim more. The posts of one
     // group (`group_id`, one per platform) are claimed together or not at all, so they are all
     // judged by the same clock (`LATE_MINUTES`): the batch is cut between groups, never inside
-    // one, and the first group always fits.
+    // one, and the first group of a team and of the batch always fits.
     let stmt = sql(
         "WITH cand AS ( \
-           SELECT d.id, COALESCE(d.group_id, d.id) AS gk, d.scheduled_at FROM posts d \
+           SELECT d.id, d.team_id, COALESCE(d.group_id, d.id) AS gk, d.scheduled_at \
+           FROM posts d \
            WHERE d.status = 'scheduled' AND d.scheduled_at <= now() \
            AND d.scheduled_at >= now() - make_interval(mins => $4) \
            AND d.approval IS DISTINCT FROM 'rejected' \
@@ -1194,10 +1215,16 @@ async fn claim(
            AND (SELECT count(*) FROM rate_limit_hits h \
                 WHERE h.bucket = 'publish:team:' || d.team_id::text \
                 AND h.created_at > now() - interval '1 day') < $1), \
+         grp AS (SELECT team_id, gk, min(scheduled_at) AS at, count(*) AS n \
+                 FROM cand GROUP BY team_id, gk), \
+         room AS ( \
+           SELECT g.team_id, g.gk, g.at, g.n FROM (SELECT *, sum(n) OVER (PARTITION BY team_id \
+                  ORDER BY at, gk) - n AS before FROM grp) g \
+           LEFT JOIN unnest($5::uuid[], $6::int[]) AS b(team_id, n) ON b.team_id = g.team_id \
+           WHERE g.before < $7 - COALESCE(b.n, 0)), \
          fit AS ( \
-           SELECT gk FROM (SELECT gk, sum(count(*)) OVER (ORDER BY min(scheduled_at), gk) \
-                                      - count(*) AS before \
-                           FROM cand GROUP BY gk) g WHERE before < $2), \
+           SELECT gk FROM (SELECT gk, sum(n) OVER (ORDER BY at, gk) - n AS before \
+                           FROM room) g WHERE before < $2), \
          due AS ( \
            SELECT p.id FROM posts p JOIN cand c ON c.id = p.id JOIN fit f ON f.gk = c.gk \
            ORDER BY c.scheduled_at, p.id FOR UPDATE OF p SKIP LOCKED) \
@@ -1209,6 +1236,9 @@ async fn claim(
             limit.into(),
             billing.into(),
             (LATE_MINUTES as i32).into(),
+            busy.keys().copied().collect::<Vec<_>>().into(),
+            busy.values().copied().collect::<Vec<_>>().into(),
+            (TEAM_AT_ONCE as i32).into(),
         ],
     );
     let txn = db.begin().await?;
@@ -1469,13 +1499,23 @@ pub async fn recover_stuck(db: &DatabaseConnection) -> Result<(), DbErr> {
 }
 
 async fn fail_post(db: &DatabaseConnection, id: Uuid, msg: &str) -> Result<(), DbErr> {
+    fail_post_mail(db, id, msg, true).await
+}
+
+/// `fail_post`, mailing the failure only when `mail`: not for an outcome the user caused.
+async fn fail_post_mail(
+    db: &DatabaseConnection,
+    id: Uuid,
+    msg: &str,
+    mail: bool,
+) -> Result<(), DbErr> {
     let stmt = sql(
         "UPDATE posts SET status = 'failed', error = $2, updated_at = now() \
          WHERE id = $1 AND status = 'queued'",
         vec![id.into(), msg.into()],
     );
     let txn = db.begin().await?;
-    if txn.execute_raw(stmt).await?.rows_affected() == 1 {
+    if txn.execute_raw(stmt).await?.rows_affected() == 1 && mail {
         crate::post_mail::queue(&txn, id, crate::post_mail::Kind::Failed).await?;
     }
     txn.commit().await
@@ -1552,8 +1592,9 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         .await?
         .is_some();
     if !set_live {
-        // The set was deleted after the claim: as the delete fails its scheduled posts.
-        return fail_post(db, id, SET_DELETED).await;
+        // The set was deleted after the claim: as the delete fails its scheduled posts, and
+        // as that, with no mail: the user did it.
+        return fail_post_mail(db, id, SET_DELETED, false).await;
     }
     if publisher(app, &post.platform).is_none() {
         let msg = format!("Publishing to {} is not available yet.", post.platform);

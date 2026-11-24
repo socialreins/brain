@@ -6,7 +6,8 @@
 //! queue time zone (`queue_schedules`, UTC without one), so a daily 9:00 post stays at 9:00
 //! across a daylight saving change.
 use chrono::{
-    DateTime, Datelike, Duration, FixedOffset, Months, NaiveDate, NaiveDateTime, TimeZone, Utc,
+    DateTime, Datelike, Duration, FixedOffset, Months, NaiveDate, NaiveDateTime, NaiveTime,
+    TimeZone, Utc,
 };
 use chrono_tz::Tz;
 use schemars::JsonSchema;
@@ -45,6 +46,13 @@ pub struct Repeat {
     #[schema(ignore)]
     #[schemars(skip)]
     pub day: Option<u32>,
+    /// The wall-clock time (`HH:MM:SS`) a copy a clock change moved was meant for (2:30 is 3:30
+    /// on the day clocks spring forward), so the next one is counted from 2:30 again. Never read
+    /// from a request.
+    #[serde(default, skip_serializing)]
+    #[schema(ignore)]
+    #[schemars(skip)]
+    pub time: Option<String>,
 }
 
 impl Repeat {
@@ -70,6 +78,9 @@ impl Repeat {
         if let Some(day) = self.day {
             v["day"] = day.into();
         }
+        if let Some(time) = &self.time {
+            v["time"] = time.clone().into();
+        }
         v
     }
 
@@ -84,6 +95,18 @@ impl Repeat {
     ) -> Option<(DateTime<Utc>, Option<Self>)> {
         let interval = u32::try_from(self.interval).ok()?;
         let from = from.with_timezone(&zone).naive_local();
+        // A copy a clock change moved is counted from the time it was meant for, if it still
+        // stands where that time puts it (a post the user moved since is counted from itself).
+        let from = self
+            .time
+            .as_deref()
+            .and_then(|t| t.parse::<NaiveTime>().ok())
+            .and_then(|t| {
+                let meant = from.date().and_time(t);
+                let put = on_clock(zone, meant)?.with_timezone(&zone).naive_local();
+                (put == from).then_some(meant)
+            })
+            .unwrap_or(from);
         // The day a monthly rule aims for: the post's, or the one a short month cut it from.
         let clamped = (from + Duration::days(1)).day() == 1;
         let day = self.day.filter(|d| clamped && *d > from.day());
@@ -113,6 +136,8 @@ impl Repeat {
         let rule = (self.remaining != Some(1)).then(|| Self {
             remaining: self.remaining.map(|n| n - 1),
             day: Some(day).filter(|d| *d != local.day()),
+            time: (at.with_timezone(&zone).naive_local() != local)
+                .then(|| local.time().to_string()),
             ..self.clone()
         });
         Some((at, rule))
@@ -236,6 +261,7 @@ mod tests {
             until: None,
             remaining: None,
             day: None,
+            time: None,
         }
     }
 
@@ -333,6 +359,33 @@ mod tests {
             at("2026-03-09T02:00:00Z")
         );
         assert_eq!(r.next(from, from, Tz::UTC), None);
+    }
+
+    #[test]
+    fn a_time_a_clock_change_moved_comes_back() {
+        let york: Tz = "America/New_York".parse().unwrap();
+        let r = rule("day", 1);
+        // 2:30 EST the day before: the 8th springs forward over it, so the copy is 3:30 EDT.
+        let from = at("2026-03-07T07:30:00Z");
+        let (spring, kept) = r.next(from, from, york).unwrap();
+        assert_eq!(spring, at("2026-03-08T07:30:00Z"));
+        let kept = kept.unwrap();
+        assert_eq!(kept.time.as_deref(), Some("02:30:00"));
+        assert_eq!(kept.stored()["time"], "02:30:00");
+        // The next one is 2:30 EDT again, and nothing more is remembered.
+        let (next, kept) = kept.next(spring, spring, york).unwrap();
+        assert_eq!(next, at("2026-03-09T06:30:00Z"));
+        assert_eq!(kept.unwrap().time, None);
+        // A copy the user moved to another time follows that time.
+        let moved = Repeat {
+            time: Some("02:30:00".into()),
+            ..r
+        };
+        let from = at("2026-03-08T13:00:00Z");
+        assert_eq!(
+            moved.next(from, from, york).unwrap().0,
+            at("2026-03-09T13:00:00Z")
+        );
     }
 
     #[test]
