@@ -14675,7 +14675,11 @@ mod teams {
                     let row = x_account(&db, &team_id).await;
                     assert_eq!(access_of(&row), "xtok");
                     assert!(refresh_of(&row).starts_with("xr-"));
-                    assert!(!row.meta.to_string().contains("xr-"), "sealed at rest");
+                    // The whole token: the sealed text is base64 and may hold "xr-" by chance.
+                    assert!(
+                        !row.meta.to_string().contains(&refresh_of(&row)),
+                        "sealed at rest"
+                    );
                     let left = row.token_expires_at.unwrap().timestamp() - Utc::now().timestamp();
                     assert!((7100..=7200).contains(&left), "{left}");
 
