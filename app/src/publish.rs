@@ -1428,19 +1428,79 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
             .into_tuple()
             .all(db)
             .await?;
+        // Only the accounts the post was given, when it names them. One gone since (left the
+        // set, or disconnected) gets a failed target saying so, never a silent skip.
+        let chosen: Option<Vec<Uuid>> = post
+            .account_ids
+            .clone()
+            .and_then(|v| serde_json::from_value(v).ok());
+        let mut gone = Vec::new();
+        let accounts = match chosen {
+            None => accounts,
+            Some(chosen) => {
+                for c in chosen.iter().filter(|c| !accounts.contains(c)) {
+                    gone.push(
+                        match social_accounts::Entity::find_by_id(*c).one(db).await? {
+                            Some(_) => (Some(*c), "Not sent: the account left this post's set."),
+                            None => (None, "Not sent: the account was disconnected."),
+                        },
+                    );
+                }
+                accounts
+                    .into_iter()
+                    .filter(|a| chosen.contains(a))
+                    .collect()
+            }
+        };
+        // One transaction, so a crash before `fanned_out` leaves no target behind. A gone
+        // account that was disconnected has no id to conflict on: count those already there.
+        let txn = db.begin().await?;
+        let stmt = sql(
+            "SELECT count(*) AS n FROM post_targets WHERE post_id = $1 AND social_account_id IS NULL",
+            vec![id.into()],
+        );
+        let had: i64 = match txn.query_one_raw(stmt).await? {
+            Some(r) => r.try_get("", "n")?,
+            None => 0,
+        };
+        let mut nulls = 0;
+        for (account, why) in gone {
+            if account.is_none() {
+                nulls += 1;
+                if nulls <= had {
+                    continue;
+                }
+            }
+            let target = Uuid::now_v7();
+            let stmt = sql(
+                "INSERT INTO post_targets (id, post_id, social_account_id, status) \
+                 VALUES ($1, $2, $3, 'pending') ON CONFLICT (post_id, social_account_id) DO NOTHING",
+                vec![target.into(), id.into(), account.into()],
+            );
+            txn.execute_raw(stmt).await?;
+            let stmt = sql(
+                &with_event(
+                    "UPDATE post_targets SET status = 'failed', error = $2, updated_at = now() \
+                     WHERE id = $1",
+                ),
+                vec![target.into(), why.into()],
+            );
+            txn.execute_raw(stmt).await?;
+        }
         for account in &accounts {
             let stmt = sql(
                 "INSERT INTO post_targets (id, post_id, social_account_id, status) \
                  VALUES ($1, $2, $3, 'pending') ON CONFLICT (post_id, social_account_id) DO NOTHING",
                 vec![Uuid::now_v7().into(), id.into(), (*account).into()],
             );
-            db.execute_raw(stmt).await?;
+            txn.execute_raw(stmt).await?;
         }
         let mark = sql(
             "UPDATE posts SET fanned_out = true WHERE id = $1",
             vec![id.into()],
         );
-        db.execute_raw(mark).await?;
+        txn.execute_raw(mark).await?;
+        txn.commit().await?;
     }
     let targets = post_targets::Entity::find()
         .filter(post_targets::Column::PostId.eq(id))
