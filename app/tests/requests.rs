@@ -24504,7 +24504,7 @@ mod teams {
                         flow("x", json!([dm("x"), wait(-1), dm("y")])),
                         "invalid_body",
                     ),
-                    (flow("x", json!([{"type": "like"}])), "invalid_body"),
+                    (flow("x", json!([{"type": "follow"}])), "invalid_body"),
                     (
                         flow("x", json!([{"type": "wait", "minutes": 5, "text": "x"}])),
                         "invalid_body",
