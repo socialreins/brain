@@ -939,8 +939,9 @@ fn author(v: &Value) -> Option<Author> {
     })
 }
 
-/// A reply to the account (`comment`), a mention or quote of it (`mention`), or a new follower
-/// (`follow`: the follow record, no text).
+/// A reply to the account (`comment`), a mention or quote of it (`mention`), or activity that
+/// needs no answer: a new follower (`follow`: the follow record), a like or a repost of one of
+/// its posts (`like`, `repost`: `parent_uri` is that post). Activity has no text.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Notification {
     pub kind: &'static str,
@@ -954,6 +955,8 @@ pub struct Notification {
     pub indexed_at: DateTime<FixedOffset>,
     /// Images, a video or a link card the post embeds.
     pub attachments: Vec<Attachment>,
+    /// Where to look at it: the liked or reposted post for `like` and `repost`.
+    pub permalink: Option<String>,
 }
 
 /// A blob's cid, when it is one: letters and digits only, so it is safe in a CDN path.
@@ -1017,20 +1020,36 @@ pub fn notification(n: &Value) -> Option<Notification> {
         "reply" => "comment",
         "mention" | "quote" => "mention",
         "follow" => "follow",
+        "like" => "like",
+        "repost" => "repost",
         _ => return None,
     };
     let uri = n["uri"].as_str()?.to_owned();
     let cid = n["cid"].as_str().map(str::to_owned);
     let reply = &n["record"]["reply"];
-    let root = match reply["root"]["uri"].as_str() {
-        Some(r) => (
+    let liked = matches!(kind, "like" | "repost")
+        .then(|| n["reasonSubject"].as_str())
+        .flatten()
+        .filter(|u| post_key(u).is_some());
+    // A like of something that is not a post is no activity on one of ours.
+    if matches!(kind, "like" | "repost") && liked.is_none() {
+        return None;
+    }
+    let root = match (liked, reply["root"]["uri"].as_str()) {
+        (Some(post), _) => (
+            post.to_owned(),
+            n["record"]["subject"]["cid"].as_str().map(str::to_owned),
+        ),
+        (None, Some(r)) => (
             r.to_owned(),
             reply["root"]["cid"].as_str().map(str::to_owned),
         ),
-        None => (uri.clone(), cid.clone()),
+        (None, None) => (uri.clone(), cid.clone()),
     };
     let author = author(&n["author"])?;
     Some(Notification {
+        permalink: liked.and_then(post_url),
+        parent_uri: liked.or(reply["parent"]["uri"].as_str()).map(str::to_owned),
         kind,
         cid,
         attachments: embed_attachments(
@@ -1040,11 +1059,62 @@ pub fn notification(n: &Value) -> Option<Notification> {
         ),
         author,
         text: n["record"]["text"].as_str().unwrap_or_default().to_owned(),
-        parent_uri: reply["parent"]["uri"].as_str().map(str::to_owned),
         root,
         indexed_at: time(&n["indexedAt"])?,
         uri,
     })
+}
+
+/// A post in the thread above an inbox item.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ThreadPost {
+    pub uri: String,
+    pub author: Author,
+    pub text: String,
+    pub at: Option<DateTime<FixedOffset>>,
+    pub attachments: Vec<Attachment>,
+}
+
+/// The posts above a `getPostThread` answer's own post, oldest first, and the post itself last
+/// when `with_post`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Thread {
+    pub posts: Vec<ThreadPost>,
+    /// The chain stops at a post that is deleted or hidden from the account.
+    pub truncated: bool,
+}
+
+/// Walks `parent` links from a `threadViewPost`, at most 25 up (what was asked for).
+pub fn thread_above(node: &Value, with_post: bool) -> Thread {
+    let mut posts = Vec::new();
+    let mut truncated = false;
+    let mut cur = if with_post { node } else { &node["parent"] };
+    while !cur.is_null() && posts.len() < 26 {
+        if cur["$type"] != "app.bsky.feed.defs#threadViewPost" {
+            truncated = true;
+            break;
+        }
+        let post = &cur["post"];
+        if let (Some(uri), Some(who)) = (post["uri"].as_str(), author(&post["author"])) {
+            posts.push(ThreadPost {
+                attachments: embed_attachments(
+                    &who.did,
+                    &post["record"]["embed"],
+                    post_url(uri).as_deref(),
+                ),
+                text: post["record"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                at: time(&post["record"]["createdAt"]).or_else(|| time(&post["indexedAt"])),
+                uri: uri.to_owned(),
+                author: who,
+            });
+        }
+        cur = &cur["parent"];
+    }
+    posts.reverse();
+    Thread { posts, truncated }
 }
 
 /// A DM someone sent the account.
@@ -1191,6 +1261,30 @@ impl Bluesky {
         Ok(got["posts"].as_array().cloned().unwrap_or_default())
     }
 
+    /// The posts above `uri` in its thread, oldest first, as `account` sees them. `truncated`
+    /// when the chain ends at a post that is gone or hidden from the account. `PostGone` when
+    /// `uri` itself is gone.
+    pub async fn thread_above(
+        &self,
+        c: &Creds<'_>,
+        uri: &str,
+        with_post: bool,
+    ) -> Result<Thread, InboxError> {
+        let q = [("uri", uri), ("depth", "0"), ("parentHeight", "25")];
+        let got = self
+            .xrpc(c, "app.bsky.feed.getPostThread", &q, None)
+            .await
+            .map_err(|e| match e {
+                InboxError::Refused { ref code, .. } if code == "NotFound" => InboxError::PostGone,
+                e => e,
+            })?;
+        // The post itself is blocked, hidden or gone: nothing to show.
+        if got["thread"]["$type"] != "app.bsky.feed.defs#threadViewPost" {
+            return Err(InboxError::PostGone);
+        }
+        Ok(thread_above(&got["thread"], with_post))
+    }
+
     /// Whether a reply to `post` would show: Bluesky still serves it, its author does not block
     /// this account and its thread takes replies from it. Nothing is sent either way. A check
     /// that cannot be made (an outage, an unknown post view) lets the reply try.
@@ -1233,6 +1327,8 @@ impl Bluesky {
                 ("reasons", "mention"),
                 ("reasons", "quote"),
                 ("reasons", "follow"),
+                ("reasons", "like"),
+                ("reasons", "repost"),
             ];
             if let Some(c) = &cursor {
                 query.push(("cursor", c));
