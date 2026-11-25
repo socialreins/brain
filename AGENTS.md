@@ -239,6 +239,7 @@ cargo run -p socialreins-brain
   equals a code (`rename` checks, `insert_team` draws again) and is unique on `lower(slug)`; the
   code is permanent, the slug may change (5 times a day per team). One given up stops resolving at once and is
   kept from other teams for 30 days (`team_slug_holds`, written in the same transaction).
+- `app/src/dry_run.rs`: `POST /v1/automations/test`, "Test this automation". It runs the real matching (`automations::mismatches`), `network_limits`, `{name}` and `{page}` filling and the AI step (`automations::ai_write`, shared with the real send, so the key choice, the monthly allowance and the checks are the same) on a sample from a stranger, and sends nothing, stores no inbox item or run and takes no daily hit. Keep it in step with `automations::run_matching` and `act` when a rule changes.
 - `app/src/webhooks.rs`: outbound webhooks. Every `post_targets` status change goes through
   `webhooks::with_event`, so its event is queued in the same statement; README documents the
   payload and signature.
