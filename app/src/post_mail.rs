@@ -102,7 +102,7 @@ async fn send_one(app: &AppState, post: Uuid, team: Uuid, kind: Kind) -> Result<
     let found = app
         .db
         .query_one_raw(sql(
-            "SELECT p.platform, p.body, p.error, p.scheduled_at, t.code FROM posts p \
+            "SELECT p.platform, p.body, p.error, p.scheduled_at, COALESCE(t.slug, t.code) AS code FROM posts p \
              JOIN teams t ON t.id = p.team_id WHERE p.id = $1",
             vec![post.into()],
         ))

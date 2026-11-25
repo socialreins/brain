@@ -852,6 +852,10 @@ pub enum InboxError {
     ThreadsDenied,
     /// Threads refused the call, or could not be reached; the scrubbed reason.
     Threads(String),
+    /// YouTube refused the channel's token or a permission is missing: connect the channel again.
+    YouTubeReconnect,
+    /// YouTube refused the call, or could not be reached; what to tell a person.
+    YouTube(String),
 }
 
 impl InboxError {
@@ -876,6 +880,8 @@ impl InboxError {
             Self::ThreadsReconnect => "threads_reconnect_required",
             Self::ThreadsDenied => "threads_permission_missing",
             Self::Threads(_) => "threads_failed",
+            Self::YouTubeReconnect => "youtube_reconnect_required",
+            Self::YouTube(_) => "youtube_failed",
         }
     }
 
@@ -947,6 +953,16 @@ impl InboxError {
                                                 misleading, sexual, rude or other); what you add \
                                                 takes up to 2000 characters."
                 .into(),
+            Self::Invalid("youtube_no_dm") => "YouTube has no direct messages and no private \
+                                               replies. Only a public reply works."
+                .into(),
+            Self::Invalid("reply_not_found") => "That reply is not on this comment.".into(),
+            Self::Invalid("youtube_write_budget") => "This channel used the 40 replies and \
+                                                     moderation calls it may make a day (each \
+                                                     costs 50 of YouTube's quota units). Try \
+                                                     again after midnight Pacific time."
+                .into(),
+            Self::Invalid("rejected") => "This comment was rejected, so it takes no reply.".into(),
             Self::Invalid(code) => format!("Not sent ({code})."),
             Self::MetaReconnect => "Meta refused the Page's token or a permission is missing. \
                                     Connect the account again under Connections."
@@ -968,6 +984,10 @@ impl InboxError {
                                     Connections and accept the new permissions."
                 .into(),
             Self::Threads(why) => format!("Threads did not take it: {why}"),
+            Self::YouTubeReconnect => "YouTube refused the channel's token or a permission is \
+                                       missing. Connect the channel again under Accounts."
+                .into(),
+            Self::YouTube(why) => why.clone(),
         }
     }
 }

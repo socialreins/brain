@@ -629,11 +629,11 @@ async fn report(
         .unwrap_or_default())
 }
 
-/// Records an attempt in `inbox_actions`.
+/// Records an attempt in `inbox_actions`; `by` is the member, none for an automation.
 pub async fn log(
     app: &AppState,
     item: &inbox_items::Model,
-    by: Uuid,
+    by: Option<Uuid>,
     action: Action,
     outcome: &Result<Option<String>, InboxError>,
     detail: Value,

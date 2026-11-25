@@ -282,7 +282,15 @@ async fn act(
         "reason_type": input.reason_type,
         "reason_chars": input.reason.as_ref().map(|r| r.chars().count()),
     });
-    if let Err(e) = actions::log(&app, &item, t.current.0.id, input.action, &outcome, detail).await
+    if let Err(e) = actions::log(
+        &app,
+        &item,
+        Some(t.current.0.id),
+        input.action,
+        &outcome,
+        detail,
+    )
+    .await
     {
         // The action happened (or not); the log is what failed.
         tracing::error!(error = %e, item = %item.id, "inbox action not logged");
