@@ -913,11 +913,16 @@ impl Env {
 
     /// A mention from `author` arrives and the automations run over it.
     async fn arrive(&self, author: &str, text: &str) {
+        self.arrive_as("mention", author, text).await;
+    }
+
+    /// An item of `kind` (`mention` or `comment`) from `author` arrives; its row id.
+    async fn arrive_as(&self, kind: &str, author: &str, text: &str) -> Uuid {
         let remote = Utc::now().timestamp_nanos_opt().unwrap().to_string();
         self.sql(&format!(
             "INSERT INTO inbox_items (id, team_id, social_account_id, platform, kind, remote_id, \
              parent_remote_id, root_remote_id, author_id, author_name, text, received_at, state) \
-             VALUES (gen_random_uuid(), '{}', '{}', 'x', 'mention', '{remote}', '{remote}', \
+             VALUES (gen_random_uuid(), '{}', '{}', 'x', '{kind}', '{remote}', '{remote}', \
              '{remote}', '{author}', 'Ann', '{text}', now() - interval '1 minute', 'open')",
             self.team, self.account
         ))
@@ -936,6 +941,7 @@ impl Env {
         socialreins_brain::automations::run(&self.state, &account, &item)
             .await
             .unwrap();
+        item.id
     }
 
     /// (status, reason) of the automation's runs, oldest first.
@@ -1280,4 +1286,323 @@ async fn a_question_is_paid_for_once_and_given_back_when_it_cannot_be_judged() {
     // A question mark costs nothing.
     e.arrive(&who(), "Where can I buy this?").await;
     assert_eq!(ledger().await, (before, 3));
+}
+
+#[tokio::test]
+#[serial]
+async fn replies_are_held_to_280_or_25000_by_the_plan_of_the_account() {
+    let e = env(ALL, false).await;
+    let long = "a".repeat(300);
+    let body = |text: &str| {
+        json!({"name": "x", "trigger": "mention_received",
+            "conditions": {"account_ids": [e.account]},
+            "actions": [{"type": "reply_publicly", "text": text}]})
+    };
+    // Saved with a Bluesky-sized reply it is refused for X, a DM of that size is fine.
+    let res = e.req(Method::POST, "/v1/automations", body(&long)).await;
+    assert_eq!(
+        (
+            res.status_code().as_u16(),
+            res.json::<Value>()["error"].clone()
+        ),
+        (422, json!("invalid_text"))
+    );
+    let dm = json!({"name": "x", "trigger": "dm_received", "conditions": {"account_ids": [e.account]},
+        "actions": [{"type": "send_dm", "text": "a".repeat(900)}]});
+    assert_eq!(
+        e.req(Method::POST, "/v1/automations", dm)
+            .await
+            .status_code(),
+        201
+    );
+    // The name counts at its longest: 217 letters and {name} is over.
+    let res = e
+        .req(
+            Method::POST,
+            "/v1/automations",
+            body(&format!("{{name}}{}", "a".repeat(217))),
+        )
+        .await;
+    assert_eq!(res.status_code(), 422);
+    // A paid X plan takes 25,000.
+    e.sql(&format!(
+        "UPDATE social_accounts SET meta = meta || '{{\"plan\": \"paid\"}}' WHERE id = '{}'",
+        e.account
+    ))
+    .await;
+    // (Bluesky's 300 still applies to the saved text: a reply that long is for the person writing it.)
+    let res = e
+        .req(Method::POST, "/v1/automations", body(&"a".repeat(290)))
+        .await;
+    assert_eq!(res.status_code(), 201, "{}", res.text());
+    let item = e.arrive_as("comment", &who(), "hello").await;
+    // A manual reply of 300 goes out on a paid plan and is refused on a free one.
+    let res = e
+        .post(
+            &format!("/v1/inbox-items/{item}/reply"),
+            json!({"text": long}),
+        )
+        .await;
+    assert_eq!(res.status_code(), 201, "{}", res.text());
+    e.sql(&format!(
+        "UPDATE social_accounts SET meta = meta || '{{\"plan\": \"free\"}}' WHERE id = '{}'",
+        e.account
+    ))
+    .await;
+    let res = e
+        .post(
+            &format!("/v1/inbox-items/{item}/reply"),
+            json!({"text": long}),
+        )
+        .await;
+    assert_eq!(res.status_code(), 422);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_used_up_budget_or_no_credits_stop_automations_with_their_own_reason() {
+    let e = env(ALL, true).await;
+    e.sql(&format!("INSERT INTO subscriptions (team_id, plan_id, status) VALUES ('{}', 'automation', 'active')", e.team)).await;
+    e.put(json!({"enabled": true, "budget_usd": 0.1}))
+        .await
+        .assert_status_ok();
+    let id = e.automation(json!({})).await;
+    // No credits: skipped with its own reason, nothing sent.
+    e.arrive(&who(), "hello").await;
+    assert_eq!(
+        e.runs(&id).await,
+        vec![run("skipped", Some("x_no_credits"))]
+    );
+    assert_eq!(e.mock.seen("POST", "/2/tweets").len(), 0);
+    // A credit pays for the send and the write counts against the account's budget.
+    socialreins_brain::billing::grant(
+        &e.db,
+        e.team,
+        socialreins_brain::billing::Kind::X,
+        20,
+        "test",
+        Some("t1"),
+    )
+    .await
+    .unwrap();
+    e.arrive(&who(), "hello").await;
+    assert_eq!(e.mock.seen("POST", "/2/tweets").len(), 1);
+    let spent = || async {
+        let r =
+            e.db.query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                format!(
+                    "SELECT spent_micros FROM x_inbox WHERE social_account_id = '{}'",
+                    e.account
+                ),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        r.try_get::<i64>("", "spent_micros").unwrap()
+    };
+    assert_eq!(spent().await, 15_000);
+    // Budget $0.10: five more writes would pass 0.075, the seventh does not fit.
+    for _ in 0..4 {
+        e.arrive(&who(), "hello").await;
+    }
+    assert_eq!(e.mock.seen("POST", "/2/tweets").len(), 5);
+    e.arrive(&who(), "hello").await;
+    e.arrive(&who(), "hello").await;
+    let runs = e.runs(&id).await;
+    assert_eq!(
+        runs.last().unwrap(),
+        &run("skipped", Some("x_budget")),
+        "{runs:?}"
+    );
+    assert_eq!(e.mock.seen("POST", "/2/tweets").len(), 6);
+    // A higher budget lets it go on; X saying the app has no credits stops it until resumed.
+    e.put(json!({"enabled": true, "budget_usd": 5.0}))
+        .await
+        .assert_status_ok();
+    e.sql(&format!(
+        "UPDATE x_inbox SET paused_reason = 'credits' WHERE social_account_id = '{}'",
+        e.account
+    ))
+    .await;
+    e.arrive(&who(), "hello").await;
+    assert_eq!(
+        e.runs(&id).await.last().unwrap(),
+        &run("skipped", Some("x_no_credits"))
+    );
+    e.post(
+        &format!("/v1/connections/{}/x-inbox/resume", e.account),
+        json!({}),
+    )
+    .await;
+    e.arrive(&who(), "hello").await;
+    assert_eq!(e.runs(&id).await.last().unwrap(), &run("sent", None));
+}
+
+#[tokio::test]
+#[serial]
+async fn the_test_shows_the_cost_a_refused_dm_and_its_fallback_and_the_estimate_matches() {
+    let e = env(ALL, false).await;
+    e.put(json!({"enabled": true})).await.assert_status_ok();
+    let automation = json!({"name": "t", "trigger": "comment_received",
+        "conditions": {"account_ids": [e.account]},
+        "actions": [{"type": "send_dm", "text": "hi {name}"}],
+        "fallback_public_reply": "open your DMs"});
+    let sample = |can_dm: bool| json!({"automation": automation, "sample": {"account_id": e.account, "text": "hello", "author_can_dm": can_dm}});
+    let res = e
+        .req(Method::POST, "/v1/automations/test", sample(true))
+        .await;
+    let out = res.json::<Value>();
+    assert_eq!(out["steps"][0]["status"], "would_send");
+    assert_eq!(out["cost"]["writes"], 1);
+    assert_eq!(out["cost"]["total_usd"], 0.03);
+    // They do not follow us and have DMs closed: X refuses, the fallback reply answers.
+    let res = e
+        .req(Method::POST, "/v1/automations/test", sample(false))
+        .await;
+    let out = res.json::<Value>();
+    assert_eq!(
+        (
+            out["steps"][0]["status"].clone(),
+            out["steps"][0]["reason"].clone()
+        ),
+        (json!("would_skip"), json!("dm_not_allowed"))
+    );
+    assert_eq!(out["steps"][1]["type"], "fallback_public_reply");
+    assert_eq!(out["steps"][1]["status"], "would_send");
+    assert_eq!(out["cost"]["writes"], 1);
+    // The editor's estimate: a DM and a like are two writes.
+    let est = json!({"name": "t", "trigger": "comment_received", "conditions": {"account_ids": [e.account]},
+        "actions": [{"type": "send_dm", "text": "hi"}, {"type": "like_comment"}]});
+    let res = e.req(Method::POST, "/v1/automations/estimate", est).await;
+    let got = res.json::<Value>();
+    assert_eq!(
+        (
+            got["x"].clone(),
+            got["cost"]["writes"].clone(),
+            got["cost"]["total_usd"].clone()
+        ),
+        (json!(true), json!(2), json!(0.045))
+    );
+    // No X account in scope: nothing to price.
+    let none = json!({"name": "t", "trigger": "comment_received", "conditions": {"account_ids": [Uuid::now_v7()]},
+        "actions": [{"type": "send_dm", "text": "hi"}]});
+    let got = e
+        .req(Method::POST, "/v1/automations/estimate", none)
+        .await
+        .json::<Value>();
+    assert_eq!(got["x"], false);
+}
+
+#[tokio::test]
+#[serial]
+async fn x_likes_hides_and_reposts_for_an_automation_and_counts_each_write() {
+    let e = env(ALL, false).await;
+    e.put(json!({"enabled": true})).await.assert_status_ok();
+    let id = e
+        .automation(json!({"trigger": "comment_received",
+            "actions": [{"type": "like_comment"}, {"type": "hide_comment"}, {"type": "repost_comment"},
+                        {"type": "reply_publicly", "text": "thanks"}]}))
+        .await;
+    e.arrive_as("comment", &who(), "hello").await;
+    assert_eq!(e.runs(&id).await, vec![run("sent", None)]);
+    assert_eq!(e.mock.seen("POST", "/2/users/1/likes").len(), 1);
+    assert_eq!(e.mock.seen("POST", "/2/users/1/retweets").len(), 1);
+    let hides = e
+        .mock
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.0 == "PUT" && c.1.ends_with("/hidden"))
+        .count();
+    assert_eq!(hides, 1);
+    // Four writes were counted against the account's budget.
+    let r =
+        e.db.query_one_raw(Statement::from_string(
+            DbBackend::Postgres,
+            format!(
+                "SELECT spent_micros FROM x_inbox WHERE social_account_id = '{}'",
+                e.account
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.try_get::<i64>("", "spent_micros").unwrap(), 60_000);
+    // A mention has no reply to hide, but a like and a repost fit it.
+    let body = |action: &str| json!({"name": "m", "trigger": "mention_received", "actions": [{"type": action}]});
+    assert_eq!(
+        e.req(Method::POST, "/v1/automations", body("hide_comment"))
+            .await
+            .status_code(),
+        422
+    );
+    let mention = e
+        .automation(json!({"name": "Mentions", "actions": [{"type": "repost_comment"}, {"type": "like_comment"}]}))
+        .await;
+    e.arrive(&who(), "hello").await;
+    assert_eq!(e.runs(&mention).await, vec![run("sent", None)]);
+    assert_eq!(e.mock.seen("POST", "/2/users/1/retweets").len(), 2);
+    assert_eq!(e.mock.seen("POST", "/2/users/1/likes").len(), 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_used_up_budget_stops_reactions_and_ai_before_they_cost_but_never_a_person() {
+    let e = env(ALL, false).await;
+    e.put(json!({"enabled": true, "budget_usd": 0.1}))
+        .await
+        .assert_status_ok();
+    e.sql(&format!(
+        "UPDATE x_inbox SET spent_micros = 100000 WHERE social_account_id = '{}'",
+        e.account
+    ))
+    .await;
+    *e.mock.ai.lock().unwrap() = "Thanks for writing".into();
+    let react = e
+        .automation(json!({"name": "React", "trigger": "comment_received", "actions": [{"type": "like_comment"}, {"type": "repost_comment"}]}))
+        .await;
+    let ai = e
+        .automation(json!({"name": "Ai", "trigger": "comment_received", "actions": [{"type": "ai_reply_publicly", "prompt": "Thank them"}]}))
+        .await;
+    let item = e.arrive_as("comment", &who(), "hello").await;
+    // Nothing reached X and the model was never paid for.
+    assert_eq!(
+        e.mock.seen("POST", "/2/users/1/likes").len()
+            + e.mock.seen("POST", "/2/users/1/retweets").len(),
+        0
+    );
+    assert_eq!(e.mock.seen("POST", "/v1/messages").len(), 0);
+    assert_eq!(e.runs(&react).await, vec![run("skipped", Some("x_budget"))]);
+    assert_eq!(e.runs(&ai).await, vec![run("skipped", Some("x_budget"))]);
+    // A person's own reply is never held back by it, and is counted.
+    let res = e
+        .post(
+            &format!("/v1/inbox-items/{item}/reply"),
+            json!({"text": "hi"}),
+        )
+        .await;
+    assert_eq!(res.status_code(), 201, "{}", res.text());
+    let r =
+        e.db.query_one_raw(Statement::from_string(
+            DbBackend::Postgres,
+            format!(
+                "SELECT spent_micros FROM x_inbox WHERE social_account_id = '{}'",
+                e.account
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.try_get::<i64>("", "spent_micros").unwrap(), 115_000);
+    // A repost needs a post to repost: a DM trigger refuses it on save.
+    let dm =
+        json!({"name": "x", "trigger": "dm_received", "actions": [{"type": "repost_comment"}]});
+    assert_eq!(
+        e.req(Method::POST, "/v1/automations", dm)
+            .await
+            .status_code(),
+        422
+    );
 }

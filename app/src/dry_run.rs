@@ -11,11 +11,13 @@ use uuid::Uuid;
 
 use crate::{
     automations::{self as rules, Action, ActionResult, Conditions, Facts, Step, RUNS_PER_DAY},
+    connectors::x::inbox::Granted,
     controllers::pages,
     inbox::{self, Button, Via},
     meta_rules::Clock,
     models::{inbox_items, social_accounts},
     state::AppState,
+    x_automation,
 };
 
 /// Tests a team may run per day; each may call the AI model once per AI step.
@@ -105,7 +107,7 @@ pub struct PlannedStep {
     pub model: Option<String>,
 }
 
-#[derive(Serialize, ToSchema, Debug, PartialEq, Eq)]
+#[derive(Serialize, ToSchema, Debug, PartialEq)]
 pub struct Outcome {
     pub trigger: String,
     /// The sample meets every condition.
@@ -131,6 +133,10 @@ pub struct Outcome {
     /// which an automation never uses) or `human_agent_off` (the app does not hold that feature).
     pub notes: Vec<String>,
     pub steps: Vec<PlannedStep>,
+    /// On X: what this run would cost, counting the writes that would go out (the read of the
+    /// sample itself included). Absent on other networks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<x_automation::Cost>,
 }
 
 enum Part<'a> {
@@ -357,6 +363,7 @@ pub async fn test(
         blocks: Vec::new(),
         sentiment: None,
         notes: Vec::new(),
+        cost: None,
         steps: Vec::new(),
     };
     if !out.matched {
@@ -439,6 +446,14 @@ pub async fn test(
     let (planned, notes) = walk(app, account, &item, &parts, walked).await;
     out.steps = planned;
     out.notes = notes;
+    if account.provider == "x" {
+        let acts = |k: &str| matches!(k, "like_comment" | "hide_comment" | "repost_comment");
+        let writes = out.steps.iter().filter(|s| {
+            (s.status == "would_send" && !acts(&s.kind))
+                || (s.status == "would_do" && acts(&s.kind))
+        });
+        out.cost = Some(x_automation::priced(trigger, writes.count() as u32));
+    }
     Ok(out)
 }
 
@@ -496,7 +511,7 @@ async fn walk(
                 tag: Some((*tag).to_owned()),
                 ..step("tag_contact", "would_tag")
             }),
-            Part::Effect(kind) => out.push(effect_step(kind, account, item)),
+            Part::Effect(kind) => out.push(effect_step(kind, account, item, app).await),
             Part::Wait(minutes, reply) => {
                 if let Some(clock) = meta.as_mut() {
                     clock.wait(*minutes, *reply);
@@ -580,11 +595,39 @@ async fn walk(
 
 /// A mail, an assignment, a moderation call or a stop as it would go: a moderation call the
 /// network or the item does not take is skipped (`not_supported`), as a run records it.
-fn effect_step(
+async fn effect_step(
     kind: &str,
     account: &social_accounts::Model,
     item: &inbox_items::Model,
+    app: &AppState,
 ) -> PlannedStep {
+    // On X a like, repost or hide is a write X bills: the budget, the credits and the scopes stop
+    // it as in a run.
+    if account.provider == "x" && matches!(kind, "hide_comment" | "like_comment" | "repost_comment")
+    {
+        let g = Granted::of(account.meta["scope"].as_str());
+        let fits = match kind {
+            "hide_comment" => item.kind == "comment",
+            _ => matches!(item.kind.as_str(), "comment" | "mention"),
+        };
+        let why = if !fits {
+            Some("not_supported")
+        } else if (kind == "like_comment" && !g.like) || (kind == "hide_comment" && !g.hide) {
+            Some("x_reconnect_required")
+        } else {
+            match x_automation::blocked(app, account).await {
+                Ok(why) => why,
+                Err(_) => Some("internal"),
+            }
+        };
+        return match why {
+            Some(why) => PlannedStep {
+                reason: Some(why.into()),
+                ..step(kind, "would_skip")
+            },
+            None => step(kind, "would_do"),
+        };
+    }
     // Like, repost and follow back on Bluesky are the inbox buttons' own: they go on a Bluesky account.
     let bluesky = account.provider == "bluesky";
     if matches!(kind, "repost_comment" | "follow_back") || (kind == "like_comment" && bluesky) {
@@ -631,12 +674,26 @@ async fn plan_send(
     }
     let bluesky_dm = via == Via::Dm && account.provider == "bluesky";
     let no_dm = bluesky_dm && !account.dm_access;
-    // What Bluesky answers a send to someone who neither follows us nor allows DMs from anyone.
-    let refused = bluesky_dm && !dm_open;
+    // What Bluesky and X answer a send to someone who neither follows us nor allows DMs from
+    // anyone.
+    let refused =
+        via == Via::Dm && matches!(account.provider.as_str(), "bluesky" | "x") && !dm_open;
     let skipped = |reason: &str| PlannedStep {
         reason: Some(reason.into()),
         ..step(kind, "would_skip")
     };
+    // X stops an automation when the budget or the credits are used up, or the DM scope is
+    // missing; the test says so as a run would.
+    if account.provider == "x" {
+        match x_automation::blocked(app, account).await {
+            Ok(Some(why)) => return skipped(why),
+            Ok(None) => {}
+            Err(_) => return skipped("internal"),
+        }
+        if via == Via::Dm && !Granted::of(account.meta["scope"].as_str()).dms {
+            return skipped("x_reconnect_required");
+        }
+    }
     if ai {
         if no_dm {
             return skipped("no_dm_access");
@@ -665,7 +722,7 @@ async fn plan_send(
     } else {
         inbox::numbered(&text, buttons)
     };
-    if !inbox::fits_on(&account.provider, via, &sent) {
+    if !inbox::fits_for(account, via, &sent) {
         return PlannedStep {
             reason: Some("too_long".into()),
             text: Some(text),

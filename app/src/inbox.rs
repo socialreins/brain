@@ -843,6 +843,14 @@ pub fn fits_on(platform: &str, via: Via, text: &str) -> bool {
     }
 }
 
+/// `fits_on` for `account`: an X account on a paid plan takes replies of 25,000, as X counts.
+pub fn fits_for(account: &social_accounts::Model, via: Via, text: &str) -> bool {
+    match account.provider.as_str() {
+        "x" => crate::x_automation::fits(&account.meta, via, text),
+        other => fits_on(other, via, text),
+    }
+}
+
 /// Sends `text` for `item` from `account`, once, and records it on the item (a reply row and
 /// `replied_at`). The inner `Err` says why nothing was sent.
 /// `skip`: byte ranges of `text` filled in from someone else, which never become links.
@@ -921,8 +929,16 @@ async fn send_inner(
     if account.provider == "youtube" && via == Via::Dm {
         return Ok(Err(InboxError::Invalid("youtube_no_dm")));
     }
-    if !fits_on(&account.provider, via, text) {
+    if !fits_for(account, via, text) {
         return Ok(Err(InboxError::Invalid("too_long")));
+    }
+    // An automation's send on X stops when the account's budget or the team's credits are used
+    // up, or X refused for credits, and says which.
+    let x_auto = account.provider == "x" && automation_id.is_some();
+    if x_auto {
+        if let Some(why) = crate::x_automation::blocked(app, account).await? {
+            return Ok(Err(InboxError::Invalid(why)));
+        }
     }
     let sent = if meta {
         meta_inbox::send(app, account, item, via, text, (buttons, human)).await?
@@ -935,6 +951,13 @@ async fn send_inner(
     } else {
         send_bluesky(app, account, item, (via, text, skip)).await
     };
+    // Every write X took is counted against the account's budget, a person's too (which the
+    // budget never blocks); a failure to count is logged, as the reply is already out.
+    if account.provider == "x" && sent.is_ok() {
+        if let Err(e) = crate::x_automation::spent(&app.db, account.id).await {
+            tracing::error!(error = %e, item = %item.id, "x write not counted against the budget");
+        }
+    }
     let remote_id = match sent {
         Ok(id) => id,
         Err(e) => {

@@ -9,8 +9,8 @@ use axum::{
 };
 use chrono::{DateTime, FixedOffset};
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, DbErr, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
+    ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, DbErr,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use socialreins_core::team;
@@ -30,6 +30,7 @@ use crate::{
     inbox,
     models::{automation_runs, automations, inbox_items, social_accounts, team_user, teams},
     state::AppState,
+    x_automation,
 };
 
 /// Most automations one team holds.
@@ -254,7 +255,7 @@ async fn find(
 
 /// The input checked and normalized; `Err` holds the 422 reply.
 async fn checked(
-    db: &impl ConnectionTrait,
+    db: &DatabaseConnection,
     team_id: Uuid,
     mut input: AutomationInput,
 ) -> Result<Result<(String, AutomationInput), Response>, DbErr> {
@@ -326,7 +327,52 @@ async fn checked(
     if let Some(code) = scope_limits(db, team_id, &input.trigger, c, actions, steps).await? {
         return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, code)));
     }
+    // Limited to X accounts alone, its replies are held to what X takes (280, or 25,000 on a
+    // paid plan).
+    let fallback = input.fallback_public_reply.as_deref();
+    let named = x_accounts(db, team_id, c, true).await?;
+    let metas: Vec<&serde_json::Value> = named.iter().map(|a| &a.meta).collect();
+    if x_automation::text_limits(&metas, actions, steps, fallback).is_err() {
+        return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_text")));
+    }
     Ok(Ok((name, input)))
+}
+
+/// The team's X accounts an automation with `c` acts on. With `named_only`, those it names, and
+/// only when it names X accounts alone (a mixed scope is left to fail item by item); else every X
+/// account of its set or of the team too.
+async fn x_accounts(
+    db: &DatabaseConnection,
+    team_id: Uuid,
+    c: &Conditions,
+    named_only: bool,
+) -> Result<Vec<social_accounts::Model>, DbErr> {
+    if named_only && c.account_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let all = social_accounts::Entity::find()
+        .filter(social_accounts::Column::TeamId.eq(team_id))
+        .filter(social_accounts::Column::Provider.eq("x"))
+        .all(db)
+        .await?;
+    if named_only {
+        let on_x = all.iter().filter(|a| c.account_ids.contains(&a.id)).count();
+        if on_x != c.account_ids.len() {
+            return Ok(Vec::new());
+        }
+    }
+    let mut out = Vec::new();
+    for a in all {
+        let named = c.account_ids.is_empty() || c.account_ids.contains(&a.id);
+        let in_set = match c.social_set_id {
+            Some(s) => rules::live_set_ids(db, a.id).await?.contains(&s),
+            None => true,
+        };
+        if named && in_set {
+            out.push(a);
+        }
+    }
+    Ok(out)
 }
 
 /// `rules::network_limits` for an automation limited to accounts by name; `None` otherwise.
@@ -998,8 +1044,51 @@ async fn item_verdicts(State(app): State<AppState>, t: InTeam, Path(id): Path<Uu
     }
 }
 
+#[derive(Serialize, ToSchema)]
+pub struct Estimate {
+    /// The automation acts on at least one X account of the team.
+    pub x: bool,
+    /// What one run costs on X (see `Outcome::cost`); absent when `x` is false.
+    pub cost: Option<x_automation::Cost>,
+}
+
+/// What one run of an automation costs on X, from its actions or steps and its trigger, without
+/// checking or saving it, so an edit shows its price while it is typed. Owners and admins.
+#[utoipa::path(post, path = "/automations/estimate", tag = "automations",
+    request_body = AutomationInput,
+    responses((status = 200, body = Estimate), (status = 401, body = Error),
+        (status = 403, body = Error)))]
+async fn estimate(
+    _: FromWeb,
+    State(app): State<AppState>,
+    t: InTeam,
+    Body(input): Body<AutomationInput>,
+) -> Response {
+    if !t.role.manages() {
+        return forbidden();
+    }
+    match x_accounts(&app.db, t.team.id, &input.conditions, false).await {
+        Ok(x) if x.is_empty() => Json(Estimate {
+            x: false,
+            cost: None,
+        })
+        .into_response(),
+        Ok(_) => {
+            let actions = input.actions.as_deref().unwrap_or_default();
+            let cost = x_automation::cost(&input.trigger, actions, input.steps.as_deref());
+            Json(Estimate {
+                x: true,
+                cost: Some(cost),
+            })
+            .into_response()
+        }
+        Err(e) => internal(e, "automation estimate"),
+    }
+}
+
 pub fn api() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
+        .routes(routes!(estimate))
         .routes(routes!(test))
         .routes(routes!(misses))
         .routes(routes!(item_verdicts))

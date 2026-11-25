@@ -30,6 +30,7 @@ pub mod stripe;
 pub mod threads_inbox;
 pub mod turnstile;
 pub mod webhooks;
+pub mod x_automation;
 pub mod x_inbox;
 pub mod youtube_inbox;
 
