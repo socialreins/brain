@@ -26662,6 +26662,190 @@ mod teams {
                 );
             }
 
+            /// Acts on the real Bluesky test account's own posts only: a root post and a reply
+            /// of its own, made here and deleted at the end. Never follows, blocks, mutes or
+            /// reports anyone (those are only mocked). Needs BLUESKY_TEST_HANDLE and
+            /// BLUESKY_TEST_APP_PASSWORD, an app password with DM access.
+            #[tokio::test]
+            #[serial]
+            #[ignore = "calls the real Bluesky"]
+            async fn live_bluesky_actions_on_own_posts() {
+                let handle = std::env::var("BLUESKY_TEST_HANDLE").expect("BLUESKY_TEST_HANDLE");
+                let password =
+                    std::env::var("BLUESKY_TEST_APP_PASSWORD").expect("BLUESKY_TEST_APP_PASSWORD");
+                let config = Config::from_env().expect("test config");
+                let db = socialreins_brain::connect(&config).await.unwrap();
+                let state = AppState::new(db.clone(), &config);
+                let s = TestServer::new(controllers::router(state.clone(), &config)).unwrap();
+                let (_, cookie, _) = user(&s, &db).await;
+                let res = connect(&s, &cookie, &handle, &password).await;
+                assert!(res.status_code().is_success(), "connect: {}", res.text());
+                let body = res.json::<Value>();
+                let (account, did) = (
+                    body["id"].as_str().unwrap().to_owned(),
+                    body["external_id"].as_str().unwrap().to_owned(),
+                );
+                let a = social_accounts::Entity::find_by_id(account.parse::<uuid::Uuid>().unwrap())
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let pds = a.meta["pds"].as_str().unwrap().to_owned();
+                let web = reqwest::Client::new();
+                let session: Value = web
+                    .post(format!("{pds}/xrpc/com.atproto.server.createSession"))
+                    .json(&json!({"identifier": handle, "password": password}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                let jwt = session["accessJwt"].as_str().unwrap().to_owned();
+                let make = |record: Value| {
+                    let (web, pds, jwt, did) = (web.clone(), pds.clone(), jwt.clone(), did.clone());
+                    async move {
+                        let made: Value = web
+                            .post(format!("{pds}/xrpc/com.atproto.repo.createRecord"))
+                            .bearer_auth(jwt)
+                            .json(&json!({"repo": did, "collection": "app.bsky.feed.post", "record": record}))
+                            .send()
+                            .await
+                            .unwrap()
+                            .json()
+                            .await
+                            .unwrap();
+                        made
+                    }
+                };
+                let stamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                let root = make(json!({"$type": "app.bsky.feed.post", "createdAt": stamp,
+                    "text": "SocialReins live test, please ignore (deleted in a minute)"}))
+                .await;
+                let (root_uri, root_cid) = (
+                    root["uri"].as_str().unwrap().to_owned(),
+                    root["cid"].as_str().unwrap().to_owned(),
+                );
+                let own = make(json!({"$type": "app.bsky.feed.post", "createdAt": stamp,
+                    "text": "A reply of its own, for the live test",
+                    "reply": {"root": {"uri": root_uri, "cid": root_cid}, "parent": {"uri": root_uri, "cid": root_cid}}})).await;
+                let (own_uri, own_cid) = (
+                    own["uri"].as_str().unwrap().to_owned(),
+                    own["cid"].as_str().unwrap().to_owned(),
+                );
+
+                // An inbox item standing for that reply, from a made-up author: only actions on
+                // the post are run, never one on the author.
+                let item = inbox::store(
+                    &db,
+                    &a,
+                    inbox::Fresh {
+                        kind: "comment",
+                        remote_id: own_uri.clone(),
+                        remote_cid: Some(own_cid.clone()),
+                        parent: Some(root_uri.clone()),
+                        root: (Some(root_uri.clone()), Some(root_cid.clone())),
+                        convo_id: None,
+                        author: socialreins_brain::connectors::bluesky::Author {
+                            did: "did:plc:livetestauthor".into(),
+                            handle: Some("live.test".into()),
+                            display_name: Some("Live test".into()),
+                            avatar: None,
+                        },
+                        text: "live".into(),
+                        at: Utc::now().fixed_offset(),
+                        permalink: None,
+                        story: None,
+                        button_payload: None,
+                        attachments: vec![],
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let id = item.id;
+                let act = |body: Value| {
+                    let r = req(
+                        &s,
+                        Method::POST,
+                        &format!("/v1/inbox-items/{id}/actions"),
+                        &cookie,
+                    );
+                    async move { r.json(&body).await }
+                };
+                let ok = |action: &str| json!({"action": action, "confirm": true});
+
+                // The thread above it, as Bluesky serves it: our root post.
+                let thread = s
+                    .get(&format!("/v1/inbox-items/{id}/thread"))
+                    .add_header("cookie", &cookie)
+                    .await;
+                assert_eq!(thread.status_code(), 200, "{}", thread.text());
+                assert_eq!(thread.json::<Value>()["posts"][0]["uri"], root_uri);
+
+                // Like, repost and thread mute, each undone; the live state shows them.
+                for (on, off, seen) in [
+                    ("like", "unlike", "liked"),
+                    ("repost", "unrepost", "reposted"),
+                    ("mute_thread", "unmute_thread", "thread_muted"),
+                ] {
+                    let res = act(ok(on)).await;
+                    assert_eq!(res.status_code(), 200, "{on}: {}", res.text());
+                    let state = s
+                        .get(&format!("/v1/inbox-items/{id}/actions"))
+                        .add_header("cookie", &cookie)
+                        .await
+                        .json::<Value>();
+                    assert_eq!(state["viewer"][seen], true, "{on}: {state}");
+                    let res = act(ok(off)).await;
+                    assert_eq!(res.status_code(), 200, "{off}: {}", res.text());
+                }
+
+                // Hide and unhide the reply in the root post's own threadgate.
+                let res = act(ok("hide_reply")).await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                let res = act(ok("unhide_reply")).await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+
+                // A public reply under our own reply (the pre-check reads it live), then deleted.
+                let sent = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/inbox-items/{id}/reply"),
+                    &cookie,
+                )
+                .json(&json!({"text": "Live test reply, deleted right after"}))
+                .await;
+                assert_eq!(sent.status_code(), 201, "{}", sent.text());
+                let reply = sent.json::<Value>()["replies"][0].clone();
+                let res = act(
+                    json!({"action": "delete_reply", "confirm": true, "reply_id": reply["id"]}),
+                )
+                .await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+
+                // Clean up: the reply, the root post and the root's threadgate.
+                let rkey = |uri: &str| uri.rsplit('/').next().unwrap().to_owned();
+                for (collection, key) in [
+                    ("app.bsky.feed.post", rkey(&own_uri)),
+                    ("app.bsky.feed.post", rkey(&root_uri)),
+                    ("app.bsky.feed.threadgate", rkey(&root_uri)),
+                ] {
+                    let res = web
+                        .post(format!("{pds}/xrpc/com.atproto.repo.deleteRecord"))
+                        .bearer_auth(&jwt)
+                        .json(&json!({"repo": did, "collection": collection, "rkey": key}))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert!(
+                        res.status().is_success(),
+                        "clean up {collection}: {}",
+                        res.text().await.unwrap()
+                    );
+                }
+            }
+
             /// Reads the real Bluesky test account's notifications and DMs, read-only. Needs
             /// BLUESKY_TEST_HANDLE and BLUESKY_TEST_APP_PASSWORD.
             #[tokio::test]

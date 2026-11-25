@@ -160,6 +160,9 @@ async fn create(
     record: Value,
     rkey: Option<&str>,
 ) -> Result<String, InboxError> {
+    // A record must say its own type.
+    let mut record = record;
+    record["$type"] = collection.into();
     let mut body = json!({ "repo": c.did, "collection": collection, "record": record });
     if let Some(k) = rkey {
         body["rkey"] = k.into();
@@ -198,7 +201,7 @@ pub async fn viewer(
         return Err(InboxError::Reconnect);
     };
     let c = account_creds(account, &secret);
-    state_of(app, &c, item).await.map(|(v, _)| v)
+    state_of(app, &c, item, Read::Both).await.map(|(v, _)| v)
 }
 
 /// The viewer state with the record URIs behind it: like, repost, follow, block.
@@ -209,10 +212,20 @@ struct Uris {
     block: Option<String>,
 }
 
+/// What `state_of` reads: the post, the author, or both (an author Bluesky cannot show then
+/// leaves their part empty instead of failing the rest).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Read {
+    Post,
+    Author,
+    Both,
+}
+
 async fn state_of(
     app: &AppState,
     c: &Creds<'_>,
     item: &inbox_items::Model,
+    read: Read,
 ) -> Result<(Viewer, Uris), InboxError> {
     let uri = |v: &Value| v.as_str().map(str::to_owned);
     let mut seen = Viewer::default();
@@ -222,7 +235,7 @@ async fn state_of(
         follow: None,
         block: None,
     };
-    if matches!(item.kind.as_str(), "comment" | "mention") {
+    if read != Read::Author && matches!(item.kind.as_str(), "comment" | "mention") {
         let posts = app.bluesky.posts(c, &[item.remote_id.as_str()]).await?;
         if let Some(p) = posts.first() {
             uris.like = uri(&p["viewer"]["like"]);
@@ -230,11 +243,20 @@ async fn state_of(
             seen.thread_muted = p["viewer"]["threadMuted"] == true;
         }
     }
-    let q = [("actor", item.author_id.as_str())];
-    let profile = app
-        .bluesky
-        .xrpc(c, "app.bsky.actor.getProfile", &q, None)
-        .await?;
+    let profile = if read == Read::Post {
+        Value::Null
+    } else {
+        let q = [("actor", item.author_id.as_str())];
+        match app
+            .bluesky
+            .xrpc(c, "app.bsky.actor.getProfile", &q, None)
+            .await
+        {
+            Ok(p) => p,
+            Err(InboxError::Refused { .. }) if read == Read::Both => Value::Null,
+            Err(e) => return Err(e),
+        }
+    };
     let about = &profile["viewer"];
     uris.follow = uri(&about["following"]);
     uris.block = uri(&about["blocking"]);
@@ -276,7 +298,7 @@ pub async fn perform(
     let did = item.author_id.as_str();
     match action {
         Action::Like | Action::Repost | Action::Unlike | Action::Unrepost => {
-            let (_, uris) = state_of(app, &c, item).await?;
+            let (_, uris) = state_of(app, &c, item, Read::Post).await?;
             let (existing, collection) = match action {
                 Action::Like | Action::Unlike => (uris.like, "app.bsky.feed.like"),
                 _ => (uris.repost, "app.bsky.feed.repost"),
@@ -292,7 +314,7 @@ pub async fn perform(
             }
         }
         Action::Follow | Action::Unfollow | Action::BlockAuthor | Action::UnblockAuthor => {
-            let (_, uris) = state_of(app, &c, item).await?;
+            let (_, uris) = state_of(app, &c, item, Read::Author).await?;
             let (existing, collection) = match action {
                 Action::Follow | Action::Unfollow => (uris.follow, "app.bsky.graph.follow"),
                 _ => (uris.block, "app.bsky.graph.block"),
