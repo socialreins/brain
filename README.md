@@ -972,7 +972,7 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | no | Both or neither. Turn on Google sign-in (OAuth client of type Web application, redirect URI `{BRAIN_URL}/auth/google/callback`). They also turn on connecting YouTube channels (add the redirect URI `{BRAIN_URL}/connect/youtube/callback` to the same client) |
 | `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | no | Both or neither. Turn on a Cloudflare Turnstile captcha: `POST /auth/link` and `/v1/contact` then need a `turnstile_token`. Off when unset |
 | `ADMIN_EMAILS` | no | Comma-separated emails, any case, whose signed-in users may use the admin console, `/v1/admin/*` (and get `is_admin: true` from `/auth/me`). None when unset |
-| `REVIEW_LOGIN_TOKEN` | no | Turns on `GET /review-login/{token}`, a sign-in to a demo account for Meta App Review. Unset (the default) the route is a `404`. Remove it after the review: see [App Review login](#app-review-login) |
+| `REVIEW_LOGIN_TOKEN` | no | Turns on `GET /review-login/{token}`, a sign-in to a demo account for Meta App Review. Unset (the default) the route is a `404`; shorter than 32 characters, brain refuses to start. Remove it after the review: see [App Review login](#app-review-login) |
 | `MEDIA_DIR` | no | `./media` (`/var/lib/brain/media` in the image). Where post media is kept while a post publishes, when no bucket is set. Files go once the post settles, so an ephemeral disk is fine. A download cut off by a restart leaves a temp file, which the hourly sweep removes once it is an hour old. Assumes a single brain instance: with more than one replica, use the `S3_*` bucket |
 | `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | no | All or none. Keep post media in an S3-compatible bucket instead of `MEDIA_DIR`, path-style. Cloudflare R2: `S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com`; AWS S3: `https://s3.<region>.amazonaws.com` with `S3_REGION`. Files are written as multipart uploads, which brain aborts when a download fails; give the bucket a lifecycle rule that aborts incomplete multipart uploads after a day (R2 does so after 7 days by default) for the ones a restart cuts off |
 | `S3_REGION` | no | `auto` (what R2 wants) |
@@ -983,7 +983,7 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 
 Meta App Review needs a reviewer to sign in without receiving email. To allow it:
 
-1. Set `REVIEW_LOGIN_TOKEN` to a long random value (`openssl rand -hex 32`) and redeploy.
+1. Set `REVIEW_LOGIN_TOKEN` to a long random value (`openssl rand -hex 32`; brain refuses to start with fewer than 32 characters) and redeploy.
 2. Give the reviewer `{BRAIN_URL}/review-login/<token>`. Opening it signs the browser in to the
    demo user `review@socialreins.com` ("App Review Demo", the owner of its own team with the
    default social set, nothing connected) and lands on `{WEB_URL}/app`. The reviewer connects

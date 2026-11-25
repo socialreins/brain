@@ -208,7 +208,7 @@ impl Config {
             turnstile,
             contact_to,
             admin_emails: admin_emails(var("ADMIN_EMAILS"))?,
-            review_login_token: var("REVIEW_LOGIN_TOKEN"),
+            review_login_token: review_login_token(var("REVIEW_LOGIN_TOKEN"))?,
             media: {
                 let mut media = Media::new(media_store(var)?, false);
                 media.max_bytes = media_max_bytes(var("MEDIA_MAX_BYTES"))?;
@@ -285,6 +285,20 @@ pub(crate) fn signup_entry(d: &str) -> Result<String, String> {
         return Err(format!("SIGNUP_DOMAINS: not a plain domain: {d}"));
     }
     Ok(d.to_owned())
+}
+
+/// A review login token shorter than this is refused at start: the link is the whole credential.
+const MIN_REVIEW_TOKEN_LEN: usize = 32;
+
+/// `REVIEW_LOGIN_TOKEN`: unset, or at least `MIN_REVIEW_TOKEN_LEN` characters (`openssl rand -hex 32`).
+fn review_login_token(raw: Option<String>) -> Result<Option<String>, String> {
+    match raw {
+        Some(t) if t.chars().count() < MIN_REVIEW_TOKEN_LEN => Err(format!(
+            "REVIEW_LOGIN_TOKEN: needs at least {MIN_REVIEW_TOKEN_LEN} characters, \
+             e.g. `openssl rand -hex 32`"
+        )),
+        t => Ok(t),
+    }
 }
 
 /// `ADMIN_EMAILS`: each address normalized like `OWNER_EMAIL`; blank entries are skipped.
@@ -411,6 +425,14 @@ fn parse_origins(list: &str) -> Result<Vec<HeaderValue>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn review_token_needs_32_characters() {
+        assert_eq!(super::review_login_token(None), Ok(None));
+        assert!(super::review_login_token(Some("a".repeat(31))).is_err());
+        let ok = Some("a".repeat(32));
+        assert_eq!(super::review_login_token(ok.clone()), Ok(ok));
+    }
+
     #[test]
     fn origins_split_and_trim() {
         let o = super::parse_origins(" https://a.com ,http://localhost:3000,").unwrap();
