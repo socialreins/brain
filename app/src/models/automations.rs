@@ -12,7 +12,7 @@ pub struct Model {
     /// When it was last switched on; items received before it never run it.
     pub activated_at: DateTimeWithTimeZone,
     /// `button_clicked`, `comment_received`, `dm_received`, `mention_received`, `new_follower`
-    /// or `story_reply`.
+    /// `story_mention` (Instagram: someone mentioned the account in a story) or `story_reply`.
     #[sea_orm(column_type = "Text")]
     pub trigger: String,
     /// `automations::Conditions` as JSON.

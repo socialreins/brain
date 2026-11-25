@@ -77,6 +77,7 @@ mod m20270103_000001_team_slug_history;
 mod m20270103_000001_wait_for_reply;
 mod m20270103_000001_youtube_inbox;
 mod m20270104_000001_run_retries;
+mod m20270105_000001_story_mention_trigger;
 
 pub struct Migrator;
 
@@ -161,6 +162,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20270103_000001_wait_for_reply::Migration),
             Box::new(m20270104_000001_run_retries::Migration),
             Box::new(m20270103_000001_youtube_inbox::Migration),
+            Box::new(m20270105_000001_story_mention_trigger::Migration),
             // inject-above (do not remove this comment)
         ]
     }
