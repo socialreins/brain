@@ -5715,7 +5715,10 @@ mod teams {
             }
 
             fn id_of(res: &axum_test::TestResponse) -> String {
-                res.json::<Value>()["id"].as_str().unwrap().to_owned()
+                res.json::<Value>()["id"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{}", res.text()))
+                    .to_owned()
             }
 
             #[tokio::test]
@@ -9961,7 +9964,9 @@ mod teams {
                     }
                     let mails = mail_for(&seen.lock().unwrap(), &owner);
                     assert_eq!(mails.len(), 4, "{mails:?}");
-                    assert!(mails[3].1.contains(&format!("/t/{slug}/posts/{late}")));
+                    assert!(mails[3]
+                        .1
+                        .contains(&format!("/t/{slug}/posts/{late_number}\n")));
 
                     // Ten notices a team a day: the eleventh and after are not mailed.
                     for i in 0..10 {
