@@ -255,6 +255,19 @@ cargo run -p socialreins-brain
   code is permanent, the slug may change (5 times a day per team). One given up stops resolving at once and is
   kept from other teams for 30 days (`team_slug_holds`, written in the same transaction).
 - `app/src/dry_run.rs`: `POST /v1/automations/test`, "Test this automation". It runs the real matching (`automations::mismatches`), `network_limits`, `{name}` and `{page}` filling and the AI step (`automations::ai_write`, shared with the real send, so the key choice, the monthly allowance and the checks are the same) on a sample from a stranger, and sends nothing, stores no inbox item or run and takes no daily hit. Keep it in step with `automations::run_matching` and `act` when a rule changes.
+- `app/src/x_inbox.rs` and `connectors/x/inbox.rs`: the X inbox. X has no webhooks we can use and
+  bills every read (pay-per-use credits), so it is opt-in per account (`x_inbox.enabled`, off by
+  default) and a slow poll (`poll_minutes`, 60 by default): mentions after `mentions_since_id`
+  (a quiet account costs nothing), DMs by a probe of one event (X has no DM cursor). Each account
+  has a monthly budget in millionths of a dollar (`budget_micros`, $2 by default) that what X
+  returned (`cost_micros`) is counted against; the poll stops at it (`paused_reason = budget`),
+  and stops for good, until `POST /connections/{id}/x-inbox/resume`, on `credits` or
+  `usage_capped`. A failed round waits for the next interval, five in a row pause it. Never add
+  a retry. With `BILLING_ENABLED` the team's `x` credits pay too (1 per reply, DM or action, 1 per
+  `READS_PER_CREDIT` items read). The inbox scopes (`dm.read dm.write like.write
+  tweet.moderate.write`) are asked only by `GET /connections/x/redirect?inbox=1` (the X app must allow
+  Direct message, so the plain connect cannot break) and never required; `meta.scope` keeps what was
+  granted (`Granted`), so older accounts keep publishing and are told to reconnect for DMs.
 - `app/src/webhooks.rs`: outbound webhooks. Every `post_targets` status change goes through
   `webhooks::with_event`, so its event is queued in the same statement; README documents the
   payload and signature.

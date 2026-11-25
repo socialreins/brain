@@ -55,14 +55,26 @@ fn unseal_str(app: &AppState, sealed: &str) -> Option<String> {
     String::from_utf8(app.cipher.decrypt(&bytes)?).ok()
 }
 
-/// `GET /connections/x/redirect`: owners and admins of the current team only.
-async fn start(State(app): State<AppState>, t: Result<InTeam, Reply>) -> Response {
+#[derive(serde::Deserialize)]
+struct Start {
+    /// `1`: also ask for the inbox's DM, like and hide permissions.
+    inbox: Option<String>,
+}
+
+/// `GET /connections/x/redirect`: owners and admins of the current team only. `?inbox=1` also
+/// asks for the inbox permissions, which the X app must allow (see `INBOX_SCOPES`).
+async fn start(
+    State(app): State<AppState>,
+    Query(q): Query<Start>,
+    t: Result<InTeam, Reply>,
+) -> Response {
     let how = (PROVIDER, app.x.configured());
     let verifier = token::new();
     let challenge = pkce_challenge(&verifier);
     let sealed = seal(&app, &verifier);
+    let inbox = q.inbox.as_deref() == Some("1");
     oauth::start_with(&app, t, how, &sealed, |uri, state| {
-        app.x.authorize_url(uri, state, &challenge)
+        app.x.authorize_url(uri, state, &challenge, inbox)
     })
     .await
 }
@@ -142,9 +154,11 @@ async fn callback(
     let new_id = Uuid::now_v7();
     let long_posts = me.long_posts();
     let plan = kept_plan(&app, team_id, &me.id).await;
+    // `scope` says which inbox actions (DMs, like, hide) the person allowed.
     let mut meta = serde_json::json!({
         "refresh_token": seal(&app, &refresh),
         "long_posts": long_posts,
+        "scope": token.scope,
     });
     // A reconnect keeps what the user chose.
     if let Some(plan) = plan {
@@ -276,6 +290,11 @@ async fn renew(app: &AppState, id: Uuid, within: Duration) -> Result<(String, bo
     };
     let known = meta.get("long_posts").cloned();
     let meta_plan = meta.get("plan").cloned();
+    // A refresh answer may name the scopes again; else the ones saved at connect stay.
+    let scope = match &refreshed {
+        Ok(t) if t.scope.is_some() => t.scope.clone().map(Into::into),
+        _ => meta.get("scope").cloned(),
+    };
     match refreshed {
         Ok(token) => {
             let next = token.refresh_token.clone().or(current).unwrap_or_default();
@@ -285,6 +304,9 @@ async fn renew(app: &AppState, id: Uuid, within: Duration) -> Result<(String, bo
             }
             if let Some(plan) = meta_plan {
                 meta["plan"] = plan;
+            }
+            if let Some(scope) = scope {
+                meta["scope"] = scope;
             }
             txn.execute_raw(stmt(
                 "UPDATE social_accounts SET access_token = $2, meta = $4, \
