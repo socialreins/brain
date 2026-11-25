@@ -897,6 +897,9 @@ impl InboxError {
             Self::Invalid("dm_unavailable") => {
                 "Meta cannot deliver a message to this person.".into()
             }
+            Self::Invalid("not_found") => {
+                "It is gone on Facebook or Instagram (deleted, or the person removed it).".into()
+            }
             Self::Invalid("not_supported") => "Facebook and Instagram do not allow this on \
                                                  this item."
                 .into(),

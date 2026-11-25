@@ -18539,6 +18539,10 @@ mod teams {
                         if DELETE_MODE.load(Ordering::SeqCst) == 1 {
                             return refused(200, "Permissions error");
                         }
+                        // 3: already gone.
+                        if DELETE_MODE.load(Ordering::SeqCst) == 3 {
+                            return refused_sub(100, 33, "Object does not exist");
+                        }
                         REMOVED.lock().unwrap().push(id);
                         ok(json!({"success": true}))
                     };
@@ -19941,6 +19945,7 @@ mod teams {
                     clean(&db).await;
                     let (cookie, team_id) = owner_connected(&s, &db).await;
                     deliver(&s, &page_comment("101_9_5", "Love it", "777", now())).await;
+                    deliver(&s, &page_comment("101_9_6", "Nice", "778", now())).await;
                     deliver(&s, &ig_comment("1784", "1790", "555")).await;
                     deliver(&s, &page_message("101", "m_1", "777", "hello")).await;
                     let items = stored(&db, &team_id).await;
@@ -20062,6 +20067,14 @@ mod teams {
                     res.assert_json_contains(&json!({"error": "not_repliable"}));
                     assert_eq!(moderate(item("1790"), "hide").await.status_code(), 422);
 
+                    // A comment already gone on Meta still counts as deleted here (a retry after a failed save).
+                    DELETE_MODE.store(3, Ordering::SeqCst);
+                    let res = moderate(item("101_9_5"), "delete").await;
+                    DELETE_MODE.store(0, Ordering::SeqCst);
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    assert_eq!(res.json::<Value>()["state"], "done");
+                    assert_eq!(res.json::<Value>()["moderation"]["deleted"], true);
+
                     // A token Meta refuses asks for a reconnect, on the account too.
                     let fb_account = account(&db, &team_id, "facebook", "101").await;
                     let row = social_accounts::ActiveModel {
@@ -20073,7 +20086,7 @@ mod teams {
                         .exec(&db)
                         .await
                         .unwrap();
-                    let res = moderate(item("101_9_5"), "hide").await;
+                    let res = moderate(item("101_9_6"), "hide").await;
                     assert_eq!(res.status_code(), 422);
                     res.assert_json_contains(&json!({"error": "meta_reconnect_required"}));
                     let fb_account = account(&db, &team_id, "facebook", "101").await;
@@ -20097,7 +20110,7 @@ mod teams {
                     };
                     for agent in [false, true] {
                         HUMAN_AGENT.store(agent, Ordering::SeqCst);
-                        let (s, db, _, _) = on_meta(true).await;
+                        let (s, db, state, _) = on_meta(true).await;
                         clean(&db).await;
                         let (cookie, team_id) = owner_connected(&s, &db).await;
                         deliver(&s, &page_message("101", "m_1", "777", "hello")).await;
@@ -20127,6 +20140,27 @@ mod teams {
                         hours_ago(&db, id, 30).await;
                         let w = show().await;
                         assert_eq!(w["open"], false);
+                        // A broadcast or automation never uses the tag, even sent in some user's name.
+                        let fb = account(&db, &team_id, "facebook", "101").await;
+                        let dm = stored(&db, &team_id).await.remove(0);
+                        let sent = inbox::send(
+                            &state,
+                            &fb,
+                            &dm,
+                            Via::Dm,
+                            "broadcast",
+                            &[],
+                            Some(uuid::Uuid::now_v7()),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                        assert!(matches!(
+                            sent,
+                            Err(socialreins_brain::connectors::bluesky::InboxError::Invalid(
+                                "outside_window"
+                            ))
+                        ));
                         let before = calls_since(0).len();
                         let res = reply("Sorry for the wait").await;
                         if agent {

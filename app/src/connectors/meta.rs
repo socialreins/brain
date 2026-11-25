@@ -168,6 +168,8 @@ fn inbox_error(refused: Refused) -> InboxError {
     let code = body["error"]["code"].as_i64();
     let sub = body["error"]["error_subcode"].as_i64();
     match (code, sub) {
+        // The comment or message it answers is gone.
+        _ if missing(status, &body) => InboxError::Invalid("not_found"),
         // Outside the 24 hour messaging window.
         (_, Some(2_018_278 | 2_534_022)) => InboxError::Invalid("outside_window"),
         (Some(4 | 17 | 32 | 613), _) => InboxError::RateLimited,
@@ -924,8 +926,11 @@ impl Meta {
                     .await?
             }
             (Moderate::Delete, _) => {
-                self.inbox_call(Method::DELETE, comment, token, None)
-                    .await?
+                match self.inbox_call(Method::DELETE, comment, token, None).await {
+                    // Already gone (deleted on the platform, or by a first try whose save failed).
+                    Err(InboxError::Invalid("not_found")) => return Ok(()),
+                    done => done?,
+                }
             }
             (Moderate::Like, false) => {
                 self.inbox_call(Method::POST, &likes, token, Some(&[]))
@@ -1103,6 +1108,8 @@ mod tests {
             InboxError::Invalid("dm_unavailable")
         );
         assert_eq!(refused(190, None), InboxError::MetaReconnect);
+        // A comment that is gone, by Graph's "does not exist" (code 100, subcode 33).
+        assert_eq!(refused(100, Some(33)), InboxError::Invalid("not_found"));
         for policy in [10, 200, 230, 299] {
             assert_eq!(
                 refused(policy, None),

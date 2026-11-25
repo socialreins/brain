@@ -845,8 +845,36 @@ pub async fn send_with(
     via: Via,
     text: &str,
     skip: &[std::ops::Range<usize>],
-    (sent_by, automation_id): (Option<Uuid>, Option<Uuid>),
+    from: (Option<Uuid>, Option<Uuid>),
     buttons: &[Button],
+) -> Result<Result<inbox_replies::Model, InboxError>, DbErr> {
+    send_inner(app, account, item, via, text, skip, from, (buttons, false)).await
+}
+
+/// A reply a person typed in the inbox: the only send that may use Meta's Human Agent tag, after
+/// the 24 hours (`META_HUMAN_AGENT`). Automations and broadcasts never do.
+pub async fn send_as_person(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    via: Via,
+    text: &str,
+    user: Uuid,
+) -> Result<Result<inbox_replies::Model, InboxError>, DbErr> {
+    let from = (Some(user), None);
+    send_inner(app, account, item, via, text, &[], from, (&[], true)).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_inner(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    via: Via,
+    text: &str,
+    skip: &[std::ops::Range<usize>],
+    (sent_by, automation_id): (Option<Uuid>, Option<Uuid>),
+    (buttons, human): (&[Button], bool),
 ) -> Result<Result<inbox_replies::Model, InboxError>, DbErr> {
     let meta = matches!(account.provider.as_str(), "facebook" | "instagram");
     let lined = numbered(text, buttons);
@@ -859,7 +887,7 @@ pub async fn send_with(
         return Ok(Err(InboxError::Invalid("too_long")));
     }
     let sent = if meta {
-        meta_inbox::send(app, account, item, via, text, (buttons, sent_by.is_some())).await?
+        meta_inbox::send(app, account, item, via, text, (buttons, human)).await?
     } else {
         send_bluesky(app, account, item, (via, text, skip)).await
     };

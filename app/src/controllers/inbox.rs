@@ -1327,7 +1327,6 @@ async fn send_reply(
         Ok(None) => return not_found(),
         Err(e) => return internal(e, "account read"),
     };
-    let user = Some(t.current.0.id);
     // One reply per item at a time, so a double click cannot send twice: the lock lives in
     // this transaction, held across the send.
     let guard = async {
@@ -1348,7 +1347,7 @@ async fn send_reply(
         Ok(None) => return reply(StatusCode::CONFLICT, "reply_in_progress"),
         Err(e) => return internal(e, "inbox reply lock"),
     };
-    let sent = inbox::send(&app, &account, &item, via, text, &[], user, None).await;
+    let sent = inbox::send_as_person(&app, &account, &item, via, text, t.current.0.id).await;
     let _ = guard.commit().await;
     match sent {
         Ok(Ok(_)) => {}
