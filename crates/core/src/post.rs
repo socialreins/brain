@@ -293,24 +293,34 @@ pub fn x_weight(text: &str) -> usize {
     total
 }
 
-/// Whether `c` is part of an emoji: the pictograph blocks, symbols that default to emoji, the
-/// variation selector, the joiner, the keycap and the tag characters. Text-style symbols such as
-/// `(c)` or `TM` are left out unless a variation selector makes them an emoji.
-fn emoji_part(c: char) -> bool {
+/// Whether `c` shows as an emoji on its own (Unicode's Emoji_Presentation): the pictograph
+/// blocks and a few dozen symbols below them. Text-style symbols (a check mark, a heart, a
+/// copyright sign) are not, and count as emoji only when a variation selector follows them.
+fn emoji_base(c: char) -> bool {
     matches!(c as u32,
-        0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2B00..=0x2BFF | 0x2300..=0x23FF
-        | 0xFE0F | 0x200D | 0x20E3 | 0xE0020..=0xE007F)
+        0x1F300..=0x1FAFF | 0x1F1E6..=0x1F1FF | 0x1F004 | 0x1F0CF | 0x1F18E | 0x1F191..=0x1F19A
+        | 0x1F201 | 0x1F21A | 0x1F22F | 0x1F232..=0x1F23A | 0x1F250..=0x1F251
+        | 0x231A..=0x231B | 0x23E9..=0x23EC | 0x23F0 | 0x23F3 | 0x25FD..=0x25FE
+        | 0x2614..=0x2615 | 0x2648..=0x2653 | 0x267F | 0x2693 | 0x26A1 | 0x26AA..=0x26AB
+        | 0x26BD..=0x26BE | 0x26C4..=0x26C5 | 0x26CE | 0x26D4 | 0x26EA | 0x26F2..=0x26F3
+        | 0x26F5 | 0x26FA | 0x26FD | 0x2705 | 0x270A..=0x270B | 0x2728 | 0x274C | 0x274E
+        | 0x2753..=0x2755 | 0x2757 | 0x2795..=0x2797 | 0x27B0 | 0x27BF | 0x2B1B..=0x2B1C
+        | 0x2B50 | 0x2B55)
 }
 
 /// What Threads counts against its 500-character limit: each character one, except an emoji
 /// (the Threads docs: "emojis are counted as the number of UTF-8 bytes"), which counts its bytes
-/// whole, so a family or a flag is the bytes of every part.
-/// shortcut: the emoji ranges in `emoji_part` are approximate, kept on the safe side for the
-/// common ones; widen them if Threads refuses a post this counts as under the limit.
+/// whole, so a family or a flag is the bytes of every part. A grapheme is an emoji when it holds
+/// an `emoji_base`, a variation selector (U+FE0F) or a keycap (U+20E3); a zero width joiner alone
+/// is not enough, since Bangla conjuncts use one.
+/// shortcut: `emoji_base` is Unicode's emoji list by hand, as of Emoji 15; add new emoji blocks
+/// if Threads refuses a post this counts as under the limit.
 pub fn threads_length(text: &str) -> usize {
     text.graphemes(true)
         .map(|g| {
-            if g.chars().any(emoji_part) {
+            if g.chars()
+                .any(|c| emoji_base(c) || matches!(c, '\u{FE0F}' | '\u{20E3}'))
+            {
                 g.len()
             } else {
                 g.chars().count()
@@ -345,7 +355,7 @@ pub fn check(platform: &str, body: &str, media: &[String]) -> Vec<Problem> {
             vec![(
                 threads_length(body),
                 THREADS_MAX_CHARS,
-                "characters, an emoji counting as its UTF-8 bytes",
+                "characters (an emoji counts as its UTF-8 bytes)",
             )],
             THREADS_MAX_MEDIA,
         ),
@@ -1084,6 +1094,17 @@ mod tests {
         assert_eq!(threads_length("🇧🇩"), 8);
         // A digit with a keycap: 1 + 3 + 3 bytes.
         assert_eq!(threads_length("1️⃣"), 7);
+        // Skin tone and a tag flag are part of their emoji.
+        assert_eq!(threads_length("👍🏽"), 8);
+        // Text-style symbols count one each, with or without a joiner in the text around them.
+        assert_eq!(threads_length("✓★♥©™"), 5);
+        // A Bangla conjunct (ra, joiner, virama, ya) is four characters, not twelve bytes.
+        assert_eq!(threads_length("র\u{200D}্য"), 4);
+        // An emoji exactly at the limit still fits.
+        assert_eq!(
+            validate("threads", &format!("{}😀", "a".repeat(496)), &[]),
+            Ok(())
+        );
     }
 
     #[test]
