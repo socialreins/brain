@@ -69,6 +69,7 @@ mod m20261226_000001_pinterest;
 mod m20261230_000001_bluesky_inbox_retry;
 mod m20261230_000002_bluesky_activity_kinds;
 mod m20261231_000001_meta_synced;
+mod m20261230_000003_inbox_actions;
 
 pub struct Migrator;
 
@@ -145,6 +146,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261230_000001_bluesky_inbox_retry::Migration),
             Box::new(m20261230_000002_bluesky_activity_kinds::Migration),
             Box::new(m20261231_000001_meta_synced::Migration),
+            Box::new(m20261230_000003_inbox_actions::Migration),
             // inject-above (do not remove this comment)
         ]
     }

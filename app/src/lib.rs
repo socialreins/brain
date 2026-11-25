@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod automations;
 pub mod billing;
+pub mod bluesky_actions;
 pub mod broadcasts;
 pub mod config;
 pub mod connectors;
