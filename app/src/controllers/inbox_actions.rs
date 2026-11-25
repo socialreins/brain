@@ -69,6 +69,8 @@ pub struct LogEntry {
     pub target: String,
     /// The error code of a failed one.
     pub error: Option<String>,
+    /// `delete_reply`: the reply it took down.
+    pub reply_id: Option<Uuid>,
     pub done_by: Option<Uuid>,
     pub created_at: DateTime<FixedOffset>,
 }
@@ -126,7 +128,8 @@ async fn list(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> R
     };
     let stmt = Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "SELECT id, action, status, target, error, done_by, created_at FROM inbox_actions \
+        "SELECT id, action, status, target, error, (detail->>'reply_id')::uuid AS reply_id, \
+         done_by, created_at FROM inbox_actions \
          WHERE inbox_item_id = $1 ORDER BY created_at DESC, id DESC LIMIT 100",
         [id.into()],
     );
