@@ -17,6 +17,8 @@ use uuid::Uuid;
 pub const KEEP_DAYS: i32 = 14;
 /// Most misses kept per automation, for items it listens for and for the others apart.
 pub const KEEP_ROWS: i64 = 100;
+/// Misses that only say the item was not this automation's to begin with.
+const NOISE: &str = "reasons <@ ARRAY['wrong_trigger', 'wrong_account', 'wrong_set']";
 /// Most misses an automation's page lists.
 pub const LISTED: i64 = 50;
 
@@ -26,7 +28,13 @@ fn sql(sql: &str, values: Vec<Value>) -> Statement {
 
 /// Stores why automation `automation` did not run on `item`. Once per pair: a second pass over
 /// the same item (the sweep) changes nothing.
-pub async fn record(
+pub async fn record(db: &impl ConnectionTrait, ids: (Uuid, Uuid, Uuid), reasons: &[&str]) {
+    if let Err(e) = try_record(db, ids, reasons).await {
+        tracing::warn!(error = %e, "automation miss not stored");
+    }
+}
+
+async fn try_record(
     db: &impl ConnectionTrait,
     (automation, team, item): (Uuid, Uuid, Uuid),
     reasons: &[&str],
@@ -48,6 +56,18 @@ pub async fn record_unreached(
     item: Uuid,
     trigger: &str,
     received_at: DateTime<FixedOffset>,
+) {
+    if let Err(e) = try_unreached(db, team, item, trigger, received_at).await {
+        tracing::warn!(error = %e, "automation misses not stored");
+    }
+}
+
+async fn try_unreached(
+    db: &impl ConnectionTrait,
+    team: Uuid,
+    item: Uuid,
+    trigger: &str,
+    received_at: DateTime<FixedOffset>,
 ) -> Result<(), DbErr> {
     let stmt = sql(
         "INSERT INTO automation_misses (automation_id, inbox_item_id, team_id, reasons) \
@@ -59,8 +79,9 @@ pub async fn record_unreached(
     db.execute_raw(stmt).await.map(|_| ())
 }
 
-/// Deletes misses older than `KEEP_DAYS` and those past the newest `KEEP_ROWS` of their kind
-/// (`wrong_trigger` rows are counted apart, so they never push out a real miss).
+/// Deletes misses older than `KEEP_DAYS` and those past the newest `KEEP_ROWS` of their kind. Rows
+/// that only say the item was for another trigger, account or set (`NOISE`) are counted apart, so
+/// they never push out a miss worth reading.
 pub async fn prune(db: &impl ConnectionTrait) -> Result<(), DbErr> {
     let old = sql(
         "DELETE FROM automation_misses WHERE created_at < now() - make_interval(days => $1)",
@@ -68,12 +89,12 @@ pub async fn prune(db: &impl ConnectionTrait) -> Result<(), DbErr> {
     );
     db.execute_raw(old).await?;
     let extra = sql(
-        "DELETE FROM automation_misses m USING ( \
-           SELECT automation_id, inbox_item_id, row_number() OVER (PARTITION BY automation_id, \
-           reasons = ARRAY['wrong_trigger'] ORDER BY created_at DESC, inbox_item_id) AS n \
+        &format!("DELETE FROM automation_misses m USING ( \
+           SELECT automation_id, inbox_item_id, row_number() OVER (PARTITION BY automation_id, {NOISE} \
+           ORDER BY created_at DESC, inbox_item_id) AS n \
            FROM automation_misses) x \
          WHERE m.automation_id = x.automation_id AND m.inbox_item_id = x.inbox_item_id \
-         AND x.n > $1",
+         AND x.n > $1"),
         vec![KEEP_ROWS.into()],
     );
     db.execute_raw(extra).await.map(|_| ())
@@ -145,8 +166,8 @@ pub struct Miss {
     pub text: String,
 }
 
-/// An automation's newest misses for items it listens for (`wrong_trigger` is left out: it
-/// would be every other item), newest first.
+/// An automation's newest misses for items it listens for (the `NOISE` ones are left out: they
+/// would be every item of another trigger, account or set), newest first.
 pub async fn for_automation(
     db: &impl ConnectionTrait,
     team: Uuid,
@@ -154,11 +175,13 @@ pub async fn for_automation(
 ) -> Result<Vec<Miss>, DbErr> {
     let rows = db
         .query_all_raw(sql(
-            "SELECT m.inbox_item_id, m.reasons, m.created_at, i.kind, i.platform, \
+            &format!(
+                "SELECT m.inbox_item_id, m.reasons, m.created_at, i.kind, i.platform, \
              COALESCE(i.author_name, i.author_handle) AS author, left(i.text, 200) AS text \
              FROM automation_misses m JOIN inbox_items i ON i.id = m.inbox_item_id \
-             WHERE m.team_id = $1 AND m.automation_id = $2 AND m.reasons <> ARRAY['wrong_trigger'] \
-             ORDER BY m.created_at DESC, m.inbox_item_id LIMIT $3",
+             WHERE m.team_id = $1 AND m.automation_id = $2 AND NOT m.{NOISE} \
+             ORDER BY m.created_at DESC, m.inbox_item_id LIMIT $3"
+            ),
             vec![team.into(), automation.into(), LISTED.into()],
         ))
         .await?;

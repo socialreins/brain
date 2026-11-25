@@ -311,7 +311,7 @@ pub enum Action {
     FollowBack {},
     /// Assigns the item to a member of the team, unless someone has it already.
     AssignItem { user_id: Uuid },
-    /// Emails the team's owners and admins the item's text and a link to it, at most 20 a team a
+    /// Emails the team's owners and admins the item's text and a link to it, at most 20 notifications a team a
     /// day. Nothing else about the person goes in it.
     NotifyTeam {},
     /// Once this automation's run starts, the automations after it do not run on the item.
@@ -504,7 +504,7 @@ fn check_conditions(trigger: &str, c: &mut Conditions) -> Result<(), &'static st
     let button = trigger == "button_clicked";
     let mention = trigger == "mention_received";
     // A like or repost names the post it is of, and has no text to look in.
-    let activity = matches!(trigger, "like_received" | "repost_received");
+    let activity = activity(trigger);
     let fits_trigger = (comment || activity || c.post_remote_ids.is_empty())
         && (comment || mention || !c.first_per_author)
         && (trigger == "dm_received" || !c.first_message)
@@ -550,6 +550,11 @@ fn check_conditions(trigger: &str, c: &mut Conditions) -> Result<(), &'static st
     Ok(())
 }
 
+/// A like or repost of one of our posts: no text, no contact, and no one to message.
+fn activity(trigger: &str) -> bool {
+    matches!(trigger, "like_received" | "repost_received")
+}
+
 /// A public reply needs a thread to go under, and `{page}` is the page of the post a comment or
 /// mention hangs off: DMs, clicks and follows have neither.
 fn public(trigger: &str) -> bool {
@@ -572,6 +577,13 @@ pub fn validate_steps(
 ) -> Result<(), &'static str> {
     check_conditions(trigger, conditions)?;
     let wait = |s: Option<&Step>| matches!(s, Some(Step::Wait { .. }));
+    if activity(trigger)
+        && steps
+            .iter()
+            .any(|s| s.sends().is_some() || matches!(s, Step::TagContact { .. }))
+    {
+        return Err("invalid_steps");
+    }
     let does = steps.iter().any(Step::takes_hit);
     if !does || steps.len() > MAX_STEPS || wait(steps.first()) || wait(steps.last()) {
         return Err("invalid_steps");
@@ -750,6 +762,15 @@ pub fn validate(
 ) -> Result<(), &'static str> {
     check_conditions(trigger, conditions)?;
     let public = public(trigger);
+    // A like or repost has no contact to tag, and a message to everyone who likes would repeat
+    // itself: only the actions that do something on the account or in the team.
+    if activity(trigger)
+        && actions
+            .iter()
+            .any(|a| a.via_text().is_some() || matches!(a, Action::TagContact { .. }))
+    {
+        return Err("invalid_actions");
+    }
     if !public
         && actions
             .iter()
@@ -1073,8 +1094,7 @@ async fn run_matching(
         return Ok(());
     }
     // The automations this item is not for, or that were off when it came, say why.
-    automation_misses::record_unreached(db, item.team_id, item.id, trigger, item.received_at)
-        .await?;
+    automation_misses::record_unreached(db, item.team_id, item.id, trigger, item.received_at).await;
     let autos = automations::Entity::find()
         .filter(automations::Column::TeamId.eq(item.team_id))
         .filter(automations::Column::Active.eq(true))
@@ -1092,7 +1112,7 @@ async fn run_matching(
     let guard = loop_guard(db, item, account).await?;
     // A follower is welcomed once per account ever: an unfollow and a new follow stores a new
     // item (a new record) but runs nothing.
-    if item.kind == "follow" {
+    let followed_before = if item.kind == "follow" {
         let stmt = sql(
             "SELECT EXISTS (SELECT 1 FROM inbox_items WHERE social_account_id = $1 \
              AND kind = 'follow' AND author_id = $2 AND id < $3) AS ok",
@@ -1102,25 +1122,19 @@ async fn run_matching(
                 item.id.into(),
             ],
         );
-        let again: bool = match db.query_one_raw(stmt).await? {
+        match db.query_one_raw(stmt).await? {
             Some(r) => r.try_get("", "ok")?,
             None => false,
-        };
-        if again {
-            for a in &autos {
-                let ids = (a.id, a.team_id, item.id);
-                automation_misses::record(db, ids, &["followed_before"]).await?;
-            }
-            return Ok(());
         }
-    }
+    } else {
+        false
+    };
     let sets = live_set_ids(db, account.id).await?;
     // Set once an automation that stops the others has started its run on this item.
     let mut stopped = false;
     for a in autos {
         if stopped {
-            automation_misses::record(db, (a.id, a.team_id, item.id), &["stopped_by_other"])
-                .await?;
+            automation_misses::record(db, (a.id, a.team_id, item.id), &["stopped_by_other"]).await;
             continue;
         }
         let parsed = (
@@ -1186,7 +1200,11 @@ async fn run_matching(
             why.push("button_not_named");
         }
         if !why.is_empty() {
-            automation_misses::record(db, (a.id, a.team_id, item.id), &why).await?;
+            automation_misses::record(db, (a.id, a.team_id, item.id), &why).await;
+            continue;
+        }
+        if followed_before {
+            automation_misses::record(db, (a.id, a.team_id, item.id), &["followed_before"]).await;
             continue;
         }
         // An action that needs the post's page does not run without one, and leaves no run:
@@ -1207,7 +1225,7 @@ async fn run_matching(
         };
         if needed && page.is_none() {
             tracing::info!(automation = %a.id, item = %item.id, "no public page, not run");
-            automation_misses::record(db, (a.id, a.team_id, item.id), &["no_public_page"]).await?;
+            automation_misses::record(db, (a.id, a.team_id, item.id), &["no_public_page"]).await;
             continue;
         }
         // The hit pays for the first send: a flow that starts on a tag has not sent yet.
@@ -1244,14 +1262,16 @@ async fn run_matching(
             }
         }
         let once = cond.first_per_author;
-        let Some(run_id) = claim(db, &a, item, steps.is_some(), sends, once).await? else {
-            continue;
-        };
+        // An automation that matched stops the rest even when its own cool-down or cap holds it
+        // back, or when this is the sweep's second look at an item it already ran on.
         stopped = actions.iter().any(|x| matches!(x, Action::StopOthers {}))
             || steps
                 .iter()
                 .flatten()
                 .any(|x| matches!(x, Step::StopOthers {}));
+        let Some(run_id) = claim(db, &a, item, steps.is_some(), sends, once).await? else {
+            continue;
+        };
         if let Some(steps) = &steps {
             let page = page.as_deref();
             let flow = Flow {
@@ -2948,7 +2968,8 @@ mod tests {
             serde_json::from_value(serde_json::json!({"type": "tag_contact", "tag": t})).unwrap()
         };
         assert_eq!(tag("  VIP "), Action::TagContact { tag: "vip".into() });
-        for t in TRIGGERS {
+        // Every trigger with a person behind it; a like or repost has no contact to tag.
+        for t in TRIGGERS.into_iter().filter(|t| !activity(t)) {
             let mut c = Conditions {
                 payloads: vec!["yes".into()],
                 ..Conditions::default()

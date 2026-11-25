@@ -106,7 +106,7 @@ pub struct AutomationInput {
     /// Up to 2 sends (`send_dm` or `ai_send_dm`, `reply_publicly` or `ai_reply_publicly`), at
     /// most one DM and one public reply, and beside them up to 3 `tag_contact`, each tag once,
     /// and each of `like_item`, `repost_item`, `follow_back` (Bluesky), `assign_item` (a
-    /// member's `user_id`), `notify_team` (emails the owners and admins, at most 20 a day) and
+    /// member's `user_id`), `notify_team` (notifies the owners and admins by email, at most 20 notifications a day) and
     /// `stop_others` (the automations after this one do not run on the item) once. At least one
     /// send or one of those but the stop. Either this or `steps`: both is
     /// `422 actions_and_steps`.

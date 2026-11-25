@@ -19,7 +19,8 @@ use crate::{
     state::AppState,
 };
 
-/// Emails to the team's owners and admins an automation may send per team per day.
+/// Notifications to the team an automation may send per team per day; each goes to every owner
+/// and admin.
 pub const MAILS_PER_DAY: i64 = 20;
 /// Longest item text put into a mail.
 const MAIL_CHARS: usize = 300;
@@ -117,6 +118,26 @@ async fn bluesky(
     let Some(action) = effect.action() else {
         return result(kind, "failed", Some("internal"), None);
     };
+    if account.provider != "bluesky" {
+        // Refused before anything is called or logged: it is no Bluesky item.
+        return result(kind, "skipped", Some("unsupported_platform"), None);
+    }
+    // One attempt at a time per item and action, as the inbox's own buttons: a second automation
+    // or a click at the same moment must not read "not liked yet" and make a second record.
+    let Ok(txn) = app.db.begin().await else {
+        return result(kind, "failed", Some("internal"), None);
+    };
+    let lock = sql(
+        "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 2)) AS ok",
+        vec![format!("{}:{}", item.id, action.as_str()).into()],
+    );
+    let held = match txn.query_one_raw(lock).await {
+        Ok(Some(r)) => r.try_get("", "ok").unwrap_or(false),
+        _ => false,
+    };
+    if !held {
+        return result(kind, "skipped", Some("action_in_progress"), None);
+    }
     let outcome = bluesky_actions::perform(app, account, item, action, &Extra::default()).await;
     if outcome == Err(InboxError::Reconnect) {
         crate::expiry::flag_reconnect(&app.db, account.id).await;
@@ -125,6 +146,7 @@ async fn bluesky(
     if let Err(e) = bluesky_actions::log(app, item, None, action, &outcome, detail).await {
         tracing::error!(error = %e, item = %item.id, "automation action not logged");
     }
+    let _ = txn.commit().await;
     match outcome {
         Ok(remote) => result(kind, "done", None, remote),
         // Nothing to do there, not a fault: the item is no place for it, or Bluesky is busy.
@@ -196,6 +218,13 @@ fn noun(kind: &str) -> &'static str {
 /// The item's text as one quoted line: a person wrote it, so it must never turn into a link
 /// button (a line starting with a link) or a heading in the HTML version of the mail.
 fn quoted(text: &str) -> String {
+    // One line, and no control or direction-changing characters a link could hide behind.
+    let hidden =
+        |c: char| c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    let text: String = text
+        .chars()
+        .filter(|c| !hidden(*c) || c.is_whitespace())
+        .collect();
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let cut: String = flat.chars().take(MAIL_CHARS).collect();
     let dots = if flat.chars().count() > MAIL_CHARS {
@@ -218,17 +247,27 @@ async fn notify(
     let Some(hits) = rate_limit::daily_reserve(&app.db, &cap).await? else {
         return Ok(result(kind, "skipped", Some("mail_cap"), None));
     };
-    let to = recipients(&app.db, item.team_id).await?;
-    let code: String = app
-        .db
-        .query_one_raw(sql(
-            "SELECT code FROM teams WHERE id = $1",
-            vec![item.team_id.into()],
-        ))
-        .await?
-        .map(|r| r.try_get("", "code"))
-        .transpose()?
-        .unwrap_or_default();
+    let read = async {
+        let to = recipients(&app.db, item.team_id).await?;
+        let code: String = app
+            .db
+            .query_one_raw(sql(
+                "SELECT code FROM teams WHERE id = $1",
+                vec![item.team_id.into()],
+            ))
+            .await?
+            .map(|r| r.try_get("", "code"))
+            .transpose()?
+            .unwrap_or_default();
+        Ok::<_, DbErr>((to, code))
+    };
+    let (to, code) = match read.await {
+        Ok(r) => r,
+        Err(e) => {
+            rate_limit::daily_refund(&app.db, &hits).await;
+            return Err(e);
+        }
+    };
     let link = format!("{}/t/{code}/inbox?item={}", app.web_url, item.id);
     let what = noun(&item.kind);
     let subject = format!("A new {what} ran one of your automations");
@@ -239,7 +278,8 @@ async fn notify(
     };
     let text = format!(
         "The automation \"{}\" ran on a new {what} on {}.\n{said}\nOpen it in your inbox:\n{link}\n",
-        a.name, item.platform
+        a.name.split_whitespace().collect::<Vec<_>>().join(" "),
+        item.platform
     );
     let mut sent = 0;
     for email in &to {
