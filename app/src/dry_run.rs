@@ -44,6 +44,15 @@ pub struct Sample {
     /// For a `button_clicked` trigger: the payload of the button clicked.
     #[serde(default)]
     pub button_payload: Option<String>,
+    /// Bluesky only: whether the author could receive our DM (they follow the account, or allow
+    /// DMs from anyone). `false` shows what a refusal does: the DM is skipped `dm_not_allowed`
+    /// and the fallback public reply takes its place. Default `true`.
+    #[serde(default = "yes")]
+    pub author_can_dm: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// One action or step as it would go.
@@ -56,7 +65,7 @@ pub struct PlannedStep {
     /// `would_send`, `would_skip`, `would_fail`, `would_tag`, `would_wait` or `not_reached` (an
     /// earlier send of a flow did not go out, so the run ends before it).
     pub status: String,
-    /// Why it would not go out, as a run's result gives it: `no_dm_access`, `too_long`,
+    /// Why it would not go out, as a run's result gives it: `no_dm_access`, `dm_not_allowed`, `too_long`,
     /// `no_ai_key`, `no_ai_credits`, `ai_failed`, `ai_empty`, `ai_too_long`, `ai_link`,
     /// `ai_leak`, `no_public_page`.
     pub reason: Option<String>,
@@ -87,9 +96,10 @@ pub struct Outcome {
     /// first-only conditions pass.)
     pub mismatches: Vec<String>,
     /// Rules that would stop it: `no_public_page` (a text holds `{page}` and the post has no
-    /// live page: the automation does not run, so there are no steps), and the Facebook and
-    /// Instagram rules of `network_limits` that make a send fail (`meta_one_private_reply`,
-    /// `meta_reply_window`; the steps are still listed, as a run would go as far as it can).
+    /// live page: the automation does not run, so there are no steps), and the rules of
+    /// `network_limits` for the account's network (`meta_one_private_reply`,
+    /// `meta_reply_window`, `x_unsupported_trigger`, `bluesky_unsupported_trigger`; the steps are
+    /// still listed, as a run would go as far as it can).
     pub blocks: Vec<String>,
     pub steps: Vec<PlannedStep>,
 }
@@ -330,6 +340,7 @@ pub async fn test(
         fallback,
         page,
         room,
+        dm_open: sample.author_can_dm,
     };
     out.steps = walk(app, account, &item, &parts, walked).await;
     Ok(out)
@@ -343,6 +354,8 @@ struct Walk<'a> {
     page: Option<String>,
     /// Sends the team's daily cap still takes; a send past it would be skipped `daily_cap`.
     room: i64,
+    /// Bluesky: the author could take our DM (`Sample::author_can_dm`).
+    dm_open: bool,
 }
 
 async fn walk(
@@ -355,6 +368,7 @@ async fn walk(
         fallback,
         page,
         room,
+        dm_open,
     }: Walk<'_>,
 ) -> Vec<PlannedStep> {
     let mut sends = 0;
@@ -398,7 +412,7 @@ async fn walk(
                     }
                 } else {
                     let send = (*kind, *via, *template, *ai, *buttons);
-                    plan_send(app, account, item, send, page.as_deref()).await
+                    plan_send(app, account, item, send, (page.as_deref(), dm_open)).await
                 };
                 stopped = flow && planned.status != "would_send";
                 out.push(planned);
@@ -408,7 +422,7 @@ async fn walk(
     let refused = |r: &PlannedStep| {
         matches!(r.kind.as_str(), "send_dm" | "ai_send_dm")
             && r.status != "would_send"
-            && matches!(r.reason.as_deref(), Some("no_dm_access"))
+            && matches!(r.reason.as_deref(), Some("no_dm_access" | "dm_not_allowed"))
     };
     let replied = |r: &PlannedStep| {
         matches!(r.kind.as_str(), "reply_publicly" | "ai_reply_publicly")
@@ -428,7 +442,7 @@ async fn walk(
             }
         } else {
             let send = (kind, Via::Public, f, false, &[][..]);
-            plan_send(app, account, item, send, page.as_deref()).await
+            plan_send(app, account, item, send, (page.as_deref(), dm_open)).await
         };
         out.push(planned);
     }
@@ -442,9 +456,12 @@ async fn plan_send(
     account: &social_accounts::Model,
     item: &inbox_items::Model,
     (kind, via, template, ai, buttons): (&str, Via, &str, bool, &[Button]),
-    page: Option<&str>,
+    (page, dm_open): (Option<&str>, bool),
 ) -> PlannedStep {
-    let no_dm = via == Via::Dm && account.provider == "bluesky" && !account.dm_access;
+    let bluesky_dm = via == Via::Dm && account.provider == "bluesky";
+    let no_dm = bluesky_dm && !account.dm_access;
+    // What Bluesky answers a send to someone who neither follows us nor allows DMs from anyone.
+    let refused = bluesky_dm && !dm_open;
     let skipped = |reason: &str| PlannedStep {
         reason: Some(reason.into()),
         ..step(kind, "would_skip")
@@ -455,11 +472,13 @@ async fn plan_send(
         }
         let reference = format!("ai:test:{}", Uuid::now_v7());
         return match rules::ai_write(app, account, item, (kind, via, template), &reference).await {
+            // A run writes first and only then learns the person refuses: the call is spent.
             Ok(w) => PlannedStep {
                 text: Some(w.text),
                 provider: Some(w.provider),
                 model: w.model,
-                ..step(kind, "would_send")
+                reason: refused.then(|| "dm_not_allowed".into()),
+                ..step(kind, if refused { "would_skip" } else { "would_send" })
             },
             Err(r) => ended(r),
         };
@@ -484,6 +503,12 @@ async fn plan_send(
     }
     if no_dm {
         return skipped("no_dm_access");
+    }
+    if refused {
+        return PlannedStep {
+            text: Some(sent),
+            ..skipped("dm_not_allowed")
+        };
     }
     PlannedStep {
         text: Some(sent),

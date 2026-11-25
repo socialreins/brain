@@ -392,7 +392,11 @@ const META_PRIVATE_REPLY_MINUTES: u32 = 7 * 24 * 60;
 /// (`x_unsupported_trigger`): a comment (a reply to our post), a mention and a DM, never a follow,
 /// a story reply or a button tap. X has no private reply and no messaging window: a DM goes
 /// when the person follows the account or has DMs open, else it ends `skipped: dm_not_allowed`
-/// and the fallback public reply answers. A mixed scope is left to fail item by item.
+/// and the fallback public reply answers. When every account is Bluesky, a story reply and a
+/// button tap never come (`bluesky_unsupported_trigger`; its buttons are numbered lines the
+/// person answers with a DM keyword). Bluesky has no private reply either: a DM goes only to
+/// someone who follows the account or allows DMs from anyone, and a welcome DM to a new
+/// follower normally does, as they follow us (unless they closed their DMs). A mixed scope is left to fail item by item.
 pub fn network_limits(
     trigger: &str,
     providers: &[&str],
@@ -407,6 +411,12 @@ pub fn network_limits(
         && matches!(trigger, "new_follower" | "story_reply" | "button_clicked")
     {
         return Err("x_unsupported_trigger");
+    }
+    if !providers.is_empty()
+        && providers.iter().all(|p| *p == "bluesky")
+        && matches!(trigger, "story_reply" | "button_clicked")
+    {
+        return Err("bluesky_unsupported_trigger");
     }
     if providers.is_empty()
         || !providers
@@ -2081,6 +2091,27 @@ mod tests {
         }
         assert_eq!(
             network_limits("new_follower", &["x", "bluesky"], &none, None),
+            Ok(())
+        );
+        // Bluesky has no story replies or button taps; a follow, a comment, a mention and a DM
+        // are all its own, and a mixed scope is left to fail item by item.
+        for no in ["story_reply", "button_clicked"] {
+            assert_eq!(
+                network_limits(no, &["bluesky"], &none, Some(&[dm("hi")])),
+                Err("bluesky_unsupported_trigger"),
+                "{no}"
+            );
+        }
+        for ok in [
+            "comment_received",
+            "mention_received",
+            "dm_received",
+            "new_follower",
+        ] {
+            assert_eq!(network_limits(ok, &["bluesky"], &none, Some(&two)), Ok(()));
+        }
+        assert_eq!(
+            network_limits("story_reply", &["bluesky", "instagram"], &none, None),
             Ok(())
         );
         assert_eq!(
