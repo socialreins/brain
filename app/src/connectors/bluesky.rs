@@ -1611,7 +1611,8 @@ impl Bluesky {
         parent: Ref<'_>,
         root: Ref<'_>,
     ) -> Result<String, InboxError> {
-        let record = post_record(text, skip, Some((parent, root)));
+        let extra = self.rich_facets(text, skip).await;
+        let record = post_record_with(text, skip, Some((parent, root)), extra);
         let body =
             serde_json::json!({ "repo": c.did, "collection": POST_COLLECTION, "record": record });
         let made = self
@@ -1657,7 +1658,7 @@ impl Bluesky {
             }
         };
         let mut message = serde_json::json!({ "text": text });
-        let facets = facets(text, skip);
+        let facets = merged(facets(text, skip), self.rich_facets(text, skip).await);
         if !facets.is_empty() {
             message["facets"] = facets.into();
         }
@@ -1786,13 +1787,121 @@ fn facets(text: &str, skip: &[Range<usize>]) -> Vec<Value> {
         .collect()
 }
 
+/// `@handle` tokens in `text` that could be mentions: after the start, whitespace or an opening
+/// bracket, a domain name of letters, digits, dots and hyphens with a dot in it, at most 5, none
+/// touching a range in `skip` (text filled in from someone else). Byte range (with the `@`) and
+/// the normalized handle.
+fn mention_candidates(text: &str, skip: &[Range<usize>]) -> Vec<(Range<usize>, String)> {
+    let mut found = Vec::new();
+    for (at, _) in text.match_indices('@') {
+        let before = text[..at].chars().next_back();
+        if before.is_some_and(|c| !c.is_whitespace() && !"([{".contains(c)) {
+            continue;
+        }
+        let tail = &text[at + 1..];
+        let len = tail
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+            .unwrap_or(tail.len());
+        let name = tail[..len].trim_end_matches(['.', '-']);
+        let range = at..at + 1 + name.len();
+        if skip
+            .iter()
+            .any(|r| range.start < r.end && r.start < range.end)
+        {
+            continue;
+        }
+        if let Some(h) = handle(name) {
+            found.push((range, h));
+        }
+        if found.len() == 5 {
+            break;
+        }
+    }
+    found
+}
+
+/// `#tag` facets for `text`, outside `skip`: 1 to 64 characters of letters, digits and `_`, not
+/// only digits, after the start, whitespace or an opening bracket.
+fn tag_facets(text: &str, skip: &[Range<usize>]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (at, _) in text.match_indices('#') {
+        let before = text[..at].chars().next_back();
+        if before.is_some_and(|c| !c.is_whitespace() && !"([{".contains(c)) {
+            continue;
+        }
+        let tail = &text[at + 1..];
+        let len = tail
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(tail.len());
+        let name = &tail[..len];
+        let range = at..at + 1 + name.len();
+        let overlaps = skip
+            .iter()
+            .any(|r| range.start < r.end && r.start < range.end);
+        if name.is_empty()
+            || name.chars().count() > 64
+            || name.chars().all(|c| c.is_ascii_digit())
+            || overlaps
+        {
+            continue;
+        }
+        out.push(serde_json::json!({
+            "index": { "byteStart": range.start, "byteEnd": range.end },
+            "features": [{ "$type": "app.bsky.richtext.facet#tag", "tag": name }],
+        }));
+    }
+    out
+}
+
+/// `links` and `extra` facets in text order, dropping any that overlaps one already kept.
+fn merged(links: Vec<Value>, extra: Vec<Value>) -> Vec<Value> {
+    let start = |f: &Value| f["index"]["byteStart"].as_u64().unwrap_or(0);
+    let end = |f: &Value| f["index"]["byteEnd"].as_u64().unwrap_or(0);
+    let mut all: Vec<Value> = links.into_iter().chain(extra).collect();
+    all.sort_by_key(start);
+    let mut kept: Vec<Value> = Vec::new();
+    for f in all {
+        if kept.last().is_none_or(|k| start(&f) >= end(k)) {
+            kept.push(f);
+        }
+    }
+    kept
+}
+
+impl Bluesky {
+    /// Mention and tag facets for `text`: each `@handle` that Bluesky resolves becomes a mention
+    /// of its DID (one that does not resolve stays plain text), each `#tag` a tag.
+    async fn rich_facets(&self, text: &str, skip: &[Range<usize>]) -> Vec<Value> {
+        let mut out = tag_facets(text, skip);
+        for (range, handle) in mention_candidates(text, skip) {
+            if let Ok(did) = self.did(&handle).await {
+                out.push(serde_json::json!({
+                    "index": { "byteStart": range.start, "byteEnd": range.end },
+                    "features": [{ "$type": "app.bsky.richtext.facet#mention", "did": did }],
+                }));
+            }
+        }
+        out
+    }
+}
+
 /// A post record, a reply when `reply` holds `(parent, root)` as `(uri, cid)` pairs.
 pub fn post_record(text: &str, skip: &[Range<usize>], reply: Option<(Ref<'_>, Ref<'_>)>) -> Value {
+    post_record_with(text, skip, reply, Vec::new())
+}
+
+/// `post_record` with `extra` facets (mentions, tags) beside the links.
+pub fn post_record_with(
+    text: &str,
+    skip: &[Range<usize>],
+    reply: Option<(Ref<'_>, Ref<'_>)>,
+    extra: Vec<Value>,
+) -> Value {
     let created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let mut record = serde_json::json!({
         "$type": POST_COLLECTION, "text": text, "createdAt": created,
     });
-    let facets = facets(text, skip);
+    let facets = merged(facets(text, skip), extra);
     if !facets.is_empty() {
         record["facets"] = facets.into();
     }
@@ -1903,6 +2012,55 @@ mod tests {
         assert_eq!(mp4_size(b"not a video"), None);
         let cut = mp4(1080, 1920, 0x10000);
         assert_eq!(mp4_size(&cut[..cut.len() - 10]), None);
+    }
+
+    #[test]
+    fn mentions_and_tags_are_found_where_bluesky_would() {
+        let text =
+            "Thanks @Alice.test, (@bob.example.com) and mail me@x.org #launch_day #2026 a#b @nodot";
+        let names: Vec<_> = mention_candidates(text, &[])
+            .into_iter()
+            .map(|(r, h)| (text[r].to_owned(), h))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("@Alice.test".to_owned(), "alice.test".to_owned()),
+                ("@bob.example.com".to_owned(), "bob.example.com".to_owned())
+            ]
+        );
+        let tags: Vec<_> = tag_facets(text, &[])
+            .iter()
+            .map(|f| f["features"][0]["tag"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            tags,
+            ["launch_day"],
+            "digits only and mid-word are not tags"
+        );
+        // Text filled in from someone else never becomes a mention or a tag.
+        let r = text.find("@Alice").unwrap();
+        assert!(mention_candidates(text, std::slice::from_ref(&(r..r + 11)))
+            .iter()
+            .all(|(_, h)| h != "alice.test"));
+        assert!(tag_facets("#x", std::slice::from_ref(&(0..2))).is_empty());
+        // At most 5 mentions.
+        let many = "@a.test @b.test @c.test @d.test @e.test @f.test";
+        assert_eq!(mention_candidates(many, &[]).len(), 5);
+    }
+
+    #[test]
+    fn facets_come_in_text_order_without_overlaps() {
+        let f = |a: u64, b: u64, t: &str| serde_json::json!({"index": {"byteStart": a, "byteEnd": b}, "features": [{"$type": t}]});
+        let got = merged(
+            vec![f(10, 20, "link")],
+            vec![f(0, 5, "tag"), f(12, 15, "mention"), f(20, 25, "tag")],
+        );
+        let kinds: Vec<_> = got
+            .iter()
+            .map(|x| x["features"][0]["$type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["tag", "link", "tag"]);
     }
 
     #[test]
