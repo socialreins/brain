@@ -519,7 +519,7 @@ async fn store_new(
     Ok(Some((account, fresh)))
 }
 
-fn clip(text: &str) -> String {
+pub(crate) fn clip(text: &str) -> String {
     text.chars().take(MAX_TEXT_CHARS).collect()
 }
 
@@ -543,10 +543,12 @@ const INSERT: &str = "WITH c AS (INSERT INTO contacts AS k (id, team_id, platfor
     INSERT INTO inbox_items (id, team_id, social_account_id, platform, kind, \
     remote_id, remote_cid, parent_remote_id, root_remote_id, root_remote_cid, convo_id, \
     author_id, author_handle, author_name, author_avatar, text, received_at, permalink, \
-    story_reply, story_id, story_url, state, button_payload, attachments, post_id, contact_id) \
+    story_reply, story_id, story_url, state, button_payload, attachments, post_id, contact_id, \
+    automated_at) \
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
     $19, $20, $21, $22, $23, $25, (SELECT t.post_id FROM post_targets t WHERE t.social_account_id = $3 \
-     AND t.remote_id IN ($8, $9) LIMIT 1), (SELECT id FROM c)) \
+     AND t.remote_id IN ($8, $9) LIMIT 1), (SELECT id FROM c), \
+     CASE WHEN $26 THEN now() END) \
     ON CONFLICT (social_account_id, remote_id) DO NOTHING RETURNING *";
 
 /// An item to store, from any platform.
@@ -604,16 +606,17 @@ pub async fn store(
     account: &social_accounts::Model,
     f: Fresh,
 ) -> Result<Option<inbox_items::Model>, DbErr> {
-    store_with(db, account, f, true).await
+    store_with(db, account, f, (true, false)).await
 }
 
 /// `store`; with `opt` false a `stop` or `start` changes nobody's broadcast opt-out (a message read
-/// late, which a newer one from its author may already have overruled).
+/// late, which a newer one from its author may already have overruled), and with `automated` the
+/// item is stored as already automated, in the same statement, so no automation answers it.
 pub async fn store_with(
     db: &DatabaseConnection,
     account: &social_accounts::Model,
     f: Fresh,
-    opt: bool,
+    (opt, automated): (bool, bool),
 ) -> Result<Option<inbox_items::Model>, DbErr> {
     let values: Vec<Value> = vec![
         Uuid::now_v7().into(),
@@ -642,6 +645,7 @@ pub async fn store_with(
         f.button_payload.into(),
         Uuid::now_v7().into(),
         serde_json::json!(f.attachments[..f.attachments.len().min(MAX_ATTACHMENTS)]).into(),
+        automated.into(),
     ];
     let item = inbox_items::Entity::find()
         .from_raw_sql(sql(INSERT, values))

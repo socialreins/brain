@@ -18442,7 +18442,9 @@ mod teams {
                                         {"id": "m_stop", "message": "STOP", "created_time": ago(300),
                                          "from": {"id": "777", "name": "Ada"}},
                                         {"id": "m_dup", "message": "ping", "created_time": ago(1),
-                                         "from": {"id": "888", "name": "Bo"}}]}},
+                                         "from": {"id": "888", "name": "Bo"}},
+                                        {"id": "m_stop2", "message": "stop", "created_time": ago(200),
+                                         "from": {"id": "666", "name": "Cy"}}]}},
                                     {"updated_time": ago(60 * 24 * 30), "messages": {"data": [
                                         {"id": "m_old", "message": "ancient",
                                          "created_time": ago(60 * 24 * 30), "from": {"id": "999"}}]}}]}),
@@ -19888,7 +19890,10 @@ mod teams {
                     // A message the webhook named by another id than the listing does.
                     let ping = page_message("101", "webhook_mid", "888", "ping");
                     assert_eq!(deliver(&s, &ping).await.status_code(), 200);
-                    assert_eq!(stored(&db, &team_id).await.len(), 3);
+                    // Another person said `stop`, then something else: still opted out.
+                    let thanks = page_message("101", "m_thanks", "666", "thanks");
+                    assert_eq!(deliver(&s, &thanks).await.status_code(), 200);
+                    assert_eq!(stored(&db, &team_id).await.len(), 4);
                     // The accounts were connected a month ago.
                     let stmt = sea_orm::Statement::from_string(
                         sea_orm::DbBackend::Postgres,
@@ -19900,7 +19905,7 @@ mod teams {
                     let fb = account(&db, &team_id, "facebook", "101").await;
                     let ig = account(&db, &team_id, "instagram", "1784").await;
 
-                    assert_eq!(meta_inbox::backfill(&state, &fb, false).await.unwrap(), 3);
+                    assert_eq!(meta_inbox::backfill(&state, &fb, false).await.unwrap(), 4);
                     assert_eq!(meta_inbox::backfill(&state, &fb, false).await.unwrap(), 0);
                     assert_eq!(meta_inbox::backfill(&state, &ig, false).await.unwrap(), 3);
                     let items = stored(&db, &team_id).await;
@@ -19917,6 +19922,8 @@ mod teams {
                             "m_new",
                             "m_start",
                             "m_stop",
+                            "m_stop2",
+                            "m_thanks",
                             "webhook_mid"
                         ],
                         "{ids:?}"
@@ -19954,6 +19961,16 @@ mod teams {
                         .unwrap()
                         .unwrap();
                     assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
+                    let stmt = sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Postgres,
+                        "SELECT count(*) AS n FROM contact_opt_outs WHERE team_id = $1 AND external_id = '666'",
+                        [team_id.parse::<uuid::Uuid>().unwrap().into()],
+                    );
+                    let row = sea_orm::ConnectionTrait::query_one_raw(&db, stmt)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(row.try_get::<i64>("", "n").unwrap(), 1);
 
                     // A dead token ends the read and asks for a reconnect.
                     let row = social_accounts::ActiveModel {

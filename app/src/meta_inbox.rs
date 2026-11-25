@@ -496,9 +496,9 @@ fn listed_facebook_comment(v: &Value, post: &str, page: &str) -> Option<Fresh> {
 /// comment's `replies`); `parent` is the media for a top-level comment, else that comment.
 fn listed_instagram_comment(v: &Value, media: &str, parent: &str) -> Option<Fresh> {
     let (id, from) = (sid(&v["id"])?, &v["from"]);
-    // Graph may leave `from` out: the username then stands for the person (shortcut: it is not
-    // the id the webhook uses, so such a commenter's contact is separate).
-    let author = sid(&from["id"]).or_else(|| sid(&v["username"]))?;
+    // No id, no item: a username is not the id the webhook and DMs use, and a made-up identity
+    // would split one person into two contacts (verify live that Graph returns `from`).
+    let author = sid(&from["id"])?;
     Some(Fresh {
         kind: "comment",
         remote_id: id,
@@ -654,7 +654,7 @@ async fn facebook_comments(
 /// (`instagram_basic`, `instagram_manage_comments`).
 async fn instagram_comments(
     app: &AppState,
-    (token, account): (&str, &str),
+    (token, account, handle): (&str, &str, Option<&str>),
     (floor, deadline): (DateTime<FixedOffset>, Instant),
     out: &mut Found,
 ) -> Result<(), InboxError> {
@@ -685,7 +685,12 @@ async fn instagram_comments(
                 let top = sid(&c["id"]).unwrap_or_default();
                 out.items.extend(listed_instagram_comment(c, &id, &id));
                 for r in c["replies"]["data"].as_array().into_iter().flatten() {
-                    if sid(&r["from"]["id"]).as_deref() == Some(account) {
+                    let own = sid(&r["from"]["id"]).as_deref() == Some(account)
+                        || handle.is_some_and(|h| {
+                            let by = sid(&r["username"]).or_else(|| sid(&r["from"]["username"]));
+                            by.is_some_and(|u| u.eq_ignore_ascii_case(h))
+                        });
+                    if own {
                         out.answered.insert(top.clone());
                     }
                     out.items.extend(listed_instagram_comment(r, &id, &top));
@@ -753,11 +758,12 @@ pub async fn backfill(
     let floor = (Utc::now() - Duration::days(inbox::FIRST_DAYS)).fixed_offset();
     let deadline = Instant::now() + BACKFILL_BUDGET;
     let mut found = Found::default();
-    let keys = (token.as_str(), account.external_id.as_str());
+    let id = account.external_id.as_str();
     let comments = if instagram {
+        let keys = (token.as_str(), id, account.handle.as_deref());
         instagram_comments(app, keys, (floor, deadline), &mut found).await
     } else {
-        facebook_comments(app, keys, (floor, deadline), &mut found).await
+        facebook_comments(app, (token.as_str(), id), (floor, deadline), &mut found).await
     };
     let mut results = vec![comments];
     if !page.is_empty() {
@@ -803,15 +809,11 @@ pub async fn backfill(
             || answered.contains(&event.remote_id);
         // A late `stop` must not undo a newer `start` the webhook already stored.
         let opt = !newer_message(app, account, &event).await?;
-        if let Some(item) = inbox::store_with(&app.db, account, event, opt).await? {
+        if inbox::store_with(&app.db, account, event, (opt, stale))
+            .await?
+            .is_some()
+        {
             added += 1;
-            if stale {
-                let stmt = sql(
-                    "UPDATE inbox_items SET automated_at = now() WHERE id = $1",
-                    vec![item.id.into()],
-                );
-                app.db.execute_raw(stmt).await?;
-            }
         }
     }
     Ok(added)
@@ -835,7 +837,7 @@ async fn near_duplicate(
         vec![
             account.id.into(),
             event.author.did.clone().into(),
-            event.text.clone().into(),
+            inbox::clip(&event.text).into(),
             event.at.into(),
         ],
     );
@@ -845,7 +847,8 @@ async fn near_duplicate(
     }
 }
 
-/// Whether the author of the DM `event` has a newer DM stored for this team.
+/// Whether the author of the DM `event` has a newer `stop`, `unsubscribe` or `start` stored for
+/// this team, which the late `event` must not overrule. Any other newer message says nothing.
 async fn newer_message(
     app: &AppState,
     account: &social_accounts::Model,
@@ -856,7 +859,8 @@ async fn newer_message(
     }
     let stmt = sql(
         "SELECT EXISTS (SELECT 1 FROM inbox_items WHERE team_id = $1 AND platform = $2 \
-         AND author_id = $3 AND kind = 'dm' AND received_at > $4) AS ok",
+         AND author_id = $3 AND kind = 'dm' AND received_at > $4 \
+         AND lower(btrim(text)) IN ('stop', 'unsubscribe', 'start')) AS ok",
         vec![
             account.team_id.into(),
             account.provider.clone().into(),
