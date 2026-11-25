@@ -1159,7 +1159,14 @@ async fn conditions_on_questions_language_and_first_mentions() {
     // Ann's second mention is not her first.
     e.arrive(&ann, &format!("{hello} again?")).await;
     assert_eq!(e.mock.seen("POST", "/2/tweets").len(), 3);
-    assert_eq!(e.runs(&id).await.len(), 3);
+    assert_eq!(e.runs(&id).await.len(), 4);
+    // A model that dresses its answer ("No.") is still understood.
+    *e.mock.ai.lock().unwrap() = "No.".into();
+    e.arrive(&who(), hello).await;
+    assert_eq!(
+        e.runs(&id).await.last().unwrap(),
+        &run("skipped", Some("no_question"))
+    );
     // A model that fails or answers something else ends the run `skipped: ai_failed`.
     *e.mock.ai.lock().unwrap() = "maybe".into();
     e.arrive(&who(), hello).await;
@@ -1233,4 +1240,44 @@ async fn weekdays_hours_and_their_checks() {
         let res = e.req(Method::POST, "/v1/automations/test", body(at)).await;
         assert_eq!(res.json::<Value>()["matched"], matched, "{at}");
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn a_question_is_paid_for_once_and_given_back_when_it_cannot_be_judged() {
+    let e = env(ALL, true).await;
+    e.sql(&format!("INSERT INTO subscriptions (team_id, plan_id, status) VALUES ('{}', 'automation', 'active')", e.team)).await;
+    let id = e
+        .automation(json!({"conditions": {"account_ids": [e.account], "question": true}}))
+        .await;
+    // The monthly allowance pays for the first judgment, whatever it says.
+    let ledger = || async {
+        let sql = format!("SELECT COALESCE(sum(amount), 0)::int AS n, count(*)::int AS rows FROM credit_ledger WHERE team_id = '{}' AND kind IN ('ai', 'ai_plan')", e.team);
+        let r =
+            e.db.query_one_raw(Statement::from_string(DbBackend::Postgres, sql))
+                .await
+                .unwrap()
+                .unwrap();
+        (
+            r.try_get::<i32>("", "n").unwrap(),
+            r.try_get::<i32>("", "rows").unwrap(),
+        )
+    };
+    let hello = "Hello there, I would like to know where I can buy your new product";
+    *e.mock.ai.lock().unwrap() = "yes".into();
+    e.arrive(&who(), hello).await;
+    let (net, rows) = ledger().await;
+    assert_eq!((net < 0, rows), (true, 1), "paid once");
+    // An answer that is neither yes nor no is given back, and the run says so.
+    let before = ledger().await.0;
+    *e.mock.ai.lock().unwrap() = "perhaps".into();
+    e.arrive(&who(), hello).await;
+    assert_eq!(ledger().await, (before, 3), "paid, then given back");
+    assert_eq!(
+        e.runs(&id).await.last().unwrap(),
+        &run("skipped", Some("ai_failed"))
+    );
+    // A question mark costs nothing.
+    e.arrive(&who(), "Where can I buy this?").await;
+    assert_eq!(ledger().await, (before, 3));
 }

@@ -308,16 +308,6 @@ pub async fn test(
     {
         mismatches.push("button_not_named");
     }
-    // Last, as in a run: a question mark needs no AI call, any other text is judged by the model
-    // and counted against the allowance. If it cannot be judged the reason is a block.
-    let mut unjudged = None;
-    if mismatches.is_empty() && cond.question {
-        match rules::asks_question(app, &item, Uuid::now_v7()).await {
-            Ok(true) => {}
-            Ok(false) => mismatches.push("no_question"),
-            Err(why) => unjudged = Some(why),
-        }
-    }
     let mut out = Outcome {
         trigger: trigger.into(),
         matched: mismatches.is_empty(),
@@ -326,10 +316,6 @@ pub async fn test(
         steps: Vec::new(),
     };
     if !out.matched {
-        return Ok(out);
-    }
-    if let Some(why) = unjudged {
-        out.blocks.push(why.into());
         return Ok(out);
     }
     let provider = [account.provider.as_str()];
@@ -358,6 +344,22 @@ pub async fn test(
     if rules::team_paused(db, item.team_id).await? {
         out.blocks.push("paused".into());
         return Ok(out);
+    }
+    // Last, as in a run, so the model is never paid for a sample that stops sooner: a question
+    // mark needs no AI call, any other text is judged and counted against the allowance.
+    if cond.question {
+        match rules::asks_question(app, &item, Uuid::now_v7()).await {
+            Ok(true) => {}
+            Ok(false) => {
+                out.matched = false;
+                out.mismatches.push("no_question".into());
+                return Ok(out);
+            }
+            Err(why) => {
+                out.blocks.push(why.into());
+                return Ok(out);
+            }
+        }
     }
     let room = cap_room(db, item.team_id).await?;
     let walked = Walk {
