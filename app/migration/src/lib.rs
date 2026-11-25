@@ -159,6 +159,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261230_000002_bluesky_activity_kinds::Migration),
             Box::new(m20261230_000003_inbox_actions::Migration),
             Box::new(m20261231_000001_meta_synced::Migration),
+            Box::new(m20270103_000001_post_numbers::Migration),
             Box::new(m20270101_000001_inbox_moderation::Migration),
             Box::new(m20270102_000001_automation_safety::Migration),
             Box::new(m20270103_000001_wait_for_reply::Migration),
@@ -166,7 +167,6 @@ impl MigratorTrait for Migrator {
             Box::new(m20270103_000001_youtube_inbox::Migration),
             Box::new(m20270105_000001_story_mention_trigger::Migration),
             Box::new(m20270106_000001_automation_misses::Migration),
-            Box::new(m20270103_000001_post_numbers::Migration),
             // inject-above (do not remove this comment)
         ]
     }
