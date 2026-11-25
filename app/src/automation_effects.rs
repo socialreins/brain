@@ -60,6 +60,19 @@ pub async fn bluesky(
     if !held {
         return skipped("action_in_progress");
     }
+    // A fan who likes ten posts in a round is followed once: the AppView may not show the first
+    // follow yet when the next like is looked at, so our own log is asked too.
+    if action == Action::Follow {
+        let done = Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT 1 AS n FROM inbox_actions WHERE social_account_id = $1 AND action = 'follow' \
+             AND target = $2 AND status = 'done' AND created_at > now() - interval '1 day'",
+            [account.id.into(), item.author_id.clone().into()],
+        );
+        if matches!(txn.query_one_raw(done).await, Ok(Some(_))) {
+            return skipped("already_done");
+        }
+    }
     let outcome = bluesky_actions::perform(app, account, item, action, &Extra::default()).await;
     if outcome == Err(InboxError::Reconnect) {
         crate::expiry::flag_reconnect(&app.db, account.id).await;

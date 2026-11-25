@@ -107,17 +107,19 @@ pub struct AutomationInput {
     /// 1 or 2 sends (`send_dm` or `ai_send_dm`, `reply_publicly` or `ai_reply_publicly`), at
     /// most one DM and one public reply, and beside them
     /// up to 3 `tag_contact`, each tag once, and once each `notify_team` (mails the owners and
-    /// admins, 20 a day), `assign` (a member of the team), `hide_comment` and `like_comment`
-    /// (`comment_received` only; Facebook and Instagram, likes Facebook only) and
+    /// admins, 20 a day), `assign` (a member of the team), `hide_comment` (`comment_received`
+    /// only; Facebook and Instagram), `like_comment` (Facebook, and Bluesky; on a comment or
+    /// mention), `repost_comment` (Bluesky; on a comment or mention), `follow_back` (Bluesky) and
     /// `stop_automations` (the newer automations do not run on the item). A send or one of
-    /// the first four is needed. Either this or `steps`: both is `422 actions_and_steps`.
+    /// the others but a stop is needed. `like_received` and `repost_received` take no send and
+    /// no tag. Either this or `steps`: both is `422 actions_and_steps`.
     #[serde(default)]
     pub actions: Option<Vec<Action>>,
     /// A flow instead of `actions`: 1 to 10 steps run in order, each a `send_dm` (with up to 3
     /// `buttons`), a `reply_publicly` (where the trigger takes one), an `ai_send_dm` or
     /// `ai_reply_publicly` (text written by AI from a `prompt`), a `wait` or a
-    /// `tag_contact`, `notify_team`, `assign`, `hide_comment`, `like_comment` or
-    /// `stop_automations` as in `actions`. Never a wait first or last, and at least one send,
+    /// `tag_contact`, `notify_team`, `assign`, `hide_comment`, `like_comment`, `repost_comment`,
+    /// `follow_back` or `stop_automations` as in `actions`. Never a wait first or last, and at least one send,
     /// mail or moderation step (`422 invalid_steps`).
     /// A send that does not go out ends the run.
     #[serde(default)]

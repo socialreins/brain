@@ -27536,6 +27536,53 @@ mod teams {
                 assert_eq!(miss["misses"].as_array().unwrap().len(), 0, "{miss}");
             }
 
+            /// A fan who likes two posts in one round is followed once, and the second run says so.
+            #[tokio::test]
+            #[serial]
+            async fn a_fan_who_likes_twice_is_followed_once() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                let root = format!("at://{me}/app.bsky.feed.post/root");
+                let id = automation(
+                    &s,
+                    &cookie,
+                    json!({"name": "Follow likers", "trigger": "like_received",
+                        "actions": [{"type": "follow_back"}]}),
+                )
+                .await;
+                set_inbox(
+                    &me,
+                    json!({
+                        "notifications": [
+                            activity("like", "did:plc:twice", "tw2", &root, &at(-2)),
+                            activity("like", "did:plc:twice", "tw1", &root, &at(-3)),
+                        ],
+                        "convos": [], "messages": {},
+                    }),
+                );
+                ingest(&db, &state, &account).await;
+                assert_eq!(made("app.bsky.graph.follow", "did:plc:twice"), 1);
+                let got = runs(&s, &cookie, &id).await;
+                assert_eq!(got.len(), 2, "{got:?}");
+                let mut states: Vec<_> = got
+                    .iter()
+                    .map(|r| {
+                        (
+                            r["status"].as_str().unwrap().to_owned(),
+                            r["reason"].clone(),
+                        )
+                    })
+                    .collect();
+                states.sort_by(|a, b| a.0.cmp(&b.0));
+                assert_eq!(
+                    states,
+                    [
+                        ("sent".to_owned(), Value::Null),
+                        ("skipped".to_owned(), json!("already_done"))
+                    ]
+                );
+            }
+
             /// `like_comment` and `repost_comment` go through the inbox's own like and repost (a record
             /// in the account's repo, a row in `inbox_actions`); `stop_automations` holds back the
             /// automations after it on that item and says so.

@@ -62,8 +62,8 @@ fn yes() -> bool {
 #[derive(Serialize, ToSchema, Debug, Default, PartialEq, Eq)]
 pub struct PlannedStep {
     /// `send_dm`, `reply_publicly`, `ai_send_dm`, `ai_reply_publicly`, `fallback_public_reply`,
-    /// `tag_contact`, `notify_team`, `assign`, `hide_comment`, `like_comment`,
-    /// `stop_automations`, `wait` or `wait_for_reply` (a test goes on as if the person answered).
+    /// `tag_contact`, `notify_team`, `assign`, `hide_comment`, `like_comment`, `repost_comment`,
+    /// `follow_back`, `stop_automations`, `wait` or `wait_for_reply` (a test goes on as if the person answered).
     #[serde(rename = "type")]
     pub kind: String,
     /// `would_send`, `would_skip`, `would_fail`, `would_tag`, `would_do` (a mail, an

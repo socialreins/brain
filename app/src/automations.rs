@@ -120,8 +120,9 @@ pub fn quota_bucket(team_id: Uuid) -> String {
 
 /// When an automation acts on an item. Empty lists mean "any". At most one of
 /// `social_set_id` and `account_ids`. Every trigger takes the scope (`social_set_id` or
-/// `account_ids`); `keywords` all but `new_follower` and `button_clicked`; `post_remote_ids` and
-/// `first_per_author` only `comment_received`; `first_message` only `dm_received`; `payloads`
+/// `account_ids`); `keywords` all but `new_follower`, `button_clicked`, `like_received` and
+/// `repost_received`; `post_remote_ids` only `comment_received`, `like_received` and
+/// `repost_received`; `first_per_author` only `comment_received` and `mention_received`; `first_message` only `dm_received`; `payloads`
 /// only `button_clicked`, which needs them.
 #[derive(Serialize, Deserialize, ToSchema, Default, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -654,6 +655,8 @@ pub fn validate_steps(
     }
     for step in steps {
         match step {
+            // Nobody sent anything to wait for an answer to behind a like or repost.
+            Step::WaitForReply { .. } if activity(trigger) => return Err("invalid_steps"),
             Step::Wait { minutes } | Step::WaitForReply { minutes }
                 if !(1..=MAX_WAIT_MINUTES).contains(minutes) =>
             {
@@ -1774,12 +1777,16 @@ async fn notify_team(
             .collect()
     };
     let subject = format!("Automation \"{}\" ran", plain(&a.name, 60));
+    // A like, repost or follow has no text.
+    let said = match plain(&item.text, 200) {
+        t if t.is_empty() => String::new(),
+        t => format!("\n\nThe text: \"{t}\""),
+    };
     let text = format!(
-        "The automation \"{}\" ran on a {} on {}.\n\nThe text: \"{}\"\n\nOpen it in the inbox:\n\n{}/app/inbox?item={}\n",
+        "The automation \"{}\" ran on a {} on {}.{said}\n\nOpen it in the inbox:\n\n{}/app/inbox?item={}\n",
         plain(&a.name, 60),
         item.kind,
         crate::expiry::label(&item.platform),
-        plain(&item.text, 200),
         app.web_url,
         item.id,
     );
@@ -3516,6 +3523,18 @@ mod tests {
             Err("invalid_steps")
         );
         assert!(Step::FollowBack.outward() && !Step::StopAutomations.outward());
+        // Nothing was sent to wait for an answer to.
+        assert_eq!(
+            flow(
+                "like_received",
+                &mut [
+                    Step::FollowBack,
+                    Step::WaitForReply { minutes: 5 },
+                    Step::NotifyTeam
+                ]
+            ),
+            Err("invalid_steps")
+        );
     }
 
     #[test]

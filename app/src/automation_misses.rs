@@ -6,7 +6,8 @@
 //! `wrong_trigger` (the item is not what the automation listens for), `not_yet_on` (it was
 //! switched on after the item came), `followed_before` (a new follower welcomed once already),
 //! `no_public_page` and `stopped_by_other` (an earlier automation on the item had "stop the
-//! others"). Rows go after 14 days, and past the newest 100 of each kind per automation.
+//! others"). Rows go after 14 days, and past the newest 100 of each kind per automation, so the
+//! rows that only say the item was another trigger's, account's or set's go sooner on a busy account.
 use chrono::{DateTime, FixedOffset};
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement, Value};
 use serde::Serialize;
