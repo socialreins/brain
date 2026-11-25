@@ -3,11 +3,11 @@
 //! automations work on them unchanged. Threads has no direct messages and no like call for apps.
 //!
 //! Reading is by polling, since Threads webhooks reach only an approved app (`webhook` turns a
-//! delivery into an early poll, nothing more, so a forged one costs one read):
-//! - a fast pass every 5 minutes reads the last 2 days of the account's posts and the replies
-//!   under those that have any, and the account's mentions;
+//! delivery into an early poll of the accounts it names, nothing more):
+//! - a fast pass every 5 minutes reads the account's mentions, the last 2 days of its posts and the
+//!   replies under those that have any;
 //! - an hourly pass reads the whole 7 days again (the gap recovery), and probes that
-//!   `threads_read_replies` was granted;
+//!   `threads_read_replies` was granted (a reply to a post older than 7 days is not read);
 //! - a new connection (`threads_synced_at` null) reads the 7 days once and stores everything as
 //!   already automated, and so does any item older than a day when it is first read, so no
 //!   automation answers old ones.
@@ -30,7 +30,11 @@ use uuid::Uuid;
 
 use crate::{
     automations,
-    connectors::bluesky::{Author, InboxError},
+    connectors::{
+        bluesky::{Author, InboxError, PostError},
+        threads::RATE_LIMITED,
+        UNSENT,
+    },
     inbox::{self, Attachment, Fresh},
     models::{inbox_items, social_accounts},
     state::AppState,
@@ -186,7 +190,8 @@ async fn failed(
              WHERE id = $1",
             vec![account.id.into(), RETRY_MINUTES.into()],
         ),
-        InboxError::ThreadsDenied if section == "replies" => sql(
+        // Only the probe says the permission is missing: one post's refusal says nothing of the rest.
+        InboxError::ThreadsDenied if section == "probe" => sql(
             "UPDATE social_accounts SET meta = meta || '{\"replies_denied\": true}'::jsonb \
              WHERE id = $1",
             vec![account.id.into()],
@@ -206,7 +211,7 @@ async fn failed(
         crate::expiry::flag_reconnect(&app.db, account.id).await;
     }
     // A missing mentions permission leaves the replies readable.
-    Ok(!(*e == InboxError::ThreadsDenied && section == "mentions"))
+    Ok(*e != InboxError::ThreadsDenied || section == "probe")
 }
 
 fn denied(account: &social_accounts::Model, key: &str) -> bool {
@@ -237,8 +242,43 @@ pub async fn read(
 
     if (first || full) && !denied(account, "replies_denied") {
         if let Err(e) = t.probe_replies(user, &token).await {
-            if failed(app, account, "replies", &e).await? {
+            if failed(app, account, "probe", &e).await? {
                 return Ok(Vec::new());
+            }
+        }
+    }
+    // Mentions first: they are few, and the replies of many posts must not use up their time.
+    if !denied(account, "mentions_denied") {
+        let mut after: Option<String> = None;
+        for _ in 0..PAGES {
+            if Instant::now() >= deadline {
+                break;
+            }
+            match t
+                .mentions(user, &token, floor.timestamp(), after.as_deref())
+                .await
+            {
+                Ok(page) => {
+                    for m in page["data"].as_array().into_iter().flatten() {
+                        // The account's own posts that tag itself are not for the inbox.
+                        if m["is_reply_owned_by_me"] != true
+                            && text(m, "username") != account.handle
+                        {
+                            found.items.extend(fresh(m, "mention"));
+                        }
+                    }
+                    after = text(&page["paging"]["cursors"], "after")
+                        .filter(|_| page["paging"]["next"].is_string());
+                }
+                Err(e) => {
+                    if failed(app, account, "mentions", &e).await? {
+                        return Ok(Vec::new());
+                    }
+                    break;
+                }
+            }
+            if after.is_none() {
+                break;
             }
         }
     }
@@ -276,6 +316,10 @@ pub async fn read(
     }
     if !denied(account, "replies_denied") {
         for post in &posts {
+            if Instant::now() >= deadline {
+                tracing::warn!(account = %account.id, "threads read out of time");
+                break;
+            }
             let mut all: Vec<Value> = Vec::new();
             let mut after: Option<String> = None;
             for _ in 0..PAGES {
@@ -307,38 +351,6 @@ pub async fn read(
             );
         }
     }
-    if !denied(account, "mentions_denied") {
-        let mut after: Option<String> = None;
-        for _ in 0..PAGES {
-            if Instant::now() >= deadline {
-                break;
-            }
-            match t
-                .mentions(user, &token, floor.timestamp(), after.as_deref())
-                .await
-            {
-                Ok(page) => {
-                    for m in page["data"].as_array().into_iter().flatten() {
-                        // The account's own posts that tag itself are not for the inbox.
-                        if m["is_reply_owned_by_me"] != true
-                            && text(m, "username") != account.handle
-                        {
-                            found.items.extend(fresh(m, "mention"));
-                        }
-                    }
-                    after = text(&page["paging"]["cursors"], "after")
-                        .filter(|_| page["paging"]["next"].is_string());
-                }
-                Err(e) => {
-                    failed(app, account, "mentions", &e).await?;
-                    break;
-                }
-            }
-            if after.is_none() {
-                break;
-            }
-        }
-    }
     store(app, account, found, first).await
 }
 
@@ -351,7 +363,8 @@ async fn store(
     first: bool,
 ) -> Result<Vec<inbox_items::Model>, DbErr> {
     let mut items = found.items;
-    items.sort_by_key(|f| f.at);
+    // Oldest first; of one post read twice, the reply (a `comment`) goes before its mention.
+    items.sort_by_key(|f| (f.at, f.kind != "comment"));
     let mut seen = HashSet::new();
     items.retain(|f| seen.insert(f.remote_id.clone()));
     let ids: Vec<String> = items.iter().map(|f| f.remote_id.clone()).collect();
@@ -484,9 +497,14 @@ pub async fn send(
         )
         .await;
     made.map(|(id, _)| id).map_err(|e| match e {
-        crate::connectors::bluesky::PostError::Reconnect => InboxError::ThreadsReconnect,
-        crate::connectors::bluesky::PostError::Denied => InboxError::ThreadsDenied,
-        crate::connectors::bluesky::PostError::Failed(why) => InboxError::Threads(why),
+        PostError::Reconnect => InboxError::ThreadsReconnect,
+        PostError::Denied => InboxError::ThreadsDenied,
+        PostError::Failed(why) if why.contains(RATE_LIMITED) => InboxError::RateLimited,
+        // Without the "Nothing was posted." mark the reply may be up: say so, so nobody sends it twice.
+        PostError::Failed(why) if !why.contains(UNSENT) => InboxError::Threads(format!(
+            "{why} It may have been posted: check Threads before trying again."
+        )),
+        PostError::Failed(why) => InboxError::Threads(why),
     })
 }
 

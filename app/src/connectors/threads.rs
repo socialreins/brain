@@ -224,9 +224,14 @@ impl Threads {
         if let Some(refusal) = dead_or_denied(&body) {
             return Err((refusal, false));
         }
+        // A rate limit refused the call, so nothing was posted.
+        if rate_limited(status, &body) {
+            let msg = format!("{step}: {RATE_LIMITED}");
+            return Err((failed(super::unsent(msg, true)), false));
+        }
         let msg = format!("{step}: {}", reason(&body, status));
         let about = super::meta::about_the_request(status, &body);
-        Err((failed(super::unsent(msg, status.as_u16() == 429)), about))
+        Err((failed(super::unsent(msg, false)), about))
     }
 
     /// Swaps an authorization code for a short-lived token, then that for a 60-day one.
@@ -488,6 +493,9 @@ impl Threads {
         .map(|_| ())
     }
 }
+
+/// What a refused publish says of a rate limit; `threads_inbox::send` turns it into `RateLimited`.
+pub const RATE_LIMITED: &str = "Threads is rate limiting this account.";
 
 /// A refusal of a rate limit: HTTP 429, or the Graph codes for an app, a user or a call rate.
 fn rate_limited(status: reqwest::StatusCode, body: &Value) -> bool {

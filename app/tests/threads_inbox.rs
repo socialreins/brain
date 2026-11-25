@@ -84,6 +84,7 @@ async fn handler(State(m): State<Arc<Mock>>, method: Method, uri: Uri, body: Byt
             return refusal(10, "Application does not have permission for this action")
         }
         4 if path.ends_with("/mentions") => return refusal(10, "No permission"),
+        6 if path.ends_with("/conversation") => return refusal(10, "Not allowed for this post"),
         _ => {}
     }
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -517,8 +518,8 @@ async fn a_person_replies_from_the_inbox_within_threads_limit() {
     // A rate limit says so, and a dead token tells the person to connect again and flags it.
     e.mock.mode.store(3, Ordering::SeqCst);
     let res = e.post(&path, json!({"text": "again"})).await;
-    assert_eq!(res.status_code(), 422);
-    assert_ne!(res.json::<Value>()["error"], "internal");
+    assert_eq!(res.status_code(), 429, "a rate limit is told as one");
+    assert_eq!(res.json::<Value>()["error"], "rate_limited");
     e.mock.mode.store(5, Ordering::SeqCst);
     let other = e.item("203").await;
     let res = e
@@ -678,6 +679,17 @@ async fn a_dead_token_a_missing_permission_and_a_rate_limit_each_get_their_own_h
     e.mock.mode.store(0, Ordering::SeqCst);
     e.tick(true).await;
     assert!(!e.items().await.is_empty());
+
+    // One post's conversation refused (the probe passed) is skipped, not taken as a missing permission.
+    let e = env().await;
+    e.mock.mode.store(6, Ordering::SeqCst);
+    threads_inbox::tick(&e.state).await.unwrap();
+    assert!(e.meta().await["replies_denied"].is_null());
+    // Ann's reply is also in the mentions, so it comes in as one when its conversation could not be read.
+    assert_eq!(
+        kinds(&e.items().await),
+        [("mention", "200"), ("mention", "300")]
+    );
 
     // Missing mentions permission alone keeps the replies coming.
     let e = env().await;

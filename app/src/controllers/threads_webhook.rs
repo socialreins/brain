@@ -2,7 +2,7 @@
 //! `{BRAIN_URL}/webhooks/threads`, verify token `THREADS_WEBHOOK_VERIFY_TOKEN`). Threads delivers
 //! `replies` and `mentions` only to an approved app, so brain polls anyway; a delivery just asks
 //! for an early read of the accounts it names (`threads_inbox::hint`) and stores nothing itself.
-//! That keeps a forged delivery harmless, and a signature that is sent must still be right.
+//! That keeps a delivery's worth small, and every delivery must carry a right signature.
 use std::collections::HashMap;
 
 use axum::{
@@ -46,16 +46,17 @@ async fn verify(State(app): State<AppState>, Query(q): Query<HashMap<String, Str
 }
 
 /// `POST /webhooks/threads`: `404` while the webhook is off, `403` for an `X-Hub-Signature-256`
-/// that is not the HMAC-SHA256 of the raw body under `THREADS_APP_SECRET` (a delivery with none
-/// is read the same, since it can only cause a read), else `200`.
+/// that is not the HMAC-SHA256 of the raw body under `THREADS_APP_SECRET` (none is not one), else
+/// `200`.
 async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if app.threads.webhook_token.is_none() {
         return reply(StatusCode::NOT_FOUND, "not_found");
     }
     let signature = headers
         .get("x-hub-signature-256")
-        .and_then(|v| v.to_str().ok());
-    if signature.is_some_and(|s| !app.threads.signed(&body, s)) {
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if !app.threads.signed(&body, signature) {
         return reply(StatusCode::FORBIDDEN, "forbidden");
     }
     let Ok(payload) = serde_json::from_slice::<Value>(&body) else {

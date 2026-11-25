@@ -139,6 +139,8 @@ pub fn budget(platform: &str, via: Via) -> usize {
         ("facebook", Via::Dm) => 2000,
         ("instagram", Via::Public) => 2200,
         ("instagram", Via::Dm) => 300,
+        // Threads counts an emoji as its UTF-8 bytes against 500, so 4 bytes a character fits 120.
+        ("threads", Via::Public) => 120,
         (_, Via::Public) => 270,
         (_, Via::Dm) => crate::inbox::DM_MAX_GRAPHEMES * 9 / 10,
     };
