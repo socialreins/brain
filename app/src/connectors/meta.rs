@@ -65,6 +65,8 @@ pub struct Meta {
     /// `META_WEBHOOK_VERIFY_TOKEN`: the subscribe handshake of `GET /webhooks/meta`; the
     /// webhook is off without it.
     pub webhook_token: Option<String>,
+    /// `META_HUMAN_AGENT`: the app holds Meta's Human Agent feature.
+    pub human_agent: bool,
     client: reqwest::Client,
 }
 
@@ -166,6 +168,8 @@ fn inbox_error(refused: Refused) -> InboxError {
     let code = body["error"]["code"].as_i64();
     let sub = body["error"]["error_subcode"].as_i64();
     match (code, sub) {
+        // The comment or message it answers is gone.
+        _ if missing(status, &body) => InboxError::Invalid("not_found"),
         // Outside the 24 hour messaging window.
         (_, Some(2_018_278 | 2_534_022)) => InboxError::Invalid("outside_window"),
         (Some(4 | 17 | 32 | 613), _) => InboxError::RateLimited,
@@ -175,6 +179,8 @@ fn inbox_error(refused: Refused) -> InboxError {
         // words messaging-policy refusals (a second private reply, a blocked recipient), which
         // a new login would not fix.
         (Some(190), _) => InboxError::MetaReconnect,
+        // A permission or a messaging policy: say so, and what Meta said.
+        (Some(10 | 200..=299), _) => InboxError::MetaDenied(reason(&body, status)),
         _ => InboxError::Meta(reason(&body, status)),
     }
 }
@@ -194,6 +200,50 @@ pub enum To<'a> {
     Comment(&'a str),
     /// This person, who wrote to the Page within 24 hours.
     Person(&'a str),
+}
+
+/// What a moderator does to a comment from the inbox.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Moderate {
+    Hide,
+    Unhide,
+    Delete,
+    Like,
+    Unlike,
+}
+
+impl Moderate {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "hide" => Self::Hide,
+            "unhide" => Self::Unhide,
+            "delete" => Self::Delete,
+            "like" => Self::Like,
+            "unlike" => Self::Unlike,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hide => "hide",
+            Self::Unhide => "unhide",
+            Self::Delete => "delete",
+            Self::Like => "like",
+            Self::Unlike => "unlike",
+        }
+    }
+
+    /// The action that undoes this one (delete has none).
+    pub fn flipped(self) -> Self {
+        match self {
+            Self::Hide => Self::Unhide,
+            Self::Unhide => Self::Hide,
+            Self::Delete => Self::Delete,
+            Self::Like => Self::Unlike,
+            Self::Unlike => Self::Like,
+        }
+    }
 }
 
 fn failed(msg: impl Into<String>) -> PostError {
@@ -252,6 +302,7 @@ impl Meta {
             rupload_url: RUPLOAD_URL.into(),
             poll_every: Duration::from_secs(5),
             webhook_token: None,
+            human_agent: false,
             client,
         })
     }
@@ -852,6 +903,53 @@ impl Meta {
         id_of(&made).ok_or_else(|| InboxError::Meta("Meta sent no id.".into()))
     }
 
+    /// Moderates a comment with the Page token: hide or show it (`is_hidden` on Facebook, `hide`
+    /// on Instagram), delete it, or like it as the Page (Facebook only). Facebook needs
+    /// `pages_manage_engagement`, Instagram `instagram_manage_comments`.
+    pub async fn moderate(
+        &self,
+        instagram: bool,
+        token: &str,
+        comment: &str,
+        action: Moderate,
+    ) -> Result<(), InboxError> {
+        if !graph_id(comment) {
+            return Err(InboxError::Invalid("not_repliable"));
+        }
+        let shown = |hide: bool| if hide { "true" } else { "false" };
+        let likes = format!("{comment}/likes");
+        let done = match (action, instagram) {
+            (Moderate::Hide | Moderate::Unhide, _) => {
+                let name = if instagram { "hide" } else { "is_hidden" };
+                let form = [(name, shown(action == Moderate::Hide))];
+                self.inbox_call(Method::POST, comment, token, Some(&form))
+                    .await?
+            }
+            (Moderate::Delete, _) => {
+                match self.inbox_call(Method::DELETE, comment, token, None).await {
+                    // Already gone (deleted on the platform, or by a first try whose save failed).
+                    Err(InboxError::Invalid("not_found")) => return Ok(()),
+                    done => done?,
+                }
+            }
+            (Moderate::Like, false) => {
+                self.inbox_call(Method::POST, &likes, token, Some(&[]))
+                    .await?
+            }
+            (Moderate::Unlike, false) => {
+                self.inbox_call(Method::DELETE, &likes, token, None).await?
+            }
+            // Instagram's API has no like for a comment.
+            (Moderate::Like | Moderate::Unlike, true) => {
+                return Err(InboxError::Invalid("not_supported"))
+            }
+        };
+        match done["success"] {
+            Value::Bool(false) => Err(InboxError::Meta("Meta did not do it.".into())),
+            _ => Ok(()),
+        }
+    }
+
     /// A message from Page `page` (`pages_messaging`, `instagram_manage_messages`): the private
     /// reply to a comment (once per comment, within 7 days), or a DM to a person who wrote
     /// within 24 hours. `buttons` (label, payload) go with it as quick replies. Returns the
@@ -862,7 +960,7 @@ impl Meta {
         token: &str,
         to: To<'_>,
         body: &str,
-        buttons: &[(&str, &str)],
+        (buttons, human_agent): (&[(&str, &str)], bool),
     ) -> Result<String, InboxError> {
         let (To::Comment(id) | To::Person(id)) = to;
         if !graph_id(page) || !graph_id(id) {
@@ -885,7 +983,11 @@ impl Meta {
             ("recipient", recipient.as_str()),
             ("message", message.as_str()),
         ];
-        if matches!(to, To::Person(_)) {
+        if human_agent {
+            // A person answering after the 24 hours (7 days at most): only with the feature.
+            form.push(("messaging_type", "MESSAGE_TAG"));
+            form.push(("tag", "HUMAN_AGENT"));
+        } else if matches!(to, To::Person(_)) {
             form.push(("messaging_type", "RESPONSE"));
         }
         let path = format!("{page}/messages");
@@ -1006,10 +1108,12 @@ mod tests {
             InboxError::Invalid("dm_unavailable")
         );
         assert_eq!(refused(190, None), InboxError::MetaReconnect);
+        // A comment that is gone, by Graph's "does not exist" (code 100, subcode 33).
+        assert_eq!(refused(100, Some(33)), InboxError::Invalid("not_found"));
         for policy in [10, 200, 230, 299] {
             assert_eq!(
                 refused(policy, None),
-                InboxError::Meta("nope".into()),
+                InboxError::MetaDenied("nope".into()),
                 "{policy}"
             );
         }

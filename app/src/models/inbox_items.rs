@@ -67,6 +67,9 @@ pub struct Model {
     /// What the item carries besides text: `inbox::Attachment`s, https links only.
     #[sea_orm(column_type = "JsonBinary")]
     pub attachments: Json,
+    /// What was done to a Meta comment from the inbox: `hidden`, `liked`, `deleted`.
+    #[sea_orm(column_type = "JsonBinary")]
+    pub moderation: Json,
     pub created_at: DateTimeWithTimeZone,
 }
 

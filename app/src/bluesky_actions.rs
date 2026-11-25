@@ -5,6 +5,7 @@
 //! Like, repost, follow and block check the live state first, so a second click adds nothing.
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use unicode_segmentation::UnicodeSegmentation;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -41,6 +42,16 @@ pub enum Action {
     UnhideReply,
     DeleteReply,
     Report,
+    // On a DM: the conversation (accept a request, leave it, mute it), its read mark, one
+    // message (delete it for ourselves, react to it).
+    AcceptConvo,
+    LeaveConvo,
+    MuteConvo,
+    UnmuteConvo,
+    MarkRead,
+    DeleteMessage,
+    React,
+    Unreact,
 }
 
 impl Action {
@@ -62,7 +73,30 @@ impl Action {
             Self::UnhideReply => "unhide_reply",
             Self::DeleteReply => "delete_reply",
             Self::Report => "report",
+            Self::AcceptConvo => "accept_convo",
+            Self::LeaveConvo => "leave_convo",
+            Self::MuteConvo => "mute_convo",
+            Self::UnmuteConvo => "unmute_convo",
+            Self::MarkRead => "mark_read",
+            Self::DeleteMessage => "delete_message",
+            Self::React => "react",
+            Self::Unreact => "unreact",
         }
+    }
+
+    /// Acts on a DM's conversation or message.
+    pub fn on_dm(self) -> bool {
+        matches!(
+            self,
+            Self::AcceptConvo
+                | Self::LeaveConvo
+                | Self::MuteConvo
+                | Self::UnmuteConvo
+                | Self::MarkRead
+                | Self::DeleteMessage
+                | Self::React
+                | Self::Unreact
+        )
     }
 
     /// Owners and admins only: what is hard to take back or reaches Bluesky's moderators.
@@ -75,6 +109,8 @@ impl Action {
                 | Self::UnhideReply
                 | Self::DeleteReply
                 | Self::Report
+                | Self::LeaveConvo
+                | Self::DeleteMessage
         )
     }
 
@@ -115,6 +151,8 @@ pub struct Extra<'a> {
     pub reason: Option<&'a str>,
     /// `report`: the account instead of the item's post.
     pub account: bool,
+    /// `react`, `unreact`: one emoji.
+    pub emoji: Option<&'a str>,
 }
 
 /// The account's own state toward the item's post and author, read live.
@@ -282,7 +320,8 @@ pub async fn perform(
         return Err(InboxError::Invalid("own_account"));
     }
     let own_post = matches!(item.kind.as_str(), "comment" | "mention");
-    if action.on_post() && !own_post {
+    if (action.on_post() && !own_post) || (action.on_dm() != (item.kind == "dm") && action.on_dm())
+    {
         return Err(InboxError::Invalid("not_applicable"));
     }
     let Some(secret) = inbox::secret(app, account) else {
@@ -383,7 +422,102 @@ pub async fn perform(
             let post = own_post.then(|| post().ok()).flatten();
             report(app, &c, item, extra, post).await.map(Some)
         }
+        _ => dm_action(app, &c, item, action, extra).await.map(|()| None),
     }
+}
+
+/// A call on a DM's conversation or message through the chat service.
+async fn dm_action(
+    app: &AppState,
+    c: &Creds<'_>,
+    item: &inbox_items::Model,
+    action: Action,
+    extra: &Extra<'_>,
+) -> Result<(), InboxError> {
+    let Some(convo) = item.convo_id.as_deref() else {
+        return Err(InboxError::Invalid("not_applicable"));
+    };
+    let message = item.remote_id.as_str();
+    let (method, body) = match action {
+        Action::AcceptConvo => ("acceptConvo", json!({ "convoId": convo })),
+        Action::LeaveConvo => ("leaveConvo", json!({ "convoId": convo })),
+        Action::MuteConvo => ("muteConvo", json!({ "convoId": convo })),
+        Action::UnmuteConvo => ("unmuteConvo", json!({ "convoId": convo })),
+        Action::MarkRead => (
+            "updateRead",
+            json!({ "convoId": convo, "messageId": message }),
+        ),
+        Action::DeleteMessage => (
+            "deleteMessageForSelf",
+            json!({ "convoId": convo, "messageId": message }),
+        ),
+        Action::React | Action::Unreact => {
+            // Bluesky takes exactly one emoji.
+            let Some(emoji) = extra
+                .emoji
+                .filter(|e| e.graphemes(true).count() == 1 && e.len() <= 64)
+            else {
+                return Err(InboxError::Invalid("invalid_emoji"));
+            };
+            let method = if action == Action::React {
+                "addReaction"
+            } else {
+                "removeReaction"
+            };
+            (
+                method,
+                json!({ "convoId": convo, "messageId": message, "value": emoji }),
+            )
+        }
+        _ => return Err(InboxError::Invalid("not_applicable")),
+    };
+    let method = format!("chat.bsky.convo.{method}");
+    app.bluesky
+        .xrpc(c, &method, &[], Some(&body))
+        .await
+        .map(|_| ())
+}
+
+/// A DM conversation as the account sees it now.
+#[derive(Serialize, ToSchema, Debug, PartialEq, Eq)]
+pub struct Convo {
+    /// `accepted`, or `request` while the account has not accepted it (a message request).
+    pub status: String,
+    pub muted: bool,
+    /// A group conversation: a reply goes to everyone in it.
+    pub group: bool,
+    /// Members Bluesky lists (a group lists only some of them).
+    pub members: usize,
+    pub unread: i64,
+}
+
+/// The DM conversation of `item`, read live.
+pub async fn convo(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+) -> Result<Option<Convo>, InboxError> {
+    let Some(id) = item.convo_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(secret) = inbox::secret(app, account) else {
+        return Err(InboxError::Reconnect);
+    };
+    let c = account_creds(account, &secret);
+    let got = app
+        .bluesky
+        .xrpc(&c, "chat.bsky.convo.getConvo", &[("convoId", id)], None)
+        .await?;
+    let v = &got["convo"];
+    Ok(Some(Convo {
+        status: v["status"].as_str().unwrap_or("accepted").to_owned(),
+        muted: v["muted"] == true,
+        group: v["kind"]["$type"]
+            .as_str()
+            .is_some_and(|t| t.ends_with("groupConvo")),
+        members: v["members"].as_array().map_or(0, Vec::len),
+        unread: v["unreadCount"].as_i64().unwrap_or(0),
+    }))
 }
 
 /// Adds `reply` to the hidden replies of the threadgate on `root` (a post of the account), or

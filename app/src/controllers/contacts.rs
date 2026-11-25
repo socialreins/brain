@@ -307,7 +307,7 @@ async fn show(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> R
             .limit(RECENT)
             .all(&app.db)
             .await?;
-        let recent = items_json(&app.db, rows).await?;
+        let recent = items_json(&app.db, rows, app.meta.human_agent).await?;
         Ok::<_, DbErr>(Some(ContactDetail { contact, recent }))
     };
     match found.await {

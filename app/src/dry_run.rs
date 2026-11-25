@@ -215,6 +215,7 @@ fn item_of(
         assigned_to: None,
         automated_at: None,
         attachments: serde_json::json!([]),
+        moderation: serde_json::json!({}),
         created_at: chrono::Utc::now().fixed_offset(),
     }
 }

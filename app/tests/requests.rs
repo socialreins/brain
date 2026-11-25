@@ -3560,6 +3560,11 @@ mod teams {
                 .route("/xrpc/chat.bsky.convo.listConvos", get(list_convos))
                 .route("/xrpc/chat.bsky.convo.getMessages", get(get_messages))
                 .route(
+                    "/xrpc/chat.bsky.convo.listConvoRequests",
+                    get(list_requests),
+                )
+                .route("/xrpc/chat.bsky.convo.getConvo", get(get_convo))
+                .route(
                     "/xrpc/chat.bsky.convo.getConvoAvailability",
                     get(convo_availability),
                 )
@@ -3770,6 +3775,42 @@ mod teams {
             (axum::http::StatusCode::OK, Json(json!({ "convos": list })))
         }
 
+        /// Message requests: the account's `requests`.
+        async fn list_requests(headers: axum::http::HeaderMap) -> Answer {
+            let did = match chat_caller(&headers) {
+                Ok(d) => d,
+                Err(a) => return a,
+            };
+            let data = inbox_of(&did);
+            // `fail_requests`: this read answers with that status.
+            if let Some(status) = data["fail_requests"].as_u64() {
+                return refused(status as u16, "Unavailable");
+            }
+            let list = data["requests"].clone();
+            let list = if list.is_null() { json!([]) } else { list };
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({ "requests": list })),
+            )
+        }
+
+        /// One conversation: the account's `convo_info` for it.
+        async fn get_convo(
+            headers: axum::http::HeaderMap,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> Answer {
+            let did = match chat_caller(&headers) {
+                Ok(d) => d,
+                Err(a) => return a,
+            };
+            match inbox_of(&did)["convo_info"][q.get("convoId").cloned().unwrap_or_default()]
+                .clone()
+            {
+                Value::Null => refused(400, "InvalidConvo"),
+                convo => (axum::http::StatusCode::OK, Json(json!({ "convo": convo }))),
+            }
+        }
+
         async fn get_messages(
             headers: axum::http::HeaderMap,
             Query(q): Query<HashMap<String, String>>,
@@ -3830,6 +3871,13 @@ mod teams {
                 .contains("BLOCKED")
             {
                 return refused(400, "InvalidRequest");
+            }
+            if b["message"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("LOCKED")
+            {
+                return refused(400, "ConvoLocked");
             }
             SENT.lock().unwrap().push(b);
             let id = format!("m{}", &uuid::Uuid::now_v7().simple().to_string()[20..]);
@@ -18331,6 +18379,9 @@ mod teams {
                 static DELETE_MODE: AtomicU64 = AtomicU64::new(0);
                 /// How many calls the mock turned away with a 429.
                 static LIMITED: AtomicU64 = AtomicU64::new(0);
+                /// `META_HUMAN_AGENT` for the brains `on_meta` makes.
+                static HUMAN_AGENT: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
 
                 type Answer = (axum::http::StatusCode, Json<Value>);
 
@@ -18454,6 +18505,7 @@ mod teams {
                                 {
                                     return refused(100, "(#100) Invalid comment")
                                 }
+                                "likes" => json!({"success": true}),
                                 "comments" | "replies" => json!({"id": format!("{node}_r{n}")}),
                                 "messages" => {
                                     let to = f.get("recipient").map(String::as_str);
@@ -18467,6 +18519,9 @@ mod teams {
                                     }
                                     if said.contains("LIMIT") {
                                         return refused(613, "Calls to this api have exceeded");
+                                    }
+                                    if said.contains("DENIED") {
+                                        return refused(200, "(#200) Permission denied");
                                     }
                                     if said.contains("WINDOW") {
                                         return refused_sub(
@@ -18572,10 +18627,23 @@ mod teams {
                         };
                     let unsubscribe =
                         |h: axum::http::HeaderMap, Path((node, edge)): Path<(String, String)>| async move {
-                            if !page_token(&h) || edge != "subscribed_apps" {
+                            if !page_token(&h)
+                                || !["subscribed_apps", "likes"].contains(&edge.as_str())
+                            {
                                 return refused(190, "expired");
                             }
                             REMOVED.lock().unwrap().push(format!("{node}/{edge}"));
+                            ok(json!({"success": true}))
+                        };
+                    // A comment hidden or shown.
+                    let update =
+                        |h: axum::http::HeaderMap,
+                         Path(id): Path<String>,
+                         Form(f): Form<HashMap<String, String>>| async move {
+                            if !page_token(&h) {
+                                return refused(190, "expired");
+                            }
+                            CALLS.lock().unwrap().push((id, f));
                             ok(json!({"success": true}))
                         };
                     let remove = |h: axum::http::HeaderMap, Path(id): Path<String>| async move {
@@ -18584,6 +18652,10 @@ mod teams {
                         }
                         if DELETE_MODE.load(Ordering::SeqCst) == 1 {
                             return refused(200, "Permissions error");
+                        }
+                        // 3: already gone.
+                        if DELETE_MODE.load(Ordering::SeqCst) == 3 {
+                            return refused_sub(100, 33, "Object does not exist");
                         }
                         REMOVED.lock().unwrap().push(id);
                         ok(json!({"success": true}))
@@ -18626,7 +18698,7 @@ mod teams {
                             "/v26.0/{node}/{edge}",
                             post(edge).delete(unsubscribe).get(history),
                         )
-                        .route("/v26.0/{id}", get(node).delete(remove))
+                        .route("/v26.0/{id}", get(node).delete(remove).post(update))
                         .route("/video-upload/v26.0/{id}", post(upload))
                         .route(
                             "/img.jpg",
@@ -18663,6 +18735,7 @@ mod teams {
                     m.rupload_url = base.clone();
                     m.poll_every = std::time::Duration::ZERO;
                     m.webhook_token = hook.map(str::to_owned);
+                    m.human_agent = HUMAN_AGENT.load(Ordering::SeqCst);
                     config.meta = m;
                     let disk = object_store::local::LocalFileSystem::new_with_prefix(media_dir())
                         .unwrap()
@@ -19976,6 +20049,256 @@ mod teams {
                     let all = all_inbox_id(&s, &cookie).await;
                     let page = inbox_items_of(&s, &cookie, &all).await;
                     assert!(page.iter().all(|i| i["contact_id"] == first[0]["id"]));
+                }
+
+                /// Hide, show, delete and like a comment from the inbox, on the platform and on the item.
+                #[tokio::test]
+                #[serial]
+                async fn comments_are_moderated_from_the_inbox() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    deliver(&s, &page_comment("101_9_5", "Love it", "777", now())).await;
+                    deliver(&s, &page_comment("101_9_6", "Nice", "778", now())).await;
+                    deliver(&s, &ig_comment("1784", "1790", "555")).await;
+                    deliver(&s, &page_message("101", "m_1", "777", "hello")).await;
+                    let items = stored(&db, &team_id).await;
+                    let item =
+                        |remote: &str| items.iter().find(|i| i.remote_id == remote).unwrap().id;
+                    let (server, ck) = (&s, &cookie);
+                    let get = |id: uuid::Uuid| async move {
+                        let res = server
+                            .get(&format!("/v1/inbox-items/{id}"))
+                            .add_header("cookie", ck)
+                            .await;
+                        res.assert_status_ok();
+                        res.json::<Value>()
+                    };
+                    let moderate = |id: uuid::Uuid, action: &str| {
+                        req(
+                            &s,
+                            Method::POST,
+                            &format!("/v1/inbox-items/{id}/moderate"),
+                            &cookie,
+                        )
+                        .json(&json!({ "action": action }))
+                    };
+                    let state = |m: &Value| {
+                        let can: Vec<&str> = m["can"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|a| a.as_str().unwrap())
+                            .collect();
+                        (
+                            m["hidden"] == true,
+                            m["liked"] == true,
+                            m["deleted"] == true,
+                            can.join(","),
+                        )
+                    };
+
+                    // What each item offers: Facebook may like, Instagram may not, a DM is no comment.
+                    let fb = get(item("101_9_5")).await;
+                    assert_eq!(
+                        state(&fb["moderation"]),
+                        (false, false, false, "hide,delete,like".into())
+                    );
+                    assert!(fb.get("reply_window").is_none());
+                    let ig = get(item("1790")).await;
+                    assert_eq!(
+                        state(&ig["moderation"]),
+                        (false, false, false, "hide,delete".into())
+                    );
+                    let dm = get(item("m_1")).await;
+                    assert!(dm.get("moderation").is_none());
+
+                    // Hide and show, with the platform's own parameter name.
+                    let before = calls_since(0).len();
+                    let res = moderate(item("101_9_5"), "hide").await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    assert_eq!(
+                        state(&res.json::<Value>()["moderation"]),
+                        (true, false, false, "unhide,delete,like".into())
+                    );
+                    assert_eq!(moderate(item("1790"), "hide").await.status_code(), 200);
+                    assert_eq!(moderate(item("101_9_5"), "unhide").await.status_code(), 200);
+                    let calls = calls_since(before);
+                    assert_eq!(calls[0].0, "101_9_5");
+                    assert_eq!(calls[0].1["is_hidden"], "true");
+                    assert_eq!(calls[1].0, "1790");
+                    assert_eq!(calls[1].1["hide"], "true");
+                    assert_eq!(calls[2].1["is_hidden"], "false");
+
+                    // Like and unlike as the Page; Instagram has no such call.
+                    let res = moderate(item("101_9_5"), "like").await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    assert!(state(&res.json::<Value>()["moderation"]).1);
+                    assert_eq!(calls_since(before).last().unwrap().0, "101_9_5/likes");
+                    assert_eq!(moderate(item("101_9_5"), "unlike").await.status_code(), 200);
+                    assert_eq!(REMOVED.lock().unwrap().last().unwrap(), "101_9_5/likes");
+                    let res = moderate(item("1790"), "like").await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json_contains(&json!({"error": "not_supported"}));
+                    assert_eq!(moderate(item("m_1"), "hide").await.status_code(), 422);
+                    let res = moderate(item("1790"), "shred").await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "invalid_action"}));
+
+                    // Deleting is for owners and admins; a member may hide.
+                    let (member, _) = joined(&s, &db, &team_id, "member").await;
+                    let by_member = |action: &str| {
+                        req(
+                            &s,
+                            Method::POST,
+                            &format!("/v1/inbox-items/{}/moderate", item("1790")),
+                            &member,
+                        )
+                        .json(&json!({ "action": action }))
+                    };
+                    assert_eq!(by_member("delete").await.status_code(), 403);
+                    assert_eq!(by_member("unhide").await.status_code(), 200);
+                    let res = moderate(item("1790"), "delete").await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let body = res.json::<Value>();
+                    assert_eq!(body["state"], "done");
+                    assert_eq!(
+                        state(&body["moderation"]),
+                        (false, false, true, String::new())
+                    );
+                    assert_eq!(REMOVED.lock().unwrap().last().unwrap(), "1790");
+
+                    // A deleted comment takes no reply and no further action.
+                    let res = req(
+                        &s,
+                        Method::POST,
+                        &format!("/v1/inbox-items/{}/reply", item("1790")),
+                        &cookie,
+                    )
+                    .json(&json!({"text": "hi"}))
+                    .await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json_contains(&json!({"error": "not_repliable"}));
+                    assert_eq!(moderate(item("1790"), "hide").await.status_code(), 422);
+
+                    // A comment already gone on Meta still counts as deleted here (a retry after a failed save).
+                    DELETE_MODE.store(3, Ordering::SeqCst);
+                    let res = moderate(item("101_9_5"), "delete").await;
+                    DELETE_MODE.store(0, Ordering::SeqCst);
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    assert_eq!(res.json::<Value>()["state"], "done");
+                    assert_eq!(res.json::<Value>()["moderation"]["deleted"], true);
+
+                    // A token Meta refuses asks for a reconnect, on the account too.
+                    let fb_account = account(&db, &team_id, "facebook", "101").await;
+                    let row = social_accounts::ActiveModel {
+                        id: Set(fb_account.id),
+                        access_token: Set(cipher().encrypt(b"dead")),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(row)
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                    let res = moderate(item("101_9_6"), "hide").await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json_contains(&json!({"error": "meta_reconnect_required"}));
+                    let fb_account = account(&db, &team_id, "facebook", "101").await;
+                    assert_eq!(fb_account.meta["reconnect"], true);
+                }
+
+                /// A DM says how long it can still be answered; a person may answer later with Meta's
+                /// Human Agent feature, once the app holds it; a permission Meta denies is named.
+                #[tokio::test]
+                #[serial]
+                async fn the_messaging_window_is_shown_and_the_human_agent_tag_is_opt_in() {
+                    let hours_ago = |db: &DatabaseConnection, id: uuid::Uuid, h: i64| {
+                        let at = (chrono::Utc::now() - chrono::Duration::hours(h)).fixed_offset();
+                        let row = inbox_items::ActiveModel {
+                            id: Set(id),
+                            received_at: Set(at),
+                            ..Default::default()
+                        };
+                        let db = db.clone();
+                        async move { inbox_items::Entity::update(row).exec(&db).await.unwrap() }
+                    };
+                    for agent in [false, true] {
+                        HUMAN_AGENT.store(agent, Ordering::SeqCst);
+                        let (s, db, state, _) = on_meta(true).await;
+                        clean(&db).await;
+                        let (cookie, team_id) = owner_connected(&s, &db).await;
+                        deliver(&s, &page_message("101", "m_1", "777", "hello")).await;
+                        let id = stored(&db, &team_id).await[0].id;
+                        let show = || async {
+                            let res = s
+                                .get(&format!("/v1/inbox-items/{id}"))
+                                .add_header("cookie", &cookie)
+                                .await;
+                            res.json::<Value>()["reply_window"].clone()
+                        };
+                        let reply = |text: &str| {
+                            req(
+                                &s,
+                                Method::POST,
+                                &format!("/v1/inbox-items/{id}/reply"),
+                                &cookie,
+                            )
+                            .json(&json!({ "text": text }))
+                        };
+                        let w = show().await;
+                        assert_eq!(w["open"], true);
+                        assert!(w["closes_at"].is_string() && w["last_message_at"].is_string());
+                        assert_eq!(w["human_agent_until"].is_string(), agent);
+
+                        // 30 hours on: closed for a message, open for a person with the feature.
+                        hours_ago(&db, id, 30).await;
+                        let w = show().await;
+                        assert_eq!(w["open"], false);
+                        // A broadcast or automation never uses the tag, even sent in some user's name.
+                        let fb = account(&db, &team_id, "facebook", "101").await;
+                        let dm = stored(&db, &team_id).await.remove(0);
+                        let sent = inbox::send(
+                            &state,
+                            &fb,
+                            &dm,
+                            Via::Dm,
+                            "broadcast",
+                            &[],
+                            Some(uuid::Uuid::now_v7()),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                        assert!(matches!(
+                            sent,
+                            Err(socialreins_brain::connectors::bluesky::InboxError::Invalid(
+                                "outside_window"
+                            ))
+                        ));
+                        let before = calls_since(0).len();
+                        let res = reply("Sorry for the wait").await;
+                        if agent {
+                            assert_eq!(res.status_code(), 201, "{}", res.text());
+                            let form = &calls_since(before)[0].1;
+                            assert_eq!(form["messaging_type"], "MESSAGE_TAG");
+                            assert_eq!(form["tag"], "HUMAN_AGENT");
+                        } else {
+                            assert_eq!(res.status_code(), 422);
+                            res.assert_json_contains(&json!({"error": "outside_window"}));
+                            assert_eq!(calls_since(before).len(), 0);
+                        }
+
+                        // Eight days on: nothing goes out, tag or not.
+                        hours_ago(&db, id, 24 * 8).await;
+                        assert_eq!(reply("Much later").await.status_code(), 422);
+
+                        // A permission Meta denies is named, apart from a dead token.
+                        hours_ago(&db, id, 1).await;
+                        let res = reply("DENIED").await;
+                        assert_eq!(res.status_code(), 422);
+                        res.assert_json_contains(&json!({"error": "meta_denied"}));
+                    }
+                    HUMAN_AGENT.store(false, Ordering::SeqCst);
                 }
 
                 /// The webhook is not the only way in: the last days of comments and conversations are
@@ -25560,6 +25883,169 @@ mod teams {
                 }
             }
 
+            /// A message request is read like any DM, its conversation says it is a request,
+            /// and a DM can be accepted, muted, marked read, reacted to and deleted for us.
+            #[tokio::test]
+            #[serial]
+            async fn message_requests_and_dm_actions() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
+                let (member, _) = joined(&s, &db, &team_id, "member").await;
+                let ask = |last: &str| {
+                    json!({"id": "rq1", "status": "request", "members": [
+                    {"did": me}, {"did": "did:plc:stranger", "handle": "stranger.test"}],
+                    "lastMessage": {"sentAt": last}})
+                };
+                let info = |kind: &str, status: &str| {
+                    json!({"rq1": {"status": status, "muted": false,
+                    "unreadCount": 2, "members": [1, 2, 3],
+                    "kind": {"$type": format!("chat.bsky.convo.defs#{kind}")}}})
+                };
+                set_inbox(
+                    &me,
+                    json!({"notifications": [], "convos": [], "requests": [ask(&at(5)),
+                        {"id": "join", "status": "request"}],
+                        "messages": {"rq1": [dm("rm1", "did:plc:stranger", "hello stranger", &at(5))]},
+                        "convo_info": info("groupConvo", "request")}),
+                );
+                ingest(&db, &state, &account).await;
+                ingest(&db, &state, &account).await;
+                assert_eq!(
+                    stored_count(&db, &team_id).await,
+                    1,
+                    "the request's message, once"
+                );
+                let all = all_inbox(&s, &cookie).await;
+                let page = items(&s, &cookie, all["id"].as_str().unwrap(), "").await;
+                let dm_id = page["items"][0]["id"].as_str().unwrap().to_owned();
+                let seen = fetch(&s, &member, &format!("/v1/inbox-items/{dm_id}/actions")).await;
+                assert_eq!(
+                    seen["convo"],
+                    json!({"status": "request", "muted": false, "group": true,
+                    "members": 3, "unread": 2})
+                );
+                let act = |who: &str, body: Value| {
+                    let r = req(
+                        &s,
+                        Method::POST,
+                        &format!("/v1/inbox-items/{dm_id}/actions"),
+                        who,
+                    );
+                    async move { r.json(&body).await }
+                };
+                let ok = |action: &str| json!({"action": action, "confirm": true});
+                for (action, call) in [
+                    ("accept_convo", "chat.bsky.convo.acceptConvo"),
+                    ("mute_convo", "chat.bsky.convo.muteConvo"),
+                    ("unmute_convo", "chat.bsky.convo.unmuteConvo"),
+                    ("mark_read", "chat.bsky.convo.updateRead"),
+                ] {
+                    let res = act(&member, ok(action)).await;
+                    assert_eq!(res.status_code(), 200, "{action}: {}", res.text());
+                    let (method, body) = CALLS.lock().unwrap().last().cloned().unwrap();
+                    assert_eq!(method, call);
+                    assert_eq!(body["convoId"], "rq1");
+                }
+                let (_, body) = CALLS.lock().unwrap().last().cloned().unwrap();
+                assert_eq!(body["messageId"], "rm1", "the read mark is the message");
+                let react = json!({"action": "react", "confirm": true, "emoji": "👍"});
+                assert_eq!(act(&member, react).await.status_code(), 200);
+                let (method, body) = CALLS.lock().unwrap().last().cloned().unwrap();
+                assert_eq!(
+                    (method.as_str(), body["value"].clone()),
+                    ("chat.bsky.convo.addReaction", json!("👍"))
+                );
+                for bad in [json!("ab"), json!("")] {
+                    let res = act(
+                        &member,
+                        json!({"action": "react", "confirm": true, "emoji": bad}),
+                    )
+                    .await;
+                    assert_eq!(res.json::<Value>()["error"], "invalid_emoji");
+                }
+                // Leaving a conversation and deleting a message are for managers.
+                for action in ["leave_convo", "delete_message"] {
+                    assert_eq!(
+                        act(&member, ok(action)).await.status_code(),
+                        403,
+                        "{action}"
+                    );
+                    assert_eq!(
+                        act(&cookie, ok(action)).await.status_code(),
+                        200,
+                        "{action}"
+                    );
+                }
+                assert_eq!(
+                    CALLS.lock().unwrap().last().unwrap().0,
+                    "chat.bsky.convo.deleteMessageForSelf"
+                );
+                // A DM has no post to like; a comment has no conversation to accept.
+                assert_eq!(
+                    act(&cookie, ok("like")).await.json::<Value>()["error"],
+                    "not_applicable"
+                );
+
+                // A locked conversation says so.
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/inbox-items/{dm_id}/reply"),
+                    &cookie,
+                )
+                .json(&json!({"text": "LOCKED hello"}))
+                .await;
+                assert_eq!(res.status_code(), 422);
+                assert_eq!(res.json::<Value>()["error"], "convo_locked");
+            }
+
+            /// A message request read while the request listing is down is not lost: the mark
+            /// stays behind and the next round reads it.
+            #[tokio::test]
+            #[serial]
+            async fn a_down_request_listing_does_not_hide_requests_for_good() {
+                let (s, db, state) = on_mock().await;
+                let (_, team_id, account, me) = owner(&s, &db).await;
+                let convo = |id: &str, last: &str| {
+                    json!({"id": id, "members": [{"did": me},
+                    {"did": "did:plc:dmer", "handle": "dmer.test"}], "lastMessage": {"sentAt": last}})
+                };
+                let data = |down: bool| {
+                    let mut d = json!({"notifications": [],
+                        "convos": [convo("cvA", &at(5))],
+                        "requests": [convo("rq9", &at(60))],
+                        "messages": {"cvA": [dm_in("a1", "did:plc:dmer", &at(5))],
+                            "rq9": [dm_in("r1", "did:plc:dmer", &at(60))]}});
+                    if down {
+                        d["fail_requests"] = json!(503);
+                    }
+                    d
+                };
+                set_inbox(&me, data(true));
+                ingest(&db, &state, &account).await;
+                assert_eq!(
+                    stored_count(&db, &team_id).await,
+                    1,
+                    "only the accepted one"
+                );
+                assert!(
+                    !marks(&db, &account).await.2,
+                    "the messages mark did not move"
+                );
+                set_inbox(&me, data(false));
+                ingest(&db, &state, &account).await;
+                ingest(&db, &state, &account).await;
+                assert_eq!(stored_count(&db, &team_id).await, 2, "the request, once");
+                // A refusal (an older service) means no requests, and does not hold the mark.
+                set_inbox(&me, {
+                    let mut d = data(false);
+                    d["fail_requests"] = json!(400);
+                    d
+                });
+                ingest(&db, &state, &account).await;
+                assert!(marks(&db, &account).await.2);
+            }
+
             /// Replies to a post Bluesky will not show, or its author blocks us from, say so
             /// before anything is sent.
             #[tokio::test]
@@ -25684,6 +26170,7 @@ mod teams {
                     ("/inbox-items/{id}", "get"),
                     ("/inbox-items/{id}", "patch"),
                     ("/inbox-items/{id}/reply", "post"),
+                    ("/inbox-items/{id}/moderate", "post"),
                     ("/inbox-items/{id}/conversation", "get"),
                     ("/inbox-items/{id}/thread", "get"),
                     ("/inbox-items/{id}/actions", "get"),
@@ -26958,6 +27445,105 @@ mod teams {
                         res.text().await.unwrap()
                     );
                 }
+            }
+
+            /// The real test account's existing conversation, on our side only: its state, a mute
+            /// and unmute, the read mark and accepting an accepted one. Sends no message and no
+            /// reaction. Needs BLUESKY_TEST_HANDLE and BLUESKY_TEST_APP_PASSWORD (DM access).
+            #[tokio::test]
+            #[serial]
+            #[ignore = "calls the real Bluesky"]
+            async fn live_bluesky_dm_state_on_our_side() {
+                let handle = std::env::var("BLUESKY_TEST_HANDLE").expect("BLUESKY_TEST_HANDLE");
+                let password =
+                    std::env::var("BLUESKY_TEST_APP_PASSWORD").expect("BLUESKY_TEST_APP_PASSWORD");
+                let config = Config::from_env().expect("test config");
+                let db = socialreins_brain::connect(&config).await.unwrap();
+                let state = AppState::new(db.clone(), &config);
+                let s = TestServer::new(controllers::router(state.clone(), &config)).unwrap();
+                let (_, cookie, _) = user(&s, &db).await;
+                let res = connect(&s, &cookie, &handle, &password).await;
+                assert!(res.status_code().is_success(), "connect: {}", res.text());
+                let account = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                // The first conversation Bluesky lists, as an item standing for its last message
+                // (read from the service, never written).
+                let a = social_accounts::Entity::find_by_id(account.parse::<uuid::Uuid>().unwrap())
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let pds = a.meta["pds"].as_str().unwrap().to_owned();
+                let web = reqwest::Client::new();
+                let session: Value = web
+                    .post(format!("{pds}/xrpc/com.atproto.server.createSession"))
+                    .json(&json!({"identifier": handle, "password": password}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                let listed: Value = web
+                    .get(format!("{pds}/xrpc/chat.bsky.convo.listConvos?limit=1"))
+                    .bearer_auth(session["accessJwt"].as_str().unwrap())
+                    .header("atproto-proxy", "did:web:api.bsky.chat#bsky_chat")
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                let convo = &listed["convos"][0];
+                let item = inbox::store(
+                    &db,
+                    &a,
+                    inbox::Fresh {
+                        kind: "dm",
+                        remote_id: convo["lastMessage"]["id"].as_str().unwrap().to_owned(),
+                        remote_cid: None,
+                        parent: None,
+                        root: (None, None),
+                        convo_id: convo["id"].as_str().map(str::to_owned),
+                        author: socialreins_brain::connectors::bluesky::Author {
+                            did: "did:plc:livetestauthor".into(),
+                            ..Default::default()
+                        },
+                        text: "live".into(),
+                        at: Utc::now().fixed_offset(),
+                        permalink: None,
+                        story: None,
+                        button_payload: None,
+                        attachments: vec![],
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let id = item.id.to_string();
+                let id = id.as_str();
+                let state_of = || async {
+                    fetch(&s, &cookie, &format!("/v1/inbox-items/{id}/actions")).await["convo"]
+                        .clone()
+                };
+                let before = state_of().await;
+                assert_eq!(before["status"], "accepted", "{before}");
+                assert_eq!(before["group"], false);
+                let act = |action: &str| {
+                    let r = req(
+                        &s,
+                        Method::POST,
+                        &format!("/v1/inbox-items/{id}/actions"),
+                        &cookie,
+                    );
+                    let body = json!({"action": action, "confirm": true});
+                    async move { r.json(&body).await }
+                };
+                assert_eq!(act("mute_convo").await.status_code(), 200);
+                assert_eq!(state_of().await["muted"], true);
+                assert_eq!(act("unmute_convo").await.status_code(), 200);
+                assert_eq!(state_of().await["muted"], false);
+                assert_eq!(act("mark_read").await.status_code(), 200);
+                assert_eq!(act("accept_convo").await.status_code(), 200);
             }
 
             /// Reads the real Bluesky test account's notifications and DMs, read-only. Needs
