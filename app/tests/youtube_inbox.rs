@@ -649,6 +649,14 @@ impl Env {
             .json(&body)
             .await
     }
+    async fn act_on(&self, path: &str, body: Value) -> axum_test::TestResponse {
+        self.s
+            .post(path)
+            .add_header("origin", WEB)
+            .add_header("cookie", self.cookie.clone())
+            .json(&body)
+            .await
+    }
     async fn shown(&self, item: Uuid) -> Value {
         self.s
             .get(&format!("/v1/inbox-items/{item}"))
@@ -858,5 +866,96 @@ async fn a_channel_cannot_spend_more_than_its_write_budget_and_nothing_is_sent_f
             .await
             .status_code(),
         422
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn automations_on_youtube_are_comment_triggers_with_public_replies_only() {
+    let e = env(false).await;
+    let make = |trigger: &str, actions: Value| {
+        json!({"name": "Thanks", "trigger": trigger,
+            "conditions": {"account_ids": [e.account]}, "actions": actions})
+    };
+    let post = |body: Value| e.act_on("/v1/automations", body);
+    // Only comments exist on YouTube, and only a public reply can answer one.
+    let res = post(make(
+        "dm_received",
+        json!([{"type": "send_dm", "text": "hi"}]),
+    ))
+    .await;
+    assert_eq!(res.json::<Value>()["error"], "youtube_unsupported_trigger");
+    let res = post(make(
+        "comment_received",
+        json!([{"type": "send_dm", "text": "hi"}]),
+    ))
+    .await;
+    assert_eq!(res.json::<Value>()["error"], "youtube_no_dm");
+    let res = post(make(
+        "comment_received",
+        json!([{"type": "reply_publicly", "text": "Thanks {name}!"}]),
+    ))
+    .await;
+    assert_eq!(res.status_code(), 201, "{}", res.text());
+    // "Test this automation" matches a sample comment and shows the reply it would send.
+    let test = json!({"automation": make("comment_received", json!([{"type": "reply_publicly", "text": "Thanks {name}!"}])),
+        "sample": {"account_id": e.account, "text": "love it", "author_name": "Ann"}});
+    let res = e.act_on("/v1/automations/test", test).await;
+    assert_eq!(res.status_code(), 200, "{}", res.text());
+    let out = res.json::<Value>();
+    assert_eq!(out["matched"], true);
+    assert_eq!(out["blocks"], json!([]));
+    assert_eq!(out["steps"][0]["status"], "would_send");
+    assert_eq!(out["steps"][0]["text"], "Thanks Ann!");
+    // A DM in the test is refused with the reason it could never go (the same check as saving).
+    let test = json!({"automation": make("comment_received", json!([{"type": "send_dm", "text": "hi"}])),
+        "sample": {"account_id": e.account, "text": "love it"}});
+    let res = e.act_on("/v1/automations/test", test).await;
+    assert_eq!(res.status_code(), 422);
+    assert_eq!(res.json::<Value>()["error"], "youtube_no_dm");
+    // A new comment is answered once, in public, under its top-level comment.
+    e.read_in().await;
+    e.mock.pages.lock().unwrap()[0].1["items"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, thread("UgxTHREAD9", "dan", "brand new", 0, vec![], 0));
+    e.tick().await;
+    let sent = e.mock.seen("POST", "/youtube/v3/comments");
+    assert_eq!(
+        sent.len(),
+        1,
+        "one reply, for the comment that arrived after the first read"
+    );
+    assert_eq!(sent[0].1["snippet"]["parentId"], "UgxTHREAD9");
+    assert_eq!(sent[0].1["snippet"]["textOriginal"], "Thanks dan!");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_dm_step_of_an_unscoped_automation_is_skipped_on_youtube_and_nothing_is_sent() {
+    let e = env(false).await;
+    // No account list: it is saved, and a YouTube comment meets a DM it can never send.
+    let body = json!({"name": "Welcome", "trigger": "comment_received",
+        "actions": [{"type": "send_dm", "text": "hi"}]});
+    let res = e.act_on("/v1/automations", body).await;
+    assert_eq!(res.status_code(), 201, "{}", res.text());
+    let id = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+    e.read_in().await;
+    e.mock.pages.lock().unwrap()[0].1["items"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, thread("UgxTHREAD8", "eve", "fresh", 0, vec![], 0));
+    e.tick().await;
+    assert!(e.mock.seen("POST", "/youtube/v3/comments").is_empty());
+    let runs =
+        e.s.get(&format!("/v1/automations/{id}/runs"))
+            .add_header("cookie", e.cookie.clone())
+            .await
+            .json::<Value>();
+    let run = &runs["runs"][0];
+    assert_eq!(
+        (run["status"].clone(), run["reason"].clone()),
+        (json!("skipped"), json!("youtube_no_dm")),
+        "{runs}"
     );
 }
