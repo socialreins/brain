@@ -6,7 +6,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     ops::Range,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -27,6 +27,8 @@ pub struct Bluesky {
     /// Tests only, never read from the environment: lets the PDS be a plain `http://127.0.0.1`
     /// mock. Names still resolve to public addresses only.
     pub allow_insecure_pds: bool,
+    /// How long the inbox tick spends reading one account (`inbox::store_new`). Tests shorten it.
+    pub inbox_budget: Duration,
     client: reqwest::Client,
     /// Inbox sessions by DID and password hash (see `live`).
     sessions: Arc<Mutex<HashMap<String, Live>>>,
@@ -198,6 +200,7 @@ impl Bluesky {
             plc: plc.into(),
             video: VIDEO_SERVICE.into(),
             allow_insecure_pds: false,
+            inbox_budget: INBOX_BUDGET,
             client,
             sessions: Arc::default(),
         })
@@ -803,6 +806,9 @@ const MAX_NOTIFICATIONS: usize = 300;
 /// A full round is 3 pages of 100; a few more allow for short pages.
 const MAX_NOTIFICATION_PAGES: usize = 6;
 const MAX_CONVOS: usize = 20;
+/// Time the inbox tick gives one account: a read that runs out stops at the next page or
+/// conversation (so it can overrun by one call) and carries on next tick.
+const INBOX_BUDGET: Duration = Duration::from_secs(20);
 
 /// Why an inbox call failed. `code` is stored on automation runs and sent to the API.
 #[derive(Debug, PartialEq, Eq)]
@@ -1033,6 +1039,22 @@ pub struct Message {
     pub sent_at: DateTime<FixedOffset>,
 }
 
+/// What `Bluesky::notifications` read. `next` is the cursor of the rest, when it stopped early.
+#[derive(Debug)]
+pub struct Notifications {
+    pub found: Vec<Notification>,
+    pub next: Option<String>,
+}
+
+/// What `Bluesky::messages` read. `resume` is set when it stopped early (`newest` is then
+/// `None`); otherwise `newest` is the next `since`.
+#[derive(Debug)]
+pub struct Messages {
+    pub found: Vec<Message>,
+    pub newest: Option<DateTime<FixedOffset>>,
+    pub resume: Option<DateTime<FixedOffset>>,
+}
+
 fn now_secs() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -1145,22 +1167,21 @@ impl Bluesky {
         Ok(got["posts"].as_array().cloned().unwrap_or_default())
     }
 
-    /// Replies, mentions and follows newer than `since`, newest first, at most `MAX_NOTIFICATIONS`.
-    /// Never marks them read.
+    /// Replies, mentions and follows newer than `since`, newest first, from the page `resume`
+    /// names (none: the newest). Stops after `MAX_NOTIFICATIONS` items, `MAX_NOTIFICATION_PAGES`
+    /// pages or when `deadline` has passed (always after at least one page), and then gives the
+    /// cursor of the rest in `next`. Never marks them read.
     pub async fn notifications(
         &self,
         c: &Creds<'_>,
         since: DateTime<FixedOffset>,
-    ) -> Result<Vec<Notification>, InboxError> {
+        resume: Option<&str>,
+        deadline: Instant,
+    ) -> Result<Notifications, InboxError> {
         let mut found = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut read = 0;
-        // Pages are counted too: a server the account owner runs could answer one item a page
-        // for ever, and the inbox tick waits on every account.
-        for _ in 0..MAX_NOTIFICATION_PAGES {
-            if read >= MAX_NOTIFICATIONS {
-                break;
-            }
+        let mut cursor = resume.map(str::to_owned);
+        let (mut read, mut pages) = (0, 0);
+        loop {
             let mut query = vec![
                 ("limit", "100"),
                 ("reasons", "reply"),
@@ -1178,19 +1199,31 @@ impl Bluesky {
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            read += list.len();
+            (read, pages) = (read + list.len(), pages + 1);
             for n in &list {
                 if time(&n["indexedAt"]).is_some_and(|t| t <= since) {
-                    return Ok(found);
+                    return Ok(Notifications { found, next: None });
                 }
                 found.extend(notification(n));
             }
+            let before = cursor.take();
             cursor = page["cursor"].as_str().map(str::to_owned);
-            if list.is_empty() || cursor.is_none() {
-                break;
+            // A cursor that does not move would keep the round open for ever.
+            if list.is_empty() || cursor.is_none() || cursor == before {
+                return Ok(Notifications { found, next: None });
+            }
+            // Counted in pages and time too: a server the account owner runs could answer one
+            // item a page, slowly, for ever, and the inbox tick waits on every account.
+            if read >= MAX_NOTIFICATIONS
+                || pages >= MAX_NOTIFICATION_PAGES
+                || Instant::now() >= deadline
+            {
+                return Ok(Notifications {
+                    found,
+                    next: cursor,
+                });
             }
         }
-        Ok(found)
     }
 
     /// Whether the account can use DMs: a privileged app password that the chat service takes.
@@ -1218,24 +1251,48 @@ impl Bluesky {
         matches!(res, Ok(r) if r.status() == StatusCode::OK)
     }
 
-    /// DMs others sent the account after `since`, and the newest message time seen (ours
-    /// included), the next `since`. Reads the 50 latest conversations, and messages of at most
-    /// `MAX_CONVOS` of them.
+    /// DMs others sent the account after `since`. Reads the 50 latest conversations, those with
+    /// news oldest first, and stops after `MAX_CONVOS` of them or when `deadline` has passed
+    /// (always after at least one): `resume` is then the time of the last one read, which the
+    /// next call passes back to skip what is done. A round that reaches the end gives `newest`,
+    /// the next `since`.
     pub async fn messages(
         &self,
         c: &Creds<'_>,
         since: DateTime<FixedOffset>,
-    ) -> Result<(Vec<Message>, Option<DateTime<FixedOffset>>), InboxError> {
+        resume: Option<DateTime<FixedOffset>>,
+        deadline: Instant,
+    ) -> Result<Messages, InboxError> {
         let q = [("limit", "50")];
         let page = self.xrpc(c, "chat.bsky.convo.listConvos", &q, None).await?;
-        let mut found = Vec::new();
-        let mut newest: Option<DateTime<FixedOffset>> = None;
         let convos = page["convos"].as_array().cloned().unwrap_or_default();
-        let fresh = convos.iter().filter_map(|convo| {
-            let last = time(&convo["lastMessage"]["sentAt"])?;
-            (last > since).then_some((convo, last))
-        });
-        for (convo, last) in fresh.take(MAX_CONVOS) {
+        let mut fresh: Vec<_> = convos
+            .iter()
+            .filter_map(|convo| {
+                let last = time(&convo["lastMessage"]["sentAt"])?;
+                (last > since).then_some((convo, last))
+            })
+            .collect();
+        fresh.sort_by_key(|(_, last)| *last);
+        let newest = fresh.last().map(|(_, last)| *last);
+        let mut found = Vec::new();
+        let mut done: Option<DateTime<FixedOffset>> = None;
+        let mut read = 0;
+        for (convo, last) in fresh {
+            if resume.is_some_and(|r| last <= r) {
+                continue;
+            }
+            // Never between two conversations of the same time: `resume` could not tell them apart.
+            if read > 0
+                && done.is_some_and(|d| last > d)
+                && (read >= MAX_CONVOS || Instant::now() >= deadline)
+            {
+                return Ok(Messages {
+                    found,
+                    newest: None,
+                    resume: done,
+                });
+            }
             let Some(id) = convo["id"].as_str() else {
                 continue;
             };
@@ -1243,8 +1300,10 @@ impl Bluesky {
             let msgs = self
                 .xrpc(c, "chat.bsky.convo.getMessages", &q, None)
                 .await?;
-            newest = newest.max(Some(last));
+            (done, read) = (Some(last), read + 1);
             let members = convo["members"].as_array().cloned().unwrap_or_default();
+            // Newer conversations first, like the messages inside one.
+            let mut batch = Vec::new();
             for m in msgs["messages"].as_array().into_iter().flatten() {
                 if m["$type"] != "chat.bsky.convo.defs#messageView" {
                     continue;
@@ -1257,7 +1316,7 @@ impl Bluesky {
                     continue;
                 }
                 let profile = members.iter().find(|p| p["did"] == sender);
-                found.push(Message {
+                batch.push(Message {
                     convo_id: id.to_owned(),
                     id: mid.to_owned(),
                     sender: profile.and_then(author).unwrap_or_else(|| Author {
@@ -1268,8 +1327,13 @@ impl Bluesky {
                     sent_at,
                 });
             }
+            found.splice(0..0, batch);
         }
-        Ok((found, newest))
+        Ok(Messages {
+            found,
+            newest,
+            resume: None,
+        })
     }
 
     /// Replies to `parent` in the thread of `root`; returns the reply's `at://` URI, empty when
