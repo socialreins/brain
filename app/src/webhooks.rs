@@ -149,7 +149,8 @@ pub fn with_event(update: &str) -> String {
          queued AS (INSERT INTO webhook_deliveries (id, team_id, target_id, event, payload) \
            SELECT c.did, w.team_id, c.id, 'post.target.' || c.status, jsonb_build_object( \
              'id', c.did, 'type', 'post.target.' || c.status, 'created_at', now(), \
-             'data', jsonb_build_object('post_id', c.post_id, 'group_id', p.group_id, \
+             'data', jsonb_build_object('post_id', c.post_id, 'post_number', p.number, \
+               'group_id', p.group_id, \
                'target_id', c.id, 'social_account_id', c.social_account_id, \
                'platform', p.platform, 'status', c.status, 'remote_url', c.remote_url, \
                'error', c.error)) \

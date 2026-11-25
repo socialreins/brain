@@ -93,7 +93,7 @@ async fn show(State(app): State<AppState>, t: InTeam) -> Response {
 ///
 /// - `post.target.published`, `post.target.failed`, `post.target.deleted`: one per target and
 ///   event, never twice, when that account's target reaches the status (a take down is
-///   `deleted`). `data`: `post_id`, `group_id` (null for a single post), `target_id`,
+///   `deleted`). `data`: `post_id`, `post_number`, `group_id` (null for a single post), `target_id`,
 ///   `social_account_id`, `platform`, `status`, `remote_url`, `error`. A post that settles as
 ///   `published` can still hold failed targets, so read each target's event, and `failed` is
 ///   not final: a retry (`POST /posts/{id}/retry`) can end in `published`, but a target that

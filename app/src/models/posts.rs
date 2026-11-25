@@ -5,6 +5,9 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
+    /// The number web pages use (`/t/<team>/posts/48213`): one counter over every team, set by the
+    /// column's identity, so an insert leaves it `NotSet`.
+    pub number: i64,
     pub team_id: Uuid,
     pub social_set_id: Uuid,
     /// `bluesky` today; the CHECK also allows the platforms still to come.

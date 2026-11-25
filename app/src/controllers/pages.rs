@@ -26,7 +26,7 @@ use super::{
     api_tokens::Actor,
     auth::{internal, Body},
     connections::live_sets,
-    posts::{self as posts_api, ThreadPart},
+    posts::{self as posts_api, PostId, ThreadPart, ID_PARAM},
     waitlist::{error, Error},
 };
 use crate::{
@@ -194,10 +194,10 @@ fn answer(found: Result<Option<Page>, DbErr>, what: &str) -> Response {
 /// The public page of a post, or of its group: every post of a group answers the same. Before
 /// the first save: `enabled` false, `details` empty and `code` null.
 #[utoipa::path(get, path = "/posts/{id}/page", tag = "posts",
-    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path)),
+    security(("session" = []), ("api_token" = [])), params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Page), (status = 401, body = Error),
         (status = 404, body = Error)))]
-async fn show(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
+async fn show(State(app): State<AppState>, a: Actor, PostId(id): PostId) -> Response {
     let found = async {
         let Some(post) = posts_api::find(&app.db, &a, id).await? else {
             return Ok(None);
@@ -217,14 +217,14 @@ async fn show(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Re
 /// public_pages_off` for `enabled: true` while the team has public pages off.
 #[utoipa::path(put, path = "/posts/{id}/page", tag = "posts",
     security(("session" = []), ("api_token" = [])), request_body = PageInput,
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Page), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error),
         (status = 422, body = Error)))]
 async fn save(
     State(app): State<AppState>,
     a: Actor,
-    Path(id): Path<Uuid>,
+    PostId(id): PostId,
     Body(input): Body<PageInput>,
 ) -> Response {
     let post = match posts_api::find(&app.db, &a, id).await {

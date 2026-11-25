@@ -37,7 +37,7 @@ use crate::{
         library::{self, MediaInput, MediaQuery, SnippetInput, SnippetQuery},
         lists::{self, AddPost, ListInput, Order},
         posts,
-        posts::{Decision, PostGroupInput, PostInput, PostQuery},
+        posts::{Decision, PostGroupInput, PostInput, PostQuery, PostRef},
         queue::{self, QueueInput},
         social_sets::{self, ListQuery},
         waitlist::error,
@@ -49,7 +49,8 @@ use crate::{
 
 #[derive(Deserialize, JsonSchema)]
 struct PostId {
-    id: Uuid,
+    /// The post's `id` (UUID) or its `number`.
+    id: PostRef,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -59,22 +60,24 @@ struct GroupId {
 
 #[derive(Deserialize, JsonSchema)]
 struct UpdatePost {
-    id: Uuid,
+    /// The post's `id` (UUID) or its `number`.
+    id: PostRef,
     #[serde(flatten)]
     post: PostInput,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct Decide {
-    id: Uuid,
+    /// The post's `id` (UUID) or its `number`.
+    id: PostRef,
     #[serde(flatten)]
     decision: Decision,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct SetRepeat {
-    /// The post.
-    id: Uuid,
+    /// The post's `id` (UUID) or its `number`.
+    id: PostRef,
     #[serde(flatten)]
     rule: Repeat,
 }
@@ -245,6 +248,14 @@ fn args<T: DeserializeOwned>(v: Value) -> Option<T> {
     serde_json::from_value(v).ok()
 }
 
+/// The post an MCP tool named; a lookup that fails is left to the handler as an unknown post.
+async fn resolve(app: &AppState, r: PostRef) -> Uuid {
+    r.resolve(&app.db).await.unwrap_or_else(|e| {
+        tracing::error!(error = %e, "post number lookup failed");
+        Uuid::default()
+    })
+}
+
 /// The `422` the REST route answers for a query or body it cannot read.
 fn invalid(code: &str) -> Response {
     error(StatusCode::UNPROCESSABLE_ENTITY, code).into_response()
@@ -275,7 +286,7 @@ async fn run(app: &AppState, a: &Actor, name: &str, v: Value) -> Option<Response
             None => invalid("invalid_query"),
         },
         "get-post" => match args::<PostId>(v) {
-            Some(p) => posts::get_post(app, a, p.id).await,
+            Some(p) => posts::get_post(app, a, resolve(app, p.id).await).await,
             None => invalid("invalid_body"),
         },
         "create-post" => match args::<Create<PostInput>>(v) {
@@ -287,26 +298,26 @@ async fn run(app: &AppState, a: &Actor, name: &str, v: Value) -> Option<Response
             None => invalid("invalid_body"),
         },
         "update-post" => match args::<UpdatePost>(v) {
-            Some(u) => posts::update_post(app, a, u.id, u.post).await,
+            Some(u) => posts::update_post(app, a, resolve(app, u.id).await, u.post).await,
             None => invalid("invalid_body"),
         },
         "approve-post" | "reject-post" => match args::<Decide>(v) {
             Some(d) => {
                 let approve = name == "approve-post";
-                posts::decide_post(app, a, d.id, approve, d.decision.note).await
+                posts::decide_post(app, a, resolve(app, d.id).await, approve, d.decision.note).await
             }
             None => invalid("invalid_body"),
         },
         "set-post-repeat" => match args::<SetRepeat>(v) {
-            Some(r) => posts::set_repeat(app, a, r.id, Some(r.rule)).await,
+            Some(r) => posts::set_repeat(app, a, resolve(app, r.id).await, Some(r.rule)).await,
             None => invalid("invalid_body"),
         },
         "clear-post-repeat" => match args::<PostId>(v) {
-            Some(p) => posts::set_repeat(app, a, p.id, None).await,
+            Some(p) => posts::set_repeat(app, a, resolve(app, p.id).await, None).await,
             None => invalid("invalid_body"),
         },
         "delete-post" => match args::<PostId>(v) {
-            Some(p) => posts::delete_post(app, a, p.id).await,
+            Some(p) => posts::delete_post(app, a, resolve(app, p.id).await).await,
             None => invalid("invalid_body"),
         },
         "takedown-post-group" => match args::<GroupId>(v) {

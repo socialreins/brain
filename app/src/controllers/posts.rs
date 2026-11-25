@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use axum::{
     body::{to_bytes, Bytes},
-    extract::{rejection::QueryRejection, Path, Query, State},
-    http::{StatusCode, Uri},
+    extract::{rejection::QueryRejection, FromRequestParts, Path, Query, State},
+    http::{request::Parts, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
@@ -52,6 +52,62 @@ use crate::{
     state::AppState,
 };
 
+/// The `{id}` of a post route: the post's `id` (a UUID) or its `number` (plain digits). A
+/// number that names no post becomes the nil UUID, so the handler answers its usual `404`; the
+/// handler also looks the post up in the caller's team, so another team's number is a `404`.
+pub struct PostId(pub Uuid);
+
+pub(crate) const ID_PARAM: &str = "The post's `id` (UUID) or its `number`.";
+
+impl FromRequestParts<AppState> for PostId {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, Response> {
+        let Path(raw) = Path::<String>::from_request_parts(parts, app)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let r = if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) {
+            PostRef::Number(raw.parse().unwrap_or(0))
+        } else {
+            PostRef::Id(Uuid::parse_str(&raw).map_err(|_| not_found())?)
+        };
+        r.resolve(&app.db)
+            .await
+            .map(Self)
+            .map_err(|e| internal(e, "post number lookup"))
+    }
+}
+
+/// A post named by its `id` (a UUID string) or its `number` (an integer), as the MCP tools take it.
+#[derive(Clone, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum PostRef {
+    Id(Uuid),
+    Number(i64),
+    /// A number sent as text, which some MCP clients do.
+    Text(String),
+}
+
+impl PostRef {
+    /// The post's id; the nil UUID for a number that names no post (the caller's team check
+    /// then answers `404`).
+    pub async fn resolve(self, db: &impl ConnectionTrait) -> Result<Uuid, DbErr> {
+        let n = match self {
+            Self::Id(id) => return Ok(id),
+            Self::Number(n) => n,
+            Self::Text(t) => t.trim().parse().unwrap_or(0),
+        };
+        Ok(posts::Entity::find()
+            .select_only()
+            .column(posts::Column::Id)
+            .filter(posts::Column::Number.eq(n))
+            .into_tuple::<Uuid>()
+            .one(db)
+            .await?
+            .unwrap_or_default())
+    }
+}
+
 /// Most posts a team keeps that are not `deleted`; at the cap a repeat rule makes no copy.
 pub(crate) const MAX_POSTS: u64 = 2000;
 
@@ -71,6 +127,9 @@ const STATUSES: [&str; 6] = [
 #[derive(Serialize, ToSchema)]
 pub struct Post {
     pub id: Uuid,
+    /// The post's number, unique over every team: the address web pages use. Every `{id}` of a
+    /// post route takes it as well as `id`.
+    pub number: i64,
     pub social_set_id: Uuid,
     /// `bluesky`.
     pub platform: String,
@@ -665,6 +724,7 @@ fn post_json(
 ) -> Post {
     Post {
         id: p.id,
+        number: p.number,
         social_set_id: p.social_set_id,
         platform: p.platform,
         body: p.body,
@@ -1547,10 +1607,10 @@ pub async fn list_posts(app: &AppState, a: &Actor, q: PostQuery) -> Response {
 
 /// One post with its targets.
 #[utoipa::path(get, path = "/posts/{id}", tag = "posts",
-    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path)),
+    security(("session" = []), ("api_token" = [])), params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Post), (status = 401, body = Error),
         (status = 404, body = Error)))]
-async fn show(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
+async fn show(State(app): State<AppState>, a: Actor, PostId(id): PostId) -> Response {
     get_post(&app, &a, id).await
 }
 
@@ -2341,14 +2401,14 @@ async fn naming(res: Response, platform: &str) -> Response {
 /// puts it back to `approval: "pending"` and a manager's or a token's leaves it `approved`.
 #[utoipa::path(put, path = "/posts/{id}", tag = "posts",
     security(("session" = []), ("api_token" = [])), request_body = PostInput,
-    params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    params(("id" = String, Path, description = ID_PARAM), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 200, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error)))]
 async fn update(
     State(app): State<AppState>,
     a: Actor,
-    Path(id): Path<Uuid>,
+    PostId(id): PostId,
     Body(input): Body<PostInput>,
 ) -> Response {
     update_post(&app, &a, id, input).await
@@ -2470,11 +2530,11 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, mut input: PostInp
 /// `pending` post approves it. A post with a repeat rule yields its next copy here, as when the
 /// scheduler takes it: the copy keeps the time of day the post was scheduled at.
 #[utoipa::path(post, path = "/posts/{id}/publish", tag = "posts",
-    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    security(("session" = []), ("api_token" = [])), params(("id" = String, Path, description = ID_PARAM), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 202, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 429, body = Error)))]
-async fn publish_now(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
+async fn publish_now(State(app): State<AppState>, a: Actor, PostId(id): PostId) -> Response {
     if !app.post_limiter.hit(a.key()) {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
@@ -2642,14 +2702,14 @@ pub async fn set_repeat(app: &AppState, a: &Actor, id: Uuid, rule: Option<Repeat
 /// posts with a rule per team.
 #[utoipa::path(put, path = "/posts/{id}/repeat", tag = "posts",
     security(("session" = []), ("api_token" = [])), request_body = Repeat,
-    params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    params(("id" = String, Path, description = ID_PARAM), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 200, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error)))]
 async fn put_repeat(
     State(app): State<AppState>,
     a: Actor,
-    Path(id): Path<Uuid>,
+    PostId(id): PostId,
     Body(rule): Body<Repeat>,
 ) -> Response {
     set_repeat(&app, &a, id, Some(rule)).await
@@ -2659,10 +2719,10 @@ async fn put_repeat(
 /// group; an edit like setting one. `409 not_scheduled` for any other post.
 #[utoipa::path(delete, path = "/posts/{id}/repeat", tag = "posts",
     security(("session" = []), ("api_token" = [])),
-    params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    params(("id" = String, Path, description = ID_PARAM), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 200, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error)))]
-async fn delete_repeat(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
+async fn delete_repeat(State(app): State<AppState>, a: Actor, PostId(id): PostId) -> Response {
     set_repeat(&app, &a, id, None).await
 }
 
@@ -2671,11 +2731,11 @@ async fn delete_repeat(State(app): State<AppState>, a: Actor, Path(id): Path<Uui
 /// {"error":"takedown_failed","message"}` says what to do, and a retry only tries what is still
 /// up. `queued` and `failed`: `409 not_deletable`.
 #[utoipa::path(delete, path = "/posts/{id}", tag = "posts",
-    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    security(("session" = []), ("api_token" = [])), params(("id" = String, Path, description = ID_PARAM), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 204), (status = 200, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error), (status = 429, body = Error)))]
-async fn destroy(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
+async fn destroy(State(app): State<AppState>, a: Actor, PostId(id): PostId) -> Response {
     delete_post(&app, &a, id).await
 }
 
@@ -2989,11 +3049,11 @@ fn publish_in_background(app: &AppState, ids: Vec<Uuid>) {
 /// no second one.
 #[utoipa::path(post, path = "/posts/{id}/retry", tag = "posts",
     security(("session" = []), ("api_token" = [])),
-    params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    params(("id" = String, Path, description = ID_PARAM), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 202, body = PostRetry), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 429, body = Error)))]
-async fn retry_post(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
+async fn retry_post(State(app): State<AppState>, a: Actor, PostId(id): PostId) -> Response {
     if !app.post_limiter.hit(a.key()) {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
@@ -3191,14 +3251,14 @@ async fn decide_group(
 /// not_awaiting_approval`.
 #[utoipa::path(post, path = "/posts/{id}/approve", tag = "posts",
     security(("session" = []), ("api_token" = [])), request_body(content = Option<Decision>),
-    params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    params(("id" = String, Path, description = ID_PARAM), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 200, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error)))]
 async fn approve(
     State(app): State<AppState>,
     a: Actor,
-    Path(id): Path<Uuid>,
+    PostId(id): PostId,
     body: Bytes,
 ) -> Response {
     match decision(&body) {
@@ -3211,14 +3271,14 @@ async fn approve(
 /// back while the team requires approval, until it is approved.
 #[utoipa::path(post, path = "/posts/{id}/reject", tag = "posts",
     security(("session" = []), ("api_token" = [])), request_body(content = Option<Decision>),
-    params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    params(("id" = String, Path, description = ID_PARAM), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 200, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error)))]
 async fn reject(
     State(app): State<AppState>,
     a: Actor,
-    Path(id): Path<Uuid>,
+    PostId(id): PostId,
     body: Bytes,
 ) -> Response {
     match decision(&body) {
@@ -3268,10 +3328,10 @@ const REFRESH_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 /// per post: `429 refreshed_recently`. A post with nothing to read (not published, a platform
 /// without metrics, an account that needs a reconnect) comes back as it is.
 #[utoipa::path(post, path = "/posts/{id}/metrics/refresh", tag = "posts",
-    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path)),
+    security(("session" = []), ("api_token" = [])), params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Post), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 429, body = Error)))]
-async fn refresh_metrics(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
+async fn refresh_metrics(State(app): State<AppState>, a: Actor, PostId(id): PostId) -> Response {
     let done = async {
         let Some(post) = find(&app.db, &a, id).await? else {
             return Ok(not_found());
