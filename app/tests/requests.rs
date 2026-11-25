@@ -18265,6 +18265,9 @@ mod teams {
                 static DELETE_MODE: AtomicU64 = AtomicU64::new(0);
                 /// How many calls the mock turned away with a 429.
                 static LIMITED: AtomicU64 = AtomicU64::new(0);
+                /// `META_HUMAN_AGENT` for the brains `on_meta` makes.
+                static HUMAN_AGENT: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
 
                 type Answer = (axum::http::StatusCode, Json<Value>);
 
@@ -18388,6 +18391,7 @@ mod teams {
                                 {
                                     return refused(100, "(#100) Invalid comment")
                                 }
+                                "likes" => json!({"success": true}),
                                 "comments" | "replies" => json!({"id": format!("{node}_r{n}")}),
                                 "messages" => {
                                     let to = f.get("recipient").map(String::as_str);
@@ -18401,6 +18405,9 @@ mod teams {
                                     }
                                     if said.contains("LIMIT") {
                                         return refused(613, "Calls to this api have exceeded");
+                                    }
+                                    if said.contains("DENIED") {
+                                        return refused(200, "(#200) Permission denied");
                                     }
                                     if said.contains("WINDOW") {
                                         return refused_sub(
@@ -18506,10 +18513,23 @@ mod teams {
                         };
                     let unsubscribe =
                         |h: axum::http::HeaderMap, Path((node, edge)): Path<(String, String)>| async move {
-                            if !page_token(&h) || edge != "subscribed_apps" {
+                            if !page_token(&h)
+                                || !["subscribed_apps", "likes"].contains(&edge.as_str())
+                            {
                                 return refused(190, "expired");
                             }
                             REMOVED.lock().unwrap().push(format!("{node}/{edge}"));
+                            ok(json!({"success": true}))
+                        };
+                    // A comment hidden or shown.
+                    let update =
+                        |h: axum::http::HeaderMap,
+                         Path(id): Path<String>,
+                         Form(f): Form<HashMap<String, String>>| async move {
+                            if !page_token(&h) {
+                                return refused(190, "expired");
+                            }
+                            CALLS.lock().unwrap().push((id, f));
                             ok(json!({"success": true}))
                         };
                     let remove = |h: axum::http::HeaderMap, Path(id): Path<String>| async move {
@@ -18560,7 +18580,7 @@ mod teams {
                             "/v26.0/{node}/{edge}",
                             post(edge).delete(unsubscribe).get(history),
                         )
-                        .route("/v26.0/{id}", get(node).delete(remove))
+                        .route("/v26.0/{id}", get(node).delete(remove).post(update))
                         .route("/video-upload/v26.0/{id}", post(upload))
                         .route(
                             "/img.jpg",
@@ -18597,6 +18617,7 @@ mod teams {
                     m.rupload_url = base.clone();
                     m.poll_every = std::time::Duration::ZERO;
                     m.webhook_token = hook.map(str::to_owned);
+                    m.human_agent = HUMAN_AGENT.load(Ordering::SeqCst);
                     config.meta = m;
                     let disk = object_store::local::LocalFileSystem::new_with_prefix(media_dir())
                         .unwrap()
@@ -19910,6 +19931,226 @@ mod teams {
                     let all = all_inbox_id(&s, &cookie).await;
                     let page = inbox_items_of(&s, &cookie, &all).await;
                     assert!(page.iter().all(|i| i["contact_id"] == first[0]["id"]));
+                }
+
+                /// Hide, show, delete and like a comment from the inbox, on the platform and on the item.
+                #[tokio::test]
+                #[serial]
+                async fn comments_are_moderated_from_the_inbox() {
+                    let (s, db, _, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (cookie, team_id) = owner_connected(&s, &db).await;
+                    deliver(&s, &page_comment("101_9_5", "Love it", "777", now())).await;
+                    deliver(&s, &ig_comment("1784", "1790", "555")).await;
+                    deliver(&s, &page_message("101", "m_1", "777", "hello")).await;
+                    let items = stored(&db, &team_id).await;
+                    let item =
+                        |remote: &str| items.iter().find(|i| i.remote_id == remote).unwrap().id;
+                    let (server, ck) = (&s, &cookie);
+                    let get = |id: uuid::Uuid| async move {
+                        let res = server
+                            .get(&format!("/v1/inbox-items/{id}"))
+                            .add_header("cookie", ck)
+                            .await;
+                        res.assert_status_ok();
+                        res.json::<Value>()
+                    };
+                    let moderate = |id: uuid::Uuid, action: &str| {
+                        req(
+                            &s,
+                            Method::POST,
+                            &format!("/v1/inbox-items/{id}/moderate"),
+                            &cookie,
+                        )
+                        .json(&json!({ "action": action }))
+                    };
+                    let state = |m: &Value| {
+                        let can: Vec<&str> = m["can"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|a| a.as_str().unwrap())
+                            .collect();
+                        (
+                            m["hidden"] == true,
+                            m["liked"] == true,
+                            m["deleted"] == true,
+                            can.join(","),
+                        )
+                    };
+
+                    // What each item offers: Facebook may like, Instagram may not, a DM is no comment.
+                    let fb = get(item("101_9_5")).await;
+                    assert_eq!(
+                        state(&fb["moderation"]),
+                        (false, false, false, "hide,delete,like".into())
+                    );
+                    assert!(fb.get("reply_window").is_none());
+                    let ig = get(item("1790")).await;
+                    assert_eq!(
+                        state(&ig["moderation"]),
+                        (false, false, false, "hide,delete".into())
+                    );
+                    let dm = get(item("m_1")).await;
+                    assert!(dm.get("moderation").is_none());
+
+                    // Hide and show, with the platform's own parameter name.
+                    let before = calls_since(0).len();
+                    let res = moderate(item("101_9_5"), "hide").await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    assert_eq!(
+                        state(&res.json::<Value>()["moderation"]),
+                        (true, false, false, "unhide,delete,like".into())
+                    );
+                    assert_eq!(moderate(item("1790"), "hide").await.status_code(), 200);
+                    assert_eq!(moderate(item("101_9_5"), "unhide").await.status_code(), 200);
+                    let calls = calls_since(before);
+                    assert_eq!(calls[0].0, "101_9_5");
+                    assert_eq!(calls[0].1["is_hidden"], "true");
+                    assert_eq!(calls[1].0, "1790");
+                    assert_eq!(calls[1].1["hide"], "true");
+                    assert_eq!(calls[2].1["is_hidden"], "false");
+
+                    // Like and unlike as the Page; Instagram has no such call.
+                    let res = moderate(item("101_9_5"), "like").await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    assert!(state(&res.json::<Value>()["moderation"]).1);
+                    assert_eq!(calls_since(before).last().unwrap().0, "101_9_5/likes");
+                    assert_eq!(moderate(item("101_9_5"), "unlike").await.status_code(), 200);
+                    assert_eq!(REMOVED.lock().unwrap().last().unwrap(), "101_9_5/likes");
+                    let res = moderate(item("1790"), "like").await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json_contains(&json!({"error": "not_supported"}));
+                    assert_eq!(moderate(item("m_1"), "hide").await.status_code(), 422);
+                    let res = moderate(item("1790"), "shred").await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json(&json!({"error": "invalid_action"}));
+
+                    // Deleting is for owners and admins; a member may hide.
+                    let (member, _) = joined(&s, &db, &team_id, "member").await;
+                    let by_member = |action: &str| {
+                        req(
+                            &s,
+                            Method::POST,
+                            &format!("/v1/inbox-items/{}/moderate", item("1790")),
+                            &member,
+                        )
+                        .json(&json!({ "action": action }))
+                    };
+                    assert_eq!(by_member("delete").await.status_code(), 403);
+                    assert_eq!(by_member("unhide").await.status_code(), 200);
+                    let res = moderate(item("1790"), "delete").await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let body = res.json::<Value>();
+                    assert_eq!(body["state"], "done");
+                    assert_eq!(
+                        state(&body["moderation"]),
+                        (false, false, true, String::new())
+                    );
+                    assert_eq!(REMOVED.lock().unwrap().last().unwrap(), "1790");
+
+                    // A deleted comment takes no reply and no further action.
+                    let res = req(
+                        &s,
+                        Method::POST,
+                        &format!("/v1/inbox-items/{}/reply", item("1790")),
+                        &cookie,
+                    )
+                    .json(&json!({"text": "hi"}))
+                    .await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json_contains(&json!({"error": "not_repliable"}));
+                    assert_eq!(moderate(item("1790"), "hide").await.status_code(), 422);
+
+                    // A token Meta refuses asks for a reconnect, on the account too.
+                    let fb_account = account(&db, &team_id, "facebook", "101").await;
+                    let row = social_accounts::ActiveModel {
+                        id: Set(fb_account.id),
+                        access_token: Set(cipher().encrypt(b"dead")),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(row)
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                    let res = moderate(item("101_9_5"), "hide").await;
+                    assert_eq!(res.status_code(), 422);
+                    res.assert_json_contains(&json!({"error": "meta_reconnect_required"}));
+                    let fb_account = account(&db, &team_id, "facebook", "101").await;
+                    assert_eq!(fb_account.meta["reconnect"], true);
+                }
+
+                /// A DM says how long it can still be answered; a person may answer later with Meta's
+                /// Human Agent feature, once the app holds it; a permission Meta denies is named.
+                #[tokio::test]
+                #[serial]
+                async fn the_messaging_window_is_shown_and_the_human_agent_tag_is_opt_in() {
+                    let hours_ago = |db: &DatabaseConnection, id: uuid::Uuid, h: i64| {
+                        let at = (chrono::Utc::now() - chrono::Duration::hours(h)).fixed_offset();
+                        let row = inbox_items::ActiveModel {
+                            id: Set(id),
+                            received_at: Set(at),
+                            ..Default::default()
+                        };
+                        let db = db.clone();
+                        async move { inbox_items::Entity::update(row).exec(&db).await.unwrap() }
+                    };
+                    for agent in [false, true] {
+                        HUMAN_AGENT.store(agent, Ordering::SeqCst);
+                        let (s, db, _, _) = on_meta(true).await;
+                        clean(&db).await;
+                        let (cookie, team_id) = owner_connected(&s, &db).await;
+                        deliver(&s, &page_message("101", "m_1", "777", "hello")).await;
+                        let id = stored(&db, &team_id).await[0].id;
+                        let show = || async {
+                            let res = s
+                                .get(&format!("/v1/inbox-items/{id}"))
+                                .add_header("cookie", &cookie)
+                                .await;
+                            res.json::<Value>()["reply_window"].clone()
+                        };
+                        let reply = |text: &str| {
+                            req(
+                                &s,
+                                Method::POST,
+                                &format!("/v1/inbox-items/{id}/reply"),
+                                &cookie,
+                            )
+                            .json(&json!({ "text": text }))
+                        };
+                        let w = show().await;
+                        assert_eq!(w["open"], true);
+                        assert!(w["closes_at"].is_string() && w["last_message_at"].is_string());
+                        assert_eq!(w["human_agent_until"].is_string(), agent);
+
+                        // 30 hours on: closed for a message, open for a person with the feature.
+                        hours_ago(&db, id, 30).await;
+                        let w = show().await;
+                        assert_eq!(w["open"], false);
+                        let before = calls_since(0).len();
+                        let res = reply("Sorry for the wait").await;
+                        if agent {
+                            assert_eq!(res.status_code(), 201, "{}", res.text());
+                            let form = &calls_since(before)[0].1;
+                            assert_eq!(form["messaging_type"], "MESSAGE_TAG");
+                            assert_eq!(form["tag"], "HUMAN_AGENT");
+                        } else {
+                            assert_eq!(res.status_code(), 422);
+                            res.assert_json_contains(&json!({"error": "outside_window"}));
+                            assert_eq!(calls_since(before).len(), 0);
+                        }
+
+                        // Eight days on: nothing goes out, tag or not.
+                        hours_ago(&db, id, 24 * 8).await;
+                        assert_eq!(reply("Much later").await.status_code(), 422);
+
+                        // A permission Meta denies is named, apart from a dead token.
+                        hours_ago(&db, id, 1).await;
+                        let res = reply("DENIED").await;
+                        assert_eq!(res.status_code(), 422);
+                        res.assert_json_contains(&json!({"error": "meta_denied"}));
+                    }
+                    HUMAN_AGENT.store(false, Ordering::SeqCst);
                 }
 
                 /// The webhook is not the only way in: the last days of comments and conversations are
@@ -25071,6 +25312,7 @@ mod teams {
                     ("/inbox-items/{id}", "get"),
                     ("/inbox-items/{id}", "patch"),
                     ("/inbox-items/{id}/reply", "post"),
+                    ("/inbox-items/{id}/moderate", "post"),
                     ("/inbox-items/{id}/conversation", "get"),
                     ("/contacts", "get"),
                     ("/contacts/{id}", "get"),

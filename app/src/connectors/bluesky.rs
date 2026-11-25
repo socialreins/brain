@@ -838,6 +838,9 @@ pub enum InboxError {
     MetaReconnect,
     /// Meta refused the call, or could not be reached; the scrubbed reason.
     Meta(String),
+    /// Meta refused it for a permission or a messaging policy (codes 10 and 200 to 299); the
+    /// scrubbed reason.
+    MetaDenied(String),
 }
 
 impl InboxError {
@@ -856,6 +859,7 @@ impl InboxError {
             // Not `reconnect_required`: the web app words that one for Bluesky.
             Self::MetaReconnect => "meta_reconnect_required",
             Self::Meta(_) => "meta_failed",
+            Self::MetaDenied(_) => "meta_denied",
         }
     }
 
@@ -893,11 +897,18 @@ impl InboxError {
             Self::Invalid("dm_unavailable") => {
                 "Meta cannot deliver a message to this person.".into()
             }
+            Self::Invalid("not_supported") => "Facebook and Instagram do not allow this on \
+                                                 this item."
+                .into(),
             Self::Invalid(code) => format!("Not sent ({code})."),
             Self::MetaReconnect => "Meta refused the Page's token or a permission is missing. \
                                     Connect the account again under Connections."
                 .into(),
             Self::Meta(why) => format!("Meta did not take it: {why}"),
+            Self::MetaDenied(why) => format!(
+                "Meta did not allow it: {why} The account may lack a permission for this, or \
+                 Meta's messaging rules forbid it."
+            ),
         }
     }
 }

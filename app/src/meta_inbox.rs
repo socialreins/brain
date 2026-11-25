@@ -33,7 +33,7 @@ use crate::{
     automations,
     connectors::{
         bluesky::{Author, InboxError},
-        meta::To,
+        meta::{Moderate, To},
     },
     inbox::{self, Attachment, Button, Fresh, Via},
     models::{inbox_items, social_accounts},
@@ -46,6 +46,8 @@ const PRIVATE_REPLY_DAYS: i64 = 7;
 const MESSAGE_HOURS: i64 = 24;
 /// Longest quick reply payload kept; ours are at most 64.
 const MAX_PAYLOAD_CHARS: usize = 200;
+/// A person's reply, with Meta's Human Agent feature, may go out this long after their last message.
+const HUMAN_AGENT_DAYS: i64 = 7;
 /// An account is read again this long after its last read, and `BACKFILL_ACCOUNTS` are read a
 /// tick (a minute), so a thousand accounts still fit in the hour.
 const BACKFILL_EVERY_MINUTES: i64 = 60;
@@ -423,16 +425,110 @@ async fn has_video_target(app: &AppState, account: Uuid) -> Result<bool, DbErr> 
     }
 }
 
-/// Whether the person wrote to the account within 24 hours, so a message may go to them.
-async fn in_message_window(app: &AppState, account: Uuid, person: &str) -> Result<bool, DbErr> {
+/// When the person last wrote to the account: the start of the messaging window.
+async fn last_message(
+    app: &AppState,
+    account: Uuid,
+    person: &str,
+) -> Result<Option<DateTime<FixedOffset>>, DbErr> {
     let stmt = sql(
-        "SELECT EXISTS (SELECT 1 FROM inbox_items WHERE social_account_id = $1 AND kind = 'dm' \
-         AND author_id = $2 AND received_at > now() - make_interval(hours => $3)) AS ok",
-        vec![account.into(), person.into(), (MESSAGE_HOURS as i32).into()],
+        "SELECT max(received_at) AS at FROM inbox_items WHERE social_account_id = $1 \
+         AND kind = 'dm' AND author_id = $2",
+        vec![account.into(), person.into()],
     );
     match app.db.query_one_raw(stmt).await? {
-        Some(r) => r.try_get("", "ok"),
-        None => Ok(false),
+        Some(r) => r.try_get("", "at"),
+        None => Ok(None),
+    }
+}
+
+/// How long a conversation stays open for a reply, from the person's last message `last`: Meta
+/// takes a message for 24 hours, and a person's reply for 7 days with the HUMAN_AGENT tag when
+/// the app holds that feature (`human_agent`, else `None`).
+pub struct Window {
+    pub closes_at: DateTime<FixedOffset>,
+    pub human_agent_until: Option<DateTime<FixedOffset>>,
+}
+
+pub fn window(last: DateTime<FixedOffset>, human_agent: bool) -> Window {
+    Window {
+        closes_at: last + Duration::hours(MESSAGE_HOURS),
+        human_agent_until: human_agent.then(|| last + Duration::days(HUMAN_AGENT_DAYS)),
+    }
+}
+
+/// What a person may do to a comment from the inbox, as the action names: hide or show,
+/// delete, and (Facebook only: Instagram has no such call) like or unlike. Nothing for a comment
+/// already deleted or an item that is not a comment of ours.
+pub fn moderations(item: &inbox_items::Model) -> Vec<&'static str> {
+    let flag = |k: &str| item.moderation[k].as_bool() == Some(true);
+    let meta = matches!(item.platform.as_str(), "facebook" | "instagram");
+    if !meta || item.kind != "comment" || flag("deleted") {
+        return Vec::new();
+    }
+    let mut can = vec![if flag("hidden") { "unhide" } else { "hide" }, "delete"];
+    if item.platform == "facebook" {
+        can.push(if flag("liked") { "unlike" } else { "like" });
+    }
+    can
+}
+
+/// Moderates a comment on Meta and keeps what was done on the item (a deleted comment is also
+/// `done`). The inner `Err` says why nothing was done.
+pub async fn moderate(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    action: Moderate,
+) -> Result<Result<(), InboxError>, DbErr> {
+    let wanted = match action {
+        Moderate::Hide | Moderate::Unhide => ("hidden", action == Moderate::Hide),
+        Moderate::Delete => ("deleted", true),
+        Moderate::Like | Moderate::Unlike => ("liked", action == Moderate::Like),
+    };
+    // Either way round: hiding what is hidden is allowed and does nothing new.
+    let can = moderations(item);
+    if !can.contains(&action.as_str()) && !can.contains(&action.flipped().as_str()) {
+        return Ok(Err(InboxError::Invalid("not_supported")));
+    }
+    let Some(token) = inbox::secret(app, account) else {
+        return Ok(Err(InboxError::MetaReconnect));
+    };
+    let instagram = account.provider == "instagram";
+    let done = app
+        .meta
+        .moderate(instagram, &token, &item.remote_id, action)
+        .await;
+    if let Err(e) = &done {
+        flag_reconnect_if_dead(app, account, e).await;
+        return Ok(done);
+    }
+    let state = if action == Moderate::Delete {
+        ", state = 'done'"
+    } else {
+        ""
+    };
+    let stmt = sql(
+        &format!(
+            "UPDATE inbox_items SET moderation = moderation || $2::jsonb{state} WHERE id = $1"
+        ),
+        vec![
+            item.id.into(),
+            serde_json::json!({ wanted.0: wanted.1 }).into(),
+        ],
+    );
+    app.db.execute_raw(stmt).await?;
+    Ok(Ok(()))
+}
+
+/// A token Meta refused: the account needs connecting again, which Home and Accounts then say.
+pub async fn flag_reconnect_if_dead(
+    app: &AppState,
+    account: &social_accounts::Model,
+    e: &InboxError,
+) {
+    if matches!(e, InboxError::MetaReconnect) {
+        crate::expiry::flag_reconnect(&app.db, account.id).await;
     }
 }
 
@@ -910,14 +1006,15 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
 /// Sends `text` for `item` from a Facebook or Instagram `account`, once: a public reply under
 /// a comment, a private reply to a comment (a `Dm` for a comment: within 7 days, one per
 /// comment), or a DM to a person who wrote within 24 hours. `buttons` go with a DM as quick
-/// replies. The inner `Ok` is the sent id.
+/// replies. `human`: a person sent it (not an automation), who may use the Human Agent tag. The
+/// inner `Ok` is the sent id.
 pub async fn send(
     app: &AppState,
     account: &social_accounts::Model,
     item: &inbox_items::Model,
     via: Via,
     text: &str,
-    buttons: &[Button],
+    (buttons, human): (&[Button], bool),
 ) -> Result<Result<String, InboxError>, DbErr> {
     let quick: Vec<(&str, &str)> = buttons
         .iter()
@@ -933,6 +1030,9 @@ pub async fn send(
     let Some(token) = inbox::secret(app, account) else {
         return Ok(Err(InboxError::MetaReconnect));
     };
+    if item.moderation["deleted"].as_bool() == Some(true) {
+        return Ok(Err(InboxError::Invalid("not_repliable")));
+    }
     let sent = match (via, item.kind.as_str()) {
         (Via::Public, "comment") => {
             app.meta
@@ -947,19 +1047,41 @@ pub async fn send(
                 Err(InboxError::Invalid("already_replied"))
             } else {
                 let to = To::Comment(&item.remote_id);
-                app.meta.message(page, &token, to, text, &quick).await
+                app.meta
+                    .message(page, &token, to, text, (&quick, false))
+                    .await
             }
         }
         (Via::Dm, "dm") => {
-            if in_message_window(app, account.id, &item.author_id).await? {
-                let to = To::Person(&item.author_id);
-                app.meta.message(page, &token, to, text, &quick).await
-            } else {
-                Err(InboxError::Invalid("outside_window"))
+            let last = last_message(app, account.id, &item.author_id).await?;
+            let now = Utc::now();
+            // 24 hours for anyone; a person's reply may use the Human Agent tag up to 7 days.
+            let tagged = match last {
+                Some(t) if t + Duration::hours(MESSAGE_HOURS) > now => Some(false),
+                Some(t)
+                    if human
+                        && app.meta.human_agent
+                        && t + Duration::days(HUMAN_AGENT_DAYS) > now =>
+                {
+                    Some(true)
+                }
+                _ => None,
+            };
+            match tagged {
+                Some(tag) => {
+                    let to = To::Person(&item.author_id);
+                    app.meta
+                        .message(page, &token, to, text, (&quick, tag))
+                        .await
+                }
+                None => Err(InboxError::Invalid("outside_window")),
             }
         }
         _ => Err(InboxError::Invalid("not_repliable")),
     };
+    if let Err(e) = &sent {
+        flag_reconnect_if_dead(app, account, e).await;
+    }
     Ok(sent)
 }
 

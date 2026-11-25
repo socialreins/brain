@@ -119,6 +119,8 @@ pub struct Config {
     /// `META_APP_ID` and `META_APP_SECRET`: connecting Facebook Pages and Instagram accounts,
     /// with the redirect URI `{BRAIN_URL}/connect/meta/callback`, on Graph API
     /// `META_GRAPH_VERSION` (default `v26.0`). Publishing with a stored Page token needs neither.
+    /// `META_HUMAN_AGENT=true` once Meta granted the app the Human Agent feature: a person's reply
+    /// may then go out up to 7 days after the last message, with the HUMAN_AGENT tag.
     /// `META_WEBHOOK_VERIFY_TOKEN` turns on `GET /webhooks/meta` (the handshake when the webhook
     /// is registered in the Meta app); `POST /webhooks/meta` is signed with `META_APP_SECRET`.
     pub meta: meta::Meta,
@@ -232,6 +234,7 @@ impl Config {
                     &var("META_GRAPH_VERSION").unwrap_or_else(|| meta::DEFAULT_VERSION.into()),
                 )?;
                 meta.webhook_token = var("META_WEBHOOK_VERIFY_TOKEN");
+                meta.human_agent = var("META_HUMAN_AGENT").is_some_and(|v| v == "true");
                 meta
             },
             stripe: crate::stripe::Stripe::new(

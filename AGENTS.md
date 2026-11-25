@@ -167,7 +167,10 @@ cargo run -p socialreins-brain
   `social_accounts.meta_synced_at`) reads the last 7 days of a Page's posts and comments, an
   Instagram account's media and comments, and the conversations (`meta_inbox::backfill`), so a
   webhook outage or a new connection leaves no hole; items older than a day are marked
-  `automated_at`, so no automation answers them.
+  `automated_at`, so no automation answers them. `POST /v1/inbox-items/{id}/moderate` hides,
+  deletes or likes a Meta comment (`meta_inbox::moderate`; what was done is kept in
+  `inbox_items.moderation`); a person's DM reply after 24 hours goes out with the HUMAN_AGENT tag
+  only with `META_HUMAN_AGENT`.
 - `app/src/automations.rs`: an automation holds `actions` or `steps` (a flow of sends and
   waits). A flow's run claims each step before sending it (`claim_step`, with the send's hit of
   the daily cap), a `wait` parks it as `waiting`, and `automations::tick` (every minute, own

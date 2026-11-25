@@ -859,7 +859,7 @@ pub async fn send_with(
         return Ok(Err(InboxError::Invalid("too_long")));
     }
     let sent = if meta {
-        meta_inbox::send(app, account, item, via, text, buttons).await?
+        meta_inbox::send(app, account, item, via, text, (buttons, sent_by.is_some())).await?
     } else {
         send_bluesky(app, account, item, (via, text, skip)).await
     };

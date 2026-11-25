@@ -31,8 +31,12 @@ use super::{
 };
 use crate::{
     billing::{self, Limit},
-    connectors::bluesky::{self, InboxError},
+    connectors::{
+        bluesky::{self, InboxError},
+        meta::Moderate,
+    },
     inbox::{self, filter_sql, Filters, Via},
+    meta_inbox,
     models::{inbox_items, inbox_replies, inboxes, social_accounts, team_user, users},
     state::AppState,
 };
@@ -141,6 +145,13 @@ pub struct Item {
     /// Photos, videos, stickers, files and links it carries, https only, at most 10. Meta's
     /// links expire after a while; `remote_url` keeps working.
     pub attachments: Vec<inbox::Attachment>,
+    /// Facebook and Instagram comments: what was done to it from the inbox and what may still be
+    /// (`POST /inbox-items/{id}/moderate`); `null` for any other item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moderation: Option<Moderation>,
+    /// Facebook and Instagram DMs: until when Meta takes a reply; `null` for any other item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_window: Option<ReplyWindow>,
     /// The author's contact (`GET /contacts/{id}`).
     pub contact_id: Option<Uuid>,
     /// The contact's tags, by name.
@@ -155,6 +166,35 @@ pub struct Item {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Conversation>)]
     pub conversation: Option<Option<Conversation>>,
+}
+
+/// What was done to a Facebook or Instagram comment from the inbox, and what may be.
+#[derive(Serialize, ToSchema)]
+pub struct Moderation {
+    pub hidden: bool,
+    /// Liked as the Page (Facebook only).
+    pub liked: bool,
+    /// Deleted on the platform; the item is `done` and cannot be answered.
+    pub deleted: bool,
+    /// Actions that work on it now: `hide` or `unhide`, `delete`, and on Facebook `like` or
+    /// `unlike`. Deleting needs an owner or admin.
+    pub can: Vec<String>,
+}
+
+/// How long Meta takes a reply to a DM: 24 hours after the person's last message.
+#[derive(Serialize, ToSchema)]
+pub struct ReplyWindow {
+    /// The person's last message to the account.
+    pub last_message_at: DateTime<FixedOffset>,
+    /// A message goes out until then; after it only a person's reply with Meta's Human Agent
+    /// feature does.
+    pub closes_at: DateTime<FixedOffset>,
+    /// Set only when the app holds the Human Agent feature (`META_HUMAN_AGENT`): until then a
+    /// person's reply may still go out, up to 7 days after the last message. `null`: the
+    /// feature is not granted, so nothing goes out after `closes_at`.
+    pub human_agent_until: Option<DateTime<FixedOffset>>,
+    /// Whether `closes_at` has not passed.
+    pub open: bool,
 }
 
 /// A DM conversation: every `dm` item of one account and contact that the inbox holds.
@@ -411,11 +451,44 @@ async fn held_by(
     Ok(out)
 }
 
+/// The latest message each person (of the Meta DMs in `rows`) wrote to each account.
+async fn last_messages(
+    db: &impl ConnectionTrait,
+    rows: &[inbox_items::Model],
+) -> Result<HashMap<(Uuid, String), DateTime<FixedOffset>>, DbErr> {
+    let meta_dm = |i: &&inbox_items::Model| {
+        i.kind == "dm" && matches!(i.platform.as_str(), "facebook" | "instagram")
+    };
+    let dms: Vec<_> = rows.iter().filter(meta_dm).collect();
+    if dms.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let latest = inbox_items::Entity::find()
+        .select_only()
+        .column(inbox_items::Column::SocialAccountId)
+        .column(inbox_items::Column::AuthorId)
+        .expr_as(
+            sea_orm::sea_query::Func::max(Expr::col(inbox_items::Column::ReceivedAt)),
+            "last",
+        )
+        .filter(inbox_items::Column::Kind.eq("dm"))
+        .filter(inbox_items::Column::SocialAccountId.is_in(dms.iter().map(|i| i.social_account_id)))
+        .filter(inbox_items::Column::AuthorId.is_in(dms.iter().map(|i| i.author_id.clone())))
+        .group_by(inbox_items::Column::SocialAccountId)
+        .group_by(inbox_items::Column::AuthorId)
+        .into_tuple::<(Uuid, String, DateTime<FixedOffset>)>()
+        .all(db)
+        .await?;
+    Ok(latest.into_iter().map(|(a, p, t)| ((a, p), t)).collect())
+}
+
 pub(super) async fn items_json(
     db: &impl ConnectionTrait,
     rows: Vec<inbox_items::Model>,
+    human_agent: bool,
 ) -> Result<Vec<Item>, DbErr> {
     let mut held = held_by(db, &rows).await?;
+    let last = last_messages(db, &rows).await?;
     let tags = tags_of(db, rows.iter().filter_map(|i| i.contact_id)).await?;
     let names: HashMap<Uuid, String> = users::Entity::find()
         .filter(users::Column::Id.is_in(rows.iter().filter_map(|i| i.assigned_to)))
@@ -443,9 +516,37 @@ pub(super) async fn items_json(
             created_at: r.created_at,
         });
     }
+    let now = chrono::Utc::now();
     Ok(rows
         .into_iter()
         .map(|i| Item {
+            moderation: matches!(i.platform.as_str(), "facebook" | "instagram")
+                .then(|| i.kind == "comment")
+                .filter(|comment| *comment)
+                .map(|_| {
+                    let flag = |k: &str| i.moderation[k].as_bool() == Some(true);
+                    Moderation {
+                        hidden: flag("hidden"),
+                        liked: flag("liked"),
+                        deleted: flag("deleted"),
+                        can: meta_inbox::moderations(&i)
+                            .into_iter()
+                            .map(String::from)
+                            .collect(),
+                    }
+                }),
+            reply_window: last
+                .get(&(i.social_account_id, i.author_id.clone()))
+                .map(|t| {
+                    let w = meta_inbox::window(*t, human_agent);
+                    ReplyWindow {
+                        last_message_at: *t,
+                        open: w.closes_at > now,
+                        closes_at: w.closes_at,
+                        human_agent_until: w.human_agent_until,
+                    }
+                })
+                .filter(|_| i.kind == "dm"),
             inbox_ids: held.remove(&i.id).unwrap_or_default(),
             replies: by_item.remove(&i.id).unwrap_or_default(),
             id: i.id,
@@ -487,8 +588,12 @@ pub(super) async fn items_json(
         .collect())
 }
 
-async fn item_json(db: &impl ConnectionTrait, i: inbox_items::Model) -> Result<Item, DbErr> {
-    let mut list = items_json(db, vec![i]).await?;
+async fn item_json(
+    db: &impl ConnectionTrait,
+    i: inbox_items::Model,
+    human_agent: bool,
+) -> Result<Item, DbErr> {
+    let mut list = items_json(db, vec![i], human_agent).await?;
     list.pop()
         .ok_or_else(|| DbErr::RecordNotFound("item vanished".into()))
 }
@@ -1006,7 +1111,7 @@ async fn items(
             rows.push(row);
         }
         let next_cursor = more.then(|| rows.last().map(|r| r.id)).flatten();
-        let mut items = items_json(&app.db, rows).await?;
+        let mut items = items_json(&app.db, rows, app.meta.human_agent).await?;
         for (item, c) in items.iter_mut().zip(conversations) {
             item.conversation = Some(c);
         }
@@ -1026,7 +1131,7 @@ async fn items(
 async fn show_item(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> Response {
     let found = async {
         match find_item(&app.db, t.team.id, id).await? {
-            Some(i) => item_json(&app.db, i).await.map(Some),
+            Some(i) => item_json(&app.db, i, app.meta.human_agent).await.map(Some),
             None => Ok(None),
         }
     };
@@ -1082,7 +1187,7 @@ async fn conversation(
         let has_more = rows.len() as u64 > limit;
         rows.truncate(limit as usize);
         rows.reverse();
-        let items = items_json(&app.db, rows).await?;
+        let items = items_json(&app.db, rows, app.meta.human_agent).await?;
         Ok::<_, DbErr>(Ok(ConversationPage { items, has_more }))
     };
     match found.await {
@@ -1153,7 +1258,7 @@ async fn change_item(
             return Ok(Ok(None));
         }
         Ok::<_, DbErr>(Ok(match find_item(&app.db, t.team.id, id).await? {
-            Some(i) => Some(item_json(&app.db, i).await?),
+            Some(i) => Some(item_json(&app.db, i, app.meta.human_agent).await?),
             None => None,
         }))
     };
@@ -1262,8 +1367,71 @@ async fn send_reply(
         }
     }
     match find_item(&app.db, t.team.id, id).await {
-        Ok(Some(i)) => match item_json(&app.db, i).await {
+        Ok(Some(i)) => match item_json(&app.db, i, app.meta.human_agent).await {
             Ok(i) => (StatusCode::CREATED, Json(i)).into_response(),
+            Err(e) => internal(e, "inbox item read"),
+        },
+        Ok(None) => not_found(),
+        Err(e) => internal(e, "inbox item read"),
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModerateInput {
+    /// `hide`, `unhide`, `delete`, `like` or `unlike`; the item's `moderation.can` says which
+    /// work on it.
+    pub action: String,
+}
+
+/// Moderates a Facebook or Instagram comment on the platform: hide or show it, delete it (owners
+/// and admins only; the item becomes `done` and cannot be answered), or like it as the Page
+/// (Facebook only). Needs `pages_manage_engagement` (Facebook) or `instagram_manage_comments`
+/// (Instagram). Every member for the rest; at most 60 a minute per user. `200` with the item. `422` with `invalid_action`, or `not_supported` for an
+/// action the item cannot take (a like on Instagram, a Bluesky item), or a Meta refusal worded as
+/// for a reply (`meta_reconnect_required`, `meta_denied`, `meta_failed`, `rate_limited`).
+#[utoipa::path(post, path = "/inbox-items/{id}/moderate", tag = "inbox",
+    request_body = ModerateInput, params(("id" = Uuid, Path)),
+    responses((status = 200, body = Item), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 404, body = Error), (status = 422, body = Error),
+        (status = 429, body = Error)))]
+async fn moderate_item(
+    _: FromWeb,
+    State(app): State<AppState>,
+    t: InTeam,
+    Path(id): Path<Uuid>,
+    Body(input): Body<ModerateInput>,
+) -> Response {
+    let Some(action) = Moderate::parse(input.action.trim()) else {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_action");
+    };
+    if action == Moderate::Delete && !t.role.manages() {
+        return forbidden();
+    }
+    let item = match find_item(&app.db, t.team.id, id).await {
+        Ok(Some(i)) => i,
+        Ok(None) => return not_found(),
+        Err(e) => return internal(e, "inbox item read"),
+    };
+    let account = match social_accounts::Entity::find_by_id(item.social_account_id)
+        .one(&app.db)
+        .await
+    {
+        Ok(Some(a)) => a,
+        Ok(None) => return not_found(),
+        Err(e) => return internal(e, "account read"),
+    };
+    if !app.moderate_limiter.hit(t.current.0.id) {
+        return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    }
+    match meta_inbox::moderate(&app, &account, &item, action).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return send_error(&e),
+        Err(e) => return internal(e, "inbox moderation"),
+    }
+    match find_item(&app.db, t.team.id, id).await {
+        Ok(Some(i)) => match item_json(&app.db, i, app.meta.human_agent).await {
+            Ok(i) => Json(i).into_response(),
             Err(e) => internal(e, "inbox item read"),
         },
         Ok(None) => not_found(),
@@ -1279,6 +1447,7 @@ pub fn api() -> OpenApiRouter<AppState> {
         .routes(routes!(show_item, change_item))
         .routes(routes!(conversation))
         .routes(routes!(send_reply))
+        .routes(routes!(moderate_item))
 }
 
 #[cfg(test)]
