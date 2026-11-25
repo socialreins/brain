@@ -240,6 +240,18 @@ pub async fn read(
     let mut found = Found::default();
     let t = &app.threads;
 
+    // A username can change and the loop guard finds our accounts by it, so it is read again on
+    // the hourly pass (a failed read keeps the old one).
+    if first || full {
+        let named = app.threads.me(&token).await.ok().and_then(|p| p.username);
+        if let Some(name) = named.filter(|n| Some(n) != account.handle.as_ref()) {
+            let stmt = sql(
+                "UPDATE social_accounts SET handle = $2 WHERE id = $1",
+                vec![account.id.into(), name.into()],
+            );
+            app.db.execute_raw(stmt).await?;
+        }
+    }
     if (first || full) && !denied(account, "replies_denied") {
         if let Err(e) = t.probe_replies(user, &token).await {
             if failed(app, account, "probe", &e).await? {

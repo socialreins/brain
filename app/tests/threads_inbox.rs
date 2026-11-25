@@ -915,6 +915,28 @@ async fn conditions_choose_the_post_the_words_and_the_first_reply_of_a_person() 
 
 #[tokio::test]
 #[serial]
+async fn a_renamed_account_is_found_again_by_its_new_username() {
+    let e = env().await;
+    e.mock
+        .nodes
+        .lock()
+        .unwrap()
+        .insert("me".into(), json!({"id": "1", "username": "us_renamed"}));
+    threads_inbox::tick(&e.state).await.unwrap();
+    let sql = format!(
+        "SELECT handle FROM social_accounts WHERE id = '{}'",
+        e.account
+    );
+    let r =
+        e.db.query_one_raw(Statement::from_string(DbBackend::Postgres, sql))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(r.try_get::<String>("", "handle").unwrap(), "us_renamed");
+}
+
+#[tokio::test]
+#[serial]
 async fn nothing_answers_our_own_accounts_or_another_teams() {
     let e = env().await;
     threads_inbox::tick(&e.state).await.unwrap();

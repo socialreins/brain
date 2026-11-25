@@ -886,7 +886,9 @@ whole), `hide_comment` (a reply directly under our post, else `threads_nested`),
 with the same reasons. The loop guard finds a Threads author by handle (Threads gives no author
 id): a reply from any connected Threads account, of the team or another, is `own_account` or
 `connected_account`. A mention whose post only its own author takes replies to is skipped
-`threads_replies_closed`. The pause switch, cool-down, daily caps and run log apply as everywhere.
+`threads_replies_closed`. "Test this automation" cannot judge two things a run can: whether a
+reply is nested (it assumes directly under the post) and a mention's reply control. The handle the
+loop guard matches is read again every hour. The pause switch, cool-down, daily caps and run log apply as everywhere.
 
 Webhooks: a team may set one public `https://` URL (at most 2000 characters, no credentials,
 not `localhost` or a private address). Each post target fires `post.target.published`,
