@@ -33,12 +33,13 @@ pub enum Status {
     Reconnect,
 }
 
-/// X, TikTok and YouTube renew an access token from the refresh token whenever it is used, so
-/// its short end date is normal. Every other token ends for good (Threads and LinkedIn are
+/// X, TikTok, YouTube and Pinterest renew an access token from the refresh token whenever it is
+/// used (Pinterest's also by a daily job, since its refresh token ends after 60 days unused), so
+/// its end date is normal. Every other token ends for good (Threads and LinkedIn are
 /// extended by a daily job well before the last week, so a token that near its end means that
 /// job failed).
 fn renews_on_use(provider: &str) -> bool {
-    matches!(provider, "x" | "tiktok" | "youtube")
+    matches!(provider, "x" | "tiktok" | "youtube" | "pinterest")
 }
 
 pub fn status(a: &social_accounts::Model, now: DateTime<Utc>) -> Status {
@@ -81,6 +82,7 @@ pub(crate) fn label(provider: &str) -> &str {
         "x" => "X",
         "tiktok" => "TikTok",
         "youtube" => "YouTube",
+        "pinterest" => "Pinterest",
         other => other,
     }
 }
@@ -113,7 +115,7 @@ pub async fn notify(app: &AppState) -> Result<u64, DbErr> {
             "SELECT * FROM social_accounts WHERE meta->>'reconnect' = 'true' \
              OR meta->>'expiry_notice' IS NOT NULL \
              OR (token_expires_at <= now() + make_interval(days => $1) \
-                 AND provider NOT IN ('x', 'tiktok', 'youtube'))",
+                 AND provider NOT IN ('x', 'tiktok', 'youtube', 'pinterest'))",
             [(WARN_DAYS as i32).into()],
         ))
         .all(&app.db)

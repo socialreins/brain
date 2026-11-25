@@ -40,7 +40,7 @@ use super::{
     waitlist::{error, Error},
 };
 use crate::{
-    connectors::{tiktok, youtube},
+    connectors::{pinterest, tiktok, youtube},
     media::Probed,
     metrics,
     models::{
@@ -93,6 +93,8 @@ pub struct Post {
     pub tiktok: Option<tiktok::Options>,
     /// YouTube settings of a YouTube post, when it has any; none (or no `privacy`) is private.
     pub youtube: Option<youtube::Options>,
+    /// Pinterest settings of a Pinterest post, when it has any.
+    pub pinterest: Option<pinterest::Options>,
     /// `draft`, `scheduled`, `queued`, `published`, `failed` or `deleted`.
     pub status: String,
     pub scheduled_at: Option<DateTime<FixedOffset>>,
@@ -315,6 +317,15 @@ pub struct PostInput {
     /// `youtube_not_supported`, another value `invalid_youtube_privacy`. Until Google audits the
     /// API project, YouTube keeps every upload private whatever is chosen.
     pub youtube: Option<youtube::Options>,
+    /// Pinterest's per-post settings: `board_id` (one of the account's boards, else its default
+    /// board), `title` (at most 100 characters) and `link` (an http or https address of at most
+    /// 2048). The post's `body` is the pin's description (at most 800 characters) and its first
+    /// image's alt text the pin's (at most 500, cut beyond). Other platforms answer
+    /// `pinterest_not_supported`; invalid settings answer `invalid_pinterest_board`,
+    /// `pinterest_title_too_long` or `invalid_pinterest_link`; a post with no board anywhere
+    /// (none named, and an account of the set without a default board) answers
+    /// `pinterest_board_required` with that `social_account_id`.
+    pub pinterest: Option<pinterest::Options>,
     /// When to publish. Set: `scheduled`; absent or `null`: `draft`.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
     /// `true` on a create: schedule the post at the earliest free slot of its set's queue
@@ -404,6 +415,8 @@ pub struct PostGroupInput {
     /// The YouTube post's settings, unless its override has some. Other platforms get none.
     /// Without them the video is private.
     pub youtube: Option<youtube::Options>,
+    /// The Pinterest post's settings, unless its override has some. Other platforms get none.
+    pub pinterest: Option<pinterest::Options>,
     /// As in `POST /posts`, for every post.
     pub scheduled_at: Option<DateTime<FixedOffset>>,
     /// As in `POST /posts`: the group takes one slot, every post its time.
@@ -534,6 +547,7 @@ pub struct Override {
     pub cover: Option<String>,
     pub tiktok: Option<tiktok::Options>,
     pub youtube: Option<youtube::Options>,
+    pub pinterest: Option<pinterest::Options>,
 }
 
 /// A failed target a retry left alone because it may already have posted.
@@ -664,6 +678,7 @@ fn post_json(
         cover: p.cover,
         tiktok: p.tiktok.and_then(|v| serde_json::from_value(v).ok()),
         youtube: p.youtube.and_then(|v| serde_json::from_value(v).ok()),
+        pinterest: p.pinterest.and_then(|v| serde_json::from_value(v).ok()),
         status: p.status,
         scheduled_at: p.scheduled_at,
         published_at: p.published_at,
@@ -885,6 +900,12 @@ fn rule_problems(input: &PostInput) -> Vec<Problem> {
         let privacy = input.youtube.as_ref().map(|y| y.privacy.as_deref());
         let youtube = post::validate_youtube(platform, privacy);
         found.extend(youtube.err().map(post::Problem::from));
+        let choice = input.pinterest.as_ref().map(|p| post::PinterestChoice {
+            board_id: p.board_id.as_deref(),
+            title: p.title.as_deref(),
+            link: p.link.as_deref(),
+        });
+        found.extend(post::check_pinterest(platform, choice));
     }
     let mut found: Vec<Problem> = found.into_iter().map(Problem::from).collect();
     // The visibility has no default: brain never posts at the most public level unasked. (Rows
@@ -927,6 +948,7 @@ struct Draft<'a> {
     thread: &'a [ThreadPart],
     cover: Option<&'a str>,
     tiktok: Option<&'a tiktok::Options>,
+    pinterest: Option<&'a pinterest::Options>,
 }
 
 impl<'a> From<&'a PostInput> for Draft<'a> {
@@ -938,6 +960,7 @@ impl<'a> From<&'a PostInput> for Draft<'a> {
             thread: &i.thread,
             cover: post::cover(i.cover.as_deref()),
             tiktok: i.tiktok.as_ref(),
+            pinterest: i.pinterest.as_ref(),
         }
     }
 }
@@ -1017,6 +1040,9 @@ async fn preflight(
     }
     if let Some(p) = x_short(app, a, set, &d, only).await? {
         return Ok(Some(refusal("x", &p)));
+    }
+    if let Some(p) = pinterest_board(app, a, set, &d, only).await? {
+        return Ok(Some(refusal("pinterest", &p)));
     }
     Ok(match tiktok_level(&d) {
         Some(level) => tiktok_offered(app, a, set, level, only)
@@ -1145,6 +1171,42 @@ async fn x_short(
     }))
 }
 
+/// The problem when a Pinterest post names no board and a Pinterest account of `set` (of `only`,
+/// when given) has no default board, naming the first such account. No call: the default is kept
+/// on the account.
+async fn pinterest_board(
+    app: &AppState,
+    a: &Actor,
+    set: Uuid,
+    d: &Draft<'_>,
+    only: Option<&[Uuid]>,
+) -> Result<Option<Problem>, DbErr> {
+    let named = d
+        .pinterest
+        .and_then(|p| p.board_id.as_deref())
+        .is_some_and(|b| !b.trim().is_empty());
+    if d.platform != "pinterest" || named {
+        return Ok(None);
+    }
+    let accounts = set_accounts(app, a, set, "pinterest", only).await?;
+    let missing = accounts
+        .iter()
+        .find(|acc| acc.meta["default_board_id"].as_str().is_none());
+    Ok(missing.map(|acc| {
+        let name = acc
+            .handle
+            .as_deref()
+            .map_or("the Pinterest account".into(), |h| format!("@{h}"));
+        Problem {
+            detail: Some(format!(
+                "Choose a board for this pin, or set a default board for {name} under Connections."
+            )),
+            social_account_id: Some(acc.id),
+            ..post::Problem::from(post::Invalid::PinterestBoardRequired).into()
+        }
+    }))
+}
+
 /// `checked`, then `preflight`: the full check of a post before a write.
 async fn checked_fully(
     app: &AppState,
@@ -1216,6 +1278,14 @@ fn stored_youtube(input: &PostInput) -> Option<serde_json::Value> {
         .youtube
         .as_ref()
         .and_then(|y| serde_json::to_value(y).ok())
+}
+
+/// The Pinterest settings as saved.
+fn stored_pinterest(input: &PostInput) -> Option<serde_json::Value> {
+    input
+        .pinterest
+        .as_ref()
+        .and_then(|p| serde_json::to_value(p).ok())
 }
 
 impl PostInput {
@@ -1608,6 +1678,10 @@ async fn examine(
             let d = Draft::from(&c.input);
             c.account = x_short(app, a, set, &d, only.as_deref()).await?;
         }
+        if c.account.is_none() && !has(c, "pinterest") {
+            let d = Draft::from(&c.input);
+            c.account = pinterest_board(app, a, set, &d, only.as_deref()).await?;
+        }
     }
     Ok(checks)
 }
@@ -1875,6 +1949,7 @@ fn stand_in(input: &PostInput) -> PostInput {
         cover: None,
         tiktok: None,
         youtube: None,
+        pinterest: None,
         scheduled_at: input.scheduled_at,
         queue: false,
         list_id: input.list_id,
@@ -1912,6 +1987,7 @@ async fn store(
         cover: Set(stored_cover(input)),
         tiktok: Set(stored_tiktok(input)),
         youtube: Set(stored_youtube(input)),
+        pinterest: Set(stored_pinterest(input)),
         account_ids: Set(stored_accounts(input)),
         status: Set(status_for(input).into()),
         scheduled_at: Set(when(input)),
@@ -2079,6 +2155,9 @@ pub(crate) async fn create_group_guarded(
                     youtube: o
                         .and_then(|o| o.youtube.clone())
                         .or_else(|| input.youtube.clone().filter(|_| platform == "youtube")),
+                    pinterest: o
+                        .and_then(|o| o.pinterest.clone())
+                        .or_else(|| input.pinterest.clone().filter(|_| platform == "pinterest")),
                     // A platform none of the chosen accounts is on goes to every account of it.
                     account_ids: chosen.as_ref().and_then(|c| {
                         let mine: Vec<Uuid> = c
@@ -2333,6 +2412,7 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, mut input: PostInp
             .col_expr(posts::Column::Cover, stored_cover(&input).into())
             .col_expr(posts::Column::Tiktok, stored_tiktok(&input).into())
             .col_expr(posts::Column::Youtube, stored_youtube(&input).into())
+            .col_expr(posts::Column::Pinterest, stored_pinterest(&input).into())
             .col_expr(
                 posts::Column::AccountIds,
                 kept.unwrap_or_else(|| stored_accounts(&input)).into(),
@@ -2772,6 +2852,10 @@ async fn preflight_saved(
         .tiktok
         .clone()
         .and_then(|v| serde_json::from_value(v).ok());
+    let pinterest: Option<pinterest::Options> = p
+        .pinterest
+        .clone()
+        .and_then(|v| serde_json::from_value(v).ok());
     let d = Draft {
         platform: &p.platform,
         body: &p.body,
@@ -2779,6 +2863,7 @@ async fn preflight_saved(
         thread: &thread,
         cover: p.cover.as_deref(),
         tiktok: tiktok.as_ref(),
+        pinterest: pinterest.as_ref(),
     };
     preflight(app, a, p.social_set_id, d, Some(&again)).await
 }

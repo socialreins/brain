@@ -45,6 +45,8 @@ pub struct Model {
     /// YouTube settings (`connectors::youtube::Options`); null for none (private).
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub youtube: Option<Json>,
+    /// Pinterest settings (`connectors::pinterest::Options`); null for none.
+    pub pinterest: Option<Json>,
     /// The targets were created (one per account of the platform in the set); a retry never
     /// adds more.
     pub fanned_out: bool,

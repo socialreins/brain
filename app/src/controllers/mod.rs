@@ -29,6 +29,7 @@ pub mod newsletters;
 pub mod oauth;
 pub mod pages;
 pub mod passkeys;
+pub mod pinterest;
 pub mod posts;
 pub mod queue;
 pub mod review_login;
@@ -107,6 +108,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(webhooks::api())
         .merge(connections::api())
         .merge(meta::api())
+        .merge(pinterest::api())
         .merge(tiktok::api())
         .merge(social_sets::api())
         .merge(queue::api())
@@ -203,6 +205,7 @@ pub fn router(state: AppState, config: &Config) -> Router {
         .merge(threads::routes())
         .merge(linkedin::routes())
         .merge(youtube::routes())
+        .merge(pinterest::routes())
         .merge(tiktok::routes())
         .merge(x::routes())
         .merge(meta::routes())
