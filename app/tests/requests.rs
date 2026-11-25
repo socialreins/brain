@@ -5696,16 +5696,31 @@ mod teams {
                 }
                 // Another team's number is as unknown as a missing one, for every route.
                 let (other, _, _) = owner_with_account(&s, &db).await;
-                for (method, path) in [
-                    (Method::GET, format!("/v1/posts/{n2}")),
-                    (Method::PUT, format!("/v1/posts/{n2}")),
-                    (Method::DELETE, format!("/v1/posts/{n2}")),
-                    (Method::POST, format!("/v1/posts/{n2}/publish")),
-                    (Method::GET, format!("/v1/posts/{n2}/page")),
+                let page = json!({"enabled": false, "details": ""});
+                let rule = json!({"every": "day", "interval": 1});
+                for (method, path, body) in [
+                    (Method::GET, format!("/v1/posts/{n2}"), json!({})),
+                    (
+                        Method::PUT,
+                        format!("/v1/posts/{n2}"),
+                        input(&set, "x", None),
+                    ),
+                    (Method::DELETE, format!("/v1/posts/{n2}"), json!({})),
+                    (Method::POST, format!("/v1/posts/{n2}/publish"), json!({})),
+                    (Method::GET, format!("/v1/posts/{n2}/page"), json!({})),
+                    (Method::PUT, format!("/v1/posts/{n2}/page"), page),
+                    (Method::POST, format!("/v1/posts/{n2}/retry"), json!({})),
+                    (Method::POST, format!("/v1/posts/{n2}/approve"), json!({})),
+                    (Method::POST, format!("/v1/posts/{n2}/reject"), json!({})),
+                    (Method::PUT, format!("/v1/posts/{n2}/repeat"), rule),
+                    (Method::DELETE, format!("/v1/posts/{n2}/repeat"), json!({})),
+                    (
+                        Method::POST,
+                        format!("/v1/posts/{n2}/metrics/refresh"),
+                        json!({}),
+                    ),
                 ] {
-                    let res = req(&s, method, &path, &other)
-                        .json(&input(&set, "x", None))
-                        .await;
+                    let res = req(&s, method, &path, &other).json(&body).await;
                     assert_eq!(res.status_code(), 404, "{path}: {}", res.text());
                 }
                 assert_eq!(get_post(&s, &cookie, &n2.to_string()).await["body"], "two");
@@ -30333,6 +30348,9 @@ mod teams {
                     assert_eq!(got, p);
                     // The post's number names it as well.
                     let (_, got) = call(&s, secret, "get-post", json!({"id": p["number"]})).await;
+                    assert_eq!(got, p);
+                    let as_text = json!({"id": p["number"].to_string()});
+                    let (_, got) = call(&s, secret, "get-post", as_text).await;
                     assert_eq!(got, p);
                     let (_, list) = call(&s, secret, "list-posts", json!({})).await;
                     let rest = bearer(&s, Method::GET, "/v1/posts", secret).await;

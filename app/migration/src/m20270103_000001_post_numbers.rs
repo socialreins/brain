@@ -7,7 +7,11 @@ pub struct Migration;
 // key stays the UUID and every foreign key stays as it is. Existing posts are numbered in
 // the order they were created (the id breaks ties; ids are time-ordered), then the counter
 // carries on after the largest. Identity "by default" lets a dump be restored with its numbers.
-const UP: &str = "ALTER TABLE posts ADD COLUMN number bigint;
+// `lock_timeout`: the ALTER waits for open transactions on `posts` (the old instance's publish
+// tick), and everything behind it waits for the ALTER; a timeout fails this boot instead, and
+// the old instance goes on serving.
+const UP: &str = "SET LOCAL lock_timeout = '10s';
+ALTER TABLE posts ADD COLUMN number bigint;
 UPDATE posts p SET number = n.n
   FROM (SELECT id, row_number() OVER (ORDER BY created_at, id) AS n FROM posts) n
   WHERE n.id = p.id;

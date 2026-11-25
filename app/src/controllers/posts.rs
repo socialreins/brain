@@ -79,28 +79,32 @@ impl FromRequestParts<AppState> for PostId {
 }
 
 /// A post named by its `id` (a UUID string) or its `number` (an integer), as the MCP tools take it.
-#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[derive(Clone, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum PostRef {
     Id(Uuid),
     Number(i64),
+    /// A number sent as text, which some MCP clients do.
+    Text(String),
 }
 
 impl PostRef {
     /// The post's id; the nil UUID for a number that names no post (the caller's team check
     /// then answers `404`).
     pub async fn resolve(self, db: &impl ConnectionTrait) -> Result<Uuid, DbErr> {
-        match self {
-            Self::Id(id) => Ok(id),
-            Self::Number(n) => Ok(posts::Entity::find()
-                .select_only()
-                .column(posts::Column::Id)
-                .filter(posts::Column::Number.eq(n))
-                .into_tuple::<Uuid>()
-                .one(db)
-                .await?
-                .unwrap_or_default()),
-        }
+        let n = match self {
+            Self::Id(id) => return Ok(id),
+            Self::Number(n) => n,
+            Self::Text(t) => t.trim().parse().unwrap_or(0),
+        };
+        Ok(posts::Entity::find()
+            .select_only()
+            .column(posts::Column::Id)
+            .filter(posts::Column::Number.eq(n))
+            .into_tuple::<Uuid>()
+            .one(db)
+            .await?
+            .unwrap_or_default())
     }
 }
 
