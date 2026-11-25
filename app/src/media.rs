@@ -10,7 +10,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use tokio::time::Instant;
 
 use object_store::{
-    path::Path, MultipartUpload, ObjectStore, PutPayload, PutResult, UploadPart, WriteMultipart,
+    path::Path, MultipartUpload, ObjectStore, ObjectStoreExt, PutPayload, PutResult, UploadPart,
+    WriteMultipart,
 };
 use reqwest::{header::CONTENT_TYPE, StatusCode, Url};
 use sea_orm::{
@@ -94,7 +95,12 @@ impl MultipartUpload for Upload {
         // Never held here: `abort` and `complete` run only once no part is being added.
         match self.0.try_lock() {
             Ok(mut upload) => upload.put_part(data),
-            Err(_) => Box::pin(async { Err(object_store::Error::NotImplemented) }),
+            Err(_) => Box::pin(async {
+                Err(object_store::Error::NotImplemented {
+                    operation: "put_part".into(),
+                    implementer: "media::Upload".into(),
+                })
+            }),
         }
     }
 
@@ -2137,8 +2143,8 @@ mod tests {
 
     use futures_util::{stream, StreamExt};
     use object_store::{
-        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
-        PutOptions, PutPayload, PutResult, UploadPart,
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart,
     };
 
     const MP4_HEAD: &[u8] = b"\0\0\0\x18ftypmp42\0\0\0\0";
@@ -2256,7 +2262,10 @@ mod tests {
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 if failing {
-                    return Err(object_store::Error::NotImplemented);
+                    return Err(object_store::Error::NotImplemented {
+                        operation: "put_part".into(),
+                        implementer: "Counting".into(),
+                    });
                 }
                 part.await?;
                 done.fetch_add(len, SeqCst);
@@ -2309,8 +2318,11 @@ mod tests {
             self.inner.get_opts(location, options).await
         }
 
-        async fn delete(&self, location: &Path) -> object_store::Result<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
         }
 
         fn list(
@@ -2327,12 +2339,13 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
-        }
-
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
         }
     }
 

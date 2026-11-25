@@ -13,6 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use object_store::ObjectStoreExt;
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement, TransactionTrait};
 use serde::Serialize;
 use utoipa::ToSchema;

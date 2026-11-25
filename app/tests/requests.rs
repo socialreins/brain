@@ -1,5 +1,6 @@
 //! Request tests against a real Postgres at `DATABASE_URL` (see README).
 use axum_test::TestServer;
+use object_store::ObjectStoreExt as _;
 use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
 use serde_json::{json, Value};
 use serial_test::serial;

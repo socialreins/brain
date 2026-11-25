@@ -1609,7 +1609,7 @@ mod tests {
         let file = [ftyp, &mdat, tail].concat();
         let store = Arc::new(object_store::memory::InMemory::new());
         let path = object_store::path::Path::from("posts/p/v");
-        object_store::ObjectStore::put(&*store, &path, file.clone().into())
+        object_store::ObjectStoreExt::put(&*store, &path, file.clone().into())
             .await
             .unwrap();
         let stored = Blob::Stored {

@@ -748,7 +748,7 @@ mod tests {
         YouTube,
         std::sync::Arc<std::sync::Mutex<Session>>,
     ) {
-        use object_store::ObjectStore;
+        use object_store::ObjectStoreExt;
         let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
         let store = std::sync::Arc::new(object_store::memory::InMemory::new());
         let path = object_store::path::Path::from("posts/p/v");
