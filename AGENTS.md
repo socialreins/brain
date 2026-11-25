@@ -251,7 +251,8 @@ cargo run -p socialreins-brain
   `usage_capped`. A failed round waits for the next interval, five in a row pause it. Never add
   a retry. With `BILLING_ENABLED` the team's `x` credits pay too (1 per reply, DM or action, 1 per
   `READS_PER_CREDIT` items read). The inbox scopes (`dm.read dm.write like.write
-  tweet.moderate.write`) are asked at connect but not required; `meta.scope` keeps what was
+  tweet.moderate.write`) are asked only by `GET /connections/x/redirect?inbox=1` (the X app must allow
+  Direct message, so the plain connect cannot break) and never required; `meta.scope` keeps what was
   granted (`Granted`), so older accounts keep publishing and are told to reconnect for DMs.
 - `app/src/webhooks.rs`: outbound webhooks. Every `post_targets` status change goes through
   `webhooks::with_event`, so its event is queued in the same statement; README documents the

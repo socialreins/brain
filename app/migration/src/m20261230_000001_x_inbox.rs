@@ -21,6 +21,7 @@ const UP: &str = "CREATE TABLE x_inbox (
   units_owed integer NOT NULL DEFAULT 0,
   mentions_since_id text,
   dm_since_id text,
+  dm_probe text,
   next_poll_at timestamptz NOT NULL DEFAULT now(),
   paused_reason text,
   last_read_at timestamptz,

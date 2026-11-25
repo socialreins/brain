@@ -55,14 +55,26 @@ fn unseal_str(app: &AppState, sealed: &str) -> Option<String> {
     String::from_utf8(app.cipher.decrypt(&bytes)?).ok()
 }
 
-/// `GET /connections/x/redirect`: owners and admins of the current team only.
-async fn start(State(app): State<AppState>, t: Result<InTeam, Reply>) -> Response {
+#[derive(serde::Deserialize)]
+struct Start {
+    /// `1`: also ask for the inbox's DM, like and hide permissions.
+    inbox: Option<String>,
+}
+
+/// `GET /connections/x/redirect`: owners and admins of the current team only. `?inbox=1` also
+/// asks for the inbox permissions, which the X app must allow (see `INBOX_SCOPES`).
+async fn start(
+    State(app): State<AppState>,
+    Query(q): Query<Start>,
+    t: Result<InTeam, Reply>,
+) -> Response {
     let how = (PROVIDER, app.x.configured());
     let verifier = token::new();
     let challenge = pkce_challenge(&verifier);
     let sealed = seal(&app, &verifier);
+    let inbox = q.inbox.as_deref() == Some("1");
     oauth::start_with(&app, t, how, &sealed, |uri, state| {
-        app.x.authorize_url(uri, state, &challenge)
+        app.x.authorize_url(uri, state, &challenge, inbox)
     })
     .await
 }

@@ -54,16 +54,14 @@ pub const MAX_BUDGET_MICROS: i64 = 100_000_000;
 /// $0.06 with their users, and a user is billed once a day).
 pub const READS_PER_CREDIT: i32 = 3;
 /// A first read (or one after a long pause) goes back at most this far, and takes at most
-/// `FIRST_ITEMS`.
+/// `FIRST_ITEMS`. DMs are asked for `DM_PAGE` at a time (each costs a DM event and its sender).
 const FIRST_DAYS: i64 = 7;
 const FIRST_ITEMS: u32 = 20;
+const DM_PAGE: i64 = 10;
 /// Pages one read of one kind may take.
 const MAX_PAGES: usize = 3;
 /// Failed rounds in a row that pause the account.
 const MAX_ERRORS: i32 = 5;
-/// What one call asking for the smallest page (5 posts and their authors) may cost: below this
-/// left of the budget, polling stops.
-const MIN_CALL_MICROS: i64 = 5 * (POST_READ_MICROS + USER_READ_MICROS);
 /// Accounts read at once across the process.
 static SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
 
@@ -78,6 +76,8 @@ pub struct Settings {
     pub units_owed: i32,
     pub mentions_since_id: Option<String>,
     pub dm_since_id: Option<String>,
+    /// `<newest DM event id>:<UTC day>` of the last probe that was paid for.
+    pub dm_probe: Option<String>,
     pub next_poll_at: DateTime<Utc>,
     pub paused_reason: Option<String>,
     pub last_read_at: Option<DateTime<Utc>>,
@@ -97,6 +97,7 @@ impl Settings {
             units_owed: 0,
             mentions_since_id: None,
             dm_since_id: None,
+            dm_probe: None,
             next_poll_at: Utc::now(),
             paused_reason: None,
             last_read_at: None,
@@ -115,6 +116,7 @@ impl Settings {
             units_owed: r.try_get("", "units_owed")?,
             mentions_since_id: r.try_get("", "mentions_since_id")?,
             dm_since_id: r.try_get("", "dm_since_id")?,
+            dm_probe: r.try_get("", "dm_probe")?,
             next_poll_at: r.try_get("", "next_poll_at")?,
             paused_reason: r.try_get("", "paused_reason")?,
             last_read_at: r.try_get("", "last_read_at")?,
@@ -136,7 +138,7 @@ pub async fn load(db: &impl ConnectionTrait, account: Uuid) -> Result<Option<Set
             "SELECT enabled, read_dms, poll_minutes, budget_micros, \
              CASE WHEN period < (date_trunc('month', now() AT TIME ZONE 'UTC'))::date \
                   THEN 0 ELSE spent_micros END AS spent_micros, \
-             units_owed, mentions_since_id, dm_since_id, next_poll_at, \
+             units_owed, mentions_since_id, dm_since_id, dm_probe, next_poll_at, \
              CASE WHEN paused_reason = 'budget' AND period < \
                   (date_trunc('month', now() AT TIME ZONE 'UTC'))::date \
                   THEN NULL ELSE paused_reason END AS paused_reason, \
@@ -338,26 +340,51 @@ impl From<DbErr> for Stop {
 struct Round {
     cost: i64,
     reads: i32,
+    /// Where the next round starts, set only once a kind was read to its end.
     mentions_cursor: Option<String>,
     dm_cursor: Option<String>,
+    /// Today's DM probe, once paid for (`x_inbox.dm_probe`).
+    probe: Option<String>,
     fresh: Vec<inbox_items::Model>,
 }
 
 impl Round {
-    /// Counts a call's cost; the room it leaves.
+    /// Counts a call's cost.
     fn pay(&mut self, micros: i64, reads: usize) {
         self.cost += micros;
         self.reads += reads as i32;
     }
 
-    fn room(&self, s: &Settings) -> Result<i64, Stop> {
+    /// The budget left, or `Budget` when it cannot cover `least` (what the call asked for can
+    /// cost at most).
+    fn room(&self, s: &Settings, least: i64) -> Result<i64, Stop> {
         let left = s.budget_micros - s.spent_micros - self.cost;
-        if left < MIN_CALL_MICROS {
+        if left < least {
             Err(Stop::Budget)
         } else {
             Ok(left)
         }
     }
+}
+
+/// Stores `found` (newest first, as X sends them) oldest first, leaving out the account's own.
+async fn keep<T>(
+    app: &AppState,
+    account: &social_accounts::Model,
+    round: &mut Round,
+    found: &[T],
+    of: impl Fn(&T) -> (&str, Fresh),
+) -> Result<(), DbErr> {
+    for t in found.iter().rev() {
+        let (author, fresh) = of(t);
+        if author == account.external_id {
+            continue;
+        }
+        round
+            .fresh
+            .extend(inbox::store(&app.db, account, fresh).await?);
+    }
+    Ok(())
 }
 
 async fn read_mentions(
@@ -371,15 +398,18 @@ async fn read_mentions(
     let start = since
         .is_none()
         .then(|| Utc::now() - Duration::days(FIRST_DAYS));
-    let (mut page, mut pages, mut found): (Option<String>, usize, Vec<Mention>) =
-        (None, 0, Vec::new());
+    let per = POST_READ_MICROS + USER_READ_MICROS;
+    let (mut page, mut pages, mut newest): (Option<String>, usize, Option<String>) =
+        (None, 0, None);
     loop {
-        let left = round.room(s)?;
-        let max = if since.is_none() {
-            FIRST_ITEMS
+        // X takes pages of 5 at least: that is the least the call can cost.
+        let left = round.room(s, 5 * per)?;
+        let most = if since.is_none() {
+            FIRST_ITEMS.into()
         } else {
-            ((left / (POST_READ_MICROS + USER_READ_MICROS)).clamp(5, 50)) as u32
+            50
         };
+        let max = (left / per).clamp(5, most) as u32;
         let r: Mentions = app
             .x
             .mentions(
@@ -392,25 +422,24 @@ async fn read_mentions(
             .await?;
         round.pay(r.cost_micros(), r.posts);
         if pages == 0 {
-            round.mentions_cursor = r.newest_id.clone();
+            newest = r.newest_id.clone();
         }
         pages += 1;
-        let more = r.next_token.clone();
-        found.extend(r.items);
-        // A first read is one page; a later one follows older pages while the budget allows.
-        match more {
+        // Stored before the next call, so a failure later keeps what was already paid for.
+        keep(app, account, round, &r.items, |m| {
+            (&m.author.id, mention_fresh(account, m))
+        })
+        .await?;
+        // A first read is one page; a later one follows older pages while it may.
+        match r.next_token {
             Some(t) if since.is_some() && pages < MAX_PAGES => page = Some(t),
             _ => break,
         }
     }
-    // Oldest first, so automations see them in the order they came.
-    for m in found.iter().rev() {
-        if m.author.id == account.external_id {
-            continue;
-        }
-        let item = inbox::store(&app.db, account, mention_fresh(account, m)).await?;
-        round.fresh.extend(item);
-    }
+    // shortcut: a backlog of more than MAX_PAGES pages loses its oldest posts; raise it if that
+    // ever matters. A failure above leaves the cursor, so the next round reads the same range
+    // again, and storing a post twice adds nothing.
+    round.mentions_cursor = newest;
     Ok(())
 }
 
@@ -422,48 +451,47 @@ async fn read_dms(
     round: &mut Round,
 ) -> Result<(), Stop> {
     let seen = s.dm_since_id.as_deref();
-    round.room(s)?;
+    let per = DM_READ_MICROS + USER_READ_MICROS;
+    round.room(s, per)?;
     // X has no `since_id` for DMs: ask for the newest event, and for more only if it is new.
     let probe = app.x.dm_events(token, 1, None).await?;
-    round.pay(probe.cost_micros(), probe.events);
     let Some(top) = probe.items.first().map(|e| e.id.clone()) else {
+        round.pay(probe.cost_micros(), probe.events);
         return Ok(());
     };
+    // X bills a resource once a UTC day however often it comes back, so the same newest event
+    // seen again today costs nothing more: an idle account's probe is paid once a day.
+    let key = format!("{top}:{}", Utc::now().date_naive());
+    if s.dm_probe.as_deref() != Some(key.as_str()) {
+        round.pay(probe.cost_micros(), probe.events);
+        round.probe = Some(key);
+    }
     if seen.is_some_and(|s| !newer(&top, s)) {
         return Ok(());
     }
-    round.dm_cursor = Some(top);
     let floor = (Utc::now() - Duration::days(FIRST_DAYS)).fixed_offset();
-    let (mut page, mut pages, mut found): (Option<String>, usize, Vec<DmEvent>) =
-        (None, 0, Vec::new());
-    'pages: loop {
-        let left = round.room(s)?;
-        let max = if seen.is_none() {
-            FIRST_ITEMS
+    let (mut page, mut pages): (Option<String>, usize) = (None, 0);
+    loop {
+        let left = round.room(s, per)?;
+        let most = if seen.is_none() {
+            FIRST_ITEMS.into()
         } else {
-            ((left / (DM_READ_MICROS + USER_READ_MICROS)).clamp(5, 50)) as u32
+            DM_PAGE
         };
+        let max = (left / per).clamp(1, most) as u32;
         let r = app.x.dm_events(token, max, page.as_deref()).await?;
         round.pay(r.cost_micros(), r.events);
-        for e in r.items {
-            if seen.is_some_and(|s| !newer(&e.id, s)) || e.at < floor {
-                break 'pages;
-            }
-            found.push(e);
-        }
+        let old = |e: &DmEvent| seen.is_some_and(|s| !newer(&e.id, s)) || e.at < floor;
+        let ends = r.items.iter().any(old);
+        let fresh: Vec<DmEvent> = r.items.iter().take_while(|e| !old(e)).cloned().collect();
+        keep(app, account, round, &fresh, |e| (&e.sender.id, dm_fresh(e))).await?;
         pages += 1;
         match r.next_token {
-            Some(t) if seen.is_some() && pages < MAX_PAGES => page = Some(t),
+            Some(t) if !ends && seen.is_some() && pages < MAX_PAGES => page = Some(t),
             _ => break,
         }
     }
-    for e in found.iter().rev() {
-        if e.sender.id == account.external_id {
-            continue;
-        }
-        let item = inbox::store(&app.db, account, dm_fresh(e)).await?;
-        round.fresh.extend(item);
-    }
+    round.dm_cursor = Some(top);
     Ok(())
 }
 
@@ -537,23 +565,22 @@ async fn poll(app: &AppState, id: Uuid) -> Result<(), DbErr> {
     // carried. A team that cannot pay is noted and not read again until it can (the check above).
     let mut owed = s.units_owed + round.reads;
     if app.billing_enabled && owed >= READS_PER_CREDIT {
-        let reference = format!("xread:{id}:{}", Uuid::now_v7());
-        let credits = i64::from(owed / READS_PER_CREDIT);
+        let due = i64::from(owed / READS_PER_CREDIT);
         let kind = billing::Kind::X;
-        match billing::spend(
-            db,
-            account.team_id,
-            kind,
-            credits,
-            "x inbox read",
-            Some(&reference),
-        )
-        .await?
-        {
-            billing::Spent::Short(_) => {
-                note(db, id, "The team has no X credits. Add some to read X.").await?;
+        // Pays what the team has; what it cannot pay stays owed, and the check above keeps
+        // reads from going on for free once it has none.
+        let take = due.min(billing::balance(db, account.team_id, kind).await?);
+        if take > 0 {
+            let reference = format!("xread:{id}:{}", Uuid::now_v7());
+            let reason = "x inbox read";
+            if let billing::Spent::Taken | billing::Spent::Repeated =
+                billing::spend(db, account.team_id, kind, take, reason, Some(&reference)).await?
+            {
+                owed -= take as i32 * READS_PER_CREDIT;
             }
-            _ => owed %= READS_PER_CREDIT,
+        }
+        if take < due {
+            note(db, id, "The team has no X credits. Add some to read X.").await?;
         }
     }
     let owed = if app.billing_enabled { owed } else { 0 };
@@ -564,6 +591,7 @@ async fn poll(app: &AppState, id: Uuid) -> Result<(), DbErr> {
          period = (date_trunc('month', now() AT TIME ZONE 'UTC'))::date, \
          mentions_since_id = COALESCE($3, mentions_since_id), \
          dm_since_id = COALESCE($4, dm_since_id), units_owed = $5, \
+         dm_probe = COALESCE($7, dm_probe), \
          last_read_at = now(), updated_at = now(), \
          errors = CASE WHEN $6 THEN 0 ELSE errors END, \
          last_error = CASE WHEN $6 THEN NULL ELSE last_error END, \
@@ -576,16 +604,21 @@ async fn poll(app: &AppState, id: Uuid) -> Result<(), DbErr> {
             round.dm_cursor.clone().into(),
             owed.into(),
             ok.into(),
+            round.probe.clone().into(),
         ],
     ))
     .await?;
+    if ok && s.read_dms && !granted.dms {
+        note(db, id, "Reconnect the account to read its DMs.").await?;
+    }
     match stop {
         None => {}
         Some(Stop::Db(e)) => return Err(e),
         Some(Stop::Budget) => pause(db, id, "budget", None).await?,
         Some(Stop::Api(e)) => on_error(app, &account, e).await?,
     }
-    // The lock-free sweep of `automations` picks these up again if this is cut short.
+    // Oldest first. The sweep of `automations` picks these up again if this is cut short.
+    round.fresh.sort_by_key(|i| i.received_at);
     for item in &round.fresh {
         if let Err(e) = automations::run(app, &account, item).await {
             tracing::error!(error = %e, item = %item.id, "x automations failed");
@@ -604,7 +637,9 @@ async fn on_error(
     match e {
         ApiError::Credits => pause(db, id, "credits", Some(&said)).await,
         ApiError::UsageCap => pause(db, id, "usage_capped", Some(&said)).await,
-        ApiError::Reconnect | ApiError::Scope => {
+        // Only a dead token marks the account: that also stops its publishing. A refusal that
+        // merely names a permission (`Scope`) is an error like the rest.
+        ApiError::Reconnect => {
             crate::expiry::flag_reconnect(db, id).await;
             note(db, id, &said).await
         }
@@ -618,7 +653,11 @@ async fn on_error(
             .await
             .map(|_| ())
         }
-        ApiError::NotAllowed(_) | ApiError::Refused(_) | ApiError::Unreachable => {
+        ApiError::Scope
+        | ApiError::NotAllowed(_)
+        | ApiError::Refused(_)
+        | ApiError::Maybe(_)
+        | ApiError::Unreachable => {
             tracing::warn!(account = %id, why = %said, "x inbox read failed");
             let n = db
                 .query_one_raw(sql(
@@ -710,6 +749,12 @@ async fn give_back(app: &AppState, team: Uuid, held: Option<String>) {
     }
 }
 
+/// X said no, so nothing went out. A 5xx, an answer with no id or no answer at all may have
+/// done it, and keeps its credit.
+fn clearly_refused(e: &ApiError) -> bool {
+    !matches!(e, ApiError::Unreachable | ApiError::Maybe(_))
+}
+
 /// X's refusal as the inbox words it.
 fn refused(e: ApiError, via: Via) -> InboxError {
     match e {
@@ -761,7 +806,7 @@ pub async fn send(
     match sent {
         Ok(id) => Ok(id),
         Err(e) => {
-            if e != ApiError::Unreachable {
+            if clearly_refused(&e) {
                 give_back(app, account.team_id, held).await;
             }
             Err(refused(e, via))
@@ -824,7 +869,7 @@ pub async fn act(
     match done {
         Ok(()) => Ok(()),
         Err(e) => {
-            if e != ApiError::Unreachable {
+            if clearly_refused(&e) {
                 give_back(app, account.team_id, held).await;
             }
             Err(refused(e, Via::Public))

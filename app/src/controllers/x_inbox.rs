@@ -9,7 +9,9 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Statement, TransactionTrait,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -273,13 +275,13 @@ async fn resume(
 }
 
 /// Likes, reposts, hides or shows again the post of an X comment or mention, once (X is not
-/// asked twice). `204`. Every member; shares the reply rate limit. `422` with `error` and
+/// asked twice). `204`. Every member; shares the reply rate limit; `409 action_in_progress` while another action on the item is going out. `422` with `error` and
 /// `message` when X refuses (`x_reconnect_required` for an account connected without the
 /// permission, `x_failed`, `rate_limited`, `not_repliable` for an item the action does not fit).
 #[utoipa::path(post, path = "/inbox-items/{id}/x-action", tag = "inbox", request_body = ActionInput,
     security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path)),
     responses((status = 204), (status = 401, body = Error), (status = 404, body = Error),
-        (status = 422, body = Error), (status = 429, body = Error)))]
+        (status = 409, body = Error), (status = 422, body = Error), (status = 429, body = Error)))]
 async fn act(
     _: FromWeb,
     State(app): State<AppState>,
@@ -310,7 +312,29 @@ async fn act(
     if !app.post_limiter.hit(t.current.0.id) {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
-    match x_inbox::act(&app, &account, &item, action).await {
+    // One action per item at a time, so a double click cannot take two credits: the lock lives in
+    // this transaction, held across the call.
+    let guard = async {
+        let txn = app.db.begin().await?;
+        let stmt = Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 2)) AS ok",
+            [item.id.to_string().into()],
+        );
+        let ok: bool = match txn.query_one_raw(stmt).await? {
+            Some(r) => r.try_get("", "ok")?,
+            None => false,
+        };
+        Ok::<_, sea_orm::DbErr>(ok.then_some(txn))
+    };
+    let guard = match guard.await {
+        Ok(Some(txn)) => txn,
+        Ok(None) => return reply(StatusCode::CONFLICT, "action_in_progress"),
+        Err(e) => return internal(e, "x action lock"),
+    };
+    let done = x_inbox::act(&app, &account, &item, action).await;
+    let _ = guard.commit().await;
+    match done {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             let status = match e {

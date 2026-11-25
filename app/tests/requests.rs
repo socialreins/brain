@@ -16567,8 +16567,8 @@ mod teams {
                     Arc, Mutex,
                 };
 
-                const ALL_SCOPES: &str = "tweet.read tweet.write users.read offline.access \
-                    media.write dm.read dm.write like.write tweet.moderate.write";
+                const ALL_SCOPES: &str =
+                    "tweet.read tweet.write users.read offline.access media.write";
                 /// 2026-11-04 12:30:00 UTC, as `x-rate-limit-reset`.
                 const RESET: &str = "1793795400";
 

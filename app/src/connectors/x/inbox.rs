@@ -35,6 +35,8 @@ pub enum ApiError {
     Scope,
     /// Any other refusal, with X's reason.
     Refused(String),
+    /// X may have done it: a 5xx, or an answer with no id. Never given back, never retried.
+    Maybe(String),
     /// X could not be reached.
     Unreachable,
 }
@@ -51,7 +53,7 @@ impl ApiError {
                 at.format("%Y-%m-%d %H:%M")
             ),
             Self::RateLimited(None) => "X rate limit reached.".into(),
-            Self::NotAllowed(why) | Self::Refused(why) => why.clone(),
+            Self::NotAllowed(why) | Self::Refused(why) | Self::Maybe(why) => why.clone(),
             Self::Scope => {
                 "The X account was connected without the permission this needs. Connect it again."
                     .into()
@@ -119,7 +121,9 @@ fn classify(status: StatusCode, headers: &HeaderMap, body: &Value) -> ApiError {
         if said.contains("scope") || said.contains("unsupported authentication") {
             return ApiError::Scope;
         }
-        return ApiError::NotAllowed(reason(body, status));
+    }
+    if status.is_server_error() {
+        return ApiError::Maybe(format!("X had an error ({}).", status.as_u16()));
     }
     ApiError::Refused(reason(body, status))
 }
@@ -420,7 +424,7 @@ impl X {
             .json(&json!({"text": text}));
         let body = self.read(req, "Message").await?;
         id(&body["data"]["dm_event_id"])
-            .ok_or_else(|| ApiError::Refused("X sent no message id.".into()))
+            .ok_or_else(|| ApiError::Maybe("X sent no message id.".into()))
     }
 
     /// A public reply to `to` (`tweet.write`); the new post's id.
@@ -431,7 +435,7 @@ impl X {
         let body = json!({"text": text, "reply": {"in_reply_to_tweet_id": to}});
         let req = self.api(Method::POST, "/2/tweets", token).json(&body);
         let answer = self.read(req, "Reply").await?;
-        id(&answer["data"]["id"]).ok_or_else(|| ApiError::Refused("X sent no post id.".into()))
+        id(&answer["data"]["id"]).ok_or_else(|| ApiError::Maybe("X sent no post id.".into()))
     }
 
     /// Likes (`like.write`) or reposts (`tweet.write`) post `tweet` as user `me`.
@@ -571,10 +575,17 @@ mod tests {
         );
         let scope = json!({"title": "Forbidden", "detail": "Missing required scope dm.read"});
         assert_eq!(c(403, &scope, &headers(None)), ApiError::Scope);
+        assert!(matches!(c(500, &none, &headers(None)), ApiError::Maybe(_)));
         assert!(matches!(
-            c(500, &none, &headers(None)),
+            c(400, &none, &headers(None)),
             ApiError::Refused(_)
         ));
+        // A 403 about something else than a DM is X's own reason, not "the recipient said no".
+        let dup = json!({"detail": "Duplicate content."});
+        assert_eq!(
+            c(403, &dup, &headers(None)),
+            ApiError::Refused("Duplicate content.".into())
+        );
         assert!(ApiError::Credits.message().contains("credits"));
     }
 }

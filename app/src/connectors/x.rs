@@ -19,9 +19,11 @@ const AUTH_URL: &str = "https://x.com/i/oauth2/authorize";
 const API_URL: &str = "https://api.x.com";
 /// `media.write` is what the v2 media upload endpoints need.
 const SCOPES: &str = "tweet.read tweet.write users.read offline.access media.write";
-/// Asked for too, for the inbox: read and send DMs, like, and hide replies. Publishing needs
-/// none of them, so a person who unticks them still connects, and an account connected before
-/// they existed keeps working; its inbox shows "reconnect" for what needs them (`Granted`).
+/// Asked for too when connecting for the inbox (`?inbox=1`): read and send DMs, like, and hide
+/// replies. They need the X app set to "Read, write and Direct message", so the plain connect
+/// leaves them out and cannot break. Publishing needs none of them, so a person who unticks them
+/// still connects, and an account connected without them keeps working; its inbox shows
+/// "reconnect" for what needs them (`Granted`).
 pub const INBOX_SCOPES: &str = "dm.read dm.write like.write tweet.moderate.write";
 /// Used when X leaves `expires_in` out.
 const DEFAULT_EXPIRES_IN: i64 = 7200;
@@ -266,13 +268,21 @@ impl X {
         redirect_uri: &str,
         state: &str,
         challenge: &str,
+        inbox: bool,
     ) -> Option<String> {
         let (id, _) = self.app.as_ref()?;
         let params = [
             ("response_type", "code"),
             ("client_id", id.as_str()),
             ("redirect_uri", redirect_uri),
-            ("scope", &format!("{SCOPES} {INBOX_SCOPES}")),
+            (
+                "scope",
+                &*if inbox {
+                    format!("{SCOPES} {INBOX_SCOPES}")
+                } else {
+                    SCOPES.to_owned()
+                },
+            ),
             ("state", state),
             ("code_challenge", challenge),
             ("code_challenge_method", "S256"),
@@ -560,7 +570,12 @@ mod tests {
     fn the_authorize_url_carries_pkce_the_scopes_and_state() {
         let x = X::new(Some(("app".into(), "secret".into()))).unwrap();
         let url = x
-            .authorize_url("https://api.example/connect/x/callback", "st", "chal")
+            .authorize_url(
+                "https://api.example/connect/x/callback",
+                "st",
+                "chal",
+                false,
+            )
             .unwrap();
         let parsed = Url::parse(&url).unwrap();
         let q: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
@@ -571,15 +586,28 @@ mod tests {
         assert_eq!(q["state"], "st");
         assert_eq!(q["code_challenge"], "chal");
         assert_eq!(q["code_challenge_method"], "S256");
+        // Publishing alone is asked with the permissions the app has always asked for.
         assert_eq!(
             q["scope"],
+            "tweet.read tweet.write users.read offline.access media.write"
+        );
+        let with = x
+            .authorize_url("https://api.example/connect/x/callback", "st", "chal", true)
+            .unwrap();
+        let with: std::collections::HashMap<_, _> = Url::parse(&with)
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+        assert_eq!(
+            with["scope"],
             "tweet.read tweet.write users.read offline.access media.write dm.read dm.write \
              like.write tweet.moderate.write"
         );
         assert!(!url.contains("secret"));
         assert!(X::new(None)
             .unwrap()
-            .authorize_url("https://x", "st", "c")
+            .authorize_url("https://x", "st", "c", false)
             .is_none());
     }
 

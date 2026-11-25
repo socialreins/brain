@@ -31,12 +31,15 @@ const WEB: &str = "http://localhost:3000";
 const ALL: &str = "tweet.read tweet.write users.read offline.access media.write dm.read dm.write like.write tweet.moderate.write";
 const OLD: &str = "tweet.read tweet.write users.read offline.access media.write";
 
-/// 0 works, 1 out of credits, 2 usage cap, 3 refuses DMs and posts (not allowed), 4 a failure.
+/// 0 works, 1 out of credits, 2 usage cap, 3 refuses DMs and posts (not allowed), 4 a failure,
+/// 6 a server error on every write, 7 a 403 about a missing scope on reads.
 #[derive(Default)]
 struct Mock {
     mode: AtomicU8,
     /// (method, path, query, body)
     calls: Mutex<Vec<(String, String, String, Value)>>,
+    /// Mentions come in two pages: the second (a `pagination_token`) is refused with a 429.
+    paged: std::sync::atomic::AtomicBool,
     mentions: Mutex<Value>,
     dms: Mutex<Value>,
 }
@@ -76,6 +79,11 @@ async fn handler(State(m): State<Arc<Mock>>, method: Method, uri: Uri, body: Byt
                 "detail": "This person does not accept your messages."});
             return (StatusCode::FORBIDDEN, Json(b)).into_response();
         }
+        6 if method != Method::GET => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        7 if method == Method::GET => {
+            let b = json!({"title": "Forbidden", "detail": "Missing required scope tweet.read"});
+            return (StatusCode::FORBIDDEN, Json(b)).into_response();
+        }
         3 | 4 if method != Method::GET => {
             let b = json!({"detail": "Nope."});
             return (StatusCode::FORBIDDEN, Json(b)).into_response();
@@ -83,6 +91,14 @@ async fn handler(State(m): State<Arc<Mock>>, method: Method, uri: Uri, body: Byt
         _ => {}
     }
     match (method.as_str(), path.as_str()) {
+        ("GET", "/2/users/1/mentions") if m.paged.load(Ordering::SeqCst) => {
+            if query.contains("pagination_token") {
+                return StatusCode::TOO_MANY_REQUESTS.into_response();
+            }
+            let mut page = m.mentions.lock().unwrap().clone();
+            page["meta"]["next_token"] = json!("n2");
+            Json(page).into_response()
+        }
         ("GET", "/2/users/1/mentions") if query.contains("since_id") => {
             Json(json!({"meta": {"result_count": 0}})).into_response()
         }
@@ -96,6 +112,11 @@ async fn handler(State(m): State<Arc<Mock>>, method: Method, uri: Uri, body: Byt
                 return Json(one).into_response();
             }
             Json(all).into_response()
+        }
+        ("POST", "/2/oauth2/token") => {
+            Json(json!({"token_type": "bearer", "access_token": "renewed",
+            "expires_in": 7200, "refresh_token": "r2"}))
+            .into_response()
         }
         ("POST", p) if p.ends_with("/messages") => (
             StatusCode::CREATED,
@@ -161,7 +182,7 @@ async fn env(scope: &str, billing: bool) -> Env {
     let mut config = Config::from_env().expect("DATABASE_URL must point at a test Postgres");
     config.trust_proxy = true;
     config.billing_enabled = billing;
-    let mut x = X::new(None).unwrap();
+    let mut x = X::new(Some(("app".into(), "secret".into()))).unwrap();
     x.api_url = base;
     config.x = x;
     let db = connect(&config).await.expect("database reachable");
@@ -276,6 +297,23 @@ impl Env {
                 )
             })
             .collect()
+    }
+    /// (mentions_since_id, errors) of the account's row.
+    async fn row(&self) -> (String, i32) {
+        let sql = format!(
+            "SELECT mentions_since_id, errors FROM x_inbox WHERE social_account_id = '{}'",
+            self.account
+        );
+        let r = self
+            .db
+            .query_one_raw(Statement::from_string(DbBackend::Postgres, sql))
+            .await
+            .unwrap()
+            .unwrap();
+        (
+            r.try_get("", "mentions_since_id").unwrap(),
+            r.try_get("", "errors").unwrap(),
+        )
     }
     async fn item(&self, remote: &str) -> Uuid {
         let r = self
@@ -651,7 +689,7 @@ async fn with_billing_replies_and_reads_spend_team_credits() {
         &e.db,
         e.team,
         socialreins_brain::billing::Kind::X,
-        2,
+        3,
         "test",
         Some("g"),
     )
@@ -668,9 +706,16 @@ async fn with_billing_replies_and_reads_spend_team_credits() {
         e.post(&path, json!({"text": "one"})).await.status_code(),
         201
     );
-    assert_eq!(e.credits().await, 1);
+    assert_eq!(e.credits().await, 2);
     // A refusal gives the credit back.
     e.mock.mode.store(3, Ordering::SeqCst);
+    assert_eq!(
+        e.post(&path, json!({"text": "two"})).await.status_code(),
+        422
+    );
+    assert_eq!(e.credits().await, 2);
+    // A server error may have posted it: the credit is kept.
+    e.mock.mode.store(6, Ordering::SeqCst);
     assert_eq!(
         e.post(&path, json!({"text": "two"})).await.status_code(),
         422
@@ -691,4 +736,133 @@ async fn with_billing_replies_and_reads_spend_team_credits() {
         .unwrap()
         .contains("credit"));
     assert_eq!(e.mock.count(), calls);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_failure_on_a_later_page_keeps_what_was_read_and_does_not_move_the_cursor() {
+    let e = env(ALL, false).await;
+    e.put(json!({"enabled": true})).await.assert_status_ok();
+    e.sql(&format!(
+        "UPDATE x_inbox SET mentions_since_id = '10' WHERE social_account_id = '{}'",
+        e.account
+    ))
+    .await;
+    e.mock.paged.store(true, Ordering::SeqCst);
+    e.tick().await;
+    // The first page's posts are stored and paid for, the cursor stays where it was.
+    assert_eq!(e.items().await.len(), 2);
+    assert_eq!(e.mock.seen("GET", "/2/users/1/mentions").len(), 2);
+    let row = e.row().await;
+    assert_eq!(row.0, "10");
+    assert_eq!(
+        row.1, 0,
+        "a rate limit waits, it is not counted as a failure"
+    );
+    assert!(e.get().await["last_error"]
+        .as_str()
+        .unwrap()
+        .contains("rate limit"));
+    assert!(e.get().await["spent_usd"].as_f64().unwrap() > 0.0);
+    // The next round reads the same range again and adds nothing twice.
+    e.tick().await;
+    assert_eq!(e.items().await.len(), 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_first_read_asks_for_no_more_than_the_budget_covers() {
+    let e = env(ALL, false).await;
+    e.put(json!({"enabled": true, "budget_usd": 0.1}))
+        .await
+        .assert_status_ok();
+    e.tick().await;
+    let first = e.mock.seen("GET", "/2/users/1/mentions");
+    assert!(first[0].0.contains("max_results=6&"), "{}", first[0].0);
+    let got = e.get().await;
+    assert!(got["spent_usd"].as_f64().unwrap() <= 0.1, "{got}");
+}
+
+#[tokio::test]
+#[serial]
+async fn the_dm_probe_is_paid_once_a_day_not_every_poll() {
+    let e = env(ALL, false).await;
+    *e.mock.dms.lock().unwrap() = json!({
+        "data": [{"id": "502", "event_type": "MessageCreate", "text": "hi", "sender_id": "7",
+                  "dm_conversation_id": "7-1", "created_at": "2026-11-24T10:05:00.000Z"}],
+        "includes": {"users": users()}, "meta": {"result_count": 1}});
+    e.put(json!({"enabled": true, "read_dms": true}))
+        .await
+        .assert_status_ok();
+    e.tick().await;
+    let first = e.get().await["spent_usd"].as_f64().unwrap();
+    let calls = e.mock.seen("GET", "/2/dm_events").len();
+    for _ in 0..4 {
+        e.tick().await;
+    }
+    // Four more polls found nothing new and cost nothing: X bills the same event once a day.
+    assert_eq!(e.get().await["spent_usd"].as_f64().unwrap(), first);
+    assert_eq!(e.mock.seen("GET", "/2/dm_events").len(), calls + 4);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_read_refused_over_a_scope_is_an_error_not_a_reconnect_flag() {
+    let e = env(ALL, false).await;
+    e.put(json!({"enabled": true})).await.assert_status_ok();
+    e.mock.mode.store(7, Ordering::SeqCst);
+    e.tick().await;
+    // The account keeps publishing: only a dead token marks it.
+    let sql = format!(
+        "SELECT meta->>'reconnect' AS r FROM social_accounts WHERE id = '{}'",
+        e.account
+    );
+    let flagged =
+        e.db.query_one_raw(Statement::from_string(DbBackend::Postgres, sql))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(flagged.try_get::<Option<String>>("", "r").unwrap(), None);
+    let got = e.get().await;
+    assert_eq!(got["paused"], Value::Null);
+    assert!(
+        got["last_error"].as_str().unwrap().contains("permission"),
+        "{got}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_renewed_token_keeps_the_granted_scopes() {
+    let e = env(ALL, false).await;
+    // An account whose token ended: renewing it asks X, which answers without a scope.
+    let sealed = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        e.state.cipher.encrypt(b"r1"),
+    );
+    e.sql(&format!(
+        "UPDATE social_accounts SET token_expires_at = now() - interval '1 minute', \
+         meta = meta || jsonb_build_object('refresh_token', '{sealed}') WHERE id = '{}'",
+        e.account
+    ))
+    .await;
+    let account = socialreins_brain::models::social_accounts::Entity::find_by_id(e.account)
+        .one(&e.db)
+        .await
+        .unwrap()
+        .unwrap();
+    let token = controllers::x::fresh_token(&e.state, &account)
+        .await
+        .unwrap();
+    assert_eq!(token, "renewed");
+    let sql = format!(
+        "SELECT meta->>'scope' AS s FROM social_accounts WHERE id = '{}'",
+        e.account
+    );
+    let r =
+        e.db.query_one_raw(Statement::from_string(DbBackend::Postgres, sql))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(r.try_get::<String>("", "s").unwrap(), ALL);
 }
