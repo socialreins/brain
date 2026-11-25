@@ -112,8 +112,9 @@ pub struct Item {
     pub id: Uuid,
     pub social_account_id: Uuid,
     pub platform: String,
-    /// `comment` (a reply to the account), `mention` (a mention or quote), `dm` or `follow` (a
-    /// new Bluesky follower, stored `done`; listed only with `kind=follow`).
+    /// `comment` (a reply to the account), `mention` (a mention or quote), `dm`, or activity,
+    /// stored `done` and listed only when asked for: `follow` (a new Bluesky follower), `like`
+    /// and `repost` (of one of the account's posts, `parent_remote_id`; `remote_url` is that post).
     pub kind: String,
     pub remote_id: String,
     /// The public link, for comments and mentions.
@@ -219,8 +220,8 @@ pub struct ItemPage {
 pub struct ItemQuery {
     /// `open` or `done`; both when absent.
     pub state: Option<String>,
-    /// `comment`, `mention`, `dm` or `follow`, within the inbox's own filters; every kind but
-    /// `follow` when absent.
+    /// `comment`, `mention`, `dm`, `follow`, `like`, `repost`, or `activity` (the last three), within
+    /// the inbox's own filters; every kind but activity when absent.
     pub kind: Option<String>,
     /// Case-insensitive search in the text and the author's name and handle, 1 to 100
     /// characters after trimming.
@@ -694,7 +695,7 @@ pub fn open_counts_sql(team_id: Uuid, inboxes: &[(Option<Uuid>, Filters)]) -> St
         .collect();
     let sql = format!(
         "SELECT {} FROM inbox_items i WHERE i.team_id = $1 AND i.state = 'open' \
-         AND i.kind <> 'follow'",
+         AND i.kind NOT IN ('follow', 'like', 'repost')",
         if counts.is_empty() {
             "1".into()
         } else {
@@ -945,11 +946,13 @@ pub fn items_sql(
     let mut scope = filter_sql(accounts_of, filters, &mut values);
     let mut rest = String::new();
     let mut hit = String::from("TRUE");
-    if let Some(kind) = kind {
+    if kind == Some("activity") {
+        scope += " AND i.kind IN ('follow', 'like', 'repost')";
+    } else if let Some(kind) = kind {
         values.push(kind.to_owned().into());
         scope += &format!(" AND i.kind = ${}", values.len());
     } else {
-        scope += " AND i.kind <> 'follow'";
+        scope += inbox::NOT_ACTIVITY;
     }
     if let Some(account) = account {
         values.push(account.into());
@@ -1044,10 +1047,9 @@ async fn items(
         .state
         .as_deref()
         .is_none_or(|s| s == "open" || s == "done");
-    let kind_ok = q
-        .kind
-        .as_deref()
-        .is_none_or(|k| matches!(k, "comment" | "mention" | "dm" | "follow"));
+    let kind_ok = q.kind.as_deref().is_none_or(|k| {
+        matches!(k, "comment" | "mention" | "dm" | "activity") || inbox::ACTIVITY.contains(&k)
+    });
     let search = q.q.as_deref().map(str::trim);
     let search_ok = search.is_none_or(|s| (1..=100).contains(&s.chars().count()));
     let tag = q.tag.as_deref().map(inbox::tag);
@@ -1194,6 +1196,90 @@ async fn conversation(
         Ok(Ok(page)) => Json(page).into_response(),
         Ok(Err(res)) => res,
         Err(e) => internal(e, "inbox conversation"),
+    }
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ThreadPost {
+    /// The post's `at://` URI.
+    pub uri: String,
+    /// Its page on bsky.app.
+    pub url: Option<String>,
+    pub author: Author,
+    pub text: String,
+    pub created_at: Option<DateTime<FixedOffset>>,
+    pub attachments: Vec<inbox::Attachment>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ThreadContext {
+    /// The posts above the item in its thread, oldest first (the thread's root first, the post
+    /// the item answers last). For a like or repost, what the liked post answers and then the
+    /// liked post itself.
+    pub posts: Vec<ThreadPost>,
+    /// The chain stops at a post that was deleted or is hidden from the account.
+    pub truncated: bool,
+}
+
+/// What a comment, mention, like or repost sits under, read from Bluesky as the account sees
+/// it: the parent post and the earlier replies above it. `422 not_a_thread` for a DM or a
+/// follow, `422 post_unavailable` when the post is gone, blocked or hidden, `429 rate_limited` past 60 reads a minute per user, and the other send errors (`429`,
+/// `reconnect_required`) when Bluesky cannot be read.
+#[utoipa::path(get, path = "/inbox-items/{id}/thread", tag = "inbox",
+    params(("id" = Uuid, Path)),
+    responses((status = 200, body = ThreadContext), (status = 401, body = Error),
+        (status = 404, body = Error), (status = 422, body = Error), (status = 429, body = Error)))]
+async fn thread(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> Response {
+    let item = match find_item(&app.db, t.team.id, id).await {
+        Ok(Some(i)) => i,
+        Ok(None) => return not_found(),
+        Err(e) => return internal(e, "inbox item read"),
+    };
+    // The post to read upwards from: the item's own, or what a like or repost points at.
+    let uri = match item.kind.as_str() {
+        "comment" | "mention" => Some(item.remote_id.clone()),
+        "like" | "repost" => item.parent_remote_id.clone(),
+        _ => None,
+    };
+    let Some(uri) = uri.filter(|_| item.platform == "bluesky") else {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "not_a_thread");
+    };
+    if !app.thread_limiter.hit(t.current.0.id) {
+        return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    }
+    let account = match social_accounts::Entity::find_by_id(item.social_account_id)
+        .one(&app.db)
+        .await
+    {
+        Ok(Some(a)) => a,
+        Ok(None) => return not_found(),
+        Err(e) => return internal(e, "account read"),
+    };
+    let with_post = matches!(item.kind.as_str(), "like" | "repost");
+    let found = inbox::thread_above(&app, &account, &uri, with_post).await;
+    match found {
+        Ok(thread) => Json(ThreadContext {
+            truncated: thread.truncated,
+            posts: thread
+                .posts
+                .into_iter()
+                .map(|p| ThreadPost {
+                    url: bluesky::post_url(&p.uri),
+                    uri: p.uri,
+                    author: Author {
+                        id: p.author.did,
+                        handle: p.author.handle,
+                        name: p.author.display_name,
+                        avatar_url: p.author.avatar,
+                    },
+                    text: p.text,
+                    created_at: p.at,
+                    attachments: p.attachments,
+                })
+                .collect(),
+        })
+        .into_response(),
+        Err(e) => send_error(&e),
     }
 }
 
@@ -1445,6 +1531,7 @@ pub fn api() -> OpenApiRouter<AppState> {
         .routes(routes!(items))
         .routes(routes!(show_item, change_item))
         .routes(routes!(conversation))
+        .routes(routes!(thread))
         .routes(routes!(send_reply))
         .routes(routes!(moderate_item))
 }
@@ -1486,7 +1573,7 @@ mod tests {
         let stmt = items_sql(team, None, &Filters::default(), &n, 10, false);
         assert_eq!(
             stmt.sql,
-            "SELECT i.* FROM inbox_items i WHERE i.team_id = $1 AND i.kind <> 'follow' \
+            "SELECT i.* FROM inbox_items i WHERE i.team_id = $1 AND i.kind NOT IN ('follow', 'like', 'repost') \
              AND (i.text ILIKE $2 OR i.author_name ILIKE $2 OR i.author_handle ILIKE $2) \
              ORDER BY i.received_at DESC, i.id DESC LIMIT $3"
         );
@@ -1519,7 +1606,7 @@ mod tests {
         let stmt = items_sql(team, None, &Filters::default(), &n, 10, false);
         assert!(
             stmt.sql
-                .contains(" AND i.kind <> 'follow' AND i.social_account_id = $2 ORDER BY"),
+                .contains(" AND i.kind NOT IN ('follow', 'like', 'repost') AND i.social_account_id = $2 ORDER BY"),
             "{}",
             stmt.sql
         );
@@ -1556,7 +1643,7 @@ mod tests {
              COUNT(*) FILTER (WHERE TRUE AND EXISTS (SELECT 1 FROM inbox_accounts ia \
              WHERE ia.inbox_id = $2 AND ia.social_account_id = i.social_account_id) \
              AND i.kind IN ($3)) AS c1 \
-             FROM inbox_items i WHERE i.team_id = $1 AND i.state = 'open' AND i.kind <> 'follow'"
+             FROM inbox_items i WHERE i.team_id = $1 AND i.state = 'open' AND i.kind NOT IN ('follow', 'like', 'repost')"
         );
     }
 }
