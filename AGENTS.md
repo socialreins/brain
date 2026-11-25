@@ -166,6 +166,11 @@ cargo run -p socialreins-brain
   on account and remote id, so redeliveries are harmless), names, links and automations run
   after it. Meta replies and DMs go out through `inbox::send` like Bluesky ones, once, never
   retried.
+  `meta_inbox::tick` (every minute, 4 accounts; each account at connect and then hourly,
+  `social_accounts.meta_synced_at`) reads the last 7 days of a Page's posts and comments, an
+  Instagram account's media and comments, and the conversations (`meta_inbox::backfill`), so a
+  webhook outage or a new connection leaves no hole; items older than a day are marked
+  `automated_at`, so no automation answers them.
 - `app/src/automations.rs`: an automation holds `actions` or `steps` (a flow of sends and
   waits). A flow's run claims each step before sending it (`claim_step`, with the send's hit of
   the daily cap), a `wait` parks it as `waiting`, and `automations::tick` (every minute, own
