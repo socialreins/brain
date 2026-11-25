@@ -169,6 +169,18 @@ pub fn spawn(app: AppState) {
             }
         }
     });
+    let youtube_app = app.clone();
+    tokio::spawn(async move {
+        // Which channels are due, and how often, is the channel's own setting (`youtube_inbox`).
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if let Err(e) = crate::youtube_inbox::tick(&youtube_app).await {
+                tracing::warn!(error = %e, "youtube inbox tick failed");
+            }
+        }
+    });
     let meta_app = app.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));

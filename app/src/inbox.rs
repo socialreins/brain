@@ -99,7 +99,14 @@ impl Attachment {
 }
 
 /// Platforms whose accounts have an inbox.
-pub const INBOX_PLATFORMS: [&str; 5] = ["bluesky", "facebook", "instagram", "threads", "x"];
+pub const INBOX_PLATFORMS: [&str; 6] = [
+    "bluesky",
+    "facebook",
+    "instagram",
+    "threads",
+    "x",
+    "youtube",
+];
 /// Most accounts one inbox holds.
 pub const MAX_INBOX_ACCOUNTS: usize = 100;
 

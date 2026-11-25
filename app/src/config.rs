@@ -229,7 +229,12 @@ impl Config {
                 threads
             },
             linkedin: LinkedIn::new(var("LINKEDIN_CLIENT_ID").zip(var("LINKEDIN_CLIENT_SECRET")))?,
-            youtube: YouTube::new(var("GOOGLE_CLIENT_ID").zip(var("GOOGLE_CLIENT_SECRET")))?,
+            youtube: {
+                let mut youtube =
+                    YouTube::new(var("GOOGLE_CLIENT_ID").zip(var("GOOGLE_CLIENT_SECRET")))?;
+                youtube.inbox_units = inbox_units(var("YOUTUBE_INBOX_UNITS"))?;
+                youtube
+            },
             x: X::new(var("X_CLIENT_ID").zip(var("X_CLIENT_SECRET")))?,
             tiktok: TikTok::new(var("TIKTOK_CLIENT_KEY").zip(var("TIKTOK_CLIENT_SECRET")))?,
             pinterest: Pinterest::new(var("PINTEREST_APP_ID").zip(var("PINTEREST_APP_SECRET")))?,
@@ -338,6 +343,16 @@ fn media_max_bytes(value: Option<String>) -> Result<usize, String> {
         Some(_) => Err(format!(
             "MEDIA_MAX_BYTES: a number of bytes from 1 to {max}"
         )),
+    }
+}
+
+/// `YOUTUBE_INBOX_UNITS`: YouTube quota units a day all channels together may spend reading and
+/// answering comments, 0 to 10,000 (default 4,000 of Google's 10,000 a day).
+fn inbox_units(value: Option<String>) -> Result<i64, String> {
+    match value.map(|v| v.trim().parse::<i64>()) {
+        None => Ok(crate::connectors::youtube::DEFAULT_INBOX_UNITS),
+        Some(Ok(n)) if (0..=10_000).contains(&n) => Ok(n),
+        Some(_) => Err("YOUTUBE_INBOX_UNITS: a number of units from 0 to 10000".into()),
     }
 }
 
