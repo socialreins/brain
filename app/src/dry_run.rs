@@ -49,6 +49,9 @@ pub struct Sample {
     /// and the fallback public reply takes its place. Default `true`.
     #[serde(default = "yes")]
     pub author_can_dm: bool,
+    /// When the sample arrives, for the weekday and hour conditions. Absent: now.
+    #[serde(default)]
+    pub at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn yes() -> bool {
@@ -95,7 +98,7 @@ pub struct Outcome {
     /// The sample meets every condition.
     pub matched: bool,
     /// Why not, when it does not: `wrong_set`, `wrong_account`, `wrong_post`, `no_keyword`,
-    /// `wrong_weekday`, `wrong_hour`, `wrong_link`, `intent_mismatch` or `button_not_named`. (A sample is always its author's first comment or message, so the
+    /// `wrong_weekday`, `outside_hours`, `wrong_language`, `no_question` or `button_not_named`. (A sample is always its author's first comment or message, so the
     /// first-only conditions pass.)
     pub mismatches: Vec<String>,
     /// Rules that would stop it: `no_public_page` (a text holds `{page}` and the post has no
@@ -103,11 +106,12 @@ pub struct Outcome {
     /// `network_limits` for the account's network (`meta_one_private_reply`,
     /// `meta_reply_window`, `x_unsupported_trigger`, `bluesky_unsupported_trigger`; the steps are
     /// still listed, as a run would go as far as it can), and `paused` (the team paused its
-    /// automations: no steps).
+    /// automations: no steps), and `no_ai_key`, `no_ai_credits` or `ai_failed` when a `question`
+    /// condition could not be judged (no steps).
     pub blocks: Vec<String>,
-    /// What an `intent` condition read the sample as (`question`, `positive`, `negative` or
-    /// `other`); null when the automation has none.
-    pub intent: Option<String>,
+    /// What a `sentiment` condition read the sample as (`positive`, `negative` or `neutral`);
+    /// null when the automation has none.
+    pub sentiment: Option<String>,
     pub steps: Vec<PlannedStep>,
 }
 
@@ -311,7 +315,7 @@ pub async fn test(
         text: &item.text,
         first_from_author: true,
         first_message: true,
-        at: item.received_at.to_utc(),
+        now: sample.at.unwrap_or_else(chrono::Utc::now),
     };
     let mut mismatches = rules::mismatches(cond, &facts);
     if trigger == "button_clicked"
@@ -327,21 +331,21 @@ pub async fn test(
         matched: mismatches.is_empty(),
         mismatches: mismatches.into_iter().map(Into::into).collect(),
         blocks: Vec::new(),
-        intent: None,
+        sentiment: None,
         steps: Vec::new(),
     };
     if !out.matched {
         return Ok(out);
     }
     // Read last, as a run does, and spent like one.
-    if !cond.intent.is_empty() && !rules::team_paused(db, item.team_id).await? {
+    if !cond.sentiment.is_empty() && !rules::team_paused(db, item.team_id).await? {
         let reference = format!("ai:test:{}", Uuid::now_v7());
-        match rules::read_intent(app, account, &item, &reference).await {
+        match rules::read_sentiment(app, account, &item, &reference).await {
             Ok(label) => {
-                out.intent = Some(label.into());
-                if !cond.intent.iter().any(|i| i == label) {
+                out.sentiment = Some(label.into());
+                if !cond.sentiment.iter().any(|i| i == label) {
                     out.matched = false;
-                    out.mismatches.push("intent_mismatch".into());
+                    out.mismatches.push("sentiment_mismatch".into());
                     return Ok(out);
                 }
             }
@@ -378,6 +382,22 @@ pub async fn test(
     if rules::team_paused(db, item.team_id).await? {
         out.blocks.push("paused".into());
         return Ok(out);
+    }
+    // Last, as in a run, so the model is never paid for a sample that stops sooner: a question
+    // mark needs no AI call, any other text is judged and counted against the allowance.
+    if cond.question {
+        match rules::asks_question(app, &item, Uuid::now_v7()).await {
+            Ok(true) => {}
+            Ok(false) => {
+                out.matched = false;
+                out.mismatches.push("no_question".into());
+                return Ok(out);
+            }
+            Err(why) => {
+                out.blocks.push(why.into());
+                return Ok(out);
+            }
+        }
     }
     let room = cap_room(db, item.team_id).await?;
     let walked = Walk {

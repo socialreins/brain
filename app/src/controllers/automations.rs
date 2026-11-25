@@ -883,7 +883,7 @@ async fn test(
         // A hit for the test and one for each AI step, which spends like a run.
         let ai = input.actions.iter().flatten().filter(|a| a.ai()).count()
             + input.steps.iter().flatten().filter(|s| s.ai()).count()
-            + usize::from(!input.conditions.intent.is_empty());
+            + usize::from(!input.conditions.sentiment.is_empty());
         let bucket = (dry_run::quota_bucket(t.team.id), dry_run::TESTS_PER_DAY);
         let caps = vec![bucket; 1 + ai];
         if crate::rate_limit::daily_reserve(&app.db, &caps)

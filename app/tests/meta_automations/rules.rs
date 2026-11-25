@@ -1,5 +1,4 @@
 //! The conditions and actions every network shares, on Facebook against the mock Graph API.
-use chrono::{Datelike, Timelike, Utc};
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
@@ -12,50 +11,11 @@ fn when(conditions: Value) -> Value {
 }
 
 #[tokio::test]
-async fn days_and_hours_are_read_on_the_clock_of_the_zone() {
-    let e = env().await;
-    let now = Utc::now();
-    let day = now.weekday().number_from_monday();
-    let other_day = day % 7 + 1;
-    let hour = now.hour();
-    let next = |h: u32| (hour + h) % 24;
-    let cases = [
-        (json!({"weekdays": [day]}), true),
-        (json!({"weekdays": [other_day]}), false),
-        (json!({"from_hour": hour, "to_hour": next(2)}), true),
-        (json!({"from_hour": next(1), "to_hour": next(3)}), false),
-        // Over midnight: from the next hour round to the previous one is every hour but this.
-        (json!({"from_hour": next(1), "to_hour": hour}), false),
-        (json!({"from_hour": next(23), "to_hour": next(1)}), true),
-    ];
-    for (conditions, runs) in cases {
-        let a = e.automation(when(conditions.clone())).await;
-        let i = e.item("comment", "9", "hi", 0).await;
-        assert_eq!(e.run(&a, i.id).await.is_some(), runs, "{conditions}");
-    }
-    // A zone moves the clock: Dhaka is 6 hours ahead of UTC.
-    let dhaka = (hour + 6) % 24;
-    let a = e
-        .automation(when(
-            json!({"timezone": "Asia/Dhaka", "from_hour": dhaka, "to_hour": (dhaka + 1) % 24}),
-        ))
-        .await;
-    let i = e.item("comment", "9", "hi", 0).await;
-    assert!(e.run(&a, i.id).await.is_some());
-}
-
-#[tokio::test]
-async fn timing_conditions_are_checked() {
+async fn link_and_sentiment_conditions_are_checked() {
     let e = env().await;
     for bad in [
-        json!({"weekdays": [0]}),
-        json!({"weekdays": [8]}),
-        json!({"from_hour": 9}),
-        json!({"from_hour": 9, "to_hour": 9}),
-        json!({"from_hour": 9, "to_hour": 24}),
-        json!({"timezone": "Asia/Dhaka"}),
-        json!({"weekdays": [1], "timezone": "Mars/Base"}),
-        json!({"has_link": true, "intent": ["joke"]}),
+        json!({"sentiment": ["joke"]}),
+        json!({"sentiment": ["question"]}),
     ] {
         let mut body = when(bad.clone());
         body["conditions"]["account_ids"] = json!([e.account.id]);
@@ -63,12 +23,23 @@ async fn timing_conditions_are_checked() {
         assert_eq!(res.status_code(), 422, "{bad}");
         assert_eq!(res.json::<Value>()["error"], "invalid_conditions", "{bad}");
     }
-    // A zone is saved with the days.
-    let mut body = when(json!({"weekdays": [3, 1, 3]}));
+    // No text to read in a follow or a button tap.
+    for trigger in ["new_follower", "button_clicked"] {
+        let mut body = reply_all(
+            json!({"trigger": trigger, "actions": [{"type": "send_dm", "text": "x"}],
+            "conditions": {"has_link": true, "payloads": ["a"]}}),
+        );
+        body["conditions"]["account_ids"] = json!([e.account.id]);
+        let res = e.post("/v1/automations", body).await;
+        assert_eq!(res.status_code(), 422, "{trigger}");
+    }
+    let mut body = when(json!({"sentiment": ["negative", "positive", "negative"]}));
     body["conditions"]["account_ids"] = json!([e.account.id]);
     let made = e.post("/v1/automations", body).await.json::<Value>();
-    assert_eq!(made["conditions"]["weekdays"], json!([1, 3]));
-    assert_eq!(made["conditions"]["timezone"], "UTC");
+    assert_eq!(
+        made["conditions"]["sentiment"],
+        json!(["negative", "positive"])
+    );
 }
 
 #[tokio::test]
@@ -87,26 +58,28 @@ async fn a_link_condition_tells_spam_from_talk() {
 }
 
 #[tokio::test]
-async fn an_intent_is_read_by_the_model_last_and_counted() {
+async fn a_sentiment_is_read_by_the_model_last_and_counted() {
     let e = env_with(Opts {
         ai_key: true,
         ..Opts::default()
     })
     .await;
     let a = e
-        .automation(when(json!({"intent": ["question"], "keywords": ["price"]})))
+        .automation(when(
+            json!({"sentiment": ["negative"], "keywords": ["price"]}),
+        ))
         .await;
-    *e.mock.ai_reply.lock().unwrap() = "Question".into();
+    *e.mock.ai_reply.lock().unwrap() = "Negative".into();
     // The keyword fails first: the model is never asked.
     let off = e.item("comment", "1", "nice", 0).await;
     assert!(e.run(&a, off.id).await.is_none());
     assert_eq!(e.mock.ai_calls.load(Ordering::SeqCst), 0);
-    let asked = e.item("comment", "2", "what is the price?", 0).await;
+    let asked = e.item("comment", "2", "what a terrible price", 0).await;
     assert_eq!(e.run(&a, asked.id).await.unwrap().0, "sent");
     assert_eq!(e.mock.ai_calls.load(Ordering::SeqCst), 1);
     // Read as something else: no run.
-    *e.mock.ai_reply.lock().unwrap() = "negative".into();
-    let angry = e.item("comment", "3", "the price is a joke", 0).await;
+    *e.mock.ai_reply.lock().unwrap() = "positive".into();
+    let angry = e.item("comment", "3", "the price is lovely", 0).await;
     assert!(e.run(&a, angry.id).await.is_none());
     // The model fails: the run log says so, and nothing is sent.
     *e.mock.ai_reply.lock().unwrap() = String::new();
@@ -118,8 +91,8 @@ async fn an_intent_is_read_by_the_model_last_and_counted() {
     );
     assert_eq!(e.mock.to("/comments").len(), 1);
     // A test of it names what the model read, and counts as an AI call.
-    *e.mock.ai_reply.lock().unwrap() = "question".into();
-    let mut automation = when(json!({"intent": ["question"]}));
+    *e.mock.ai_reply.lock().unwrap() = "negative".into();
+    let mut automation = when(json!({"sentiment": ["negative"]}));
     automation["conditions"]["account_ids"] = json!([e.account.id]);
     let res = e
         .post(
@@ -130,15 +103,15 @@ async fn an_intent_is_read_by_the_model_last_and_counted() {
         .await;
     let out = res.json::<Value>();
     assert_eq!(
-        (out["matched"].clone(), out["intent"].clone()),
-        (json!(true), json!("question"))
+        (out["matched"].clone(), out["sentiment"].clone()),
+        (json!(true), json!("negative"))
     );
 }
 
 #[tokio::test]
-async fn an_intent_without_any_key_is_skipped_with_its_reason() {
+async fn a_sentiment_without_any_key_is_skipped_with_its_reason() {
     let e = env().await;
-    let a = e.automation(when(json!({"intent": ["question"]}))).await;
+    let a = e.automation(when(json!({"sentiment": ["negative"]}))).await;
     let i = e.item("comment", "1", "price?", 0).await;
     let (status, reason) = e.run(&a, i.id).await.unwrap();
     assert_eq!(
@@ -148,7 +121,7 @@ async fn an_intent_without_any_key_is_skipped_with_its_reason() {
     // That skip never ran: the same person's next comment is still new to the automation.
     let a2 = e
         .automation(when(
-            json!({"first_per_author": true, "intent": ["question"]}),
+            json!({"first_per_author": true, "sentiment": ["negative"]}),
         ))
         .await;
     let first = e.item("comment", "2", "price?", 0).await;
@@ -250,11 +223,11 @@ async fn a_stop_holds_when_the_sweep_runs_the_item_again_and_the_model_is_not_as
     })
     .await;
     let stopper = e
-        .automation(reply_all(json!({"name": "First", "conditions": {"intent": ["question"]},
+        .automation(reply_all(json!({"name": "First", "conditions": {"sentiment": ["negative"]},
             "actions": [{"type": "reply_publicly", "text": "Answer"}, {"type": "stop_automations"}]})))
         .await;
     let later = e.automation(reply_all(json!({"name": "Later"}))).await;
-    *e.mock.ai_reply.lock().unwrap() = "question".into();
+    *e.mock.ai_reply.lock().unwrap() = "negative".into();
     let item = e.item("comment", &digits(), "how much?", 0).await;
     assert!(e.run(&later, item.id).await.is_none());
     assert_eq!(e.mock.ai_calls.load(Ordering::SeqCst), 1);
@@ -276,10 +249,10 @@ async fn a_person_in_a_cool_down_is_not_read_by_the_model() {
     })
     .await;
     let a = e
-        .automation(reply_all(json!({"conditions": {"intent": ["question"]},
+        .automation(reply_all(json!({"conditions": {"sentiment": ["negative"]},
             "cooldown_minutes": 60})))
         .await;
-    *e.mock.ai_reply.lock().unwrap() = "question".into();
+    *e.mock.ai_reply.lock().unwrap() = "negative".into();
     let who = digits();
     let first = e.item("comment", &who, "how much?", 0).await;
     assert_eq!(e.run(&a, first.id).await.unwrap().0, "sent");
