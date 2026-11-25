@@ -18404,6 +18404,60 @@ mod teams {
                                 _ => refused(100, "unknown fields"),
                             }
                         };
+                    // What a Page and an Instagram account hold of the last days, for the backfill.
+                    let history =
+                        |h: axum::http::HeaderMap,
+                         Path((node, edge)): Path<(String, String)>,
+                         Query(q): Query<HashMap<String, String>>| async move {
+                            if !page_token(&h) {
+                                return refused(190, "Error validating access token");
+                            }
+                            let ago = |mins: i64| {
+                                let t = chrono::Utc::now() - chrono::Duration::minutes(mins);
+                                t.format("%Y-%m-%dT%H:%M:%S+0000").to_string()
+                            };
+                            let platform = q.get("platform").map(String::as_str);
+                            ok(match (node.as_str(), edge.as_str(), platform) {
+                                ("101", "feed", _) => json!({"data": [
+                                    {"id": "101_9", "created_time": ago(60)},
+                                    {"id": "101_1", "created_time": ago(60 * 24 * 30)}]}),
+                                ("101_9", "comments", _) => json!({"data": [
+                                    {"id": "101_9_5", "message": "two days ago",
+                                     "created_time": ago(60 * 48), "from": {"id": "777", "name": "Ada"}},
+                                    {"id": "101_9_6", "message": "the page", "created_time": ago(50),
+                                     "from": {"id": "101", "name": "Cafe"}},
+                                    {"id": "101_9_7", "message": "already here",
+                                     "created_time": ago(30), "from": {"id": "888", "name": "Bo"},
+                                     "parent": {"id": "101_9_5"}}]}),
+                                // Older than the window: never asked for.
+                                ("101_1", "comments", _) => json!({"data": [
+                                    {"id": "101_1_1", "message": "ancient",
+                                     "created_time": ago(60 * 24 * 30), "from": {"id": "999"}}]}),
+                                ("101", "conversations", None) => json!({"data": [
+                                    {"updated_time": ago(10), "messages": {"data": [
+                                        {"id": "m_new", "message": "hello", "created_time": ago(10),
+                                         "from": {"id": "777", "name": "Ada"}},
+                                        {"id": "m_ours", "message": "hi", "created_time": ago(9),
+                                         "from": {"id": "101", "name": "Cafe"}}]}},
+                                    {"updated_time": ago(60 * 24 * 30), "messages": {"data": [
+                                        {"id": "m_old", "message": "ancient",
+                                         "created_time": ago(60 * 24 * 30), "from": {"id": "999"}}]}}]}),
+                                ("101", "conversations", Some("instagram")) => json!({"data": [
+                                    {"updated_time": ago(20), "messages": {"data": [
+                                        {"id": "ig_m1", "message": "hi from ig", "created_time": ago(20),
+                                         "from": {"id": "555", "username": "jane"}}]}}]}),
+                                ("1784", "media", _) => json!({"data": [{"id": "17900000"}]}),
+                                ("17900000", "comments", _) => json!({"data": [
+                                    {"id": "ig5", "text": "so nice", "timestamp": ago(60 * 48),
+                                     "username": "jane", "from": {"id": "555", "username": "jane"},
+                                     "replies": {"data": [
+                                        {"id": "ig6", "text": "thanks", "timestamp": ago(60 * 47),
+                                         "username": "cafe", "from": {"id": "1784", "username": "cafe"}},
+                                        {"id": "ig7", "text": "me too", "timestamp": ago(15),
+                                         "username": "kim", "from": {"id": "556", "username": "kim"}}]}}]}),
+                                _ => return refused(100, "unknown edge"),
+                            })
+                        };
                     let unsubscribe =
                         |h: axum::http::HeaderMap, Path((node, edge)): Path<(String, String)>| async move {
                             if !page_token(&h) || edge != "subscribed_apps" {
@@ -18456,7 +18510,10 @@ mod teams {
                         .route("/v26.0/oauth/access_token", post(token))
                         .route("/v26.0/{id}/thumbnails", post(thumbnail))
                         .route("/v26.0/me/accounts", get(accounts))
-                        .route("/v26.0/{node}/{edge}", post(edge).delete(unsubscribe))
+                        .route(
+                            "/v26.0/{node}/{edge}",
+                            post(edge).delete(unsubscribe).get(history),
+                        )
                         .route("/v26.0/{id}", get(node).delete(remove))
                         .route("/video-upload/v26.0/{id}", post(upload))
                         .route(
@@ -19807,6 +19864,137 @@ mod teams {
                     let all = all_inbox_id(&s, &cookie).await;
                     let page = inbox_items_of(&s, &cookie, &all).await;
                     assert!(page.iter().all(|i| i["contact_id"] == first[0]["id"]));
+                }
+
+                /// The webhook is not the only way in: the last days of comments and conversations are
+                /// read again, once, and what is older or already stored is left alone.
+                #[tokio::test]
+                #[serial]
+                async fn backfill_reads_what_the_webhook_missed() {
+                    use socialreins_brain::meta_inbox;
+                    let (s, db, state, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (_, team_id) = owner_connected(&s, &db).await;
+                    let fb = account(&db, &team_id, "facebook", "101").await;
+                    let ig = account(&db, &team_id, "instagram", "1784").await;
+                    // One comment arrived by webhook before.
+                    let late = page_comment("101_9_7", "already here", "888", now() - 1800);
+                    assert_eq!(deliver(&s, &late).await.status_code(), 200);
+                    assert_eq!(stored(&db, &team_id).await.len(), 1);
+
+                    assert_eq!(meta_inbox::backfill(&state, &fb, false).await.unwrap(), 2);
+                    assert_eq!(meta_inbox::backfill(&state, &fb, false).await.unwrap(), 0);
+                    assert_eq!(meta_inbox::backfill(&state, &ig, false).await.unwrap(), 3);
+                    let items = stored(&db, &team_id).await;
+                    let ids: Vec<_> = items.iter().map(|i| i.remote_id.as_str()).collect();
+                    // Not the Page's own, not the old post's, not the old conversation's.
+                    assert_eq!(
+                        ids,
+                        ["101_9_5", "101_9_7", "ig5", "ig7", "ig_m1", "m_new"],
+                        "{ids:?}"
+                    );
+                    let by = |id: &str| items.iter().find(|i| i.remote_id == id).unwrap();
+                    let comment = by("101_9_5");
+                    assert_eq!(comment.author_name.as_deref(), Some("Ada"));
+                    assert_eq!(comment.parent_remote_id.as_deref(), Some("101_9"));
+                    assert_eq!(comment.root_remote_id.as_deref(), Some("101_9"));
+                    assert_eq!(by("101_9_7").state, "open");
+                    // A comment of two days ago is never answered by an automation, a new one may be.
+                    assert!(comment.automated_at.is_some());
+                    assert!(by("ig5").automated_at.is_some());
+                    assert!(by("m_new").automated_at.is_none());
+                    assert!(by("ig7").automated_at.is_none());
+                    let reply = by("ig7");
+                    assert_eq!(reply.parent_remote_id.as_deref(), Some("ig5"));
+                    assert_eq!(by("ig5").parent_remote_id.as_deref(), Some("17900000"));
+                    assert_eq!(reply.root_remote_id.as_deref(), Some("17900000"));
+                    assert_eq!(reply.author_handle.as_deref(), Some("kim"));
+                    let dm = by("m_new");
+                    assert_eq!((dm.kind.as_str(), dm.author_id.as_str()), ("dm", "777"));
+                    assert_eq!(dm.convo_id.as_deref(), Some("777"));
+                    assert_eq!(by("ig_m1").platform, "instagram");
+
+                    // A dead token ends the read and asks for a reconnect.
+                    let row = social_accounts::ActiveModel {
+                        id: Set(fb.id),
+                        access_token: Set(cipher().encrypt(b"dead")),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(row)
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                    let fb = account(&db, &team_id, "facebook", "101").await;
+                    assert_eq!(meta_inbox::backfill(&state, &fb, false).await.unwrap(), 0);
+                    let fb = account(&db, &team_id, "facebook", "101").await;
+                    assert_eq!(fb.meta["reconnect"], true);
+                    assert!(fb.inbox_error_at.is_some());
+                }
+
+                /// The slow schedule: a new connection is read at the next tick, then hourly, and an
+                /// account that needs a reconnect is left alone.
+                #[tokio::test]
+                #[serial]
+                async fn backfill_runs_on_connect_and_then_hourly() {
+                    use sea_orm::ConnectionTrait;
+                    use socialreins_brain::meta_inbox;
+                    let (s, db, state, _) = on_meta(true).await;
+                    clean(&db).await;
+                    let (_, team_id) = owner_connected(&s, &db).await;
+                    let synced = |id: uuid::Uuid| {
+                        let db = db.clone();
+                        async move {
+                            let stmt = sea_orm::Statement::from_sql_and_values(
+                                sea_orm::DbBackend::Postgres,
+                                "SELECT meta_synced_at IS NOT NULL AS ok FROM social_accounts WHERE id = $1",
+                                [id.into()],
+                            );
+                            let row = db.query_one_raw(stmt).await.unwrap().unwrap();
+                            row.try_get::<bool>("", "ok").unwrap()
+                        }
+                    };
+                    let (fb, ig) = (
+                        account(&db, &team_id, "facebook", "101").await,
+                        account(&db, &team_id, "instagram", "1784").await,
+                    );
+                    assert!(!synced(fb.id).await && !synced(ig.id).await);
+                    meta_inbox::tick(&state).await.unwrap();
+                    assert!(synced(fb.id).await && synced(ig.id).await);
+                    let found = stored(&db, &team_id).await.len();
+                    assert!(found >= 5, "{found}");
+                    // The first read of an account answers nothing, however new its items are.
+                    let all = stored(&db, &team_id).await;
+                    assert!(all.iter().all(|i| i.automated_at.is_some()));
+                    // Read an hour ago: due again. Just now: not.
+                    let age = |mins: i32| {
+                        let db = db.clone();
+                        async move {
+                            let stmt = sea_orm::Statement::from_sql_and_values(
+                                sea_orm::DbBackend::Postgres,
+                                "UPDATE social_accounts SET meta_synced_at = now() - make_interval(mins => $1)",
+                                [mins.into()],
+                            );
+                            db.execute_raw(stmt).await.unwrap();
+                        }
+                    };
+                    let reads = || {
+                        let db = db.clone();
+                        async move {
+                            let stmt = sea_orm::Statement::from_string(
+                                sea_orm::DbBackend::Postgres,
+                                "SELECT count(*) AS n FROM social_accounts WHERE meta_synced_at > now() - interval '5 minutes'",
+                            );
+                            let row = db.query_one_raw(stmt).await.unwrap().unwrap();
+                            row.try_get::<i64>("", "n").unwrap()
+                        }
+                    };
+                    age(30).await;
+                    meta_inbox::tick(&state).await.unwrap();
+                    assert_eq!(reads().await, 0, "not due after 30 minutes");
+                    age(61).await;
+                    socialreins_brain::expiry::flag_reconnect(&db, fb.id).await;
+                    meta_inbox::tick(&state).await.unwrap();
+                    assert_eq!(reads().await, 1, "only the account that needs no reconnect");
                 }
 
                 #[tokio::test]

@@ -811,6 +811,25 @@ impl Meta {
             .map_err(inbox_error)
     }
 
+    /// A read of what the inbox may have missed (`meta_inbox::backfill`): Graph's answer for
+    /// `path` (a Page's posts, comments or conversations, an Instagram media's comments), or why
+    /// not, worded as for a send. One page; the caller follows `paging.cursors.after`.
+    pub async fn history(
+        &self,
+        token: &str,
+        path: &str,
+        query: Params<'_>,
+    ) -> Result<Value, InboxError> {
+        if !path.split('/').next().is_some_and(graph_id) {
+            return Err(InboxError::Invalid("not_repliable"));
+        }
+        let url = format!("{}/{}/{path}", self.graph_url, self.version);
+        let req = self.client.get(url).query(query);
+        self.raw(req, Some(token), None, "Inbox")
+            .await
+            .map_err(inbox_error)
+    }
+
     /// A public reply under `comment`: `{comment}/comments` on Facebook (`pages_manage_engagement`),
     /// `{comment}/replies` on Instagram (`instagram_manage_comments`). Returns the reply's id.
     pub async fn reply_to_comment(

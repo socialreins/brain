@@ -8,6 +8,18 @@
 //! A click on a quick reply button (`message.quick_reply.payload`) is a `dm` with
 //! `button_payload` set: it runs `button_clicked` automations, not `dm_received` ones either.
 //! Replies and DMs go out through `send`, once, never retried.
+//!
+//! The webhook is the only live source, so a delivery Meta never made (an outage of ours, or an
+//! account connected a week after its comments) would stay missing. `tick` therefore reads each
+//! account's last 7 days again, on connect and then hourly (`backfill`): the Page's recent
+//! posts and their comments, or the Instagram account's recent media and their comments, and the
+//! Page's conversations. Items go in with the webhook's unique key, so nothing is stored twice.
+//! A backfilled item younger than a day is left for the automation sweep (its comment-to-DM
+//! still works, within Meta's windows); an older one is marked automated. The first read of an
+//! account marks every item automated, so connecting an account (or deploying this) never
+//! answers a week of old comments.
+use std::time::{Duration as Wait, Instant};
+
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 use sea_orm::ColumnTrait;
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, EntityTrait, QueryFilter, Statement};
@@ -31,6 +43,22 @@ const PRIVATE_REPLY_DAYS: i64 = 7;
 const MESSAGE_HOURS: i64 = 24;
 /// Longest quick reply payload kept; ours are at most 64.
 const MAX_PAYLOAD_CHARS: usize = 200;
+/// An account is read again this long after its last read, and `BACKFILL_ACCOUNTS` are read a
+/// tick (a minute), so a thousand accounts still fit in the hour.
+const BACKFILL_EVERY_MINUTES: i64 = 60;
+const BACKFILL_ACCOUNTS: i64 = 4;
+/// Longest one account's read takes; what it reached is kept and the rest waits for the next
+/// hour (shortcut: no resume cursor, since a read is capped at about 60 calls).
+const BACKFILL_BUDGET: Wait = Wait::from_secs(30);
+/// Items asked for in a call, and the most pages one list is followed for.
+const PAGE_SIZE: &str = "25";
+const POST_PAGES: usize = 2;
+const COMMENT_PAGES: usize = 2;
+const CONVERSATION_PAGES: usize = 4;
+/// Messages read of each conversation (the newest).
+const CONVERSATION_MESSAGES: &str = "10";
+/// A backfilled item older than this is stored but never answered by an automation.
+const AUTOMATE_WITHIN_HOURS: i64 = 24;
 
 fn sid(v: &Value) -> Option<String> {
     match v {
@@ -418,6 +446,356 @@ async fn private_reply_sent(app: &AppState, item: Uuid) -> Result<bool, DbErr> {
     }
 }
 
+/// A time as Graph writes it (`2026-11-25T10:00:00+0000`).
+fn graph_time(v: &Value) -> Option<DateTime<FixedOffset>> {
+    let s = v.as_str()?;
+    DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%z")
+        .or_else(|_| DateTime::parse_from_rfc3339(s))
+        .ok()
+}
+
+/// A comment as Graph lists it under a Page post (`{post}/comments`), as the webhook's would
+/// have been. `None` for the Page's own comments and ones that name no author.
+fn listed_facebook_comment(v: &Value, post: &str, page: &str) -> Option<Fresh> {
+    let (id, from) = (sid(&v["id"])?, &v["from"]);
+    let author = sid(&from["id"]).filter(|a| a != page)?;
+    Some(Fresh {
+        kind: "comment",
+        remote_id: id,
+        remote_cid: None,
+        parent: Some(sid(&v["parent"]["id"]).unwrap_or_else(|| post.to_owned())),
+        root: (Some(post.to_owned()), None),
+        convo_id: None,
+        story: None,
+        button_payload: None,
+        author: Author {
+            did: author,
+            display_name: sid(&from["name"]),
+            ..Author::default()
+        },
+        text: v["message"].as_str().unwrap_or_default().to_owned(),
+        at: graph_time(&v["created_time"])?,
+        permalink: Some(format!("https://www.facebook.com/{post}")),
+        attachments: comment_attachments(v),
+    })
+}
+
+/// An Instagram comment as Graph lists it under a media (`{media}/comments`, or inside a
+/// comment's `replies`); `parent` is the media for a top-level comment, else that comment.
+fn listed_instagram_comment(v: &Value, media: &str, parent: &str) -> Option<Fresh> {
+    let (id, from) = (sid(&v["id"])?, &v["from"]);
+    Some(Fresh {
+        kind: "comment",
+        remote_id: id,
+        remote_cid: None,
+        parent: Some(parent.to_owned()),
+        root: (Some(media.to_owned()), None),
+        convo_id: None,
+        story: None,
+        button_payload: None,
+        author: Author {
+            did: sid(&from["id"])?,
+            handle: sid(&from["username"]).or_else(|| sid(&v["username"])),
+            ..Author::default()
+        },
+        text: v["text"].as_str().unwrap_or_default().to_owned(),
+        at: graph_time(&v["timestamp"])?,
+        permalink: None,
+        attachments: Vec::new(),
+    })
+}
+
+/// The messages of one listed conversation that people sent `me`, newer than `floor`.
+/// Messages with no text are left out (shortcut: their attachments are not read, a webhook
+/// delivery carries them).
+fn listed_messages(conversation: &Value, me: &str, floor: DateTime<FixedOffset>) -> Vec<Fresh> {
+    let messages = conversation["messages"]["data"].as_array();
+    messages
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let (id, from) = (sid(&m["id"])?, &m["from"]);
+            let sender = sid(&from["id"]).filter(|s| s != me)?;
+            let text = m["message"].as_str().filter(|t| !t.is_empty())?;
+            let at = graph_time(&m["created_time"]).filter(|t| *t >= floor)?;
+            Some(Fresh {
+                kind: "dm",
+                remote_id: id,
+                remote_cid: None,
+                parent: None,
+                root: (None, None),
+                convo_id: Some(sender.clone()),
+                story: None,
+                button_payload: None,
+                author: Author {
+                    did: sender,
+                    display_name: sid(&from["name"]),
+                    handle: sid(&from["username"]),
+                    ..Author::default()
+                },
+                text: text.to_owned(),
+                at,
+                permalink: None,
+                attachments: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+/// Follows a Graph list through at most `pages` pages, giving `each` every entry until it says
+/// stop (`false`), the time is up or the list ends.
+async fn read_pages(
+    app: &AppState,
+    token: &str,
+    (path, query): (&str, &[(&str, &str)]),
+    (pages, deadline): (usize, Instant),
+    mut each: impl FnMut(&Value) -> bool,
+) -> Result<(), InboxError> {
+    let mut after = String::new();
+    for _ in 0..pages {
+        if Instant::now() >= deadline {
+            tracing::warn!(path, "meta backfill out of time");
+            break;
+        }
+        let mut q = query.to_vec();
+        if !after.is_empty() {
+            q.push(("after", &after));
+        }
+        let body = app.meta.history(token, path, &q).await?;
+        for entry in body["data"].as_array().into_iter().flatten() {
+            if !each(entry) {
+                return Ok(());
+            }
+        }
+        match (
+            body["paging"]["next"].is_string(),
+            sid(&body["paging"]["cursors"]["after"]),
+        ) {
+            (true, Some(next)) => after = next,
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
+/// The comments of the last days on a Facebook Page's posts (`pages_read_engagement` for the
+/// list of posts, `pages_read_user_content` for their comments).
+async fn facebook_comments(
+    app: &AppState,
+    (token, page): (&str, &str),
+    (floor, deadline): (DateTime<FixedOffset>, Instant),
+    out: &mut Vec<Fresh>,
+) -> Result<(), InboxError> {
+    let mut posts = Vec::new();
+    let feed = format!("{page}/feed");
+    let query = [("fields", "id,created_time"), ("limit", PAGE_SIZE)];
+    read_pages(app, token, (&feed, &query), (POST_PAGES, deadline), |p| {
+        // Newest first: the first post older than the window ends the list.
+        if graph_time(&p["created_time"]).is_some_and(|t| t < floor) {
+            return false;
+        }
+        posts.extend(sid(&p["id"]));
+        true
+    })
+    .await?;
+    let fields = "id,message,from,created_time,parent{id},attachment{type,url,media}";
+    for post in posts {
+        let path = format!("{post}/comments");
+        let query = [("filter", "stream"), ("fields", fields), ("limit", "100")];
+        read_pages(
+            app,
+            token,
+            (&path, &query),
+            (COMMENT_PAGES, deadline),
+            |c| {
+                out.extend(listed_facebook_comment(c, &post, page).filter(|f| f.at >= floor));
+                true
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// The comments of the last days on an Instagram account's media, replies included
+/// (`instagram_basic`, `instagram_manage_comments`).
+async fn instagram_comments(
+    app: &AppState,
+    (token, account): (&str, &str),
+    (floor, deadline): (DateTime<FixedOffset>, Instant),
+    out: &mut Vec<Fresh>,
+) -> Result<(), InboxError> {
+    let mut media = Vec::new();
+    let since = floor.timestamp().to_string();
+    let path = format!("{account}/media");
+    let query = [
+        ("fields", "id,timestamp"),
+        ("since", since.as_str()),
+        ("limit", PAGE_SIZE),
+    ];
+    read_pages(app, token, (&path, &query), (POST_PAGES, deadline), |m| {
+        media.extend(sid(&m["id"]));
+        true
+    })
+    .await?;
+    let reply = "id,text,timestamp,username,from{id,username}";
+    let fields = format!("{reply},replies{{{reply}}}");
+    for id in media {
+        let path = format!("{id}/comments");
+        let query = [("fields", fields.as_str()), ("limit", "50")];
+        read_pages(
+            app,
+            token,
+            (&path, &query),
+            (COMMENT_PAGES, deadline),
+            |c| {
+                let top = sid(&c["id"]).unwrap_or_default();
+                out.extend(listed_instagram_comment(c, &id, &id));
+                for r in c["replies"]["data"].as_array().into_iter().flatten() {
+                    out.extend(listed_instagram_comment(r, &id, &top));
+                }
+                true
+            },
+        )
+        .await?;
+    }
+    out.retain(|f| f.at >= floor);
+    Ok(())
+}
+
+/// The recent messages of a Page's conversations (`pages_messaging`) or, with `instagram`, of its
+/// linked Instagram account (`instagram_manage_messages`). Conversations come newest first, and
+/// Graph has no time filter for them: the first one untouched since `floor` ends the list.
+async fn conversations(
+    app: &AppState,
+    (token, page, me): (&str, &str, &str),
+    (instagram, floor, deadline): (bool, DateTime<FixedOffset>, Instant),
+    out: &mut Vec<Fresh>,
+) -> Result<(), InboxError> {
+    let path = format!("{page}/conversations");
+    let fields = format!(
+        "updated_time,messages.limit({CONVERSATION_MESSAGES}){{id,message,from,created_time}}"
+    );
+    let mut query = vec![("fields", fields.as_str()), ("limit", PAGE_SIZE)];
+    if instagram {
+        query.push(("platform", "instagram"));
+    }
+    let pages = (CONVERSATION_PAGES, deadline);
+    read_pages(app, token, (&path, &query), pages, |c| {
+        if graph_time(&c["updated_time"]).is_some_and(|t| t < floor) {
+            return false;
+        }
+        out.extend(listed_messages(c, me, floor));
+        true
+    })
+    .await
+}
+
+/// Reads what `account` missed in the last `inbox::FIRST_DAYS` days and stores it; how many items
+/// were new. `first`: the account was never read, so no automation may answer what is found. A section Meta refuses for a missing permission is logged and skipped, one that finds
+/// the token dead flags the account for a reconnect and ends the read.
+pub async fn backfill(
+    app: &AppState,
+    account: &social_accounts::Model,
+    first: bool,
+) -> Result<usize, DbErr> {
+    let Some(token) = inbox::secret(app, account) else {
+        return Ok(0);
+    };
+    let instagram = account.provider == "instagram";
+    let page = if instagram {
+        account.meta["page_id"].as_str().unwrap_or_default()
+    } else {
+        &account.external_id
+    };
+    let floor = (Utc::now() - Duration::days(inbox::FIRST_DAYS)).fixed_offset();
+    let deadline = Instant::now() + BACKFILL_BUDGET;
+    let mut found = Vec::new();
+    let keys = (token.as_str(), account.external_id.as_str());
+    let comments = if instagram {
+        instagram_comments(app, keys, (floor, deadline), &mut found).await
+    } else {
+        facebook_comments(app, keys, (floor, deadline), &mut found).await
+    };
+    let mut results = vec![comments];
+    if !page.is_empty() {
+        let who = (token.as_str(), page, account.external_id.as_str());
+        let window = (instagram, floor, deadline);
+        results.push(conversations(app, who, window, &mut found).await);
+    }
+    for r in results {
+        match r {
+            Ok(()) => {}
+            Err(InboxError::MetaReconnect) => {
+                let stmt = sql(
+                    "UPDATE social_accounts SET inbox_error_at = now() WHERE id = $1",
+                    vec![account.id.into()],
+                );
+                app.db.execute_raw(stmt).await?;
+                crate::expiry::flag_reconnect(&app.db, account.id).await;
+                break;
+            }
+            Err(e) => {
+                tracing::warn!(code = e.code(), account = %account.id, "meta backfill read failed")
+            }
+        }
+    }
+    // Oldest first, as a webhook would have delivered them.
+    found.sort_by_key(|f| f.at);
+    let mut added = 0;
+    let old = Utc::now() - Duration::hours(AUTOMATE_WITHIN_HOURS);
+    for event in found {
+        if is_ours(app, account, &event).await? {
+            continue;
+        }
+        let stale = first || event.at < old;
+        if let Some(item) = inbox::store(&app.db, account, event).await? {
+            added += 1;
+            if stale {
+                let stmt = sql(
+                    "UPDATE inbox_items SET automated_at = now() WHERE id = $1",
+                    vec![item.id.into()],
+                );
+                app.db.execute_raw(stmt).await?;
+            }
+        }
+    }
+    Ok(added)
+}
+
+/// One round: claims the accounts not read for an hour (or ever: a new connection), at most
+/// `BACKFILL_ACCOUNTS`, by stamping them, so a second instance skips them and a crash costs one
+/// hour. An account whose token is known dead, or whose read was refused in the last hour, waits.
+pub async fn tick(app: &AppState) -> Result<(), DbErr> {
+    let claim = sql(
+        "WITH due AS (SELECT id, meta_synced_at IS NULL AS first FROM social_accounts \
+         WHERE provider IN ('facebook', 'instagram') \
+         AND (meta_synced_at IS NULL OR meta_synced_at < now() - make_interval(mins => $1)) \
+         AND (inbox_error_at IS NULL OR inbox_error_at < now() - make_interval(mins => $1)) \
+         AND COALESCE(meta->>'reconnect', 'false') <> 'true' \
+         ORDER BY meta_synced_at NULLS FIRST LIMIT $2 FOR UPDATE SKIP LOCKED) \
+         UPDATE social_accounts a SET meta_synced_at = now() FROM due WHERE a.id = due.id \
+         RETURNING a.id, due.first",
+        vec![
+            (BACKFILL_EVERY_MINUTES as i32).into(),
+            BACKFILL_ACCOUNTS.into(),
+        ],
+    );
+    for row in app.db.query_all_raw(claim).await? {
+        let id: Uuid = row.try_get("", "id")?;
+        let first: bool = row.try_get("", "first")?;
+        let Some(account) = social_accounts::Entity::find_by_id(id).one(&app.db).await? else {
+            continue;
+        };
+        match backfill(app, &account, first).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(account = %id, items = n, "meta backfill stored items"),
+            Err(e) => tracing::error!(error = %e, account = %id, "meta backfill failed"),
+        }
+    }
+    Ok(())
+}
+
 /// Sends `text` for `item` from a Facebook or Instagram `account`, once: a public reply under
 /// a comment, a private reply to a comment (a `Dm` for a comment: within 7 days, one per
 /// comment), or a DM to a person who wrote within 24 hours. `buttons` go with a DM as quick
@@ -557,5 +935,47 @@ mod tests {
         assert_eq!(got[0].author.handle.as_deref(), Some("jane"));
         assert_eq!(got[0].at.timestamp(), 1_700_000_000);
         assert!(events("page", &entry).is_empty());
+    }
+
+    #[test]
+    fn listed_comments_and_messages_become_items() {
+        let c = json!({"id": "101_9_5", "message": "hi", "created_time": "2026-11-20T10:00:00+0000",
+            "from": {"id": "777", "name": "Ada"}, "parent": {"id": "101_9_4"},
+            "attachment": {"type": "photo", "media": {"image": {"src": "https://x.example/a.jpg"}}}});
+        let got = listed_facebook_comment(&c, "101_9", "101").unwrap();
+        assert_eq!(got.parent.as_deref(), Some("101_9_4"));
+        assert_eq!(got.root.0.as_deref(), Some("101_9"));
+        assert_eq!(got.author.display_name.as_deref(), Some("Ada"));
+        assert_eq!(got.at.timestamp(), 1_795_168_800);
+        assert_eq!(got.attachments.len(), 1);
+        // A top-level comment answers the post; the Page's own and nameless ones are left out.
+        let top =
+            json!({"id": "1", "from": {"id": "7"}, "created_time": "2026-11-20T10:00:00+0000"});
+        let top = listed_facebook_comment(&top, "101_9", "101").unwrap();
+        assert_eq!(top.parent.as_deref(), Some("101_9"));
+        let own =
+            json!({"id": "2", "from": {"id": "101"}, "created_time": "2026-11-20T10:00:00+0000"});
+        assert!(listed_facebook_comment(&own, "101_9", "101").is_none());
+        let nameless = json!({"id": "3", "created_time": "2026-11-20T10:00:00+0000"});
+        assert!(listed_facebook_comment(&nameless, "101_9", "101").is_none());
+
+        let ig = json!({"id": "c1", "text": "nice", "timestamp": "2026-11-20T10:00:00+0000",
+            "username": "jane", "from": {"id": "555"}});
+        let got = listed_instagram_comment(&ig, "m9", "c0").unwrap();
+        assert_eq!(got.parent.as_deref(), Some("c0"));
+        assert_eq!(got.author.did, "555");
+        assert_eq!(got.author.handle.as_deref(), Some("jane"));
+
+        let floor = DateTime::parse_from_rfc3339("2026-11-19T00:00:00+00:00").unwrap();
+        let convo = json!({"messages": {"data": [
+            {"id": "m1", "message": "hello", "created_time": "2026-11-20T10:00:00+0000",
+                "from": {"id": "777", "name": "Ada"}},
+            {"id": "m2", "message": "ours", "created_time": "2026-11-20T10:01:00+0000", "from": {"id": "101"}},
+            {"id": "m3", "message": "", "created_time": "2026-11-20T10:02:00+0000", "from": {"id": "777"}},
+            {"id": "m4", "message": "old", "created_time": "2026-11-01T10:00:00+0000", "from": {"id": "777"}}]}});
+        let got = listed_messages(&convo, "101", floor);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].remote_id, "m1");
+        assert_eq!(got[0].convo_id.as_deref(), Some("777"));
     }
 }
