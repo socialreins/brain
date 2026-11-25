@@ -929,3 +929,33 @@ async fn automations_on_youtube_are_comment_triggers_with_public_replies_only() 
     assert_eq!(sent[0].1["snippet"]["parentId"], "UgxTHREAD9");
     assert_eq!(sent[0].1["snippet"]["textOriginal"], "Thanks dan!");
 }
+
+#[tokio::test]
+#[serial]
+async fn a_dm_step_of_an_unscoped_automation_is_skipped_on_youtube_and_nothing_is_sent() {
+    let e = env(false).await;
+    // No account list: it is saved, and a YouTube comment meets a DM it can never send.
+    let body = json!({"name": "Welcome", "trigger": "comment_received",
+        "actions": [{"type": "send_dm", "text": "hi"}]});
+    let res = e.act_on("/v1/automations", body).await;
+    assert_eq!(res.status_code(), 201, "{}", res.text());
+    let id = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+    e.read_in().await;
+    e.mock.pages.lock().unwrap()[0].1["items"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, thread("UgxTHREAD8", "eve", "fresh", 0, vec![], 0));
+    e.tick().await;
+    assert!(e.mock.seen("POST", "/youtube/v3/comments").is_empty());
+    let runs =
+        e.s.get(&format!("/v1/automations/{id}/runs"))
+            .add_header("cookie", e.cookie.clone())
+            .await
+            .json::<Value>();
+    let run = &runs["runs"][0];
+    assert_eq!(
+        (run["status"].clone(), run["reason"].clone()),
+        (json!("skipped"), json!("youtube_no_dm")),
+        "{runs}"
+    );
+}

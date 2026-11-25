@@ -2413,7 +2413,9 @@ fn outcome(kind: &str, sent: Result<Result<String, InboxError>, DbErr>) -> Actio
             e @ (InboxError::DmNotAllowed
             | InboxError::NoDmAccess
             | InboxError::RateLimited
-            | InboxError::Invalid("outside_window" | "already_replied" | "dm_unavailable")),
+            | InboxError::Invalid(
+                "outside_window" | "already_replied" | "dm_unavailable" | "youtube_no_dm",
+            )),
         )) => ("skipped", Some(e.code().to_owned()), None),
         Ok(Err(e)) => ("failed", Some(e.code().to_owned()), None),
         Err(e) => {
@@ -2775,6 +2777,10 @@ async fn ai_send(
     prompt: &str,
     reference: &str,
 ) -> ActionResult {
+    // YouTube has no DM: skip before the AI call is paid for.
+    if via == Via::Dm && account.provider == "youtube" {
+        return outcome(kind, Ok(Err(InboxError::Invalid("youtube_no_dm"))));
+    }
     let written = match ai_write(app, account, item, (kind, via, prompt), reference).await {
         Ok(w) => w,
         Err(ended) => return ended,
