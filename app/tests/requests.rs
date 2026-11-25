@@ -27415,10 +27415,50 @@ mod teams {
                     &format!("/v1/inbox-items/{id}/reply"),
                     &cookie,
                 )
-                .json(&json!({"text": "Live test reply, deleted right after"}))
+                .json(&json!({"text": format!("Live test reply to myself @{handle} #livetest, deleted right after")}))
                 .await;
                 assert_eq!(sent.status_code(), 201, "{}", sent.text());
                 let reply = sent.json::<Value>()["replies"][0].clone();
+                // The mention and the tag went out as facets: read the record back.
+                let rkey = reply["remote_url"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_owned();
+                let mut record = Value::Null;
+                for _ in 0..4 {
+                    let got = web
+                        .get(format!("{pds}/xrpc/com.atproto.repo.getRecord"))
+                        .query(&[
+                            ("repo", did.as_str()),
+                            ("collection", "app.bsky.feed.post"),
+                            ("rkey", rkey.as_str()),
+                        ])
+                        .send()
+                        .await;
+                    if let Ok(got) = got {
+                        record = got.json().await.unwrap_or(Value::Null);
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                }
+                let features: Vec<String> = record["value"]["facets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|f| f["features"][0]["$type"].as_str().unwrap().to_owned())
+                    .collect();
+                assert_eq!(
+                    features,
+                    [
+                        "app.bsky.richtext.facet#mention",
+                        "app.bsky.richtext.facet#tag"
+                    ],
+                    "{record}"
+                );
+                assert_eq!(record["value"]["facets"][0]["features"][0]["did"], did);
                 let res = act(
                     json!({"action": "delete_reply", "confirm": true, "reply_id": reply["id"]}),
                 )
