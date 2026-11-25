@@ -199,7 +199,22 @@ cargo run -p socialreins-brain
   advisory lock) takes due runs up through `resume_due`, whose one statement moves them back to
   `running`. Never send a step without claiming it, and never retry one. Every claim and park
   checks `UNCHANGED` (the flow is on and has the steps the run started on, `steps_hash`). A quick reply click is
-  a `dm` item with `button_payload` (`trigger_of`: `button_clicked`, never `dm_received`).
+  a `dm` item with `button_payload` (`trigger_of`: `button_clicked`, never `dm_received`). A Bluesky like or
+  repost of one of our posts is a `like` or `repost` item (stored `done`, no contact), which runs
+  `like_received` and `repost_received` (`post_remote_ids` limits them to a post); nobody is behind them to
+  message or tag, so `validate` refuses sends and tags there.
+- `app/src/automation_effects.rs`: `like_comment` (on Bluesky; Facebook's is Meta moderation), `repost_comment` and
+  `follow_back` on Bluesky go through `bluesky_actions::perform`, so the inbox buttons' own live-state check and
+  refusals apply, under the buttons' per-item lock, with an `inbox_actions` row that has no `done_by`.
+  `network_limits` refuses `repost_comment` and `follow_back` for an account list with no Bluesky account
+  (`bluesky_only_action`), `dry_run::effect_step` mirrors them: keep both in step.
+- `app/src/automation_misses.rs`: why an automation did not run on an item, `automation_misses` (one row per
+  automation and item: the failed condition codes, `wrong_trigger`, `not_yet_on`, `followed_before`,
+  `no_public_page`, `stopped_by_other`). Writing is best effort (a failed insert never stops an automation).
+  Runs held back for a safety reason are `automation_runs` rows instead (`skip_run`, `claim`), so nothing is
+  stored twice. `automations::tick` prunes every tenth minute: 14 days, and the newest 100 of each kind per
+  automation (items for another trigger, account or set are one kind apart). `GET /v1/automations/{id}/misses` and
+  `GET /v1/inbox-items/{id}/automations`.
 - `app/src/controllers/queue.rs`: posting queues. `queue_schedules` holds one row per set (an IANA
   `time_zone`, `slots` as sorted minutes of the week, weekday 0 Sunday). `queue: true` on a create
   takes `queue::pick` inside the insert's transaction, under a per-set advisory lock held until
@@ -271,11 +286,16 @@ cargo run -p socialreins-brain
   it in the transaction of anything that takes a post out of `scheduled` to publish it
   (`publish::claim`, and publish now through `publish::reserve_and`), so a post yields one copy
   at most. A copy's group id is a UUID v5 of the old one, so group mates agree without talking.
-- Team slugs (`teams.slug`, optional, set with `PATCH /v1/team`): `teams::team_by_code` is the
-  one place a request's `X-Team` or `?team=` becomes a team, by `code` or by slug. A slug never
-  equals a code (`rename` checks, `insert_team` draws again) and is unique on `lower(slug)`; the
-  code is permanent, the slug may change (5 times a day per team). One given up stops resolving at once and is
-  kept from other teams for 30 days (`team_slug_holds`, written in the same transaction).
+- Team slugs (`teams.slug`, optional): `teams::team_by_code` is the one place a request's
+  `X-Team` or `?team=` becomes a team, by `code` or by slug. A slug never equals a code (`insert_team`
+  draws again, `team_slugs::taken` refuses) and is unique on `lower(slug)`; the code is permanent. The
+  slug has its own routes in `controllers/team_slugs.rs` (`PATCH /team/slug`: owner, fresh sign-in;
+  `GET /slugs/check`; public `GET /public/team-slugs/{slug}`) and `POST /teams` takes one. A slug given
+  up (change, clear, team delete) is a `team_slug_history` row, written in the same transaction: it holds
+  the slug for other teams 90 days, feeds the web redirect for 400 days and counts the team's changes (3
+  per 30 days). `crates/core/src/team.rs` has the rules and `RESERVED_SLUGS`; the web repo's
+  `tests/unit/team-slug.test.ts` checks it covers every web route. Post notice mail links by
+  `COALESCE(slug, code)`.
 - `app/src/dry_run.rs`: `POST /v1/automations/test`, "Test this automation". It runs the real matching (`automations::mismatches`), `network_limits`, `{name}` and `{page}` filling and the AI step (`automations::ai_write`, shared with the real send, so the key choice, the monthly allowance and the checks are the same) on a sample from a stranger, and sends nothing, stores no inbox item or run and takes no daily hit. Keep it in step with `automations::run_matching` and `act` when a rule changes.
 - `app/src/x_inbox.rs` and `connectors/x/inbox.rs`: the X inbox. X has no webhooks we can use and
   bills every read (pay-per-use credits), so it is opt-in per account (`x_inbox.enabled`, off by

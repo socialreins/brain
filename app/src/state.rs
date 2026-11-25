@@ -61,6 +61,11 @@ pub struct AppState {
     pub contact_limiter: Arc<RateLimiter>,
     /// Per-IP limit on `GET /v1/public/pages/{code}`.
     pub page_limiter: Arc<RateLimiter>,
+    /// Per user limit on `GET /v1/slugs/check`, which a form calls while someone types.
+    pub slug_check_limiter: Arc<RateLimiter<uuid::Uuid>>,
+    /// Per-IP limit on `GET /v1/public/team-slugs/{slug}`. Generous: the web app asks for
+    /// every visitor of an unknown team address, from one address.
+    pub slug_lookup_limiter: Arc<RateLimiter>,
     /// Per-IP limit on `POST /v1/public/newsletter/unsubscribe`. Generous: a mail provider
     /// posts its readers' one-click unsubscribes from few addresses.
     pub unsubscribe_limiter: Arc<RateLimiter>,
@@ -126,6 +131,8 @@ impl AppState {
                 crate::rate_limit::MAX_KEYS,
             )),
             page_limiter: Arc::new(RateLimiter::per_minute(120)),
+            slug_check_limiter: Arc::new(RateLimiter::per_minute(120)),
+            slug_lookup_limiter: Arc::new(RateLimiter::per_minute(600)),
             unsubscribe_limiter: Arc::new(RateLimiter::per_minute(120)),
             admin_emails: config.admin_emails.clone(),
             review_login_token: config.review_login_token.clone(),

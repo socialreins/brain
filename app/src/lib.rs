@@ -1,4 +1,6 @@
 pub mod ai;
+pub mod automation_effects;
+pub mod automation_misses;
 pub mod automations;
 pub mod billing;
 pub mod bluesky_actions;
@@ -14,6 +16,7 @@ pub mod mail;
 pub mod mcp;
 pub mod media;
 pub mod meta_inbox;
+pub mod meta_rules;
 pub mod metrics;
 pub mod models;
 pub mod newsletters;
