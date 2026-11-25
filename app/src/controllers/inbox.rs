@@ -1118,7 +1118,7 @@ pub struct ThreadContext {
 
 /// What a comment, mention, like or repost sits under, read from Bluesky as the account sees
 /// it: the parent post and the earlier replies above it. `422 not_a_thread` for a DM or a
-/// follow, `422 post_unavailable` when the post is gone, and the other send errors (`429`,
+/// follow, `422 post_unavailable` when the post is gone, blocked or hidden, `429 rate_limited` past 60 reads a minute per user, and the other send errors (`429`,
 /// `reconnect_required`) when Bluesky cannot be read.
 #[utoipa::path(get, path = "/inbox-items/{id}/thread", tag = "inbox",
     params(("id" = Uuid, Path)),
@@ -1139,6 +1139,9 @@ async fn thread(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) ->
     let Some(uri) = uri.filter(|_| item.platform == "bluesky") else {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "not_a_thread");
     };
+    if !app.thread_limiter.hit(t.current.0.id) {
+        return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    }
     let account = match social_accounts::Entity::find_by_id(item.social_account_id)
         .one(&app.db)
         .await

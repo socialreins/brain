@@ -1278,6 +1278,10 @@ impl Bluesky {
                 InboxError::Refused { ref code, .. } if code == "NotFound" => InboxError::PostGone,
                 e => e,
             })?;
+        // The post itself is blocked, hidden or gone: nothing to show.
+        if got["thread"]["$type"] != "app.bsky.feed.defs#threadViewPost" {
+            return Err(InboxError::PostGone);
+        }
         Ok(thread_above(&got["thread"], with_post))
     }
 

@@ -24748,7 +24748,7 @@ mod teams {
             #[serial]
             async fn likes_and_reposts_are_quiet_and_items_show_their_thread() {
                 let (s, db, state) = on_mock().await;
-                let (cookie, _, account, me) = owner(&s, &db).await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
                 let root = format!("at://{me}/app.bsky.feed.post/root");
                 let c1 = "at://did:plc:fan1/app.bsky.feed.post/c1";
                 let root_key = root.as_str();
@@ -24847,6 +24847,40 @@ mod teams {
                     .await;
                 assert_eq!(res.status_code(), 422);
                 assert_eq!(res.json::<Value>()["error"], "not_a_thread");
+                // Likers are not contacts; people who wrote are.
+                let contacts = |who: &str| {
+                    let stmt = sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Postgres,
+                        "SELECT count(*) AS n FROM contacts WHERE external_id = $1 \
+                         AND team_id = $2",
+                        [
+                            who.to_owned().into(),
+                            team_id.parse::<uuid::Uuid>().unwrap().into(),
+                        ],
+                    );
+                    let db = db.clone();
+                    async move {
+                        sea_orm::ConnectionTrait::query_one_raw(&db, stmt)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .try_get::<i64>("", "n")
+                            .unwrap()
+                    }
+                };
+                assert_eq!(contacts("did:plc:fan3").await, 0);
+                assert_eq!(contacts("did:plc:fan1").await, 1);
+                // A comment that was blocked or deleted meanwhile has no thread to show.
+                set_inbox(
+                    &me,
+                    json!({"threads": {c1: {"$type": "app.bsky.feed.defs#blockedPost"}}}),
+                );
+                let res = s
+                    .get(&format!("/v1/inbox-items/{comment}/thread"))
+                    .add_header("cookie", &cookie)
+                    .await;
+                assert_eq!(res.status_code(), 422);
+                assert_eq!(res.json::<Value>()["error"], "post_unavailable");
                 set_inbox(&me, json!({"threads": {}}));
                 let res = s
                     .get(&format!("/v1/inbox-items/{comment}/thread"))
@@ -25400,6 +25434,9 @@ mod teams {
                 exec(&db, &sql).await;
                 let orphans = || async {
                     inbox_items::Entity::find()
+                        .filter(
+                            inbox_items::Column::TeamId.eq(team_id.parse::<uuid::Uuid>().unwrap()),
+                        )
                         .filter(inbox_items::Column::ContactId.is_null())
                         .count(&db)
                         .await

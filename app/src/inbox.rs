@@ -573,9 +573,10 @@ fn clip(text: &str) -> String {
 // The author's contact is upserted in the same statement, so an item never lacks one. The
 // contact keeps the handle, name and avatar of its newest item (`$17`, when it came) that gave
 // one, so an old item read late or delivered again changes none of them; it stores nothing.
+// A like or repost makes no contact: people who only liked are not people who wrote to us.
 const INSERT: &str = "WITH c AS (INSERT INTO contacts AS k (id, team_id, platform, external_id, \
     handle, display_name, avatar_url, first_seen_at, last_seen_at) \
-    VALUES ($24, $2, $4, $12, $13, $14, $15, $17, $17) \
+    SELECT $24, $2, $4, $12, $13, $14, $15, $17, $17 WHERE $5 NOT IN ('like', 'repost') \
     ON CONFLICT (team_id, platform, external_id) DO UPDATE SET \
     handle = CASE WHEN $17 < k.last_seen_at THEN COALESCE(k.handle, $13) \
         ELSE COALESCE($13, k.handle) END, \
