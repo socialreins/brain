@@ -74,7 +74,9 @@ mod m20261231_000001_meta_synced;
 mod m20270101_000001_inbox_moderation;
 mod m20270102_000001_automation_safety;
 mod m20270103_000001_team_slug_history;
+mod m20270103_000001_wait_for_reply;
 mod m20270103_000001_youtube_inbox;
+mod m20270104_000001_run_retries;
 
 pub struct Migrator;
 
@@ -124,6 +126,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261202_000001_feeds::Migration),
             Box::new(m20261203_000001_automation_flows::Migration),
             Box::new(m20261204_000001_team_slug::Migration),
+            Box::new(m20270103_000001_team_slug_history::Migration),
             Box::new(m20261205_000001_contacts::Migration),
             Box::new(m20261206_000001_post_metrics::Migration),
             Box::new(m20261207_000001_inbox_conversations::Migration),
@@ -155,8 +158,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20261231_000001_meta_synced::Migration),
             Box::new(m20270101_000001_inbox_moderation::Migration),
             Box::new(m20270102_000001_automation_safety::Migration),
+            Box::new(m20270103_000001_wait_for_reply::Migration),
+            Box::new(m20270104_000001_run_retries::Migration),
             Box::new(m20270103_000001_youtube_inbox::Migration),
-            Box::new(m20270103_000001_team_slug_history::Migration),
             // inject-above (do not remove this comment)
         ]
     }
