@@ -820,6 +820,12 @@ pub enum InboxError {
     /// The recipient's settings do not take DMs from this account.
     DmNotAllowed,
     RateLimited,
+    /// The post's author blocks this account: a reply would be hidden.
+    BlockedByAuthor,
+    /// The post's thread does not take replies from this account (its threadgate).
+    RepliesDisabled,
+    /// The post is gone, or Bluesky does not show it to this account.
+    PostGone,
     /// Bluesky answered with an error; `code` is a scrubbed XRPC error name.
     Refused {
         status: u16,
@@ -845,6 +851,9 @@ impl InboxError {
             Self::NoDmAccess => "no_dm_access",
             Self::DmNotAllowed => "dm_not_allowed",
             Self::RateLimited => "rate_limited",
+            Self::BlockedByAuthor => "blocked_by_author",
+            Self::RepliesDisabled => "replies_disabled",
+            Self::PostGone => "post_unavailable",
             Self::Refused { .. } => "bluesky_refused",
             Self::Unreachable => "bluesky_unreachable",
             Self::Invalid(code) => code,
@@ -869,6 +878,15 @@ impl InboxError {
                                    messages from this account."
                 .into(),
             Self::RateLimited => "The platform is rate limiting this account.".into(),
+            Self::BlockedByAuthor => "The author of this post blocks this account, so a reply \
+                                      would not show. Nothing was sent."
+                .into(),
+            Self::RepliesDisabled => "This thread does not take replies from this account \
+                                      (its author limited who can reply). Nothing was sent."
+                .into(),
+            Self::PostGone => "The post was deleted, or Bluesky does not show it to this \
+                               account. Nothing was sent."
+                .into(),
             Self::Refused { code, .. } => format!("Bluesky refused it ({code})."),
             Self::Unreachable => "Bluesky could not be reached.".into(),
             Self::Invalid("outside_window") => "Meta only takes this message within 24 hours of \
@@ -1054,6 +1072,9 @@ pub struct Message {
 pub struct Notifications {
     pub found: Vec<Notification>,
     pub next: Option<String>,
+    /// Why a later page failed: `found` keeps what the earlier pages gave and `next` is the
+    /// page that failed, so the next tick carries on from it.
+    pub stopped: Option<InboxError>,
 }
 
 /// What `Bluesky::messages` read. `resume` is set when it stopped early (`newest` is then
@@ -1063,6 +1084,9 @@ pub struct Messages {
     pub found: Vec<Message>,
     pub newest: Option<DateTime<FixedOffset>>,
     pub resume: Option<DateTime<FixedOffset>>,
+    /// Why a later conversation failed: `found` keeps what the earlier ones gave and `resume`
+    /// is the last one read.
+    pub stopped: Option<InboxError>,
 }
 
 fn now_secs() -> i64 {
@@ -1177,6 +1201,27 @@ impl Bluesky {
         Ok(got["posts"].as_array().cloned().unwrap_or_default())
     }
 
+    /// Whether a reply to `post` would show: Bluesky still serves it, its author does not block
+    /// this account and its thread takes replies from it. Nothing is sent either way. A check
+    /// that cannot be made (an outage, an unknown post view) lets the reply try.
+    pub async fn can_reply(&self, c: &Creds<'_>, post: &str) -> Result<(), InboxError> {
+        let got = match self.posts(c, &[post]).await {
+            Ok(got) => got,
+            Err(e @ (InboxError::Reconnect | InboxError::RateLimited)) => return Err(e),
+            Err(_) => return Ok(()),
+        };
+        let Some(p) = got.first() else {
+            return Err(InboxError::PostGone);
+        };
+        if p["author"]["viewer"]["blockedBy"] == true {
+            return Err(InboxError::BlockedByAuthor);
+        }
+        if p["viewer"]["replyDisabled"] == true {
+            return Err(InboxError::RepliesDisabled);
+        }
+        Ok(())
+    }
+
     /// Replies, mentions and follows newer than `since`, newest first, from the page `resume`
     /// names (none: the newest). Stops after `MAX_NOTIFICATIONS` items, `MAX_NOTIFICATION_PAGES`
     /// pages or when `deadline` has passed (always after at least one page), and then gives the
@@ -1202,9 +1247,21 @@ impl Bluesky {
             if let Some(c) = &cursor {
                 query.push(("cursor", c));
             }
-            let page = self
+            let page = match self
                 .xrpc(c, "app.bsky.notification.listNotifications", &query, None)
-                .await?;
+                .await
+            {
+                Ok(page) => page,
+                // A later page that fails (429, 5xx) must not drop the earlier ones.
+                Err(e) if pages > 0 => {
+                    return Ok(Notifications {
+                        found,
+                        next: cursor,
+                        stopped: Some(e),
+                    })
+                }
+                Err(e) => return Err(e),
+            };
             let list = page["notifications"]
                 .as_array()
                 .cloned()
@@ -1212,7 +1269,11 @@ impl Bluesky {
             (read, pages) = (read + list.len(), pages + 1);
             for n in &list {
                 if time(&n["indexedAt"]).is_some_and(|t| t <= since) {
-                    return Ok(Notifications { found, next: None });
+                    return Ok(Notifications {
+                        found,
+                        next: None,
+                        stopped: None,
+                    });
                 }
                 found.extend(notification(n));
             }
@@ -1220,7 +1281,11 @@ impl Bluesky {
             cursor = page["cursor"].as_str().map(str::to_owned);
             // A cursor that does not move would keep the round open for ever.
             if list.is_empty() || cursor.is_none() || cursor == before {
-                return Ok(Notifications { found, next: None });
+                return Ok(Notifications {
+                    found,
+                    next: None,
+                    stopped: None,
+                });
             }
             // Counted in pages and time too: a server the account owner runs could answer one
             // item a page, slowly, for ever, and the inbox tick waits on every account.
@@ -1231,6 +1296,7 @@ impl Bluesky {
                 return Ok(Notifications {
                     found,
                     next: cursor,
+                    stopped: None,
                 });
             }
         }
@@ -1287,6 +1353,8 @@ impl Bluesky {
         let newest = fresh.last().map(|(_, last)| *last);
         let mut found = Vec::new();
         let mut done: Option<DateTime<FixedOffset>> = None;
+        // The latest time read that is earlier than `done`: where a failure may resume.
+        let mut below: Option<DateTime<FixedOffset>> = None;
         let mut read = 0;
         for (convo, last) in fresh {
             if resume.is_some_and(|r| last <= r) {
@@ -1301,15 +1369,34 @@ impl Bluesky {
                     found,
                     newest: None,
                     resume: done,
+                    stopped: None,
                 });
             }
             let Some(id) = convo["id"].as_str() else {
                 continue;
             };
             let q = [("convoId", id), ("limit", "50")];
-            let msgs = self
-                .xrpc(c, "chat.bsky.convo.getMessages", &q, None)
-                .await?;
+            let msgs = match self.xrpc(c, "chat.bsky.convo.getMessages", &q, None).await {
+                Ok(m) => m,
+                // The conversations read before this one keep their messages. `resume` must
+                // sit below this one's time (it skips what is at or before it), so one that
+                // shares the time of the last read is read again, which stores nothing twice.
+                Err(e) => {
+                    let resume = if done == Some(last) { below } else { done };
+                    return match resume {
+                        Some(_) => Ok(Messages {
+                            found,
+                            newest: None,
+                            resume,
+                            stopped: Some(e),
+                        }),
+                        None => Err(e),
+                    };
+                }
+            };
+            if done.is_some_and(|d| d < last) {
+                below = done;
+            }
             (done, read) = (Some(last), read + 1);
             let members = convo["members"].as_array().cloned().unwrap_or_default();
             // Newer conversations first, like the messages inside one.
@@ -1343,6 +1430,7 @@ impl Bluesky {
             found,
             newest,
             resume: None,
+            stopped: None,
         })
     }
 
