@@ -80,6 +80,11 @@ const UNCHANGED: &str = "r.steps_hash = md5($4::jsonb::text) AND EXISTS (SELECT 
     FROM automations a WHERE a.id = r.automation_id AND a.active \
     AND md5(a.steps::text) = r.steps_hash)";
 const CHANGED: &str = "automation_changed";
+/// Runs stored `skipped` for a safety reason (`paused`, `own_account`, `connected_account`,
+/// `cooldown`, `automation_cap`, or the team's `daily_cap`) did nothing: they are not an author's first run and never count
+/// toward a cool-down or an automation's cap. SQL on a run aliased `r`.
+const NOT_ACTED: &str = "(r.status = 'skipped' AND COALESCE(r.reason, '') IN ('paused', \
+    'own_account', 'connected_account', 'cooldown', 'automation_cap', 'daily_cap'))";
 /// Longest `{name}` put into a text.
 pub(crate) const MAX_NAME_CHARS: usize = 64;
 /// What `{page}` counts as when a text is checked.
@@ -783,16 +788,10 @@ async fn run_matching(
     if autos.is_empty() || item.received_at < account.created_at {
         return Ok(());
     }
-    // Comments by the team's own accounts never run them either, so two automated accounts
-    // cannot answer each other in a loop.
-    let own = social_accounts::Entity::find()
-        .filter(social_accounts::Column::TeamId.eq(item.team_id))
-        .filter(social_accounts::Column::ExternalId.eq(&item.author_id))
-        .one(db)
-        .await?;
-    if own.is_some() {
-        return Ok(());
-    }
+    // Nothing runs on an item by a connected account (the team's own, or another team's), so
+    // two automated accounts cannot answer each other in a loop, and nothing runs while the team
+    // has paused its automations. Each automation that would have run stores why it did not.
+    let guard = loop_guard(db, item, account).await?;
     // A follower is welcomed once per account ever: an unfollow and a new follow stores a new
     // item (a new record) but runs nothing.
     if item.kind == "follow" {
@@ -826,9 +825,12 @@ async fn run_matching(
         };
         let first = if cond.first_per_author {
             let stmt = sql(
-                "SELECT NOT EXISTS (SELECT 1 FROM automation_runs r \
-                 JOIN inbox_items i ON i.id = r.inbox_item_id \
-                 WHERE r.automation_id = $1 AND i.author_id = $2 AND i.id <> $3) AS ok",
+                &format!(
+                    "SELECT NOT EXISTS (SELECT 1 FROM automation_runs r \
+                     JOIN inbox_items i ON i.id = r.inbox_item_id \
+                     WHERE r.automation_id = $1 AND i.author_id = $2 AND i.id <> $3 \
+                     AND NOT {NOT_ACTED}) AS ok"
+                ),
                 vec![a.id.into(), item.author_id.clone().into(), item.id.into()],
             );
             match db.query_one_raw(stmt).await? {
@@ -896,6 +898,16 @@ async fn run_matching(
         let sends = steps
             .as_ref()
             .is_none_or(|s| s.first().is_some_and(|x| x.sends().is_some()));
+        // Read for each automation, so a pause during the round holds the rest back.
+        let held = match guard {
+            Some(why) => Some(why),
+            None if team_paused(db, item.team_id).await? => Some("paused"),
+            None => None,
+        };
+        if let Some(why) = held {
+            skip_run(db, &a, item, why).await?;
+            continue;
+        }
         let once = cond.first_per_author;
         let Some(run_id) = claim(db, &a, item, steps.is_some(), sends, once).await? else {
             continue;
@@ -917,6 +929,62 @@ async fn run_matching(
         finish(db, run_id, results).await?;
     }
     Ok(())
+}
+
+/// Why a connected account's item runs nothing: `own_account` when its author is another account
+/// of the item's team, `connected_account` when it is an account of any other team.
+async fn loop_guard(
+    db: &DatabaseConnection,
+    item: &inbox_items::Model,
+    account: &social_accounts::Model,
+) -> Result<Option<&'static str>, DbErr> {
+    let teams: Vec<Uuid> = social_accounts::Entity::find()
+        .select_only()
+        .column(social_accounts::Column::TeamId)
+        .filter(social_accounts::Column::Provider.eq(&account.provider))
+        .filter(social_accounts::Column::ExternalId.eq(&item.author_id))
+        .into_tuple()
+        .all(db)
+        .await?;
+    Ok(match teams.contains(&item.team_id) {
+        true => Some("own_account"),
+        false if !teams.is_empty() => Some("connected_account"),
+        false => None,
+    })
+}
+
+/// Whether the team has paused all its automations (`teams.automations_paused`).
+pub(crate) async fn team_paused(db: &impl ConnectionTrait, team: Uuid) -> Result<bool, DbErr> {
+    let stmt = sql(
+        "SELECT automations_paused AS paused FROM teams WHERE id = $1",
+        vec![team.into()],
+    );
+    match db.query_one_raw(stmt).await? {
+        Some(r) => r.try_get("", "paused"),
+        None => Ok(false),
+    }
+}
+
+/// Stores a run that did nothing, `skipped` for a safety `reason` the run log shows. Once per
+/// automation and item.
+async fn skip_run(
+    db: &DatabaseConnection,
+    a: &automations::Model,
+    item: &inbox_items::Model,
+    reason: &str,
+) -> Result<(), DbErr> {
+    let stmt = sql(
+        "INSERT INTO automation_runs (id, automation_id, inbox_item_id, team_id, status, reason) \
+         VALUES ($1, $2, $3, $4, 'skipped', $5) ON CONFLICT (automation_id, inbox_item_id) DO NOTHING",
+        vec![
+            Uuid::now_v7().into(),
+            a.id.into(),
+            item.id.into(),
+            a.team_id.into(),
+            reason.into(),
+        ],
+    );
+    db.execute_raw(stmt).await.map(|_| ())
 }
 
 /// A flow's run in progress.
@@ -1249,6 +1317,12 @@ pub async fn resume(app: &AppState, run: &automation_runs::Model) -> Result<(), 
         Some(post) if holds => pages::address(db, &app.web_url, item.team_id, post).await?,
         _ => None,
     };
+    // A paused team's waiting runs end here: nothing goes out while it is paused. They sent
+    // before they waited, so unlike a run held back at the start they count as having run.
+    if team_paused(db, a.team_id).await? {
+        let why = Some("paused_waiting".into());
+        return settle(db, run.id, "skipped", why, &results).await;
+    }
     // Also where a run ends whose automation was switched off or given other steps since.
     if !claim_step(db, run.id, &a, i, next.sends().is_some(), &results).await? {
         return Ok(());
@@ -1288,9 +1362,12 @@ async fn claim(
         );
         txn.execute_raw(held).await?;
         let taken = sql(
-            "SELECT EXISTS (SELECT 1 FROM automation_runs r \
-             JOIN inbox_items i ON i.id = r.inbox_item_id \
-             WHERE r.automation_id = $1 AND i.author_id = $2 AND i.id <> $3) AS taken",
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM automation_runs r \
+                 JOIN inbox_items i ON i.id = r.inbox_item_id \
+                 WHERE r.automation_id = $1 AND i.author_id = $2 AND i.id <> $3 \
+                 AND NOT {NOT_ACTED}) AS taken"
+            ),
             vec![a.id.into(), item.author_id.clone().into(), item.id.into()],
         );
         let taken: bool = match txn.query_one_raw(taken).await? {
@@ -1317,6 +1394,15 @@ async fn claim(
     if txn.execute_raw(stmt).await?.rows_affected() != 1 {
         return Ok(None);
     }
+    if let Some(why) = limited(&txn, a, item, id).await? {
+        let stmt = sql(
+            "UPDATE automation_runs SET status = 'skipped', reason = $2 WHERE id = $1",
+            vec![id.into(), why.into()],
+        );
+        txn.execute_raw(stmt).await?;
+        txn.commit().await?;
+        return Ok(None);
+    }
     let cap = [(quota_bucket(a.team_id), RUNS_PER_DAY)];
     if sends && reserve_in(&txn, &cap).await?.is_none() {
         let stmt = sql(
@@ -1329,6 +1415,71 @@ async fn claim(
     }
     txn.commit().await?;
     Ok(Some(id))
+}
+
+/// Why run `id` of `a` (just inserted, in `txn`) must not act: `cooldown` when the automation
+/// already ran for the same author within its `cooldown_minutes`, `automation_cap` when it already
+/// ran `daily_cap` times in 24 hours. Each is checked under a lock, so two items at once cannot
+/// both get past it.
+async fn limited(
+    txn: &impl ConnectionTrait,
+    a: &automations::Model,
+    item: &inbox_items::Model,
+    id: Uuid,
+) -> Result<Option<&'static str>, DbErr> {
+    let exists = |sql_text: &str, values: Vec<Value>| {
+        let stmt = sql(sql_text, values);
+        async move {
+            let row = txn.query_one_raw(stmt).await?;
+            row.map_or(Ok(false), |r| r.try_get("", "hit"))
+        }
+    };
+    if let Some(minutes) = a.cooldown_minutes {
+        let lock = sql(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1::text || ':' || $2, 0))",
+            vec![a.id.into(), item.author_id.clone().into()],
+        );
+        txn.execute_raw(lock).await?;
+        let hit = exists(
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM automation_runs r \
+                 JOIN inbox_items i ON i.id = r.inbox_item_id \
+                 WHERE r.automation_id = $1 AND i.author_id = $2 AND r.id <> $3 \
+                 AND r.created_at > now() - make_interval(mins => $4) \
+                 AND NOT {NOT_ACTED}) AS hit"
+            ),
+            vec![
+                a.id.into(),
+                item.author_id.clone().into(),
+                id.into(),
+                (minutes).into(),
+            ],
+        )
+        .await?;
+        if hit {
+            return Ok(Some("cooldown"));
+        }
+    }
+    if let Some(cap) = a.daily_cap {
+        let lock = sql(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 1))",
+            vec![a.id.into()],
+        );
+        txn.execute_raw(lock).await?;
+        let hit = exists(
+            &format!(
+                "SELECT count(*) >= $3 AS hit FROM automation_runs r \
+                 WHERE r.automation_id = $1 AND r.id <> $2 \
+                 AND r.created_at > now() - interval '1 day' AND NOT {NOT_ACTED}"
+            ),
+            vec![a.id.into(), id.into(), i64::from(cap).into()],
+        )
+        .await?;
+        if hit {
+            return Ok(Some("automation_cap"));
+        }
+    }
+    Ok(None)
 }
 
 /// One action's outcome, as stored in a run's `results`.

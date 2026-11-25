@@ -99,7 +99,8 @@ pub struct Outcome {
     /// live page: the automation does not run, so there are no steps), and the rules of
     /// `network_limits` for the account's network (`meta_one_private_reply`,
     /// `meta_reply_window`, `x_unsupported_trigger`, `bluesky_unsupported_trigger`; the steps are
-    /// still listed, as a run would go as far as it can).
+    /// still listed, as a run would go as far as it can), and `paused` (the team paused its
+    /// automations: no steps).
     pub blocks: Vec<String>,
     pub steps: Vec<PlannedStep>,
 }
@@ -332,6 +333,11 @@ pub async fn test(
         out.blocks.push("no_public_page".into());
     }
     if out.blocks.iter().any(|b| b == "no_public_page") {
+        return Ok(out);
+    }
+    // A paused team sends nothing, so there is nothing to show beyond the reason.
+    if rules::team_paused(db, item.team_id).await? {
+        out.blocks.push("paused".into());
         return Ok(out);
     }
     let room = cap_room(db, item.team_id).await?;

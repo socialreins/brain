@@ -26,6 +26,10 @@ pub struct Model {
     pub steps: Option<Json>,
     #[sea_orm(column_type = "Text", nullable)]
     pub fallback_public_reply: Option<String>,
+    /// Minutes before it answers the same person again; null: no cool-down.
+    pub cooldown_minutes: Option<i32>,
+    /// Most runs of this automation in a day; null: only the team's cap.
+    pub daily_cap: Option<i32>,
     pub created_by: Option<Uuid>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,

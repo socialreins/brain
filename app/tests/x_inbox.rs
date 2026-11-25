@@ -16,7 +16,8 @@ use axum::{
 use axum_test::TestServer;
 use chrono::{Duration, Utc};
 use sea_orm::{
-    ActiveValue::Set, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, Statement,
+    ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
+    QueryFilter, Statement,
 };
 use serde_json::{json, Value};
 use serial_test::serial;
@@ -865,4 +866,257 @@ async fn a_renewed_token_keeps_the_granted_scopes() {
             .unwrap()
             .unwrap();
     assert_eq!(r.try_get::<String>("", "s").unwrap(), ALL);
+}
+
+// Automations on X: safety (pause switch, cool-down, caps, loop guard) with the mock X.
+
+impl Env {
+    async fn req(&self, method: Method, path: &str, body: Value) -> axum_test::TestResponse {
+        self.s
+            .method(method, path)
+            .add_header("origin", WEB)
+            .add_header("cookie", self.cookie.clone())
+            .json(&body)
+            .await
+    }
+
+    /// A mention automation on this account that replies "thanks"; `extra` is merged in.
+    async fn automation(&self, extra: Value) -> String {
+        let mut body = json!({
+            "name": "Thanks",
+            "trigger": "mention_received",
+            "conditions": {"account_ids": [self.account]},
+            "actions": [{"type": "reply_publicly", "text": "thanks"}],
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let res = self.req(Method::POST, "/v1/automations", body).await;
+        assert_eq!(res.status_code(), 201, "{}", res.text());
+        let id = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+        self.sql(&format!(
+            "UPDATE automations SET activated_at = now() - interval '3 days' WHERE id = '{id}'; \
+             UPDATE social_accounts SET created_at = now() - interval '3 days' WHERE id = '{}'",
+            self.account
+        ))
+        .await;
+        id
+    }
+
+    /// A mention from `author` arrives and the automations run over it.
+    async fn arrive(&self, author: &str, text: &str) {
+        let remote = Utc::now().timestamp_nanos_opt().unwrap().to_string();
+        self.sql(&format!(
+            "INSERT INTO inbox_items (id, team_id, social_account_id, platform, kind, remote_id, \
+             parent_remote_id, root_remote_id, author_id, author_name, text, received_at, state) \
+             VALUES (gen_random_uuid(), '{}', '{}', 'x', 'mention', '{remote}', '{remote}', \
+             '{remote}', '{author}', 'Ann', '{text}', now() - interval '1 minute', 'open')",
+            self.team, self.account
+        ))
+        .await;
+        let item = socialreins_brain::models::inbox_items::Entity::find()
+            .filter(socialreins_brain::models::inbox_items::Column::RemoteId.eq(remote))
+            .one(&self.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let account = socialreins_brain::models::social_accounts::Entity::find_by_id(self.account)
+            .one(&self.db)
+            .await
+            .unwrap()
+            .unwrap();
+        socialreins_brain::automations::run(&self.state, &account, &item)
+            .await
+            .unwrap();
+    }
+
+    /// (status, reason) of the automation's runs, oldest first.
+    async fn runs(&self, id: &str) -> Vec<(String, Option<String>)> {
+        let res = self
+            .s
+            .get(&format!("/v1/automations/{id}/runs"))
+            .add_header("cookie", self.cookie.clone())
+            .await;
+        let mut runs: Vec<_> = res.json::<Value>()["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["status"].as_str().unwrap().to_owned(),
+                    r["reason"].as_str().map(str::to_owned),
+                )
+            })
+            .collect();
+        runs.reverse();
+        runs
+    }
+}
+
+fn who() -> String {
+    format!("u{}", Uuid::now_v7().simple())
+}
+
+fn run(status: &str, reason: Option<&str>) -> (String, Option<String>) {
+    (status.to_owned(), reason.map(str::to_owned))
+}
+
+#[tokio::test]
+#[serial]
+async fn a_cooldown_a_daily_cap_and_the_pause_switch_hold_an_automation_back() {
+    let e = env(ALL, false).await;
+    // Out of range values are refused.
+    for (bad, code) in [
+        (json!({"cooldown_minutes": 0}), "invalid_cooldown"),
+        (json!({"cooldown_minutes": 20000}), "invalid_cooldown"),
+        (json!({"daily_cap": 0}), "invalid_daily_cap"),
+        (json!({"daily_cap": 501}), "invalid_daily_cap"),
+    ] {
+        let body = json!({"name": "x", "trigger": "mention_received",
+            "actions": [{"type": "reply_publicly", "text": "t"}]});
+        let mut body = body;
+        body[bad.as_object().unwrap().keys().next().unwrap()] =
+            bad.as_object().unwrap().values().next().unwrap().clone();
+        let res = e.req(Method::POST, "/v1/automations", body).await;
+        assert_eq!(res.status_code(), 422, "{bad}");
+        assert_eq!(res.json::<Value>()["error"], code);
+    }
+    let id = e
+        .automation(json!({"cooldown_minutes": 60, "daily_cap": 2}))
+        .await;
+    let (ann, bob, cy) = (who(), who(), who());
+    e.arrive(&ann, "first").await;
+    // The same person again within the hour: stored, not answered.
+    e.arrive(&ann, "second").await;
+    e.arrive(&bob, "hello").await;
+    // The cap of two runs is used up: a third person is not answered either.
+    e.arrive(&cy, "hello").await;
+    assert_eq!(e.mock.seen("POST", "/2/tweets").len(), 2);
+    assert_eq!(
+        e.runs(&id).await,
+        vec![
+            run("sent", None),
+            run("skipped", Some("cooldown")),
+            run("sent", None),
+            run("skipped", Some("automation_cap")),
+        ]
+    );
+    // Lifting both, then pausing the team: nothing goes out and the run log says why.
+    let body = json!({"name": "Thanks", "trigger": "mention_received",
+        "conditions": {"account_ids": [e.account]},
+        "actions": [{"type": "reply_publicly", "text": "thanks"}]});
+    let res = e
+        .req(Method::PUT, &format!("/v1/automations/{id}"), body)
+        .await;
+    assert_eq!(res.status_code(), 200, "{}", res.text());
+    assert_eq!(res.json::<Value>()["cooldown_minutes"], Value::Null);
+    let res = e
+        .req(
+            Method::PATCH,
+            "/v1/team",
+            json!({"automations_paused": true}),
+        )
+        .await;
+    assert_eq!(res.json::<Value>()["automations_paused"], true);
+    e.arrive(&who(), "hello").await;
+    assert_eq!(e.mock.seen("POST", "/2/tweets").len(), 2);
+    // "Test this automation" says so too.
+    let test = json!({"automation": {"name": "t", "trigger": "mention_received",
+        "conditions": {"account_ids": [e.account]},
+        "actions": [{"type": "reply_publicly", "text": "thanks"}]},
+        "sample": {"account_id": e.account, "text": "hi"}});
+    let res = e.req(Method::POST, "/v1/automations/test", test).await;
+    assert_eq!(res.status_code(), 200, "{}", res.text());
+    assert_eq!(res.json::<Value>()["blocks"], json!(["paused"]));
+    let res = e
+        .req(
+            Method::PATCH,
+            "/v1/team",
+            json!({"automations_paused": false}),
+        )
+        .await;
+    assert_eq!(res.json::<Value>()["automations_paused"], false);
+    // A cap run counts only runs that did something: the skipped ones above never did.
+    e.arrive(&who(), "hello").await;
+    assert_eq!(e.mock.seen("POST", "/2/tweets").len(), 3);
+    let runs = e.runs(&id).await;
+    assert_eq!(runs[4], run("skipped", Some("paused")));
+    assert_eq!(runs[5], run("sent", None));
+    // The run log counts the reasons.
+    let got =
+        e.s.get(&format!("/v1/automations/{id}"))
+            .add_header("cookie", e.cookie.clone())
+            .await
+            .json::<Value>();
+    let reasons = got["runs"]["reasons"].as_array().unwrap();
+    for why in ["cooldown", "automation_cap", "paused"] {
+        let hit = reasons.iter().find(|r| r["reason"] == why);
+        assert_eq!(hit.map(|r| r["count"].clone()), Some(json!(1)), "{why}");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn nothing_answers_a_connected_account_of_this_or_another_team() {
+    let e = env(ALL, false).await;
+    let other = env(ALL, false).await;
+    let (ours, theirs) = (who(), who());
+    for (env, ext) in [(&e, &ours), (&other, &theirs)] {
+        env.sql(&format!(
+            "INSERT INTO social_accounts (id, team_id, provider, external_id, handle, access_token, \
+             meta) VALUES (gen_random_uuid(), '{}', 'x', '{ext}', 'h', ''::bytea, '{{}}')",
+            env.team
+        ))
+        .await;
+    }
+    let id = e.automation(json!({})).await;
+    e.arrive(&ours, "hi").await;
+    e.arrive(&theirs, "hi").await;
+    e.arrive(&who(), "hi").await;
+    assert_eq!(e.mock.seen("POST", "/2/tweets").len(), 1);
+    assert_eq!(
+        e.runs(&id).await,
+        vec![
+            run("skipped", Some("own_account")),
+            run("skipped", Some("connected_account")),
+            run("sent", None),
+        ]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_pause_ends_waiting_flows_and_a_cooldown_holds_a_flow() {
+    let e = env(ALL, false).await;
+    let pause = |on: bool| e.req(Method::PATCH, "/v1/team", json!({"automations_paused": on}));
+    // A flow that sent, waited and meets a pause ends there, as having run.
+    let flow = e
+        .automation(
+            json!({"name": "Flow", "cooldown_minutes": 5, "actions": null,
+            "steps": [{"type": "reply_publicly", "text": "one"}, {"type": "wait", "minutes": 1},
+                      {"type": "reply_publicly", "text": "two"}]}),
+        )
+        .await;
+    e.arrive(&who(), "hello").await;
+    assert_eq!(e.runs(&flow).await, vec![run("waiting", None)]);
+    pause(true).await;
+    e.sql("UPDATE automation_runs SET resume_at = now() - interval '1 minute' WHERE status = 'waiting'")
+        .await;
+    socialreins_brain::automations::resume_due(&e.state, socialreins_brain::automations::ROUND)
+        .await
+        .unwrap();
+    assert_eq!(
+        e.runs(&flow).await,
+        vec![run("skipped", Some("paused_waiting"))]
+    );
+    // The cool-down also holds a flow's second run for the same person.
+    pause(false).await;
+    let bob = who();
+    e.arrive(&bob, "hello").await;
+    e.arrive(&bob, "hello").await;
+    let runs = e.runs(&flow).await;
+    assert_eq!(
+        runs[1..],
+        [run("waiting", None), run("skipped", Some("cooldown"))]
+    );
 }
