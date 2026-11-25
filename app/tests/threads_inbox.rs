@@ -475,8 +475,24 @@ async fn an_automation_answers_a_new_reply_with_a_public_reply_only() {
         .await;
     assert_eq!(res.status_code(), 201, "{}", res.text());
     let id = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+    // A like does not exist on Threads; hiding a reply directly under our post does.
+    let res = e
+        .post(
+            "/v1/automations",
+            body("comment_received", json!({"type": "like_comment"})),
+        )
+        .await;
+    assert_eq!(res.json::<Value>()["error"], "threads_no_like");
+    let res = e
+        .post(
+            "/v1/automations",
+            body("comment_received", json!({"type": "hide_comment"})),
+        )
+        .await;
+    assert_eq!(res.status_code(), 201, "{}", res.text());
+    let hide = res.json::<Value>()["id"].as_str().unwrap().to_owned();
     e.sql(&format!(
-        "UPDATE automations SET activated_at = now() - interval '3 days' WHERE id = '{id}'"
+        "UPDATE automations SET activated_at = now() - interval '3 days' WHERE id IN ('{id}', '{hide}')"
     ))
     .await;
     e.mock.conversations.lock().unwrap().get_mut("100").unwrap()["data"]
@@ -488,10 +504,15 @@ async fn an_automation_answers_a_new_reply_with_a_public_reply_only() {
     let made = e.mock.seen("POST", "/v1.0/1/threads");
     assert_eq!(made.len(), 1, "one reply, for the new reply only");
     assert!(made[0].1.contains("reply_to_id=205") && made[0].1.contains("thanks"));
+    // The second automation hid that reply (and only that one) through manage_reply.
+    let hid = e.mock.seen("POST", "/v1.0/205/manage_reply");
+    assert_eq!(hid.len(), 1);
+    assert!(hid[0].1.contains("hide=true"));
     assert_eq!(e.mock.seen("POST", "/v1.0/1/threads_publish").len(), 1);
-    // The old ones were never answered.
+    // The old ones were never answered or hidden.
     e.tick(true).await;
     assert_eq!(e.mock.seen("POST", "/v1.0/1/threads").len(), 1);
+    assert!(e.mock.seen("POST", "/v1.0/200/manage_reply").is_empty());
 }
 
 #[tokio::test]
