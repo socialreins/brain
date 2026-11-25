@@ -156,6 +156,19 @@ pub fn spawn(app: AppState) {
             }
         }
     });
+    let threads_app = app.clone();
+    tokio::spawn(async move {
+        // Which Threads accounts are due (every 5 minutes, or at once after a webhook hint) is
+        // decided by the account's own stamps (`threads_inbox`).
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if let Err(e) = crate::threads_inbox::tick(&threads_app).await {
+                tracing::warn!(error = %e, "threads inbox tick failed");
+            }
+        }
+    });
     let youtube_app = app.clone();
     tokio::spawn(async move {
         // Which channels are due, and how often, is the channel's own setting (`youtube_inbox`).

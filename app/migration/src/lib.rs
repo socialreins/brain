@@ -74,6 +74,7 @@ mod m20261231_000001_meta_synced;
 mod m20270101_000001_inbox_moderation;
 mod m20270102_000001_automation_safety;
 mod m20270103_000001_team_slug_history;
+mod m20270103_000001_threads_inbox;
 mod m20270103_000001_wait_for_reply;
 mod m20270103_000001_youtube_inbox;
 mod m20270104_000001_run_retries;
@@ -163,6 +164,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20270103_000001_wait_for_reply::Migration),
             Box::new(m20270104_000001_run_retries::Migration),
             Box::new(m20270103_000001_youtube_inbox::Migration),
+            Box::new(m20270103_000001_threads_inbox::Migration),
             Box::new(m20270105_000001_story_mention_trigger::Migration),
             Box::new(m20270106_000001_automation_misses::Migration),
             // inject-above (do not remove this comment)

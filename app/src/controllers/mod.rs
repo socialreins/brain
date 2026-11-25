@@ -40,6 +40,7 @@ pub mod subscribers;
 pub mod team_slugs;
 pub mod teams;
 pub mod threads;
+pub mod threads_webhook;
 pub mod tiktok;
 pub mod uploads;
 pub mod waitlist;
@@ -218,6 +219,7 @@ pub fn router(state: AppState, config: &Config) -> Router {
         .merge(x::routes())
         .merge(meta::routes())
         .merge(meta_webhook::routes())
+        .merge(threads_webhook::routes())
         .merge(stripe::routes())
         .merge(media::routes())
         .nest(
