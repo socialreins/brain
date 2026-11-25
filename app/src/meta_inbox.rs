@@ -41,13 +41,13 @@ use crate::{
 };
 
 /// A private reply to a comment works within 7 days of it.
-const PRIVATE_REPLY_DAYS: i64 = 7;
+pub(crate) const PRIVATE_REPLY_DAYS: i64 = 7;
 /// A message to a person works within 24 hours of their last message.
-const MESSAGE_HOURS: i64 = 24;
+pub(crate) const MESSAGE_HOURS: i64 = 24;
 /// Longest quick reply payload kept; ours are at most 64.
 const MAX_PAYLOAD_CHARS: usize = 200;
 /// A person's reply, with Meta's Human Agent feature, may go out this long after their last message.
-const HUMAN_AGENT_DAYS: i64 = 7;
+pub(crate) const HUMAN_AGENT_DAYS: i64 = 7;
 /// An account is read again this long after its last read, and `BACKFILL_ACCOUNTS` are read a
 /// tick (a minute), so a thousand accounts still fit in the hour.
 const BACKFILL_EVERY_MINUTES: i64 = 60;
@@ -123,7 +123,7 @@ fn message_attachments(msg: &Value) -> Vec<Attachment> {
                 "video" | "ig_reel" | "reel" => "video",
                 "audio" => "audio",
                 "file" => "file",
-                "story_mention" => "image",
+                "story_mention" => "story_mention",
                 "share" | "fallback" | "template" => "link",
                 _ => return None,
             };
@@ -1148,6 +1148,19 @@ mod tests {
             ))
         );
         assert_eq!(got[1].story, None);
+    }
+
+    #[test]
+    fn a_story_mention_is_a_dm_with_a_story_mention_attachment() {
+        let entry = json!({"id": "1784", "time": 1_700_000_000, "messaging": [
+            {"sender": {"id": "555"}, "recipient": {"id": "1784"}, "timestamp": 1_700_000_000_000i64,
+             "message": {"mid": "sm1", "attachments": [
+                {"type": "story_mention", "payload": {"url": "https://cdn.example/s.jpg"}}]}}]});
+        let got = events("instagram", &entry);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, "dm");
+        let kinds: Vec<_> = got[0].attachments.iter().map(|a| a.kind.as_str()).collect();
+        assert_eq!(kinds, ["story_mention"]);
     }
 
     #[test]

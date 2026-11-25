@@ -233,6 +233,12 @@ impl Env {
         res.json::<Value>()["id"].as_str().unwrap().to_owned()
     }
 
+    /// The team's account is an Instagram one from now on.
+    pub async fn instagram(&mut self) {
+        let id = digits();
+        self.account = new_account(&self.state, &self.db, self.team, "instagram", &id).await;
+    }
+
     /// Stores an item `age_minutes` old and runs the automations over it, as a webhook does.
     pub async fn item(
         &self,
@@ -240,6 +246,18 @@ impl Env {
         author: &str,
         text: &str,
         age_minutes: i64,
+    ) -> inbox_items::Model {
+        self.item_with(kind, author, text, age_minutes, Vec::new())
+            .await
+    }
+
+    pub async fn item_with(
+        &self,
+        kind: &'static str,
+        author: &str,
+        text: &str,
+        age_minutes: i64,
+        attachments: Vec<socialreins_brain::inbox::Attachment>,
     ) -> inbox_items::Model {
         // Graph ids are digits and underscores.
         let remote = format!("101_{}", Uuid::now_v7().as_u128() % 1_000_000_000_000);
@@ -261,7 +279,7 @@ impl Env {
             permalink: None,
             story: None,
             button_payload: None,
-            attachments: Vec::new(),
+            attachments,
         };
         let item = inbox::store(&self.db, &self.account, fresh)
             .await
