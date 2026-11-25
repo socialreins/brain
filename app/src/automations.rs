@@ -55,12 +55,13 @@ use crate::{
     state::AppState,
 };
 
-pub const TRIGGERS: [&str; 6] = [
+pub const TRIGGERS: [&str; 7] = [
     "button_clicked",
     "comment_received",
     "dm_received",
     "mention_received",
     "new_follower",
+    "story_mention",
     "story_reply",
 ];
 /// Automation runs that act, per team per day (`rate_limit::reserve_in`).
@@ -493,10 +494,22 @@ pub fn trigger_of(item: &inbox_items::Model) -> Option<&'static str> {
         "mention" => Some("mention_received"),
         "dm" if item.button_payload.is_some() => Some("button_clicked"),
         "dm" if item.story_reply => Some("story_reply"),
+        // Instagram: someone @mentioned the account in their story.
+        "dm" if story_mention(item) => Some("story_mention"),
         "dm" => Some("dm_received"),
         "follow" => Some("new_follower"),
         _ => None,
     }
+}
+
+/// Whether the DM is Instagram's notice that someone mentioned the account in a story (an
+/// attachment of kind `story_mention`).
+pub fn story_mention(item: &inbox_items::Model) -> bool {
+    item.platform == "instagram"
+        && item.attachments.as_array().is_some_and(|a| {
+            a.iter()
+                .any(|x| x["kind"].as_str() == Some("story_mention"))
+        })
 }
 
 /// A button payload: 1 to 64 characters of `a-z`, `0-9`, `_` and `-`.
@@ -517,10 +530,11 @@ fn check_conditions(trigger: &str, c: &mut Conditions) -> Result<(), &'static st
     let fits_trigger = (comment || c.post_remote_ids.is_empty())
         && (comment || mention || !c.first_per_author)
         && (trigger == "dm_received" || !c.first_message)
-        && (!(button || trigger == "new_follower") || c.keywords.is_empty())
+        && (!(button || trigger == "new_follower" || trigger == "story_mention")
+            || c.keywords.is_empty())
         && (button != c.payloads.is_empty());
     // A follow and a click carry no text to read.
-    let textless = button || trigger == "new_follower";
+    let textless = button || matches!(trigger, "new_follower" | "story_mention");
     let text_ok = !(textless && (c.has_link.is_some() || !c.sentiment.is_empty()))
         && c.sentiment.len() <= SENTIMENTS.len()
         && c.sentiment.iter().all(|i| SENTIMENTS.contains(&i.as_str()));
@@ -685,15 +699,25 @@ pub fn network_limits(
     }
     if !providers.is_empty()
         && providers.iter().all(|p| *p == "x")
-        && matches!(trigger, "new_follower" | "story_reply" | "button_clicked")
+        && matches!(
+            trigger,
+            "new_follower" | "story_reply" | "story_mention" | "button_clicked"
+        )
     {
         return Err("x_unsupported_trigger");
     }
     if !providers.is_empty()
         && providers.iter().all(|p| *p == "bluesky")
-        && matches!(trigger, "story_reply" | "button_clicked")
+        && matches!(trigger, "story_reply" | "story_mention" | "button_clicked")
     {
         return Err("bluesky_unsupported_trigger");
+    }
+    // A story mention is Instagram's alone.
+    if trigger == "story_mention"
+        && !providers.is_empty()
+        && providers.iter().all(|p| *p == "facebook")
+    {
+        return Err("facebook_unsupported_trigger");
     }
     if providers.is_empty()
         || !providers

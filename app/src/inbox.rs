@@ -67,7 +67,8 @@ const MAX_URL_CHARS: usize = 2048;
 /// the kind's label.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq, Eq)]
 pub struct Attachment {
-    /// `image`, `video`, `sticker`, `gif`, `audio`, `file` or `link`.
+    /// `image`, `video`, `sticker`, `gif`, `audio`, `file`, `link` or `story_mention` (Instagram:
+    /// the DM is someone mentioning the account in their story; the file is the story).
     pub kind: String,
     /// The file itself, or the page a `link` points to.
     pub url: String,
