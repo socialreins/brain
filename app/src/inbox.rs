@@ -28,6 +28,11 @@ use crate::{
 pub const FIRST_DAYS: i64 = 7;
 /// Kinds an inbox filter takes. `follow` items are left out of item lists unless asked for.
 pub const KINDS: [&str; 3] = ["comment", "mention", "dm"];
+/// Kinds that need no answer: stored `done`, left out of item lists and counts unless asked for
+/// (`kind=activity` lists them all).
+pub const ACTIVITY: [&str; 3] = ["follow", "like", "repost"];
+/// The condition on `inbox_items i` that leaves activity out.
+pub const NOT_ACTIVITY: &str = " AND i.kind NOT IN ('follow', 'like', 'repost')";
 pub const PLATFORMS: [&str; 8] = [
     "facebook",
     "instagram",
@@ -279,7 +284,7 @@ fn sql(sql: &str, values: Vec<Value>) -> Statement {
     Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
 }
 
-fn pds(account: &social_accounts::Model) -> &str {
+pub(crate) fn pds(account: &social_accounts::Model) -> &str {
     account.meta["pds"].as_str().unwrap_or_default()
 }
 
@@ -568,9 +573,10 @@ pub(crate) fn clip(text: &str) -> String {
 // The author's contact is upserted in the same statement, so an item never lacks one. The
 // contact keeps the handle, name and avatar of its newest item (`$17`, when it came) that gave
 // one, so an old item read late or delivered again changes none of them; it stores nothing.
+// A like or repost makes no contact: people who only liked are not people who wrote to us.
 const INSERT: &str = "WITH c AS (INSERT INTO contacts AS k (id, team_id, platform, external_id, \
     handle, display_name, avatar_url, first_seen_at, last_seen_at) \
-    VALUES ($24, $2, $4, $12, $13, $14, $15, $17, $17) \
+    SELECT $24, $2, $4, $12, $13, $14, $15, $17, $17 WHERE $5 NOT IN ('like', 'repost') \
     ON CONFLICT (team_id, platform, external_id) DO UPDATE SET \
     handle = CASE WHEN $17 < k.last_seen_at THEN COALESCE(k.handle, $13) \
         ELSE COALESCE($13, k.handle) END, \
@@ -680,8 +686,13 @@ pub async fn store_with(
         f.story.is_some().into(),
         f.story.clone().and_then(|s| s.0).into(),
         f.story.and_then(|s| s.1).into(),
-        // A follow is not work to answer.
-        (if f.kind == "follow" { "done" } else { "open" }).into(),
+        // A follow, like or repost is not work to answer.
+        (if ACTIVITY.contains(&f.kind) {
+            "done"
+        } else {
+            "open"
+        })
+        .into(),
         f.button_payload.into(),
         Uuid::now_v7().into(),
         serde_json::json!(f.attachments[..f.attachments.len().min(MAX_ATTACHMENTS)]).into(),
@@ -741,7 +752,7 @@ async fn store_notification(
         author: n.author.clone(),
         text: n.text.clone(),
         at: n.indexed_at,
-        permalink: None,
+        permalink: n.permalink.clone(),
         story: None,
         button_payload: None,
         attachments: n.attachments.clone(),
@@ -896,6 +907,25 @@ pub async fn send_with(
     );
     app.db.execute_raw(stmt).await?;
     Ok(Ok(reply))
+}
+
+/// The posts above `uri` in its thread (and `uri` itself last, with `with_post`), read as
+/// `account` sees them.
+pub async fn thread_above(
+    app: &AppState,
+    account: &social_accounts::Model,
+    uri: &str,
+    with_post: bool,
+) -> Result<crate::connectors::bluesky::Thread, InboxError> {
+    let Some(secret) = secret(app, account) else {
+        return Err(InboxError::Reconnect);
+    };
+    let c = Creds {
+        pds: pds(account),
+        did: &account.external_id,
+        password: &secret,
+    };
+    app.bluesky.thread_above(&c, uri, with_post).await
 }
 
 /// The Bluesky half of `send`: the id of what went out.
