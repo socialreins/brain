@@ -40,6 +40,7 @@ async fn health_and_version() {
     let res = s.get("/health").await;
     res.assert_status_ok();
     res.assert_json(&json!({"status": "ok"}));
+    assert_eq!(res.header("strict-transport-security"), "max-age=31536000");
     s.get("/version")
         .await
         .assert_json(&json!({"commit": "dev"}));
