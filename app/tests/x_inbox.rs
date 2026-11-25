@@ -1501,7 +1501,7 @@ async fn x_likes_hides_and_reposts_for_an_automation_and_counts_each_write() {
     e.put(json!({"enabled": true})).await.assert_status_ok();
     let id = e
         .automation(json!({"trigger": "comment_received",
-            "actions": [{"type": "like_comment"}, {"type": "hide_comment"}, {"type": "repost"},
+            "actions": [{"type": "like_comment"}, {"type": "hide_comment"}, {"type": "repost_comment"},
                         {"type": "reply_publicly", "text": "thanks"}]}))
         .await;
     e.arrive_as("comment", &who(), "hello").await;
@@ -1530,21 +1530,21 @@ async fn x_likes_hides_and_reposts_for_an_automation_and_counts_each_write() {
         .unwrap()
         .unwrap();
     assert_eq!(r.try_get::<i64>("", "spent_micros").unwrap(), 60_000);
-    // A mention has no reply to hide or comment to like, but a repost fits it.
+    // A mention has no reply to hide, but a like and a repost fit it.
     let body = |action: &str| json!({"name": "m", "trigger": "mention_received", "actions": [{"type": action}]});
     assert_eq!(
-        e.req(Method::POST, "/v1/automations", body("like_comment"))
+        e.req(Method::POST, "/v1/automations", body("hide_comment"))
             .await
             .status_code(),
         422
     );
-    let repost = e
-        .automation(json!({"name": "Mentions", "actions": [{"type": "repost"}]}))
+    let mention = e
+        .automation(json!({"name": "Mentions", "actions": [{"type": "repost_comment"}, {"type": "like_comment"}]}))
         .await;
     e.arrive(&who(), "hello").await;
-    let runs = e.runs(&repost).await;
-    assert_eq!(runs, vec![run("sent", None)]);
+    assert_eq!(e.runs(&mention).await, vec![run("sent", None)]);
     assert_eq!(e.mock.seen("POST", "/2/users/1/retweets").len(), 2);
+    assert_eq!(e.mock.seen("POST", "/2/users/1/likes").len(), 2);
 }
 
 #[tokio::test]
@@ -1561,7 +1561,7 @@ async fn a_used_up_budget_stops_reactions_and_ai_before_they_cost_but_never_a_pe
     .await;
     *e.mock.ai.lock().unwrap() = "Thanks for writing".into();
     let react = e
-        .automation(json!({"name": "React", "trigger": "comment_received", "actions": [{"type": "like_comment"}, {"type": "repost"}]}))
+        .automation(json!({"name": "React", "trigger": "comment_received", "actions": [{"type": "like_comment"}, {"type": "repost_comment"}]}))
         .await;
     let ai = e
         .automation(json!({"name": "Ai", "trigger": "comment_received", "actions": [{"type": "ai_reply_publicly", "prompt": "Thank them"}]}))
@@ -1597,7 +1597,8 @@ async fn a_used_up_budget_stops_reactions_and_ai_before_they_cost_but_never_a_pe
         .unwrap();
     assert_eq!(r.try_get::<i64>("", "spent_micros").unwrap(), 115_000);
     // A repost needs a post to repost: a DM trigger refuses it on save.
-    let dm = json!({"name": "x", "trigger": "dm_received", "actions": [{"type": "repost"}]});
+    let dm =
+        json!({"name": "x", "trigger": "dm_received", "actions": [{"type": "repost_comment"}]});
     assert_eq!(
         e.req(Method::POST, "/v1/automations", dm)
             .await

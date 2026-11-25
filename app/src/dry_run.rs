@@ -49,7 +49,7 @@ pub struct Sample {
     /// For a `button_clicked` trigger: the payload of the button clicked.
     #[serde(default)]
     pub button_payload: Option<String>,
-    /// Bluesky and X: whether the author could receive our DM (they follow the account, or allow
+    /// Bluesky only: whether the author could receive our DM (they follow the account, or allow
     /// DMs from anyone). `false` shows what a refusal does: the DM is skipped `dm_not_allowed`
     /// and the fallback public reply takes its place. Default `true`.
     #[serde(default = "yes")]
@@ -77,8 +77,8 @@ fn yes() -> bool {
 #[derive(Serialize, ToSchema, Debug, Default, PartialEq, Eq)]
 pub struct PlannedStep {
     /// `send_dm`, `reply_publicly`, `ai_send_dm`, `ai_reply_publicly`, `fallback_public_reply`,
-    /// `tag_contact`, `notify_team`, `assign`, `hide_comment`, `like_comment`,
-    /// `stop_automations`, `wait` or `wait_for_reply` (a test goes on as if the person answered).
+    /// `tag_contact`, `notify_team`, `assign`, `hide_comment`, `like_comment`, `repost_comment`,
+    /// `follow_back`, `stop_automations`, `wait` or `wait_for_reply` (a test goes on as if the person answered).
     #[serde(rename = "type")]
     pub kind: String,
     /// `would_send`, `would_skip`, `would_fail`, `would_tag`, `would_do` (a mail, an
@@ -231,6 +231,8 @@ fn item_of(
         "comment_received" => "comment",
         "mention_received" => "mention",
         "new_follower" => "follow",
+        "like_received" => "like",
+        "repost_received" => "repost",
         _ => "dm",
     };
     inbox_items::Model {
@@ -251,7 +253,7 @@ fn item_of(
         author_name: s.author_name.clone().filter(|n| !n.trim().is_empty()),
         author_avatar: None,
         // A follow carries no text.
-        text: if kind == "follow" {
+        text: if matches!(kind, "follow" | "like" | "repost") {
             String::new()
         } else {
             s.text.clone()
@@ -360,8 +362,8 @@ pub async fn test(
         blocks: Vec::new(),
         sentiment: None,
         notes: Vec::new(),
-        steps: Vec::new(),
         cost: None,
+        steps: Vec::new(),
     };
     if !out.matched {
         return Ok(out);
@@ -444,7 +446,7 @@ pub async fn test(
     out.steps = planned;
     out.notes = notes;
     if account.provider == "x" {
-        let acts = |k: &str| matches!(k, "like_comment" | "hide_comment" | "repost");
+        let acts = |k: &str| matches!(k, "like_comment" | "hide_comment" | "repost_comment");
         let writes = out.steps.iter().filter(|s| {
             (s.status == "would_send" && !acts(&s.kind))
                 || (s.status == "would_do" && acts(&s.kind))
@@ -508,7 +510,7 @@ async fn walk(
                 tag: Some((*tag).to_owned()),
                 ..step("tag_contact", "would_tag")
             }),
-            Part::Effect(kind) => out.push(effect_step(kind, item, account, app).await),
+            Part::Effect(kind) => out.push(effect_step(kind, account, item, app).await),
             Part::Wait(minutes, reply) => {
                 if let Some(clock) = meta.as_mut() {
                     clock.wait(*minutes, *reply);
@@ -594,25 +596,28 @@ async fn walk(
 /// network or the item does not take is skipped (`not_supported`), as a run records it.
 async fn effect_step(
     kind: &str,
-    item: &inbox_items::Model,
     account: &social_accounts::Model,
+    item: &inbox_items::Model,
     app: &AppState,
 ) -> PlannedStep {
     // On X a like, repost or hide is a write X bills: the budget, the credits and the scopes stop
     // it as in a run.
-    if account.provider == "x" && matches!(kind, "hide_comment" | "like_comment" | "repost") {
+    if account.provider == "x" && matches!(kind, "hide_comment" | "like_comment" | "repost_comment")
+    {
         let g = Granted::of(account.meta["scope"].as_str());
-        let comment = item.kind == "comment";
         let fits = match kind {
-            "repost" => matches!(item.kind.as_str(), "comment" | "mention"),
-            _ => comment,
+            "hide_comment" => item.kind == "comment",
+            _ => matches!(item.kind.as_str(), "comment" | "mention"),
         };
         let why = if !fits {
             Some("not_supported")
         } else if (kind == "like_comment" && !g.like) || (kind == "hide_comment" && !g.hide) {
             Some("x_reconnect_required")
         } else {
-            x_automation::blocked(app, account).await.ok().flatten()
+            match x_automation::blocked(app, account).await {
+                Ok(why) => why,
+                Err(_) => Some("internal"),
+            }
         };
         return match why {
             Some(why) => PlannedStep {
@@ -620,6 +625,18 @@ async fn effect_step(
                 ..step(kind, "would_skip")
             },
             None => step(kind, "would_do"),
+        };
+    }
+    // Like, repost and follow back on Bluesky are the inbox buttons' own: they go on a Bluesky account.
+    let bluesky = account.provider == "bluesky";
+    if matches!(kind, "repost_comment" | "follow_back") || (kind == "like_comment" && bluesky) {
+        return if bluesky {
+            step(kind, "would_do")
+        } else {
+            PlannedStep {
+                reason: Some("not_supported".into()),
+                ..step(kind, "would_skip")
+            }
         };
     }
     let moderation = matches!(kind, "hide_comment" | "like_comment");

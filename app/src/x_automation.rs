@@ -120,7 +120,10 @@ pub fn cost(trigger: &str, actions: &[Action], steps: Option<&[Step]>) -> Cost {
             .iter()
             .filter(|s| {
                 s.sends().is_some()
-                    || matches!(s, Step::LikeComment | Step::HideComment | Step::Repost)
+                    || matches!(
+                        s,
+                        Step::LikeComment | Step::HideComment | Step::RepostComment
+                    )
             })
             .count(),
         None => actions
@@ -129,7 +132,7 @@ pub fn cost(trigger: &str, actions: &[Action], steps: Option<&[Step]>) -> Cost {
                 a.via_text().is_some()
                     || matches!(
                         a,
-                        Action::LikeComment | Action::HideComment | Action::Repost
+                        Action::LikeComment | Action::HideComment | Action::RepostComment
                     )
             })
             .count(),

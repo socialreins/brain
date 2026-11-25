@@ -27,6 +27,13 @@
 //! `tag_contact`, an action and a step, sends nothing: it adds a tag to the contact of the
 //! item's author (`inbox::add_tag`) and takes no hit of the daily cap. An automation still needs
 //! a send beside it.
+//!
+//! A Bluesky like or repost of one of our posts is a `like` or `repost` item (stored `done`,
+//! with no contact) and runs `like_received` and `repost_received`. Nobody is behind those to
+//! message or tag, so they take only the actions that do something on the account or in the
+//! team. `like_comment` (also on Bluesky), `repost_comment` and `follow_back` go through
+//! `automation_effects::bluesky`, the inbox buttons' own code. Why an automation did not run on
+//! an item is kept by `automation_misses`.
 use sea_orm::{
     sea_query::Query, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, DbErr,
     EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait, Value,
@@ -41,8 +48,9 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
-    ai,
+    ai, automation_effects, automation_misses,
     billing::{self, AiSpent},
+    bluesky_actions,
     connectors::{bluesky::InboxError, meta::Moderate},
     controllers::ai_key::key_of,
     controllers::{connections::live_sets, pages},
@@ -55,12 +63,14 @@ use crate::{
     state::AppState,
 };
 
-pub const TRIGGERS: [&str; 7] = [
+pub const TRIGGERS: [&str; 9] = [
     "button_clicked",
     "comment_received",
     "dm_received",
+    "like_received",
     "mention_received",
     "new_follower",
+    "repost_received",
     "story_mention",
     "story_reply",
 ];
@@ -111,8 +121,9 @@ pub fn quota_bucket(team_id: Uuid) -> String {
 
 /// When an automation acts on an item. Empty lists mean "any". At most one of
 /// `social_set_id` and `account_ids`. Every trigger takes the scope (`social_set_id` or
-/// `account_ids`); `keywords` all but `new_follower` and `button_clicked`; `post_remote_ids` and
-/// `first_per_author` only `comment_received`; `first_message` only `dm_received`; `payloads`
+/// `account_ids`); `keywords` all but `new_follower`, `button_clicked`, `like_received` and
+/// `repost_received`; `post_remote_ids` only `comment_received`, `like_received` and
+/// `repost_received`; `first_per_author` only `comment_received` and `mention_received`; `first_message` only `dm_received`; `payloads`
 /// only `button_clicked`, which needs them.
 #[derive(Serialize, Deserialize, ToSchema, Default, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -323,12 +334,15 @@ pub enum Action {
     /// and the account sees it any more). `comment_received` only; elsewhere or on another
     /// network it is `skipped: not_supported`.
     HideComment,
-    /// Likes the comment as the Page (Facebook only; `skipped: not_supported` elsewhere). On X it
-    /// likes the post of the comment, a write X bills.
+    /// Likes the comment as the Page on Facebook, or from the account on Bluesky, where it is
+    /// a comment or a mention; `skipped: not_supported` elsewhere.
     LikeComment,
-    /// Reposts the post of the comment or mention. X only (`skipped: not_supported` elsewhere);
-    /// a write X bills. `comment_received` and `mention_received`.
-    Repost,
+    /// Reposts the comment or mention from the account (Bluesky only; `skipped: not_supported`
+    /// elsewhere).
+    RepostComment,
+    /// Follows the item's author from the account (Bluesky only, every trigger; nothing is done
+    /// to someone it follows already or to an account of the team).
+    FollowBack,
     /// Once this automation has started on an item, the team's later automations (newer ones)
     /// do not run on it.
     StopAutomations,
@@ -355,7 +369,8 @@ impl Action {
             Self::Assign { .. } => "assign",
             Self::HideComment => "hide_comment",
             Self::LikeComment => "like_comment",
-            Self::Repost => "repost",
+            Self::RepostComment => "repost_comment",
+            Self::FollowBack => "follow_back",
             Self::StopAutomations => "stop_automations",
         }
     }
@@ -425,8 +440,10 @@ pub enum Step {
     HideComment,
     /// As `Action::LikeComment`.
     LikeComment,
-    /// As `Action::Repost`.
-    Repost,
+    /// As `Action::RepostComment`.
+    RepostComment,
+    /// As `Action::FollowBack`.
+    FollowBack,
     /// As `Action::StopAutomations`.
     StopAutomations,
 }
@@ -445,7 +462,8 @@ impl Step {
             Self::Assign { .. } => "assign",
             Self::HideComment => "hide_comment",
             Self::LikeComment => "like_comment",
-            Self::Repost => "repost",
+            Self::RepostComment => "repost_comment",
+            Self::FollowBack => "follow_back",
             Self::StopAutomations => "stop_automations",
         }
     }
@@ -470,7 +488,8 @@ impl Step {
             Self::Assign { user_id } => Action::Assign { user_id: *user_id },
             Self::HideComment => Action::HideComment,
             Self::LikeComment => Action::LikeComment,
-            Self::Repost => Action::Repost,
+            Self::RepostComment => Action::RepostComment,
+            Self::FollowBack => Action::FollowBack,
             Self::StopAutomations => Action::StopAutomations,
             _ => return None,
         })
@@ -507,6 +526,8 @@ pub fn trigger_of(item: &inbox_items::Model) -> Option<&'static str> {
         "dm" if story_mention(item) => Some("story_mention"),
         "dm" => Some("dm_received"),
         "follow" => Some("new_follower"),
+        "like" => Some("like_received"),
+        "repost" => Some("repost_received"),
         _ => None,
     }
 }
@@ -536,14 +557,15 @@ fn check_conditions(trigger: &str, c: &mut Conditions) -> Result<(), &'static st
     let comment = trigger == "comment_received";
     let button = trigger == "button_clicked";
     let mention = trigger == "mention_received";
-    let fits_trigger = (comment || c.post_remote_ids.is_empty())
+    let like = activity(trigger);
+    let fits_trigger = (comment || like || c.post_remote_ids.is_empty())
         && (comment || mention || !c.first_per_author)
         && (trigger == "dm_received" || !c.first_message)
-        && (!(button || trigger == "new_follower" || trigger == "story_mention")
+        && (!(button || like || matches!(trigger, "new_follower" | "story_mention"))
             || c.keywords.is_empty())
         && (button != c.payloads.is_empty());
-    // A follow and a click carry no text to read.
-    let textless = button || matches!(trigger, "new_follower" | "story_mention");
+    // A follow, a like, a repost, a story mention and a click carry no text to read.
+    let textless = button || like || matches!(trigger, "new_follower" | "story_mention");
     let text_ok = !(textless && (c.has_link.is_some() || !c.sentiment.is_empty()))
         && c.sentiment.len() <= SENTIMENTS.len()
         && c.sentiment.iter().all(|i| SENTIMENTS.contains(&i.as_str()));
@@ -593,6 +615,11 @@ fn check_conditions(trigger: &str, c: &mut Conditions) -> Result<(), &'static st
 /// What `sentiment` may name; a text read as anything else never matches.
 pub const SENTIMENTS: [&str; 2] = ["negative", "positive"];
 
+/// A like or repost of one of our posts: no text, no contact and no one to message.
+fn activity(trigger: &str) -> bool {
+    matches!(trigger, "like_received" | "repost_received")
+}
+
 /// A public reply needs a thread to go under, and `{page}` is the page of the post a comment or
 /// mention hangs off: DMs, clicks and follows have neither.
 fn public(trigger: &str) -> bool {
@@ -623,8 +650,17 @@ pub fn validate_steps(
         || !once(|s| matches!(s, Step::Assign { .. }))
         || !once(|s| matches!(s, Step::HideComment))
         || !once(|s| matches!(s, Step::LikeComment))
-        || !once(|s| matches!(s, Step::Repost))
+        || !once(|s| matches!(s, Step::RepostComment))
+        || !once(|s| matches!(s, Step::FollowBack))
         || !once(|s| matches!(s, Step::StopAutomations))
+    {
+        return Err("invalid_steps");
+    }
+    // Nobody to message or tag behind a like or repost: it would repeat for every one.
+    if activity(trigger)
+        && steps
+            .iter()
+            .any(|s| s.sends().is_some() || matches!(s, Step::TagContact { .. }))
     {
         return Err("invalid_steps");
     }
@@ -633,6 +669,8 @@ pub fn validate_steps(
     }
     for step in steps {
         match step {
+            // Nobody sent anything to wait for an answer to behind a like or repost.
+            Step::WaitForReply { .. } if activity(trigger) => return Err("invalid_steps"),
             Step::Wait { minutes } | Step::WaitForReply { minutes }
                 if !(1..=MAX_WAIT_MINUTES).contains(minutes) =>
             {
@@ -642,10 +680,12 @@ pub fn validate_steps(
                 return Err("invalid_steps");
             }
             Step::TagContact { tag } if !tag_ok(tag) => return Err("invalid_steps"),
-            Step::HideComment | Step::LikeComment if trigger != "comment_received" => {
+            Step::HideComment if trigger != "comment_received" => {
                 return Err("invalid_steps");
             }
-            Step::Repost if !public(trigger) => return Err("invalid_steps"),
+            Step::LikeComment | Step::RepostComment if !public(trigger) => {
+                return Err("invalid_steps");
+            }
             Step::SendDm { buttons, .. } => {
                 for b in buttons.iter_mut() {
                     b.label = b.label.trim().to_owned();
@@ -707,6 +747,26 @@ pub fn network_limits(
 ) -> Result<(), &'static str> {
     if providers.iter().any(|p| !AUTOMATED.contains(p)) {
         return Err("unsupported_account");
+    }
+    // Likes and reposts of our posts, and reposting and following back, are Bluesky only (reposting
+    // also X). A
+    // scope with a Bluesky account in it is left to fail item by item, as a mixed one is.
+    let no_bluesky = !providers.is_empty() && !providers.contains(&"bluesky");
+    if no_bluesky && activity(trigger) {
+        return Err("bluesky_only_trigger");
+    }
+    // Reposting is also done on X (`x_react`); following back only on Bluesky.
+    let only_x = !providers.is_empty() && providers.iter().all(|p| *p == "x");
+    let bluesky_action = |a: &Action| {
+        matches!(a, Action::FollowBack) || (!only_x && matches!(a, Action::RepostComment))
+    };
+    let bluesky_step =
+        |s: &Step| matches!(s, Step::FollowBack) || (!only_x && matches!(s, Step::RepostComment));
+    if no_bluesky
+        && (actions.iter().any(bluesky_action)
+            || steps.unwrap_or_default().iter().any(bluesky_step))
+    {
+        return Err("bluesky_only_action");
     }
     if !providers.is_empty()
         && providers.iter().all(|p| *p == "x")
@@ -825,16 +885,24 @@ pub fn validate(
         return Err("invalid_text");
     }
     let once = |f: fn(&Action) -> bool| actions.iter().filter(|a| f(a)).count() <= 1;
-    let comment_only = actions
+    let comment_only = actions.iter().any(|a| matches!(a, Action::HideComment));
+    let post_only = actions
         .iter()
-        .any(|a| matches!(a, Action::HideComment | Action::LikeComment));
+        .any(|a| matches!(a, Action::LikeComment | Action::RepostComment));
+    // A like or repost has nobody to message or tag.
+    let nobody = activity(trigger)
+        && actions
+            .iter()
+            .any(|a| a.via_text().is_some() || matches!(a, Action::TagContact { .. }));
     if (comment_only && trigger != "comment_received")
+        || (post_only && !public)
+        || nobody
+        || !once(|a| matches!(a, Action::RepostComment))
+        || !once(|a| matches!(a, Action::FollowBack))
         || !once(|a| matches!(a, Action::NotifyTeam))
         || !once(|a| matches!(a, Action::Assign { .. }))
         || !once(|a| matches!(a, Action::HideComment))
         || !once(|a| matches!(a, Action::LikeComment))
-        || !once(|a| matches!(a, Action::Repost))
-        || (!public && actions.iter().any(|a| matches!(a, Action::Repost)))
         || !once(|a| matches!(a, Action::StopAutomations))
     {
         return Err("invalid_actions");
@@ -1179,6 +1247,13 @@ async fn run_matching(
     let Some(trigger) = trigger_of(item) else {
         return Ok(());
     };
+    // Comments from before the account was connected (a first read goes back 7 days) never
+    // run automations.
+    if item.received_at < account.created_at {
+        return Ok(());
+    }
+    // The automations this item is not for, or that were off when it came, say why.
+    automation_misses::record_unreached(db, item.team_id, item.id, trigger, item.received_at).await;
     let autos = automations::Entity::find()
         .filter(automations::Column::TeamId.eq(item.team_id))
         .filter(automations::Column::Active.eq(true))
@@ -1187,9 +1262,7 @@ async fn run_matching(
         .order_by_asc(automations::Column::CreatedAt)
         .all(db)
         .await?;
-    // Comments from before the account was connected (a first read goes back 7 days) never
-    // run automations.
-    if autos.is_empty() || item.received_at < account.created_at {
+    if autos.is_empty() {
         return Ok(());
     }
     // Nothing runs on an item by a connected account (the team's own, or another team's), so
@@ -1198,7 +1271,7 @@ async fn run_matching(
     let guard = loop_guard(db, item, account).await?;
     // A follower is welcomed once per account ever: an unfollow and a new follow stores a new
     // item (a new record) but runs nothing.
-    if item.kind == "follow" {
+    let followed_before = if item.kind == "follow" {
         let stmt = sql(
             "SELECT EXISTS (SELECT 1 FROM inbox_items WHERE social_account_id = $1 \
              AND kind = 'follow' AND author_id = $2 AND id < $3) AS ok",
@@ -1208,16 +1281,21 @@ async fn run_matching(
                 item.id.into(),
             ],
         );
-        let again: bool = match db.query_one_raw(stmt).await? {
+        match db.query_one_raw(stmt).await? {
             Some(r) => r.try_get("", "ok")?,
             None => false,
-        };
-        if again {
-            return Ok(());
         }
-    }
+    } else {
+        false
+    };
     let sets = live_set_ids(db, account.id).await?;
+    // Set once an automation that stops the others has taken the item.
+    let mut stopped = false;
     for a in autos {
+        if stopped {
+            automation_misses::record(db, (a.id, a.team_id, item.id), &["stopped_by_other"]).await;
+            continue;
+        }
         let parsed = (
             serde_json::from_value::<Conditions>(a.conditions.clone()),
             serde_json::from_value::<Vec<Action>>(a.actions.clone()),
@@ -1276,7 +1354,16 @@ async fn run_matching(
         let clicked = item.button_payload.as_ref();
         let named =
             trigger != "button_clicked" || clicked.is_some_and(|p| cond.payloads.contains(p));
-        if !named || !matches(&cond, &facts) {
+        let mut why = mismatches(&cond, &facts);
+        if !named {
+            why.push("button_not_named");
+        }
+        if !why.is_empty() {
+            automation_misses::record(db, (a.id, a.team_id, item.id), &why).await;
+            continue;
+        }
+        if followed_before {
+            automation_misses::record(db, (a.id, a.team_id, item.id), &["followed_before"]).await;
             continue;
         }
         // An action that needs the post's page does not run without one, and leaves no run:
@@ -1297,6 +1384,7 @@ async fn run_matching(
         };
         if needed && page.is_none() {
             tracing::info!(automation = %a.id, item = %item.id, "no public page, not run");
+            automation_misses::record(db, (a.id, a.team_id, item.id), &["no_public_page"]).await;
             continue;
         }
         // Read for each automation, so a pause during the round holds the rest back.
@@ -1370,7 +1458,7 @@ async fn run_matching(
             // The sweep took the item again: this automation did take it before, and the newer
             // ones are still to leave it alone.
             if stop && ran(db, &a, item).await? {
-                break;
+                stopped = true;
             }
             continue;
         };
@@ -1392,7 +1480,7 @@ async fn run_matching(
         }
         // This automation took the item: the newer ones leave it alone.
         if stop {
-            break;
+            stopped = true;
         }
     }
     Ok(())
@@ -1528,7 +1616,8 @@ impl Flow<'_> {
                 | Step::Assign { .. }
                 | Step::HideComment
                 | Step::LikeComment
-                | Step::Repost
+                | Step::RepostComment
+                | Step::FollowBack
                 | Step::StopAutomations) => {
                     if let Some(action) = step.effect() {
                         let (app, account, item) = (self.app, self.account, self.item);
@@ -1646,10 +1735,23 @@ async fn effect(
                 done(kind, Some("internal"), true)
             }
         },
-        Action::HideComment | Action::LikeComment | Action::Repost if account.provider == "x" => {
+        Action::HideComment | Action::LikeComment | Action::RepostComment
+            if account.provider == "x" =>
+        {
             x_react(app, account, item, action).await
         }
-        Action::Repost => done(kind, Some("not_supported"), false),
+        // On Bluesky the inbox buttons' own code, with the same refusals.
+        Action::LikeComment | Action::RepostComment | Action::FollowBack
+            if account.provider == "bluesky" =>
+        {
+            let act = match action {
+                Action::LikeComment => bluesky_actions::Action::Like,
+                Action::RepostComment => bluesky_actions::Action::Repost,
+                _ => bluesky_actions::Action::Follow,
+            };
+            automation_effects::bluesky(app, account, item, a, (kind, act)).await
+        }
+        Action::RepostComment | Action::FollowBack => done(kind, Some("not_supported"), false),
         Action::HideComment | Action::LikeComment => {
             let m = if matches!(action, Action::HideComment) {
                 Moderate::Hide
@@ -1699,16 +1801,16 @@ async fn x_react(
         reason: reason.map(str::to_owned),
         ..Default::default()
     };
-    let (what, comment_only) = match action {
-        Action::LikeComment => (Do::Like, true),
-        Action::HideComment => (Do::Hide, true),
-        _ => (Do::Repost, false),
-    };
-    if !matches!(item.kind.as_str(), "comment" | "mention")
-        || (comment_only && item.kind != "comment")
-    {
+    // Hiding is for a reply to our post; a like or repost fits a comment or a mention.
+    let hide = matches!(action, Action::HideComment);
+    if !matches!(item.kind.as_str(), "comment" | "mention") || (hide && item.kind != "comment") {
         return result("skipped", Some("not_supported"));
     }
+    let what = match action {
+        Action::LikeComment => Do::Like,
+        Action::HideComment => Do::Hide,
+        _ => Do::Repost,
+    };
     match crate::x_automation::blocked(app, account).await {
         Ok(Some(why)) => return result("skipped", Some(why)),
         Ok(None) => {}
@@ -1767,17 +1869,17 @@ async fn notify_team(
             .take(max)
             .collect()
     };
-    let who = item
-        .author_name
-        .as_deref()
-        .map_or_else(|| "Someone".to_owned(), |n| plain(n, 60));
     let subject = format!("Automation \"{}\" ran", plain(&a.name, 60));
+    // A like, repost or follow has no text.
+    let said = match plain(&item.text, 200) {
+        t if t.is_empty() => String::new(),
+        t => format!("\n\nThe text: \"{t}\""),
+    };
     let text = format!(
-        "The automation \"{}\" ran on a {} from {who} on {}.\n\nThey wrote: \"{}\"\n\nOpen it in the inbox:\n\n{}/app/inbox?item={}\n",
+        "The automation \"{}\" ran on a {} on {}.{said}\n\nOpen it in the inbox:\n\n{}/app/inbox?item={}\n",
         plain(&a.name, 60),
         item.kind,
         crate::expiry::label(&item.platform),
-        plain(&item.text, 200),
         app.web_url,
         item.id,
     );
@@ -2161,6 +2263,12 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
         Vec::new()
     };
     lock.commit().await?;
+    // Every tenth minute, so the "why not" log stays small (a failure only delays it).
+    if chrono::Timelike::minute(&chrono::Utc::now()).is_multiple_of(10) {
+        if let Err(e) = automation_misses::prune(&app.db).await {
+            tracing::warn!(error = %e, "automation misses not pruned");
+        }
+    }
     work(app, &due, ROUND).await;
     Ok(())
 }
@@ -3358,7 +3466,8 @@ mod tests {
             serde_json::from_value(serde_json::json!({"type": "tag_contact", "tag": t})).unwrap()
         };
         assert_eq!(tag("  VIP "), Action::TagContact { tag: "vip".into() });
-        for t in TRIGGERS {
+        // Every trigger with a person behind it; a like or repost has no contact to tag.
+        for t in TRIGGERS.into_iter().filter(|t| !activity(t)) {
             let mut c = Conditions {
                 payloads: vec!["yes".into()],
                 ..Conditions::default()
@@ -3447,6 +3556,211 @@ mod tests {
             r("send_dm", "skipped", Some("no_dm_access")),
         ];
         assert_eq!(summary(&tagged), ("skipped", Some("no_dm_access".into())));
+    }
+
+    #[test]
+    fn likes_and_reposts_are_triggers_with_nobody_to_message() {
+        let now = chrono::Utc::now().fixed_offset();
+        let item = |kind: &str| inbox_items::Model {
+            id: Uuid::now_v7(),
+            team_id: Uuid::nil(),
+            social_account_id: Uuid::nil(),
+            platform: "bluesky".into(),
+            kind: kind.into(),
+            remote_id: "r".into(),
+            remote_cid: None,
+            parent_remote_id: None,
+            root_remote_id: None,
+            root_remote_cid: None,
+            convo_id: None,
+            post_id: None,
+            author_id: "a".into(),
+            author_handle: None,
+            author_name: None,
+            author_avatar: None,
+            text: String::new(),
+            received_at: now,
+            state: "done".into(),
+            replied_at: None,
+            permalink: None,
+            story_reply: false,
+            story_id: None,
+            story_url: None,
+            button_payload: None,
+            contact_id: None,
+            assigned_to: None,
+            automated_at: None,
+            attachments: serde_json::json!([]),
+            moderation: serde_json::json!({}),
+            created_at: now,
+        };
+        assert_eq!(trigger_of(&item("like")), Some("like_received"));
+        assert_eq!(trigger_of(&item("repost")), Some("repost_received"));
+        let ok = |trigger: &str, actions: Vec<Action>| {
+            validate(trigger, &mut Conditions::default(), &actions, None)
+        };
+        assert_eq!(ok("like_received", vec![Action::FollowBack]), Ok(()));
+        assert_eq!(
+            ok(
+                "repost_received",
+                vec![Action::FollowBack, Action::NotifyTeam]
+            ),
+            Ok(())
+        );
+        assert_eq!(ok("comment_received", vec![Action::RepostComment]), Ok(()));
+        assert_eq!(ok("mention_received", vec![Action::LikeComment]), Ok(()));
+        for (trigger, actions) in [
+            // A like or repost has no post of its own to like or repost.
+            ("like_received", vec![Action::LikeComment]),
+            ("new_follower", vec![Action::RepostComment]),
+            ("like_received", vec![Action::StopAutomations]),
+            (
+                "like_received",
+                vec![Action::FollowBack, Action::FollowBack],
+            ),
+            // Nobody to message or tag behind a like: it would repeat for every one.
+            ("like_received", vec![Action::SendDm { text: "hi".into() }]),
+            (
+                "repost_received",
+                vec![Action::FollowBack, Action::TagContact { tag: "a".into() }],
+            ),
+        ] {
+            assert_eq!(
+                ok(trigger, actions.clone()),
+                Err("invalid_actions"),
+                "{trigger} {actions:?}"
+            );
+        }
+        // A like names a post but has no words or "first".
+        let mut c = Conditions {
+            post_remote_ids: vec!["at://x/app.bsky.feed.post/1".into()],
+            ..Conditions::default()
+        };
+        assert_eq!(check_conditions("like_received", &mut c), Ok(()));
+        assert_eq!(
+            check_conditions("dm_received", &mut c),
+            Err("invalid_conditions")
+        );
+        for bad in [
+            Conditions {
+                keywords: vec!["a".into()],
+                ..Conditions::default()
+            },
+            Conditions {
+                first_per_author: true,
+                ..Conditions::default()
+            },
+            Conditions {
+                question: true,
+                ..Conditions::default()
+            },
+        ] {
+            assert_eq!(
+                check_conditions("repost_received", &mut bad.clone()),
+                Err("invalid_conditions")
+            );
+        }
+        let flow = |trigger: &str, steps: &mut [Step]| {
+            validate_steps(trigger, &mut Conditions::default(), steps)
+        };
+        assert_eq!(
+            flow("like_received", &mut [Step::FollowBack, Step::NotifyTeam]),
+            Ok(())
+        );
+        assert_eq!(
+            flow("like_received", &mut [Step::RepostComment]),
+            Err("invalid_steps")
+        );
+        assert_eq!(
+            flow(
+                "like_received",
+                &mut [Step::FollowBack, Step::TagContact { tag: "a".into() }]
+            ),
+            Err("invalid_steps")
+        );
+        assert_eq!(
+            flow(
+                "comment_received",
+                &mut [
+                    Step::LikeComment,
+                    Step::Wait { minutes: 5 },
+                    Step::FollowBack
+                ]
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            flow(
+                "comment_received",
+                &mut [Step::FollowBack, Step::FollowBack]
+            ),
+            Err("invalid_steps")
+        );
+        assert!(Step::FollowBack.outward() && !Step::StopAutomations.outward());
+        // Nothing was sent to wait for an answer to.
+        assert_eq!(
+            flow(
+                "like_received",
+                &mut [
+                    Step::FollowBack,
+                    Step::WaitForReply { minutes: 5 },
+                    Step::NotifyTeam
+                ]
+            ),
+            Err("invalid_steps")
+        );
+    }
+
+    #[test]
+    fn network_limits_keep_likes_and_bluesky_actions_on_bluesky() {
+        let none: [Action; 0] = [];
+        for trigger in ["like_received", "repost_received"] {
+            assert_eq!(network_limits(trigger, &["bluesky"], &none, None), Ok(()));
+            assert_eq!(network_limits(trigger, &[], &none, None), Ok(()));
+            // A mixed scope is left to fail item by item, a scope with no Bluesky is refused.
+            assert_eq!(
+                network_limits(trigger, &["bluesky", "facebook"], &none, None),
+                Ok(())
+            );
+            for no in ["facebook", "instagram", "x"] {
+                assert_eq!(
+                    network_limits(trigger, &[no], &none, None),
+                    Err("bluesky_only_trigger"),
+                    "{no}"
+                );
+            }
+        }
+        for no in ["facebook", "x"] {
+            for a in [Action::FollowBack, Action::RepostComment] {
+                // X reposts too (`x_react`); only Bluesky follows back.
+                let want = if no == "x" && a == Action::RepostComment {
+                    Ok(())
+                } else {
+                    Err("bluesky_only_action")
+                };
+                assert_eq!(network_limits("comment_received", &[no], &[a], None), want);
+            }
+            let steps = [Step::FollowBack];
+            assert_eq!(
+                network_limits("comment_received", &[no], &none, Some(&steps)),
+                Err("bluesky_only_action")
+            );
+        }
+        // Like is also Facebook's, and a mail or an assignment goes to nobody's servers.
+        let local = [Action::LikeComment, Action::NotifyTeam];
+        assert_eq!(
+            network_limits("comment_received", &["facebook"], &local, None),
+            Ok(())
+        );
+        assert_eq!(
+            network_limits(
+                "comment_received",
+                &["bluesky"],
+                &[Action::FollowBack],
+                None
+            ),
+            Ok(())
+        );
     }
 
     #[test]

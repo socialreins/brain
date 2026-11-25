@@ -2607,7 +2607,31 @@ mod teams {
     }
 
     fn set_slug(s: &TestServer, cookie: &str, slug: Value) -> TestRequest {
-        req(s, Method::PATCH, "/v1/team", cookie).json(&json!({"slug": slug}))
+        req(s, Method::PATCH, "/v1/team/slug", cookie).json(&json!({"slug": slug}))
+    }
+
+    /// Moves what the team gave up `slug` back in time, past the 90-day hold or the redirect.
+    async fn retired_days_ago(db: &DatabaseConnection, slug: &str, days: i64) {
+        let sql = format!(
+            "UPDATE team_slug_history SET retired_at = now() - interval '{days} days' \
+             WHERE slug = '{slug}'"
+        );
+        sea_orm::ConnectionTrait::execute_unprepared(db, &sql)
+            .await
+            .unwrap();
+    }
+
+    /// The address the web app's redirect lookup gives for `slug`, `None` for a 404.
+    async fn redirect_for(s: &TestServer, slug: &str) -> Option<String> {
+        let res = s.get(&format!("/v1/public/team-slugs/{slug}")).await;
+        match res.status_code().as_u16() {
+            200 => Some(res.json::<Value>()["address"].as_str().unwrap().to_owned()),
+            404 => {
+                res.assert_json(&json!({"error": "not_found"}));
+                None
+            }
+            other => panic!("{other}"),
+        }
     }
 
     #[tokio::test]
@@ -2618,32 +2642,33 @@ mod teams {
         let team = current(&s, &owner).await;
         assert_eq!(team["slug"], Value::Null);
         let team_id = team["id"].as_str().unwrap().to_owned();
-        let (admin, _) = joined(&s, &db, &team_id, "admin").await;
-        let (member, _) = joined(&s, &db, &team_id, "member").await;
         let slug = fresh_slug();
 
-        let res = set_slug(&s, &member, json!(slug)).await;
-        assert_eq!(res.status_code(), 403);
         // Trimmed and lowercased; the code stays.
         let res = set_slug(&s, &owner, json!(format!("  {} ", slug.to_uppercase()))).await;
         res.assert_status_ok();
         let set = res.json::<Value>();
         assert_eq!(set["slug"], slug);
         assert_eq!(set["code"], team["code"]);
+        let (member, _) = joined(&s, &db, &team_id, "member").await;
         assert_eq!(current(&s, &member).await["slug"], slug);
         let list = s.get("/v1/teams").add_header("cookie", &owner).await;
         assert_eq!(list.json::<Value>()[0]["slug"], slug);
         let me = s.get("/auth/me").add_header("cookie", &owner).await;
         assert_eq!(me.json::<Value>()["current_team"]["slug"], slug);
-        // Another field alone leaves it.
+        // Another field alone leaves it, and the old route no longer takes a slug.
         let renamed = req(&s, Method::PATCH, "/v1/team", &owner)
-            .json(&json!({"name": "Renamed"}))
+            .json(&json!({"name": "Renamed", "slug": "other-slug"}))
             .await;
         assert_eq!(renamed.json::<Value>()["slug"], slug);
 
-        // An admin changes it, and the old one stops naming the team.
+        // Sending the slug it has changes nothing.
+        let same = set_slug(&s, &owner, json!(slug)).await;
+        assert_eq!(same.json::<Value>()["slug"], slug);
+
+        // Changed: the old one stops naming the team for API calls.
         let next = fresh_slug();
-        let res = set_slug(&s, &admin, json!(next)).await;
+        let res = set_slug(&s, &owner, json!(next)).await;
         assert_eq!(res.json::<Value>()["slug"], next);
         let named = |name: &str| {
             s.get("/v1/team")
@@ -2658,7 +2683,7 @@ mod teams {
         res.assert_status_ok();
         assert_eq!(res.json::<Value>()["slug"], Value::Null);
         assert_eq!(named(&next).await.status_code(), 404);
-        // A slug given up is kept from other teams for 30 days; its old team takes it back.
+        // A slug given up is kept from other teams for 90 days; its old team takes it back.
         let (_, other, _) = user(&s, &db).await;
         for held in [&slug, &next] {
             let res = set_slug(&s, &other, json!(held)).await;
@@ -2668,16 +2693,13 @@ mod teams {
         let res = set_slug(&s, &owner, json!(slug)).await;
         assert_eq!(res.json::<Value>()["slug"], slug);
         assert_eq!(named(&slug).await.json::<Value>()["id"], team["id"]);
-        // After the 30 days another team takes it, and the hold becomes theirs when they let go.
-        let aged = format!(
-            "UPDATE team_slug_holds SET released_at = now() - interval '30 days 1 minute' \
-             WHERE slug = '{next}'"
-        );
-        sea_orm::ConnectionTrait::execute_unprepared(&db, &aged)
-            .await
-            .unwrap();
+        // 89 days on it is still held; after the 90 days another team takes it.
+        retired_days_ago(&db, &next, 89).await;
+        assert_eq!(set_slug(&s, &other, json!(next)).await.status_code(), 409);
+        retired_days_ago(&db, &next, 91).await;
         let res = set_slug(&s, &other, json!(next)).await;
         assert_eq!(res.json::<Value>()["slug"], next);
+        // It is theirs now: they hold it for 90 days when they let go.
         set_slug(&s, &other, Value::Null).await.assert_status_ok();
         assert_eq!(set_slug(&s, &owner, json!(next)).await.status_code(), 409);
         // A deleted team's slug is held the same way.
@@ -2689,11 +2711,65 @@ mod teams {
         let res = req(&s, Method::DELETE, "/v1/team", &other).await;
         assert_eq!(res.status_code(), 204);
         assert_eq!(set_slug(&s, &owner, json!(gone)).await.status_code(), 409);
+        assert_eq!(redirect_for(&s, &gone).await, None);
 
         let doc = s.get("/openapi.json").await.json::<Value>();
         let schemas = &doc["components"]["schemas"];
         assert!(schemas["Team"]["properties"]["slug"].is_object());
-        assert!(schemas["TeamChange"]["properties"]["slug"].is_object());
+        assert!(schemas["TeamChange"]["properties"]["slug"].is_null());
+        assert!(doc["paths"]["/team/slug"]["patch"].is_object());
+        assert!(doc["paths"]["/slugs/check"]["get"].is_object());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn only_an_owner_with_a_fresh_sign_in_changes_the_slug() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, owner, _) = user(&s, &db).await;
+        let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+        let (admin, _) = joined(&s, &db, &team_id, "admin").await;
+        let (member, _) = joined(&s, &db, &team_id, "member").await;
+        for cookie in [&admin, &member] {
+            let res = set_slug(&s, cookie, json!(fresh_slug())).await;
+            assert_eq!(res.status_code(), 403);
+            res.assert_json(&json!({"error": "forbidden"}));
+        }
+        // A request without a session is refused, and one not from the web app too.
+        let call = s
+            .method(Method::PATCH, "/v1/team/slug")
+            .json(&json!({"slug": fresh_slug()}));
+        assert_eq!(call.add_header("origin", WEB).await.status_code(), 401);
+        let res = s
+            .method(Method::PATCH, "/v1/team/slug")
+            .add_header("cookie", owner.clone())
+            .json(&json!({"slug": fresh_slug()}))
+            .await;
+        assert_eq!(res.status_code(), 403);
+        let slug = fresh_slug();
+        let aged = |cookie: &str, minutes: i64| {
+            let row = sessions::ActiveModel {
+                token_hash: Set(token::hash(cookie.trim_start_matches("sr_session="))),
+                created_at: Set((Utc::now() - Duration::minutes(minutes)).fixed_offset()),
+                ..Default::default()
+            };
+            let db = db.clone();
+            async move { sessions::Entity::update(row).exec(&db).await.unwrap() }
+        };
+        aged(&owner, 11).await;
+        let res = set_slug(&s, &owner, json!(slug)).await;
+        assert_eq!(res.status_code(), 403);
+        res.assert_json(&json!({"error": "reauth_required"}));
+        assert_eq!(current(&s, &owner).await["slug"], Value::Null);
+        aged(&owner, 9).await;
+        set_slug(&s, &owner, json!(slug)).await.assert_status_ok();
+        // The field is required: no body can clear the slug by leaving it out.
+        for body in [json!({}), json!({"slag": "x"})] {
+            let res = req(&s, Method::PATCH, "/v1/team/slug", &owner)
+                .json(&body)
+                .await;
+            assert_eq!(res.status_code(), 422, "{body}");
+        }
+        assert_eq!(current(&s, &owner).await["slug"], slug);
     }
 
     #[tokio::test]
@@ -2746,7 +2822,7 @@ mod teams {
     async fn slugs_are_validated() {
         let (s, db) = server_where(|_| {}).await;
         let (_, cookie, _) = user(&s, &db).await;
-        let long = "a".repeat(31);
+        let long = "a".repeat(33);
         for (slug, reason) in [
             ("ab", "length"),
             ("", "length"),
@@ -2762,6 +2838,9 @@ mod teams {
             ("socialreins", "reserved"),
             ("t", "reserved"),
             ("_", "reserved"),
+            ("pricing", "reserved"),
+            ("my-socialreins", "reserved"),
+            ("fuck-this", "blocked"),
         ] {
             let res = set_slug(&s, &cookie, json!(slug)).await;
             assert_eq!(res.status_code(), 422, "{slug}");
@@ -2811,35 +2890,239 @@ mod teams {
 
     #[tokio::test]
     #[serial]
-    async fn a_team_changes_its_slug_5_times_a_day() {
+    async fn a_team_gives_up_its_slug_3_times_in_30_days() {
         let (s, db) = server_where(|_| {}).await;
         let (_, cookie, _) = user(&s, &db).await;
         let (_, other, _) = user(&s, &db).await;
         let taken = fresh_slug();
         set_slug(&s, &other, json!(taken)).await.assert_status_ok();
-        let mine = fresh_slug();
-        // Sets and clears both count: these are 4 of the day's 5.
-        for change in [json!(mine), Value::Null, json!(mine), Value::Null] {
+        // The first slug gives nothing up. Then change, clear, set and change again: 3 given up.
+        let (one, two, three, four) = (fresh_slug(), fresh_slug(), fresh_slug(), fresh_slug());
+        for change in [json!(one), json!(two), Value::Null, json!(three)] {
             set_slug(&s, &cookie, change).await.assert_status_ok();
         }
         // Refused changes and the slug it already has cost nothing.
         assert_eq!(set_slug(&s, &cookie, json!(taken)).await.status_code(), 409);
         assert_eq!(set_slug(&s, &cookie, json!("ab")).await.status_code(), 422);
-        set_slug(&s, &cookie, Value::Null).await.assert_status_ok();
-        set_slug(&s, &cookie, json!(mine)).await.assert_status_ok();
-        set_slug(&s, &cookie, json!(mine)).await.assert_status_ok();
+        set_slug(&s, &cookie, json!(three)).await.assert_status_ok();
+        set_slug(&s, &cookie, json!(four)).await.assert_status_ok();
+        set_slug(&s, &cookie, json!(four)).await.assert_status_ok();
+        // That was the third; the next is the fourth.
         for change in [Value::Null, json!(fresh_slug())] {
             let res = set_slug(&s, &cookie, change).await;
             assert_eq!(res.status_code(), 429);
             res.assert_json(&json!({"error": "slug_changed_too_often"}));
         }
-        assert_eq!(current(&s, &cookie).await["slug"], mine);
-        // The rest of the team still changes, and the cap is the team's own.
+        assert_eq!(current(&s, &cookie).await["slug"], four);
+        // The cap is the team's own, and the rest of the team still changes.
+        set_slug(&s, &other, Value::Null).await.assert_status_ok();
         let res = req(&s, Method::PATCH, "/v1/team", &cookie)
-            .json(&json!({"name": "Still", "slug": mine}))
+            .json(&json!({"name": "Still"}))
             .await;
         assert_eq!(res.json::<Value>()["name"], "Still");
-        set_slug(&s, &other, Value::Null).await.assert_status_ok();
+        // The oldest change is 31 days old: one more is allowed.
+        let sql = format!(
+            "UPDATE team_slug_history SET retired_at = now() - interval '31 days' \
+             WHERE slug = '{one}'"
+        );
+        sea_orm::ConnectionTrait::execute_unprepared(&db, &sql)
+            .await
+            .unwrap();
+        set_slug(&s, &cookie, Value::Null).await.assert_status_ok();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_slug_given_up_redirects_to_the_teams_address() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, owner, _) = user(&s, &db).await;
+        let team = current(&s, &owner).await;
+        let code = team["code"].as_str().unwrap();
+        let (one, two) = (fresh_slug(), fresh_slug());
+        // Nothing to redirect before a slug is given up: a current slug and a code are addresses.
+        set_slug(&s, &owner, json!(one)).await.assert_status_ok();
+        assert_eq!(redirect_for(&s, &one).await, None);
+        assert_eq!(redirect_for(&s, code).await, None);
+        assert_eq!(redirect_for(&s, &fresh_slug()).await, None);
+        // After a change the old one leads to the new, in any case, and the header allows a cache.
+        set_slug(&s, &owner, json!(two)).await.assert_status_ok();
+        assert_eq!(redirect_for(&s, &one).await.as_deref(), Some(&*two));
+        assert_eq!(
+            redirect_for(&s, &one.to_uppercase()).await.as_deref(),
+            Some(&*two)
+        );
+        let res = s.get(&format!("/v1/public/team-slugs/{one}")).await;
+        assert_eq!(res.header("cache-control"), "public, max-age=60");
+        // Cleared: it leads to the code. Taken back: the team's own address, no redirect.
+        set_slug(&s, &owner, Value::Null).await.assert_status_ok();
+        for old in [&one, &two] {
+            assert_eq!(redirect_for(&s, old).await.as_deref(), Some(code));
+        }
+        set_slug(&s, &owner, json!(one)).await.assert_status_ok();
+        assert_eq!(redirect_for(&s, &one).await, None);
+        assert_eq!(redirect_for(&s, &two).await.as_deref(), Some(&*one));
+        // 400 days on it no longer leads anywhere; a slug that never was does not either.
+        retired_days_ago(&db, &two, 399).await;
+        assert_eq!(redirect_for(&s, &two).await.as_deref(), Some(&*one));
+        retired_days_ago(&db, &two, 401).await;
+        assert_eq!(redirect_for(&s, &two).await, None);
+        // The redirect tells no more than the slug: nothing to read for a team's own pages, and
+        // no session is needed.
+        let res = s
+            .get(&format!("/v1/public/team-slugs/{}", "a".repeat(65)))
+            .await;
+        assert_eq!(res.status_code(), 404);
+
+        // A slug that passed to another team after its 90 days is theirs, not a redirect.
+        let (_, other, _) = user(&s, &db).await;
+        let passed = fresh_slug();
+        set_slug(&s, &owner, json!(passed)).await.assert_status_ok();
+        set_slug(&s, &owner, json!(fresh_slug()))
+            .await
+            .assert_status_ok();
+        assert!(redirect_for(&s, &passed).await.is_some());
+        retired_days_ago(&db, &passed, 91).await;
+        set_slug(&s, &other, json!(passed)).await.assert_status_ok();
+        assert_eq!(redirect_for(&s, &passed).await, None);
+        // Once they let go of it too, it is a slug two teams gave up: no redirect to either.
+        set_slug(&s, &other, json!(fresh_slug()))
+            .await
+            .assert_status_ok();
+        assert_eq!(redirect_for(&s, &passed).await, None);
+        // A deleted team leaves nothing to redirect to.
+        let (_, doomed, _) = user(&s, &db).await;
+        req(&s, Method::POST, "/v1/teams", &doomed)
+            .json(&json!({"name": "Doomed"}))
+            .await;
+        let old = fresh_slug();
+        set_slug(&s, &doomed, json!(old)).await.assert_status_ok();
+        set_slug(&s, &doomed, json!(fresh_slug()))
+            .await
+            .assert_status_ok();
+        assert!(redirect_for(&s, &old).await.is_some());
+        let res = req(&s, Method::DELETE, "/v1/team", &doomed).await;
+        assert_eq!(res.status_code(), 204);
+        assert_eq!(redirect_for(&s, &old).await, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_slug_can_be_checked_before_it_is_taken() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, owner, _) = user(&s, &db).await;
+        let (_, other, _) = user(&s, &db).await;
+        let team = current(&s, &owner).await;
+        let check = |cookie: &str, query: &str| {
+            s.get(&format!("/v1/slugs/check?{query}"))
+                .add_header("cookie", cookie.to_owned())
+        };
+        let answer = |res: axum_test::TestResponse| {
+            res.assert_status_ok();
+            let v = res.json::<Value>();
+            (
+                v["slug"].as_str().unwrap().to_owned(),
+                v["available"].as_bool().unwrap(),
+                v["reason"].as_str().map(str::to_owned),
+            )
+        };
+        let free = fresh_slug();
+        let res = check(&owner, &format!("slug=%20{}%20", free.to_uppercase())).await;
+        assert_eq!(answer(res), (free.clone(), true, None));
+        for (typed, reason) in [
+            ("ab", "length"),
+            ("a--b", "characters"),
+            ("posts", "reserved"),
+            ("fuck-it", "blocked"),
+            (team["code"].as_str().unwrap(), "taken"),
+        ] {
+            let res = check(&owner, &format!("slug={typed}")).await;
+            assert_eq!(
+                answer(res),
+                (typed.to_owned(), false, Some(reason.to_owned()))
+            );
+        }
+        // Another team's slug, and one it gave up, are taken; for its own team they are not.
+        let (mine, was) = (fresh_slug(), fresh_slug());
+        set_slug(&s, &owner, json!(was)).await.assert_status_ok();
+        set_slug(&s, &owner, json!(mine)).await.assert_status_ok();
+        for slug in [&mine, &was] {
+            let res = check(&other, &format!("slug={slug}")).await;
+            assert_eq!(answer(res).2.as_deref(), Some("taken"), "{slug}");
+        }
+        let res = check(
+            &owner,
+            &format!("slug={was}&for_team={}", team["code"].as_str().unwrap()),
+        )
+        .await;
+        assert_eq!(answer(res), (was.clone(), true, None));
+        let res = check(
+            &owner,
+            &format!("slug={mine}&for_team={}", team["code"].as_str().unwrap()),
+        )
+        .await;
+        assert_eq!(answer(res).2.as_deref(), Some("current"));
+        // It cannot be asked about a team the caller is not in, and needs a session.
+        let res = check(
+            &other,
+            &format!("slug={free}&for_team={}", team["code"].as_str().unwrap()),
+        )
+        .await;
+        assert_eq!(res.status_code(), 404);
+        let res = s.get(&format!("/v1/slugs/check?slug={free}")).await;
+        assert_eq!(res.status_code(), 401);
+        let res = check(&owner, "").await;
+        assert_eq!(res.status_code(), 422);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_new_team_can_start_with_a_slug() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, cookie, id) = user(&s, &db).await;
+        let (_, other, _) = user(&s, &db).await;
+        let make = |body: Value| req(&s, Method::POST, "/v1/teams", &cookie).json(&body);
+        let slug = fresh_slug();
+        let res = make(json!({"name": "Acme", "slug": format!(" {} ", slug.to_uppercase())})).await;
+        assert_eq!(res.status_code(), 201);
+        let made = res.json::<Value>();
+        assert_eq!(made["slug"], slug);
+        assert_eq!(made["code"].as_str().unwrap().len(), 6);
+        assert_eq!(current(&s, &cookie).await["slug"], slug);
+        // Without one, or with null or an empty one, it starts at its code.
+        for body in [
+            json!({"name": "A"}),
+            json!({"name": "B", "slug": null}),
+            json!({"name": "C", "slug": " "}),
+        ] {
+            let res = make(body).await;
+            assert_eq!(res.status_code(), 201);
+            assert_eq!(res.json::<Value>()["slug"], Value::Null);
+        }
+        let count = memberships(&db, id).await;
+        // A slug that is taken, given up by another team lately, or not allowed makes no team.
+        let given_up = fresh_slug();
+        set_slug(&s, &other, json!(given_up))
+            .await
+            .assert_status_ok();
+        set_slug(&s, &other, json!(fresh_slug()))
+            .await
+            .assert_status_ok();
+        for taken in [&slug, &given_up] {
+            let res = make(json!({"name": "D", "slug": taken})).await;
+            assert_eq!(res.status_code(), 409, "{taken}");
+            res.assert_json(&json!({"error": "slug_taken"}));
+        }
+        for (bad, reason) in [
+            ("ab", "length"),
+            ("admin", "reserved"),
+            ("a_b", "characters"),
+            ("shit-co", "blocked"),
+        ] {
+            let res = make(json!({"name": "E", "slug": bad})).await;
+            assert_eq!(res.status_code(), 422, "{bad}");
+            res.assert_json(&json!({"error": "invalid_slug", "reason": reason}));
+        }
+        assert_eq!(memberships(&db, id).await, count);
     }
 
     #[tokio::test]
@@ -9580,6 +9863,26 @@ mod teams {
                     assert_eq!(mails.len(), 3, "{mails:?}");
                     assert_eq!(mails[2].0, "Your Bluesky post was not posted");
 
+                    // A team with a slug of its own is linked by it.
+                    let slug = format!("s-{}", team::random_code(12));
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE teams SET slug = '{slug}' WHERE id = '{team_id}'; \
+                             UPDATE post_notices SET created_at = now() - interval '3 hours' \
+                             WHERE post_id = '{late}'; \
+                             UPDATE posts SET status = 'scheduled', error = NULL, \
+                             scheduled_at = now() - interval '90 minutes' WHERE id = '{late}'"
+                        ),
+                    )
+                    .await;
+                    for _ in 0..3 {
+                        publish::tick(&state).await.unwrap();
+                    }
+                    let mails = mail_for(&seen.lock().unwrap(), &owner);
+                    assert_eq!(mails.len(), 4, "{mails:?}");
+                    assert!(mails[3].1.contains(&format!("/t/{slug}/posts/{late}")));
+
                     // Ten notices a team a day: the eleventh and after are not mailed.
                     for i in 0..10 {
                         let body = input(&set, &format!("REJECT {i}"), Some(&past()));
@@ -11155,7 +11458,7 @@ mod teams {
                         .await;
                     // The redirect names the team by its slug, the list below by its code.
                     let slug = format!("s-{}", team::random_code(12));
-                    req(&s, Method::PATCH, "/v1/team", &cookie)
+                    req(&s, Method::PATCH, "/v1/team/slug", &cookie)
                         .add_header("x-team", personal["code"].as_str().unwrap().to_owned())
                         .json(&json!({"slug": slug}))
                         .await
@@ -27286,6 +27589,454 @@ mod teams {
                         .unwrap()
                         .len(),
                     20
+                );
+            }
+
+            async fn me_id(s: &TestServer, cookie: &str) -> String {
+                let me = s.get("/auth/me").add_header("cookie", cookie).await;
+                me.json::<Value>()["id"].as_str().unwrap().to_owned()
+            }
+
+            async fn count_hits(db: &DatabaseConnection, bucket: String) -> i64 {
+                let stmt = sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DbBackend::Postgres,
+                    "SELECT count(*) AS n FROM rate_limit_hits WHERE bucket = $1",
+                    [bucket.into()],
+                );
+                let row = sea_orm::ConnectionTrait::query_one_raw(db, stmt).await;
+                row.unwrap().unwrap().try_get::<i64>("", "n").unwrap()
+            }
+
+            fn made(collection: &str, subject: &str) -> usize {
+                let same = |r: &&Value| {
+                    let to = &r["record"]["subject"];
+                    r["collection"] == collection && (to == subject || to["uri"] == subject)
+                };
+                RECORDS.lock().unwrap().iter().filter(same).count()
+            }
+
+            /// The activity item `kind` by `author` is stored once, found in the activity list.
+            async fn activity_item(s: &TestServer, cookie: &str, kind: &str) -> String {
+                let all = all_inbox(s, cookie).await;
+                let all_id = all["id"].as_str().unwrap();
+                let page = items(s, cookie, all_id, &format!("?kind={kind}")).await;
+                page["items"][0]["id"].as_str().unwrap().to_owned()
+            }
+
+            /// Likes and reposts of our posts run `like_received` and `repost_received` (optionally
+            /// for one post); follow back, notify, assign and a flow of them act once per item and
+            /// take a hit each; what did not match is logged with why.
+            #[tokio::test]
+            #[serial]
+            async fn likes_and_reposts_run_automations_and_the_misses_say_why() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
+                let uid = me_id(&s, &cookie).await;
+                let root = format!("at://{me}/app.bsky.feed.post/root");
+                let other = format!("at://{me}/app.bsky.feed.post/other");
+                for (body, code) in [
+                    // A like has no post of its own to like or repost, and nothing to reply under.
+                    (
+                        json!({"trigger": "like_received", "actions": [{"type": "like_comment"}]}),
+                        "invalid_actions",
+                    ),
+                    (
+                        json!({"trigger": "new_follower", "actions": [{"type": "repost_comment"}]}),
+                        "invalid_actions",
+                    ),
+                    (
+                        json!({"trigger": "like_received",
+                            "actions": [{"type": "reply_publicly", "text": "x"}]}),
+                        "invalid_actions",
+                    ),
+                    // A stop alone does nothing; each action once; an assignee must be a member.
+                    (
+                        json!({"trigger": "like_received", "actions": [{"type": "stop_automations"}]}),
+                        "invalid_actions",
+                    ),
+                    (
+                        json!({"trigger": "like_received",
+                            "actions": [{"type": "follow_back"}, {"type": "follow_back"}]}),
+                        "invalid_actions",
+                    ),
+                    (
+                        json!({"trigger": "like_received", "actions": [
+                            {"type": "assign", "user_id": uuid::Uuid::now_v7()}]}),
+                        "invalid_actions",
+                    ),
+                    // A like has no text to look in, and is never an author's "first comment".
+                    (
+                        json!({"trigger": "like_received", "conditions": {"keywords": ["x"]},
+                            "actions": [{"type": "follow_back"}]}),
+                        "invalid_conditions",
+                    ),
+                    (
+                        json!({"trigger": "repost_received",
+                            "conditions": {"first_per_author": true},
+                            "actions": [{"type": "follow_back"}]}),
+                        "invalid_conditions",
+                    ),
+                    (
+                        json!({"trigger": "repost_received", "steps": [{"type": "like_comment"}]}),
+                        "invalid_steps",
+                    ),
+                    (
+                        json!({"trigger": "like_received", "steps": [
+                            {"type": "stop_automations"}, {"type": "wait", "minutes": 5}]}),
+                        "invalid_steps",
+                    ),
+                ] {
+                    let mut body = body;
+                    body["name"] = json!("x");
+                    let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                        .json(&body)
+                        .await;
+                    assert_eq!(res.status_code(), 422, "{body}");
+                    assert_eq!(res.json::<Value>()["error"], code, "{body}");
+                }
+                let liked = automation(
+                    &s,
+                    &cookie,
+                    json!({"name": "Follow likers", "trigger": "like_received",
+                        "actions": [{"type": "follow_back"}, {"type": "notify_team"}]}),
+                )
+                .await;
+                let flowed = automation(
+                    &s,
+                    &cookie,
+                    json!({"name": "Assign likers", "trigger": "like_received", "steps": [
+                        {"type": "notify_team"},
+                        {"type": "assign", "user_id": uid}]}),
+                )
+                .await;
+                let reposted = automation(
+                    &s,
+                    &cookie,
+                    json!({"name": "Reposts of the other post", "trigger": "repost_received",
+                        "conditions": {"post_remote_ids": [other]},
+                        "actions": [{"type": "follow_back"}]}),
+                )
+                .await;
+                let on_root = automation(
+                    &s,
+                    &cookie,
+                    json!({"name": "Reposts of the root", "trigger": "repost_received",
+                        "conditions": {"post_remote_ids": [root]},
+                        "actions": [{"type": "assign", "user_id": uid}]}),
+                )
+                .await;
+                set_inbox(
+                    &me,
+                    json!({
+                        "notifications": [
+                            activity("repost", "did:plc:reposterxx", "rx1", &root, &at(-2)),
+                            activity("like", "did:plc:likerxx", "lx1", &root, &at(-1)),
+                        ],
+                        "convos": [], "messages": {},
+                    }),
+                );
+                ingest(&db, &state, &account).await;
+                ingest(&db, &state, &account).await;
+
+                let got = runs(&s, &cookie, &liked).await;
+                assert_eq!(got.len(), 1, "{got:?}");
+                assert_eq!(got[0]["status"], "sent", "{got:?}");
+                let kinds: Vec<_> = got[0]["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| (r["type"].clone(), r["status"].clone()))
+                    .collect();
+                assert_eq!(
+                    kinds,
+                    [
+                        (json!("follow_back"), json!("done")),
+                        (json!("notify_team"), json!("done"))
+                    ]
+                );
+                // Followed the liker, once, and the repost's author not (that automation is for
+                // the other post).
+                assert_eq!(made("app.bsky.graph.follow", "did:plc:likerxx"), 1);
+                assert_eq!(made("app.bsky.graph.follow", "did:plc:reposterxx"), 0);
+                let got = runs(&s, &cookie, &flowed).await;
+                assert_eq!(got.len(), 1, "{got:?}");
+                assert_eq!(got[0]["status"], "sent", "{got:?}");
+                assert_eq!(got[0]["step_index"], 1);
+                let like_id = activity_item(&s, &cookie, "like").await;
+                let item = fetch(&s, &cookie, &format!("/v1/inbox-items/{like_id}")).await;
+                assert_eq!(item["assigned_to"]["id"], uid);
+                // One hit for the first automation's run and one for the flow (its mail; an
+                // assignment goes to nobody outside, so it takes none, as the repost
+                // automation's only action); two notifications.
+                assert_eq!(
+                    count_hits(&db, format!("automation:team:{team_id}")).await,
+                    2
+                );
+                assert_eq!(
+                    count_hits(&db, format!("automation:notice:{team_id}")).await,
+                    2
+                );
+
+                // The repost: the automation for the other post says so, and the one for the
+                // root ran.
+                assert!(runs(&s, &cookie, &reposted).await.is_empty());
+                assert_eq!(runs(&s, &cookie, &on_root).await.len(), 1);
+                let miss = fetch(&s, &cookie, &format!("/v1/automations/{reposted}/misses")).await;
+                let list = miss["misses"].as_array().unwrap();
+                assert_eq!(list.len(), 1, "{miss}");
+                assert_eq!(list[0]["reasons"], json!(["wrong_post"]));
+                assert_eq!(
+                    (&list[0]["kind"], &list[0]["author"]),
+                    (&json!("repost"), &json!("Fan rx1"))
+                );
+                // The like automations were not for it: no list entry, a verdict on the item.
+                let none = fetch(&s, &cookie, &format!("/v1/automations/{liked}/misses")).await;
+                assert_eq!(none["misses"].as_array().unwrap().len(), 0, "{none}");
+                let repost_id = activity_item(&s, &cookie, "repost").await;
+                let v = fetch(
+                    &s,
+                    &cookie,
+                    &format!("/v1/inbox-items/{repost_id}/automations"),
+                )
+                .await;
+                let verdict = |id: &str| {
+                    v["automations"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|a| a["automation_id"] == id)
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                };
+                assert_eq!(verdict(&liked)["reasons"], json!(["wrong_trigger"]));
+                assert_eq!(verdict(&liked)["outcome"], "not_matched");
+                assert_eq!(verdict(&reposted)["reasons"], json!(["wrong_post"]));
+                assert_eq!(verdict(&on_root)["outcome"], "ran");
+                // Never over the team boundary.
+                let (stranger, ..) = owner(&s, &db).await;
+                let res = s
+                    .get(&format!("/v1/inbox-items/{repost_id}/automations"))
+                    .add_header("cookie", &stranger)
+                    .await;
+                assert_eq!(res.status_code(), 404);
+                let res = s
+                    .get(&format!("/v1/automations/{reposted}/misses"))
+                    .add_header("cookie", &stranger)
+                    .await;
+                assert_eq!(res.status_code(), 404);
+
+                // Switched off, an automation says nothing; after 14 days a miss goes.
+                exec(
+                    &db,
+                    "UPDATE automation_misses SET created_at = now() - interval '15 days' \
+                     WHERE reasons = ARRAY['wrong_post']",
+                )
+                .await;
+                socialreins_brain::automation_misses::prune(&db)
+                    .await
+                    .unwrap();
+                let miss = fetch(&s, &cookie, &format!("/v1/automations/{reposted}/misses")).await;
+                assert_eq!(miss["misses"].as_array().unwrap().len(), 0, "{miss}");
+            }
+
+            /// A fan who likes two posts in one round is followed once, and the second run says so.
+            #[tokio::test]
+            #[serial]
+            async fn a_fan_who_likes_twice_is_followed_once() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                let root = format!("at://{me}/app.bsky.feed.post/root");
+                let id = automation(
+                    &s,
+                    &cookie,
+                    json!({"name": "Follow likers", "trigger": "like_received",
+                        "actions": [{"type": "follow_back"}]}),
+                )
+                .await;
+                set_inbox(
+                    &me,
+                    json!({
+                        "notifications": [
+                            activity("like", "did:plc:twice", "tw2", &root, &at(-2)),
+                            activity("like", "did:plc:twice", "tw1", &root, &at(-3)),
+                        ],
+                        "convos": [], "messages": {},
+                    }),
+                );
+                ingest(&db, &state, &account).await;
+                assert_eq!(made("app.bsky.graph.follow", "did:plc:twice"), 1);
+                let got = runs(&s, &cookie, &id).await;
+                assert_eq!(got.len(), 2, "{got:?}");
+                let mut states: Vec<_> = got
+                    .iter()
+                    .map(|r| {
+                        (
+                            r["status"].as_str().unwrap().to_owned(),
+                            r["reason"].clone(),
+                        )
+                    })
+                    .collect();
+                states.sort_by(|a, b| a.0.cmp(&b.0));
+                assert_eq!(
+                    states,
+                    [
+                        ("sent".to_owned(), Value::Null),
+                        ("skipped".to_owned(), json!("already_done"))
+                    ]
+                );
+            }
+
+            /// `like_comment` and `repost_comment` go through the inbox's own like and repost (a record
+            /// in the account's repo, a row in `inbox_actions`); `stop_automations` holds back the
+            /// automations after it on that item and says so.
+            #[tokio::test]
+            #[serial]
+            async fn comment_automations_like_repost_and_stop_the_others() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                let c1 = "at://did:plc:stopfan/app.bsky.feed.post/cstop";
+                let first = automation(
+                    &s,
+                    &cookie,
+                    json!({"name": "Like and repost", "trigger": "comment_received", "actions": [
+                        {"type": "like_comment"}, {"type": "repost_comment"}, {"type": "stop_automations"}]}),
+                )
+                .await;
+                let second = automation(
+                    &s,
+                    &cookie,
+                    json!({"name": "Never", "trigger": "comment_received",
+                        "actions": [{"type": "follow_back"}]}),
+                )
+                .await;
+                set_inbox(
+                    &me,
+                    json!({
+                        "notifications": [note("reply", "did:plc:stopfan", "cstop", "Love it stop", &at(-2), &me)],
+                        "convos": [], "messages": {},
+                        "posts": {c1: {"uri": c1}}, "profiles": {},
+                    }),
+                );
+                ingest(&db, &state, &account).await;
+                ingest(&db, &state, &account).await;
+                assert_eq!(made("app.bsky.feed.like", c1), 1);
+                assert_eq!(made("app.bsky.feed.repost", c1), 1);
+                assert_eq!(made("app.bsky.graph.follow", "did:plc:stopfan"), 0);
+                let got = runs(&s, &cookie, &first).await;
+                assert_eq!(got.len(), 1, "{got:?}");
+                let kinds: Vec<_> = got[0]["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| (r["type"].clone(), r["status"].clone()))
+                    .collect();
+                assert_eq!(
+                    kinds,
+                    [
+                        (json!("like_comment"), json!("done")),
+                        (json!("repost_comment"), json!("done")),
+                        (json!("stop_automations"), json!("done")),
+                    ]
+                );
+                assert_eq!(got[0]["status"], "sent");
+                assert!(runs(&s, &cookie, &second).await.is_empty());
+                let miss = fetch(&s, &cookie, &format!("/v1/automations/{second}/misses")).await;
+                assert_eq!(
+                    miss["misses"][0]["reasons"],
+                    json!(["stopped_by_other"]),
+                    "{miss}"
+                );
+                // Logged like a person's click, but by nobody.
+                let n = {
+                    let stmt = sea_orm::Statement::from_string(
+                        sea_orm::DbBackend::Postgres,
+                        format!(
+                            "SELECT count(*) AS n FROM inbox_actions WHERE team_id = \
+                             (SELECT team_id FROM social_accounts WHERE id = '{account}') \
+                             AND done_by IS NULL AND status = 'done' \
+                             AND action IN ('like', 'repost')"
+                        ),
+                    );
+                    let row = sea_orm::ConnectionTrait::query_one_raw(&db, stmt).await;
+                    row.unwrap().unwrap().try_get::<i64>("", "n").unwrap()
+                };
+                assert_eq!(n, 2);
+            }
+
+            /// "Test this automation" shows the new triggers and actions and does none of them.
+            #[tokio::test]
+            #[serial]
+            async fn testing_the_new_actions_does_nothing_and_says_what_would_happen() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
+                let uid = me_id(&s, &cookie).await;
+                let root = format!("at://{me}/app.bsky.feed.post/root");
+                let sample = json!({"account_id": account, "text": "", "post_remote_id": root});
+                let try_it = |automation: Value, sample: Value| {
+                    let r = req(&s, Method::POST, "/v1/automations/test", &cookie);
+                    async move {
+                        let res = r
+                            .json(&json!({"automation": automation, "sample": sample}))
+                            .await;
+                        (res.status_code(), res.json::<Value>())
+                    }
+                };
+                let before = RECORDS.lock().unwrap().len();
+                let (status, out) = try_it(
+                    json!({"name": "t", "trigger": "like_received",
+                        "conditions": {"post_remote_ids": [root]},
+                        "actions": [{"type": "follow_back"}, {"type": "assign", "user_id": uid},
+                            {"type": "notify_team"}, {"type": "stop_automations"}]}),
+                    sample.clone(),
+                )
+                .await;
+                assert_eq!(status, 200, "{out}");
+                assert_eq!(out["matched"], true);
+                let steps: Vec<_> = out["steps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| {
+                        (
+                            p["type"].as_str().unwrap().to_owned(),
+                            p["status"].as_str().unwrap().to_owned(),
+                        )
+                    })
+                    .collect();
+                let would = |t: &str| (t.to_owned(), "would_do".to_owned());
+                assert_eq!(
+                    steps,
+                    [
+                        would("follow_back"),
+                        would("assign"),
+                        would("notify_team"),
+                        would("stop_automations")
+                    ]
+                );
+                // Another post: no match, and why.
+                let elsewhere = json!({"account_id": account, "text": "",
+                    "post_remote_id": format!("at://{me}/app.bsky.feed.post/else")});
+                let (_, out) = try_it(
+                    json!({"name": "t", "trigger": "repost_received",
+                        "conditions": {"post_remote_ids": [root]},
+                        "actions": [{"type": "follow_back"}]}),
+                    elsewhere,
+                )
+                .await;
+                assert_eq!(out["matched"], false);
+                assert_eq!(out["mismatches"], json!(["wrong_post"]));
+                // A comment: like and repost would go.
+                let (_, out) = try_it(
+                    json!({"name": "t", "trigger": "comment_received",
+                        "actions": [{"type": "like_comment"}, {"type": "repost_comment"}]}),
+                    json!({"account_id": account, "text": "hello"}),
+                )
+                .await;
+                assert_eq!(out["steps"][0]["status"], "would_do", "{out}");
+                assert_eq!(RECORDS.lock().unwrap().len(), before);
+                assert_eq!(
+                    count_hits(&db, format!("automation:notice:{team_id}")).await,
+                    0
                 );
             }
 
