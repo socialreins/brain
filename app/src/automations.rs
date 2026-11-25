@@ -81,10 +81,10 @@ const UNCHANGED: &str = "r.steps_hash = md5($4::jsonb::text) AND EXISTS (SELECT 
     AND md5(a.steps::text) = r.steps_hash)";
 const CHANGED: &str = "automation_changed";
 /// Runs stored `skipped` for a safety reason (`paused`, `own_account`, `connected_account`,
-/// `cooldown`, `automation_cap`) did nothing: they are not an author's first run and never count
+/// `cooldown`, `automation_cap`, or the team's `daily_cap`) did nothing: they are not an author's first run and never count
 /// toward a cool-down or an automation's cap. SQL on a run aliased `r`.
-const NOT_ACTED: &str = "(r.status = 'skipped' AND r.reason IN ('paused', 'own_account', \
-    'connected_account', 'cooldown', 'automation_cap'))";
+const NOT_ACTED: &str = "(r.status = 'skipped' AND COALESCE(r.reason, '') IN ('paused', \
+    'own_account', 'connected_account', 'cooldown', 'automation_cap', 'daily_cap'))";
 /// Longest `{name}` put into a text.
 pub(crate) const MAX_NAME_CHARS: usize = 64;
 /// What `{page}` counts as when a text is checked.
@@ -781,11 +781,7 @@ async fn run_matching(
     // Nothing runs on an item by a connected account (the team's own, or another team's), so
     // two automated accounts cannot answer each other in a loop, and nothing runs while the team
     // has paused its automations. Each automation that would have run stores why it did not.
-    let held = match loop_guard(db, item, account).await? {
-        Some(why) => Some(why),
-        None if team_paused(db, item.team_id).await? => Some("paused"),
-        None => None,
-    };
+    let guard = loop_guard(db, item, account).await?;
     // A follower is welcomed once per account ever: an unfollow and a new follow stores a new
     // item (a new record) but runs nothing.
     if item.kind == "follow" {
@@ -892,6 +888,12 @@ async fn run_matching(
         let sends = steps
             .as_ref()
             .is_none_or(|s| s.first().is_some_and(|x| x.sends().is_some()));
+        // Read for each automation, so a pause during the round holds the rest back.
+        let held = match guard {
+            Some(why) => Some(why),
+            None if team_paused(db, item.team_id).await? => Some("paused"),
+            None => None,
+        };
         if let Some(why) = held {
             skip_run(db, &a, item, why).await?;
             continue;
@@ -1305,9 +1307,11 @@ pub async fn resume(app: &AppState, run: &automation_runs::Model) -> Result<(), 
         Some(post) if holds => pages::address(db, &app.web_url, item.team_id, post).await?,
         _ => None,
     };
-    // A paused team's waiting runs end here: nothing goes out while it is paused.
+    // A paused team's waiting runs end here: nothing goes out while it is paused. They sent
+    // before they waited, so unlike a run held back at the start they count as having run.
     if team_paused(db, a.team_id).await? {
-        return settle(db, run.id, "skipped", Some("paused".into()), &results).await;
+        let why = Some("paused_waiting".into());
+        return settle(db, run.id, "skipped", why, &results).await;
     }
     // Also where a run ends whose automation was switched off or given other steps since.
     if !claim_step(db, run.id, &a, i, next.sends().is_some(), &results).await? {

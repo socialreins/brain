@@ -1083,3 +1083,40 @@ async fn nothing_answers_a_connected_account_of_this_or_another_team() {
         ]
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn a_pause_ends_waiting_flows_and_a_cooldown_holds_a_flow() {
+    let e = env(ALL, false).await;
+    let pause = |on: bool| e.req(Method::PATCH, "/v1/team", json!({"automations_paused": on}));
+    // A flow that sent, waited and meets a pause ends there, as having run.
+    let flow = e
+        .automation(
+            json!({"name": "Flow", "cooldown_minutes": 5, "actions": null,
+            "steps": [{"type": "reply_publicly", "text": "one"}, {"type": "wait", "minutes": 1},
+                      {"type": "reply_publicly", "text": "two"}]}),
+        )
+        .await;
+    e.arrive(&who(), "hello").await;
+    assert_eq!(e.runs(&flow).await, vec![run("waiting", None)]);
+    pause(true).await;
+    e.sql("UPDATE automation_runs SET resume_at = now() - interval '1 minute' WHERE status = 'waiting'")
+        .await;
+    socialreins_brain::automations::resume_due(&e.state, socialreins_brain::automations::ROUND)
+        .await
+        .unwrap();
+    assert_eq!(
+        e.runs(&flow).await,
+        vec![run("skipped", Some("paused_waiting"))]
+    );
+    // The cool-down also holds a flow's second run for the same person.
+    pause(false).await;
+    let bob = who();
+    e.arrive(&bob, "hello").await;
+    e.arrive(&bob, "hello").await;
+    let runs = e.runs(&flow).await;
+    assert_eq!(
+        runs[1..],
+        [run("waiting", None), run("skipped", Some("cooldown"))]
+    );
+}
