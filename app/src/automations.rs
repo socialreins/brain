@@ -176,7 +176,7 @@ impl Action {
     }
 
     /// How a send goes out and its text (an AI send's prompt); `None` for a `tag_contact`.
-    fn via_text(&self) -> Option<(Via, &str)> {
+    pub(crate) fn via_text(&self) -> Option<(Via, &str)> {
         match self {
             Self::SendDm { text } => Some((Via::Dm, text)),
             Self::ReplyPublicly { text } => Some((Via::Public, text)),
@@ -186,7 +186,7 @@ impl Action {
         }
     }
 
-    fn ai(&self) -> bool {
+    pub(crate) fn ai(&self) -> bool {
         matches!(self, Self::AiSendDm { .. } | Self::AiReplyPublicly { .. })
     }
 }
@@ -232,7 +232,7 @@ impl Step {
 
     /// How a send step goes out, its text (an AI step's prompt) and its buttons; `None` for a
     /// wait or a tag.
-    fn sends(&self) -> Option<(Via, &str, &[Button])> {
+    pub(crate) fn sends(&self) -> Option<(Via, &str, &[Button])> {
         match self {
             Self::SendDm { text, buttons } => Some((Via::Dm, text, buttons)),
             Self::ReplyPublicly { text } => Some((Via::Public, text, &[])),
@@ -242,7 +242,7 @@ impl Step {
         }
     }
 
-    fn ai(&self) -> bool {
+    pub(crate) fn ai(&self) -> bool {
         matches!(self, Self::AiSendDm { .. } | Self::AiReplyPublicly { .. })
     }
 }
@@ -544,22 +544,41 @@ pub struct Facts<'a> {
     pub first_message: bool,
 }
 
-pub fn matches(c: &Conditions, f: &Facts<'_>) -> bool {
-    let set_ok = c.social_set_id.is_none_or(|s| f.account_sets.contains(&s));
-    let account_ok = c.account_ids.is_empty() || c.account_ids.contains(&f.account_id);
+/// Why `f` does not meet `c`: one code per condition that fails (`wrong_set`, `wrong_account`,
+/// `wrong_post`, `no_keyword`, `not_first_from_author`, `not_first_message`); empty when it does.
+pub fn mismatches(c: &Conditions, f: &Facts<'_>) -> Vec<&'static str> {
+    let text = f.text.to_lowercase();
     let post_ok = c.post_remote_ids.is_empty()
         || c.post_remote_ids
             .iter()
             .any(|p| Some(p.as_str()) == f.parent || Some(p.as_str()) == f.root);
-    let text = f.text.to_lowercase();
-    let keyword_ok =
-        c.keywords.is_empty() || c.keywords.iter().any(|k| text.contains(&k.to_lowercase()));
-    set_ok
-        && account_ok
-        && post_ok
-        && keyword_ok
-        && (!c.first_per_author || f.first_from_author)
-        && (!c.first_message || f.first_message)
+    [
+        (
+            c.social_set_id.is_none_or(|s| f.account_sets.contains(&s)),
+            "wrong_set",
+        ),
+        (
+            c.account_ids.is_empty() || c.account_ids.contains(&f.account_id),
+            "wrong_account",
+        ),
+        (post_ok, "wrong_post"),
+        (
+            c.keywords.is_empty() || c.keywords.iter().any(|k| text.contains(&k.to_lowercase())),
+            "no_keyword",
+        ),
+        (
+            !c.first_per_author || f.first_from_author,
+            "not_first_from_author",
+        ),
+        (!c.first_message || f.first_message, "not_first_message"),
+    ]
+    .into_iter()
+    .filter_map(|(ok, why)| (!ok).then_some(why))
+    .collect()
+}
+
+pub fn matches(c: &Conditions, f: &Facts<'_>) -> bool {
+    mismatches(c, f).is_empty()
 }
 
 /// The commenter's display name when it is plainly a name: letters, digits, spaces, `'`, `-`
@@ -704,6 +723,24 @@ pub async fn sweep(app: &AppState) -> Result<(), DbErr> {
     Ok(())
 }
 
+/// The live sets that hold `account`.
+pub(crate) async fn live_set_ids(
+    db: &DatabaseConnection,
+    account: Uuid,
+) -> Result<Vec<Uuid>, DbErr> {
+    let in_live = Query::select()
+        .column(membership::Column::SocialSetId)
+        .from(membership::Entity)
+        .and_where(membership::Column::SocialAccountId.eq(account))
+        .and_where(membership::Column::SocialSetId.in_subquery(live_sets()))
+        .to_owned();
+    let rows = db.query_all(&in_live).await?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| r.try_get("", "social_set_id").ok())
+        .collect())
+}
+
 async fn run_matching(
     app: &AppState,
     account: &social_accounts::Model,
@@ -756,17 +793,7 @@ async fn run_matching(
             return Ok(());
         }
     }
-    let in_live = Query::select()
-        .column(membership::Column::SocialSetId)
-        .from(membership::Entity)
-        .and_where(membership::Column::SocialAccountId.eq(account.id))
-        .and_where(membership::Column::SocialSetId.in_subquery(live_sets()))
-        .to_owned();
-    let rows = db.query_all(&in_live).await?;
-    let sets: Vec<Uuid> = rows
-        .iter()
-        .filter_map(|r| r.try_get("", "social_set_id").ok())
-        .collect();
+    let sets = live_set_ids(db, account.id).await?;
     for a in autos {
         let parsed = (
             serde_json::from_value::<Conditions>(a.conditions.clone()),
@@ -1339,7 +1366,7 @@ fn outcome(kind: &str, sent: Result<Result<String, InboxError>, DbErr>) -> Actio
 
 /// `template` with each `{page}` replaced by the page's address; `None` when it holds one and
 /// there is no page.
-fn with_page(template: &str, page: Option<&str>) -> Option<String> {
+pub(crate) fn with_page(template: &str, page: Option<&str>) -> Option<String> {
     if !template.contains("{page}") {
         return Some(template.to_owned());
     }
@@ -1436,25 +1463,29 @@ async fn act(
     results
 }
 
-/// Writes a reply with AI from the owner's `prompt` and the item's text, and sends it as
-/// `kind`. The team's own key goes first, free and unmetered; else ours, which with billing on
-/// is paid under `reference` from the plan's monthly allowance, then an `ai` credit
-/// (`billing::spend_ai`), and given back when nothing usable came of the call. `skipped` with
-/// `no_ai_key` (no key at all) or `no_ai_credits`; `failed` with `ai_failed`, `ai_empty`,
-/// `ai_too_long`, `ai_link` or `ai_leak` (it repeats the prompt), and then nothing is sent. A
+/// What an AI step wrote: the text, the provider and the model.
+pub(crate) struct Written {
+    pub text: String,
+    pub provider: String,
+    pub model: Option<String>,
+}
+
+/// Writes a reply with AI from the owner's `prompt` and the item's text, as `kind`. The team's
+/// own key goes first, free and unmetered; else ours, which with billing on is paid under
+/// `reference` from the plan's monthly allowance, then an `ai` credit (`billing::spend_ai`),
+/// and given back when nothing usable came of the call. `Err` holds the result of a step that
+/// ends there: `skipped` with `no_ai_key` (no key at all) or `no_ai_credits`; `failed` with
+/// `ai_failed`, `ai_empty`, `ai_too_long`, `ai_link` or `ai_leak` (it repeats the prompt). A
 /// reference given back before is never paid or written again (`ai_failed`). Neither key nor
 /// prompt is logged.
-#[allow(clippy::too_many_arguments)]
-async fn ai_send(
+#[allow(clippy::result_large_err)] // the step's own result, used once
+pub(crate) async fn ai_write(
     app: &AppState,
     account: &social_accounts::Model,
     item: &inbox_items::Model,
-    automation: Uuid,
-    kind: &str,
-    via: Via,
-    prompt: &str,
+    (kind, via, prompt): (&str, Via, &str),
     reference: &str,
-) -> ActionResult {
+) -> Result<Written, ActionResult> {
     let ended = |status: &str, reason: &str| ActionResult {
         kind: kind.into(),
         status: status.into(),
@@ -1465,13 +1496,13 @@ async fn ai_send(
         Ok(k) => k,
         Err(e) => {
             tracing::error!(error = %e, item = %item.id, "ai key unreadable");
-            return ended("failed", "internal");
+            return Err(ended("failed", "internal"));
         }
     };
     let metered = team_key.is_none() && app.billing_enabled;
     let ours = || app.ai.own_key.clone().map(|k| ("anthropic".to_owned(), k));
     let Some((provider, key)) = team_key.or_else(ours) else {
-        return ended("skipped", "no_ai_key");
+        return Err(ended("skipped", "no_ai_key"));
     };
     let mut paid = None;
     if metered {
@@ -1493,11 +1524,11 @@ async fn ai_send(
         };
         match spent {
             Ok(AiSpent::Paid(kind)) => paid = Some(kind),
-            Ok(AiSpent::Short) => return ended("skipped", "no_ai_credits"),
-            Ok(AiSpent::Refunded) => return ended("failed", "ai_failed"),
+            Ok(AiSpent::Short) => return Err(ended("skipped", "no_ai_credits")),
+            Ok(AiSpent::Refunded) => return Err(ended("failed", "ai_failed")),
             Err(e) => {
                 tracing::error!(error = %e, item = %item.id, "ai reply not paid");
-                return ended("failed", "internal");
+                return Err(ended("failed", "internal"));
             }
         }
     }
@@ -1545,8 +1576,12 @@ async fn ai_send(
             }
         }
     };
-    let text = match text {
-        Ok(t) => t,
+    match text {
+        Ok(text) => Ok(Written {
+            text,
+            provider,
+            model,
+        }),
         Err(reason) => {
             if let Some(kind) = paid {
                 let back = billing::grant(
@@ -1561,18 +1596,36 @@ async fn ai_send(
                     tracing::error!(error = %e, item = %item.id, "ai reply not given back");
                 }
             }
-            return ActionResult {
+            Err(ActionResult {
                 provider: Some(provider),
                 model,
                 ..ended("failed", reason)
-            };
+            })
         }
+    }
+}
+
+/// Writes a reply with AI (`ai_write`) and sends it as `kind`, once.
+#[allow(clippy::too_many_arguments)]
+async fn ai_send(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    automation: Uuid,
+    kind: &str,
+    via: Via,
+    prompt: &str,
+    reference: &str,
+) -> ActionResult {
+    let written = match ai_write(app, account, item, (kind, via, prompt), reference).await {
+        Ok(w) => w,
+        Err(ended) => return ended,
     };
     let from = (None, Some(automation));
-    let sent = inbox::send_with(app, account, item, via, &text, &[], from, &[]).await;
+    let sent = inbox::send_with(app, account, item, via, &written.text, &[], from, &[]).await;
     ActionResult {
-        provider: Some(provider),
-        model,
+        provider: Some(written.provider),
+        model: written.model,
         ..outcome(
             kind,
             sent.map(|r| r.map(|m| m.remote_id.unwrap_or_default())),
