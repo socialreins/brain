@@ -63,9 +63,12 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | POST | `/auth/passkeys/login/finish` | `{"challenge_id","credential"}`: sets the session cookie, returns the user |
 | GET | `/auth/passkeys` | The signed-in user's passkeys |
 | DELETE | `/auth/passkeys/{id}` | Deletes one of the signed-in user's passkeys, `204`, else `404` |
-| POST, GET | `/v1/teams` | Create a team (`{"name"}`, with its default set, named "All sets"; caller owns it and switches to it), or list mine |
+| POST, GET | `/v1/teams` | Create a team (`{"name","slug"}`, `slug` optional: see "Team slugs"; with its default set, named "All sets"; caller owns it and switches to it), or list mine |
 | PUT | `/v1/current-team` | `{"team_id"}`: switch to one of my teams |
-| GET, PATCH, DELETE | `/v1/team` | The current team (`{"id","name","code","slug","public_pages","newsletter","newsletter_sender","require_approval","role"}`), or the one the request names; rename it, set or clear its slug, or switch its public pages, their newsletter sign-up or post approvals (`{"name","slug","public_pages","newsletter","newsletter_sender","require_approval"}`, any of them; owner, admin; see "Team slugs" and "Approvals"). `newsletter_sender` is who the team's newsletters are from, `{"name": 1 to 80 characters on one line without `@`, `<`, `>`, `:` or `/`, "address": the postal address the law wants under every newsletter, 10 to 300 characters, line breaks allowed, "logo": optional, the team's logo above every newsletter in place of the name, a public `https` image link of at most 2000 characters with a host and no user name or password; `null`, `""` or leaving it out means no logo}` or `null` to clear it (`422 {"error":"invalid_sender","field"}`, `field` being `name`, `address` or `logo`). The whole object is replaced, so send `logo` with every change that should keep it; the reply shows it as stored (`"logo": null` without one). The logo is never fetched here, only put in the mail as an image; no newsletter is tested or sent without it, and changing it clears `tested_at` of the team's drafts; delete it (owner, sign-in from the last 10 minutes) |
+| GET, PATCH, DELETE | `/v1/team` | The current team (`{"id","name","code","slug","public_pages","newsletter","newsletter_sender","require_approval","role"}`), or the one the request names; rename it, or switch its public pages, their newsletter sign-up or post approvals (`{"name","public_pages","newsletter","newsletter_sender","require_approval"}`, any of them; owner, admin; see "Team slugs" and "Approvals"). `newsletter_sender` is who the team's newsletters are from, `{"name": 1 to 80 characters on one line without `@`, `<`, `>`, `:` or `/`, "address": the postal address the law wants under every newsletter, 10 to 300 characters, line breaks allowed, "logo": optional, the team's logo above every newsletter in place of the name, a public `https` image link of at most 2000 characters with a host and no user name or password; `null`, `""` or leaving it out means no logo}` or `null` to clear it (`422 {"error":"invalid_sender","field"}`, `field` being `name`, `address` or `logo`). The whole object is replaced, so send `logo` with every change that should keep it; the reply shows it as stored (`"logo": null` without one). The logo is never fetched here, only put in the mail as an image; no newsletter is tested or sent without it, and changing it clears `tested_at` of the team's drafts; delete it (owner, sign-in from the last 10 minutes) |
+| PATCH | `/v1/team/slug` | `{"slug"}` (`null` goes back to the code; the field is required): set or clear the team's slug. Owner only, with a sign-in from the last 10 minutes; see "Team slugs" |
+| GET | `/v1/slugs/check?slug=&for_team=` | `{"slug","available","reason"}`: whether a slug can be taken now, for a live check; `for_team` (a team of mine, by code or slug) makes its own slugs read right |
+| GET | `/v1/public/team-slugs/{slug}` | Public. `{"address"}`: where the links of a slug a team gave up lead now (its current slug, else its code); `404` otherwise. The web app uses it to redirect |
 | GET | `/v1/team/members` | The current team's members |
 | PATCH, DELETE | `/v1/team/members/{user_id}` | `{"role"}`: change a role (owner, admin); remove a member, or leave |
 | POST, GET | `/v1/team/invitations` | `{"email","role"}`: invite as `admin` or `member` (owner, admin); list pending |
@@ -276,20 +279,35 @@ API tokens ignore both: a token always acts in its own team.
 
 Team slugs: a team may also pick a `slug` (`null` until it does), and wherever a request names
 a team by code (`X-Team`, `?team=`) it may use the slug instead, in any case. The code keeps
-working and never changes. `PATCH /v1/team` with `{"slug": "acme"}` sets it and `{"slug": null}`
-clears it (owner or admin). A slug is trimmed and lowercased, then must be 3 to 30 characters
-of `a-z`, `0-9` and `-`, start and end with a letter or digit, hold no `--`, and not be one of
-`new`, `admin`, `api`, `app`, `t`, `team`, `teams`, `login`, `signup`, `settings`, `billing`,
-`www`, `socialreins`, `support`, `help`, `_`: otherwise `422 {"error":"invalid_slug","reason":...}`
-with `reason` one of `reserved`, `length`, `characters` (checked in that order). A slug that
-is another team's slug or any team's code is `409 {"error":"slug_taken"}`, and no new team is
-given a code that is a slug. A team changes its slug (a set or a clear) at most 5 times a day,
-then `429 {"error":"slug_changed_too_often"}`; refused changes and sending the slug it already
-has do not count. A slug a team gives up (by changing or clearing it, or when the team is
-deleted) stops naming the team at once: old links by it are `404`, so link by code where a link
-must last. For 30 days after that no other team can take it (`409 slug_taken`), so an old link
-never lands on another team; the team that had it may take it back at any time. Everything else is keyed by
-the team's id: API tokens, posts and connections do not notice a slug change.
+working and never changes. A team can start with one (`POST /v1/teams` with `{"name","slug"}`),
+and its owner sets, changes or clears it with `PATCH /v1/team/slug` and `{"slug": "acme"}` or
+`{"slug": null}`, with a sign-in from the last 10 minutes (`403 reauth_required`); admins and
+members get `403 forbidden`, and `PATCH /v1/team` no longer takes a slug. A slug is trimmed and
+lowercased, then must be 3 to 32 characters of `a-z`, `0-9` and `-`, start and end with a letter
+or digit, hold no `--`, not be one of the reserved words (every first path segment of the web
+app, brain's own paths, and names of SocialReins, its owner and the networks: `RESERVED_SLUGS` in
+`crates/core/src/team.rs`), not contain `socialreins`, and have no hyphen-separated part from a
+short blocklist: otherwise `422 {"error":"invalid_slug","reason":...}` with `reason` one of
+`reserved`, `length`, `characters`, `blocked` (checked in that order). A slug that is another
+team's slug or any team's code is `409 {"error":"slug_taken"}`, and no new team is given a code
+that is a slug. `GET /v1/slugs/check?slug=acme` answers the same questions without taking the
+slug (`{"slug","available","reason"}`, `reason` also `taken` or `current`), for a form that
+checks while someone types; at most 120 calls a minute per user.
+
+A team gives up a slug (changes it or clears it) at most 3 times in 30 days, then `429
+{"error":"slug_changed_too_often"}`; setting its first slug, refused changes and sending the slug
+it already has do not count. A slug given up (by changing or clearing it, or when the team is
+deleted) is written to `team_slug_history` and stops naming the team for API calls at once
+(`404`, so link by code where a call must last). For 90 days after that no other team can take
+it (`409 slug_taken`), so an old link never lands on another team; the team that had it may take
+it back at any time. For 400 days `GET /v1/public/team-slugs/{slug}` answers `{"address"}`, the
+team's current slug or its code, and the web app redirects `/t/<old>/...` there with a permanent
+redirect, keeping the path and the query; after the 90 days another team may have taken the
+slug, and then it is theirs and nothing redirects (nor when two teams gave it up). The lookup is public (a slug is in every link
+a team shares) and limited to 600 calls a minute per IP. Everything else is keyed by the team's
+id: API tokens, posts, public post pages (`/p/<code>`), newsletter and invitation links and
+webhooks do not hold the slug and do not notice a change. Post notice mails link to
+`/t/<slug or code>/posts/...`, built when they are sent.
 
 Teams: every sign-in gives a user with no team a personal team named after the first word of
 their name, owned by them, with its Default social set. The team routes use the session cookie, and the state-changing ones the same origin
