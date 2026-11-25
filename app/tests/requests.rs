@@ -3549,6 +3549,7 @@ mod teams {
                     get(list_notifications),
                 )
                 .route("/xrpc/app.bsky.feed.getPosts", get(feed_posts))
+                .route("/xrpc/app.bsky.feed.getPostThread", get(post_thread))
                 .route("/xrpc/chat.bsky.convo.listConvos", get(list_convos))
                 .route("/xrpc/chat.bsky.convo.getMessages", get(get_messages))
                 .route(
@@ -3699,6 +3700,21 @@ mod teams {
                 })
                 .collect();
             (axum::http::StatusCode::OK, Json(json!({ "posts": posts })))
+        }
+
+        /// `app.bsky.feed.getPostThread`: the account's `threads` (uri to thread node), else
+        /// `NotFound` like Bluesky for a post it does not have.
+        async fn post_thread(
+            headers: axum::http::HeaderMap,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> Answer {
+            let Some((did, _)) = caller(&headers) else {
+                return refused(401, "AuthenticationRequired");
+            };
+            match inbox_of(&did)["threads"][q.get("uri").cloned().unwrap_or_default()].clone() {
+                Value::Null => refused(400, "NotFound"),
+                node => (axum::http::StatusCode::OK, Json(json!({ "thread": node }))),
+            }
         }
 
         async fn list_convos(headers: axum::http::HeaderMap) -> Answer {
@@ -22133,7 +22149,10 @@ mod teams {
                     .count(&db)
                     .await
                     .unwrap();
-                assert_eq!(stored, 3, "comment, mention and DM, each once");
+                assert_eq!(
+                    stored, 3,
+                    "comment, mention and DM, each once; a like of no post is not kept"
+                );
 
                 let all = all_inbox(&s, &cookie).await;
                 let all_id = all["id"].as_str().unwrap();
@@ -22175,7 +22194,7 @@ mod teams {
                 assert_eq!(mentions["items"].as_array().unwrap().len(), 1);
                 assert_eq!(mentions["items"][0]["kind"], "mention");
                 let res = s
-                    .get(&format!("/v1/inboxes/{all_id}/items?kind=like"))
+                    .get(&format!("/v1/inboxes/{all_id}/items?kind=banana"))
                     .add_header("cookie", &cookie)
                     .await;
                 assert_eq!(res.status_code(), 422);
@@ -24701,6 +24720,138 @@ mod teams {
                 );
             }
 
+            fn activity(reason: &str, from: &str, rkey: &str, subject: &str, when: &str) -> Value {
+                json!({
+                    "uri": format!("at://{from}/app.bsky.feed.{reason}/{rkey}"),
+                    "cid": format!("cid-{rkey}"),
+                    "reason": reason,
+                    "reasonSubject": subject,
+                    "author": {"did": from, "handle": format!("{rkey}.fan.test"),
+                        "displayName": format!("Fan {rkey}")},
+                    "record": {"$type": format!("app.bsky.feed.{reason}"),
+                        "subject": {"uri": subject, "cid": "cid-root"}},
+                    "indexedAt": when,
+                })
+            }
+
+            fn view(author: &str, rkey: &str, text: &str, parent: Value) -> Value {
+                json!({"$type": "app.bsky.feed.defs#threadViewPost",
+                    "post": {"uri": format!("at://{author}/app.bsky.feed.post/{rkey}"),
+                        "author": {"did": author, "handle": format!("{rkey}.fan.test")},
+                        "record": {"text": text, "createdAt": at(100)}},
+                    "parent": parent})
+            }
+
+            /// Likes and reposts are done at once and listed only as activity; a comment,
+            /// mention, like or repost shows the posts above it, as the account sees them.
+            #[tokio::test]
+            #[serial]
+            async fn likes_and_reposts_are_quiet_and_items_show_their_thread() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                let root = format!("at://{me}/app.bsky.feed.post/root");
+                let c1 = "at://did:plc:fan1/app.bsky.feed.post/c1";
+                let root_key = root.as_str();
+                set_inbox(
+                    &me,
+                    json!({
+                        "notifications": [
+                            activity("repost", "did:plc:fan4", "r1", &root, &at(10)),
+                            activity("like", "did:plc:fan3", "l1", &root, &at(20)),
+                            note("reply", "did:plc:fan1", "c1", "Love it", &at(30), &me),
+                            // Not a post of ours: ignored, not stored as a like of nothing.
+                            activity("like", "did:plc:fan5", "l2", "https://example.com/x", &at(40)),
+                        ],
+                        "convos": [{"id": "cv1", "members": [{"did": me}, {"did": "did:plc:dmer"}],
+                            "lastMessage": {"sentAt": at(5)}}],
+                        "messages": {"cv1": [dm("msg1", "did:plc:dmer", "hi", &at(5))]},
+                        "threads": {
+                            c1: view("did:plc:fan1", "c1", "Love it",
+                                view("did:plc:fan2", "mid", "the middle",
+                                    view(&me, "root", "our post", Value::Null))),
+                            root_key: view(&me, "root", "our post",
+                                json!({"$type": "app.bsky.feed.defs#blockedPost"})),
+                        },
+                    }),
+                );
+                ingest(&db, &state, &account).await;
+                ingest(&db, &state, &account).await;
+                let all = all_inbox(&s, &cookie).await;
+                let all_id = all["id"].as_str().unwrap();
+                let kinds = |page: &Value| -> Vec<String> {
+                    page["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|i| i["kind"].as_str().unwrap().to_owned())
+                        .collect()
+                };
+                assert_eq!(
+                    kinds(&items(&s, &cookie, all_id, "").await),
+                    ["dm", "comment"]
+                );
+                let quiet = items(&s, &cookie, all_id, "?kind=activity").await;
+                assert_eq!(kinds(&quiet), ["repost", "like"]);
+                assert_eq!(
+                    kinds(&items(&s, &cookie, all_id, "?kind=like").await).len(),
+                    1
+                );
+                let like = &quiet["items"][1];
+                assert_eq!(like["state"], "done");
+                assert_eq!(like["parent_remote_id"], root);
+                assert_eq!(like["text"], "");
+                assert_eq!(like["author"]["name"], "Fan l1");
+                assert_eq!(
+                    like["remote_url"],
+                    format!("https://bsky.app/profile/{me}/post/root")
+                );
+                // Only what asked for open items counts: activity is never open work.
+                let open = items(&s, &cookie, all_id, "?state=open").await;
+                assert_eq!(kinds(&open), ["dm", "comment"]);
+                let counted = &s
+                    .get("/v1/inboxes")
+                    .add_header("cookie", &cookie)
+                    .await
+                    .json::<Value>()[0];
+                assert_eq!(counted["open_count"], 2);
+
+                let page = items(&s, &cookie, all_id, "").await;
+                let comment = page["items"][1]["id"].as_str().unwrap();
+                let dm = page["items"][0]["id"].as_str().unwrap();
+                let thread = fetch(&s, &cookie, &format!("/v1/inbox-items/{comment}/thread")).await;
+                let texts: Vec<&str> = thread["posts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| p["text"].as_str().unwrap())
+                    .collect();
+                assert_eq!(texts, ["our post", "the middle"], "root first");
+                assert_eq!(thread["truncated"], false);
+                assert!(thread["posts"][0]["url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("https://bsky.app/"));
+                // A like reads the liked post's own thread: here its parent is hidden.
+                let like_id = like["id"].as_str().unwrap();
+                let thread = fetch(&s, &cookie, &format!("/v1/inbox-items/{like_id}/thread")).await;
+                assert_eq!(thread["posts"], json!([]));
+                assert_eq!(thread["truncated"], true);
+                // A DM has no thread; a post Bluesky no longer has says so.
+                let res = s
+                    .get(&format!("/v1/inbox-items/{dm}/thread"))
+                    .add_header("cookie", &cookie)
+                    .await;
+                assert_eq!(res.status_code(), 422);
+                assert_eq!(res.json::<Value>()["error"], "not_a_thread");
+                set_inbox(&me, json!({"threads": {}}));
+                let res = s
+                    .get(&format!("/v1/inbox-items/{comment}/thread"))
+                    .add_header("cookie", &cookie)
+                    .await;
+                assert_eq!(res.status_code(), 422);
+                assert_eq!(res.json::<Value>()["error"], "post_unavailable");
+            }
+
             /// Replies to a post Bluesky will not show, or its author blocks us from, say so
             /// before anything is sent.
             #[tokio::test]
@@ -24826,6 +24977,7 @@ mod teams {
                     ("/inbox-items/{id}", "patch"),
                     ("/inbox-items/{id}/reply", "post"),
                     ("/inbox-items/{id}/conversation", "get"),
+                    ("/inbox-items/{id}/thread", "get"),
                     ("/contacts", "get"),
                     ("/contacts/{id}", "get"),
                     ("/contacts/{id}", "patch"),
