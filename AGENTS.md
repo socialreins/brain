@@ -199,7 +199,22 @@ cargo run -p socialreins-brain
   advisory lock) takes due runs up through `resume_due`, whose one statement moves them back to
   `running`. Never send a step without claiming it, and never retry one. Every claim and park
   checks `UNCHANGED` (the flow is on and has the steps the run started on, `steps_hash`). A quick reply click is
-  a `dm` item with `button_payload` (`trigger_of`: `button_clicked`, never `dm_received`).
+  a `dm` item with `button_payload` (`trigger_of`: `button_clicked`, never `dm_received`). A Bluesky like or
+  repost of one of our posts is a `like` or `repost` item (stored `done`, no contact), which runs
+  `like_received` and `repost_received` (`post_remote_ids` limits them to a post); nobody is behind them to
+  message or tag, so `validate` refuses sends and tags there.
+- `app/src/automation_effects.rs`: `like_comment` (on Bluesky; Facebook's is Meta moderation), `repost_comment` and
+  `follow_back` on Bluesky go through `bluesky_actions::perform`, so the inbox buttons' own live-state check and
+  refusals apply, under the buttons' per-item lock, with an `inbox_actions` row that has no `done_by`.
+  `network_limits` refuses `repost_comment` and `follow_back` for an account list with no Bluesky account
+  (`bluesky_only_action`), `dry_run::effect_step` mirrors them: keep both in step.
+- `app/src/automation_misses.rs`: why an automation did not run on an item, `automation_misses` (one row per
+  automation and item: the failed condition codes, `wrong_trigger`, `not_yet_on`, `followed_before`,
+  `no_public_page`, `stopped_by_other`). Writing is best effort (a failed insert never stops an automation).
+  Runs held back for a safety reason are `automation_runs` rows instead (`skip_run`, `claim`), so nothing is
+  stored twice. `automations::tick` prunes every tenth minute: 14 days, and the newest 100 of each kind per
+  automation (items for another trigger, account or set are one kind apart). `GET /v1/automations/{id}/misses` and
+  `GET /v1/inbox-items/{id}/automations`.
 - `app/src/controllers/queue.rs`: posting queues. `queue_schedules` holds one row per set (an IANA
   `time_zone`, `slots` as sorted minutes of the week, weekday 0 Sunday). `queue: true` on a create
   takes `queue::pick` inside the insert's transaction, under a per-set advisory lock held until

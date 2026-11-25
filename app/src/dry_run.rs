@@ -75,8 +75,8 @@ fn yes() -> bool {
 #[derive(Serialize, ToSchema, Debug, Default, PartialEq, Eq)]
 pub struct PlannedStep {
     /// `send_dm`, `reply_publicly`, `ai_send_dm`, `ai_reply_publicly`, `fallback_public_reply`,
-    /// `tag_contact`, `notify_team`, `assign`, `hide_comment`, `like_comment`,
-    /// `stop_automations`, `wait` or `wait_for_reply` (a test goes on as if the person answered).
+    /// `tag_contact`, `notify_team`, `assign`, `hide_comment`, `like_comment`, `repost_comment`,
+    /// `follow_back`, `stop_automations`, `wait` or `wait_for_reply` (a test goes on as if the person answered).
     #[serde(rename = "type")]
     pub kind: String,
     /// `would_send`, `would_skip`, `would_fail`, `would_tag`, `would_do` (a mail, an
@@ -225,6 +225,8 @@ fn item_of(
         "comment_received" => "comment",
         "mention_received" => "mention",
         "new_follower" => "follow",
+        "like_received" => "like",
+        "repost_received" => "repost",
         _ => "dm",
     };
     inbox_items::Model {
@@ -245,7 +247,7 @@ fn item_of(
         author_name: s.author_name.clone().filter(|n| !n.trim().is_empty()),
         author_avatar: None,
         // A follow carries no text.
-        text: if kind == "follow" {
+        text: if matches!(kind, "follow" | "like" | "repost") {
             String::new()
         } else {
             s.text.clone()
@@ -493,7 +495,7 @@ async fn walk(
                 tag: Some((*tag).to_owned()),
                 ..step("tag_contact", "would_tag")
             }),
-            Part::Effect(kind) => out.push(effect_step(kind, item)),
+            Part::Effect(kind) => out.push(effect_step(kind, account, item)),
             Part::Wait(minutes, reply) => {
                 if let Some(clock) = meta.as_mut() {
                     clock.wait(*minutes, *reply);
@@ -577,7 +579,23 @@ async fn walk(
 
 /// A mail, an assignment, a moderation call or a stop as it would go: a moderation call the
 /// network or the item does not take is skipped (`not_supported`), as a run records it.
-fn effect_step(kind: &str, item: &inbox_items::Model) -> PlannedStep {
+fn effect_step(
+    kind: &str,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+) -> PlannedStep {
+    // Like, repost and follow back on Bluesky are the inbox buttons' own: they go on a Bluesky account.
+    let bluesky = account.provider == "bluesky";
+    if matches!(kind, "repost_comment" | "follow_back") || (kind == "like_comment" && bluesky) {
+        return if bluesky {
+            step(kind, "would_do")
+        } else {
+            PlannedStep {
+                reason: Some("not_supported".into()),
+                ..step(kind, "would_skip")
+            }
+        };
+    }
     let moderation = matches!(kind, "hide_comment" | "like_comment");
     let can = crate::meta_inbox::moderations(item);
     let wanted = if kind == "hide_comment" {
