@@ -227,10 +227,16 @@ pub const LANGUAGES: [(&str, whatlang::Lang); 23] = {
     ]
 };
 
+/// The least confidence (0 to 1) whatlang must have in a language for it to count. Its own
+/// `is_reliable` wants 0.8, which a plain English sentence of a dozen words does not reach.
+// shortcut: a very short text can be called the wrong language above this; raise it, or add the
+// platform's own language tag (X sends one with each post) when that shows up in real use.
+const MIN_LANGUAGE_CONFIDENCE: f64 = 0.3;
+
 /// The language of `text` as one of `LANGUAGES`' codes; `None` when it is another one or the
-/// detector is not sure (a short or mixed text).
+/// detector is not sure (a very short or mixed text).
 pub fn language_of(text: &str) -> Option<&'static str> {
-    let info = whatlang::detect(text).filter(whatlang::Info::is_reliable)?;
+    let info = whatlang::detect(text).filter(|i| i.confidence() >= MIN_LANGUAGE_CONFIDENCE)?;
     LANGUAGES
         .iter()
         .find(|(_, l)| *l == info.lang())
@@ -398,7 +404,8 @@ fn check_conditions(trigger: &str, c: &mut Conditions) -> Result<(), &'static st
     let comment = trigger == "comment_received";
     let button = trigger == "button_clicked";
     let mention = trigger == "mention_received";
-    let fits_trigger = (comment || (c.post_remote_ids.is_empty() && !c.first_per_author))
+    let fits_trigger = (comment || c.post_remote_ids.is_empty())
+        && (comment || mention || !c.first_per_author)
         && (trigger == "dm_received" || !c.first_message)
         && (!(button || trigger == "new_follower") || c.keywords.is_empty())
         && (button != c.payloads.is_empty());
@@ -423,7 +430,9 @@ fn check_conditions(trigger: &str, c: &mut Conditions) -> Result<(), &'static st
         || ((c.question || !c.languages.is_empty()) && !text_trigger)
         || c.languages.len() > 10
         || codes.len() != c.languages.len()
-        || !codes.iter().all(|l| LANGUAGES.iter().any(|(code, _)| code == l))
+        || !codes
+            .iter()
+            .all(|l| LANGUAGES.iter().any(|(code, _)| code == l))
     {
         return Err("invalid_conditions");
     }
@@ -693,10 +702,14 @@ pub struct Facts<'a> {
     pub first_from_author: bool,
     /// No earlier DM item from the same author on the account.
     pub first_message: bool,
+    /// The moment the conditions on weekdays and hours are judged at.
+    pub now: chrono::DateTime<chrono::Utc>,
 }
 
 /// Why `f` does not meet `c`: one code per condition that fails (`wrong_set`, `wrong_account`,
-/// `wrong_post`, `no_keyword`, `not_first_from_author`, `not_first_message`); empty when it does.
+/// `wrong_post`, `no_keyword`, `not_first_from_author`, `not_first_message`, `wrong_weekday`,
+/// `outside_hours`, `wrong_language`); empty when it does. `question` is judged apart
+/// (`asks_question`), as it may cost an AI call.
 pub fn mismatches(c: &Conditions, f: &Facts<'_>) -> Vec<&'static str> {
     let text = f.text.to_lowercase();
     let post_ok = c.post_remote_ids.is_empty()
@@ -725,6 +738,12 @@ pub fn mismatches(c: &Conditions, f: &Facts<'_>) -> Vec<&'static str> {
     ]
     .into_iter()
     .filter_map(|(ok, why)| (!ok).then_some(why))
+    .chain(c.when.as_ref().and_then(|w| w.mismatch(f.now)))
+    .chain(
+        (!c.languages.is_empty()
+            && !language_of(f.text).is_some_and(|l| c.languages.iter().any(|x| x == l)))
+        .then_some("wrong_language"),
+    )
     .collect()
 }
 
@@ -992,6 +1011,7 @@ async fn run_matching(
             text: &item.text,
             first_from_author: first,
             first_message,
+            now: chrono::Utc::now(),
         };
         // A click runs the automations that name its button.
         let clicked = item.button_payload.as_ref();
@@ -1033,6 +1053,17 @@ async fn run_matching(
         if let Some(why) = held {
             skip_run(db, &a, item, why).await?;
             continue;
+        }
+        // Last of the conditions, as it may cost an AI call: only a message that got this far.
+        if cond.question {
+            match asks_question(app, item, a.id).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(why) => {
+                    skip_run(db, &a, item, why).await?;
+                    continue;
+                }
+            }
         }
         let once = cond.first_per_author;
         let Some(run_id) = claim(db, &a, item, steps.is_some(), sends, once).await? else {
@@ -1767,6 +1798,40 @@ pub(crate) struct Written {
     pub model: Option<String>,
 }
 
+/// Whether the item's text asks a question: yes when it holds a question mark (no AI call), else
+/// judged by an AI model with the same key choice and payment as an AI reply, once per
+/// automation and item (`ai:q:...`, so a sweep never pays twice). `Err` is the reason the run is
+/// stored `skipped`: `no_ai_key`, `no_ai_credits` or `ai_failed`.
+pub(crate) async fn asks_question(
+    app: &AppState,
+    item: &inbox_items::Model,
+    automation: Uuid,
+) -> Result<bool, &'static str> {
+    if item.text.contains(['?', '\u{ff1f}', '\u{61f}', '\u{bf}']) {
+        return Ok(true);
+    }
+    if item.text.trim().is_empty() {
+        return Ok(false);
+    }
+    let reference = format!("ai:q:{automation}:{}", item.id);
+    let access = ai_pay(app, item, &reference).await;
+    let AiAccess {
+        provider,
+        key,
+        paid,
+    } = access.map_err(|(_, reason)| reason)?;
+    let (system, user) = ai::question_prompt(&item.text);
+    match app.ai.write(&provider, &key, &system, &user).await {
+        Ok((answer, _)) if answer.trim().eq_ignore_ascii_case("yes") => Ok(true),
+        Ok((answer, _)) if answer.trim().eq_ignore_ascii_case("no") => Ok(false),
+        other => {
+            tracing::warn!(status = ?other.err(), %provider, item = %item.id, "question not judged");
+            ai_refund(app, item, paid, &reference).await;
+            Err("ai_failed")
+        }
+    }
+}
+
 /// Who pays for one AI call and with which key: the team's own key, free, else ours, which with
 /// billing on is paid under `reference` from the plan's monthly allowance, then an `ai` credit.
 struct AiAccess {
@@ -2010,7 +2075,91 @@ mod tests {
             text,
             first_from_author: true,
             first_message: true,
+            now: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn hours_and_weekdays_are_judged_in_the_zone() {
+        use chrono::TimeZone;
+        // 2026-11-23 is a Monday.
+        let at = |h| {
+            chrono::Utc
+                .with_ymd_and_hms(2026, 11, 23, h, 30, 0)
+                .unwrap()
+        };
+        let office = When {
+            zone: "Asia/Dhaka".into(),
+            weekdays: vec![0, 1],
+            from_hour: Some(9),
+            to_hour: Some(17),
+        };
+        assert!(office.valid());
+        assert_eq!(office.mismatch(at(5)), None, "11:30 in Dhaka");
+        assert_eq!(office.mismatch(at(12)), Some("outside_hours"));
+        let tuesday = When {
+            weekdays: vec![1],
+            ..office.clone()
+        };
+        assert_eq!(tuesday.mismatch(at(5)), Some("wrong_weekday"));
+        let night = When {
+            zone: "UTC".into(),
+            weekdays: vec![],
+            from_hour: Some(22),
+            to_hour: Some(6),
+        };
+        assert_eq!(night.mismatch(at(23)), None);
+        assert_eq!(night.mismatch(at(5)), None);
+        assert_eq!(night.mismatch(at(6)), Some("outside_hours"));
+        let all_day = When {
+            from_hour: None,
+            to_hour: None,
+            weekdays: vec![0],
+            ..night.clone()
+        };
+        assert_eq!(all_day.mismatch(at(12)), None);
+        for bad in [
+            When {
+                zone: "Nope".into(),
+                ..night.clone()
+            },
+            When {
+                to_hour: None,
+                ..night.clone()
+            },
+            When {
+                to_hour: Some(22),
+                ..night.clone()
+            },
+            When {
+                to_hour: Some(25),
+                ..night.clone()
+            },
+            When {
+                from_hour: None,
+                to_hour: None,
+                ..night.clone()
+            },
+        ] {
+            assert!(!bad.valid(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_language_is_known_only_when_the_text_is_clear() {
+        let en = "I would like to know where I can buy your new product in my town";
+        assert_eq!(language_of(en), Some("en"));
+        assert_eq!(
+            language_of("আমি আপনার নতুন পণ্যটি কোথায় কিনতে পারি তা জানতে চাই"),
+            Some("bn")
+        );
+        assert_eq!(language_of("Wo kann ich das kaufen?"), Some("de"));
+        assert_eq!(language_of(""), None);
+        let c = Conditions {
+            languages: vec!["bn".into()],
+            ..Default::default()
+        };
+        assert_eq!(mismatches(&c, &facts(&[], en)), vec!["wrong_language"]);
     }
 
     #[test]
@@ -2120,13 +2269,23 @@ mod tests {
             first_per_author: true,
             ..Conditions::default()
         };
-        for c in [post, author] {
+        for c in [post, author.clone()] {
             assert_eq!(ok("comment_received", c.clone(), &[dm()], None), Ok(()));
-            assert_eq!(
-                ok("mention_received", c, &[dm()], None),
-                Err("invalid_conditions")
-            );
         }
+        // A mention takes "first mention per person" but has no post to be under.
+        assert_eq!(ok("mention_received", author, &[dm()], None), Ok(()));
+        assert_eq!(
+            ok(
+                "mention_received",
+                Conditions {
+                    post_remote_ids: vec!["p".into()],
+                    ..Conditions::default()
+                },
+                &[dm()],
+                None
+            ),
+            Err("invalid_conditions")
+        );
         for t in ["dm_received", "story_reply", "new_follower"] {
             let none = Conditions::default();
             assert_eq!(
