@@ -2648,8 +2648,14 @@ async fn takedown_group(
     a: Actor,
     Path(group_id): Path<Uuid>,
 ) -> Response {
+    takedown_post_group(&app, &a, group_id).await
+}
+
+/// The body of `POST /post-groups/{group_id}/takedown`, shared with the MCP
+/// `takedown-post-group` tool.
+pub async fn takedown_post_group(app: &AppState, a: &Actor, group_id: Uuid) -> Response {
     let done = async {
-        let found = group_rows(&app.db, &a, group_id).await?;
+        let found = group_rows(&app.db, a, group_id).await?;
         if found.is_empty() {
             return Ok(not_found());
         }
@@ -2659,7 +2665,7 @@ async fn takedown_group(
         let mut results = Vec::new();
         for p in &found {
             let (state, message) = match p.status.as_str() {
-                "published" => match take_down(&app, p).await? {
+                "published" => match take_down(app, p).await? {
                     Ok(()) => ("taken_down", None),
                     Err(message) => ("failed", Some(message)),
                 },
@@ -2673,8 +2679,8 @@ async fn takedown_group(
                 message,
             });
         }
-        let rows = group_rows(&app.db, &a, group_id).await?;
-        let group = group_json(&app.db, &a, group_id, rows).await?;
+        let rows = group_rows(&app.db, a, group_id).await?;
+        let group = group_json(&app.db, a, group_id, rows).await?;
         Ok::<_, DbErr>(Json(GroupTakedown { group, results }).into_response())
     };
     done.await

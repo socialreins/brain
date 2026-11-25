@@ -15531,10 +15531,13 @@ mod teams {
                     };
                     if let Some((db, account, _)) = due {
                         m.revoked.lock().unwrap().push(who.to_owned());
-                        db.execute_unprepared(&format!(
-                            "UPDATE social_accounts SET token_expires_at = now() + \
+                        sea_orm::ConnectionTrait::execute_unprepared(
+                            &db,
+                            &format!(
+                                "UPDATE social_accounts SET token_expires_at = now() + \
                              interval '1 minute' WHERE id = '{account}'"
-                        ))
+                            ),
+                        )
                         .await
                         .unwrap();
                     }
@@ -24200,6 +24203,12 @@ mod teams {
 
             /// A brain on the mock whose API token limit is `per_minute`.
             async fn on_mock(per_minute: u32) -> (TestServer, DatabaseConnection) {
+                let (s, db, _) = on_mock_state(per_minute).await;
+                (s, db)
+            }
+
+            /// `on_mock`, with the state for driving the publish tick.
+            async fn on_mock_state(per_minute: u32) -> (TestServer, DatabaseConnection, AppState) {
                 let base = mock_bluesky().await;
                 let mut config = Config::from_env().expect("test config");
                 config.trust_proxy = true;
@@ -24211,8 +24220,8 @@ mod teams {
                     .expect("database reachable");
                 let mut state = AppState::new(db.clone(), &config);
                 state.api_token_limiter = Arc::new(RateLimiter::per_minute(per_minute));
-                let app = controllers::router(state, &config);
-                (TestServer::new(app).unwrap(), db)
+                let app = controllers::router(state.clone(), &config);
+                (TestServer::new(app).unwrap(), db, state)
             }
 
             async fn make_token(s: &TestServer, cookie: &str, body: Value) -> Value {
@@ -26777,6 +26786,7 @@ mod teams {
                             "save-snippet",
                             "set-post-repeat",
                             "set-queue",
+                            "takedown-post-group",
                             "update-post",
                         ]
                     );
@@ -26835,6 +26845,118 @@ mod teams {
                     let (err, e) = call(&s, secret, "get-post", json!({"id": id})).await;
                     assert!(err);
                     assert_eq!(e, json!({"error": "not_found"}));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn takedown_post_group_follows_the_token_rules_of_the_post_routes() {
+                    let (s, db, state) = on_mock_state(120).await;
+                    let (owner, team_id, _) = owner_with_account(&s, &db).await;
+                    let default = default_set(&db, &team_id).await.to_string();
+                    let clients = req(&s, Method::POST, "/v1/social-sets", &owner)
+                        .json(&json!({"name": "Clients"}))
+                        .await
+                        .json::<Value>()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let res = connect(&s, &owner, &new_handle(), APP_PASSWORD).await;
+                    let second = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                    req(
+                        &s,
+                        Method::PUT,
+                        &format!("/v1/connections/{second}/sets"),
+                        &owner,
+                    )
+                    .json(&json!({"set_ids": [default, clients]}))
+                    .await
+                    .assert_status_ok();
+                    let secret = |made: Value| made["secret"].as_str().unwrap().to_owned();
+                    let team = secret(make_token(&s, &owner, json!({"name": "team"})).await);
+                    let mine = json!({"name": "cm", "social_set_id": clients});
+                    let mine = secret(make_token(&s, &owner, mine).await);
+                    let ro = json!({"name": "ro", "read_only": true});
+                    let ro = secret(make_token(&s, &owner, ro).await);
+                    let (_, stranger, _) = user(&s, &db).await;
+                    let theirs = secret(make_token(&s, &stranger, json!({"name": "x"})).await);
+
+                    // One published post in each set, each tied into a group of its own.
+                    let mut groups = Vec::new();
+                    for set in [&default, &clients] {
+                        let mut body = post_body(Some(set), "going");
+                        body["scheduled_at"] = json!("2020-01-01T00:00:00Z");
+                        let res = req(&s, Method::POST, "/v1/posts", &owner).json(&body).await;
+                        assert_eq!(res.status_code(), 201, "{}", res.text());
+                        let id = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                        let group = uuid::Uuid::now_v7();
+                        let set_group =
+                            format!("UPDATE posts SET group_id = '{group}' WHERE id = '{id}'");
+                        sea_orm::ConnectionTrait::execute_unprepared(&db, &set_group)
+                            .await
+                            .unwrap();
+                        groups.push((group.to_string(), id));
+                    }
+                    socialreins_brain::publish::tick(&state).await.unwrap();
+                    let status = |id: String| {
+                        let (s, owner) = (&s, &owner);
+                        async move {
+                            let res = req(s, Method::GET, &format!("/v1/posts/{id}"), owner).await;
+                            res.json::<Value>()["status"].as_str().unwrap().to_owned()
+                        }
+                    };
+                    let ((g_default, p_default), (g_clients, p_clients)) =
+                        (groups[0].clone(), groups[1].clone());
+                    assert_eq!(status(p_default.clone()).await, "published");
+                    assert_eq!(status(p_clients.clone()).await, "published");
+                    let route = |g: &str| format!("/v1/post-groups/{g}/takedown");
+                    let tool = |g: &str| json!({"group_id": g});
+
+                    // A read-only token: refused on REST and in MCP, nothing taken down.
+                    let res = bearer(&s, Method::POST, &route(&g_default), &ro).await;
+                    assert_eq!(res.status_code(), 403);
+                    res.assert_json(&json!({"error": "read_only_token"}));
+                    let (err, v) = call(&s, &ro, "takedown-post-group", tool(&g_default)).await;
+                    assert!(err);
+                    assert_eq!(v, json!({"error": "read_only_token"}));
+                    // Another team's token, and the unknown, find nothing.
+                    for group in [g_default.clone(), uuid::Uuid::now_v7().to_string()] {
+                        let res = bearer(&s, Method::POST, &route(&group), &theirs).await;
+                        assert_eq!(res.status_code(), 404);
+                        let (err, v) = call(&s, &theirs, "takedown-post-group", tool(&group)).await;
+                        assert!(err);
+                        assert_eq!(v, json!({"error": "not_found"}));
+                    }
+                    // A set token cannot reach a group outside its set.
+                    let res = bearer(&s, Method::POST, &route(&g_default), &mine).await;
+                    assert_eq!(res.status_code(), 404);
+                    let (err, v) = call(&s, &mine, "takedown-post-group", tool(&g_default)).await;
+                    assert!(err);
+                    assert_eq!(v, json!({"error": "not_found"}));
+                    assert_eq!(status(p_default.clone()).await, "published");
+                    assert_eq!(status(p_clients.clone()).await, "published");
+
+                    // Its own group goes, through MCP.
+                    let (err, v) = call(&s, &mine, "takedown-post-group", tool(&g_clients)).await;
+                    assert!(!err, "{v}");
+                    assert_eq!(v["group_id"], g_clients.as_str());
+                    assert_eq!(v["results"][0]["post_id"], p_clients.as_str());
+                    assert_eq!(v["results"][0]["state"], "taken_down");
+                    assert_eq!(status(p_clients.clone()).await, "deleted");
+                    assert_eq!(status(p_default.clone()).await, "published");
+
+                    // A whole-team token takes the other down on REST, and MCP then finds it gone.
+                    let res = bearer(&s, Method::POST, &route(&g_default), &team).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    assert_eq!(res.json::<Value>()["results"][0]["state"], "taken_down");
+                    let (err, v) = call(&s, &team, "takedown-post-group", tool(&g_default)).await;
+                    assert!(!err, "{v}");
+                    assert_eq!(v["results"][0]["state"], "already_gone");
+                    assert_eq!(status(p_default).await, "deleted");
+
+                    // Not a group id.
+                    let (err, v) = call(&s, &team, "takedown-post-group", json!({})).await;
+                    assert!(err);
+                    assert_eq!(v, json!({"error": "invalid_body"}));
                 }
 
                 #[tokio::test]

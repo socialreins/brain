@@ -53,6 +53,11 @@ struct PostId {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct GroupId {
+    group_id: Uuid,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct UpdatePost {
     id: Uuid,
     #[serde(flatten)]
@@ -172,6 +177,7 @@ fn specs() -> Vec<(&'static str, &'static str, Value, bool)> {
         ("clear-post-repeat", "Stops a scheduled post (and the other scheduled posts of its group) repeating; the post itself stays scheduled. Same as DELETE /v1/posts/{id}/repeat.", schema::<PostId>(), false),
         ("get-analytics", "The metrics (likes, comments, shares, views) of the posts published in a range of UTC days, from and to as YYYY-MM-DD (default the last 30 days, at most 366): totals, per platform, per day and the 10 top posts. Read from Bluesky, Facebook, Instagram and YouTube only. Same as GET /v1/analytics.", schema::<analytics::AnalyticsQuery>(), true),
         ("delete-post", "Deletes a draft or scheduled post, or takes a published one down. Same as DELETE /v1/posts/{id}.", schema::<PostId>(), false),
+        ("takedown-post-group", "Takes every published post of a post group down, one after another, and lists what happened to each in results (taken_down, already_gone, failed with a message, or not_published, which is left alone: a scheduled or queued post still goes out). A failure, such as TikTok having no delete call, does not stop the others, and calling it again only tries what is still up. Whole-team or set token, not read-only. Same as POST /v1/post-groups/{group_id}/takedown.", schema::<GroupId>(), false),
         ("list-lists", "The team's post lists (ordered groups of posts, such as a series), without their posts. Same as GET /v1/lists.", schema::<NoArgs>(), true),
         ("create-list", "Creates a post list, team-wide or tied to one set. Same as POST /v1/lists.", schema::<ListInput>(), false),
         ("get-list", "One post list with its posts in order; a post's position is its Part N. Same as GET /v1/lists/{id}.", schema::<ListId>(), true),
@@ -202,7 +208,11 @@ fn to_mcp(
             .read_only(read_only)
             .destructive(matches!(
                 name,
-                "delete-post" | "remove-post-from-list" | "delete-snippet" | "remove-feed"
+                "delete-post"
+                    | "takedown-post-group"
+                    | "remove-post-from-list"
+                    | "delete-snippet"
+                    | "remove-feed"
             ))
             .open_world(false),
     );
@@ -297,6 +307,10 @@ async fn run(app: &AppState, a: &Actor, name: &str, v: Value) -> Option<Response
         },
         "delete-post" => match args::<PostId>(v) {
             Some(p) => posts::delete_post(app, a, p.id).await,
+            None => invalid("invalid_body"),
+        },
+        "takedown-post-group" => match args::<GroupId>(v) {
+            Some(g) => posts::takedown_post_group(app, a, g.group_id).await,
             None => invalid("invalid_body"),
         },
         "list-lists" => lists::list_lists(app, a).await,
