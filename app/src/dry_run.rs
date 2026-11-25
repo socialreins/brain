@@ -101,7 +101,8 @@ pub struct Outcome {
     /// Rules that would stop it: `no_public_page` (a text holds `{page}` and the post has no
     /// live page: the automation does not run, so there are no steps), and the rules of
     /// `network_limits` for the account's network (`meta_one_private_reply`,
-    /// `meta_reply_window`, `x_unsupported_trigger`, `bluesky_unsupported_trigger`; the steps are
+    /// `meta_reply_window`, `x_unsupported_trigger`, `bluesky_unsupported_trigger`,
+    /// `youtube_unsupported_trigger`, `youtube_no_dm`; the steps are
     /// still listed, as a run would go as far as it can), and `paused` (the team paused its
     /// automations: no steps), and `no_ai_key`, `no_ai_credits` or `ai_failed` when a `question`
     /// condition could not be judged (no steps).
@@ -485,6 +486,13 @@ async fn plan_send(
     (kind, via, template, ai, buttons): (&str, Via, &str, bool, &[Button]),
     (page, dm_open): (Option<&str>, bool),
 ) -> PlannedStep {
+    if via == Via::Dm && account.provider == "youtube" {
+        // YouTube has no DM and no private reply: only a public reply can answer a comment.
+        return PlannedStep {
+            reason: Some("youtube_no_dm".into()),
+            ..step(kind, "would_skip")
+        };
+    }
     let bluesky_dm = via == Via::Dm && account.provider == "bluesky";
     let no_dm = bluesky_dm && !account.dm_access;
     // What Bluesky answers a send to someone who neither follows us nor allows DMs from anyone.
