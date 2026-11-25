@@ -15616,7 +15616,7 @@ mod teams {
                                         "expires_in": 2592000, "scope": ALL})),
                                 )
                             }
-                            _ => refused(StatusCode::BAD_REQUEST, "Invalid grant."),
+                            _ => refused(StatusCode::BAD_REQUEST, "Invalid grant (invalid_grant)."),
                         }
                     };
                     let user = |h: HeaderMap| async move {
@@ -15770,6 +15770,7 @@ mod teams {
                     let mut p = Pinterest::new(app).unwrap();
                     p.api_url = base.clone();
                     p.poll_every = std::time::Duration::from_millis(5);
+                    p.poll_for = std::time::Duration::from_millis(300);
                     config.pinterest = p;
                     let disk = object_store::local::LocalFileSystem::new_with_prefix(media_dir())
                         .unwrap()

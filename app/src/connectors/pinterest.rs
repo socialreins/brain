@@ -20,19 +20,14 @@ const API_URL: &str = "https://api.pinterest.com/v5";
 /// Asked for at connect, joined with commas. Pinterest lists `boards:write` beside the others for
 /// creating a pin; brain never creates or changes a board.
 const SCOPES: &str = "boards:read,boards:write,pins:read,pins:write,user_accounts:read";
-/// What the account must have granted: the rest of `SCOPES` is for Pinterest's own check.
-const NEEDED: [&str; 4] = [
-    "boards:read",
-    "pins:read",
-    "pins:write",
-    "user_accounts:read",
-];
 /// Used when Pinterest leaves `expires_in` out: 30 days.
 const DEFAULT_EXPIRES_IN: i64 = 2_592_000;
 /// Longest one pin (the upload, Pinterest processing the video, creating the pin) may take.
 pub const PUBLISH_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long to wait for Pinterest to process an uploaded video before giving up.
 const POLL_FOR: Duration = Duration::from_secs(240);
+/// The longest one video upload request may take, whatever its size (`publish::PUBLISH_LIMIT`).
+const UPLOAD_MAX: Duration = Duration::from_secs(14 * 60);
 /// Boards listed for the editor: 250 a page, at most 4 pages.
 const BOARD_PAGES: usize = 4;
 pub const IMAGE_TYPES: [&str; 2] = ["image/jpeg", "image/png"];
@@ -94,8 +89,9 @@ pub struct Pinterest {
     /// Tests point these at a mock.
     pub auth_url: String,
     pub api_url: String,
-    /// How often an uploaded video is asked about; tests shorten it.
+    /// How often an uploaded video is asked about, and for how long; tests shorten them.
     pub poll_every: Duration,
+    pub poll_for: Duration,
     client: reqwest::Client,
 }
 
@@ -118,7 +114,7 @@ impl Token {
             .unwrap_or_default()
             .split([',', ' '])
             .collect();
-        NEEDED.iter().all(|s| granted.contains(s))
+        SCOPES.split(',').all(|s| granted.contains(&s))
     }
 }
 
@@ -194,6 +190,7 @@ impl Pinterest {
             auth_url: AUTH_URL.into(),
             api_url: API_URL.into(),
             poll_every: Duration::from_secs(3),
+            poll_for: POLL_FOR,
             client,
         })
     }
@@ -263,7 +260,10 @@ impl Pinterest {
         let (status, body) = self.raw(req, step).await?;
         if !status.is_success() || body["access_token"].is_null() {
             // A refresh token that is revoked, expired or already replaced.
-            if step == "Refresh" && matches!(status.as_u16(), 400 | 401) {
+            // Any other 400 (a wrong app secret, say) is not the account's doing and must not flag it.
+            let said = body.to_string().to_ascii_lowercase();
+            let grant = said.contains("grant") || said.contains("refresh token");
+            if step == "Refresh" && (status.as_u16() == 401 || grant) {
                 return Err(PostError::Reconnect);
             }
             return Err(refusal(status, &body, step));
@@ -466,7 +466,10 @@ impl Pinterest {
         let sent = self
             .client
             .post(upload)
-            .timeout(PUBLISH_TIMEOUT)
+            .timeout(
+                (PUBLISH_TIMEOUT + Duration::from_secs(blob.len() / crate::media::MIN_SPEED))
+                    .min(UPLOAD_MAX),
+            )
             .multipart(form.part("file", file))
             .send()
             .await
@@ -493,14 +496,17 @@ impl Pinterest {
                 .client
                 .get(self.url(&format!("/media/{id}")))
                 .bearer_auth(token);
-            // A failed status call (a limit, a 5xx) is asked again until the time is up.
-            let got = self.send(req, "Video").await.unwrap_or(Value::Null);
+            // A failed status call (a limit, a 5xx) is asked again until the time is up; a dead token is not.
+            let got = match self.send(req, "Video").await {
+                Err(e @ PostError::Reconnect) => return Err(e),
+                other => other.unwrap_or(Value::Null),
+            };
             match got["status"].as_str().unwrap_or_default() {
                 "succeeded" => return Ok(()),
                 "failed" => return Err(failed("Video: Pinterest could not process the video.")),
                 _ => {}
             }
-            if started.elapsed() >= POLL_FOR + Duration::from_secs(50) * super::extra_polls() {
+            if started.elapsed() >= self.poll_for + Duration::from_secs(50) * super::extra_polls() {
                 let msg = "Video: Pinterest is still processing the video. Try again later.";
                 return Err(failed(super::unsent(msg.into(), true)));
             }
@@ -574,10 +580,15 @@ mod tests {
             "boards:read boards:write pins:read pins:write user_accounts:read"
         ))
         .has_all_scopes());
-        assert!(
-            token(Some("boards:read,pins:read,pins:write,user_accounts:read")).has_all_scopes()
-        );
+        assert!(token(Some(
+            "boards:read,boards:write,pins:read,pins:write,user_accounts:read"
+        ))
+        .has_all_scopes());
         assert!(!token(Some("boards:read pins:read user_accounts:read")).has_all_scopes());
+        assert!(!token(Some(
+            "boards:read boards:write pins:read user_accounts:read"
+        ))
+        .has_all_scopes());
         assert!(!token(None).has_all_scopes());
     }
 

@@ -260,15 +260,22 @@ async fn callback(
     };
     let mut meta = serde_json::json!({ "refresh_token": seal(&app, &refresh) });
     // A reconnect keeps the default board the user chose.
-    let kept = app
+    let kept = match app
         .db
         .query_one_raw(stmt(
             "SELECT meta->>'default_board_id' AS id, meta->>'default_board_name' AS name \
              FROM social_accounts WHERE team_id = $1 AND provider = $2 AND external_id = $3",
             vec![team_id.into(), PROVIDER.into(), me.id.clone().into()],
         ))
-        .await;
-    if let Ok(Some(row)) = kept {
+        .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::error!(error = %e, "pinterest default board read failed");
+            return fail("internal");
+        }
+    };
+    if let Some(row) = kept {
         let id: Option<String> = row.try_get("", "id").ok().flatten();
         let name: Option<String> = row.try_get("", "name").ok().flatten();
         if let Some(id) = id {

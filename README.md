@@ -635,11 +635,11 @@ the same OAuth checks as Threads, with its own redirect URI
 `{BRAIN_URL}/connect/pinterest/callback`, state and cookie (`sr_pinterest`, scoped to
 `/connect/pinterest`). The callback swaps the code at `POST api.pinterest.com/v5/oauth/token`
 (HTTP Basic with the app id and secret, `continuous_refresh=true`), needs the refresh token and
-the scopes `boards:read`, `pins:read`, `pins:write` and `user_accounts:read` (error code
+all five scopes (error code
 `missing_scopes` when one is missing; `pinterest_failed` besides the Threads codes), reads
 `GET /v5/user_account` (id, username, name, picture) and saves a `pinterest` account
 (`external_id` is Pinterest's id) in the team's default set. Pinterest lists `boards:write` beside
-the others for creating a pin, so brain asks for it; brain never creates or changes a board. The
+the others for creating a pin, so brain asks for and requires it; brain never creates or changes a board. The
 access token lasts 30 days, the refresh token 60 days from the last refresh: a token with under an
 hour left is renewed before a call under a lock on the account row (the refresh token Pinterest
 sends back is saved in the same transaction), and a daily job renews every account with 10 days or
@@ -658,7 +658,7 @@ comment or cover). The post may carry `pinterest`: `{"board_id","title","link"}`
 with no board named, for a set that holds a Pinterest account with no default board, is
 `422 pinterest_board_required` naming that `social_account_id`. The pin's alt text is the first
 non-blank alt text of its images, cut to Pinterest's 500 characters (a pin has one: a second
-text, or the cut, is noted in the target's `alt_error`). Other platforms answer
+text, or the cut, is noted in the target's `alt_error`). A board id belongs to one account, so a post for several Pinterest accounts should name none and use each account's default board. Other platforms answer
 `pinterest_not_supported`. A group takes `pinterest` for its Pinterest post only, with an override
 (`overrides.pinterest.pinterest`). Feeds cannot post to Pinterest (an item has no image).
 
