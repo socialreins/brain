@@ -1323,8 +1323,9 @@ pub struct ThreadContext {
     pub truncated: bool,
 }
 
-/// What a comment, mention, like or repost sits under, read from Bluesky as the account sees
-/// it: the parent post and the earlier replies above it. `422 not_a_thread` for a DM or a
+/// What a comment, mention, like or repost sits under, read from Bluesky (or, for a Threads reply
+/// or mention, from Threads) as the account sees it: the parent post and the earlier replies
+/// above it. `422 not_a_thread` for a DM or a
 /// follow, `422 post_unavailable` when the post is gone, blocked or hidden, `429 rate_limited` past 60 reads a minute per user, and the other send errors (`429`,
 /// `reconnect_required`) when Bluesky cannot be read.
 #[utoipa::path(get, path = "/inbox-items/{id}/thread", tag = "inbox",
@@ -1337,6 +1338,9 @@ async fn thread(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) ->
         Ok(None) => return not_found(),
         Err(e) => return internal(e, "inbox item read"),
     };
+    if item.platform == "threads" && matches!(item.kind.as_str(), "comment" | "mention") {
+        return threads_thread(&app, &t, &item).await;
+    }
     // The post to read upwards from: the item's own, or what a like or repost points at.
     let uri = match item.kind.as_str() {
         "comment" | "mention" => Some(item.remote_id.clone()),
@@ -1376,6 +1380,45 @@ async fn thread(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) ->
                     },
                     text: p.text,
                     created_at: p.at,
+                    attachments: p.attachments,
+                })
+                .collect(),
+        })
+        .into_response(),
+        Err(e) => send_error(&e),
+    }
+}
+
+/// The thread context of a Threads reply or mention: the posts it answers, read as the account
+/// sees them (`threads_inbox::above`).
+async fn threads_thread(app: &AppState, t: &InTeam, item: &inbox_items::Model) -> Response {
+    if !app.live_limiter.hit(t.current.0.id) {
+        return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    }
+    let account = match social_accounts::Entity::find_by_id(item.social_account_id)
+        .one(&app.db)
+        .await
+    {
+        Ok(Some(a)) => a,
+        Ok(None) => return not_found(),
+        Err(e) => return internal(e, "account read"),
+    };
+    match crate::threads_inbox::above(app, &account, item).await {
+        Ok((posts, truncated)) => Json(ThreadContext {
+            truncated,
+            posts: posts
+                .into_iter()
+                .map(|p| ThreadPost {
+                    uri: p.id,
+                    url: p.permalink,
+                    author: Author {
+                        id: p.author.did,
+                        handle: p.author.handle,
+                        name: p.author.display_name,
+                        avatar_url: p.author.avatar,
+                    },
+                    text: p.text,
+                    created_at: Some(p.at),
                     attachments: p.attachments,
                 })
                 .collect(),

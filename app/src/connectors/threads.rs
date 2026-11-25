@@ -8,12 +8,21 @@ use reqwest::{Method, Url};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::bluesky::PostError;
+use super::bluesky::{InboxError, PostError};
 
 const AUTH_URL: &str = "https://threads.com/oauth/authorize";
 const GRAPH_URL: &str = "https://graph.threads.com";
 const VERSION: &str = "v1.0";
-const SCOPES: &str = "threads_basic,threads_content_publish,threads_manage_replies,threads_delete";
+/// `threads_read_replies` (read replies to our posts and our own replies) and
+/// `threads_manage_mentions` (read posts that tag us) feed the inbox; `threads_manage_replies`
+/// writes a reply and hides or shows one. The last three are not yet in the Meta App Review
+/// (`plan/status.md`): until they are, only the app's testers can grant them.
+const SCOPES: &str = "threads_basic,threads_content_publish,threads_manage_replies,threads_delete,\
+threads_read_replies,threads_manage_mentions";
+/// What a reply, a mention or a post in the context above one carries.
+const POST_FIELDS: &str = "id,text,username,permalink,timestamp,media_type,media_url,\
+thumbnail_url,gif_url,is_reply,is_reply_owned_by_me,replied_to,root_post,has_replies,\
+profile_picture_url";
 /// A long-lived token lasts 60 days; used when Threads leaves `expires_in` out.
 const DEFAULT_EXPIRES_IN: i64 = 60 * 24 * 3600;
 /// Container status checks: now, then after 1, 2, ... `POLLS - 1` times `poll_every`.
@@ -36,6 +45,9 @@ pub struct Threads {
     /// when published sooner than about 30 seconds. Tests shorten it, and `poll_every`.
     pub publish_wait: Duration,
     pub poll_every: Duration,
+    /// `THREADS_WEBHOOK_VERIFY_TOKEN`: turns on `GET /webhooks/threads`, the handshake when the
+    /// webhook is registered in the Threads app.
+    pub webhook_token: Option<String>,
     client: reqwest::Client,
 }
 
@@ -128,7 +140,16 @@ impl Threads {
             graph_url: GRAPH_URL.into(),
             publish_wait: Duration::from_secs(30),
             poll_every: Duration::from_secs(5),
+            webhook_token: None,
             client,
+        })
+    }
+
+    /// Whether `header` (`X-Hub-Signature-256`) signs `body` with the app secret. Never true
+    /// without one.
+    pub fn signed(&self, body: &[u8], header: &str) -> bool {
+        self.app.as_ref().is_some_and(|(_, secret)| {
+            socialreins_core::webhook::verify_sha256(secret, body, header)
         })
     }
 
@@ -203,9 +224,14 @@ impl Threads {
         if let Some(refusal) = dead_or_denied(&body) {
             return Err((refusal, false));
         }
+        // A rate limit refused the call, so nothing was posted.
+        if rate_limited(status, &body) {
+            let msg = format!("{step}: {RATE_LIMITED}");
+            return Err((failed(super::unsent(msg, true)), false));
+        }
         let msg = format!("{step}: {}", reason(&body, status));
         let about = super::meta::about_the_request(status, &body);
-        Err((failed(super::unsent(msg, status.as_u16() == 429)), about))
+        Err((failed(super::unsent(msg, false)), about))
     }
 
     /// Swaps an authorization code for a short-lived token, then that for a 60-day one.
@@ -468,6 +494,138 @@ impl Threads {
     }
 }
 
+/// What a refused publish says of a rate limit; `threads_inbox::send` turns it into `RateLimited`.
+pub const RATE_LIMITED: &str = "Threads is rate limiting this account.";
+
+/// A refusal of a rate limit: HTTP 429, or the Graph codes for an app, a user or a call rate.
+fn rate_limited(status: reqwest::StatusCode, body: &Value) -> bool {
+    status.as_u16() == 429
+        || body["error"]["code"]
+            .as_i64()
+            .is_some_and(|c| matches!(c, 4 | 17 | 32 | 613) || (80000..80015).contains(&c))
+}
+
+impl Threads {
+    /// One call for the inbox: the JSON answer, or what the refusal means to a person
+    /// (`ThreadsReconnect` for a dead token, `ThreadsDenied` for a missing permission,
+    /// `RateLimited`, else `Threads` with the reason). Nothing is retried.
+    async fn inbox_call(
+        &self,
+        method: Method,
+        path: &str,
+        token: &str,
+        query: &[(&str, &str)],
+        form: Option<&[(&str, &str)]>,
+    ) -> Result<Value, InboxError> {
+        let mut req = self
+            .client
+            .request(method, format!("{}/{VERSION}/{path}", self.graph_url))
+            .query(query)
+            .bearer_auth(token);
+        if let Some(f) = form {
+            req = req.form(f);
+        }
+        let res = req.send().await.map_err(|e| {
+            tracing::warn!(error = %e.without_url(), "threads inbox call failed");
+            InboxError::Threads("Threads could not be reached.".into())
+        })?;
+        let status = res.status();
+        let body: Value = res.json().await.unwrap_or(Value::Null);
+        if status.is_success() {
+            return Ok(body);
+        }
+        if rate_limited(status, &body) {
+            return Err(InboxError::RateLimited);
+        }
+        Err(match dead_or_denied(&body) {
+            Some(PostError::Reconnect) => InboxError::ThreadsReconnect,
+            Some(_) => InboxError::ThreadsDenied,
+            None if status.as_u16() == 401 => InboxError::ThreadsReconnect,
+            None => InboxError::Threads(reason(&body, status)),
+        })
+    }
+
+    /// The account's own posts since `since` (a date), newest first, one page; `has_replies`
+    /// says which have replies to read. Needs `threads_basic`.
+    pub async fn my_posts(
+        &self,
+        user: &str,
+        token: &str,
+        since: &str,
+        after: Option<&str>,
+    ) -> Result<Value, InboxError> {
+        let mut q = vec![
+            ("fields", "id,timestamp,has_replies"),
+            ("since", since),
+            ("limit", "50"),
+        ];
+        q.extend(after.map(|a| ("after", a)));
+        self.inbox_call(Method::GET, &format!("{user}/threads"), token, &q, None)
+            .await
+    }
+
+    /// Every reply under the post `media`, at any depth, newest first, one page. Needs
+    /// `threads_read_replies`.
+    pub async fn conversation(
+        &self,
+        token: &str,
+        media: &str,
+        after: Option<&str>,
+    ) -> Result<Value, InboxError> {
+        let mut q = vec![("fields", POST_FIELDS), ("limit", "50")];
+        q.extend(after.map(|a| ("after", a)));
+        let path = format!("{media}/conversation");
+        self.inbox_call(Method::GET, &path, token, &q, None).await
+    }
+
+    /// One reply of the account's, just to learn whether `threads_read_replies` was granted.
+    pub async fn probe_replies(&self, user: &str, token: &str) -> Result<(), InboxError> {
+        let q = [("fields", "id"), ("limit", "1")];
+        let path = format!("{user}/replies");
+        self.inbox_call(Method::GET, &path, token, &q, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Public posts that tag the account, since `since` (Unix seconds), one page. Needs
+    /// `threads_manage_mentions`; without advanced access only a tester's mentions come.
+    pub async fn mentions(
+        &self,
+        user: &str,
+        token: &str,
+        since: i64,
+        after: Option<&str>,
+    ) -> Result<Value, InboxError> {
+        let since = since.to_string();
+        let mut q = vec![("fields", POST_FIELDS), ("since", &since), ("limit", "50")];
+        q.extend(after.map(|a| ("after", a)));
+        let path = format!("{user}/mentions");
+        self.inbox_call(Method::GET, &path, token, &q, None).await
+    }
+
+    /// One post or reply, as the account sees it.
+    pub async fn post(&self, token: &str, id: &str) -> Result<Value, InboxError> {
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(InboxError::Invalid("not_repliable"));
+        }
+        let q = [("fields", POST_FIELDS)];
+        self.inbox_call(Method::GET, id, token, &q, None).await
+    }
+
+    /// Hides (`true`) or shows again a reply directly under one of the account's posts. Needs
+    /// `threads_manage_replies`; a reply deeper in the thread is refused.
+    pub async fn manage_reply(&self, token: &str, id: &str, hide: bool) -> Result<(), InboxError> {
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(InboxError::Invalid("not_repliable"));
+        }
+        let form = [("hide", if hide { "true" } else { "false" })];
+        let path = format!("{id}/manage_reply");
+        self.inbox_call(Method::POST, &path, token, &[], Some(&form))
+            .await
+            .map(|_| ())
+    }
+}
+
 fn item(m: &Item<'_>) -> Vec<(&'static str, String)> {
     if m.video {
         vec![("media_type", "VIDEO".into()), ("video_url", m.url.into())]
@@ -514,7 +672,8 @@ mod tests {
         assert_eq!(q["client_id"], "app");
         assert_eq!(
             q["scope"],
-            "threads_basic,threads_content_publish,threads_manage_replies,threads_delete"
+            "threads_basic,threads_content_publish,threads_manage_replies,threads_delete,\
+             threads_read_replies,threads_manage_mentions"
         );
         assert_eq!(q["state"], "st");
         assert_eq!(q["response_type"], "code");
@@ -543,6 +702,22 @@ mod tests {
             assert_eq!(code(c), Some(PostError::Denied), "{c}");
         }
         assert_eq!(code(300), None);
+    }
+
+    #[test]
+    fn rate_limits_are_told_from_other_refusals() {
+        let err = |c: i64| json!({"error": {"code": c}});
+        let bad = reqwest::StatusCode::BAD_REQUEST;
+        for c in [4, 17, 32, 613, 80001] {
+            assert!(rate_limited(bad, &err(c)), "{c}");
+        }
+        assert!(rate_limited(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            &Value::Null
+        ));
+        for c in [10, 100, 190, 200] {
+            assert!(!rate_limited(bad, &err(c)), "{c}");
+        }
     }
 
     #[test]

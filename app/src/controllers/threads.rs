@@ -101,6 +101,7 @@ async fn callback(
         social_accounts::Column::AccessToken,
         social_accounts::Column::TokenExpiresAt,
         social_accounts::Column::Meta,
+        social_accounts::Column::InboxErrorAt,
         social_accounts::Column::UpdatedAt,
     ];
     if let Err(e) = save_account(&app, (team_id, new_id), row, refresh).await {

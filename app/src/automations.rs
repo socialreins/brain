@@ -330,9 +330,10 @@ pub enum Action {
     NotifyTeam,
     /// Assigns the item to a member of the team, unless it has an assignee already.
     Assign { user_id: Uuid },
-    /// Hides the comment on Facebook or Instagram (a moderation action: nobody but its author
-    /// and the account sees it any more). `comment_received` only; elsewhere or on another
-    /// network it is `skipped: not_supported`.
+    /// Hides the comment on Facebook, Instagram or Threads (a moderation action: nobody but its
+    /// author and the account sees it any more; on Threads only a reply directly under a post of
+    /// the account, else `skipped: threads_nested`). `comment_received` only; elsewhere or on
+    /// another network it is `skipped: not_supported`.
     HideComment,
     /// Likes the comment as the Page on Facebook, or from the account on Bluesky, where it is
     /// a comment or a mention; `skipped: not_supported` elsewhere.
@@ -718,7 +719,14 @@ pub fn validate_steps(
 }
 
 /// Networks whose inbox can fire an automation.
-pub const AUTOMATED: [&str; 5] = ["bluesky", "facebook", "instagram", "x", "youtube"];
+pub const AUTOMATED: [&str; 6] = [
+    "bluesky",
+    "facebook",
+    "instagram",
+    "threads",
+    "x",
+    "youtube",
+];
 /// Meta allows a message to a person only within 24 hours of their last one.
 const META_WINDOW_MINUTES: u32 = 24 * 60;
 /// And a private reply to a comment only within 7 days of it.
@@ -739,7 +747,12 @@ const META_PRIVATE_REPLY_MINUTES: u32 = 7 * 24 * 60;
 /// person answers with a DM keyword). Bluesky has no private reply either: a DM goes only to
 /// someone who follows the account or allows DMs from anyone, and a welcome DM to a new
 /// follower normally does, as they follow us (unless they closed their DMs). When every account
-/// is YouTube, only a comment can fire it (`youtube_unsupported_trigger`: no mentions, DMs,
+/// is Threads, only a reply and a mention can fire it (`threads_unsupported_trigger`), no DM may
+/// be sent (`threads_no_dm`: Threads has no messages and no private reply), a comment is not liked
+/// (`threads_no_like`; hiding a reply directly under our post works), and a public reply
+/// holds 500 characters with an emoji counted as its UTF-8 bytes (`invalid_text`). A mixed scope
+/// is left to fail item by item: a DM to a Threads item is skipped (`threads_no_dm`) and the
+/// fallback public reply answers. When every account is YouTube, only a comment can fire it (`youtube_unsupported_trigger`: no mentions, DMs,
 /// follows, story replies or buttons) and only public replies can answer (`youtube_no_dm`: YouTube
 /// has no DM and no private reply). A mixed scope is left to fail item by item.
 pub fn network_limits(
@@ -779,6 +792,45 @@ pub fn network_limits(
         )
     {
         return Err("x_unsupported_trigger");
+    }
+    // Threads has replies and mentions only: no follow, story or button, and no DM at all.
+    if !providers.is_empty() && providers.iter().all(|p| *p == "threads") {
+        if !matches!(trigger, "comment_received" | "mention_received") {
+            return Err("threads_unsupported_trigger");
+        }
+        let dm = actions
+            .iter()
+            .any(|a| a.via_text().is_some_and(|s| s.0 == Via::Dm))
+            || steps.is_some_and(|s| s.iter().any(|x| x.sends().is_some_and(|s| s.0 == Via::Dm)));
+        if dm {
+            return Err("threads_no_dm");
+        }
+        // Threads can hide a reply but has no like.
+        let like = actions.iter().any(|a| matches!(a, Action::LikeComment))
+            || steps.is_some_and(|s| s.iter().any(|x| matches!(x, Step::LikeComment)));
+        if like {
+            return Err("threads_no_like");
+        }
+        // 500 characters, an emoji counted as its UTF-8 bytes, with a name at its widest.
+        let widest = |t: &str| {
+            t.replace("{name}", &"\u{10348}".repeat(MAX_NAME_CHARS))
+                .replace("{page}", &"p".repeat(MAX_PAGE_CHARS))
+        };
+        let texts = actions
+            .iter()
+            .filter_map(|a| a.via_text().filter(|_| !a.ai()))
+            .chain(
+                steps
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|s| s.sends().filter(|_| !s.ai()).map(|(v, t, _)| (v, t))),
+            );
+        if texts
+            .into_iter()
+            .any(|(_, t)| !inbox::fits_on("threads", Via::Public, &widest(t)))
+        {
+            return Err("invalid_text");
+        }
     }
     if !providers.is_empty() && providers.iter().all(|p| *p == "youtube") {
         if trigger != "comment_received" {
@@ -1776,6 +1828,23 @@ async fn effect(
             } else {
                 Moderate::Like
             };
+            // Threads can hide, not like: its reply is hidden through `manage_reply`.
+            if account.provider == "threads" {
+                if m != Moderate::Hide || item.kind != "comment" {
+                    return done(kind, Some("not_supported"), false);
+                }
+                return match crate::threads_inbox::perform(app, account, item, Some(true)).await {
+                    Ok(_) => done(kind, None, false),
+                    Err(e) => {
+                        let calm = matches!(
+                            e,
+                            InboxError::RateLimited
+                                | InboxError::Invalid("not_our_thread" | "threads_nested")
+                        );
+                        done(kind, Some(e.code()), !calm)
+                    }
+                };
+            }
             let meta = matches!(account.provider.as_str(), "facebook" | "instagram");
             if !meta || item.kind != "comment" {
                 return done(kind, Some("not_supported"), false);
@@ -2589,8 +2658,8 @@ fn outcome(kind: &str, sent: Result<Result<String, InboxError>, DbErr>) -> Actio
             | InboxError::NoDmAccess
             | InboxError::RateLimited
             | InboxError::Invalid(
-                "outside_window" | "already_replied" | "dm_unavailable" | "youtube_no_dm"
-                | "x_no_credits" | "x_usage_capped" | "x_budget",
+                "outside_window" | "already_replied" | "dm_unavailable" | "threads_no_dm"
+                | "youtube_no_dm" | "x_no_credits" | "x_usage_capped" | "x_budget",
             )),
         )) => ("skipped", Some(e.code().to_owned()), None),
         Ok(Err(e)) => ("failed", Some(e.code().to_owned()), None),
@@ -2674,6 +2743,7 @@ async fn act(
                         | "outside_window"
                         | "already_replied"
                         | "dm_unavailable"
+                        | "threads_no_dm"
                 )
             )
     });
@@ -3578,6 +3648,71 @@ mod tests {
             r("send_dm", "skipped", Some("no_dm_access")),
         ];
         assert_eq!(summary(&tagged), ("skipped", Some("no_dm_access".into())));
+    }
+
+    #[test]
+    fn threads_takes_public_replies_to_replies_and_mentions_only() {
+        let reply = |t: &str| Action::ReplyPublicly { text: t.into() };
+        let dm = Action::SendDm { text: "hi".into() };
+        let ok = ["comment_received", "mention_received"];
+        for trigger in ok {
+            assert_eq!(
+                network_limits(trigger, &["threads"], &[reply("hi")], None),
+                Ok(())
+            );
+            // No DM and no private reply on Threads, in actions or in a flow.
+            assert_eq!(
+                network_limits(trigger, &["threads"], std::slice::from_ref(&dm), None),
+                Err("threads_no_dm")
+            );
+            let flow = [Step::SendDm {
+                text: "hi".into(),
+                buttons: vec![],
+            }];
+            assert_eq!(
+                network_limits(trigger, &["threads"], &[], Some(&flow)),
+                Err("threads_no_dm")
+            );
+        }
+        for trigger in [
+            "dm_received",
+            "new_follower",
+            "story_reply",
+            "button_clicked",
+        ] {
+            assert_eq!(
+                network_limits(trigger, &["threads"], &[], None),
+                Err("threads_unsupported_trigger")
+            );
+        }
+        // 500 UTF-8 bytes, a name at 4 bytes a letter: 126 emoji are over, and so is a long name.
+        assert_eq!(
+            network_limits(
+                "comment_received",
+                &["threads"],
+                &[reply(&"😀".repeat(126))],
+                None
+            ),
+            Err("invalid_text")
+        );
+        assert_eq!(
+            network_limits(
+                "comment_received",
+                &["threads"],
+                &[reply(&"a".repeat(500))],
+                None
+            ),
+            Ok(())
+        );
+        // Mixed with another network, each item is judged when it comes.
+        assert_eq!(
+            network_limits("comment_received", &["threads", "bluesky"], &[dm], None),
+            Ok(())
+        );
+        // A DM to a Threads item is skipped, not failed, so a fallback reply answers.
+        let sent: Result<Result<String, InboxError>, DbErr> =
+            Ok(Err(InboxError::Invalid("threads_no_dm")));
+        assert_eq!(outcome("send_dm", sent).status, "skipped");
     }
 
     #[test]

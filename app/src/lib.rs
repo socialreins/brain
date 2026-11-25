@@ -27,6 +27,7 @@ pub mod repeat;
 pub mod scheduler;
 pub mod state;
 pub mod stripe;
+pub mod threads_inbox;
 pub mod turnstile;
 pub mod webhooks;
 pub mod x_automation;

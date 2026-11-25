@@ -845,6 +845,13 @@ pub enum InboxError {
     XReconnect,
     /// X refused the call, or could not be reached; what to tell a person (`connectors::x::inbox`).
     X(String),
+    /// Threads refused the token: connect the account again.
+    ThreadsReconnect,
+    /// Threads refused a permission (codes 10 and 200 to 299): the account was connected before
+    /// replies existed, or without the permission; connecting it again asks for it.
+    ThreadsDenied,
+    /// Threads refused the call, or could not be reached; the scrubbed reason.
+    Threads(String),
     /// YouTube refused the channel's token or a permission is missing: connect the channel again.
     YouTubeReconnect,
     /// YouTube refused the call, or could not be reached; what to tell a person.
@@ -870,6 +877,9 @@ impl InboxError {
             Self::MetaDenied(_) => "meta_denied",
             Self::XReconnect => "x_reconnect_required",
             Self::X(_) => "x_failed",
+            Self::ThreadsReconnect => "threads_reconnect_required",
+            Self::ThreadsDenied => "threads_permission_missing",
+            Self::Threads(_) => "threads_failed",
             Self::YouTubeReconnect => "youtube_reconnect_required",
             Self::YouTube(_) => "youtube_failed",
         }
@@ -923,6 +933,18 @@ impl InboxError {
             Self::Invalid("too_many_hidden") => "Bluesky keeps at most 300 hidden replies on \
                                                  a post."
                 .into(),
+            Self::Invalid("threads_no_dm") => "Threads has no direct messages, so nothing was \
+                                               sent."
+                .into(),
+            Self::Invalid("threads_no_action") => {
+                "Threads does not let apps like, repost, follow, \
+                                                   mute or block, so nothing was done."
+                    .into()
+            }
+            Self::Invalid("threads_nested") => "Threads can only hide a reply directly under a \
+                                                post of this account, not one deeper in the \
+                                                thread."
+                .into(),
             Self::Invalid("invalid_emoji") => "A reaction is one emoji.".into(),
             Self::Invalid("convo_locked") => "This conversation is locked: no one can send \
                                               messages in it now."
@@ -954,6 +976,14 @@ impl InboxError {
                                  Connect the account again under Connections."
                 .into(),
             Self::X(why) => why.clone(),
+            Self::ThreadsReconnect => "Threads refused the account's token (it expired or was \
+                                       revoked). Connect the account again under Connections."
+                .into(),
+            Self::ThreadsDenied => "Threads did not allow this: the account was connected \
+                                    without the permission for replies. Connect it again under \
+                                    Connections and accept the new permissions."
+                .into(),
+            Self::Threads(why) => format!("Threads did not take it: {why}"),
             Self::YouTubeReconnect => "YouTube refused the channel's token or a permission is \
                                        missing. Connect the channel again under Accounts."
                 .into(),

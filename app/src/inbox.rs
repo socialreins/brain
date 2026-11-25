@@ -100,7 +100,14 @@ impl Attachment {
 }
 
 /// Platforms whose accounts have an inbox.
-pub const INBOX_PLATFORMS: [&str; 5] = ["bluesky", "facebook", "instagram", "x", "youtube"];
+pub const INBOX_PLATFORMS: [&str; 6] = [
+    "bluesky",
+    "facebook",
+    "instagram",
+    "threads",
+    "x",
+    "youtube",
+];
 /// Most accounts one inbox holds.
 pub const MAX_INBOX_ACCOUNTS: usize = 100;
 
@@ -816,7 +823,8 @@ pub fn fits(via: Via, text: &str) -> bool {
 
 /// `text` fits a reply on `platform`: Facebook takes comments of 8000 characters and messages of
 /// 2000; Instagram comments of 2200 characters and messages of 1000 bytes; X replies of 280
-/// weighted characters and messages of 10,000; any other platform is held to `fits`.
+/// weighted characters and messages of 10,000; Threads replies of 500 characters with an emoji
+/// counted as its UTF-8 bytes, and no messages; any other platform is held to `fits`.
 pub fn fits_on(platform: &str, via: Via, text: &str) -> bool {
     let chars = text.chars().count();
     let some = !text.trim().is_empty();
@@ -827,6 +835,8 @@ pub fn fits_on(platform: &str, via: Via, text: &str) -> bool {
         ("instagram", Via::Dm) => some && text.len() <= 1000,
         ("x", Via::Public) => some && socialreins_core::post::check_x_short([text]).is_none(),
         ("x", Via::Dm) => some && chars <= 10_000,
+        ("threads", Via::Public) => socialreins_core::post::validate("threads", text, &[]).is_ok(),
+        ("threads", Via::Dm) => false,
         ("youtube", Via::Public) => some && chars <= 10_000,
         ("youtube", Via::Dm) => false,
         _ => fits(via, text),
@@ -904,8 +914,17 @@ async fn send_inner(
     let lined = numbered(text, buttons);
     // `skip` still holds: the lines come after everything it names.
     let text = if meta { text } else { &lined };
-    if !meta && !matches!(account.provider.as_str(), "bluesky" | "x" | "youtube") {
+    if !meta
+        && !matches!(
+            account.provider.as_str(),
+            "bluesky" | "x" | "threads" | "youtube"
+        )
+    {
         return Ok(Err(InboxError::Invalid("unsupported_platform")));
+    }
+    // Threads and YouTube have no DMs: say so, rather than "too long".
+    if account.provider == "threads" && via == Via::Dm {
+        return Ok(Err(InboxError::Invalid("threads_no_dm")));
     }
     if account.provider == "youtube" && via == Via::Dm {
         return Ok(Err(InboxError::Invalid("youtube_no_dm")));
@@ -925,6 +944,8 @@ async fn send_inner(
         meta_inbox::send(app, account, item, via, text, (buttons, human)).await?
     } else if account.provider == "x" {
         crate::x_inbox::send(app, account, item, via, text).await
+    } else if account.provider == "threads" {
+        crate::threads_inbox::send(app, account, item, text).await
     } else if account.provider == "youtube" {
         crate::youtube_inbox::send(app, account, item, text).await
     } else {
@@ -941,7 +962,7 @@ async fn send_inner(
         Ok(id) => id,
         Err(e) => {
             // A refused password is the account's state, not this send's: say so everywhere.
-            if e == InboxError::Reconnect && !meta {
+            if matches!(e, InboxError::Reconnect | InboxError::ThreadsReconnect) && !meta {
                 crate::expiry::flag_reconnect(&app.db, account.id).await;
             }
             return Ok(Err(e));
