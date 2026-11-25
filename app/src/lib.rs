@@ -27,6 +27,7 @@ pub mod stripe;
 pub mod turnstile;
 pub mod webhooks;
 pub mod x_inbox;
+pub mod youtube_inbox;
 
 use migration::{Migrator, MigratorTrait};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbErr, TransactionTrait};
