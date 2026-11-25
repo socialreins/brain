@@ -5,6 +5,8 @@
 //! bytes: `206` with `Content-Range`, or `416` for a range past the end.
 use std::ops::Range;
 
+use object_store::ObjectStoreExt;
+
 use axum::{
     body::Body,
     extract::{Path, State},

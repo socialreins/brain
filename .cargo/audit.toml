@@ -1,0 +1,10 @@
+[advisories]
+ignore = [
+  # libsqlite3-sys 0.37.0 (C SQLite CVE). Only in Cargo.lock because sea-orm lists sqlx-sqlite as an
+  # optional driver: brain uses Postgres, and `cargo tree --target all` shows it is not compiled.
+  # The fix needs libsqlite3-sys >= 0.39, which sqlx-sqlite 0.9.0 does not allow. Drop this when sqlx moves on.
+  "RUSTSEC-2026-0459",
+  # arrow-data 60.0.0 (unsound). Same story: arrow-* come in only through an optional sea-orm feature
+  # that brain does not enable, so no arrow code is compiled. Drop this when sea-orm moves on.
+  "RUSTSEC-2026-0442",
+]
