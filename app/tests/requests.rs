@@ -24831,10 +24831,14 @@ mod teams {
                     .as_str()
                     .unwrap()
                     .starts_with("https://bsky.app/"));
-                // A like reads the liked post's own thread: here its parent is hidden.
+                // A like shows the liked post (and what it answers): here its parent is hidden.
                 let like_id = like["id"].as_str().unwrap();
                 let thread = fetch(&s, &cookie, &format!("/v1/inbox-items/{like_id}/thread")).await;
-                assert_eq!(thread["posts"], json!([]));
+                assert_eq!(
+                    thread["posts"][0]["text"], "our post",
+                    "the liked post itself"
+                );
+                assert_eq!(thread["posts"].as_array().unwrap().len(), 1);
                 assert_eq!(thread["truncated"], true);
                 // A DM has no thread; a post Bluesky no longer has says so.
                 let res = s

@@ -1109,8 +1109,8 @@ pub struct ThreadPost {
 #[derive(Serialize, ToSchema)]
 pub struct ThreadContext {
     /// The posts above the item in its thread, oldest first (the thread's root first, the post
-    /// the item answers last). For a like or repost, the post that was liked or reposted and
-    /// what it answers.
+    /// the item answers last). For a like or repost, what the liked post answers and then the
+    /// liked post itself.
     pub posts: Vec<ThreadPost>,
     /// The chain stops at a post that was deleted or is hidden from the account.
     pub truncated: bool,
@@ -1147,7 +1147,8 @@ async fn thread(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) ->
         Ok(None) => return not_found(),
         Err(e) => return internal(e, "account read"),
     };
-    let found = inbox::thread_above(&app, &account, &uri).await;
+    let with_post = matches!(item.kind.as_str(), "like" | "repost");
+    let found = inbox::thread_above(&app, &account, &uri, with_post).await;
     match found {
         Ok(thread) => Json(ThreadContext {
             truncated: thread.truncated,

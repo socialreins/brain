@@ -1075,7 +1075,8 @@ pub struct ThreadPost {
     pub attachments: Vec<Attachment>,
 }
 
-/// The posts above a `getPostThread` answer's own post, oldest first.
+/// The posts above a `getPostThread` answer's own post, oldest first, and the post itself last
+/// when `with_post`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Thread {
     pub posts: Vec<ThreadPost>,
@@ -1084,11 +1085,11 @@ pub struct Thread {
 }
 
 /// Walks `parent` links from a `threadViewPost`, at most 25 up (what was asked for).
-pub fn thread_above(node: &Value) -> Thread {
+pub fn thread_above(node: &Value, with_post: bool) -> Thread {
     let mut posts = Vec::new();
     let mut truncated = false;
-    let mut cur = &node["parent"];
-    while !cur.is_null() && posts.len() < 25 {
+    let mut cur = if with_post { node } else { &node["parent"] };
+    while !cur.is_null() && posts.len() < 26 {
         if cur["$type"] != "app.bsky.feed.defs#threadViewPost" {
             truncated = true;
             break;
@@ -1263,7 +1264,12 @@ impl Bluesky {
     /// The posts above `uri` in its thread, oldest first, as `account` sees them. `truncated`
     /// when the chain ends at a post that is gone or hidden from the account. `PostGone` when
     /// `uri` itself is gone.
-    pub async fn thread_above(&self, c: &Creds<'_>, uri: &str) -> Result<Thread, InboxError> {
+    pub async fn thread_above(
+        &self,
+        c: &Creds<'_>,
+        uri: &str,
+        with_post: bool,
+    ) -> Result<Thread, InboxError> {
         let q = [("uri", uri), ("depth", "0"), ("parentHeight", "25")];
         let got = self
             .xrpc(c, "app.bsky.feed.getPostThread", &q, None)
@@ -1272,7 +1278,7 @@ impl Bluesky {
                 InboxError::Refused { ref code, .. } if code == "NotFound" => InboxError::PostGone,
                 e => e,
             })?;
-        Ok(thread_above(&got["thread"]))
+        Ok(thread_above(&got["thread"], with_post))
     }
 
     /// Whether a reply to `post` would show: Bluesky still serves it, its author does not block

@@ -888,11 +888,13 @@ pub async fn send_with(
     Ok(Ok(reply))
 }
 
-/// The posts above `uri` in its thread, read as `account` sees them.
+/// The posts above `uri` in its thread (and `uri` itself last, with `with_post`), read as
+/// `account` sees them.
 pub async fn thread_above(
     app: &AppState,
     account: &social_accounts::Model,
     uri: &str,
+    with_post: bool,
 ) -> Result<crate::connectors::bluesky::Thread, InboxError> {
     let Some(secret) = secret(app, account) else {
         return Err(InboxError::Reconnect);
@@ -902,7 +904,7 @@ pub async fn thread_above(
         did: &account.external_id,
         password: &secret,
     };
-    app.bluesky.thread_above(&c, uri).await
+    app.bluesky.thread_above(&c, uri, with_post).await
 }
 
 /// The Bluesky half of `send`: the id of what went out.
