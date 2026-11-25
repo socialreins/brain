@@ -165,8 +165,8 @@ async fn list(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> R
 /// Does one action from an item, confirmed (`confirm: true`, else `422 confirm_required`) and
 /// logged. `403` when a member asks for what only owners and admins do; `422` with `error` and
 /// `message` when it cannot be done (`not_applicable`, `not_our_thread`, `own_account`,
-/// `invalid_reason`, `too_many_hidden`, and the Bluesky errors of a reply) or `429`. At most 10 a
-/// minute per user, shared with publishing and replies.
+/// `invalid_reason`, `too_many_hidden`, and the Bluesky errors of a reply) or `429`. At most 60 a
+/// minute per user, shared with thread reads.
 #[utoipa::path(post, path = "/inbox-items/{id}/actions", tag = "inbox", request_body = ActionInput,
     params(("id" = Uuid, Path)),
     responses((status = 200, body = ActionDone), (status = 401, body = crate::controllers::waitlist::Error),
@@ -209,7 +209,7 @@ async fn act(
         },
         None => None,
     };
-    if !app.post_limiter.hit(t.current.0.id) {
+    if !app.live_limiter.hit(t.current.0.id) {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     // A report is made once per target: a second click must not file it again.

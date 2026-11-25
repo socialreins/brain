@@ -1139,7 +1139,7 @@ async fn thread(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) ->
     let Some(uri) = uri.filter(|_| item.platform == "bluesky") else {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "not_a_thread");
     };
-    if !app.thread_limiter.hit(t.current.0.id) {
+    if !app.live_limiter.hit(t.current.0.id) {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let account = match social_accounts::Entity::find_by_id(item.social_account_id)
