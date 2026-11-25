@@ -44,6 +44,7 @@ pub mod uploads;
 pub mod waitlist;
 pub mod webhooks;
 pub mod x;
+pub mod x_inbox;
 pub mod youtube;
 
 use axum::{
@@ -128,6 +129,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(feeds::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
         .merge(inbox::api())
         .merge(inbox_actions::api())
+        .merge(x_inbox::api())
         .merge(contacts::api())
         .merge(broadcasts::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
         .merge(newsletters::api().layer(DefaultBodyLimit::max(MAX_NEWSLETTER_BODY_BYTES)))

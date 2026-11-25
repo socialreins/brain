@@ -22604,7 +22604,7 @@ mod teams {
                     &db,
                     &format!(
                         "INSERT INTO social_accounts (id, team_id, provider, external_id, \
-                         access_token) VALUES ('{x}', '{team_id}', 'x', 'x-{x}', '\\\\x00')"
+                         access_token) VALUES ('{x}', '{team_id}', 'tiktok', 'x-{x}', '\\\\x00')"
                     ),
                 )
                 .await
@@ -22862,7 +22862,7 @@ mod teams {
                 let x = uuid::Uuid::now_v7();
                 db.execute_unprepared(&format!(
                     "INSERT INTO social_accounts (id, team_id, provider, external_id, access_token) \
-                     VALUES ('{x}', '{team_id}', 'x', 'x-{x}', '\\\\x00')"
+                     VALUES ('{x}', '{team_id}', 'tiktok', 'x-{x}', '\\\\x00')"
                 ))
                 .await
                 .unwrap();
