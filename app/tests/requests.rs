@@ -23262,7 +23262,7 @@ mod teams {
                 for (patch, code) in [
                     (json!({"trigger": "follow"}), "invalid_trigger"),
                     (json!({"actions": []}), "invalid_actions"),
-                    (json!({"actions": [{"type": "like"}]}), "invalid_body"),
+                    (json!({"actions": [{"type": "follow"}]}), "invalid_body"),
                     (json!({"conditions": {"keyword": ["x"]}}), "invalid_body"),
                     (
                         json!({"conditions": {"account_ids": [uuid::Uuid::now_v7()]}}),

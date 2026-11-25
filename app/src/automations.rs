@@ -2923,7 +2923,7 @@ mod tests {
         );
         let unknown = serde_json::json!([{"type": "send_dm", "text": "x", "extra": 1}]);
         assert!(serde_json::from_value::<Vec<Action>>(unknown).is_err());
-        let wrong = serde_json::json!([{"type": "like"}]);
+        let wrong = serde_json::json!([{"type": "follow"}]);
         assert!(serde_json::from_value::<Vec<Action>>(wrong).is_err());
         let typo = serde_json::json!({"keyword": ["x"]});
         assert!(serde_json::from_value::<Conditions>(typo).is_err());
