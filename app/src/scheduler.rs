@@ -144,6 +144,18 @@ pub fn spawn(app: AppState) {
             }
         }
     });
+    let x_app = app.clone();
+    tokio::spawn(async move {
+        // Which X accounts are due, and how often, is the account's own setting (`x_inbox`).
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if let Err(e) = crate::x_inbox::tick(&x_app).await {
+                tracing::warn!(error = %e, "x inbox tick failed");
+            }
+        }
+    });
     tokio::spawn(async move {
         // Posts a killed process claimed and never started go out at the first round.
         match publish::release_unstarted(&app.db).await {

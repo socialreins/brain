@@ -142,9 +142,11 @@ async fn callback(
     let new_id = Uuid::now_v7();
     let long_posts = me.long_posts();
     let plan = kept_plan(&app, team_id, &me.id).await;
+    // `scope` says which inbox actions (DMs, like, hide) the person allowed.
     let mut meta = serde_json::json!({
         "refresh_token": seal(&app, &refresh),
         "long_posts": long_posts,
+        "scope": token.scope,
     });
     // A reconnect keeps what the user chose.
     if let Some(plan) = plan {
@@ -276,6 +278,11 @@ async fn renew(app: &AppState, id: Uuid, within: Duration) -> Result<(String, bo
     };
     let known = meta.get("long_posts").cloned();
     let meta_plan = meta.get("plan").cloned();
+    // A refresh answer may name the scopes again; else the ones saved at connect stay.
+    let scope = match &refreshed {
+        Ok(t) if t.scope.is_some() => t.scope.clone().map(Into::into),
+        _ => meta.get("scope").cloned(),
+    };
     match refreshed {
         Ok(token) => {
             let next = token.refresh_token.clone().or(current).unwrap_or_default();
@@ -285,6 +292,9 @@ async fn renew(app: &AppState, id: Uuid, within: Duration) -> Result<(String, bo
             }
             if let Some(plan) = meta_plan {
                 meta["plan"] = plan;
+            }
+            if let Some(scope) = scope {
+                meta["scope"] = scope;
             }
             txn.execute_raw(stmt(
                 "UPDATE social_accounts SET access_token = $2, meta = $4, \

@@ -832,6 +832,10 @@ pub enum InboxError {
     MetaReconnect,
     /// Meta refused the call, or could not be reached; the scrubbed reason.
     Meta(String),
+    /// X refused the token or a permission is missing: connect the account again.
+    XReconnect,
+    /// X refused the call, or could not be reached; what to tell a person (`connectors::x::inbox`).
+    X(String),
 }
 
 impl InboxError {
@@ -847,6 +851,8 @@ impl InboxError {
             // Not `reconnect_required`: the web app words that one for Bluesky.
             Self::MetaReconnect => "meta_reconnect_required",
             Self::Meta(_) => "meta_failed",
+            Self::XReconnect => "x_reconnect_required",
+            Self::X(_) => "x_failed",
         }
     }
 
@@ -859,8 +865,8 @@ impl InboxError {
             Self::NoDmAccess => "The app password has no DM access. Make one with \"Allow access \
                                  to your direct messages\" and reconnect the account."
                 .into(),
-            Self::DmNotAllowed => "Bluesky did not take the DM: the recipient's settings do not \
-                                   allow messages from this account."
+            Self::DmNotAllowed => "The DM was not taken: the recipient's settings do not allow \
+                                   messages from this account."
                 .into(),
             Self::RateLimited => "The platform is rate limiting this account.".into(),
             Self::Refused { code, .. } => format!("Bluesky refused it ({code})."),
@@ -880,6 +886,10 @@ impl InboxError {
                                     Connect the account again under Connections."
                 .into(),
             Self::Meta(why) => format!("Meta did not take it: {why}"),
+            Self::XReconnect => "X refused the account's token or a permission is missing. \
+                                 Connect the account again under Connections."
+                .into(),
+            Self::X(why) => why.clone(),
         }
     }
 }

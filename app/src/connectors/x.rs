@@ -13,10 +13,16 @@ use serde_json::{json, Value};
 
 use super::bluesky::PostError;
 
+pub mod inbox;
+
 const AUTH_URL: &str = "https://x.com/i/oauth2/authorize";
 const API_URL: &str = "https://api.x.com";
 /// `media.write` is what the v2 media upload endpoints need.
 const SCOPES: &str = "tweet.read tweet.write users.read offline.access media.write";
+/// Asked for too, for the inbox: read and send DMs, like, and hide replies. Publishing needs
+/// none of them, so a person who unticks them still connects, and an account connected before
+/// they existed keeps working; its inbox shows "reconnect" for what needs them (`Granted`).
+pub const INBOX_SCOPES: &str = "dm.read dm.write like.write tweet.moderate.write";
 /// Used when X leaves `expires_in` out.
 const DEFAULT_EXPIRES_IN: i64 = 7200;
 /// Media status checks, each after the wait X asks for (at most `MAX_WAIT_SECS`).
@@ -266,7 +272,7 @@ impl X {
             ("response_type", "code"),
             ("client_id", id.as_str()),
             ("redirect_uri", redirect_uri),
-            ("scope", SCOPES),
+            ("scope", &format!("{SCOPES} {INBOX_SCOPES}")),
             ("state", state),
             ("code_challenge", challenge),
             ("code_challenge_method", "S256"),
@@ -567,7 +573,8 @@ mod tests {
         assert_eq!(q["code_challenge_method"], "S256");
         assert_eq!(
             q["scope"],
-            "tweet.read tweet.write users.read offline.access media.write"
+            "tweet.read tweet.write users.read offline.access media.write dm.read dm.write \
+             like.write tweet.moderate.write"
         );
         assert!(!url.contains("secret"));
         assert!(X::new(None)
