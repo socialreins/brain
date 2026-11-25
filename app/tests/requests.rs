@@ -22169,6 +22169,28 @@ mod teams {
                     assert_eq!(out["blocks"], json!(["no_public_page"]));
                     assert_eq!(out["steps"], json!([]));
 
+                    // The team's 500 runs a day used: a send would be skipped.
+                    let bucket = format!("automation:team:{team}");
+                    let hits = |q: &str| {
+                        sea_orm::Statement::from_sql_and_values(
+                            sea_orm::DbBackend::Postgres,
+                            q,
+                            [bucket.clone().into()],
+                        )
+                    };
+                    db.execute_raw(hits(
+                        "INSERT INTO rate_limit_hits (bucket) SELECT $1 FROM generate_series(1, 500)",
+                    ))
+                    .await
+                    .unwrap();
+                    let one = automation(json!([{"type": "send_dm", "text": "Hi"}]));
+                    let out = try_it(one, sample("guide")).await.json::<Value>();
+                    assert_eq!(out["steps"][0]["status"], "would_skip", "{out}");
+                    assert_eq!(out["steps"][0]["reason"], "daily_cap");
+                    db.execute_raw(hits("DELETE FROM rate_limit_hits WHERE bucket = $1"))
+                        .await
+                        .unwrap();
+
                     // An account without DM access: the DM would be skipped, the rest not reached.
                     db.execute_raw(sea_orm::Statement::from_sql_and_values(
                         sea_orm::DbBackend::Postgres,
@@ -22209,8 +22231,8 @@ mod teams {
                     assert_eq!((items().await.unwrap(), runs().await.unwrap()), (0, 0));
                 }
 
-                /// A test that writes with our key counts against the allowance like a run, and
-                /// a test no one may run (a member) or past the daily limit is refused.
+                /// A test that writes with our key counts against the allowance like a run, an unusable
+                /// answer is given back, and past the daily limit a test is refused.
                 #[tokio::test]
                 #[serial]
                 async fn testing_counts_against_the_ai_allowance_and_is_limited() {
@@ -22260,6 +22282,13 @@ mod teams {
                         .await
                         .json::<Value>();
                     assert_eq!(out["steps"][0]["reason"], "ai_empty");
+                    assert_eq!(usage().await, 1);
+                    reply("Grab it at evil.example now");
+                    let out = req(&s, Method::POST, "/v1/automations/test", &cookie)
+                        .json(&body)
+                        .await
+                        .json::<Value>();
+                    assert_eq!(out["steps"][0]["reason"], "ai_link");
                     assert_eq!(usage().await, 1);
 
                     // Over the daily limit.

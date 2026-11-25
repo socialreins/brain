@@ -676,7 +676,8 @@ pub struct TestInput {
 /// in `sample.account_id`: whether it matches (or why not), any rule that would stop it, and
 /// each action with its final text, AI text included. Nothing is sent and no inbox item or run
 /// is stored. An AI step is written by the real model with the real key choice and counted
-/// against the AI allowance like a run. At most 100 tests a team a day (`429 rate_limited`).
+/// against the AI allowance like a run. At most 100 tests a team a day, an AI step counting as
+/// one more each (`429 rate_limited`).
 /// Owners and admins on the Automation plan.
 #[utoipa::path(post, path = "/automations/test", tag = "automations", request_body = TestInput,
     responses((status = 200, body = Outcome), (status = 401, body = Error),
@@ -718,21 +719,34 @@ async fn test(
                 "invalid_sample",
             )));
         };
-        let caps = [(dry_run::quota_bucket(t.team.id), dry_run::TESTS_PER_DAY)];
+        // A hit for the test and one for each AI step, which spends like a run.
+        let ai = input.actions.iter().flatten().filter(|a| a.ai()).count()
+            + input.steps.iter().flatten().filter(|s| s.ai()).count();
+        let bucket = (dry_run::quota_bucket(t.team.id), dry_run::TESTS_PER_DAY);
+        let caps = vec![bucket; 1 + ai];
         if crate::rate_limit::daily_reserve(&app.db, &caps)
             .await?
             .is_none()
         {
             return Ok(Err(reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited")));
         }
-        let given = (
-            input.trigger.as_str(),
-            &input.conditions,
-            input.actions.as_deref().unwrap_or_default(),
-            input.steps.as_deref(),
-            input.fallback_public_reply.as_deref(),
-        );
-        Ok::<_, DbErr>(Ok(dry_run::test(&app, &account, given, &sample).await?))
+        // Run apart from the request: a dropped request must not stop it between an AI spend and
+        // its refund.
+        let app = app.clone();
+        let task = tokio::spawn(async move {
+            let given = (
+                input.trigger.as_str(),
+                &input.conditions,
+                input.actions.as_deref().unwrap_or_default(),
+                input.steps.as_deref(),
+                input.fallback_public_reply.as_deref(),
+            );
+            dry_run::test(&app, &account, given, &sample).await
+        });
+        match task.await {
+            Ok(outcome) => Ok::<_, DbErr>(Ok(outcome?)),
+            Err(e) => Err(DbErr::Custom(e.to_string())),
+        }
     };
     match tried.await {
         Ok(Ok(outcome)) => Json(outcome).into_response(),

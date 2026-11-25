@@ -82,13 +82,14 @@ pub struct Outcome {
     pub trigger: String,
     /// The sample meets every condition.
     pub matched: bool,
-    /// Why not, when it does not: `wrong_set`, `wrong_account`, `wrong_post`, `no_keyword`,
-    /// `not_first_from_author`, `not_first_message`, `button_not_named`.
+    /// Why not, when it does not: `wrong_set`, `wrong_account`, `wrong_post`, `no_keyword` or
+    /// `button_not_named`. (A sample is always its author's first comment or message, so the
+    /// first-only conditions pass.)
     pub mismatches: Vec<String>,
-    /// Rules that stop a matching item from running at all (no steps then): the codes of
-    /// `network_limits` (`unsupported_account`, `meta_one_private_reply`, `meta_reply_window`,
-    /// `invalid_text`), `no_public_page` (a text holds `{page}` and the post has no live page)
-    /// and `daily_cap` (the team's 500 runs a day are used).
+    /// Rules that would stop it: `no_public_page` (a text holds `{page}` and the post has no
+    /// live page: the automation does not run, so there are no steps), and the Facebook and
+    /// Instagram rules of `network_limits` that make a send fail (`meta_one_private_reply`,
+    /// `meta_reply_window`; the steps are still listed, as a run would go as far as it can).
     pub blocks: Vec<String>,
     pub steps: Vec<PlannedStep>,
 }
@@ -193,7 +194,12 @@ fn item_of(
         author_handle: None,
         author_name: s.author_name.clone().filter(|n| !n.trim().is_empty()),
         author_avatar: None,
-        text: s.text.clone(),
+        // A follow carries no text.
+        text: if kind == "follow" {
+            String::new()
+        } else {
+            s.text.clone()
+        },
         received_at: chrono::Utc::now().fixed_offset(),
         state: "open".into(),
         replied_at: None,
@@ -213,8 +219,8 @@ fn item_of(
     }
 }
 
-/// Whether the team's runs of the last day are at the daily cap; takes no hit.
-async fn cap_reached(db: &DatabaseConnection, team: Uuid) -> Result<bool, DbErr> {
+/// How many more sends the team's daily cap takes; takes no hit.
+async fn cap_room(db: &DatabaseConnection, team: Uuid) -> Result<i64, DbErr> {
     let stmt = Statement::from_sql_and_values(
         DbBackend::Postgres,
         "SELECT count(*) AS n FROM rate_limit_hits \
@@ -225,7 +231,7 @@ async fn cap_reached(db: &DatabaseConnection, team: Uuid) -> Result<bool, DbErr>
         Some(r) => r.try_get("", "n")?,
         None => 0,
     };
-    Ok(n >= RUNS_PER_DAY)
+    Ok((RUNS_PER_DAY - n).max(0))
 }
 
 /// The post of ours the sample hangs off, as ingest finds it.
@@ -296,8 +302,10 @@ pub async fn test(
         return Ok(out);
     }
     let provider = [account.provider.as_str()];
-    if let Err(code) = rules::network_limits(trigger, &provider, actions, steps) {
-        out.blocks.push(code.into());
+    // `invalid_text` here is an estimate for the longest possible name; the real text is checked below.
+    match rules::network_limits(trigger, &provider, actions, steps) {
+        Err(code) if code != "invalid_text" => out.blocks.push(code.into()),
+        _ => {}
     }
     let parts = parts(actions, steps);
     let holds = |t: &str| t.contains("{page}");
@@ -312,27 +320,43 @@ pub async fn test(
     if needs_page && page.is_none() {
         out.blocks.push("no_public_page".into());
     }
-    if cap_reached(db, item.team_id).await? {
-        out.blocks.push("daily_cap".into());
-    }
-    if !out.blocks.is_empty() {
+    if out.blocks.iter().any(|b| b == "no_public_page") {
         return Ok(out);
     }
-    out.steps = walk(app, account, &item, &parts, steps.is_some(), fallback, page).await;
+    let room = cap_room(db, item.team_id).await?;
+    let walked = Walk {
+        flow: steps.is_some(),
+        fallback,
+        page,
+        room,
+    };
+    out.steps = walk(app, account, &item, &parts, walked).await;
     Ok(out)
 }
 
 /// Plays the parts as a run does: a flow stops at its first send that would not go out, a list
 /// of actions tries each, then the fallback reply when a DM was refused and nothing replied.
+struct Walk<'a> {
+    flow: bool,
+    fallback: Option<&'a str>,
+    page: Option<String>,
+    /// Sends the team's daily cap still takes; a send past it would be skipped `daily_cap`.
+    room: i64,
+}
+
 async fn walk(
     app: &AppState,
     account: &social_accounts::Model,
     item: &inbox_items::Model,
     parts: &[Part<'_>],
-    flow: bool,
-    fallback: Option<&str>,
-    page: Option<String>,
+    Walk {
+        flow,
+        fallback,
+        page,
+        room,
+    }: Walk<'_>,
 ) -> Vec<PlannedStep> {
+    let mut sends = 0;
     let mut out: Vec<PlannedStep> = Vec::new();
     let mut stopped = false;
     for part in parts {
@@ -365,14 +389,16 @@ async fn walk(
                 ai,
                 buttons,
             } => {
-                let planned = plan_send(
-                    app,
-                    account,
-                    item,
-                    (kind, *via, template, *ai, buttons),
-                    page.as_deref(),
-                )
-                .await;
+                sends += 1;
+                let planned = if sends > room {
+                    PlannedStep {
+                        reason: Some("daily_cap".into()),
+                        ..step(kind, "would_skip")
+                    }
+                } else {
+                    let send = (*kind, *via, *template, *ai, *buttons);
+                    plan_send(app, account, item, send, page.as_deref()).await
+                };
                 stopped = flow && planned.status != "would_send";
                 out.push(planned);
             }
@@ -394,14 +420,15 @@ async fn walk(
         out.iter().any(replied),
     ) {
         let kind = "fallback_public_reply";
-        let planned = plan_send(
-            app,
-            account,
-            item,
-            (kind, Via::Public, f, false, &[]),
-            page.as_deref(),
-        )
-        .await;
+        let planned = if sends + 1 > room {
+            PlannedStep {
+                reason: Some("daily_cap".into()),
+                ..step(kind, "would_skip")
+            }
+        } else {
+            let send = (kind, Via::Public, f, false, &[][..]);
+            plan_send(app, account, item, send, page.as_deref()).await
+        };
         out.push(planned);
     }
     out
