@@ -102,7 +102,7 @@ async fn send_one(app: &AppState, post: Uuid, team: Uuid, kind: Kind) -> Result<
     let found = app
         .db
         .query_one_raw(sql(
-            "SELECT p.platform, p.body, p.error, p.scheduled_at, t.code FROM posts p \
+            "SELECT p.platform, p.body, p.error, p.scheduled_at, p.number, t.code FROM posts p \
              JOIN teams t ON t.id = p.team_id WHERE p.id = $1",
             vec![post.into()],
         ))
@@ -114,6 +114,7 @@ async fn send_one(app: &AppState, post: Uuid, team: Uuid, kind: Kind) -> Result<
     let body: String = p.try_get("", "body")?;
     let error: Option<String> = p.try_get("", "error")?;
     let code: String = p.try_get("", "code")?;
+    let number: i64 = p.try_get("", "number")?;
     // The author and the owners, each once; a member who left the team is not mailed.
     let to = app
         .db
@@ -124,7 +125,7 @@ async fn send_one(app: &AppState, post: Uuid, team: Uuid, kind: Kind) -> Result<
             vec![team.into(), post.into()],
         ))
         .await?;
-    let link = format!("{}/t/{code}/posts/{post}", app.web_url);
+    let link = format!("{}/t/{code}/posts/{number}", app.web_url);
     let (subject, text) = compose(kind, &platform, &body, error.as_deref(), &link);
     for r in to {
         let email: String = r.try_get("", "email")?;

@@ -231,6 +231,8 @@ async fn copy(
     }
     let copy = posts::ActiveModel {
         id: Set(Uuid::now_v7()),
+        // The column's identity gives the copy its own; `reset_all` would copy the original's.
+        number: sea_orm::NotSet,
         status: Set("scheduled".into()),
         scheduled_at: Set(Some(at.fixed_offset())),
         published_at: Set(None),

@@ -5658,6 +5658,66 @@ mod teams {
 
             #[tokio::test]
             #[serial]
+            async fn a_post_is_addressed_by_its_number_or_its_uuid() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let first = create(&s, &cookie, input(&set, "one", None)).await;
+                let second = create(&s, &cookie, input(&set, "two", None)).await;
+                let (a, b) = (first.json::<Value>(), second.json::<Value>());
+                let (n1, n2) = (a["number"].as_i64().unwrap(), b["number"].as_i64().unwrap());
+                assert!(n2 > n1, "the counter only goes up: {n1} then {n2}");
+                let id = a["id"].as_str().unwrap();
+                // Both forms read, change and publish the same post; the answer names both.
+                let by_number = get_post(&s, &cookie, &n1.to_string()).await;
+                assert_eq!(by_number["id"], id);
+                assert_eq!(get_post(&s, &cookie, id).await["number"], n1);
+                let res = req(&s, Method::PUT, &format!("/v1/posts/{n1}"), &cookie)
+                    .json(&input(&set, "edited", None))
+                    .await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                assert_eq!(get_post(&s, &cookie, id).await["body"], "edited");
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/posts/{n1}/publish"),
+                    &cookie,
+                )
+                .await;
+                assert_eq!(res.status_code(), 202, "{}", res.text());
+                assert_eq!(settled(&s, &cookie, id).await["status"], "published");
+                // A number nobody has, one too large, and text that is neither are `404`.
+                for bad in ["999999999999", "99999999999999999999999", "nope"] {
+                    let res = s
+                        .get(&format!("/v1/posts/{bad}"))
+                        .add_header("cookie", &cookie)
+                        .await;
+                    assert_eq!(res.status_code(), 404, "{bad}");
+                }
+                // Another team's number is as unknown as a missing one, for every route.
+                let (other, _, _) = owner_with_account(&s, &db).await;
+                for (method, path) in [
+                    (Method::GET, format!("/v1/posts/{n2}")),
+                    (Method::PUT, format!("/v1/posts/{n2}")),
+                    (Method::DELETE, format!("/v1/posts/{n2}")),
+                    (Method::POST, format!("/v1/posts/{n2}/publish")),
+                    (Method::GET, format!("/v1/posts/{n2}/page")),
+                ] {
+                    let res = req(&s, method, &path, &other)
+                        .json(&input(&set, "x", None))
+                        .await;
+                    assert_eq!(res.status_code(), 404, "{path}: {}", res.text());
+                }
+                assert_eq!(get_post(&s, &cookie, &n2.to_string()).await["body"], "two");
+                // The list carries it too.
+                let list = s.get("/v1/posts").add_header("cookie", &cookie).await;
+                let list = list.json::<Value>();
+                let list = list.as_array().unwrap();
+                assert!(!list.is_empty() && list.iter().all(|p| p["number"].is_i64()));
+            }
+
+            #[tokio::test]
+            #[serial]
             async fn a_video_over_the_configured_cap_is_refused_when_saved() {
                 // `MEDIA_MAX_BYTES` under the mock's clip, and far under its image.
                 let (s, db, _) = on_mock_capped(50).await;
@@ -9542,7 +9602,11 @@ mod teams {
                         text.contains("Bluesky refused it (InvalidRequest)."),
                         "{text}"
                     );
-                    assert!(text.contains(&format!("/t/{code}/posts/{id}")), "{text}");
+                    let number = get_post(&s, &cookie, &id).await["number"].to_string();
+                    assert!(
+                        text.contains(&format!("/t/{code}/posts/{number}\n")),
+                        "{text}"
+                    );
                     // Mailed once: another round sends nothing new.
                     publish::tick(&state).await.unwrap();
                     assert_eq!(mail_for(&seen.lock().unwrap(), &owner).len(), 1);
@@ -9560,7 +9624,8 @@ mod teams {
                         "{}",
                         mails[1].1
                     );
-                    assert!(mails[1].1.contains(&format!("/posts/{late}")));
+                    let late_number = get_post(&s, &cookie, &late).await["number"].to_string();
+                    assert!(mails[1].1.contains(&format!("/posts/{late_number}\n")));
 
                     // Scheduled again, as time passes it goes late a second time: mailed again, once.
                     exec(
@@ -30265,6 +30330,9 @@ mod teams {
                     let rest = bearer(&s, Method::GET, &format!("/v1/posts/{id}"), secret).await;
                     assert_eq!(rest.json::<Value>(), p);
                     let (_, got) = call(&s, secret, "get-post", json!({"id": id})).await;
+                    assert_eq!(got, p);
+                    // The post's number names it as well.
+                    let (_, got) = call(&s, secret, "get-post", json!({"id": p["number"]})).await;
                     assert_eq!(got, p);
                     let (_, list) = call(&s, secret, "list-posts", json!({})).await;
                     let rest = bearer(&s, Method::GET, "/v1/posts", secret).await;
