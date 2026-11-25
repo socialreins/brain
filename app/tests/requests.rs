@@ -25425,6 +25425,35 @@ mod teams {
                     json!({"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:fan1"})
                 );
 
+                // A DM has no post to report: its author's account is reported only when asked.
+                let res = act(
+                    &cookie,
+                    &dm_id,
+                    json!({"action": "report", "confirm": true, "reason_type": "spam"}),
+                )
+                .await;
+                assert_eq!(res.json::<Value>()["error"], "not_applicable");
+                let res = act(&cookie, &dm_id, json!({"action": "report", "confirm": true, "reason_type": "spam", "account": true})).await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+
+                // One attempt at a time per item and action: while another holds it, this waits out.
+                let key = format!("{c1_id}:like");
+                let holder = sea_orm::TransactionTrait::begin(&db).await.unwrap();
+                sea_orm::ConnectionTrait::execute_raw(
+                    &holder,
+                    sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Postgres,
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1, 2))",
+                        [key.into()],
+                    ),
+                )
+                .await
+                .unwrap();
+                let res = act(&member, &c1_id, ok("like")).await;
+                assert_eq!(res.status_code(), 409);
+                assert_eq!(res.json::<Value>()["error"], "action_in_progress");
+                holder.commit().await.unwrap();
+
                 // A refusal from Bluesky is said, and logged as failed.
                 let res = act(&cookie, &bad_id, ok("mute_author")).await;
                 assert_eq!(res.status_code(), 422);

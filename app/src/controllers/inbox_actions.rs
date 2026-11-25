@@ -11,6 +11,7 @@ use axum::{
 use chrono::{DateTime, FixedOffset};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, FromQueryResult, QueryFilter, Statement,
+    TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -121,6 +122,9 @@ fn failed(e: &InboxError) -> Response {
     responses((status = 200, body = Actions), (status = 401, body = crate::controllers::waitlist::Error),
         (status = 404, body = crate::controllers::waitlist::Error)))]
 async fn list(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> Response {
+    if !app.live_limiter.hit(t.current.0.id) {
+        return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    }
     let (item, account) = match find(&app, t.team.id, id).await {
         Ok(Some(found)) => found,
         Ok(None) => return reply(StatusCode::NOT_FOUND, "not_found"),
@@ -215,6 +219,26 @@ async fn act(
     if !app.live_limiter.hit(t.current.0.id) {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
+    // One attempt at a time per item and action, so a double click cannot like twice or file a
+    // report twice: the lock lives in this transaction, held across the call and its log.
+    let guard = async {
+        let txn = app.db.begin().await?;
+        let stmt = Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 2)) AS ok",
+            [format!("{}:{}", item.id, input.action.as_str()).into()],
+        );
+        let ok: bool = match txn.query_one_raw(stmt).await? {
+            Some(r) => r.try_get("", "ok")?,
+            None => false,
+        };
+        Ok::<_, sea_orm::DbErr>(ok.then_some(txn))
+    };
+    let guard = match guard.await {
+        Ok(Some(txn)) => txn,
+        Ok(None) => return reply(StatusCode::CONFLICT, "action_in_progress"),
+        Err(e) => return internal(e, "inbox action lock"),
+    };
     // A report is made once per target: a second click must not file it again.
     if input.action == Action::Report {
         let stmt = Statement::from_sql_and_values(
@@ -251,6 +275,7 @@ async fn act(
         // The action happened (or not); the log is what failed.
         tracing::error!(error = %e, item = %item.id, "inbox action not logged");
     }
+    let _ = guard.commit().await;
     match outcome {
         Ok(remote_id) => Json(ActionDone {
             action: input.action,

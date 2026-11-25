@@ -185,8 +185,8 @@ async fn delete(app: &AppState, c: &Creds<'_>, uri: &str) -> Result<(), InboxErr
         .xrpc(c, "com.atproto.repo.deleteRecord", &[], Some(&body))
         .await
     {
+        // Deleting a record that is not there succeeds; a 400 is a real refusal.
         Ok(_) => Ok(()),
-        Err(InboxError::Refused { status: 400, .. }) => Ok(()),
         Err(e) => Err(e),
     }
 }
@@ -378,7 +378,11 @@ pub async fn perform(
             };
             delete(app, &c, uri).await.map(|()| None)
         }
-        Action::Report => report(app, &c, item, extra, post().ok()).await.map(Some),
+        Action::Report => {
+            // A post is reported by its own uri and cid; only a comment or mention is one.
+            let post = own_post.then(|| post().ok()).flatten();
+            report(app, &c, item, extra, post).await.map(Some)
+        }
     }
 }
 
@@ -455,11 +459,13 @@ async fn report(
     else {
         return Err(InboxError::Invalid("invalid_reason"));
     };
-    let subject = match post.filter(|_| !extra.account) {
-        Some((uri, cid)) => {
+    let subject = match (extra.account, post) {
+        (false, Some((uri, cid))) => {
             json!({ "$type": "com.atproto.repo.strongRef", "uri": uri, "cid": cid })
         }
-        None => json!({ "$type": "com.atproto.admin.defs#repoRef", "did": item.author_id }),
+        // Nothing to report but the account, and it must be asked for.
+        (false, None) => return Err(InboxError::Invalid("not_applicable")),
+        (true, _) => json!({ "$type": "com.atproto.admin.defs#repoRef", "did": item.author_id }),
     };
     let mut body = json!({ "reasonType": reason_type, "subject": subject });
     if let Some(reason) = extra.reason.map(str::trim).filter(|r| !r.is_empty()) {
