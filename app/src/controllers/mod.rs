@@ -46,6 +46,7 @@ pub mod webhooks;
 pub mod x;
 pub mod x_inbox;
 pub mod youtube;
+pub mod youtube_inbox;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -130,6 +131,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(inbox::api())
         .merge(inbox_actions::api())
         .merge(x_inbox::api())
+        .merge(youtube_inbox::api())
         .merge(contacts::api())
         .merge(broadcasts::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
         .merge(newsletters::api().layer(DefaultBodyLimit::max(MAX_NEWSLETTER_BODY_BYTES)))

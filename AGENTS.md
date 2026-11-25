@@ -183,6 +183,16 @@ cargo run -p socialreins-brain
   deletes or likes a Meta comment (`meta_inbox::moderate`; what was done is kept in
   `inbox_items.moderation`); a person's DM reply after 24 hours goes out with the HUMAN_AGENT tag
   only with `META_HUMAN_AGENT`.
+- `app/src/youtube_inbox.rs`: YouTube comments into `inbox_items` (`connectors/youtube/comments.rs`:
+  `commentThreads.list` with `allThreadsRelatedToChannelId`, newest first). Opt-in per channel
+  (`youtube_inbox`), because the Google project's 10,000 units a day are shared: a channel's
+  `daily_units` (reads are 1 unit) and all channels' `YOUTUBE_INBOX_UNITS` bound it, both by
+  Pacific day, and `quotaExceeded` pauses the channel. A sweep is bounded in pages and time and
+  keeps its place (`page_token`, `pending_at`); `newest_at` moves only when one ends. A first
+  read is 7 days of history stored `automated`. Top-level comment: parent and root are the
+  video; reply: parent is the top-level comment (YouTube replies are one level deep). YouTube's
+  developer policy allows stored API data 30 days, so `purge` deletes older comments, video
+  titles and contact names. No new OAuth scope: `youtube.force-ssl` was asked for from the start.
 - `app/src/automations.rs`: an automation holds `actions` or `steps` (a flow of sends and
   waits). A flow's run claims each step before sending it (`claim_step`, with the send's hit of
   the daily cap), a `wait` parks it as `waiting`, and `automations::tick` (every minute, own

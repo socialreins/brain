@@ -176,7 +176,9 @@ async fn callback(
         avatar_url: Set(channel.thumbnail),
         access_token: Set(app.cipher.encrypt(token.access_token.as_bytes())),
         token_expires_at: Set(Some(now + Duration::seconds(token.expires_in))),
-        meta: Set(serde_json::json!({ "refresh_token": seal(&app, &refresh) })),
+        meta: Set(
+            serde_json::json!({ "refresh_token": seal(&app, &refresh), "scope": token.scope }),
+        ),
         dm_access: Set(false),
         inbox_error_at: Set(None),
         created_by: Set(Some(user_id)),
