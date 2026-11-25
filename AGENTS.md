@@ -50,7 +50,7 @@ cargo run -p socialreins-brain
   email gets a confirmation link to the web app, which posts the token to
   `POST /v1/waitlist/verify` (never a state-changing GET: mail scanners open links). Mail goes
   out after the reply, at most hourly per email, 20 a day per IP and 500 a day overall
-  (`rate_limit::daily_reserve`). `GET /v1/waitlist/count` is cached 30 seconds, and `GET /v1/admin/waitlist` is for `ADMIN_EMAILS` (`config.rs`) with a
+  (`rate_limit::daily_reserve`). `POST /v1/waitlist/name` sets an optional name with the join's `name_token` (hash stored on a new row only, a dummy for a known email, valid an hour). `GET /v1/waitlist/count` counts verified signups, cached 30 seconds, and `GET /v1/admin/waitlist` is for `ADMIN_EMAILS` (`config.rs`) with a
   session cookie only.
 - `app/src/controllers/pages.rs`: public pages of posts. `teams.public_pages` (`PATCH /v1/team`,
   owner or admin) switches them on; `post_pages` holds one row per `subject` (the post's

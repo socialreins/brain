@@ -32,10 +32,11 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/version` | `{"commit":"<sha>"}`, from `RAILWAY_GIT_COMMIT_SHA`, `dev` locally |
 | GET | `/openapi.json` | OpenAPI document for `/v1` |
 | POST | `/mcp` | MCP server (streamable HTTP, stateless): tools for sets, posting queues, accounts, posts (with `approve-post`, `reject-post`, `set-post-repeat`, `clear-post-repeat` and `takedown-post-group`, write tools), lists, the media library (`list-media`, `add-media`), feeds (`list-feeds`, `add-feed`, `remove-feed`), analytics (`get-analytics`, a read tool) and snippets (`list-snippets`, `save-snippet` creating or, with an `id`, replacing, `delete-snippet`). Bearer API token only, same scope and per-token limit as `/v1`, bodies up to 64 KiB; `Idempotency-Key` does not apply. `create-post` and `create-post-group` take `validate_only` (see "Validate only"), which a read-only token may send |
-| POST | `/v1/waitlist` | `{"email":"...","source":"..."}` joins the waitlist and emails a confirmation link |
+| POST | `/v1/waitlist` | `{"email":"...","source":"..."}` joins the waitlist (unverified) and emails a confirmation link; answers `{"status":"ok","name_token"}` |
+| POST | `/v1/waitlist/name` | `{"token":<name_token>,"name"}` adds the joiner's optional name (1 to 80 characters, no control, invisible or direction-changing characters) within an hour of joining and until the email is verified; `200 {"status":"ok"}` for any well-formed token, `422 invalid_link` or `invalid_name` |
 | POST | `/v1/waitlist/verify` | `{"token"}` from the emailed link: marks the signup verified, `200 {"status":"verified"}`, else `422 {"error":"invalid_link"}` |
-| GET | `/v1/waitlist/count` | `{"count":n}`: every signup, verified or not, cached for 30 seconds |
-| GET | `/v1/admin/waitlist` | `ADMIN_EMAILS` only, session cookie: `{"total","verified","signups":[{"id","email","source","created_at","verified_at","approved_at"}]}`, newest first, at most 1000 (`?verified=true\|false` and `?q=` (part of the email, any case) filter the list) |
+| GET | `/v1/waitlist/count` | `{"count":n}`: verified signups only, cached for 30 seconds |
+| GET | `/v1/admin/waitlist` | `ADMIN_EMAILS` only, session cookie: `{"total","verified","signups":[{"id","email","source","name","created_at","verified_at","approved_at"}]}`, newest first, at most 1000 (`?verified=true\|false`, `?hide_stale=true` (leaves out unverified, unapproved signups older than 30 days) and `?q=` (part of the email, any case) filter the list) |
 | GET | `/v1/admin/overview` | Admin console (every `/v1/admin/*` route: `ADMIN_EMAILS` only, session cookie). Totals: `{"users","new_users_7d","teams","accounts":{"total","by_provider":{"bluesky":n}},"posts":{"scheduled","published","failed",...},"waitlist":{"total","verified","approved"}}` |
 | GET | `/v1/admin/users` | `?q=` (part of the email or name, any case), `?limit=` (1 to 200, default 50), `?offset=`: `{"total","users":[{"id","email","name","is_admin","created_at","last_sign_in_at","teams":[{"id","name","role"}]}]}`, newest first. `last_sign_in_at` is the start of the newest session still stored, else `null` |
 | GET | `/v1/admin/teams` | `?q=` (part of the name, any case), `?limit=`, `?offset=`: `{"total","teams":[{"id","name","created_at","members","accounts","posts","owner_email"}]}`, newest first; `posts` leaves out deleted ones |
@@ -160,8 +161,12 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | POST | `/v1/automations/{id}/enable`, `/disable` | Switch it on (acts on items from then on) or off, which ends its waiting runs (owner, admin) |
 | GET | `/v1/automations/{id}/runs` | Its runs newest first (`?cursor=`): `sent`, `failed` or `skipped` with a `reason` and per-action `results`, or `running`, or `waiting` for a flow at a `wait`; `step_index` (a flow's step last tried, from 0, null without steps) and `resume_at` (when a `waiting` run goes on, else null) |
 
-`POST /v1/waitlist` answers `200 {"status":"ok"}` for a new email and for one already on the
-list, so it never reveals who signed up. A bad email gets `422 {"error":"invalid_email"}`. Each
+`POST /v1/waitlist` answers `200 {"status":"ok","name_token":"..."}` for a new email and for one
+already on the list, so it never reveals who signed up. The `name_token` (64 hex characters) is
+stored hashed on a new row only; for a known email it is a random value that opens nothing.
+`POST /v1/waitlist/name` with it sets the optional name within an hour of joining and answers
+the same `200` for any well-formed token, so a stranger cannot change anyone's name or learn
+who is on the list. A bad email gets `422 {"error":"invalid_email"}`. Each
 client IP (IPv6 by /64) gets 10 requests a minute, then `429`. A new or still unverified email
 gets a confirmation email ("Confirm your spot on the SocialReins waitlist") after the reply, at
 most once an hour however often it signs up; a verified one gets none. At most 20 confirmation
@@ -172,7 +177,7 @@ try again. The link opens the web app at `WEB_URL/waitlist/verify?token=...`, wh
 token to `POST /v1/waitlist/verify` (so a mail scanner opening the link changes nothing): the
 first post sets `verified_at`, later ones answer the same `200`, and a missing, malformed or
 unknown token gets `422 invalid_link`. A resend replaces the token. It shares the waitlist's
-10 requests a minute per IP. Only the token's SHA-256 hash is stored. `GET /v1/waitlist/count` is public. `GET /v1/admin/waitlist` needs a session cookie
+10 requests a minute per IP. Only the token's SHA-256 hash is stored. `GET /v1/waitlist/count` is public and counts verified signups only. Signups made before names existed keep `verified_at` as it was (set only by opening the link), so none became verified by the migration. `GET /v1/admin/waitlist` needs a session cookie
 (not an API token) of a user in `ADMIN_EMAILS`: `401 unauthorized` signed out, `403 forbidden`
 otherwise. So does every other `/v1/admin/*` route (the admin console); the ones that change
 something also need an `Origin` in `CORS_ORIGINS`. None of them returns post bodies, tokens or

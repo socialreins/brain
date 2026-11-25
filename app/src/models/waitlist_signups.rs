@@ -20,6 +20,12 @@ pub struct Model {
     pub verify_sent_at: Option<DateTimeWithTimeZone>,
     /// When an admin approved the email: it may sign up whatever the sign-up rules say.
     pub approved_at: Option<DateTimeWithTimeZone>,
+    /// What the joiner asked to be called, set after joining and frozen once verified. Unproven.
+    #[sea_orm(column_type = "Text", nullable)]
+    pub name: Option<String>,
+    /// SHA-256 hex of the `name_token` the join answered; set on a new row only.
+    #[sea_orm(column_type = "Text", nullable, unique)]
+    pub name_token_hash: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
