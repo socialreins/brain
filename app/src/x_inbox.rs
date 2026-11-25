@@ -59,7 +59,7 @@ const FIRST_DAYS: i64 = 7;
 const FIRST_ITEMS: u32 = 20;
 const DM_PAGE: i64 = 10;
 /// Pages one read of one kind may take.
-const MAX_PAGES: usize = 3;
+const MAX_PAGES: usize = 6;
 /// Failed rounds in a row that pause the account.
 const MAX_ERRORS: i32 = 5;
 /// Accounts read at once across the process.
@@ -343,6 +343,8 @@ struct Round {
     /// Where the next round starts, set only once a kind was read to its end.
     mentions_cursor: Option<String>,
     dm_cursor: Option<String>,
+    /// More arrived than one round reads: the oldest of it is skipped (the cursor moves on).
+    skipped: bool,
     /// Today's DM probe, once paid for (`x_inbox.dm_probe`).
     probe: Option<String>,
     fresh: Vec<inbox_items::Model>,
@@ -433,12 +435,17 @@ async fn read_mentions(
         // A first read is one page; a later one follows older pages while it may.
         match r.next_token {
             Some(t) if since.is_some() && pages < MAX_PAGES => page = Some(t),
+            Some(_) if since.is_some() => {
+                round.skipped = true;
+                break;
+            }
             _ => break,
         }
     }
-    // shortcut: a backlog of more than MAX_PAGES pages loses its oldest posts; raise it if that
-    // ever matters. A failure above leaves the cursor, so the next round reads the same range
-    // again, and storing a post twice adds nothing.
+    // shortcut: a backlog of more than MAX_PAGES pages of 50 loses its oldest posts (said in
+    // `last_error`), since going back for them could mean paying for the same pages again every
+    // round. A failure above leaves the cursor, so the next round reads the same range again,
+    // and storing a post twice adds nothing.
     round.mentions_cursor = newest;
     Ok(())
 }
@@ -473,10 +480,12 @@ async fn read_dms(
     let (mut page, mut pages): (Option<String>, usize) = (None, 0);
     loop {
         let left = round.room(s, per)?;
-        let most = if seen.is_none() {
-            FIRST_ITEMS.into()
-        } else {
-            DM_PAGE
+        // The first page is small, so one new DM does not pay for fifty old ones; a page that
+        // was all new is followed by bigger ones.
+        let most = match (seen.is_none(), pages) {
+            (true, _) => FIRST_ITEMS.into(),
+            (false, 0) => DM_PAGE,
+            (false, _) => 50,
         };
         let max = (left / per).clamp(1, most) as u32;
         let r = app.x.dm_events(token, max, page.as_deref()).await?;
@@ -488,6 +497,10 @@ async fn read_dms(
         pages += 1;
         match r.next_token {
             Some(t) if !ends && seen.is_some() && pages < MAX_PAGES => page = Some(t),
+            Some(_) if !ends && seen.is_some() => {
+                round.skipped = true;
+                break;
+            }
             _ => break,
         }
     }
@@ -608,6 +621,10 @@ async fn poll(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         ],
     ))
     .await?;
+    if ok && round.skipped {
+        let said = "More came in than one read takes, so the oldest were skipped. Read more often.";
+        note(db, id, said).await?;
+    }
     if ok && s.read_dms && !granted.dms {
         note(db, id, "Reconnect the account to read its DMs.").await?;
     }

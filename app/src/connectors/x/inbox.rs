@@ -329,10 +329,15 @@ impl X {
             .await
             .map_err(|_| ApiError::Unreachable)?;
         if status.is_success() {
-            Ok(body)
-        } else {
-            Err(classify(status, &headers, &body))
+            return Ok(body);
         }
+        Err(match classify(status, &headers, &body) {
+            // X words a DM it will not take in more than one way: a 403 on a DM send is that.
+            ApiError::Refused(why) if step == "Message" && status == StatusCode::FORBIDDEN => {
+                ApiError::NotAllowed(why)
+            }
+            e => e,
+        })
     }
 
     /// Mentions of the user, and replies to their posts (a reply mentions its author): newest
