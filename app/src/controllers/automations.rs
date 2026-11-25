@@ -27,7 +27,7 @@ use crate::{
     automations::{self as rules, Action, ActionResult, Conditions, Step},
     dry_run::{self, Outcome, Sample},
     inbox,
-    models::{automation_runs, automations, social_accounts, teams},
+    models::{automation_runs, automations, social_accounts, team_user, teams},
     state::AppState,
 };
 
@@ -100,14 +100,19 @@ pub struct AutomationInput {
     pub conditions: Conditions,
     /// 1 or 2 sends (`send_dm` or `ai_send_dm`, `reply_publicly` or `ai_reply_publicly`), at
     /// most one DM and one public reply, and beside them
-    /// up to 3 `tag_contact`, each tag once. Either this or `steps`: both is
-    /// `422 actions_and_steps`.
+    /// up to 3 `tag_contact`, each tag once, and once each `notify_team` (mails the owners and
+    /// admins, 20 a day), `assign` (a member of the team), `hide_comment` and `like_comment`
+    /// (`comment_received` only; Facebook and Instagram, likes Facebook only) and
+    /// `stop_automations` (the newer automations do not run on the item). A send or one of
+    /// the first four is needed. Either this or `steps`: both is `422 actions_and_steps`.
     #[serde(default)]
     pub actions: Option<Vec<Action>>,
     /// A flow instead of `actions`: 1 to 10 steps run in order, each a `send_dm` (with up to 3
     /// `buttons`), a `reply_publicly` (where the trigger takes one), an `ai_send_dm` or
     /// `ai_reply_publicly` (text written by AI from a `prompt`), a `wait` or a
-    /// `tag_contact`. Never a wait first or last, and at least one send (`422 invalid_steps`).
+    /// `tag_contact`, `notify_team`, `assign`, `hide_comment`, `like_comment` or
+    /// `stop_automations` as in `actions`. Never a wait first or last, and at least one send,
+    /// mail or moderation step (`422 invalid_steps`).
     /// A send that does not go out ends the run.
     #[serde(default)]
     pub steps: Option<Vec<Step>>,
@@ -152,6 +157,12 @@ pub struct Run {
     pub step_index: Option<i32>,
     /// When a `waiting` run goes on; null otherwise.
     pub resume_at: Option<DateTime<FixedOffset>>,
+    /// How often it was tried again after a rate limit refused a send (by itself up to 3
+    /// times, 5, 10 and 15 minutes later, or by a person).
+    pub retries: i32,
+    /// A person may try it again (`POST /automations/{id}/runs/{run_id}/retry`): the platform
+    /// rate limited a send, so nothing of it went out.
+    pub can_retry: bool,
     pub created_at: DateTime<FixedOffset>,
     pub updated_at: DateTime<FixedOffset>,
 }
@@ -167,6 +178,10 @@ pub struct RunPage {
 pub struct RunQuery {
     /// `next_cursor` of the previous page.
     pub cursor: Option<Uuid>,
+    /// Only runs with this status (`sent`, `skipped`, `failed`, `waiting` or `running`).
+    pub status: Option<String>,
+    /// Only runs with this reason (see `Run.reason`).
+    pub reason: Option<String>,
 }
 
 fn reply(status: StatusCode, code: &str) -> Response {
@@ -179,6 +194,23 @@ fn forbidden() -> Response {
 
 fn not_found() -> Response {
     reply(StatusCode::NOT_FOUND, "not_found")
+}
+
+fn run_json(r: automation_runs::Model, a: Option<&automations::Model>) -> Run {
+    Run {
+        can_retry: a.is_some_and(|a| rules::retryable(&r, a)),
+        retries: r.retries,
+        resume_at: r.resume_at.filter(|_| r.status == "waiting"),
+        id: r.id,
+        automation_id: r.automation_id,
+        inbox_item_id: r.inbox_item_id,
+        status: r.status,
+        reason: r.reason,
+        results: serde_json::from_value(r.results).unwrap_or_default(),
+        step_index: r.step_index,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+    }
 }
 
 fn automation_json(a: automations::Model) -> Automation {
@@ -261,6 +293,28 @@ async fn checked(
     }
     let actions = input.actions.as_deref().unwrap_or_default();
     let steps = input.steps.as_deref();
+    let assignees = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Assign { user_id } => Some(*user_id),
+            _ => None,
+        })
+        .chain(steps.into_iter().flatten().filter_map(|s| match s {
+            Step::Assign { user_id } => Some(*user_id),
+            _ => None,
+        }));
+    for user in assignees {
+        if team_user::Entity::find_by_id((team_id, user))
+            .one(db)
+            .await?
+            .is_none()
+        {
+            return Ok(Err(reply(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_actions",
+            )));
+        }
+    }
     if let Some(code) = scope_limits(db, team_id, &input.trigger, c, actions, steps).await? {
         return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, code)));
     }
@@ -697,6 +751,13 @@ async fn runs(
         if let Some(c) = q.cursor {
             sel = sel.filter(automation_runs::Column::Id.lt(c));
         }
+        if let Some(status) = &q.status {
+            sel = sel.filter(automation_runs::Column::Status.eq(status));
+        }
+        if let Some(reason) = &q.reason {
+            sel = sel.filter(automation_runs::Column::Reason.eq(reason));
+        }
+        let automation = find(&app.db, t.team.id, id).await?;
         let mut rows = sel
             .order_by_desc(automation_runs::Column::Id)
             .limit(PAGE + 1)
@@ -707,18 +768,7 @@ async fn runs(
         let next_cursor = more.then(|| rows.last().map(|r| r.id)).flatten();
         let runs = rows
             .into_iter()
-            .map(|r| Run {
-                resume_at: r.resume_at.filter(|_| r.status == "waiting"),
-                id: r.id,
-                automation_id: r.automation_id,
-                inbox_item_id: r.inbox_item_id,
-                status: r.status,
-                reason: r.reason,
-                results: serde_json::from_value(r.results).unwrap_or_default(),
-                step_index: r.step_index,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-            })
+            .map(|r| run_json(r, automation.as_ref()))
             .collect();
         Ok::<_, DbErr>(Some(RunPage { runs, next_cursor }))
     };
@@ -726,6 +776,51 @@ async fn runs(
         Ok(Some(p)) => Json(p).into_response(),
         Ok(None) => not_found(),
         Err(e) => internal(e, "automation runs"),
+    }
+}
+
+/// Tries a run again after the platform rate limited a send (`Run.can_retry`), which sent
+/// nothing, so it can never send twice: an action list is run again now, a flow sends its last
+/// step again at the next round (within a minute; its `status` is `waiting`). Owners and
+/// admins. `409 not_retryable` for any other run (a send that failed some other way may have
+/// gone out), `409 paused` while the team's automations are paused.
+#[utoipa::path(post, path = "/automations/{id}/runs/{run_id}/retry", tag = "automations",
+    params(("id" = Uuid, Path), ("run_id" = Uuid, Path)),
+    responses((status = 200, body = Run), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error)))]
+async fn retry(
+    _: FromWeb,
+    State(app): State<AppState>,
+    t: InTeam,
+    Path((id, run_id)): Path<(Uuid, Uuid)>,
+) -> Response {
+    if !t.role.manages() {
+        return forbidden();
+    }
+    let done = async {
+        let Some(a) = find(&app.db, t.team.id, id).await? else {
+            return Ok(Err(not_found()));
+        };
+        let run = automation_runs::Entity::find_by_id(run_id)
+            .filter(automation_runs::Column::AutomationId.eq(id))
+            .one(&app.db)
+            .await?;
+        let Some(run) = run else {
+            return Ok(Err(not_found()));
+        };
+        match rules::retry(&app, &a, &run).await? {
+            Ok(()) => {}
+            Err(code) => return Ok(Err(reply(StatusCode::CONFLICT, code))),
+        }
+        let run = automation_runs::Entity::find_by_id(run_id)
+            .one(&app.db)
+            .await?;
+        Ok::<_, DbErr>(run.map(|r| run_json(r, Some(&a))).ok_or_else(not_found))
+    };
+    match done.await {
+        Ok(Ok(run)) => Json(run).into_response(),
+        Ok(Err(res)) => res,
+        Err(e) => internal(e, "automation run retry"),
     }
 }
 
@@ -787,7 +882,8 @@ async fn test(
         };
         // A hit for the test and one for each AI step, which spends like a run.
         let ai = input.actions.iter().flatten().filter(|a| a.ai()).count()
-            + input.steps.iter().flatten().filter(|s| s.ai()).count();
+            + input.steps.iter().flatten().filter(|s| s.ai()).count()
+            + usize::from(!input.conditions.intent.is_empty());
         let bucket = (dry_run::quota_bucket(t.team.id), dry_run::TESTS_PER_DAY);
         let caps = vec![bucket; 1 + ai];
         if crate::rate_limit::daily_reserve(&app.db, &caps)
@@ -829,4 +925,5 @@ pub fn api() -> OpenApiRouter<AppState> {
         .routes(routes!(enable))
         .routes(routes!(disable))
         .routes(routes!(runs))
+        .routes(routes!(retry))
 }

@@ -21,6 +21,14 @@ pub struct Model {
     /// When a `waiting` run goes on. Still set on a `running` one that a round took up and
     /// has not started yet.
     pub resume_at: Option<DateTimeWithTimeZone>,
+    /// Parked at a `wait_for_reply` step: goes on when the person's next DM comes
+    /// (`reply_item_id`), else ends `skipped: no_reply` at `resume_at`.
+    pub awaiting_reply: bool,
+    /// The DM that answered the `wait_for_reply`; later DM steps go out in its conversation.
+    pub reply_item_id: Option<Uuid>,
+    /// Tries again after a rate limit refused a send (by itself, at most `MAX_RETRIES`, or by a
+    /// person).
+    pub retries: i32,
     /// A flow's run: the md5 of the steps (as jsonb text) it started on.
     #[sea_orm(column_type = "Text", nullable)]
     pub steps_hash: Option<String>,

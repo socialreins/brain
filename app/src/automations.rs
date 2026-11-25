@@ -19,6 +19,11 @@
 //! the owner's prompt and the item's text (`ai_send`, `crate::ai`). They are sends like the others:
 //! the same claim, daily cap and run results, which name the provider and model.
 //!
+//! A send a platform refused for rate limiting sent nothing, so it is safe to try again: a flow
+//! parks and tries the step again in 5, 10 and 15 minutes (`retry_later`, at most `MAX_RETRIES`),
+//! and a person may retry a run that ended that way (`retry`) when nothing else of it went out.
+//! Every other failure is final, because it may have been sent.
+//!
 //! `tag_contact`, an action and a step, sends nothing: it adds a tag to the contact of the
 //! item's author (`inbox::add_tag`) and takes no hit of the daily cap. An automation still needs
 //! a send beside it.
@@ -38,7 +43,7 @@ use uuid::Uuid;
 use crate::{
     ai,
     billing::{self, AiSpent},
-    connectors::bluesky::InboxError,
+    connectors::{bluesky::InboxError, meta::Moderate},
     controllers::ai_key::key_of,
     controllers::{connections::live_sets, pages},
     inbox::{self, Button, Via},
@@ -68,6 +73,9 @@ pub const MAX_WAIT_MINUTES: u32 = 10_080;
 const MAX_BUTTONS: usize = 3;
 /// Most `tag_contact` actions beside an automation's sends.
 const MAX_TAG_ACTIONS: usize = 3;
+/// How often a run is tried again by itself after a rate limit, and in all with a person's tries.
+const MAX_RETRIES: i32 = 3;
+const MAX_MANUAL_RETRIES: i32 = 10;
 /// Waiting runs one `tick` takes up.
 const RESUME_BATCH: i64 = 100;
 const FLOW_LOCK: i64 = 0x0046_4c4f_5753_5449;
@@ -82,9 +90,12 @@ const UNCHANGED: &str = "r.steps_hash = md5($4::jsonb::text) AND EXISTS (SELECT 
 const CHANGED: &str = "automation_changed";
 /// Runs stored `skipped` for a safety reason (`paused`, `own_account`, `connected_account`,
 /// `cooldown`, `automation_cap`, or the team's `daily_cap`) did nothing: they are not an author's first run and never count
-/// toward a cool-down or an automation's cap. SQL on a run aliased `r`.
-const NOT_ACTED: &str = "(r.status = 'skipped' AND COALESCE(r.reason, '') IN ('paused', \
-    'own_account', 'connected_account', 'cooldown', 'automation_cap', 'daily_cap'))";
+/// toward a cool-down or an automation's cap. So is any run skipped before it did or tried
+/// anything (no results: an AI reading that could not be made, `intent_cap`). SQL on a run
+/// aliased `r`.
+const NOT_ACTED: &str = "(r.status = 'skipped' AND (r.results = '[]'::jsonb OR \
+    COALESCE(r.reason, '') IN ('paused', 'own_account', 'connected_account', 'cooldown', \
+    'automation_cap', 'daily_cap')))";
 /// Longest `{name}` put into a text.
 pub(crate) const MAX_NAME_CHARS: usize = 64;
 /// What `{page}` counts as when a text is checked.
@@ -127,6 +138,30 @@ pub struct Conditions {
     /// payloads; 1 to 20, each 1 to 64 characters of `a-z`, `0-9`, `_` and `-`.
     #[serde(default)]
     pub payloads: Vec<String>,
+    /// Only on these days, 1 (Monday) to 7 (Sunday), by the clock of `timezone` at the time the
+    /// item came. Empty: any day.
+    #[serde(default)]
+    pub weekdays: Vec<u8>,
+    /// Only from this hour (0 to 23) up to, not including, `to_hour`; one needs the other. When
+    /// `from_hour` is the larger the window runs over midnight (22 to 6). Absent: any hour.
+    #[serde(default)]
+    pub from_hour: Option<u8>,
+    #[serde(default)]
+    pub to_hour: Option<u8>,
+    /// An IANA zone ("Asia/Dhaka") for `weekdays` and the hours; "UTC" when they are set and
+    /// this is not. Only with them.
+    #[serde(default)]
+    pub timezone: Option<String>,
+    /// `true`: only text with a link, domain or email in it; `false`: only text without one.
+    /// Absent: either. Not for `new_follower` or `button_clicked`, which carry no text.
+    #[serde(default)]
+    pub has_link: Option<bool>,
+    /// Only text an AI model reads as one of these: `question`, `positive` or `negative`
+    /// (text that is none of them never matches). The reading counts as one AI reply (the team's
+    /// key, else the plan's allowance, then credits), made only once everything else matched.
+    /// Not for `new_follower` or `button_clicked`.
+    #[serde(default)]
+    pub intent: Vec<String>,
 }
 
 /// What an automation does. Texts may hold `{name}`, the commenter's display name ("there"
@@ -158,6 +193,20 @@ pub enum Action {
         #[serde(deserialize_with = "tidy_tag")]
         tag: String,
     },
+    /// Mails the team's owners and admins about the item (who, what they wrote, a link to the
+    /// inbox); at most 20 mails a day per team, then `skipped: notify_cap`. Every trigger.
+    NotifyTeam,
+    /// Assigns the item to a member of the team, unless it has an assignee already.
+    Assign { user_id: Uuid },
+    /// Hides the comment on Facebook or Instagram (a moderation action: nobody but its author
+    /// and the account sees it any more). `comment_received` only; elsewhere or on another
+    /// network it is `skipped: not_supported`.
+    HideComment,
+    /// Likes the comment as the Page (Facebook only; `skipped: not_supported` elsewhere).
+    LikeComment,
+    /// Once this automation has started on an item, the team's later automations (newer ones)
+    /// do not run on it.
+    StopAutomations,
 }
 
 /// A tag as contacts keep one, trimmed and lowercased; `validate` refuses what is still not one.
@@ -177,22 +226,37 @@ impl Action {
             Self::AiSendDm { .. } => "ai_send_dm",
             Self::AiReplyPublicly { .. } => "ai_reply_publicly",
             Self::TagContact { .. } => "tag_contact",
+            Self::NotifyTeam => "notify_team",
+            Self::Assign { .. } => "assign",
+            Self::HideComment => "hide_comment",
+            Self::LikeComment => "like_comment",
+            Self::StopAutomations => "stop_automations",
         }
     }
 
-    /// How a send goes out and its text (an AI send's prompt); `None` for a `tag_contact`.
+    /// How a send goes out and its text (an AI send's prompt); `None` for anything that is not
+    /// a send.
     pub(crate) fn via_text(&self) -> Option<(Via, &str)> {
         match self {
             Self::SendDm { text } => Some((Via::Dm, text)),
             Self::ReplyPublicly { text } => Some((Via::Public, text)),
             Self::AiSendDm { prompt } => Some((Via::Dm, prompt)),
             Self::AiReplyPublicly { prompt } => Some((Via::Public, prompt)),
-            Self::TagContact { .. } => None,
+            _ => None,
         }
     }
 
     pub(crate) fn ai(&self) -> bool {
         matches!(self, Self::AiSendDm { .. } | Self::AiReplyPublicly { .. })
+    }
+
+    /// An action that reaches someone or something outside SocialReins (a send, a mail, a
+    /// moderation call): it takes a hit of the team's daily cap.
+    pub(crate) fn outward(&self) -> bool {
+        !matches!(
+            self,
+            Self::TagContact { .. } | Self::Assign { .. } | Self::StopAutomations
+        )
     }
 }
 
@@ -215,12 +279,28 @@ pub enum Step {
     AiReplyPublicly { prompt: String },
     /// The run stops here for 1 to 10080 minutes (7 days). Never the first or last step.
     Wait { minutes: u32 },
+    /// The run stops here until the person writes again, or `minutes` (1 to 10080) pass, when
+    /// it ends `skipped: no_reply`. Never the first or last step. A DM step after it goes out
+    /// in the conversation their answer came in, which on Facebook and Instagram opens a new
+    /// 24 hour window (so a comment's one private reply may be followed by more messages). An
+    /// answer a waiting run takes does not start other automations.
+    WaitForReply { minutes: u32 },
     /// Adds `tag` to the contact of the item's author, as `Action::TagContact` does, and goes
     /// on whatever came of it. Not a send: a flow needs a send step beside it.
     TagContact {
         #[serde(deserialize_with = "tidy_tag")]
         tag: String,
     },
+    /// As `Action::NotifyTeam`.
+    NotifyTeam,
+    /// As `Action::Assign`.
+    Assign { user_id: Uuid },
+    /// As `Action::HideComment`.
+    HideComment,
+    /// As `Action::LikeComment`.
+    LikeComment,
+    /// As `Action::StopAutomations`.
+    StopAutomations,
 }
 
 impl Step {
@@ -231,7 +311,13 @@ impl Step {
             Self::AiSendDm { .. } => "ai_send_dm",
             Self::AiReplyPublicly { .. } => "ai_reply_publicly",
             Self::Wait { .. } => "wait",
+            Self::WaitForReply { .. } => "wait_for_reply",
             Self::TagContact { .. } => "tag_contact",
+            Self::NotifyTeam => "notify_team",
+            Self::Assign { .. } => "assign",
+            Self::HideComment => "hide_comment",
+            Self::LikeComment => "like_comment",
+            Self::StopAutomations => "stop_automations",
         }
     }
 
@@ -243,8 +329,26 @@ impl Step {
             Self::ReplyPublicly { text } => Some((Via::Public, text, &[])),
             Self::AiSendDm { prompt } => Some((Via::Dm, prompt, &[])),
             Self::AiReplyPublicly { prompt } => Some((Via::Public, prompt, &[])),
-            Self::Wait { .. } | Self::TagContact { .. } => None,
+            _ => None,
         }
+    }
+
+    /// The step as an action, when it is one that takes no time.
+    pub(crate) fn effect(&self) -> Option<Action> {
+        Some(match self {
+            Self::TagContact { tag } => Action::TagContact { tag: tag.clone() },
+            Self::NotifyTeam => Action::NotifyTeam,
+            Self::Assign { user_id } => Action::Assign { user_id: *user_id },
+            Self::HideComment => Action::HideComment,
+            Self::LikeComment => Action::LikeComment,
+            Self::StopAutomations => Action::StopAutomations,
+            _ => return None,
+        })
+    }
+
+    /// As `Action::outward`; a wait is not.
+    pub(crate) fn outward(&self) -> bool {
+        self.sends().is_some() || self.effect().is_some_and(|a| a.outward())
     }
 
     pub(crate) fn ai(&self) -> bool {
@@ -293,11 +397,28 @@ fn check_conditions(trigger: &str, c: &mut Conditions) -> Result<(), &'static st
         && (trigger == "dm_received" || !c.first_message)
         && (!(button || trigger == "new_follower") || c.keywords.is_empty())
         && (button != c.payloads.is_empty());
+    // A follow and a click carry no text to read.
+    let textless = button || trigger == "new_follower";
+    let when_ok = c.weekdays.len() <= 7
+        && c.weekdays.iter().all(|d| (1..=7).contains(d))
+        && c.from_hour.is_some() == c.to_hour.is_some()
+        && c.from_hour.is_none_or(|h| h < 24)
+        && c.to_hour.is_none_or(|h| h < 24)
+        && (c.from_hour.is_none() || c.from_hour != c.to_hour)
+        && (c.timezone.is_none() || !c.weekdays.is_empty() || c.from_hour.is_some())
+        && c.timezone
+            .as_deref()
+            .is_none_or(|z| z.parse::<chrono_tz::Tz>().is_ok());
+    let text_ok = !(textless && (c.has_link.is_some() || !c.intent.is_empty()))
+        && c.intent.len() <= INTENTS.len()
+        && c.intent.iter().all(|i| INTENTS.contains(&i.as_str()));
     let ids_ok = c.post_remote_ids.len() <= 100
         && c.post_remote_ids
             .iter()
             .all(|p| !p.is_empty() && p.len() <= 300 && !p.chars().any(char::is_whitespace));
     if !fits_trigger
+        || !when_ok
+        || !text_ok
         || !ids_ok
         || c.account_ids.len() > 100
         || (c.social_set_id.is_some() && !c.account_ids.is_empty())
@@ -311,8 +432,18 @@ fn check_conditions(trigger: &str, c: &mut Conditions) -> Result<(), &'static st
     c.account_ids.dedup();
     c.payloads.sort();
     c.payloads.dedup();
+    c.weekdays.sort_unstable();
+    c.weekdays.dedup();
+    c.intent.sort();
+    c.intent.dedup();
+    if c.timezone.is_none() && (!c.weekdays.is_empty() || c.from_hour.is_some()) {
+        c.timezone = Some("UTC".into());
+    }
     Ok(())
 }
+
+/// What `intent` may name, and what the reading says of a text (`other` never matches).
+pub const INTENTS: [&str; 3] = ["negative", "positive", "question"];
 
 /// A public reply needs a thread to go under, and `{page}` is the page of the post a comment or
 /// mention hangs off: DMs, clicks and follows have neither.
@@ -335,20 +466,26 @@ pub fn validate_steps(
     steps: &mut [Step],
 ) -> Result<(), &'static str> {
     check_conditions(trigger, conditions)?;
-    let wait = |s: Option<&Step>| matches!(s, Some(Step::Wait { .. }));
-    let sends = steps.iter().any(|s| s.sends().is_some());
+    let wait = |s: Option<&Step>| matches!(s, Some(Step::Wait { .. } | Step::WaitForReply { .. }));
+    // At least one step that does something outside (a send, a mail, a moderation call).
+    let sends = steps.iter().any(Step::outward);
     if !sends || steps.len() > MAX_STEPS || wait(steps.first()) || wait(steps.last()) {
         return Err("invalid_steps");
     }
     for step in steps {
         match step {
-            Step::Wait { minutes } if !(1..=MAX_WAIT_MINUTES).contains(minutes) => {
+            Step::Wait { minutes } | Step::WaitForReply { minutes }
+                if !(1..=MAX_WAIT_MINUTES).contains(minutes) =>
+            {
                 return Err("invalid_steps");
             }
             Step::ReplyPublicly { .. } | Step::AiReplyPublicly { .. } if !public(trigger) => {
                 return Err("invalid_steps");
             }
             Step::TagContact { tag } if !tag_ok(tag) => return Err("invalid_steps"),
+            Step::HideComment | Step::LikeComment if trigger != "comment_received" => {
+                return Err("invalid_steps");
+            }
             Step::SendDm { buttons, .. } => {
                 for b in buttons.iter_mut() {
                     b.label = b.label.trim().to_owned();
@@ -430,7 +567,7 @@ pub fn network_limits(
     {
         return Ok(());
     }
-    let mut dms: Vec<&str> = actions
+    let dms: Vec<&str> = actions
         .iter()
         .filter_map(|a| match a {
             Action::SendDm { text } => Some(text.as_str()),
@@ -438,25 +575,36 @@ pub fn network_limits(
         })
         .collect();
     let mut waited = 0u32;
+    // After a `wait_for_reply` the person has written: the next DMs are in a new 24 hour window,
+    // no longer the comment's one private reply.
+    let mut answered = false;
+    let mut private_replies = dms.len();
+    let mut all_dms = dms.clone();
     for step in steps.unwrap_or_default() {
         match step {
             Step::Wait { minutes } => waited += minutes,
+            Step::WaitForReply { .. } => (waited, answered) = (0, true),
             Step::SendDm { text, .. } => {
                 let dm_trigger = !public(trigger) && trigger != "new_follower";
-                if dm_trigger && waited >= META_WINDOW_MINUTES {
+                if (dm_trigger || answered) && waited >= META_WINDOW_MINUTES {
                     return Err("meta_reply_window");
                 }
-                if trigger == "comment_received" && waited >= META_PRIVATE_REPLY_MINUTES {
+                if trigger == "comment_received"
+                    && !answered
+                    && waited >= META_PRIVATE_REPLY_MINUTES
+                {
                     return Err("meta_reply_window");
                 }
-                dms.push(text);
+                private_replies += usize::from(!answered);
+                all_dms.push(text);
             }
             _ => {}
         }
     }
-    if trigger == "comment_received" && dms.len() > 1 {
+    if trigger == "comment_received" && private_replies > 1 {
         return Err("meta_one_private_reply");
     }
+    let dms = all_dms;
     // A name may be in any script: each of its letters counted at 4 bytes, the most UTF-8 takes.
     let widest = |t: &str| {
         t.replace("{name}", &"\u{10348}".repeat(MAX_NAME_CHARS))
@@ -497,7 +645,22 @@ pub fn validate(
     if !public && sends().any(|s| s.1.contains("{page}")) {
         return Err("invalid_text");
     }
-    // One or two sends, at most one of each type, and up to 3 tags, each once.
+    let once = |f: fn(&Action) -> bool| actions.iter().filter(|a| f(a)).count() <= 1;
+    let comment_only = actions
+        .iter()
+        .any(|a| matches!(a, Action::HideComment | Action::LikeComment));
+    if (comment_only && trigger != "comment_received")
+        || !once(|a| matches!(a, Action::NotifyTeam))
+        || !once(|a| matches!(a, Action::Assign { .. }))
+        || !once(|a| matches!(a, Action::HideComment))
+        || !once(|a| matches!(a, Action::LikeComment))
+        || !once(|a| matches!(a, Action::StopAutomations))
+    {
+        return Err("invalid_actions");
+    }
+    // One or two sends, at most one of each type, and up to 3 tags, each once. Beside them
+    // each other action once; one of them (or a send) is needed, tags and `stop_automations`
+    // alone do nothing.
     let mut tags: Vec<&str> = actions
         .iter()
         .filter_map(|a| match a {
@@ -508,8 +671,12 @@ pub fn validate(
     let (dms, tagged) = (sends().filter(|s| s.0 == Via::Dm).count(), tags.len());
     tags.sort();
     tags.dedup();
-    let sent = actions.len() - tagged;
-    if sent == 0 || dms > 1 || sent - dms > 1 {
+    let sent = sends().count();
+    if !actions.iter().any(Action::outward)
+        && !actions.iter().any(|a| matches!(a, Action::Assign { .. }))
+        || dms > 1
+        || sent - dms > 1
+    {
         return Err("invalid_actions");
     }
     if tagged > MAX_TAG_ACTIONS || tags.len() != tagged || !tags.iter().all(|t| tag_ok(t)) {
@@ -567,12 +734,37 @@ pub struct Facts<'a> {
     pub first_from_author: bool,
     /// No earlier DM item from the same author on the account.
     pub first_message: bool,
+    /// When the item came.
+    pub at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Whether the clock of `c.timezone` at `at` falls on one of `c.weekdays` and within the hours.
+fn on_time(c: &Conditions, at: chrono::DateTime<chrono::Utc>) -> (bool, bool) {
+    use chrono::{Datelike, Timelike};
+    let zone: chrono_tz::Tz = c
+        .timezone
+        .as_deref()
+        .and_then(|z| z.parse().ok())
+        .unwrap_or(chrono_tz::UTC);
+    let local = at.with_timezone(&zone);
+    let day = c.weekdays.is_empty()
+        || c.weekdays
+            .contains(&(local.weekday().number_from_monday() as u8));
+    let hour = local.hour() as u8;
+    let in_hours = match (c.from_hour, c.to_hour) {
+        (Some(from), Some(to)) if from < to => (from..to).contains(&hour),
+        (Some(from), Some(to)) => hour >= from || hour < to,
+        _ => true,
+    };
+    (day, in_hours)
 }
 
 /// Why `f` does not meet `c`: one code per condition that fails (`wrong_set`, `wrong_account`,
-/// `wrong_post`, `no_keyword`, `not_first_from_author`, `not_first_message`); empty when it does.
+/// `wrong_post`, `no_keyword`, `not_first_from_author`, `not_first_message`, `wrong_weekday`,
+/// `wrong_hour`, `wrong_link`); empty when it does. `intent` is read apart (`read_intent`).
 pub fn mismatches(c: &Conditions, f: &Facts<'_>) -> Vec<&'static str> {
     let text = f.text.to_lowercase();
+    let (day, hour) = on_time(c, f.at);
     let post_ok = c.post_remote_ids.is_empty()
         || c.post_remote_ids
             .iter()
@@ -596,6 +788,12 @@ pub fn mismatches(c: &Conditions, f: &Facts<'_>) -> Vec<&'static str> {
             "not_first_from_author",
         ),
         (!c.first_message || f.first_message, "not_first_message"),
+        (day, "wrong_weekday"),
+        (hour, "wrong_hour"),
+        (
+            c.has_link.is_none_or(|want| want == ai::has_link(f.text)),
+            "wrong_link",
+        ),
     ]
     .into_iter()
     .filter_map(|(ok, why)| (!ok).then_some(why))
@@ -681,7 +879,10 @@ pub async fn run(
     account: &social_accounts::Model,
     item: &inbox_items::Model,
 ) -> Result<(), DbErr> {
-    run_matching(app, account, item).await?;
+    // A DM a waiting flow was waiting for belongs to that flow: nothing else answers it.
+    if !answers_waiting(&app.db, item).await? {
+        run_matching(app, account, item).await?;
+    }
     // Done to the end: the sweep leaves it alone from now on.
     app.db
         .execute_raw(sql(
@@ -690,6 +891,34 @@ pub async fn run(
         ))
         .await
         .map(|_| ())
+}
+
+/// Brings forward the waiting runs of flows at a `wait_for_reply` that `item` answers: a DM
+/// from the person the run was started for, on the same account, that came after the run began.
+/// `tick` then takes them up. Whether it answered any.
+async fn answers_waiting(
+    db: &DatabaseConnection,
+    item: &inbox_items::Model,
+) -> Result<bool, DbErr> {
+    if item.kind != "dm" {
+        return Ok(false);
+    }
+    let stmt = sql(
+        "UPDATE automation_runs r SET reply_item_id = $1, resume_at = now(), updated_at = now() \
+         FROM inbox_items i WHERE i.id = r.inbox_item_id AND r.team_id = $2 \
+         AND r.awaiting_reply AND r.status = 'waiting' AND r.reply_item_id IS NULL \
+         AND i.social_account_id = $3 AND i.author_id = $4 AND i.platform = $5 \
+         AND r.created_at <= $6",
+        vec![
+            item.id.into(),
+            item.team_id.into(),
+            item.social_account_id.into(),
+            item.author_id.clone().into(),
+            item.platform.clone().into(),
+            item.received_at.into(),
+        ],
+    );
+    Ok(db.execute_raw(stmt).await?.rows_affected() > 0)
 }
 
 /// Items automations never finished (a crash, a restart, a database error) are older than this
@@ -866,6 +1095,7 @@ async fn run_matching(
             text: &item.text,
             first_from_author: first,
             first_message,
+            at: item.received_at.to_utc(),
         };
         // A click runs the automations that name its button.
         let clicked = item.button_payload.as_ref();
@@ -894,10 +1124,6 @@ async fn run_matching(
             tracing::info!(automation = %a.id, item = %item.id, "no public page, not run");
             continue;
         }
-        // The hit pays for the first send: a flow that starts on a tag has not sent yet.
-        let sends = steps
-            .as_ref()
-            .is_none_or(|s| s.first().is_some_and(|x| x.sends().is_some()));
         // Read for each automation, so a pause during the round holds the rest back.
         let held = match guard {
             Some(why) => Some(why),
@@ -908,6 +1134,36 @@ async fn run_matching(
             skip_run(db, &a, item, why).await?;
             continue;
         }
+        // Read last, once all else matched: it costs a model call.
+        if !cond.intent.is_empty() {
+            let reference = format!("ai:intent:{}:{}", a.id, item.id);
+            // Our model's time is not free: a team reads at most as many texts a day as it may
+            // start runs.
+            let cap = [(format!("automation:intent:{}", item.team_id), RUNS_PER_DAY)];
+            if crate::rate_limit::daily_reserve(db, &cap).await?.is_none() {
+                skip_run(db, &a, item, "intent_cap").await?;
+                continue;
+            }
+            match read_intent(app, account, item, &reference).await {
+                Ok(label) if cond.intent.iter().any(|i| i == label) => {}
+                Ok(_) => continue,
+                Err(r) => {
+                    let why = r.reason.unwrap_or_else(|| "ai_failed".into());
+                    skip_run(db, &a, item, &why).await?;
+                    continue;
+                }
+            }
+        }
+        // The hit pays for the first outward action: a flow that starts on a tag has not
+        // reached anyone yet.
+        let sends = match &steps {
+            Some(s) => s.first().is_some_and(Step::outward),
+            None => actions.iter().any(Action::outward),
+        };
+        let stop = match &steps {
+            Some(s) => s.iter().any(|x| matches!(x, Step::StopAutomations)),
+            None => actions.iter().any(|x| matches!(x, Action::StopAutomations)),
+        };
         let once = cond.first_per_author;
         let Some(run_id) = claim(db, &a, item, steps.is_some(), sends, once).await? else {
             continue;
@@ -921,12 +1177,17 @@ async fn run_matching(
                 a: &a,
                 steps,
                 page,
+                reply: None,
             };
             flow.advance(run_id, 0, Vec::new()).await?;
-            continue;
+        } else {
+            let results = act(app, account, item, &a, &actions, page.as_deref(), run_id).await;
+            finish(db, run_id, results).await?;
         }
-        let results = act(app, account, item, &a, &actions, page.as_deref(), run_id).await;
-        finish(db, run_id, results).await?;
+        // This automation took the item: the newer ones leave it alone.
+        if stop {
+            break;
+        }
     }
     Ok(())
 }
@@ -996,6 +1257,8 @@ struct Flow<'a> {
     steps: &'a [Step],
     /// The address `{page}` stands for, when the item's post has a live page.
     page: Option<&'a str>,
+    /// The DM that answered a `wait_for_reply`: DM steps after it go out in its conversation.
+    reply: Option<&'a inbox_items::Model>,
 }
 
 impl Flow<'_> {
@@ -1012,11 +1275,22 @@ impl Flow<'_> {
         loop {
             let (via, template, buttons): (Via, &str, &[Button]) = match &self.steps[i] {
                 Step::Wait { minutes } => {
-                    return park(db, run, self.a, *minutes, &results).await;
+                    return park(db, run, self.a, (*minutes, false), &results).await;
+                }
+                Step::WaitForReply { minutes } => {
+                    return park(db, run, self.a, (*minutes, true), &results).await;
                 }
                 // Whatever came of it, the flow goes on.
-                Step::TagContact { tag } => {
-                    results.push(tag_contact(db, self.item, tag).await);
+                step @ (Step::TagContact { .. }
+                | Step::NotifyTeam
+                | Step::Assign { .. }
+                | Step::HideComment
+                | Step::LikeComment
+                | Step::StopAutomations) => {
+                    if let Some(action) = step.effect() {
+                        let (app, account, item) = (self.app, self.account, self.item);
+                        results.push(effect(app, account, item, self.a, &action).await);
+                    }
                     if !self.step_on(run, &mut i, &results).await? {
                         return Ok(());
                     }
@@ -1028,10 +1302,15 @@ impl Flow<'_> {
                 Step::AiReplyPublicly { prompt } => (Via::Public, prompt, &[]),
             };
             let kind = self.steps[i].kind();
+            // A DM goes out where the person last wrote.
+            let target = match (via, self.reply) {
+                (Via::Dm, Some(reply)) => reply,
+                _ => self.item,
+            };
             let result = match with_page(template, self.page) {
                 _ if self.steps[i].ai() => {
                     let reference = format!("ai:{run}:{i}");
-                    let (app, account, item) = (self.app, self.account, self.item);
+                    let (app, account, item) = (self.app, self.account, target);
                     ai_send(
                         app, account, item, self.a.id, kind, via, template, &reference,
                     )
@@ -1041,7 +1320,7 @@ impl Flow<'_> {
                 Some(template) => {
                     let (text, filled) = render(&template, self.item.author_name.as_deref());
                     let from = (None, Some(self.a.id));
-                    let (account, item) = (self.account, self.item);
+                    let (account, item) = (self.account, target);
                     let sent = inbox::send_with(
                         self.app, account, item, via, &text, &filled, from, buttons,
                     );
@@ -1052,6 +1331,10 @@ impl Flow<'_> {
                     )
                 }
             };
+            if is_rate_limited(&result) && retry_later(db, run, i, &results).await? {
+                // Parked: step `i` is sent again later, and this refusal is not kept.
+                return Ok(());
+            }
             let stopped = (result.status != "sent").then(|| result.clone());
             results.push(result);
             if let Some(r) = stopped {
@@ -1077,8 +1360,205 @@ impl Flow<'_> {
             settle(db, run, "sent", None, results).await?;
             return Ok(false);
         };
-        claim_step(db, run, self.a, *i, next.sends().is_some(), results).await
+        claim_step(db, run, self.a, *i, next.outward(), results).await
     }
+}
+
+/// Runs an action that is not a send, as a result.
+async fn effect(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    a: &automations::Model,
+    action: &Action,
+) -> ActionResult {
+    let done = |kind: &str, why: Option<&str>, failed: bool| ActionResult {
+        kind: kind.into(),
+        status: match (why, failed) {
+            (None, _) => "done",
+            (Some(_), true) => "failed",
+            (Some(_), false) => "skipped",
+        }
+        .into(),
+        reason: why.map(str::to_owned),
+        ..Default::default()
+    };
+    let kind = action.kind();
+    match action {
+        Action::TagContact { tag } => tag_contact(&app.db, item, tag).await,
+        Action::StopAutomations => done(kind, None, false),
+        Action::NotifyTeam => match notify_team(app, item, a).await {
+            Ok(why) => done(kind, why, why == Some("mail_failed")),
+            Err(e) => {
+                tracing::error!(error = %e, item = %item.id, "automation notice failed");
+                done(kind, Some("internal"), true)
+            }
+        },
+        Action::Assign { user_id } => match assign(&app.db, item, *user_id).await {
+            Ok(why) => done(kind, why, false),
+            Err(e) => {
+                tracing::error!(error = %e, item = %item.id, "automation assign failed");
+                done(kind, Some("internal"), true)
+            }
+        },
+        Action::HideComment | Action::LikeComment => {
+            let m = if matches!(action, Action::HideComment) {
+                Moderate::Hide
+            } else {
+                Moderate::Like
+            };
+            let meta = matches!(account.provider.as_str(), "facebook" | "instagram");
+            if !meta || item.kind != "comment" {
+                return done(kind, Some("not_supported"), false);
+            }
+            match crate::meta_inbox::moderate(app, account, item, m).await {
+                Ok(Ok(())) => done(kind, None, false),
+                Ok(Err(e)) => {
+                    // Nothing was done for these; anything else is a refusal worth a look.
+                    let calm = matches!(
+                        e,
+                        InboxError::RateLimited
+                            | InboxError::Invalid("not_supported" | "not_found")
+                    );
+                    done(kind, Some(e.code()), !calm)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, item = %item.id, "automation moderation failed");
+                    done(kind, Some("internal"), true)
+                }
+            }
+        }
+        // A send never comes here.
+        _ => done(kind, Some("not_supported"), false),
+    }
+}
+
+/// Most mails `notify_team` sends a team a day.
+const NOTICES_PER_DAY: i64 = 20;
+
+/// Mails the team's owners and admins about `item`. `None` when a mail went out, else why not:
+/// `notify_cap` (the day's limit), `mail_failed`.
+async fn notify_team(
+    app: &AppState,
+    item: &inbox_items::Model,
+    a: &automations::Model,
+) -> Result<Option<&'static str>, DbErr> {
+    let cap = [(
+        format!("automation:notice:{}", item.team_id),
+        NOTICES_PER_DAY,
+    )];
+    let Some(hits) = crate::rate_limit::daily_reserve(&app.db, &cap).await? else {
+        return Ok(Some("notify_cap"));
+    };
+    let to = app
+        .db
+        .query_all_raw(sql(
+            "SELECT u.email FROM team_user t JOIN users u ON u.id = t.user_id \
+             WHERE t.team_id = $1 AND t.role IN ('owner', 'admin') ORDER BY u.email",
+            vec![item.team_id.into()],
+        ))
+        .await?;
+    // A stranger wrote the name and the text: only plain words go into the mail, so nothing in
+    // it becomes a link.
+    let plain = |t: &str, max: usize| -> String {
+        let flat = socialreins_core::team::inert(t);
+        flat.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(max)
+            .collect()
+    };
+    let who = item
+        .author_name
+        .as_deref()
+        .map_or_else(|| "Someone".to_owned(), |n| plain(n, 60));
+    let subject = format!("Automation \"{}\" ran", plain(&a.name, 60));
+    let text = format!(
+        "The automation \"{}\" ran on a {} from {who} on {}.\n\nThey wrote: \"{}\"\n\nOpen it in the inbox:\n\n{}/app/inbox?item={}\n",
+        plain(&a.name, 60),
+        item.kind,
+        crate::expiry::label(&item.platform),
+        plain(&item.text, 200),
+        app.web_url,
+        item.id,
+    );
+    let mut sent = false;
+    for r in to {
+        let email: String = r.try_get("", "email")?;
+        match app
+            .mailer
+            .send(&email, &subject, text.clone(), &app.web_url)
+            .await
+        {
+            Ok(()) => sent = true,
+            Err(e) => tracing::warn!(error = %e, "automation notice not mailed"),
+        }
+    }
+    if !sent {
+        crate::rate_limit::daily_refund(&app.db, &hits).await;
+    }
+    Ok((!sent).then_some("mail_failed"))
+}
+
+/// Assigns the item to `user` unless it has an assignee. `None` when done, else why not:
+/// `already_assigned`, `not_a_member`.
+async fn assign(
+    db: &DatabaseConnection,
+    item: &inbox_items::Model,
+    user: Uuid,
+) -> Result<Option<&'static str>, DbErr> {
+    let stmt = sql(
+        "UPDATE inbox_items SET assigned_to = $2 WHERE id = $1 AND assigned_to IS NULL \
+         AND EXISTS (SELECT 1 FROM team_user WHERE team_id = $3 AND user_id = $2)",
+        vec![item.id.into(), user.into(), item.team_id.into()],
+    );
+    if db.execute_raw(stmt).await?.rows_affected() == 1 {
+        return Ok(None);
+    }
+    let stmt = sql(
+        "SELECT assigned_to IS NOT NULL AS taken FROM inbox_items WHERE id = $1",
+        vec![item.id.into()],
+    );
+    let taken: bool = match db.query_one_raw(stmt).await? {
+        Some(r) => r.try_get("", "taken")?,
+        None => false,
+    };
+    Ok(Some(if taken {
+        "already_assigned"
+    } else {
+        "not_a_member"
+    }))
+}
+
+/// The instructions that make the model read an item instead of answering it.
+const INTENT_PROMPT: &str = "Do not write a reply to the person. Read their message and answer \
+    with exactly one word: question (it asks something), positive (thanks, praise or \
+    excitement), negative (a complaint, anger, criticism or an insult) or other.";
+
+/// Reads what the item's text is, with the same key choice, allowance and checks an AI step has
+/// (`ai_write`): `question`, `positive`, `negative` or `other`. `Err` holds the reason it could
+/// not be read (`no_ai_key`, `no_ai_credits`, `ai_failed`, ...).
+#[allow(clippy::result_large_err)] // the step's own result, used once
+pub(crate) async fn read_intent(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    reference: &str,
+) -> Result<&'static str, ActionResult> {
+    let given = ("read_intent", Via::Dm, INTENT_PROMPT);
+    let written = ai_write(app, account, item, given, reference).await?;
+    let word = written
+        .text
+        .split(|c: char| !c.is_alphabetic())
+        .find(|w| !w.is_empty())
+        .map(str::to_lowercase);
+    Ok(match word.as_deref() {
+        Some("question") => "question",
+        Some("positive") => "positive",
+        Some("negative") => "negative",
+        _ => "other",
+    })
 }
 
 /// Adds `tag` to the contact of the item's author, as a result: `done` when it was added,
@@ -1136,7 +1616,7 @@ async fn claim_step(
     values.push(a.steps.clone().into());
     let claim = format!(
         "UPDATE automation_runs r SET step_index = $2, results = $3, resume_at = NULL, \
-         updated_at = now() WHERE r.id = $1 AND r.status = 'running' \
+         awaiting_reply = false, updated_at = now() WHERE r.id = $1 AND r.status = 'running' \
          AND r.step_index = $2 - 1 AND {UNCHANGED}"
     );
     if txn.execute_raw(sql(&claim, values)).await?.rows_affected() != 1 {
@@ -1154,18 +1634,141 @@ async fn claim_step(
     Ok(true)
 }
 
+/// A send the platform refused for rate limiting: nothing went out.
+fn is_rate_limited(r: &ActionResult) -> bool {
+    r.status == "skipped" && r.reason.as_deref() == Some("rate_limited")
+}
+
+/// Parks a flow run to send step `i` again in 5, 10 or 15 minutes, with `results` as they stood
+/// before it. `false` when the tries are used up or the run is no longer ours.
+async fn retry_later(
+    db: &DatabaseConnection,
+    run: Uuid,
+    i: usize,
+    results: &[ActionResult],
+) -> Result<bool, DbErr> {
+    let stmt = sql(
+        "UPDATE automation_runs SET status = 'waiting', step_index = $2 - 1, results = $3, \
+         retries = retries + 1, resume_at = now() + make_interval(mins => (retries + 1) * 5), \
+         updated_at = now() WHERE id = $1 AND status = 'running' AND retries < $4",
+        vec![
+            run.into(),
+            (i as i32).into(),
+            serde_json::json!(results).into(),
+            MAX_RETRIES.into(),
+        ],
+    );
+    Ok(db.execute_raw(stmt).await?.rows_affected() == 1)
+}
+
+/// Whether a person may try a run again: it ended `skipped` or `failed` only because the
+/// platform rate limited a send, so nothing of that send, or of an action list, went out.
+pub fn retryable(run: &automation_runs::Model, a: &automations::Model) -> bool {
+    let results: Vec<ActionResult> =
+        serde_json::from_value(run.results.clone()).unwrap_or_default();
+    let sends = |r: &&ActionResult| !matches!(r.kind.as_str(), "tag_contact" | "stop_automations");
+    let refused = match (run.step_index, results.last()) {
+        // A flow: the last step refused, whatever came before went out and stays done.
+        (Some(_), Some(last)) => is_rate_limited(last),
+        // An action list: nothing of it went out.
+        (None, Some(_)) => results.iter().filter(sends).all(is_rate_limited),
+        _ => false,
+    };
+    refused
+        && a.active
+        && matches!(run.status.as_str(), "skipped" | "failed")
+        && run.retries < MAX_MANUAL_RETRIES
+}
+
+/// Tries a run again for a person (`retryable`). A flow goes back to `waiting` to send its last
+/// step again at the next round; an action list is run again now. `Err` holds why not:
+/// `not_retryable`, `paused`. The transition is one statement, so two clicks start one retry.
+pub async fn retry(
+    app: &AppState,
+    a: &automations::Model,
+    run: &automation_runs::Model,
+) -> Result<Result<(), &'static str>, DbErr> {
+    let db = &app.db;
+    if !retryable(run, a) {
+        return Ok(Err("not_retryable"));
+    }
+    if team_paused(db, a.team_id).await? {
+        return Ok(Err("paused"));
+    }
+    let flow = run.step_index.is_some();
+    let stmt = if flow {
+        sql(
+            "UPDATE automation_runs r SET status = 'waiting', reason = NULL, \
+             step_index = r.step_index - 1, \
+             results = r.results - (jsonb_array_length(r.results) - 1), \
+             retries = r.retries + 1, resume_at = now(), updated_at = now() \
+             WHERE r.id = $1 AND r.status IN ('skipped', 'failed') AND r.retries < $2 \
+             AND r.steps_hash = md5($3::jsonb::text) AND EXISTS (SELECT 1 FROM automations a \
+             WHERE a.id = r.automation_id AND a.active AND md5(a.steps::text) = r.steps_hash)",
+            vec![
+                run.id.into(),
+                MAX_MANUAL_RETRIES.into(),
+                a.steps.clone().into(),
+            ],
+        )
+    } else {
+        sql(
+            "UPDATE automation_runs r SET status = 'running', reason = NULL, results = '[]', \
+             retries = r.retries + 1, updated_at = now() \
+             WHERE r.id = $1 AND r.status IN ('skipped', 'failed') AND r.retries < $2",
+            vec![run.id.into(), MAX_MANUAL_RETRIES.into()],
+        )
+    };
+    if db.execute_raw(stmt).await?.rows_affected() != 1 {
+        return Ok(Err("not_retryable"));
+    }
+    if flow {
+        return Ok(Ok(()));
+    }
+    let item = inbox_items::Entity::find_by_id(run.inbox_item_id)
+        .one(db)
+        .await?;
+    let account = match &item {
+        Some(i) => {
+            social_accounts::Entity::find_by_id(i.social_account_id)
+                .one(db)
+                .await?
+        }
+        None => None,
+    };
+    let actions: Vec<Action> = serde_json::from_value(a.actions.clone()).unwrap_or_default();
+    let (Some(item), Some(account)) = (item, account) else {
+        settle(db, run.id, "skipped", Some(CHANGED.into()), &[]).await?;
+        return Ok(Ok(()));
+    };
+    let holds = |t: &str| t.contains("{page}");
+    let wanted = actions
+        .iter()
+        .filter_map(Action::via_text)
+        .any(|x| holds(x.1))
+        || a.fallback_public_reply.as_deref().is_some_and(holds);
+    let page = match item.post_id {
+        Some(post) if wanted => pages::address(db, &app.web_url, item.team_id, post).await?,
+        _ => None,
+    };
+    let results = act(app, &account, &item, a, &actions, page.as_deref(), run.id).await;
+    finish(db, run.id, results).await?;
+    Ok(Ok(()))
+}
+
 /// Parks a run at its `wait` step: `waiting` until `minutes` from now. A run whose automation
 /// changed since the step was claimed ends instead (`cancel_waiting` came before it parked).
 async fn park(
     db: &DatabaseConnection,
     run: Uuid,
     a: &automations::Model,
-    minutes: u32,
+    (minutes, for_reply): (u32, bool),
     results: &[ActionResult],
 ) -> Result<(), DbErr> {
     let park = format!(
         "UPDATE automation_runs r SET status = 'waiting', results = $3, updated_at = now(), \
-         resume_at = now() + make_interval(mins => $2) WHERE r.id = $1 \
+         resume_at = now() + make_interval(mins => $2), awaiting_reply = $5, \
+         reply_item_id = NULL WHERE r.id = $1 \
          AND r.status = 'running' AND {UNCHANGED}"
     );
     let values = vec![
@@ -1173,6 +1776,7 @@ async fn park(
         (minutes as i32).into(),
         serde_json::json!(results).into(),
         a.steps.clone().into(),
+        for_reply.into(),
     ];
     if db.execute_raw(sql(&park, values)).await?.rows_affected() == 1 {
         return Ok(());
@@ -1306,9 +1910,18 @@ pub async fn resume(app: &AppState, run: &automation_runs::Model) -> Result<(), 
         .and_then(|a| a.steps.clone())
         .and_then(|s| serde_json::from_value::<Vec<Step>>(s).ok())
         .unwrap_or_default();
-    let i = run.step_index.map_or(0, |i| i as usize + 1);
+    // A run parked to try its step again has the one before it (-1 before the first).
+    let i = run.step_index.map_or(0, |i| (i + 1) as usize);
     let (Some(a), Some(item), Some(account), Some(next)) = (a, item, account, steps.get(i)) else {
         return settle(db, run.id, "skipped", Some(CHANGED.into()), &results).await;
+    };
+    // Parked for a reply and no reply came: it timed out. Else the answer is where DMs go now.
+    let reply = match (run.awaiting_reply, run.reply_item_id) {
+        (true, None) => {
+            return settle(db, run.id, "skipped", Some("no_reply".into()), &results).await;
+        }
+        (_, Some(id)) => inbox_items::Entity::find_by_id(id).one(db).await?,
+        _ => None,
     };
     let holds = steps
         .iter()
@@ -1324,7 +1937,7 @@ pub async fn resume(app: &AppState, run: &automation_runs::Model) -> Result<(), 
         return settle(db, run.id, "skipped", why, &results).await;
     }
     // Also where a run ends whose automation was switched off or given other steps since.
-    if !claim_step(db, run.id, &a, i, next.sends().is_some(), &results).await? {
+    if !claim_step(db, run.id, &a, i, next.outward(), &results).await? {
         return Ok(());
     }
     let flow = Flow {
@@ -1334,6 +1947,7 @@ pub async fn resume(app: &AppState, run: &automation_runs::Model) -> Result<(), 
         a: &a,
         steps: &steps,
         page: page.as_deref(),
+        reply: reply.as_ref(),
     };
     flow.advance(run.id, i, results).await
 }
@@ -1571,9 +2185,7 @@ async fn act(
     let mut results = Vec::new();
     for action in actions {
         let Some((via, template)) = action.via_text() else {
-            if let Action::TagContact { tag } = action {
-                results.push(tag_contact(&app.db, item, tag).await);
-            }
+            results.push(effect(app, account, item, a, action).await);
             continue;
         };
         if action.ai() {
@@ -1808,8 +2420,14 @@ async fn ai_send(
 /// anything went, else `failed` when anything failed, else `skipped`; the reason is the first
 /// one given.
 pub fn summary(results: &[ActionResult]) -> (&'static str, Option<String>) {
-    let sends = || results.iter().filter(|r| r.kind != "tag_contact");
-    let status = if sends().any(|r| r.status == "sent") {
+    // A tag and `stop_automations` say nothing of what was done; a mail, an assignment or a
+    // moderation call that was `done` counts as acting.
+    let sends = || {
+        results
+            .iter()
+            .filter(|r| !matches!(r.kind.as_str(), "tag_contact" | "stop_automations"))
+    };
+    let status = if sends().any(|r| matches!(r.status.as_str(), "sent" | "done")) {
         "sent"
     } else if sends().any(|r| r.status == "failed") {
         "failed"
@@ -1842,6 +2460,7 @@ mod tests {
             text,
             first_from_author: true,
             first_message: true,
+            at: chrono::Utc::now(),
         }
     }
 
