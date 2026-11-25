@@ -1343,6 +1343,8 @@ impl Bluesky {
         let newest = fresh.last().map(|(_, last)| *last);
         let mut found = Vec::new();
         let mut done: Option<DateTime<FixedOffset>> = None;
+        // The latest time read that is earlier than `done`: where a failure may resume.
+        let mut below: Option<DateTime<FixedOffset>> = None;
         let mut read = 0;
         for (convo, last) in fresh {
             if resume.is_some_and(|r| last <= r) {
@@ -1366,17 +1368,25 @@ impl Bluesky {
             let q = [("convoId", id), ("limit", "50")];
             let msgs = match self.xrpc(c, "chat.bsky.convo.getMessages", &q, None).await {
                 Ok(m) => m,
-                // The conversations read before this one keep their messages.
-                Err(e) if done.is_some() => {
-                    return Ok(Messages {
-                        found,
-                        newest: None,
-                        resume: done,
-                        stopped: Some(e),
-                    })
+                // The conversations read before this one keep their messages. `resume` must
+                // sit below this one's time (it skips what is at or before it), so one that
+                // shares the time of the last read is read again, which stores nothing twice.
+                Err(e) => {
+                    let resume = if done == Some(last) { below } else { done };
+                    return match resume {
+                        Some(_) => Ok(Messages {
+                            found,
+                            newest: None,
+                            resume,
+                            stopped: Some(e),
+                        }),
+                        None => Err(e),
+                    };
                 }
-                Err(e) => return Err(e),
             };
+            if done.is_some_and(|d| d < last) {
+                below = done;
+            }
             (done, read) = (Some(last), read + 1);
             let members = convo["members"].as_array().cloned().unwrap_or_default();
             // Newer conversations first, like the messages inside one.

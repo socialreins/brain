@@ -24657,6 +24657,50 @@ mod teams {
                 }
             }
 
+            /// Two conversations with the same time: a failure on the second must not move the
+            /// resume mark past it, or its messages are never read.
+            #[tokio::test]
+            #[serial]
+            async fn a_failure_between_conversations_of_one_time_loses_nothing() {
+                let (s, db, state) = on_mock().await;
+                let (_, team_id, account, me) = owner(&s, &db).await;
+                let (early, same) = (at(500), at(100));
+                let convos = json!([
+                    convo_of("cvE", &me, &early),
+                    convo_of("cvA", &me, &same),
+                    convo_of("cvB", &me, &same),
+                ]);
+                let messages = json!({
+                    "cvE": [dm_in("e1", "did:plc:dmer", &early)],
+                    "cvA": [dm_in("a1", "did:plc:dmer", &same)],
+                    "cvB": [dm_in("b1", "did:plc:dmer", &same)],
+                });
+                let data = |fail: Option<&str>| {
+                    let mut d =
+                        json!({"notifications": [], "convos": convos, "messages": messages});
+                    if let Some(id) = fail {
+                        d["fail_convo"] = json!(id);
+                        d["fail_status"] = json!(503);
+                    }
+                    d
+                };
+                // Which of A and B is read second is the sort's choice: fail the one asked for
+                // last by failing both in turn, then recovering.
+                for failing in ["cvA", "cvB"] {
+                    set_inbox(&me, data(Some(failing)));
+                    ingest(&db, &state, &account).await;
+                }
+                set_inbox(&me, data(None));
+                for _ in 0..3 {
+                    ingest(&db, &state, &account).await;
+                }
+                assert_eq!(
+                    stored_count(&db, &team_id).await,
+                    3,
+                    "e1, a1 and b1, once each"
+                );
+            }
+
             /// Replies to a post Bluesky will not show, or its author blocks us from, say so
             /// before anything is sent.
             #[tokio::test]
