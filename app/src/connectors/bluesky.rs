@@ -1468,7 +1468,8 @@ impl Bluesky {
         let page = self.xrpc(c, "chat.bsky.convo.listConvos", &q, None).await?;
         let mut convos = page["convos"].as_array().cloned().unwrap_or_default();
         // Message requests (people the account does not follow, who may write to it) are listed
-        // apart from the accepted conversations; an answer that fails leaves them for next tick.
+        // apart from the accepted conversations.
+        let mut requests_missed = false;
         let asked = self
             .xrpc(c, "chat.bsky.convo.listConvoRequests", &q, None)
             .await;
@@ -1485,6 +1486,11 @@ impl Bluesky {
                 }
             }
             Err(e @ (InboxError::Reconnect | InboxError::RateLimited)) => return Err(e),
+            // The service is down or timing out: the requests may be missing from this round.
+            Err(InboxError::Unreachable) | Err(InboxError::Refused { status: 500.., .. }) => {
+                requests_missed = true
+            }
+            // Refused or unknown (an older server): there are no requests to read.
             Err(_) => {}
         }
         let mut fresh: Vec<_> = convos
@@ -1573,7 +1579,9 @@ impl Bluesky {
         }
         Ok(Messages {
             found,
-            newest,
+            // Without the requests, the mark stays where it was: the next round reads this
+            // one's conversations again (storing nothing twice) and the requests with them.
+            newest: newest.filter(|_| !requests_missed),
             resume: None,
             stopped: None,
         })

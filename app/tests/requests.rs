@@ -3781,7 +3781,12 @@ mod teams {
                 Ok(d) => d,
                 Err(a) => return a,
             };
-            let list = inbox_of(&did)["requests"].clone();
+            let data = inbox_of(&did);
+            // `fail_requests`: this read answers with that status.
+            if let Some(status) = data["fail_requests"].as_u64() {
+                return refused(status as u16, "Unavailable");
+            }
+            let list = data["requests"].clone();
             let list = if list.is_null() { json!([]) } else { list };
             (
                 axum::http::StatusCode::OK,
@@ -25640,6 +25645,53 @@ mod teams {
                 .await;
                 assert_eq!(res.status_code(), 422);
                 assert_eq!(res.json::<Value>()["error"], "convo_locked");
+            }
+
+            /// A message request read while the request listing is down is not lost: the mark
+            /// stays behind and the next round reads it.
+            #[tokio::test]
+            #[serial]
+            async fn a_down_request_listing_does_not_hide_requests_for_good() {
+                let (s, db, state) = on_mock().await;
+                let (_, team_id, account, me) = owner(&s, &db).await;
+                let convo = |id: &str, last: &str| {
+                    json!({"id": id, "members": [{"did": me},
+                    {"did": "did:plc:dmer", "handle": "dmer.test"}], "lastMessage": {"sentAt": last}})
+                };
+                let data = |down: bool| {
+                    let mut d = json!({"notifications": [],
+                        "convos": [convo("cvA", &at(5))],
+                        "requests": [convo("rq9", &at(60))],
+                        "messages": {"cvA": [dm_in("a1", "did:plc:dmer", &at(5))],
+                            "rq9": [dm_in("r1", "did:plc:dmer", &at(60))]}});
+                    if down {
+                        d["fail_requests"] = json!(503);
+                    }
+                    d
+                };
+                set_inbox(&me, data(true));
+                ingest(&db, &state, &account).await;
+                assert_eq!(
+                    stored_count(&db, &team_id).await,
+                    1,
+                    "only the accepted one"
+                );
+                assert!(
+                    !marks(&db, &account).await.2,
+                    "the messages mark did not move"
+                );
+                set_inbox(&me, data(false));
+                ingest(&db, &state, &account).await;
+                ingest(&db, &state, &account).await;
+                assert_eq!(stored_count(&db, &team_id).await, 2, "the request, once");
+                // A refusal (an older service) means no requests, and does not hold the mark.
+                set_inbox(&me, {
+                    let mut d = data(false);
+                    d["fail_requests"] = json!(400);
+                    d
+                });
+                ingest(&db, &state, &account).await;
+                assert!(marks(&db, &account).await.2);
             }
 
             /// Replies to a post Bluesky will not show, or its author blocks us from, say so
