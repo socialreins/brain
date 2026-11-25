@@ -899,6 +899,18 @@ impl InboxError {
             Self::Invalid("dm_unavailable") => {
                 "Meta cannot deliver a message to this person.".into()
             }
+            Self::Invalid("not_applicable") => "That does not apply to this item.".into(),
+            Self::Invalid("own_account") => "That is one of your own accounts.".into(),
+            Self::Invalid("not_our_thread") => "Only replies under a post of this account can \
+                                                be hidden."
+                .into(),
+            Self::Invalid("too_many_hidden") => "Bluesky keeps at most 300 hidden replies on \
+                                                 a post."
+                .into(),
+            Self::Invalid("invalid_reason") => "Pick a reason for the report (spam, violation, \
+                                                misleading, sexual, rude or other); what you add \
+                                                takes up to 2000 characters."
+                .into(),
             Self::Invalid(code) => format!("Not sent ({code})."),
             Self::MetaReconnect => "Meta refused the Page's token or a permission is missing. \
                                     Connect the account again under Connections."
@@ -1214,12 +1226,25 @@ impl Bluesky {
     /// An XRPC call on the account's PDS: a GET with `query`, or a POST of `body`. `chat.*`
     /// methods go through the chat proxy and need DM access. A rejected session is opened again
     /// once: the call never ran, so this cannot send twice.
-    async fn xrpc(
+    pub(crate) async fn xrpc(
         &self,
         c: &Creds<'_>,
         method: &str,
         query: &[(&str, &str)],
         body: Option<&Value>,
+    ) -> Result<Value, InboxError> {
+        self.xrpc_via(c, method, query, body, None).await
+    }
+
+    /// `xrpc`, with `proxy` (a service DID and id) as the `atproto-proxy` the PDS forwards to,
+    /// for calls a moderation service takes. `chat.*` always goes to the chat service.
+    pub(crate) async fn xrpc_via(
+        &self,
+        c: &Creds<'_>,
+        method: &str,
+        query: &[(&str, &str)],
+        body: Option<&Value>,
+        proxy: Option<&str>,
     ) -> Result<Value, InboxError> {
         let chat = method.starts_with("chat.");
         for fresh in [false, true] {
@@ -1233,8 +1258,8 @@ impl Bluesky {
                 None => self.client.get(url).query(query),
             };
             req = req.bearer_auth(&s.jwt);
-            if chat {
-                req = req.header("atproto-proxy", CHAT_PROXY);
+            if let Some(proxy) = proxy.or(chat.then_some(CHAT_PROXY)) {
+                req = req.header("atproto-proxy", proxy);
             }
             let res = req.send().await.map_err(|e| {
                 tracing::warn!(error = %e.without_url(), method, "bluesky call failed");

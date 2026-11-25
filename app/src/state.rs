@@ -27,8 +27,9 @@ pub struct AppState {
     pub connect_limiter: Arc<RateLimiter<uuid::Uuid>>,
     /// Per-user limit on publish-now and take-down calls, each of which calls a platform.
     pub post_limiter: Arc<RateLimiter<uuid::Uuid>>,
-    /// Per-user limit on live reads of a Bluesky thread (`GET /inbox-items/{id}/thread`).
-    pub thread_limiter: Arc<RateLimiter<uuid::Uuid>>,
+    /// Per-user limit on what an inbox item asks Bluesky live: a thread read
+    /// (`GET /inbox-items/{id}/thread`) or an action (`POST /inbox-items/{id}/actions`).
+    pub live_limiter: Arc<RateLimiter<uuid::Uuid>>,
     /// Per-team limit on `POST /v1/uploads`.
     pub upload_limiter: Arc<RateLimiter<uuid::Uuid>>,
     /// Per-token limit on every request made with an API token.
@@ -95,7 +96,7 @@ impl AppState {
             invitation_limiter: Arc::new(RateLimiter::per_minute(10)),
             connect_limiter: Arc::new(RateLimiter::per_minute(5)),
             post_limiter: Arc::new(RateLimiter::per_minute(10)),
-            thread_limiter: Arc::new(RateLimiter::per_minute(60)),
+            live_limiter: Arc::new(RateLimiter::per_minute(60)),
             upload_limiter: Arc::new(RateLimiter::per_minute(60)),
             api_token_limiter: Arc::new(RateLimiter::per_minute(120)),
             brain_url: config.brain_url.clone(),
