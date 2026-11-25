@@ -43,6 +43,8 @@ struct Mock {
     paged: std::sync::atomic::AtomicBool,
     mentions: Mutex<Value>,
     dms: Mutex<Value>,
+    /// What the AI model answers.
+    ai: Mutex<String>,
 }
 
 impl Mock {
@@ -114,6 +116,10 @@ async fn handler(State(m): State<Arc<Mock>>, method: Method, uri: Uri, body: Byt
             }
             Json(all).into_response()
         }
+        ("POST", "/v1/messages") => {
+            let text = m.ai.lock().unwrap().clone();
+            Json(json!({"content": [{"type": "text", "text": text}]})).into_response()
+        }
         ("POST", "/2/oauth2/token") => {
             Json(json!({"token_type": "bearer", "access_token": "renewed",
             "expires_in": 7200, "refresh_token": "r2"}))
@@ -183,6 +189,8 @@ async fn env(scope: &str, billing: bool) -> Env {
     let mut config = Config::from_env().expect("DATABASE_URL must point at a test Postgres");
     config.trust_proxy = true;
     config.billing_enabled = billing;
+    config.ai.own_key = Some("sk-ant-test".into());
+    config.ai.anthropic_url = base.clone();
     let mut x = X::new(Some(("app".into(), "secret".into()))).unwrap();
     x.api_url = base;
     config.x = x;
@@ -1119,4 +1127,157 @@ async fn a_pause_ends_waiting_flows_and_a_cooldown_holds_a_flow() {
         runs[1..],
         [run("waiting", None), run("skipped", Some("cooldown"))]
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn conditions_on_questions_language_and_first_mentions() {
+    let e = env(ALL, false).await;
+    let id = e
+        .automation(
+            json!({"conditions": {"account_ids": [e.account], "question": true,
+            "languages": ["en"], "first_per_author": true}}),
+        )
+        .await;
+    let (ann, bob, cy) = (who(), who(), who());
+    let hello = "Hello there, I would like to know where I can buy your new product";
+    // A question mark needs no AI call.
+    e.arrive(&ann, &format!("{hello}?")).await;
+    assert_eq!(e.mock.seen("POST", "/v1/messages").len(), 0);
+    // Without one the model judges: "no" does not run it, "yes" does.
+    *e.mock.ai.lock().unwrap() = "No".into();
+    e.arrive(&bob, hello).await;
+    assert_eq!(e.mock.seen("POST", "/v1/messages").len(), 1);
+    *e.mock.ai.lock().unwrap() = "yes".into();
+    e.arrive(&cy, hello).await;
+    // Another language never gets that far, and costs no call.
+    e.arrive(&who(), "আমি আপনার নতুন পণ্যটি কোথায় কিনতে পারি তা জানতে চাই?")
+        .await;
+    assert_eq!(e.mock.seen("POST", "/v1/messages").len(), 2);
+    // Bob was judged "no", so no run exists for him and a later question is his first.
+    e.arrive(&bob, &format!("{hello}?")).await;
+    // Ann's second mention is not her first.
+    e.arrive(&ann, &format!("{hello} again?")).await;
+    assert_eq!(e.mock.seen("POST", "/2/tweets").len(), 3);
+    assert_eq!(e.runs(&id).await.len(), 4);
+    // A model that dresses its answer ("No.") is still understood.
+    *e.mock.ai.lock().unwrap() = "No.".into();
+    e.arrive(&who(), hello).await;
+    assert_eq!(
+        e.runs(&id).await.last().unwrap(),
+        &run("skipped", Some("no_question"))
+    );
+    // A model that fails or answers something else ends the run `skipped: ai_failed`.
+    *e.mock.ai.lock().unwrap() = "maybe".into();
+    e.arrive(&who(), hello).await;
+    assert_eq!(
+        e.runs(&id).await.last().unwrap(),
+        &run("skipped", Some("ai_failed"))
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn weekdays_hours_and_their_checks() {
+    let e = env(ALL, false).await;
+    for (bad, why) in [
+        (json!({"zone": "Mars/Base"}), "unknown zone"),
+        (json!({"zone": "UTC", "from_hour": 9}), "one hour only"),
+        (
+            json!({"zone": "UTC", "from_hour": 9, "to_hour": 9}),
+            "empty window",
+        ),
+        (json!({"zone": "UTC", "weekdays": [7]}), "no such day"),
+        (json!({"zone": "UTC"}), "no rule at all"),
+    ] {
+        let body = json!({"name": "x", "trigger": "mention_received",
+            "conditions": {"when": bad},
+            "actions": [{"type": "reply_publicly", "text": "t"}]});
+        let res = e.req(Method::POST, "/v1/automations", body).await;
+        assert_eq!(res.status_code(), 422, "{why}");
+        assert_eq!(res.json::<Value>()["error"], "invalid_conditions", "{why}");
+    }
+    for (bad, trigger) in [
+        (json!({"question": true}), "new_follower"),
+        (json!({"languages": ["en"]}), "button_clicked"),
+        (json!({"languages": ["xx"]}), "mention_received"),
+        (json!({"languages": ["en", "en"]}), "mention_received"),
+    ] {
+        let body = json!({"name": "x", "trigger": trigger, "conditions": bad,
+            "actions": [{"type": "send_dm", "text": "t"}]});
+        let res = e.req(Method::POST, "/v1/automations", body).await;
+        assert_eq!(res.status_code(), 422, "{bad}");
+    }
+    // 2026-11-23 is a Monday: office hours on weekdays, in Dhaka (UTC+6).
+    let office =
+        json!({"zone": "Asia/Dhaka", "weekdays": [0, 1, 2, 3, 4], "from_hour": 9, "to_hour": 17});
+    let test = |at: &str| {
+        let body = json!({"automation": {"name": "t", "trigger": "mention_received",
+            "conditions": {"account_ids": [e.account], "when": office},
+            "actions": [{"type": "reply_publicly", "text": "thanks"}]},
+            "sample": {"account_id": e.account, "text": "hi", "at": at}});
+        e.req(Method::POST, "/v1/automations/test", body)
+    };
+    let res = test("2026-11-23T05:00:00Z").await;
+    assert_eq!(res.json::<Value>()["matched"], true, "11:00 in Dhaka");
+    let res = test("2026-11-23T12:00:00Z").await;
+    assert_eq!(res.json::<Value>()["mismatches"], json!(["outside_hours"]));
+    let res = test("2026-11-22T05:00:00Z").await;
+    assert_eq!(res.json::<Value>()["mismatches"], json!(["wrong_weekday"]));
+    // An overnight window.
+    let night = json!({"zone": "UTC", "from_hour": 22, "to_hour": 6});
+    let body = |at: &str| {
+        json!({"automation": {"name": "t", "trigger": "mention_received",
+            "conditions": {"account_ids": [e.account], "when": night},
+            "actions": [{"type": "reply_publicly", "text": "thanks"}]},
+            "sample": {"account_id": e.account, "text": "hi", "at": at}})
+    };
+    for (at, matched) in [
+        ("2026-11-23T23:00:00Z", true),
+        ("2026-11-23T03:00:00Z", true),
+        ("2026-11-23T12:00:00Z", false),
+    ] {
+        let res = e.req(Method::POST, "/v1/automations/test", body(at)).await;
+        assert_eq!(res.json::<Value>()["matched"], matched, "{at}");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn a_question_is_paid_for_once_and_given_back_when_it_cannot_be_judged() {
+    let e = env(ALL, true).await;
+    e.sql(&format!("INSERT INTO subscriptions (team_id, plan_id, status) VALUES ('{}', 'automation', 'active')", e.team)).await;
+    let id = e
+        .automation(json!({"conditions": {"account_ids": [e.account], "question": true}}))
+        .await;
+    // The monthly allowance pays for the first judgment, whatever it says.
+    let ledger = || async {
+        let sql = format!("SELECT COALESCE(sum(amount), 0)::int AS n, count(*)::int AS rows FROM credit_ledger WHERE team_id = '{}' AND kind IN ('ai', 'ai_plan')", e.team);
+        let r =
+            e.db.query_one_raw(Statement::from_string(DbBackend::Postgres, sql))
+                .await
+                .unwrap()
+                .unwrap();
+        (
+            r.try_get::<i32>("", "n").unwrap(),
+            r.try_get::<i32>("", "rows").unwrap(),
+        )
+    };
+    let hello = "Hello there, I would like to know where I can buy your new product";
+    *e.mock.ai.lock().unwrap() = "yes".into();
+    e.arrive(&who(), hello).await;
+    let (net, rows) = ledger().await;
+    assert_eq!((net < 0, rows), (true, 1), "paid once");
+    // An answer that is neither yes nor no is given back, and the run says so.
+    let before = ledger().await.0;
+    *e.mock.ai.lock().unwrap() = "perhaps".into();
+    e.arrive(&who(), hello).await;
+    assert_eq!(ledger().await, (before, 3), "paid, then given back");
+    assert_eq!(
+        e.runs(&id).await.last().unwrap(),
+        &run("skipped", Some("ai_failed"))
+    );
+    // A question mark costs nothing.
+    e.arrive(&who(), "Where can I buy this?").await;
+    assert_eq!(ledger().await, (before, 3));
 }
