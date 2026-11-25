@@ -148,7 +148,9 @@ cargo run -p socialreins-brain
   (`notifications_cursor` with `notifications_pending_at`, `messages_resume_at`) and read next tick:
   `notifications_seen_at` and `messages_seen_at` move only when a round reaches its end, and a
   tick always reads at least one page and one conversation. Items store once (unique on account
-  and remote id), so a reread adds nothing; a refused saved cursor starts the read over.
+  and remote id), so a reread adds nothing; a refused saved cursor starts the read over. Trade-off:
+  while a long backlog is read back, items newer than the round's first page wait until it ends.
+  Only the 50 latest conversations are listed, so older ones with news past that are never seen.
 - `app/src/meta_inbox.rs` and `controllers/meta_webhook.rs`: `/webhooks/meta`. The signature of
   the raw body is checked before anything is parsed; items are stored before the `200` (unique
   on account and remote id, so redeliveries are harmless), names, links and automations run

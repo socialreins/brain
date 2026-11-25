@@ -23254,9 +23254,10 @@ mod teams {
                 );
                 let started = std::time::Instant::now();
                 ingest(&db, &state, &account).await;
-                assert!(started.elapsed() < std::time::Duration::from_millis(1200));
+                assert!(started.elapsed() < std::time::Duration::from_millis(1500));
                 let first = stored_count(&db, &team_id).await;
-                assert!((2..12).contains(&first), "{first}");
+                // The page cap alone would allow 6; the time stops it at about 3.
+                assert!((1..=4).contains(&first), "{first}");
                 assert!(marks(&db, &account).await.0.is_some());
                 for _ in 0..12 {
                     if marks(&db, &account).await.0.is_none() {

@@ -1206,8 +1206,10 @@ impl Bluesky {
                 }
                 found.extend(notification(n));
             }
+            let before = cursor.take();
             cursor = page["cursor"].as_str().map(str::to_owned);
-            if list.is_empty() || cursor.is_none() {
+            // A cursor that does not move would keep the round open for ever.
+            if list.is_empty() || cursor.is_none() || cursor == before {
                 return Ok(Notifications { found, next: None });
             }
             // Counted in pages and time too: a server the account owner runs could answer one
