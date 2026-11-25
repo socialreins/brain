@@ -485,6 +485,19 @@ pub async fn send(
     let Some(token) = inbox::secret(app, account) else {
         return Err(InboxError::ThreadsReconnect);
     };
+    // A post that tagged us may limit who can reply to it: one for its own author only takes no
+    // reply from us, which is told before anything is sent. The other limits (followers, accounts
+    // the author follows) cannot be judged from here, so Threads has the last word on them.
+    if item.kind == "mention"
+        && app
+            .threads
+            .reply_audience(&token, &item.remote_id)
+            .await
+            .as_deref()
+            == Some("PARENT_POST_AUTHOR_ONLY")
+    {
+        return Err(InboxError::Invalid("threads_replies_closed"));
+    }
     // A reply is a post made with `reply_to_id`, so it waits like a post does.
     let made = app
         .threads

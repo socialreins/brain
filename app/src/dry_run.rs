@@ -628,6 +628,29 @@ async fn effect_step(
             None => step(kind, "would_do"),
         };
     }
+    // Threads hides a reply directly under our post, as a run does; it has no like for an app.
+    if account.provider == "threads"
+        && matches!(
+            kind,
+            "hide_comment" | "like_comment" | "repost_comment" | "follow_back"
+        )
+    {
+        let nested = item.parent_remote_id != item.root_remote_id;
+        let why = match kind {
+            "hide_comment" if item.kind != "comment" => Some("not_supported"),
+            "hide_comment" if nested => Some("threads_nested"),
+            "hide_comment" => None,
+            "like_comment" => Some("threads_no_like"),
+            _ => Some("not_supported"),
+        };
+        return match why {
+            Some(why) => PlannedStep {
+                reason: Some(why.into()),
+                ..step(kind, "would_skip")
+            },
+            None => step(kind, "would_do"),
+        };
+    }
     // Like, repost and follow back on Bluesky are the inbox buttons' own: they go on a Bluesky account.
     let bluesky = account.provider == "bluesky";
     if matches!(kind, "repost_comment" | "follow_back") || (kind == "like_comment" && bluesky) {
@@ -665,6 +688,13 @@ async fn plan_send(
     (kind, via, template, ai, buttons): (&str, Via, &str, bool, &[Button]),
     (page, dm_open): (Option<&str>, bool),
 ) -> PlannedStep {
+    if via == Via::Dm && account.provider == "threads" {
+        // Threads has no DM and no private reply: only a public reply can answer.
+        return PlannedStep {
+            reason: Some("threads_no_dm".into()),
+            ..step(kind, "would_skip")
+        };
+    }
     if via == Via::Dm && account.provider == "youtube" {
         // YouTube has no DM and no private reply: only a public reply can answer a comment.
         return PlannedStep {

@@ -809,3 +809,260 @@ async fn the_webhook_hints_an_early_read_and_checks_its_signature() {
     assert_eq!(e.items().await.len(), 3);
     let _ = e.team;
 }
+
+// Automations on Threads: conditions, the loop guard, reply controls and "Test this automation".
+
+impl Env {
+    /// An automation on this account (`extra` merged into the body), active since 3 days ago.
+    async fn automation(&self, trigger: &str, actions: Value, conditions: Value) -> String {
+        let mut cond = json!({"account_ids": [self.account]});
+        for (k, v) in conditions.as_object().into_iter().flatten() {
+            cond[k] = v.clone();
+        }
+        let body = json!({"name": "t", "trigger": trigger, "conditions": cond, "actions": actions});
+        let res = self.post("/v1/automations", body).await;
+        assert_eq!(res.status_code(), 201, "{}", res.text());
+        let id = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+        self.sql(&format!(
+            "UPDATE automations SET activated_at = now() - interval '3 days' WHERE id = '{id}'"
+        ))
+        .await;
+        id
+    }
+    /// (status, reason) of the automation's runs, oldest first.
+    async fn runs(&self, id: &str) -> Vec<(String, Option<String>)> {
+        let res = self
+            .s
+            .get(&format!("/v1/automations/{id}/runs"))
+            .add_header("cookie", self.cookie.clone())
+            .await;
+        let mut runs: Vec<_> = res.json::<Value>()["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["status"].as_str().unwrap().to_owned(),
+                    r["reason"].as_str().map(str::to_owned),
+                )
+            })
+            .collect();
+        runs.reverse();
+        runs
+    }
+    /// Puts `replies` (newest first) under post 100 and reads them in.
+    async fn arrive(&self, replies: Vec<Value>) {
+        {
+            let mut c = self.mock.conversations.lock().unwrap();
+            let all = c.get_mut("100").unwrap();
+            let list = all["data"].as_array_mut().unwrap();
+            for r in replies.into_iter().rev() {
+                list.insert(0, r);
+            }
+        }
+        self.tick(false).await;
+        self.settled().await;
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn conditions_choose_the_post_the_words_and_the_first_reply_of_a_person() {
+    let e = env().await;
+    threads_inbox::tick(&e.state).await.unwrap();
+    // Only under another post, so nothing here matches.
+    let other = e
+        .automation(
+            "comment_received",
+            json!([{"type": "reply_publicly", "text": "other"}]),
+            json!({"post_remote_ids": ["101"]}),
+        )
+        .await;
+    // Under post 100, with a word, once per person, on every weekday.
+    let wanted = e
+        .automation(
+            "comment_received",
+            json!([{"type": "reply_publicly", "text": "thanks"}]),
+            json!({"post_remote_ids": ["100"], "keywords": ["guide"], "first_per_author": true,
+                "when": {"zone": "UTC", "weekdays": [0, 1, 2, 3, 4, 5, 6]}}),
+        )
+        .await;
+    let mut a = reply("301", "hal", "100", 2);
+    a["text"] = "send the GUIDE please".into();
+    let mut b = reply("302", "ida", "100", 2);
+    b["text"] = "nice post".into();
+    let mut c = reply("303", "hal", "100", 1);
+    c["text"] = "guide again".into();
+    e.arrive(vec![c, b, a]).await;
+    let made = e.mock.seen("POST", "/v1.0/1/threads");
+    assert_eq!(made.len(), 1, "one reply: the keyword, once for hal");
+    assert!(made[0].1.contains("reply_to_id=301") && made[0].1.contains("thanks"));
+    assert_eq!(e.runs(&wanted).await, vec![("sent".into(), None)]);
+    assert!(e.runs(&other).await.is_empty());
+    // A weekday that is not today stops it, and the run log's miss list says so.
+    let day = chrono::Datelike::weekday(&Utc::now()).num_days_from_monday() as u8;
+    let never = (day + 1) % 7;
+    e.sql(&format!(
+        "UPDATE automations SET conditions = jsonb_set(conditions, '{{when}}', \
+         '{{\"zone\": \"UTC\", \"weekdays\": [{never}]}}') WHERE id = '{wanted}'"
+    ))
+    .await;
+    let mut d = reply("304", "jo", "100", 1);
+    d["text"] = "guide".into();
+    e.arrive(vec![d]).await;
+    assert_eq!(e.mock.seen("POST", "/v1.0/1/threads").len(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn nothing_answers_our_own_accounts_or_another_teams() {
+    let e = env().await;
+    threads_inbox::tick(&e.state).await.unwrap();
+    // A second Threads account of this team, and one of another team, by handle.
+    let other_team = Uuid::now_v7();
+    // A team code: 6 of the letters and digits teams use.
+    let letters = b"abcdefghjkmnpqrstuvwxyz23456789";
+    let code: String = other_team.as_bytes()[10..16]
+        .iter()
+        .map(|b| letters[*b as usize % letters.len()] as char)
+        .collect();
+    e.sql(&format!(
+        "INSERT INTO teams (id, name, code) VALUES ('{other_team}', 'other', '{code}'); \
+         INSERT INTO social_accounts (id, team_id, provider, external_id, handle, access_token, meta) VALUES \
+         (gen_random_uuid(), '{}', 'threads', '2', 'sister', '\\x00', '{{\"reconnect\": true}}'), \
+         (gen_random_uuid(), '{other_team}', 'threads', '3', 'Stranger', '\\x00', '{{\"reconnect\": true}}')",
+        e.team
+    ))
+    .await;
+    let id = e
+        .automation(
+            "comment_received",
+            json!([{"type": "reply_publicly", "text": "thanks"}]),
+            json!({}),
+        )
+        .await;
+    e.arrive(vec![
+        reply("311", "sister", "100", 3),
+        reply("312", "stranger", "100", 2),
+        reply("313", "kim", "100", 1),
+    ])
+    .await;
+    // Only kim, who is nobody's account, is answered.
+    let made = e.mock.seen("POST", "/v1.0/1/threads");
+    assert_eq!(made.len(), 1);
+    assert!(made[0].1.contains("reply_to_id=313"));
+    let mut runs = e.runs(&id).await;
+    runs.sort();
+    assert_eq!(
+        runs,
+        vec![
+            ("sent".into(), None),
+            ("skipped".into(), Some("connected_account".into())),
+            ("skipped".into(), Some("own_account".into())),
+        ]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_post_that_only_its_author_takes_replies_to_is_not_answered() {
+    let e = env().await;
+    threads_inbox::tick(&e.state).await.unwrap();
+    e.mock.nodes.lock().unwrap().insert(
+        "300".into(),
+        json!({"id": "300", "reply_audience": "PARENT_POST_AUTHOR_ONLY"}),
+    );
+    let item = e.item("300").await;
+    let res = e
+        .post(
+            &format!("/v1/inbox-items/{item}/reply"),
+            json!({"text": "hi"}),
+        )
+        .await;
+    assert_eq!(res.status_code(), 422);
+    assert_eq!(res.json::<Value>()["error"], "threads_replies_closed");
+    assert_eq!(e.mock.seen("POST", "/v1.0/1/threads").len(), 0);
+    // An open post, or one Threads does not say anything of, is tried.
+    e.mock.nodes.lock().unwrap().insert(
+        "300".into(),
+        json!({"id": "300", "reply_audience": "EVERYONE"}),
+    );
+    let res = e
+        .post(
+            &format!("/v1/inbox-items/{item}/reply"),
+            json!({"text": "hi"}),
+        )
+        .await;
+    assert_eq!(res.status_code(), 201, "{}", res.text());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_this_automation_plans_what_threads_can_do() {
+    let e = env().await;
+    threads_inbox::tick(&e.state).await.unwrap();
+    let test = |actions: Value, trigger: &str| {
+        json!({"automation": {"name": "t", "trigger": trigger,
+            "conditions": {"account_ids": [e.account]}, "actions": actions},
+            "sample": {"account_id": e.account, "text": "hello"}})
+    };
+    // Saved or tested, a DM or a like is refused with a code.
+    for (actions, code) in [
+        (json!([{"type": "send_dm", "text": "hi"}]), "threads_no_dm"),
+        (json!([{"type": "like_comment"}]), "threads_no_like"),
+    ] {
+        let res = e
+            .post(
+                "/v1/automations/test",
+                test(actions.clone(), "comment_received"),
+            )
+            .await;
+        assert_eq!(res.status_code(), 422, "{}", res.text());
+        assert_eq!(res.json::<Value>()["error"], code);
+        let res = e
+            .post(
+                "/v1/automations",
+                test(actions, "comment_received")["automation"].clone(),
+            )
+            .await;
+        assert_eq!(res.json::<Value>()["error"], code);
+    }
+    let res = e
+        .post(
+            "/v1/automations/test",
+            test(
+                json!([{"type": "reply_publicly", "text": "thanks"}, {"type": "hide_comment"},
+                    {"type": "tag_contact", "tag": "fan"}, {"type": "notify_team"}]),
+                "comment_received",
+            ),
+        )
+        .await;
+    assert_eq!(res.status_code(), 200, "{}", res.text());
+    let got = res.json::<Value>();
+    let steps: Vec<(&str, &str)> = got["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["type"].as_str().unwrap(), s["status"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            ("reply_publicly", "would_send"),
+            ("hide_comment", "would_do"),
+            ("tag_contact", "would_tag"),
+            ("notify_team", "would_do"),
+        ]
+    );
+    // 126 emoji are 504 bytes: too long for Threads, though only 126 characters.
+    let res = e
+        .post(
+            "/v1/automations/test",
+            test(
+                json!([{"type": "reply_publicly", "text": "😀".repeat(126)}]),
+                "comment_received",
+            ),
+        )
+        .await;
+    assert_eq!(res.status_code(), 422, "{}", res.text());
+}

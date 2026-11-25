@@ -612,6 +612,21 @@ impl Threads {
         self.inbox_call(Method::GET, id, token, &q, None).await
     }
 
+    /// Who may reply to a post (`reply_audience`: `EVERYONE`, `ACCOUNTS_YOU_FOLLOW`,
+    /// `MENTIONED_ONLY`, `PARENT_POST_AUTHOR_ONLY`, `FOLLOWERS_ONLY`), when Threads says; `None`
+    /// when it does not or the call failed (Threads gives it for top-level posts only).
+    pub async fn reply_audience(&self, token: &str, id: &str) -> Option<String> {
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let q = [("fields", "reply_audience")];
+        let v = self
+            .inbox_call(Method::GET, id, token, &q, None)
+            .await
+            .ok()?;
+        v["reply_audience"].as_str().map(str::to_owned)
+    }
+
     /// Hides (`true`) or shows again a reply directly under one of the account's posts. Needs
     /// `threads_manage_replies`; a reply deeper in the thread is refused.
     pub async fn manage_reply(&self, token: &str, id: &str, hide: bool) -> Result<(), InboxError> {
