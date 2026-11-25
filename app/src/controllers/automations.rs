@@ -53,6 +53,10 @@ pub struct Automation {
     /// A public reply sent when a `send_dm` could not go (`dm_not_allowed`, `no_dm_access`)
     /// and no `reply_publicly` went out.
     pub fallback_public_reply: Option<String>,
+    /// Minutes before it answers the same person again (1 to 10080); null: no cool-down.
+    pub cooldown_minutes: Option<i32>,
+    /// Most runs of this automation in a day (1 to 500); null: only the team's daily cap.
+    pub daily_cap: Option<i32>,
     pub created_by: Option<Uuid>,
     pub created_at: DateTime<FixedOffset>,
     pub updated_at: DateTime<FixedOffset>,
@@ -73,6 +77,14 @@ pub struct RunStats {
     /// The same as `total`, kept for older clients.
     pub count: i64,
     pub last_at: Option<DateTime<FixedOffset>>,
+    /// Why runs were skipped or failed, with how many each (`reason` of the run), most first.
+    pub reasons: Vec<ReasonCount>,
+}
+
+#[derive(Serialize, ToSchema, Debug, PartialEq, Eq)]
+pub struct ReasonCount {
+    pub reason: String,
+    pub count: i64,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -107,6 +119,14 @@ pub struct AutomationInput {
     /// Not with `steps` (`422 invalid_fallback`).
     #[serde(default)]
     pub fallback_public_reply: Option<String>,
+    /// Minutes, 1 to 10080: it does not answer the same person again within this time (the
+    /// run is stored `skipped: cooldown`). Absent: no cool-down.
+    #[serde(default)]
+    pub cooldown_minutes: Option<u32>,
+    /// 1 to 500: most runs of this automation in 24 hours (a run past it is stored `skipped:
+    /// automation_cap`). Absent: only the team's daily cap.
+    #[serde(default)]
+    pub daily_cap: Option<u32>,
 }
 
 fn yes() -> bool {
@@ -172,6 +192,8 @@ fn automation_json(a: automations::Model) -> Automation {
         actions: serde_json::from_value(a.actions).unwrap_or_default(),
         steps: a.steps.and_then(|s| serde_json::from_value(s).ok()),
         fallback_public_reply: a.fallback_public_reply,
+        cooldown_minutes: a.cooldown_minutes,
+        daily_cap: a.daily_cap,
         created_by: a.created_by,
         created_at: a.created_at,
         updated_at: a.updated_at,
@@ -199,6 +221,19 @@ async fn checked(
     let Some(name) = team::name(&input.name) else {
         return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name")));
     };
+    let in_range = |v: Option<u32>, max: u32| v.is_none_or(|v| (1..=max).contains(&v));
+    if !in_range(input.cooldown_minutes, 10_080) {
+        return Ok(Err(reply(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_cooldown",
+        )));
+    }
+    if !in_range(input.daily_cap, rules::RUNS_PER_DAY as u32) {
+        return Ok(Err(reply(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_daily_cap",
+        )));
+    }
     input.fallback_public_reply = input
         .fallback_public_reply
         .map(|f| f.trim().to_owned())
@@ -277,7 +312,8 @@ async fn run_stats(
             [team_id.into(), only.into()],
         ))
         .await?;
-    rows.iter()
+    let mut stats = rows
+        .iter()
         .map(|r| {
             let id: Uuid = r.try_get("", "automation_id")?;
             let total = r.try_get("", "total")?;
@@ -290,10 +326,30 @@ async fn run_stats(
                 total,
                 count: total,
                 last_at: r.try_get("", "last_at")?,
+                reasons: Vec::new(),
             };
             Ok((id, stats))
         })
-        .collect()
+        .collect::<Result<std::collections::HashMap<_, _>, DbErr>>()?;
+    let why = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT automation_id, reason, COUNT(*) AS n FROM automation_runs \
+             WHERE team_id = $1 AND ($2::uuid IS NULL OR automation_id = $2) \
+             AND status IN ('skipped', 'failed') AND reason IS NOT NULL GROUP BY automation_id, reason ORDER BY n DESC, reason",
+            [team_id.into(), only.into()],
+        ))
+        .await?;
+    for r in &why {
+        let id: Uuid = r.try_get("", "automation_id")?;
+        if let Some(s) = stats.get_mut(&id) {
+            s.reasons.push(ReasonCount {
+                reason: r.try_get("", "reason")?,
+                count: r.try_get("", "n")?,
+            });
+        }
+    }
+    Ok(stats)
 }
 
 /// The team's automations, oldest first, each with its run counts by status and last run.
@@ -394,6 +450,8 @@ async fn create(
             actions: Set(serde_json::json!(input.actions.unwrap_or_default())),
             steps: Set(input.steps.map(|s| serde_json::json!(s))),
             fallback_public_reply: Set(input.fallback_public_reply),
+            cooldown_minutes: Set(input.cooldown_minutes.map(|v| v as i32)),
+            daily_cap: Set(input.daily_cap.map(|v| v as i32)),
             created_by: Set(Some(t.current.0.id)),
             ..Default::default()
         };
@@ -484,6 +542,14 @@ async fn update(
             .col_expr(
                 automations::Column::FallbackPublicReply,
                 input.fallback_public_reply.into(),
+            )
+            .col_expr(
+                automations::Column::CooldownMinutes,
+                input.cooldown_minutes.map(|v| v as i32).into(),
+            )
+            .col_expr(
+                automations::Column::DailyCap,
+                input.daily_cap.map(|v| v as i32).into(),
             )
             .filter(automations::Column::Id.eq(id))
             .filter(automations::Column::TeamId.eq(t.team.id))
