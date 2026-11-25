@@ -62,10 +62,11 @@ fn yes() -> bool {
 #[derive(Serialize, ToSchema, Debug, Default, PartialEq, Eq)]
 pub struct PlannedStep {
     /// `send_dm`, `reply_publicly`, `ai_send_dm`, `ai_reply_publicly`, `fallback_public_reply`,
-    /// `tag_contact` or `wait`.
+    /// `tag_contact`, `like`, `repost`, `hide_reply`, `assign`, `notify_team` or `wait`.
     #[serde(rename = "type")]
     pub kind: String,
-    /// `would_send`, `would_skip`, `would_fail`, `would_tag`, `would_wait` or `not_reached` (an
+    /// `would_send`, `would_skip`, `would_fail`, `would_tag`, `would_do` (a like, repost, hide,
+    /// assignment or mail to the team), `would_wait` or `not_reached` (an
     /// earlier send of a flow did not go out, so the run ends before it).
     pub status: String,
     /// Why it would not go out, as a run's result gives it: `no_dm_access`, `dm_not_allowed`, `too_long`,
@@ -119,6 +120,8 @@ enum Part<'a> {
     },
     Tag(&'a str),
     Wait(u32),
+    /// Like, repost, hide a reply, assign or mail the team.
+    Effect(&'static str),
 }
 
 /// The checked automation as the parts a run goes through, in order.
@@ -136,7 +139,7 @@ fn parts<'a>(actions: &'a [Action], steps: Option<&'a [Step]>) -> Vec<Part<'a>> 
                 }),
                 (None, Step::Wait { minutes }) => Some(Part::Wait(*minutes)),
                 (None, Step::TagContact { tag }) => Some(Part::Tag(tag)),
-                (None, _) => None,
+                (None, s) => s.effect().map(|e| Part::Effect(e.kind())),
             })
             .collect(),
         None => actions
@@ -150,7 +153,7 @@ fn parts<'a>(actions: &'a [Action], steps: Option<&'a [Step]>) -> Vec<Part<'a>> 
                     buttons: &[],
                 }),
                 (None, Action::TagContact { tag }) => Some(Part::Tag(tag)),
-                (None, _) => None,
+                (None, a) => a.effect().map(|e| Part::Effect(e.kind())),
             })
             .collect(),
     }
@@ -407,6 +410,7 @@ async fn walk(
                 Part::Send { kind, .. } => (*kind, None, None),
                 Part::Tag(t) => ("tag_contact", Some(t.to_string()), None),
                 Part::Wait(m) => ("wait", None, Some(*m)),
+                Part::Effect(kind) => (*kind, None, None),
             };
             out.push(PlannedStep {
                 tag,
@@ -424,6 +428,22 @@ async fn walk(
                 wait_minutes: Some(*minutes),
                 ..step("wait", "would_wait")
             }),
+            Part::Effect(kind) => {
+                // Acting on a post is built for some networks only (`REACTORS`).
+                let on_post = matches!(*kind, "like" | "repost" | "hide_reply");
+                let unsupported = on_post && !rules::REACTORS.contains(&account.provider.as_str());
+                out.push(PlannedStep {
+                    reason: unsupported.then(|| "unsupported_action".into()),
+                    ..step(
+                        kind,
+                        if unsupported {
+                            "would_skip"
+                        } else {
+                            "would_do"
+                        },
+                    )
+                });
+            }
             Part::Send {
                 kind,
                 via,

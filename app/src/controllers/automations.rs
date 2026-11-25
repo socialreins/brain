@@ -27,7 +27,7 @@ use crate::{
     automations::{self as rules, Action, ActionResult, Conditions, Step},
     dry_run::{self, Outcome, Sample},
     inbox,
-    models::{automation_runs, automations, social_accounts, teams},
+    models::{automation_runs, automations, social_accounts, team_user, teams},
     state::AppState,
 };
 
@@ -261,6 +261,20 @@ async fn checked(
     }
     let actions = input.actions.as_deref().unwrap_or_default();
     let steps = input.steps.as_deref();
+    let mut members = rules::assignees(actions, steps);
+    members.sort();
+    members.dedup();
+    let known = team_user::Entity::find()
+        .filter(team_user::Column::TeamId.eq(team_id))
+        .filter(team_user::Column::UserId.is_in(members.iter().copied()))
+        .count(db)
+        .await?;
+    if known != members.len() as u64 {
+        return Ok(Err(reply(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_assignee",
+        )));
+    }
     if let Some(code) = scope_limits(db, team_id, &input.trigger, c, actions, steps).await? {
         return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, code)));
     }

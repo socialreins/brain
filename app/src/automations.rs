@@ -48,6 +48,7 @@ use crate::{
     },
     rate_limit::reserve_in,
     state::AppState,
+    x_inbox::Action as XAction,
 };
 
 pub const TRIGGERS: [&str; 6] = [
@@ -293,7 +294,61 @@ pub enum Action {
         #[serde(deserialize_with = "tidy_tag")]
         tag: String,
     },
+    /// Likes the post of the comment or mention (comment and mention triggers). Costs a write
+    /// on X. Only on networks that support it (`REACTORS`).
+    Like,
+    /// Reposts the post of the comment or mention, as `Like`.
+    Repost,
+    /// Hides the reply (`comment_received` only), as `Like`.
+    HideReply,
+    /// Assigns the item to a member of the team, when nobody has it yet.
+    #[serde(rename = "assign")]
+    AssignTo { user_id: Uuid },
+    /// Emails the team's owners and admins that an item came, with a link to it and `note`
+    /// (up to 200 characters, may be empty). At most 50 a team a day.
+    NotifyTeam {
+        #[serde(default)]
+        note: String,
+    },
+    /// The team's automations made after this one do not run on this item (each is stored
+    /// `skipped: stopped_by_other`).
+    StopOthers,
 }
+
+/// What a step does that is not a message and not a tag: an action on the post, or on the team.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Effect<'a> {
+    Like,
+    Repost,
+    HideReply,
+    Assign(Uuid),
+    Notify(&'a str),
+}
+
+impl Effect<'_> {
+    pub(crate) fn kind(self) -> &'static str {
+        match self {
+            Self::Like => "like",
+            Self::Repost => "repost",
+            Self::HideReply => "hide_reply",
+            Self::Assign(_) => "assign",
+            Self::Notify(_) => "notify_team",
+        }
+    }
+
+    /// Whether it takes a hit of the daily cap: all but an assignment, which costs nothing.
+    pub(crate) fn costs(self) -> bool {
+        !matches!(self, Self::Assign(_))
+    }
+
+    /// The post's own actions: they need a comment or mention to act on.
+    fn on_post(self) -> bool {
+        matches!(self, Self::Like | Self::Repost | Self::HideReply)
+    }
+}
+
+/// Networks whose actions on a post (`Like`, `Repost`, `HideReply`) an automation may do.
+pub const REACTORS: [&str; 1] = ["x"];
 
 /// A tag as contacts keep one, trimmed and lowercased; `validate` refuses what is still not one.
 fn tidy_tag<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
@@ -312,17 +367,34 @@ impl Action {
             Self::AiSendDm { .. } => "ai_send_dm",
             Self::AiReplyPublicly { .. } => "ai_reply_publicly",
             Self::TagContact { .. } => "tag_contact",
+            Self::Like => "like",
+            Self::Repost => "repost",
+            Self::HideReply => "hide_reply",
+            Self::AssignTo { .. } => "assign",
+            Self::NotifyTeam { .. } => "notify_team",
+            Self::StopOthers => "stop_others",
         }
     }
 
-    /// How a send goes out and its text (an AI send's prompt); `None` for a `tag_contact`.
+    /// How a send goes out and its text (an AI send's prompt); `None` for anything else.
     pub(crate) fn via_text(&self) -> Option<(Via, &str)> {
         match self {
             Self::SendDm { text } => Some((Via::Dm, text)),
             Self::ReplyPublicly { text } => Some((Via::Public, text)),
             Self::AiSendDm { prompt } => Some((Via::Dm, prompt)),
             Self::AiReplyPublicly { prompt } => Some((Via::Public, prompt)),
-            Self::TagContact { .. } => None,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn effect(&self) -> Option<Effect<'_>> {
+        match self {
+            Self::Like => Some(Effect::Like),
+            Self::Repost => Some(Effect::Repost),
+            Self::HideReply => Some(Effect::HideReply),
+            Self::AssignTo { user_id } => Some(Effect::Assign(*user_id)),
+            Self::NotifyTeam { note } => Some(Effect::Notify(note)),
+            _ => None,
         }
     }
 
@@ -356,6 +428,22 @@ pub enum Step {
         #[serde(deserialize_with = "tidy_tag")]
         tag: String,
     },
+    /// As `Action::Like`; goes on whatever came of it.
+    Like,
+    /// As `Action::Repost`; goes on whatever came of it.
+    Repost,
+    /// As `Action::HideReply`; goes on whatever came of it.
+    HideReply,
+    /// As `Action::AssignTo`; goes on whatever came of it.
+    #[serde(rename = "assign")]
+    AssignTo { user_id: Uuid },
+    /// As `Action::NotifyTeam`; goes on whatever came of it.
+    NotifyTeam {
+        #[serde(default)]
+        note: String,
+    },
+    /// As `Action::StopOthers`, from the moment the run starts.
+    StopOthers,
 }
 
 impl Step {
@@ -367,7 +455,29 @@ impl Step {
             Self::AiReplyPublicly { .. } => "ai_reply_publicly",
             Self::Wait { .. } => "wait",
             Self::TagContact { .. } => "tag_contact",
+            Self::Like => "like",
+            Self::Repost => "repost",
+            Self::HideReply => "hide_reply",
+            Self::AssignTo { .. } => "assign",
+            Self::NotifyTeam { .. } => "notify_team",
+            Self::StopOthers => "stop_others",
         }
+    }
+
+    pub(crate) fn effect(&self) -> Option<Effect<'_>> {
+        match self {
+            Self::Like => Some(Effect::Like),
+            Self::Repost => Some(Effect::Repost),
+            Self::HideReply => Some(Effect::HideReply),
+            Self::AssignTo { user_id } => Some(Effect::Assign(*user_id)),
+            Self::NotifyTeam { note } => Some(Effect::Notify(note)),
+            _ => None,
+        }
+    }
+
+    /// Whether the step takes a hit of the daily cap: a message, or an effect that costs.
+    pub(crate) fn costs(&self) -> bool {
+        self.sends().is_some() || self.effect().is_some_and(Effect::costs)
     }
 
     /// How a send step goes out, its text (an AI step's prompt) and its buttons; `None` for a
@@ -378,7 +488,7 @@ impl Step {
             Self::ReplyPublicly { text } => Some((Via::Public, text, &[])),
             Self::AiSendDm { prompt } => Some((Via::Dm, prompt, &[])),
             Self::AiReplyPublicly { prompt } => Some((Via::Public, prompt, &[])),
-            Self::Wait { .. } | Self::TagContact { .. } => None,
+            _ => None,
         }
     }
 
@@ -492,8 +602,24 @@ pub fn validate_steps(
 ) -> Result<(), &'static str> {
     check_conditions(trigger, conditions)?;
     let wait = |s: Option<&Step>| matches!(s, Some(Step::Wait { .. }));
-    let sends = steps.iter().any(|s| s.sends().is_some());
-    if !sends || steps.len() > MAX_STEPS || wait(steps.first()) || wait(steps.last()) {
+    let sends = steps
+        .iter()
+        .any(|s| s.sends().is_some() || s.effect().is_some());
+    let stops = steps
+        .iter()
+        .filter(|s| matches!(s, Step::StopOthers))
+        .count();
+    let fits = steps
+        .iter()
+        .filter_map(Step::effect)
+        .all(|e| effect_fits(trigger, e));
+    if !sends
+        || !fits
+        || stops > 1
+        || steps.len() > MAX_STEPS
+        || wait(steps.first())
+        || wait(steps.last())
+    {
         return Err("invalid_steps");
     }
     for step in steps {
@@ -566,6 +692,15 @@ pub fn network_limits(
 ) -> Result<(), &'static str> {
     if providers.iter().any(|p| !AUTOMATED.contains(p)) {
         return Err("unsupported_account");
+    }
+    // Acting on a post (like, repost, hide) is built for the networks in `REACTORS` only.
+    let reacts = actions
+        .iter()
+        .filter_map(Action::effect)
+        .chain(steps.unwrap_or_default().iter().filter_map(Step::effect))
+        .any(Effect::on_post);
+    if reacts && providers.iter().any(|p| !REACTORS.contains(p)) {
+        return Err("unsupported_action");
     }
     if !providers.is_empty()
         && providers.iter().all(|p| *p == "x")
@@ -664,8 +799,24 @@ pub fn validate(
     let (dms, tagged) = (sends().filter(|s| s.0 == Via::Dm).count(), tags.len());
     tags.sort();
     tags.dedup();
-    let sent = actions.len() - tagged;
-    if sent == 0 || dms > 1 || sent - dms > 1 {
+    let sent = sends().count();
+    let effects: Vec<Effect> = actions.iter().filter_map(Action::effect).collect();
+    let mut kinds: Vec<&str> = effects.iter().map(|e| e.kind()).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    let stops = actions
+        .iter()
+        .filter(|a| matches!(a, Action::StopOthers))
+        .count();
+    // A message or an action of its own is needed beside tags; each effect at most once.
+    let doing = !effects.is_empty();
+    if (sent == 0 && !doing)
+        || dms > 1
+        || sent - dms > 1
+        || kinds.len() != effects.len()
+        || stops > 1
+        || effects.iter().any(|e| !effect_fits(trigger, *e))
+    {
         return Err("invalid_actions");
     }
     if tagged > MAX_TAG_ACTIONS || tags.len() != tagged || !tags.iter().all(|t| tag_ok(t)) {
@@ -688,6 +839,30 @@ pub fn validate(
         }
     }
     Ok(())
+}
+
+/// Whether the trigger gives an effect something to act on: the post's own actions need a
+/// comment or mention, hiding a reply a comment; a note is short; the rest fits any trigger.
+fn effect_fits(trigger: &str, e: Effect<'_>) -> bool {
+    match e {
+        Effect::Like | Effect::Repost => public(trigger),
+        Effect::HideReply => trigger == "comment_received",
+        Effect::Notify(note) => note.chars().count() <= 200 && !note.chars().any(char::is_control),
+        Effect::Assign(_) => true,
+    }
+}
+
+/// The assignees an automation names: the controller checks each is a member of the team.
+pub fn assignees(actions: &[Action], steps: Option<&[Step]>) -> Vec<Uuid> {
+    let from_actions = actions.iter().filter_map(Action::effect);
+    let from_steps = steps.unwrap_or_default().iter().filter_map(Step::effect);
+    from_actions
+        .chain(from_steps)
+        .filter_map(|e| match e {
+            Effect::Assign(u) => Some(u),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Whether every `{page}` can become a clean link: at the start or after whitespace or `(`,
@@ -958,6 +1133,7 @@ async fn run_matching(
     // two automated accounts cannot answer each other in a loop, and nothing runs while the team
     // has paused its automations. Each automation that would have run stores why it did not.
     let guard = loop_guard(db, item, account).await?;
+    let mut stopped = false;
     // A follower is welcomed once per account ever: an unfollow and a new follow stores a new
     // item (a new record) but runs nothing.
     if item.kind == "follow" {
@@ -1064,11 +1240,12 @@ async fn run_matching(
         // The hit pays for the first send: a flow that starts on a tag has not sent yet.
         let sends = steps
             .as_ref()
-            .is_none_or(|s| s.first().is_some_and(|x| x.sends().is_some()));
+            .is_none_or(|s| s.first().is_some_and(Step::costs));
         // Read for each automation, so a pause during the round holds the rest back.
         let held = match guard {
             Some(why) => Some(why),
             None if team_paused(db, item.team_id).await? => Some("paused"),
+            None if stopped => Some("stopped_by_other"),
             None => None,
         };
         if let Some(why) = held {
@@ -1098,6 +1275,12 @@ async fn run_matching(
         let Some(run_id) = claim(db, &a, item, steps.is_some(), sends, once).await? else {
             continue;
         };
+        // From here the team's later automations leave this item alone.
+        stopped |= actions.iter().any(|x| matches!(x, Action::StopOthers))
+            || steps
+                .iter()
+                .flatten()
+                .any(|x| matches!(x, Step::StopOthers));
         if let Some(steps) = &steps {
             let page = page.as_deref();
             let flow = Flow {
@@ -1208,10 +1391,26 @@ impl Flow<'_> {
                     }
                     continue;
                 }
+                Step::StopOthers => {
+                    if !self.step_on(run, &mut i, &results).await? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                step if step.effect().is_some() => {
+                    let effect = step.effect().expect("checked");
+                    let (app, account, item) = (self.app, self.account, self.item);
+                    results.push(do_effect(app, account, item, effect).await);
+                    if !self.step_on(run, &mut i, &results).await? {
+                        return Ok(());
+                    }
+                    continue;
+                }
                 Step::SendDm { text, buttons } => (Via::Dm, text, buttons),
                 Step::ReplyPublicly { text } => (Via::Public, text, &[]),
                 Step::AiSendDm { prompt } => (Via::Dm, prompt, &[]),
                 Step::AiReplyPublicly { prompt } => (Via::Public, prompt, &[]),
+                _ => unreachable!("effects and stops are handled above"),
             };
             let kind = self.steps[i].kind();
             let result = match with_page(template, self.page) {
@@ -1263,7 +1462,7 @@ impl Flow<'_> {
             settle(db, run, "sent", None, results).await?;
             return Ok(false);
         };
-        claim_step(db, run, self.a, *i, next.sends().is_some(), results).await
+        claim_step(db, run, self.a, *i, next.costs(), results).await
     }
 }
 
@@ -1510,7 +1709,7 @@ pub async fn resume(app: &AppState, run: &automation_runs::Model) -> Result<(), 
         return settle(db, run.id, "skipped", why, &results).await;
     }
     // Also where a run ends whose automation was switched off or given other steps since.
-    if !claim_step(db, run.id, &a, i, next.sends().is_some(), &results).await? {
+    if !claim_step(db, run.id, &a, i, next.costs(), &results).await? {
         return Ok(());
     }
     let flow = Flow {
@@ -1668,6 +1867,153 @@ async fn limited(
     Ok(None)
 }
 
+/// Does `effect` for `item`: acts on its post, assigns it, or mails the team. A result like a
+/// send's: `sent` when it was done, `skipped` when it could not apply (`unsupported_action`,
+/// `not_repliable`, `already_assigned`, `not_a_member`, `mail_cap`), `failed` when the network or
+/// mail refused it. Never retried.
+pub(crate) async fn do_effect(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    effect: Effect<'_>,
+) -> ActionResult {
+    let kind = effect.kind();
+    let result = |status: &str, reason: Option<&str>| ActionResult {
+        kind: kind.into(),
+        status: status.into(),
+        reason: reason.map(Into::into),
+        ..Default::default()
+    };
+    match effect {
+        Effect::Like | Effect::Repost | Effect::HideReply => {
+            let done = react(app, account, item, effect).await;
+            ActionResult {
+                remote_id: None,
+                ..outcome(kind, Ok(done.map(|()| String::new())))
+            }
+        }
+        Effect::Assign(user) => match assign(&app.db, item, user).await {
+            Ok(Ok(())) => result("sent", None),
+            Ok(Err(why)) => result("skipped", Some(why)),
+            Err(e) => {
+                tracing::error!(error = %e, item = %item.id, "automation assign failed");
+                result("failed", Some("internal"))
+            }
+        },
+        Effect::Notify(note) => match notify_team(app, account, item, note).await {
+            Ok(Ok(())) => result("sent", None),
+            Ok(Err(why)) => result("skipped", Some(why)),
+            Err(e) => {
+                tracing::error!(error = %e, item = %item.id, "automation notice failed");
+                result("failed", Some("internal"))
+            }
+        },
+    }
+}
+
+/// An action on the item's post, by network (`REACTORS`); the network's refusal as an error.
+async fn react(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    effect: Effect<'_>,
+) -> Result<(), InboxError> {
+    match (account.provider.as_str(), effect) {
+        ("x", Effect::Like) => crate::x_inbox::act(app, account, item, XAction::Like).await,
+        ("x", Effect::Repost) => crate::x_inbox::act(app, account, item, XAction::Repost).await,
+        ("x", Effect::HideReply) => crate::x_inbox::act(app, account, item, XAction::Hide).await,
+        _ => Err(InboxError::Invalid("unsupported_action")),
+    }
+}
+
+/// Assigns the item to `user` when nobody has it and `user` is still a member of its team.
+async fn assign(
+    db: &DatabaseConnection,
+    item: &inbox_items::Model,
+    user: Uuid,
+) -> Result<Result<(), &'static str>, DbErr> {
+    let member = sql(
+        "SELECT EXISTS (SELECT 1 FROM team_user WHERE team_id = $1 AND user_id = $2) AS ok",
+        vec![item.team_id.into(), user.into()],
+    );
+    let ok: bool = match db.query_one_raw(member).await? {
+        Some(r) => r.try_get("", "ok")?,
+        None => false,
+    };
+    if !ok {
+        return Ok(Err("not_a_member"));
+    }
+    let set = sql(
+        "UPDATE inbox_items SET assigned_to = $2 WHERE id = $1 AND assigned_to IS NULL",
+        vec![item.id.into(), user.into()],
+    );
+    Ok(match db.execute_raw(set).await?.rows_affected() {
+        1 => Ok(()),
+        _ => Err("already_assigned"),
+    })
+}
+
+/// Notices an automation may mail a team in a day.
+const NOTICES_PER_DAY: i64 = 50;
+
+/// Mails the team's owners and admins that `item` came, once per run. Plain text with the
+/// network, the kind, a safe first name and a link; the stranger's own words are not copied in.
+async fn notify_team(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    note: &str,
+) -> Result<Result<(), &'static str>, DbErr> {
+    let cap = [(
+        format!("automation-mail:team:{}", item.team_id),
+        NOTICES_PER_DAY,
+    )];
+    if crate::rate_limit::daily_reserve(&app.db, &cap)
+        .await?
+        .is_none()
+    {
+        return Ok(Err("mail_cap"));
+    }
+    let to = app
+        .db
+        .query_all_raw(sql(
+            "SELECT DISTINCT u.email, t.code FROM team_user m JOIN users u ON u.id = m.user_id \
+             JOIN teams t ON t.id = m.team_id WHERE m.team_id = $1 \
+             AND m.role IN ('owner', 'admin') ORDER BY u.email",
+            vec![item.team_id.into()],
+        ))
+        .await?;
+    let network = crate::expiry::label(&account.provider);
+    let what = match item.kind.as_str() {
+        "dm" => "message",
+        other => other,
+    };
+    let who = safe_name(item.author_name.as_deref()).unwrap_or_else(|| "someone".into());
+    let mut mailed = false;
+    for r in &to {
+        let email: String = r.try_get("", "email")?;
+        let code: String = r.try_get("", "code")?;
+        let link = format!("{}/t/{code}/inbox?item={}", app.web_url, item.id);
+        let note = note.trim();
+        let note = if note.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nNote from the automation: {note}")
+        };
+        let text = format!(
+            "A new {what} from {who} reached your {network} account.{note}\n\nOpen it: {link}"
+        );
+        let subject = format!("New {what} on {network}");
+        match app.mailer.send(&email, &subject, text, &app.web_url).await {
+            Ok(()) => mailed = true,
+            Err(e) => {
+                tracing::warn!(error = %e, item = %item.id, "automation notice mail not sent")
+            }
+        }
+    }
+    Ok(if mailed { Ok(()) } else { Err("mail_failed") })
+}
+
 /// One action's outcome, as stored in a run's `results`.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq, Eq, Default)]
 pub struct ActionResult {
@@ -1704,7 +2050,10 @@ fn outcome(kind: &str, sent: Result<Result<String, InboxError>, DbErr>) -> Actio
             e @ (InboxError::DmNotAllowed
             | InboxError::NoDmAccess
             | InboxError::RateLimited
-            | InboxError::Invalid("outside_window" | "already_replied" | "dm_unavailable")),
+            | InboxError::Invalid(
+                "outside_window" | "already_replied" | "dm_unavailable" | "unsupported_action"
+                | "not_repliable",
+            )),
         )) => ("skipped", Some(e.code().to_owned()), None),
         Ok(Err(e)) => ("failed", Some(e.code().to_owned()), None),
         Err(e) => {
@@ -1759,6 +2108,8 @@ async fn act(
         let Some((via, template)) = action.via_text() else {
             if let Action::TagContact { tag } = action {
                 results.push(tag_contact(&app.db, item, tag).await);
+            } else if let Some(effect) = action.effect() {
+                results.push(do_effect(app, account, item, effect).await);
             }
             continue;
         };

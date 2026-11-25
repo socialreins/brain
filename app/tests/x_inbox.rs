@@ -913,11 +913,16 @@ impl Env {
 
     /// A mention from `author` arrives and the automations run over it.
     async fn arrive(&self, author: &str, text: &str) {
+        self.arrive_as("mention", author, text).await;
+    }
+
+    /// An item of `kind` (`mention` or `comment`) from `author` arrives; its row id.
+    async fn arrive_as(&self, kind: &str, author: &str, text: &str) -> Uuid {
         let remote = Utc::now().timestamp_nanos_opt().unwrap().to_string();
         self.sql(&format!(
             "INSERT INTO inbox_items (id, team_id, social_account_id, platform, kind, remote_id, \
              parent_remote_id, root_remote_id, author_id, author_name, text, received_at, state) \
-             VALUES (gen_random_uuid(), '{}', '{}', 'x', 'mention', '{remote}', '{remote}', \
+             VALUES (gen_random_uuid(), '{}', '{}', 'x', '{kind}', '{remote}', '{remote}', \
              '{remote}', '{author}', 'Ann', '{text}', now() - interval '1 minute', 'open')",
             self.team, self.account
         ))
@@ -936,6 +941,18 @@ impl Env {
         socialreins_brain::automations::run(&self.state, &account, &item)
             .await
             .unwrap();
+        item.id
+    }
+
+    /// The one run row of an automation, as (status, reason, results).
+    async fn run_row(&self, id: &str) -> Option<sea_orm::QueryResult> {
+        let sql = format!(
+            "SELECT status, reason, results FROM automation_runs WHERE automation_id = '{id}'"
+        );
+        self.db
+            .query_one_raw(Statement::from_string(DbBackend::Postgres, sql))
+            .await
+            .unwrap()
     }
 
     /// (status, reason) of the automation's runs, oldest first.
@@ -1280,4 +1297,135 @@ async fn a_question_is_paid_for_once_and_given_back_when_it_cannot_be_judged() {
     // A question mark costs nothing.
     e.arrive(&who(), "Where can I buy this?").await;
     assert_eq!(ledger().await, (before, 3));
+
+async fn actions_like_repost_hide_assign_notify_and_stop_the_rest() {
+    let e = env(ALL, false).await;
+    let me =
+        e.s.get("/auth/me")
+            .add_header("cookie", e.cookie.clone())
+            .await
+            .json::<Value>()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    // What a trigger can do: no like on a DM, no hide under a mention, an assignee on the team,
+    // each action once, and a short note.
+    let try_it = |trigger: &str, actions: Value| {
+        let body = json!({"name": "x", "trigger": trigger, "actions": actions});
+        e.req(Method::POST, "/v1/automations", body)
+    };
+    let reply = json!({"type": "reply_publicly", "text": "t"});
+    for (trigger, actions, code) in [
+        ("dm_received", json!([{"type": "like"}]), "invalid_actions"),
+        (
+            "mention_received",
+            json!([{"type": "hide_reply"}]),
+            "invalid_actions",
+        ),
+        (
+            "mention_received",
+            json!([{"type": "like"}, {"type": "like"}]),
+            "invalid_actions",
+        ),
+        (
+            "mention_received",
+            json!([reply, {"type": "stop_others"}, {"type": "stop_others"}]),
+            "invalid_actions",
+        ),
+        (
+            "mention_received",
+            json!([{"type": "notify_team", "note": "a".repeat(201)}]),
+            "invalid_actions",
+        ),
+        (
+            "mention_received",
+            json!([{"type": "assign", "user_id": Uuid::now_v7()}]),
+            "invalid_assignee",
+        ),
+        // Tags and a stop alone do nothing.
+        (
+            "mention_received",
+            json!([{"type": "tag_contact", "tag": "a"}, {"type": "stop_others"}]),
+            "invalid_actions",
+        ),
+    ] {
+        let res = try_it(trigger, actions.clone()).await;
+        assert_eq!(res.status_code(), 422, "{actions}");
+        assert_eq!(res.json::<Value>()["error"], code, "{actions}");
+    }
+    // Under a comment: like, repost, hide, assign, mail and a reply, and stop the others.
+    let first = e
+        .automation(json!({"name": "Everything", "trigger": "comment_received",
+            "actions": [{"type": "like"}, {"type": "repost"}, {"type": "hide_reply"},
+                {"type": "assign", "user_id": me}, {"type": "notify_team", "note": "look"},
+                {"type": "stop_others"}, reply]}))
+        .await;
+    let second = e
+        .automation(json!({"name": "Later", "trigger": "comment_received"}))
+        .await;
+    let item = e.arrive_as("comment", &who(), "hello").await;
+    let r = e.run_row(&first).await.expect("ran");
+    assert_eq!(r.try_get::<String>("", "status").unwrap(), "sent");
+    let results: Value = r.try_get("", "results").unwrap();
+    let got: Vec<(String, String)> = results
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| {
+            (
+                x["type"].as_str().unwrap().into(),
+                x["status"].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    let sent = |k: &str| (k.to_owned(), "sent".to_owned());
+    assert_eq!(
+        got,
+        vec![
+            sent("like"),
+            sent("repost"),
+            sent("hide_reply"),
+            sent("assign"),
+            sent("notify_team"),
+            sent("reply_publicly")
+        ]
+    );
+    assert_eq!(e.mock.seen("POST", "/2/users/1/likes").len(), 1);
+    assert_eq!(e.mock.seen("POST", "/2/users/1/retweets").len(), 1);
+    assert_eq!(
+        e.mock.seen("PUT", "/2/tweets/").len()
+            + e.mock
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.0 == "PUT" && c.1.ends_with("/hidden"))
+                .count(),
+        1
+    );
+    let assigned =
+        e.db.query_one_raw(Statement::from_string(
+            DbBackend::Postgres,
+            format!("SELECT assigned_to::text AS a FROM inbox_items WHERE id = '{item}'"),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(assigned.try_get::<String>("", "a").unwrap(), me);
+    // The later automation was stopped, and says so.
+    let r = e.run_row(&second).await.expect("logged");
+    assert_eq!(
+        r.try_get::<String>("", "reason").unwrap(),
+        "stopped_by_other"
+    );
+    // On a network that cannot do it, the like is skipped, and a save naming such accounts is refused.
+    assert!(matches!(
+        socialreins_brain::automations::network_limits(
+            "mention_received",
+            &["bluesky"],
+            &[socialreins_brain::automations::Action::Like],
+            None
+        ),
+        Err("unsupported_action")
+    ));
 }
