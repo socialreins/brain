@@ -396,7 +396,7 @@ const META_PRIVATE_REPLY_MINUTES: u32 = 7 * 24 * 60;
 /// button tap never come (`bluesky_unsupported_trigger`; its buttons are numbered lines the
 /// person answers with a DM keyword). Bluesky has no private reply either: a DM goes only to
 /// someone who follows the account or allows DMs from anyone, and a welcome DM to a new
-/// follower does, as they follow us. A mixed scope is left to fail item by item.
+/// follower normally does, as they follow us (unless they closed their DMs). A mixed scope is left to fail item by item.
 pub fn network_limits(
     trigger: &str,
     providers: &[&str],

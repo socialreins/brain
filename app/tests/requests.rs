@@ -23981,6 +23981,23 @@ mod teams {
                     let out = try_it(refused, sample("guide")).await.json::<Value>();
                     assert_eq!(out["steps"][0]["status"], "would_send", "{out}");
                     assert_eq!(out["steps"].as_array().unwrap().len(), 1);
+                    // A flow stops at the refused DM; an AI DM is written first, as a run does.
+                    let closed = || {
+                        json!({"account_id": account, "text": "guide",
+                        "author_name": "Fan", "author_can_dm": false})
+                    };
+                    let two = automation(json!([
+                        {"type": "send_dm", "text": "Hi"},
+                        {"type": "reply_publicly", "text": "Hello"}]));
+                    let out = try_it(two, closed()).await.json::<Value>();
+                    assert_eq!(out["steps"][0]["reason"], "dm_not_allowed", "{out}");
+                    assert_eq!(out["steps"][1]["status"], "not_reached");
+                    reply("Thanks for asking");
+                    let ai = automation(json!([{"type": "ai_send_dm", "prompt": PROMPT}]));
+                    let out = try_it(ai, closed()).await.json::<Value>();
+                    assert_eq!(out["steps"][0]["status"], "would_skip", "{out}");
+                    assert_eq!(out["steps"][0]["reason"], "dm_not_allowed");
+                    assert_eq!(out["steps"][0]["text"], "Thanks for asking");
 
                     // An account without DM access: the DM would be skipped, the rest not reached.
                     db.execute_raw(sea_orm::Statement::from_sql_and_values(

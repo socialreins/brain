@@ -96,9 +96,10 @@ pub struct Outcome {
     /// first-only conditions pass.)
     pub mismatches: Vec<String>,
     /// Rules that would stop it: `no_public_page` (a text holds `{page}` and the post has no
-    /// live page: the automation does not run, so there are no steps), and the Facebook and
-    /// Instagram rules of `network_limits` that make a send fail (`meta_one_private_reply`,
-    /// `meta_reply_window`; the steps are still listed, as a run would go as far as it can).
+    /// live page: the automation does not run, so there are no steps), and the rules of
+    /// `network_limits` for the account's network (`meta_one_private_reply`,
+    /// `meta_reply_window`, `x_unsupported_trigger`, `bluesky_unsupported_trigger`; the steps are
+    /// still listed, as a run would go as far as it can).
     pub blocks: Vec<String>,
     pub steps: Vec<PlannedStep>,
 }
@@ -469,17 +470,15 @@ async fn plan_send(
         if no_dm {
             return skipped("no_dm_access");
         }
-        // A run's AI call is given back when the send is refused, so it is not written here.
-        if refused {
-            return skipped("dm_not_allowed");
-        }
         let reference = format!("ai:test:{}", Uuid::now_v7());
         return match rules::ai_write(app, account, item, (kind, via, template), &reference).await {
+            // A run writes first and only then learns the person refuses: the call is spent.
             Ok(w) => PlannedStep {
                 text: Some(w.text),
                 provider: Some(w.provider),
                 model: w.model,
-                ..step(kind, "would_send")
+                reason: refused.then(|| "dm_not_allowed".into()),
+                ..step(kind, if refused { "would_skip" } else { "would_send" })
             },
             Err(r) => ended(r),
         };
