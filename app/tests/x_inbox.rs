@@ -1432,3 +1432,92 @@ async fn actions_like_repost_hide_assign_notify_and_stop_the_rest() {
         Err("unsupported_action")
     ));
 }
+
+#[tokio::test]
+#[serial]
+async fn a_stopped_run_is_not_a_first_an_assignment_never_overrides_and_flows_do_effects() {
+    let e = env(ALL, false).await;
+    e.sql("UPDATE automation_runs SET status = 'skipped' WHERE status IN ('waiting', 'running')")
+        .await;
+    let me =
+        e.s.get("/auth/me")
+            .add_header("cookie", e.cookie.clone())
+            .await
+            .json::<Value>()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    let stopper = e
+        .automation(json!({"name": "Stopper", "actions": [{"type": "reply_publicly", "text": "a"}, {"type": "stop_others"}]}))
+        .await;
+    let welcome = e
+        .automation(json!({"name": "Welcome", "conditions": {"account_ids": [e.account], "first_per_author": true}}))
+        .await;
+    let ann = who();
+    e.arrive(&ann, "hello").await;
+    assert_eq!(
+        e.runs(&welcome).await,
+        vec![run("skipped", Some("stopped_by_other"))]
+    );
+    // The stopper goes off: Ann's next mention is still her first for the welcome.
+    let res = e
+        .req(
+            Method::POST,
+            &format!("/v1/automations/{stopper}/disable"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(res.status_code(), 200);
+    e.arrive(&ann, "hello again").await;
+    assert_eq!(e.runs(&welcome).await.last().unwrap(), &run("sent", None));
+    // An item somebody has already is not taken over.
+    let assign = e
+        .automation(json!({"name": "Assign", "actions": [{"type": "assign", "user_id": me}]}))
+        .await;
+    let remote = Utc::now().timestamp_nanos_opt().unwrap().to_string();
+    e.sql(&format!(
+        "INSERT INTO inbox_items (id, team_id, social_account_id, platform, kind, remote_id, \
+         author_id, text, received_at, state, assigned_to) VALUES (gen_random_uuid(), '{}', '{}', \
+         'x', 'mention', '{remote}', '{}', 'hi', now() - interval '1 minute', 'open', '{me}')",
+        e.team,
+        e.account,
+        who()
+    ))
+    .await;
+    let item = socialreins_brain::models::inbox_items::Entity::find()
+        .filter(socialreins_brain::models::inbox_items::Column::RemoteId.eq(remote))
+        .one(&e.db)
+        .await
+        .unwrap()
+        .unwrap();
+    let account = socialreins_brain::models::social_accounts::Entity::find_by_id(e.account)
+        .one(&e.db)
+        .await
+        .unwrap()
+        .unwrap();
+    socialreins_brain::automations::run(&e.state, &account, &item)
+        .await
+        .unwrap();
+    let row = e.run_row(&assign).await.expect("ran");
+    let results: Value = row.try_get("", "results").unwrap();
+    assert_eq!(results[0]["status"], "skipped");
+    assert_eq!(results[0]["reason"], "already_assigned");
+    // A flow likes, waits and replies; duplicate effects in one flow are refused on save.
+    let steps = |s: Value| json!({"name": "Flow", "trigger": "comment_received", "conditions": {"account_ids": [e.account]}, "actions": null, "steps": s});
+    let twice =
+        steps(json!([{"type": "like"}, {"type": "like"}, {"type": "reply_publicly", "text": "x"}]));
+    assert_eq!(
+        e.req(Method::POST, "/v1/automations", twice)
+            .await
+            .status_code(),
+        422
+    );
+    let flow = e
+        .automation(steps(json!([{"type": "like"}, {"type": "wait", "minutes": 1}, {"type": "reply_publicly", "text": "later"}])))
+        .await;
+    let item = e.arrive_as("comment", &who(), "hello").await;
+    let _ = item;
+    let runs = e.runs(&flow).await;
+    assert!(runs.contains(&run("waiting", None)), "{runs:?}");
+    assert!(e.mock.seen("POST", "/2/users/1/likes").len() >= 1);
+}

@@ -87,7 +87,8 @@ const CHANGED: &str = "automation_changed";
 /// toward a cool-down or an automation's cap. SQL on a run aliased `r`.
 const NOT_ACTED: &str = "(r.status = 'skipped' AND COALESCE(r.reason, '') IN ('paused', \
     'own_account', 'connected_account', 'cooldown', 'automation_cap', 'daily_cap', \
-    'no_question', 'question_cap', 'no_ai_key', 'no_ai_credits', 'ai_failed'))";
+    'no_question', 'question_cap', 'no_ai_key', 'no_ai_credits', 'ai_failed', \
+    'stopped_by_other', 'unsupported_action'))";
 /// Longest `{name}` put into a text.
 pub(crate) const MAX_NAME_CHARS: usize = 64;
 /// What `{page}` counts as when a text is checked.
@@ -613,8 +614,18 @@ pub fn validate_steps(
         .iter()
         .filter_map(Step::effect)
         .all(|e| effect_fits(trigger, e));
+    // Each effect at most once, as in a list of actions.
+    let mut kinds: Vec<&str> = steps
+        .iter()
+        .filter_map(Step::effect)
+        .map(|e| e.kind())
+        .collect();
+    let all = kinds.len();
+    kinds.sort_unstable();
+    kinds.dedup();
     if !sends
         || !fits
+        || kinds.len() != all
         || stops > 1
         || steps.len() > MAX_STEPS
         || wait(steps.first())
@@ -1133,7 +1144,6 @@ async fn run_matching(
     // two automated accounts cannot answer each other in a loop, and nothing runs while the team
     // has paused its automations. Each automation that would have run stores why it did not.
     let guard = loop_guard(db, item, account).await?;
-    let mut stopped = false;
     // A follower is welcomed once per account ever: an unfollow and a new follow stores a new
     // item (a new record) but runs nothing.
     if item.kind == "follow" {
@@ -1245,11 +1255,22 @@ async fn run_matching(
         let held = match guard {
             Some(why) => Some(why),
             None if team_paused(db, item.team_id).await? => Some("paused"),
-            None if stopped => Some("stopped_by_other"),
+            None if stopped_before(db, item, &a).await? => Some("stopped_by_other"),
             None => None,
         };
         if let Some(why) = held {
             skip_run(db, &a, item, why).await?;
+            continue;
+        }
+        // Acting on a post is built for some networks only; an automation not limited to them by
+        // name finds out here, before it takes a hit of the cap.
+        let reacts = actions
+            .iter()
+            .filter_map(Action::effect)
+            .chain(steps.iter().flatten().filter_map(Step::effect))
+            .any(Effect::on_post);
+        if reacts && !REACTORS.contains(&account.provider.as_str()) {
+            skip_run(db, &a, item, "unsupported_action").await?;
             continue;
         }
         // Last of the conditions, as it may cost an AI call: only a message that got this far.
@@ -1275,12 +1296,6 @@ async fn run_matching(
         let Some(run_id) = claim(db, &a, item, steps.is_some(), sends, once).await? else {
             continue;
         };
-        // From here the team's later automations leave this item alone.
-        stopped |= actions.iter().any(|x| matches!(x, Action::StopOthers))
-            || steps
-                .iter()
-                .flatten()
-                .any(|x| matches!(x, Step::StopOthers));
         if let Some(steps) = &steps {
             let page = page.as_deref();
             let flow = Flow {
@@ -1330,6 +1345,36 @@ pub(crate) async fn team_paused(db: &impl ConnectionTrait, team: Uuid) -> Result
     );
     match db.query_one_raw(stmt).await? {
         Some(r) => r.try_get("", "paused"),
+        None => Ok(false),
+    }
+}
+
+/// Whether an automation made before `a` that stops the others has a run on `item` that acted
+/// (a stopper held back by a cool-down, a cap or a pause does not stop anyone). Read from the
+/// runs, so a sweep that comes back to the item decides as the first round did.
+async fn stopped_before(
+    db: &DatabaseConnection,
+    item: &inbox_items::Model,
+    a: &automations::Model,
+) -> Result<bool, DbErr> {
+    let stmt = sql(
+        &format!(
+            "SELECT EXISTS (SELECT 1 FROM automation_runs r \
+             JOIN automations x ON x.id = r.automation_id \
+             WHERE r.inbox_item_id = $1 AND x.team_id = $2 AND x.id <> $3 \
+             AND (x.created_at, x.id) < ($4, $3) AND NOT {NOT_ACTED} \
+             AND (x.actions @> '[{{\"type\": \"stop_others\"}}]' \
+                  OR COALESCE(x.steps, '[]'::jsonb) @> '[{{\"type\": \"stop_others\"}}]')) AS yes"
+        ),
+        vec![
+            item.id.into(),
+            item.team_id.into(),
+            a.id.into(),
+            a.created_at.into(),
+        ],
+    );
+    match db.query_one_raw(stmt).await? {
+        Some(r) => r.try_get("", "yes"),
         None => Ok(false),
     }
 }
@@ -1926,38 +1971,41 @@ async fn react(
     }
 }
 
-/// Assigns the item to `user` when nobody has it and `user` is still a member of its team.
+/// Assigns the item to `user` when nobody has it and `user` is still a member of its team. The
+/// membership is held (`FOR SHARE`) until the assignment commits, as the inbox does, so removing
+/// the member waits and then clears it.
 async fn assign(
     db: &DatabaseConnection,
     item: &inbox_items::Model,
     user: Uuid,
 ) -> Result<Result<(), &'static str>, DbErr> {
+    let txn = db.begin().await?;
     let member = sql(
-        "SELECT EXISTS (SELECT 1 FROM team_user WHERE team_id = $1 AND user_id = $2) AS ok",
+        "SELECT user_id FROM team_user WHERE team_id = $1 AND user_id = $2 FOR SHARE",
         vec![item.team_id.into(), user.into()],
     );
-    let ok: bool = match db.query_one_raw(member).await? {
-        Some(r) => r.try_get("", "ok")?,
-        None => false,
-    };
-    if !ok {
+    if txn.query_one_raw(member).await?.is_none() {
         return Ok(Err("not_a_member"));
     }
     let set = sql(
         "UPDATE inbox_items SET assigned_to = $2 WHERE id = $1 AND assigned_to IS NULL",
         vec![item.id.into(), user.into()],
     );
-    Ok(match db.execute_raw(set).await?.rows_affected() {
-        1 => Ok(()),
-        _ => Err("already_assigned"),
+    let changed = txn.execute_raw(set).await?.rows_affected();
+    txn.commit().await?;
+    Ok(if changed == 1 {
+        Ok(())
+    } else {
+        Err("already_assigned")
     })
 }
 
 /// Notices an automation may mail a team in a day.
 const NOTICES_PER_DAY: i64 = 50;
 
-/// Mails the team's owners and admins that `item` came, once per run. Plain text with the
-/// network, the kind, a safe first name and a link; the stranger's own words are not copied in.
+/// Mails the team's owners and admins that `item` came, once per run, at most `NOTICES_PER_DAY` a
+/// team a day (each goes to every owner and admin; the allowance is given back when no mail
+/// went). Plain text with the network, the kind and a link; nothing the stranger wrote is copied in.
 async fn notify_team(
     app: &AppState,
     account: &social_accounts::Model,
@@ -1968,12 +2016,9 @@ async fn notify_team(
         format!("automation-mail:team:{}", item.team_id),
         NOTICES_PER_DAY,
     )];
-    if crate::rate_limit::daily_reserve(&app.db, &cap)
-        .await?
-        .is_none()
-    {
+    let Some(hits) = crate::rate_limit::daily_reserve(&app.db, &cap).await? else {
         return Ok(Err("mail_cap"));
-    }
+    };
     let to = app
         .db
         .query_all_raw(sql(
@@ -1988,28 +2033,30 @@ async fn notify_team(
         "dm" => "message",
         other => other,
     };
-    let who = safe_name(item.author_name.as_deref()).unwrap_or_else(|| "someone".into());
+    let note = note.trim();
+    let note = if note.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nNote from the automation: {note}")
+    };
     let mut mailed = false;
     for r in &to {
         let email: String = r.try_get("", "email")?;
         let code: String = r.try_get("", "code")?;
         let link = format!("{}/t/{code}/inbox?item={}", app.web_url, item.id);
-        let note = note.trim();
-        let note = if note.is_empty() {
-            String::new()
-        } else {
-            format!("\n\nNote from the automation: {note}")
-        };
-        let text = format!(
-            "A new {what} from {who} reached your {network} account.{note}\n\nOpen it: {link}"
-        );
+        // Nothing the stranger wrote goes in: not their text, not even their name.
+        let text =
+            format!("A new {what} reached your {network} account.{note}\n\nOpen it:\n{link}");
         let subject = format!("New {what} on {network}");
         match app.mailer.send(&email, &subject, text, &app.web_url).await {
             Ok(()) => mailed = true,
             Err(e) => {
-                tracing::warn!(error = %e, item = %item.id, "automation notice mail not sent")
+                tracing::warn!(error = %e, item = %item.id, "automation notice mail not sent");
             }
         }
+    }
+    if !mailed {
+        crate::rate_limit::daily_refund(&app.db, &hits).await;
     }
     Ok(if mailed { Ok(()) } else { Err("mail_failed") })
 }
@@ -2439,7 +2486,12 @@ async fn ai_send(
 /// anything went, else `failed` when anything failed, else `skipped`; the reason is the first
 /// one given.
 pub fn summary(results: &[ActionResult]) -> (&'static str, Option<String>) {
-    let sends = || results.iter().filter(|r| r.kind != "tag_contact");
+    // A tag and an assignment cost nothing and say nothing of what went out.
+    let sends = || {
+        results
+            .iter()
+            .filter(|r| !matches!(r.kind.as_str(), "tag_contact" | "assign"))
+    };
     let status = if sends().any(|r| r.status == "sent") {
         "sent"
     } else if sends().any(|r| r.status == "failed") {
