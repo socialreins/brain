@@ -11059,7 +11059,8 @@ mod teams {
                     );
                     assert_eq!(
                         q["scope"],
-                        "threads_basic,threads_content_publish,threads_manage_replies,threads_delete"
+                        "threads_basic,threads_content_publish,threads_manage_replies,threads_delete,\
+                         threads_read_replies,threads_manage_mentions"
                     );
                     let set = res
                         .iter_headers_by_name("set-cookie")

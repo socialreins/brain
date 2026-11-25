@@ -313,6 +313,14 @@ pub async fn perform(
     action: Action,
     extra: &Extra<'_>,
 ) -> Result<Option<String>, InboxError> {
+    if account.provider == "threads" && item.platform == "threads" {
+        let hide = match action {
+            Action::HideReply => Some(true),
+            Action::UnhideReply => Some(false),
+            _ => None,
+        };
+        return crate::threads_inbox::perform(app, account, item, hide).await;
+    }
     if account.provider != "bluesky" || item.platform != "bluesky" {
         return Err(InboxError::Invalid("unsupported_platform"));
     }

@@ -68,6 +68,11 @@ pub struct Connection {
     /// must be connected again. Absent otherwise.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub reconnect: bool,
+    /// Threads: Threads refused reading replies because the account was connected without that
+    /// permission, so replies do not reach the inbox until it is connected again (the web says
+    /// "reconnect to enable replies"). Absent otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub replies_denied: bool,
     /// X: the account may post 25,000 weighted characters instead of 280: the user's `plan`
     /// when set, else what X reported (learned at connect, or at the next token renewal for an
     /// older account). Absent otherwise.
@@ -191,6 +196,7 @@ fn connection_json(a: social_accounts::Model, set_ids: Vec<Uuid>) -> Connection 
         dm_access: a.dm_access,
         webhook_error: a.meta["webhook_error"].as_str().map(str::to_owned),
         reconnect: a.meta["reconnect"].as_bool() == Some(true),
+        replies_denied: a.meta["replies_denied"].as_bool() == Some(true),
         long_posts: super::x::x_long_posts(&a.meta),
         detected_long_posts: a.meta["long_posts"].as_bool(),
         plan: a.meta["plan"].as_str().map(str::to_owned),

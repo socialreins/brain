@@ -222,7 +222,12 @@ impl Config {
                 media.dir = var("S3_BUCKET").is_none().then(|| media_dir(var).into());
                 media
             },
-            threads: Threads::new(var("THREADS_APP_ID").zip(var("THREADS_APP_SECRET")))?,
+            threads: {
+                let mut threads =
+                    Threads::new(var("THREADS_APP_ID").zip(var("THREADS_APP_SECRET")))?;
+                threads.webhook_token = var("THREADS_WEBHOOK_VERIFY_TOKEN");
+                threads
+            },
             linkedin: LinkedIn::new(var("LINKEDIN_CLIENT_ID").zip(var("LINKEDIN_CLIENT_SECRET")))?,
             youtube: YouTube::new(var("GOOGLE_CLIENT_ID").zip(var("GOOGLE_CLIENT_SECRET")))?,
             x: X::new(var("X_CLIENT_ID").zip(var("X_CLIENT_SECRET")))?,
