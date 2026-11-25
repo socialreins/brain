@@ -51,6 +51,8 @@ pub struct ActionInput {
     /// `report`: report the author's account instead of the post.
     #[serde(default)]
     pub account: bool,
+    /// `react`, `unreact`: one emoji.
+    pub emoji: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -82,6 +84,8 @@ pub struct Actions {
     /// not be read (`viewer_error` says why).
     pub viewer: Option<Viewer>,
     pub viewer_error: Option<&'static str>,
+    /// A DM's conversation, read live; `null` for other items or when Bluesky could not be read.
+    pub convo: Option<actions::Convo>,
     /// The reply is hidden from our thread, by the last hide or unhide made here.
     pub hidden: bool,
     /// Newest first.
@@ -160,9 +164,15 @@ async fn list(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> R
     } else {
         (None, Some("unsupported_platform"))
     };
+    let convo = if item.kind == "dm" && item.platform == "bluesky" {
+        actions::convo(&app, &account, &item).await.ok().flatten()
+    } else {
+        None
+    };
     Json(Actions {
         viewer,
         viewer_error,
+        convo,
         hidden,
         log,
     })
@@ -258,6 +268,7 @@ async fn act(
         reason_type: input.reason_type.as_deref(),
         reason: input.reason.as_deref(),
         account: input.account,
+        emoji: input.emoji.as_deref(),
     };
     let outcome = actions::perform(&app, &account, &item, input.action, &extra).await;
     if outcome == Err(InboxError::Reconnect) {
@@ -267,6 +278,7 @@ async fn act(
     let detail = json!({
         "account": input.account,
         "reply_id": input.reply_id,
+        "emoji": input.emoji,
         "reason_type": input.reason_type,
         "reason_chars": input.reason.as_ref().map(|r| r.chars().count()),
     });

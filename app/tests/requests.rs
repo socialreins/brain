@@ -3560,6 +3560,11 @@ mod teams {
                 .route("/xrpc/chat.bsky.convo.listConvos", get(list_convos))
                 .route("/xrpc/chat.bsky.convo.getMessages", get(get_messages))
                 .route(
+                    "/xrpc/chat.bsky.convo.listConvoRequests",
+                    get(list_requests),
+                )
+                .route("/xrpc/chat.bsky.convo.getConvo", get(get_convo))
+                .route(
                     "/xrpc/chat.bsky.convo.getConvoAvailability",
                     get(convo_availability),
                 )
@@ -3770,6 +3775,37 @@ mod teams {
             (axum::http::StatusCode::OK, Json(json!({ "convos": list })))
         }
 
+        /// Message requests: the account's `requests`.
+        async fn list_requests(headers: axum::http::HeaderMap) -> Answer {
+            let did = match chat_caller(&headers) {
+                Ok(d) => d,
+                Err(a) => return a,
+            };
+            let list = inbox_of(&did)["requests"].clone();
+            let list = if list.is_null() { json!([]) } else { list };
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({ "requests": list })),
+            )
+        }
+
+        /// One conversation: the account's `convo_info` for it.
+        async fn get_convo(
+            headers: axum::http::HeaderMap,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> Answer {
+            let did = match chat_caller(&headers) {
+                Ok(d) => d,
+                Err(a) => return a,
+            };
+            match inbox_of(&did)["convo_info"][q.get("convoId").cloned().unwrap_or_default()]
+                .clone()
+            {
+                Value::Null => refused(400, "InvalidConvo"),
+                convo => (axum::http::StatusCode::OK, Json(json!({ "convo": convo }))),
+            }
+        }
+
         async fn get_messages(
             headers: axum::http::HeaderMap,
             Query(q): Query<HashMap<String, String>>,
@@ -3830,6 +3866,13 @@ mod teams {
                 .contains("BLOCKED")
             {
                 return refused(400, "InvalidRequest");
+            }
+            if b["message"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("LOCKED")
+            {
+                return refused(400, "ConvoLocked");
             }
             SENT.lock().unwrap().push(b);
             let id = format!("m{}", &uuid::Uuid::now_v7().simple().to_string()[20..]);
@@ -25483,6 +25526,122 @@ mod teams {
                 assert_eq!(res.status_code(), 404);
             }
 
+            /// A message request is read like any DM, its conversation says it is a request,
+            /// and a DM can be accepted, muted, marked read, reacted to and deleted for us.
+            #[tokio::test]
+            #[serial]
+            async fn message_requests_and_dm_actions() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
+                let (member, _) = joined(&s, &db, &team_id, "member").await;
+                let ask = |last: &str| {
+                    json!({"id": "rq1", "status": "request", "members": [
+                    {"did": me}, {"did": "did:plc:stranger", "handle": "stranger.test"}],
+                    "lastMessage": {"sentAt": last}})
+                };
+                let info = |kind: &str, status: &str| {
+                    json!({"rq1": {"status": status, "muted": false,
+                    "unreadCount": 2, "members": [1, 2, 3],
+                    "kind": {"$type": format!("chat.bsky.convo.defs#{kind}")}}})
+                };
+                set_inbox(
+                    &me,
+                    json!({"notifications": [], "convos": [], "requests": [ask(&at(5)),
+                        {"id": "join", "status": "request"}],
+                        "messages": {"rq1": [dm("rm1", "did:plc:stranger", "hello stranger", &at(5))]},
+                        "convo_info": info("groupConvo", "request")}),
+                );
+                ingest(&db, &state, &account).await;
+                ingest(&db, &state, &account).await;
+                assert_eq!(
+                    stored_count(&db, &team_id).await,
+                    1,
+                    "the request's message, once"
+                );
+                let all = all_inbox(&s, &cookie).await;
+                let page = items(&s, &cookie, all["id"].as_str().unwrap(), "").await;
+                let dm_id = page["items"][0]["id"].as_str().unwrap().to_owned();
+                let seen = fetch(&s, &member, &format!("/v1/inbox-items/{dm_id}/actions")).await;
+                assert_eq!(
+                    seen["convo"],
+                    json!({"status": "request", "muted": false, "group": true,
+                    "members": 3, "unread": 2})
+                );
+                let act = |who: &str, body: Value| {
+                    let r = req(
+                        &s,
+                        Method::POST,
+                        &format!("/v1/inbox-items/{dm_id}/actions"),
+                        who,
+                    );
+                    async move { r.json(&body).await }
+                };
+                let ok = |action: &str| json!({"action": action, "confirm": true});
+                for (action, call) in [
+                    ("accept_convo", "chat.bsky.convo.acceptConvo"),
+                    ("mute_convo", "chat.bsky.convo.muteConvo"),
+                    ("unmute_convo", "chat.bsky.convo.unmuteConvo"),
+                    ("mark_read", "chat.bsky.convo.updateRead"),
+                ] {
+                    let res = act(&member, ok(action)).await;
+                    assert_eq!(res.status_code(), 200, "{action}: {}", res.text());
+                    let (method, body) = CALLS.lock().unwrap().last().cloned().unwrap();
+                    assert_eq!(method, call);
+                    assert_eq!(body["convoId"], "rq1");
+                }
+                let (_, body) = CALLS.lock().unwrap().last().cloned().unwrap();
+                assert_eq!(body["messageId"], "rm1", "the read mark is the message");
+                let react = json!({"action": "react", "confirm": true, "emoji": "👍"});
+                assert_eq!(act(&member, react).await.status_code(), 200);
+                let (method, body) = CALLS.lock().unwrap().last().cloned().unwrap();
+                assert_eq!(
+                    (method.as_str(), body["value"].clone()),
+                    ("chat.bsky.convo.addReaction", json!("👍"))
+                );
+                for bad in [json!("ab"), json!("")] {
+                    let res = act(
+                        &member,
+                        json!({"action": "react", "confirm": true, "emoji": bad}),
+                    )
+                    .await;
+                    assert_eq!(res.json::<Value>()["error"], "invalid_emoji");
+                }
+                // Leaving a conversation and deleting a message are for managers.
+                for action in ["leave_convo", "delete_message"] {
+                    assert_eq!(
+                        act(&member, ok(action)).await.status_code(),
+                        403,
+                        "{action}"
+                    );
+                    assert_eq!(
+                        act(&cookie, ok(action)).await.status_code(),
+                        200,
+                        "{action}"
+                    );
+                }
+                assert_eq!(
+                    CALLS.lock().unwrap().last().unwrap().0,
+                    "chat.bsky.convo.deleteMessageForSelf"
+                );
+                // A DM has no post to like; a comment has no conversation to accept.
+                assert_eq!(
+                    act(&cookie, ok("like")).await.json::<Value>()["error"],
+                    "not_applicable"
+                );
+
+                // A locked conversation says so.
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/inbox-items/{dm_id}/reply"),
+                    &cookie,
+                )
+                .json(&json!({"text": "LOCKED hello"}))
+                .await;
+                assert_eq!(res.status_code(), 422);
+                assert_eq!(res.json::<Value>()["error"], "convo_locked");
+            }
+
             /// Replies to a post Bluesky will not show, or its author blocks us from, say so
             /// before anything is sent.
             #[tokio::test]
@@ -26881,6 +27040,105 @@ mod teams {
                         res.text().await.unwrap()
                     );
                 }
+            }
+
+            /// The real test account's existing conversation, on our side only: its state, a mute
+            /// and unmute, the read mark and accepting an accepted one. Sends no message and no
+            /// reaction. Needs BLUESKY_TEST_HANDLE and BLUESKY_TEST_APP_PASSWORD (DM access).
+            #[tokio::test]
+            #[serial]
+            #[ignore = "calls the real Bluesky"]
+            async fn live_bluesky_dm_state_on_our_side() {
+                let handle = std::env::var("BLUESKY_TEST_HANDLE").expect("BLUESKY_TEST_HANDLE");
+                let password =
+                    std::env::var("BLUESKY_TEST_APP_PASSWORD").expect("BLUESKY_TEST_APP_PASSWORD");
+                let config = Config::from_env().expect("test config");
+                let db = socialreins_brain::connect(&config).await.unwrap();
+                let state = AppState::new(db.clone(), &config);
+                let s = TestServer::new(controllers::router(state.clone(), &config)).unwrap();
+                let (_, cookie, _) = user(&s, &db).await;
+                let res = connect(&s, &cookie, &handle, &password).await;
+                assert!(res.status_code().is_success(), "connect: {}", res.text());
+                let account = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                // The first conversation Bluesky lists, as an item standing for its last message
+                // (read from the service, never written).
+                let a = social_accounts::Entity::find_by_id(account.parse::<uuid::Uuid>().unwrap())
+                    .one(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let pds = a.meta["pds"].as_str().unwrap().to_owned();
+                let web = reqwest::Client::new();
+                let session: Value = web
+                    .post(format!("{pds}/xrpc/com.atproto.server.createSession"))
+                    .json(&json!({"identifier": handle, "password": password}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                let listed: Value = web
+                    .get(format!("{pds}/xrpc/chat.bsky.convo.listConvos?limit=1"))
+                    .bearer_auth(session["accessJwt"].as_str().unwrap())
+                    .header("atproto-proxy", "did:web:api.bsky.chat#bsky_chat")
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                let convo = &listed["convos"][0];
+                let item = inbox::store(
+                    &db,
+                    &a,
+                    inbox::Fresh {
+                        kind: "dm",
+                        remote_id: convo["lastMessage"]["id"].as_str().unwrap().to_owned(),
+                        remote_cid: None,
+                        parent: None,
+                        root: (None, None),
+                        convo_id: convo["id"].as_str().map(str::to_owned),
+                        author: socialreins_brain::connectors::bluesky::Author {
+                            did: "did:plc:livetestauthor".into(),
+                            ..Default::default()
+                        },
+                        text: "live".into(),
+                        at: Utc::now().fixed_offset(),
+                        permalink: None,
+                        story: None,
+                        button_payload: None,
+                        attachments: vec![],
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let id = item.id.to_string();
+                let id = id.as_str();
+                let state_of = || async {
+                    fetch(&s, &cookie, &format!("/v1/inbox-items/{id}/actions")).await["convo"]
+                        .clone()
+                };
+                let before = state_of().await;
+                assert_eq!(before["status"], "accepted", "{before}");
+                assert_eq!(before["group"], false);
+                let act = |action: &str| {
+                    let r = req(
+                        &s,
+                        Method::POST,
+                        &format!("/v1/inbox-items/{id}/actions"),
+                        &cookie,
+                    );
+                    let body = json!({"action": action, "confirm": true});
+                    async move { r.json(&body).await }
+                };
+                assert_eq!(act("mute_convo").await.status_code(), 200);
+                assert_eq!(state_of().await["muted"], true);
+                assert_eq!(act("unmute_convo").await.status_code(), 200);
+                assert_eq!(state_of().await["muted"], false);
+                assert_eq!(act("mark_read").await.status_code(), 200);
+                assert_eq!(act("accept_convo").await.status_code(), 200);
             }
 
             /// Reads the real Bluesky test account's notifications and DMs, read-only. Needs
