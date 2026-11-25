@@ -219,3 +219,97 @@ async fn a_story_mention_automation_is_checked() {
         201
     );
 }
+
+#[tokio::test]
+async fn the_window_edges_and_the_text_check_come_in_meta_s_order() {
+    let dm = json!({"name": "Welcome", "trigger": "dm_received",
+        "actions": [{"type": "send_dm", "text": "Hi"}]});
+    let e = env().await;
+    // 1439 minutes is inside the 24 hours, 1440 is not.
+    let inside = test(&e, dm.clone(), json!({"age_minutes": 1439})).await;
+    assert_eq!(steps(&inside)[0].1, "would_send");
+    let outside = test(&e, dm.clone(), json!({"age_minutes": 1440})).await;
+    assert_eq!(steps(&outside)[0].2.as_deref(), Some("outside_window"));
+    // A sample older than 30 days is refused.
+    let mut automation = dm.clone();
+    automation["conditions"] = json!({"account_ids": [e.account.id]});
+    let res = e
+        .post(
+            "/v1/automations/test",
+            json!({"automation": automation,
+                "sample": {"account_id": e.account.id, "text": "hi", "age_minutes": 43201}}),
+        )
+        .await;
+    assert_eq!(res.status_code(), 422);
+    // Too long is found before the window, as a real send does it: no human-agent note, no fallback.
+    let mut ig = env().await;
+    ig.instagram().await;
+    let long = json!({"name": "Long", "trigger": "comment_received",
+        "actions": [{"type": "send_dm", "text": "é".repeat(501)}],
+        "fallback_public_reply": "Sent!"});
+    let mut automation = long.clone();
+    automation["conditions"] = json!({});
+    let res = ig
+        .post(
+            "/v1/automations/test",
+            json!({"automation": automation,
+                "sample": {"account_id": ig.account.id, "text": "hi", "age_minutes": 8 * 24 * 60}}),
+        )
+        .await;
+    let out = res.json::<Value>();
+    assert_eq!(
+        steps(&out)[0],
+        (
+            "send_dm".into(),
+            "would_fail".into(),
+            Some("too_long".into())
+        )
+    );
+    assert_eq!(out["notes"], json!([]));
+    assert_eq!(steps(&out).len(), 1);
+}
+
+#[tokio::test]
+async fn story_mentions_and_follows_on_the_wrong_networks_are_refused() {
+    let e = env().await;
+    let dm = json!([{"type": "send_dm", "text": "Thanks"}]);
+    let save = |trigger: &str, actions: Value, accounts: Vec<uuid::Uuid>| {
+        e.post(
+            "/v1/automations",
+            json!({"name": "a", "trigger": trigger, "actions": actions,
+                "conditions": {"account_ids": accounts}}),
+        )
+    };
+    // Facebook has no story mentions, and Meta never brings a follow or a mention of the account.
+    for (trigger, code) in [
+        ("story_mention", "facebook_unsupported_trigger"),
+        ("new_follower", "meta_unsupported_trigger"),
+        ("mention_received", "meta_unsupported_trigger"),
+    ] {
+        let res = save(trigger, dm.clone(), vec![e.account.id]).await;
+        assert_eq!(res.status_code(), 422, "{trigger}");
+        assert_eq!(res.json::<Value>()["error"], code, "{trigger}");
+    }
+    // A text condition has nothing to read in a story mention.
+    for bad in [json!({"question": true}), json!({"languages": ["en"]})] {
+        let res = e
+            .post(
+                "/v1/automations",
+                json!({"name": "a", "trigger": "story_mention", "actions": dm, "conditions": bad}),
+            )
+            .await;
+        assert_eq!(res.status_code(), 422, "{bad}");
+    }
+    // Saved for no account in particular, a test on a Facebook account still shows the block.
+    let res = e
+        .post(
+            "/v1/automations/test",
+            json!({"automation": {"name": "a", "trigger": "story_mention", "actions": dm, "conditions": {}},
+                "sample": {"account_id": e.account.id, "text": "hi"}}),
+        )
+        .await;
+    assert_eq!(
+        res.json::<Value>()["blocks"],
+        json!(["facebook_unsupported_trigger"])
+    );
+}

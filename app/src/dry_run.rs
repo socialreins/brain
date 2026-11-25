@@ -516,19 +516,26 @@ async fn walk(
                         reason: Some("daily_cap".into()),
                         ..step(kind, "would_skip")
                     }
-                } else if let Some(no) = meta
-                    .as_mut()
-                    .filter(|_| *via == Via::Dm)
-                    .and_then(|c| c.dm(human_agent).err())
-                {
-                    notes.extend(no.note.map(String::from).filter(|n| !notes.contains(n)));
-                    PlannedStep {
-                        reason: Some(no.reason.into()),
-                        ..step(kind, "would_skip")
-                    }
                 } else {
                     let send = (*kind, *via, *template, *ai, *buttons);
-                    plan_send(app, account, item, send, (page.as_deref(), dm_open)).await
+                    let planned =
+                        plan_send(app, account, item, send, (page.as_deref(), dm_open)).await;
+                    // As `send` does: the text is checked first, then Meta's windows, and a private
+                    // reply is used up only once it would go out.
+                    let refusal = meta
+                        .as_mut()
+                        .filter(|_| *via == Via::Dm && planned.status == "would_send")
+                        .and_then(|c| c.dm(human_agent).err());
+                    match refusal {
+                        Some(no) => {
+                            notes.extend(no.note.map(String::from).filter(|n| !notes.contains(n)));
+                            PlannedStep {
+                                reason: Some(no.reason.into()),
+                                ..step(kind, "would_skip")
+                            }
+                        }
+                        None => planned,
+                    }
                 };
                 stopped = flow && planned.status != "would_send";
                 out.push(planned);
