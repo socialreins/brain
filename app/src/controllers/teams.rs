@@ -29,11 +29,12 @@ use uuid::Uuid;
 
 use super::{
     auth::{internal, Body, CurrentUser, FromWeb},
+    team_slugs::RETIRE,
     waitlist::{error, Error, Reply},
 };
 use crate::{
     models::{social_sets, team_invitations, team_user, teams, users},
-    rate_limit::{daily_refund, daily_reserve, reserve_in},
+    rate_limit::{daily_refund, daily_reserve},
     state::AppState,
 };
 
@@ -44,10 +45,6 @@ const INVITES_PER_TEAM_EMAIL: i64 = 3;
 const INVITES_PER_EMAIL: i64 = 20;
 const INVITES_PER_TEAM: i64 = 50;
 const INVITES_PER_INVITER: i64 = 50;
-const SLUG_CHANGES_PER_TEAM: i64 = 5;
-/// Keeps slug `$1` for team `$2` alone for 30 days from now (`team_slug_holds`).
-const HOLD: &str = "INSERT INTO team_slug_holds (slug, team_id) VALUES ($1, $2) \
-    ON CONFLICT (slug) DO UPDATE SET team_id = excluded.team_id, released_at = now()";
 
 #[derive(Serialize, ToSchema)]
 pub struct Team {
@@ -56,7 +53,7 @@ pub struct Team {
     /// The team's address in the web app (`/t/<code>/...`): 6 lowercase characters that never
     /// change. Not a secret; it gives no access.
     pub code: String,
-    /// An address the team chose (`PATCH /team`), accepted wherever the code is; `null` when it
+    /// An address the team chose (`PATCH /team/slug`), accepted wherever the code is; `null` when it
     /// has none. Unlike the code it may change.
     pub slug: Option<String>,
     /// Posts of this team may have a public page (`PUT /posts/{id}/page`).
@@ -162,6 +159,9 @@ pub struct InvitationPreview {
 pub struct TeamName {
     /// 1 to 60 characters after trimming, no control characters.
     pub name: String,
+    /// The team's slug from the start, with the rules of `PATCH /team/slug`. Absent, `null` or
+    /// empty: none, and the team is at its code.
+    pub slug: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -182,11 +182,6 @@ pub struct TeamChange {
     #[serde(default, deserialize_with = "present")]
     #[schema(value_type = Option<Sender>)]
     pub newsletter_sender: Option<Option<Sender>>,
-    /// The team's slug: 3 to 30 of `a-z`, `0-9` and `-` after trimming and lowercasing, a
-    /// letter or digit at both ends, no `--`. `null` clears it. Absent: unchanged.
-    #[serde(default, deserialize_with = "present")]
-    #[schema(value_type = Option<String>)]
-    pub slug: Option<Option<String>>,
 }
 
 /// A field that was sent, `null` included (an absent one stays `None` through `default`).
@@ -443,7 +438,7 @@ async fn named_team(parts: &mut Parts, app: &AppState) -> Option<String> {
 
 /// The team with the code or slug `named` (any case) and the user's role in it; `None` when
 /// there is no such team or the user is not in it, so the two look the same to the caller.
-async fn team_by_code(
+pub(super) async fn team_by_code(
     db: &DatabaseConnection,
     user_id: Uuid,
     named: &str,
@@ -512,10 +507,12 @@ pub(crate) async fn invited(db: &DatabaseConnection, email: &str) -> Result<bool
 }
 
 /// Creates a team with its default set; the caller becomes its owner and switches to it. At
-/// most 10 a day per user.
+/// most 10 a day per user. With a `slug` it starts at that address (`422 invalid_slug`, `409
+/// slug_taken`, as for `PATCH /team/slug`), else at its code.
 #[utoipa::path(post, path = "/teams", tag = "teams", request_body = TeamName,
     responses((status = 201, body = Team), (status = 401, body = Error),
-        (status = 403, body = Error), (status = 422, body = Error), (status = 429, body = Error)))]
+        (status = 403, body = Error), (status = 409, body = Error), (status = 422, body = Error),
+        (status = 429, body = Error)))]
 async fn create(
     _: FromWeb,
     State(app): State<AppState>,
@@ -525,6 +522,21 @@ async fn create(
     let Some(name) = team::name(&body.name) else {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name");
     };
+    let slug = match body
+        .slug
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => match team::slug(raw) {
+            Ok(slug) => Some(slug),
+            Err(reason) => {
+                let body = serde_json::json!({"error": "invalid_slug", "reason": reason});
+                return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
+            }
+        },
+        None => None,
+    };
     let caps = [(format!("team:create:{}", user.id), TEAMS_PER_DAY)];
     let reserved = match daily_reserve(&app.db, &caps).await {
         Ok(Some(ids)) => ids,
@@ -533,11 +545,33 @@ async fn create(
     };
     let made = async {
         let txn = app.db.begin().await?;
-        let team = create_team(&txn, user.id, &name).await?;
-        txn.commit().await.map(|_| team)
+        let mut team = create_team(&txn, user.id, &name).await?;
+        if let Some(slug) = slug {
+            if super::team_slugs::taken(&txn, &slug, Some(team.id)).await? {
+                return Ok(None);
+            }
+            let row = teams::ActiveModel {
+                id: Set(team.id),
+                slug: Set(Some(slug)),
+                ..Default::default()
+            };
+            team = teams::Entity::update(row).exec(&txn).await?;
+        }
+        txn.commit().await.map(|()| Some(team))
     };
     match made.await {
-        Ok(team) => (StatusCode::CREATED, Json(team_json(&team, Role::Owner))).into_response(),
+        Ok(Some(team)) => {
+            (StatusCode::CREATED, Json(team_json(&team, Role::Owner))).into_response()
+        }
+        // Not made: the slug was taken, or two teams took it at once and the index said no.
+        Ok(None) => {
+            daily_refund(&app.db, &reserved).await;
+            reply(StatusCode::CONFLICT, "slug_taken")
+        }
+        Err(e) if matches!(e.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) => {
+            daily_refund(&app.db, &reserved).await;
+            reply(StatusCode::CONFLICT, "slug_taken")
+        }
         Err(e) => {
             daily_refund(&app.db, &reserved).await;
             internal(e, "team insert")
@@ -604,19 +638,13 @@ async fn show(t: InTeam) -> Response {
 
 /// Renames the current team (`name`) or switches its public pages (`public_pages`) or their
 /// newsletter sign-up (`newsletter`) or post approvals (`require_approval`), or pauses every
-/// automation (`automations_paused`), or sets or clears
-/// its `slug` or who its newsletters are from (`newsletter_sender`, `422 invalid_sender` with
-/// the bad `field`, `name`, `address` or `logo`; a change clears `tested_at` of the team's draft
-/// newsletters). Owners and admins only. A bad slug is `422 invalid_slug` with a `reason`
-/// (`length`, `characters` or `reserved`); one that is another team's slug or any team's code is
-/// `409 slug_taken`; a team changes its slug at most 5 times a day (`429
-/// slug_changed_too_often`). A slug given up (changed, cleared, or its team deleted) stops
-/// naming the team at once and stays `409 slug_taken` for every other team for 30 days; the
-/// team that had it may take it back any time.
+/// automation (`automations_paused`), or sets or clears who its newsletters are from
+/// (`newsletter_sender`, `422 invalid_sender` with the bad `field`, `name`, `address` or `logo`;
+/// a change clears `tested_at` of the team's draft newsletters). Owners and admins only. The
+/// slug has its own route, `PATCH /team/slug`.
 #[utoipa::path(patch, path = "/team", tag = "teams", request_body = TeamChange,
     responses((status = 200, body = Team), (status = 401, body = Error),
-        (status = 403, body = Error), (status = 409, body = Error),
-        (status = 422, body = Error), (status = 429, body = Error)))]
+        (status = 403, body = Error), (status = 422, body = Error)))]
 async fn rename(
     _: FromWeb,
     State(app): State<AppState>,
@@ -673,56 +701,8 @@ async fn rename(
         row.newsletter_sender_address = Set(address);
         row.newsletter_sender_logo = Set(logo);
     }
-    let slug = match body.slug.map(|s| s.as_deref().map(team::slug).transpose()) {
-        Some(Err(reason)) => {
-            let body = serde_json::json!({"error": "invalid_slug", "reason": reason});
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
-        }
-        // The slug the team already has is no change, and costs none of the day's five.
-        Some(Ok(slug)) if slug != t.team.slug => Some(slug),
-        _ => None,
-    };
     let saved = async {
         let txn = app.db.begin().await?;
-        if let Some(slug) = slug {
-            let caps = [(format!("team:slug:{}", t.team.id), SLUG_CHANGES_PER_TEAM)];
-            if reserve_in(&txn, &caps).await?.is_none() {
-                return Ok(Err((
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "slug_changed_too_often",
-                )));
-            }
-            let raw = |sql: &str, values: [sea_orm::Value; 2]| {
-                Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
-            };
-            let id = t.team.id;
-            // Locked, so the slug held back below is the one this change replaces.
-            let before = teams::Entity::find_by_id(id)
-                .lock_exclusive()
-                .one(&txn)
-                .await?;
-            if let Some(new) = &slug {
-                let sql = "SELECT 1 FROM teams WHERE code = $1 OR (lower(slug) = $1 AND id <> $2) \
-                    UNION ALL SELECT 1 FROM team_slug_holds WHERE slug = $1 AND team_id <> $2 \
-                    AND released_at > now() - interval '30 days'";
-                let taken = raw(sql, [new.clone().into(), id.into()]);
-                if txn.query_one_raw(taken).await?.is_some() {
-                    return Ok(Err((StatusCode::CONFLICT, "slug_taken")));
-                }
-                // Its own hold, or one that ran out.
-                let sql = "DELETE FROM team_slug_holds WHERE slug = $1";
-                let free =
-                    Statement::from_sql_and_values(DbBackend::Postgres, sql, [new.clone().into()]);
-                txn.execute_raw(free).await?;
-            }
-            if let Some(old) = before
-                .and_then(|b| b.slug)
-                .filter(|old| Some(old) != slug.as_ref())
-            {
-                txn.execute_raw(raw(HOLD, [old.into(), id.into()])).await?;
-            }
-            row.slug = Set(slug);
-        }
         let team = teams::Entity::update(row).exec(&txn).await?;
         if sender_changed {
             // The test mail showed the old sender: drafts need a new one before they send.
@@ -732,15 +712,10 @@ async fn rename(
                 Statement::from_sql_and_values(DbBackend::Postgres, sql, [t.team.id.into()]);
             txn.execute_raw(untest).await?;
         }
-        txn.commit().await.map(|_| Ok(team))
+        txn.commit().await.map(|()| team)
     };
     match saved.await {
-        Ok(Ok(team)) => Json(team_json(&team, t.role)).into_response(),
-        Ok(Err((status, code))) => reply(status, code),
-        // Two teams took one slug at once: the unique index let the first through.
-        Err(e) if matches!(e.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) => {
-            reply(StatusCode::CONFLICT, "slug_taken")
-        }
+        Ok(team) => Json(team_json(&team, t.role)).into_response(),
         Err(e) => internal(e, "team rename"),
     }
 }
@@ -787,7 +762,7 @@ async fn destroy(_: FromWeb, State(app): State<AppState>, t: InTeam) -> Response
         // change may have landed after this request loaded the team.
         if let Some(slug) = locked.and_then(|team| team.slug) {
             let values = [slug.into(), t.team.id.into()];
-            let hold = Statement::from_sql_and_values(DbBackend::Postgres, HOLD, values);
+            let hold = Statement::from_sql_and_values(DbBackend::Postgres, RETIRE, values);
             txn.execute_raw(hold).await?;
         }
         // API tokens go with the team through their cascading foreign key.

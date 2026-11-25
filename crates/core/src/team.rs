@@ -75,36 +75,137 @@ pub fn parse_code(raw: &str) -> Option<String> {
     (code.len() == CODE_CHARS && code.bytes().all(|b| CODE_ALPHABET.contains(&b))).then_some(code)
 }
 
-/// Words a team slug may not be: the web app's own first path segments and names that would
-/// pass for SocialReins itself.
+/// Words a team slug may not be: every first path segment of the web app
+/// (its pages, the team pages of `lib/team-path.ts`, files like `robots`), brain's own paths,
+/// and names that would pass for SocialReins, its owner or the networks it posts to. The web
+/// repo's `tests/unit/team-slug.test.ts` fails when a route is missing here.
 pub const RESERVED_SLUGS: &[&str] = &[
-    "new",
+    "_",
+    "about",
+    "abuse",
     "admin",
+    "amazon",
+    "analytics",
+    "anthropic",
     "api",
+    "api-tokens",
     "app",
+    "apple",
+    "assets",
+    "auth",
+    "automations",
+    "billing",
+    "binarylabs",
+    "bluesky",
+    "blog",
+    "broadcasts",
+    "bytech",
+    "calendar",
+    "careers",
+    "claude",
+    "compare",
+    "config",
+    "connections",
+    "contact",
+    "contacts",
+    "data-deletion",
+    "dev",
+    "docs",
+    "email",
+    "facebook",
+    "feeds",
+    "features",
+    "google",
+    "health",
+    "help",
+    "home",
+    "inbox",
+    "indexnow",
+    "instagram",
+    "invitations",
+    "legal",
+    "library",
+    "linkedin",
+    "lists",
+    "login",
+    "logout",
+    "mail",
+    "manifest",
+    "mcp",
+    "media",
+    "meta",
+    "metrics",
+    "microsoft",
+    "new",
+    "newsletter",
+    "newsletters",
+    "oauth",
+    "official",
+    "openai",
+    "openapi",
+    "p",
+    "paypal",
+    "pinterest",
+    "post-types",
+    "posts",
+    "press",
+    "pricing",
+    "privacy",
+    "profile",
+    "queue",
+    "robots",
+    "root",
+    "security",
+    "sets",
+    "settings",
+    "signup",
+    "sitemap",
+    "socialreins",
+    "socials",
+    "staff",
+    "static",
+    "status",
+    "stripe",
+    "support",
     "t",
     "team",
     "teams",
-    "login",
-    "signup",
-    "settings",
-    "billing",
+    "telegram",
+    "terms",
+    "threads",
+    "tiktok",
+    "twitter",
+    "v1",
+    "version",
+    "waitlist",
+    "webhooks",
+    "welcome",
+    "whatsapp",
     "www",
-    "socialreins",
-    "support",
-    "help",
-    "_",
+    "x",
+    "youtube",
 ];
 
-/// `raw` as a team slug (trimmed, lowercase): 3 to 30 of `a-z`, `0-9` and `-`, a letter or digit
-/// at both ends, no `--`, not in `RESERVED_SLUGS`. The error is the reason: `reserved`,
-/// `length` or `characters`, checked in that order.
+/// Words that may not be a hyphen-separated part of a slug: a short list of slurs and obvious
+/// abuse, not a profanity filter. Whole parts only, so `class` and `scunthorpe` pass.
+const BLOCKED_WORDS: &[&str] = &[
+    "bitch", "cunt", "faggot", "fuck", "nazi", "nigga", "nigger", "porn", "rape", "shit", "slut",
+    "whore",
+];
+
+pub const SLUG_MIN_CHARS: usize = 3;
+pub const SLUG_MAX_CHARS: usize = 32;
+
+/// `raw` as a team slug (trimmed, lowercase): 3 to 32 of `a-z`, `0-9` and `-`, a letter or digit
+/// at both ends, no `--`, not in `RESERVED_SLUGS`, not containing `socialreins`, no part in the
+/// blocklist. The error is the reason: `reserved`, `length`, `characters` or `blocked`, checked
+/// in that order.
 pub fn slug(raw: &str) -> Result<String, &'static str> {
     let slug = raw.trim().to_ascii_lowercase();
-    if RESERVED_SLUGS.contains(&slug.as_str()) {
+    if RESERVED_SLUGS.contains(&slug.as_str()) || slug.contains("socialreins") {
         return Err("reserved");
     }
-    if !(3..=30).contains(&slug.chars().count()) {
+    if !(SLUG_MIN_CHARS..=SLUG_MAX_CHARS).contains(&slug.chars().count()) {
         return Err("length");
     }
     let plain = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
@@ -113,7 +214,13 @@ pub fn slug(raw: &str) -> Result<String, &'static str> {
         && plain(bytes[0])
         && plain(bytes[bytes.len() - 1])
         && !slug.contains("--");
-    ok.then_some(slug).ok_or("characters")
+    if !ok {
+        return Err("characters");
+    }
+    if slug.split('-').any(|part| BLOCKED_WORDS.contains(&part)) {
+        return Err("blocked");
+    }
+    Ok(slug)
 }
 
 /// A trimmed team or set name of 1 to `MAX_NAME_CHARS` characters, without control characters
@@ -151,11 +258,12 @@ mod tests {
     #[test]
     fn slugs_are_lowercase_words_with_single_hyphens() {
         assert_eq!(slug("  Acme-Co2 ").as_deref(), Ok("acme-co2"));
-        assert_eq!(slug(&"a".repeat(30)), Ok("a".repeat(30)));
+        assert_eq!(slug(&"a".repeat(32)), Ok("a".repeat(32)));
+        assert_eq!(slug("class-scunthorpe").as_deref(), Ok("class-scunthorpe"));
         for (raw, why) in [
             ("ab", "length"),
             ("", "length"),
-            (&*"a".repeat(31), "length"),
+            (&*"a".repeat(33), "length"),
             ("-acme", "characters"),
             ("acme-", "characters"),
             ("ac--me", "characters"),
@@ -165,6 +273,12 @@ mod tests {
             ("Admin", "reserved"),
             ("t", "reserved"),
             ("_", "reserved"),
+            ("Posts", "reserved"),
+            ("pricing", "reserved"),
+            ("my-socialreins-team", "reserved"),
+            ("SocialReins", "reserved"),
+            ("fuck-you", "blocked"),
+            ("the-shit", "blocked"),
         ] {
             assert_eq!(slug(raw), Err(why), "{raw}");
         }
@@ -222,5 +336,17 @@ mod tests {
         assert_eq!(name("a\r\nBcc: x"), None);
         assert!(name_up_to(&"a".repeat(80), 80).is_some());
         assert_eq!(name_up_to(&"a".repeat(81), 80), None);
+    }
+}
+
+#[cfg(test)]
+mod reserved_tests {
+    #[test]
+    fn the_reserved_list_has_no_repeats_and_no_capitals() {
+        let mut sorted = super::RESERVED_SLUGS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), super::RESERVED_SLUGS.len());
+        assert!(sorted.iter().all(|w| *w == w.to_ascii_lowercase()));
     }
 }

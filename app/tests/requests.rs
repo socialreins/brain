@@ -2607,7 +2607,31 @@ mod teams {
     }
 
     fn set_slug(s: &TestServer, cookie: &str, slug: Value) -> TestRequest {
-        req(s, Method::PATCH, "/v1/team", cookie).json(&json!({"slug": slug}))
+        req(s, Method::PATCH, "/v1/team/slug", cookie).json(&json!({"slug": slug}))
+    }
+
+    /// Moves what the team gave up `slug` back in time, past the 90-day hold or the redirect.
+    async fn retired_days_ago(db: &DatabaseConnection, slug: &str, days: i64) {
+        let sql = format!(
+            "UPDATE team_slug_history SET retired_at = now() - interval '{days} days' \
+             WHERE slug = '{slug}'"
+        );
+        sea_orm::ConnectionTrait::execute_unprepared(db, &sql)
+            .await
+            .unwrap();
+    }
+
+    /// The address the web app's redirect lookup gives for `slug`, `None` for a 404.
+    async fn redirect_for(s: &TestServer, slug: &str) -> Option<String> {
+        let res = s.get(&format!("/v1/public/team-slugs/{slug}")).await;
+        match res.status_code().as_u16() {
+            200 => Some(res.json::<Value>()["address"].as_str().unwrap().to_owned()),
+            404 => {
+                res.assert_json(&json!({"error": "not_found"}));
+                None
+            }
+            other => panic!("{other}"),
+        }
     }
 
     #[tokio::test]
@@ -2618,32 +2642,33 @@ mod teams {
         let team = current(&s, &owner).await;
         assert_eq!(team["slug"], Value::Null);
         let team_id = team["id"].as_str().unwrap().to_owned();
-        let (admin, _) = joined(&s, &db, &team_id, "admin").await;
-        let (member, _) = joined(&s, &db, &team_id, "member").await;
         let slug = fresh_slug();
 
-        let res = set_slug(&s, &member, json!(slug)).await;
-        assert_eq!(res.status_code(), 403);
         // Trimmed and lowercased; the code stays.
         let res = set_slug(&s, &owner, json!(format!("  {} ", slug.to_uppercase()))).await;
         res.assert_status_ok();
         let set = res.json::<Value>();
         assert_eq!(set["slug"], slug);
         assert_eq!(set["code"], team["code"]);
+        let (member, _) = joined(&s, &db, &team_id, "member").await;
         assert_eq!(current(&s, &member).await["slug"], slug);
         let list = s.get("/v1/teams").add_header("cookie", &owner).await;
         assert_eq!(list.json::<Value>()[0]["slug"], slug);
         let me = s.get("/auth/me").add_header("cookie", &owner).await;
         assert_eq!(me.json::<Value>()["current_team"]["slug"], slug);
-        // Another field alone leaves it.
+        // Another field alone leaves it, and the old route no longer takes a slug.
         let renamed = req(&s, Method::PATCH, "/v1/team", &owner)
-            .json(&json!({"name": "Renamed"}))
+            .json(&json!({"name": "Renamed", "slug": "other-slug"}))
             .await;
         assert_eq!(renamed.json::<Value>()["slug"], slug);
 
-        // An admin changes it, and the old one stops naming the team.
+        // Sending the slug it has changes nothing.
+        let same = set_slug(&s, &owner, json!(slug)).await;
+        assert_eq!(same.json::<Value>()["slug"], slug);
+
+        // Changed: the old one stops naming the team for API calls.
         let next = fresh_slug();
-        let res = set_slug(&s, &admin, json!(next)).await;
+        let res = set_slug(&s, &owner, json!(next)).await;
         assert_eq!(res.json::<Value>()["slug"], next);
         let named = |name: &str| {
             s.get("/v1/team")
@@ -2658,7 +2683,7 @@ mod teams {
         res.assert_status_ok();
         assert_eq!(res.json::<Value>()["slug"], Value::Null);
         assert_eq!(named(&next).await.status_code(), 404);
-        // A slug given up is kept from other teams for 30 days; its old team takes it back.
+        // A slug given up is kept from other teams for 90 days; its old team takes it back.
         let (_, other, _) = user(&s, &db).await;
         for held in [&slug, &next] {
             let res = set_slug(&s, &other, json!(held)).await;
@@ -2668,16 +2693,13 @@ mod teams {
         let res = set_slug(&s, &owner, json!(slug)).await;
         assert_eq!(res.json::<Value>()["slug"], slug);
         assert_eq!(named(&slug).await.json::<Value>()["id"], team["id"]);
-        // After the 30 days another team takes it, and the hold becomes theirs when they let go.
-        let aged = format!(
-            "UPDATE team_slug_holds SET released_at = now() - interval '30 days 1 minute' \
-             WHERE slug = '{next}'"
-        );
-        sea_orm::ConnectionTrait::execute_unprepared(&db, &aged)
-            .await
-            .unwrap();
+        // 89 days on it is still held; after the 90 days another team takes it.
+        retired_days_ago(&db, &next, 89).await;
+        assert_eq!(set_slug(&s, &other, json!(next)).await.status_code(), 409);
+        retired_days_ago(&db, &next, 91).await;
         let res = set_slug(&s, &other, json!(next)).await;
         assert_eq!(res.json::<Value>()["slug"], next);
+        // It is theirs now: they hold it for 90 days when they let go.
         set_slug(&s, &other, Value::Null).await.assert_status_ok();
         assert_eq!(set_slug(&s, &owner, json!(next)).await.status_code(), 409);
         // A deleted team's slug is held the same way.
@@ -2689,11 +2711,65 @@ mod teams {
         let res = req(&s, Method::DELETE, "/v1/team", &other).await;
         assert_eq!(res.status_code(), 204);
         assert_eq!(set_slug(&s, &owner, json!(gone)).await.status_code(), 409);
+        assert_eq!(redirect_for(&s, &gone).await, None);
 
         let doc = s.get("/openapi.json").await.json::<Value>();
         let schemas = &doc["components"]["schemas"];
         assert!(schemas["Team"]["properties"]["slug"].is_object());
-        assert!(schemas["TeamChange"]["properties"]["slug"].is_object());
+        assert!(schemas["TeamChange"]["properties"]["slug"].is_null());
+        assert!(doc["paths"]["/team/slug"]["patch"].is_object());
+        assert!(doc["paths"]["/slugs/check"]["get"].is_object());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn only_an_owner_with_a_fresh_sign_in_changes_the_slug() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, owner, _) = user(&s, &db).await;
+        let team_id = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+        let (admin, _) = joined(&s, &db, &team_id, "admin").await;
+        let (member, _) = joined(&s, &db, &team_id, "member").await;
+        for cookie in [&admin, &member] {
+            let res = set_slug(&s, cookie, json!(fresh_slug())).await;
+            assert_eq!(res.status_code(), 403);
+            res.assert_json(&json!({"error": "forbidden"}));
+        }
+        // A request without a session is refused, and one not from the web app too.
+        let call = s
+            .method(Method::PATCH, "/v1/team/slug")
+            .json(&json!({"slug": fresh_slug()}));
+        assert_eq!(call.add_header("origin", WEB).await.status_code(), 401);
+        let res = s
+            .method(Method::PATCH, "/v1/team/slug")
+            .add_header("cookie", owner.clone())
+            .json(&json!({"slug": fresh_slug()}))
+            .await;
+        assert_eq!(res.status_code(), 403);
+        let slug = fresh_slug();
+        let aged = |cookie: &str, minutes: i64| {
+            let row = sessions::ActiveModel {
+                token_hash: Set(token::hash(cookie.trim_start_matches("sr_session="))),
+                created_at: Set((Utc::now() - Duration::minutes(minutes)).fixed_offset()),
+                ..Default::default()
+            };
+            let db = db.clone();
+            async move { sessions::Entity::update(row).exec(&db).await.unwrap() }
+        };
+        aged(&owner, 11).await;
+        let res = set_slug(&s, &owner, json!(slug)).await;
+        assert_eq!(res.status_code(), 403);
+        res.assert_json(&json!({"error": "reauth_required"}));
+        assert_eq!(current(&s, &owner).await["slug"], Value::Null);
+        aged(&owner, 9).await;
+        set_slug(&s, &owner, json!(slug)).await.assert_status_ok();
+        // The field is required: no body can clear the slug by leaving it out.
+        for body in [json!({}), json!({"slag": "x"})] {
+            let res = req(&s, Method::PATCH, "/v1/team/slug", &owner)
+                .json(&body)
+                .await;
+            assert_eq!(res.status_code(), 422, "{body}");
+        }
+        assert_eq!(current(&s, &owner).await["slug"], slug);
     }
 
     #[tokio::test]
@@ -2746,7 +2822,7 @@ mod teams {
     async fn slugs_are_validated() {
         let (s, db) = server_where(|_| {}).await;
         let (_, cookie, _) = user(&s, &db).await;
-        let long = "a".repeat(31);
+        let long = "a".repeat(33);
         for (slug, reason) in [
             ("ab", "length"),
             ("", "length"),
@@ -2762,6 +2838,9 @@ mod teams {
             ("socialreins", "reserved"),
             ("t", "reserved"),
             ("_", "reserved"),
+            ("pricing", "reserved"),
+            ("my-socialreins", "reserved"),
+            ("fuck-this", "blocked"),
         ] {
             let res = set_slug(&s, &cookie, json!(slug)).await;
             assert_eq!(res.status_code(), 422, "{slug}");
@@ -2811,35 +2890,239 @@ mod teams {
 
     #[tokio::test]
     #[serial]
-    async fn a_team_changes_its_slug_5_times_a_day() {
+    async fn a_team_gives_up_its_slug_3_times_in_30_days() {
         let (s, db) = server_where(|_| {}).await;
         let (_, cookie, _) = user(&s, &db).await;
         let (_, other, _) = user(&s, &db).await;
         let taken = fresh_slug();
         set_slug(&s, &other, json!(taken)).await.assert_status_ok();
-        let mine = fresh_slug();
-        // Sets and clears both count: these are 4 of the day's 5.
-        for change in [json!(mine), Value::Null, json!(mine), Value::Null] {
+        // The first slug gives nothing up. Then change, clear, set and change again: 3 given up.
+        let (one, two, three, four) = (fresh_slug(), fresh_slug(), fresh_slug(), fresh_slug());
+        for change in [json!(one), json!(two), Value::Null, json!(three)] {
             set_slug(&s, &cookie, change).await.assert_status_ok();
         }
         // Refused changes and the slug it already has cost nothing.
         assert_eq!(set_slug(&s, &cookie, json!(taken)).await.status_code(), 409);
         assert_eq!(set_slug(&s, &cookie, json!("ab")).await.status_code(), 422);
-        set_slug(&s, &cookie, Value::Null).await.assert_status_ok();
-        set_slug(&s, &cookie, json!(mine)).await.assert_status_ok();
-        set_slug(&s, &cookie, json!(mine)).await.assert_status_ok();
+        set_slug(&s, &cookie, json!(three)).await.assert_status_ok();
+        set_slug(&s, &cookie, json!(four)).await.assert_status_ok();
+        set_slug(&s, &cookie, json!(four)).await.assert_status_ok();
+        // That was the third; the next is the fourth.
         for change in [Value::Null, json!(fresh_slug())] {
             let res = set_slug(&s, &cookie, change).await;
             assert_eq!(res.status_code(), 429);
             res.assert_json(&json!({"error": "slug_changed_too_often"}));
         }
-        assert_eq!(current(&s, &cookie).await["slug"], mine);
-        // The rest of the team still changes, and the cap is the team's own.
+        assert_eq!(current(&s, &cookie).await["slug"], four);
+        // The cap is the team's own, and the rest of the team still changes.
+        set_slug(&s, &other, Value::Null).await.assert_status_ok();
         let res = req(&s, Method::PATCH, "/v1/team", &cookie)
-            .json(&json!({"name": "Still", "slug": mine}))
+            .json(&json!({"name": "Still"}))
             .await;
         assert_eq!(res.json::<Value>()["name"], "Still");
-        set_slug(&s, &other, Value::Null).await.assert_status_ok();
+        // The oldest change is 31 days old: one more is allowed.
+        let sql = format!(
+            "UPDATE team_slug_history SET retired_at = now() - interval '31 days' \
+             WHERE slug = '{one}'"
+        );
+        sea_orm::ConnectionTrait::execute_unprepared(&db, &sql)
+            .await
+            .unwrap();
+        set_slug(&s, &cookie, Value::Null).await.assert_status_ok();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_slug_given_up_redirects_to_the_teams_address() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, owner, _) = user(&s, &db).await;
+        let team = current(&s, &owner).await;
+        let code = team["code"].as_str().unwrap();
+        let (one, two) = (fresh_slug(), fresh_slug());
+        // Nothing to redirect before a slug is given up: a current slug and a code are addresses.
+        set_slug(&s, &owner, json!(one)).await.assert_status_ok();
+        assert_eq!(redirect_for(&s, &one).await, None);
+        assert_eq!(redirect_for(&s, code).await, None);
+        assert_eq!(redirect_for(&s, &fresh_slug()).await, None);
+        // After a change the old one leads to the new, in any case, and the header allows a cache.
+        set_slug(&s, &owner, json!(two)).await.assert_status_ok();
+        assert_eq!(redirect_for(&s, &one).await.as_deref(), Some(&*two));
+        assert_eq!(
+            redirect_for(&s, &one.to_uppercase()).await.as_deref(),
+            Some(&*two)
+        );
+        let res = s.get(&format!("/v1/public/team-slugs/{one}")).await;
+        assert_eq!(res.header("cache-control"), "public, max-age=60");
+        // Cleared: it leads to the code. Taken back: the team's own address, no redirect.
+        set_slug(&s, &owner, Value::Null).await.assert_status_ok();
+        for old in [&one, &two] {
+            assert_eq!(redirect_for(&s, old).await.as_deref(), Some(code));
+        }
+        set_slug(&s, &owner, json!(one)).await.assert_status_ok();
+        assert_eq!(redirect_for(&s, &one).await, None);
+        assert_eq!(redirect_for(&s, &two).await.as_deref(), Some(&*one));
+        // 400 days on it no longer leads anywhere; a slug that never was does not either.
+        retired_days_ago(&db, &two, 399).await;
+        assert_eq!(redirect_for(&s, &two).await.as_deref(), Some(&*one));
+        retired_days_ago(&db, &two, 401).await;
+        assert_eq!(redirect_for(&s, &two).await, None);
+        // The redirect tells no more than the slug: nothing to read for a team's own pages, and
+        // no session is needed.
+        let res = s
+            .get(&format!("/v1/public/team-slugs/{}", "a".repeat(65)))
+            .await;
+        assert_eq!(res.status_code(), 404);
+
+        // A slug that passed to another team after its 90 days is theirs, not a redirect.
+        let (_, other, _) = user(&s, &db).await;
+        let passed = fresh_slug();
+        set_slug(&s, &owner, json!(passed)).await.assert_status_ok();
+        set_slug(&s, &owner, json!(fresh_slug()))
+            .await
+            .assert_status_ok();
+        assert!(redirect_for(&s, &passed).await.is_some());
+        retired_days_ago(&db, &passed, 91).await;
+        set_slug(&s, &other, json!(passed)).await.assert_status_ok();
+        assert_eq!(redirect_for(&s, &passed).await, None);
+        // Once they let go of it too, it is a slug two teams gave up: no redirect to either.
+        set_slug(&s, &other, json!(fresh_slug()))
+            .await
+            .assert_status_ok();
+        assert_eq!(redirect_for(&s, &passed).await, None);
+        // A deleted team leaves nothing to redirect to.
+        let (_, doomed, _) = user(&s, &db).await;
+        req(&s, Method::POST, "/v1/teams", &doomed)
+            .json(&json!({"name": "Doomed"}))
+            .await;
+        let old = fresh_slug();
+        set_slug(&s, &doomed, json!(old)).await.assert_status_ok();
+        set_slug(&s, &doomed, json!(fresh_slug()))
+            .await
+            .assert_status_ok();
+        assert!(redirect_for(&s, &old).await.is_some());
+        let res = req(&s, Method::DELETE, "/v1/team", &doomed).await;
+        assert_eq!(res.status_code(), 204);
+        assert_eq!(redirect_for(&s, &old).await, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_slug_can_be_checked_before_it_is_taken() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, owner, _) = user(&s, &db).await;
+        let (_, other, _) = user(&s, &db).await;
+        let team = current(&s, &owner).await;
+        let check = |cookie: &str, query: &str| {
+            s.get(&format!("/v1/slugs/check?{query}"))
+                .add_header("cookie", cookie.to_owned())
+        };
+        let answer = |res: axum_test::TestResponse| {
+            res.assert_status_ok();
+            let v = res.json::<Value>();
+            (
+                v["slug"].as_str().unwrap().to_owned(),
+                v["available"].as_bool().unwrap(),
+                v["reason"].as_str().map(str::to_owned),
+            )
+        };
+        let free = fresh_slug();
+        let res = check(&owner, &format!("slug=%20{}%20", free.to_uppercase())).await;
+        assert_eq!(answer(res), (free.clone(), true, None));
+        for (typed, reason) in [
+            ("ab", "length"),
+            ("a--b", "characters"),
+            ("posts", "reserved"),
+            ("fuck-it", "blocked"),
+            (team["code"].as_str().unwrap(), "taken"),
+        ] {
+            let res = check(&owner, &format!("slug={typed}")).await;
+            assert_eq!(
+                answer(res),
+                (typed.to_owned(), false, Some(reason.to_owned()))
+            );
+        }
+        // Another team's slug, and one it gave up, are taken; for its own team they are not.
+        let (mine, was) = (fresh_slug(), fresh_slug());
+        set_slug(&s, &owner, json!(was)).await.assert_status_ok();
+        set_slug(&s, &owner, json!(mine)).await.assert_status_ok();
+        for slug in [&mine, &was] {
+            let res = check(&other, &format!("slug={slug}")).await;
+            assert_eq!(answer(res).2.as_deref(), Some("taken"), "{slug}");
+        }
+        let res = check(
+            &owner,
+            &format!("slug={was}&for_team={}", team["code"].as_str().unwrap()),
+        )
+        .await;
+        assert_eq!(answer(res), (was.clone(), true, None));
+        let res = check(
+            &owner,
+            &format!("slug={mine}&for_team={}", team["code"].as_str().unwrap()),
+        )
+        .await;
+        assert_eq!(answer(res).2.as_deref(), Some("current"));
+        // It cannot be asked about a team the caller is not in, and needs a session.
+        let res = check(
+            &other,
+            &format!("slug={free}&for_team={}", team["code"].as_str().unwrap()),
+        )
+        .await;
+        assert_eq!(res.status_code(), 404);
+        let res = s.get(&format!("/v1/slugs/check?slug={free}")).await;
+        assert_eq!(res.status_code(), 401);
+        let res = check(&owner, "").await;
+        assert_eq!(res.status_code(), 422);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_new_team_can_start_with_a_slug() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, cookie, id) = user(&s, &db).await;
+        let (_, other, _) = user(&s, &db).await;
+        let make = |body: Value| req(&s, Method::POST, "/v1/teams", &cookie).json(&body);
+        let slug = fresh_slug();
+        let res = make(json!({"name": "Acme", "slug": format!(" {} ", slug.to_uppercase())})).await;
+        assert_eq!(res.status_code(), 201);
+        let made = res.json::<Value>();
+        assert_eq!(made["slug"], slug);
+        assert_eq!(made["code"].as_str().unwrap().len(), 6);
+        assert_eq!(current(&s, &cookie).await["slug"], slug);
+        // Without one, or with null or an empty one, it starts at its code.
+        for body in [
+            json!({"name": "A"}),
+            json!({"name": "B", "slug": null}),
+            json!({"name": "C", "slug": " "}),
+        ] {
+            let res = make(body).await;
+            assert_eq!(res.status_code(), 201);
+            assert_eq!(res.json::<Value>()["slug"], Value::Null);
+        }
+        let count = memberships(&db, id).await;
+        // A slug that is taken, given up by another team lately, or not allowed makes no team.
+        let given_up = fresh_slug();
+        set_slug(&s, &other, json!(given_up))
+            .await
+            .assert_status_ok();
+        set_slug(&s, &other, json!(fresh_slug()))
+            .await
+            .assert_status_ok();
+        for taken in [&slug, &given_up] {
+            let res = make(json!({"name": "D", "slug": taken})).await;
+            assert_eq!(res.status_code(), 409, "{taken}");
+            res.assert_json(&json!({"error": "slug_taken"}));
+        }
+        for (bad, reason) in [
+            ("ab", "length"),
+            ("admin", "reserved"),
+            ("a_b", "characters"),
+            ("shit-co", "blocked"),
+        ] {
+            let res = make(json!({"name": "E", "slug": bad})).await;
+            assert_eq!(res.status_code(), 422, "{bad}");
+            res.assert_json(&json!({"error": "invalid_slug", "reason": reason}));
+        }
+        assert_eq!(memberships(&db, id).await, count);
     }
 
     #[tokio::test]
@@ -9580,6 +9863,26 @@ mod teams {
                     assert_eq!(mails.len(), 3, "{mails:?}");
                     assert_eq!(mails[2].0, "Your Bluesky post was not posted");
 
+                    // A team with a slug of its own is linked by it.
+                    let slug = format!("s-{}", team::random_code(12));
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE teams SET slug = '{slug}' WHERE id = '{team_id}'; \
+                             UPDATE post_notices SET created_at = now() - interval '3 hours' \
+                             WHERE post_id = '{late}'; \
+                             UPDATE posts SET status = 'scheduled', error = NULL, \
+                             scheduled_at = now() - interval '90 minutes' WHERE id = '{late}'"
+                        ),
+                    )
+                    .await;
+                    for _ in 0..3 {
+                        publish::tick(&state).await.unwrap();
+                    }
+                    let mails = mail_for(&seen.lock().unwrap(), &owner);
+                    assert_eq!(mails.len(), 4, "{mails:?}");
+                    assert!(mails[3].1.contains(&format!("/t/{slug}/posts/{late}")));
+
                     // Ten notices a team a day: the eleventh and after are not mailed.
                     for i in 0..10 {
                         let body = input(&set, &format!("REJECT {i}"), Some(&past()));
@@ -11155,7 +11458,7 @@ mod teams {
                         .await;
                     // The redirect names the team by its slug, the list below by its code.
                     let slug = format!("s-{}", team::random_code(12));
-                    req(&s, Method::PATCH, "/v1/team", &cookie)
+                    req(&s, Method::PATCH, "/v1/team/slug", &cookie)
                         .add_header("x-team", personal["code"].as_str().unwrap().to_owned())
                         .json(&json!({"slug": slug}))
                         .await
