@@ -933,6 +933,12 @@ impl InboxError {
             Self::Invalid("too_many_hidden") => "Bluesky keeps at most 300 hidden replies on \
                                                  a post."
                 .into(),
+            Self::Invalid("threads_replies_closed") => {
+                "The author of this post limited who can reply \
+                                                        to it, so a reply from this account was \
+                                                        not sent."
+                    .into()
+            }
             Self::Invalid("threads_no_dm") => "Threads has no direct messages, so nothing was \
                                                sent."
                 .into(),

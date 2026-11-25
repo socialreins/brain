@@ -240,6 +240,18 @@ pub async fn read(
     let mut found = Found::default();
     let t = &app.threads;
 
+    // A username can change and the loop guard finds our accounts by it, so it is read again on
+    // the hourly pass (a failed read keeps the old one).
+    if first || full {
+        let named = app.threads.me(&token).await.ok().and_then(|p| p.username);
+        if let Some(name) = named.filter(|n| Some(n) != account.handle.as_ref()) {
+            let stmt = sql(
+                "UPDATE social_accounts SET handle = $2 WHERE id = $1",
+                vec![account.id.into(), name.into()],
+            );
+            app.db.execute_raw(stmt).await?;
+        }
+    }
     if (first || full) && !denied(account, "replies_denied") {
         if let Err(e) = t.probe_replies(user, &token).await {
             if failed(app, account, "probe", &e).await? {
@@ -485,6 +497,19 @@ pub async fn send(
     let Some(token) = inbox::secret(app, account) else {
         return Err(InboxError::ThreadsReconnect);
     };
+    // A post that tagged us may limit who can reply to it: one for its own author only takes no
+    // reply from us, which is told before anything is sent. The other limits (followers, accounts
+    // the author follows) cannot be judged from here, so Threads has the last word on them.
+    if item.kind == "mention"
+        && app
+            .threads
+            .reply_audience(&token, &item.remote_id)
+            .await
+            .as_deref()
+            == Some("PARENT_POST_AUTHOR_ONLY")
+    {
+        return Err(InboxError::Invalid("threads_replies_closed"));
+    }
     // A reply is a post made with `reply_to_id`, so it waits like a post does.
     let made = app
         .threads

@@ -876,6 +876,19 @@ the posts above a reply or mention live. Refusals say what to do: `threads_recon
 `threads_permission_missing`, `rate_limited`, `threads_failed`. Permissions in the connect flow:
 `threads_basic`, `threads_content_publish`, `threads_manage_replies`, `threads_delete`,
 `threads_read_replies`, `threads_manage_mentions`.
+Automations on Threads take `comment_received` and `mention_received` with every condition (post
+ids as Threads media ids, keywords, first reply of a person, weekdays and hours, language, link,
+question, mood), and these actions: a public reply (plain or AI, 500 bytes with an emoji counted
+whole), `hide_comment` (a reply directly under our post, else `threads_nested`), `tag_contact`,
+`assign`, `notify_team`, `stop_automations`. A DM or private reply is refused at save and in
+"Test this automation" (`threads_no_dm`), a like too (`threads_no_like`), any other trigger
+`threads_unsupported_trigger`. On an account scope with other networks they are skipped per item
+with the same reasons. The loop guard finds a Threads author by handle (Threads gives no author
+id): a reply from any connected Threads account, of the team or another, is `own_account` or
+`connected_account`. A mention whose post only its own author takes replies to is skipped
+`threads_replies_closed`. "Test this automation" cannot judge two things a run can: whether a
+reply is nested (it assumes directly under the post) and a mention's reply control. The handle the
+loop guard matches is read again every hour. The pause switch, cool-down, daily caps and run log apply as everywhere.
 
 Webhooks: a team may set one public `https://` URL (at most 2000 characters, no credentials,
 not `localhost` or a private address). Each post target fires `post.target.published`,

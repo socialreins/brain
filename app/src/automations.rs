@@ -1599,14 +1599,21 @@ async fn loop_guard(
     item: &inbox_items::Model,
     account: &social_accounts::Model,
 ) -> Result<Option<&'static str>, DbErr> {
-    let teams: Vec<Uuid> = social_accounts::Entity::find()
+    let accounts = social_accounts::Entity::find()
         .select_only()
         .column(social_accounts::Column::TeamId)
-        .filter(social_accounts::Column::Provider.eq(&account.provider))
-        .filter(social_accounts::Column::ExternalId.eq(&item.author_id))
-        .into_tuple()
-        .all(db)
-        .await?;
+        .filter(social_accounts::Column::Provider.eq(&account.provider));
+    // Threads names an author by username only, never by the numeric id its accounts are kept
+    // under, so its accounts are found by handle.
+    let accounts = if account.provider == "threads" {
+        accounts.filter(sea_orm::sea_query::Expr::cust_with_values(
+            "lower(handle) = lower($1)",
+            [item.author_id.clone()],
+        ))
+    } else {
+        accounts.filter(social_accounts::Column::ExternalId.eq(&item.author_id))
+    };
+    let teams: Vec<Uuid> = accounts.into_tuple().all(db).await?;
     Ok(match teams.contains(&item.team_id) {
         true => Some("own_account"),
         false if !teams.is_empty() => Some("connected_account"),
@@ -1830,7 +1837,10 @@ async fn effect(
             };
             // Threads can hide, not like: its reply is hidden through `manage_reply`.
             if account.provider == "threads" {
-                if m != Moderate::Hide || item.kind != "comment" {
+                if m != Moderate::Hide {
+                    return done(kind, Some("threads_no_like"), false);
+                }
+                if item.kind != "comment" {
                     return done(kind, Some("not_supported"), false);
                 }
                 return match crate::threads_inbox::perform(app, account, item, Some(true)).await {
@@ -2658,8 +2668,15 @@ fn outcome(kind: &str, sent: Result<Result<String, InboxError>, DbErr>) -> Actio
             | InboxError::NoDmAccess
             | InboxError::RateLimited
             | InboxError::Invalid(
-                "outside_window" | "already_replied" | "dm_unavailable" | "threads_no_dm"
-                | "youtube_no_dm" | "x_no_credits" | "x_usage_capped" | "x_budget",
+                "outside_window"
+                | "already_replied"
+                | "dm_unavailable"
+                | "threads_no_dm"
+                | "threads_replies_closed"
+                | "youtube_no_dm"
+                | "x_no_credits"
+                | "x_usage_capped"
+                | "x_budget",
             )),
         )) => ("skipped", Some(e.code().to_owned()), None),
         Ok(Err(e)) => ("failed", Some(e.code().to_owned()), None),
