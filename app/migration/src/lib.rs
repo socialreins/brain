@@ -73,10 +73,10 @@ mod m20261230_000003_inbox_actions;
 mod m20261231_000001_meta_synced;
 mod m20270101_000001_inbox_moderation;
 mod m20270102_000001_automation_safety;
+mod m20270103_000001_post_numbers;
 mod m20270103_000001_wait_for_reply;
 mod m20270103_000001_youtube_inbox;
 mod m20270104_000001_run_retries;
-mod m20270103_000001_post_numbers;
 
 pub struct Migrator;
 
