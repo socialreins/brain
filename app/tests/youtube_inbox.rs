@@ -583,6 +583,24 @@ async fn a_long_sweep_goes_on_at_the_next_tick_and_loses_nothing() {
     let (has_cursor, page) = e.cursor().await;
     assert!(!has_cursor, "the cursor moves only when a sweep ends");
     assert_eq!(page.as_deref(), Some("p5"));
+    // A person's Resume starts a fresh sweep: a token YouTube stopped taking cannot wedge it.
+    let res =
+        e.s.post(&format!(
+            "/v1/connections/{}/youtube-inbox/resume",
+            e.account
+        ))
+        .add_header("origin", WEB)
+        .add_header("cookie", e.cookie.clone())
+        .json(&json!({}))
+        .await;
+    res.assert_status_ok();
+    assert_eq!(e.cursor().await.1, None);
+    e.tick().await;
+    assert_eq!(
+        e.items().await.len(),
+        5,
+        "the fresh sweep read the same newest pages again"
+    );
     e.tick().await;
     assert_eq!(e.items().await.len(), 7);
     let (has_cursor, page) = e.cursor().await;

@@ -78,7 +78,7 @@ pub struct YouTubeInboxInput {
     pub enabled: Option<bool>,
     /// 10 to 1440.
     pub poll_minutes: Option<i32>,
-    /// 20 to 5000.
+    /// 20 to 2000.
     pub daily_units: Option<i32>,
 }
 
@@ -163,7 +163,7 @@ async fn show(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> R
 
 /// Sets the settings. Owners and admins. `409 reconnect_required` when turning it on for a
 /// channel YouTube refused, `422 reconnect_for_comments` for one connected without the comments
-/// permission, `422` `invalid_poll` (10 to 1440 minutes) or `invalid_budget` (20 to 5000 units).
+/// permission, `422` `invalid_poll` (10 to 1440 minutes) or `invalid_budget` (20 to 2000 units).
 #[utoipa::path(put, path = "/connections/{id}/youtube-inbox", tag = "inbox",
     request_body = YouTubeInboxInput,
     security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path)),

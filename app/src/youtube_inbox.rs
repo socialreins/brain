@@ -50,7 +50,7 @@ pub const MAX_POLL_MINUTES: i32 = 1440;
 /// Units a channel may spend reading in one Pacific day.
 pub const DEFAULT_DAILY_UNITS: i32 = 300;
 pub const MIN_DAILY_UNITS: i32 = 20;
-pub const MAX_DAILY_UNITS: i32 = 5000;
+pub const MAX_DAILY_UNITS: i32 = 2000;
 /// What a reply, a moderation call or a delete costs.
 pub const WRITE_UNITS: i32 = 50;
 /// Pages of 100 threads one tick may read, and longest it may take, for one channel.
@@ -178,6 +178,10 @@ pub async fn save(db: &impl ConnectionTrait, account: Uuid, c: &Choice) -> Resul
                           ELSE youtube_inbox.next_poll_at END, \
            errors = CASE WHEN NOT youtube_inbox.enabled AND EXCLUDED.enabled THEN 0 \
                     ELSE youtube_inbox.errors END, \
+           page_token = CASE WHEN NOT youtube_inbox.enabled AND EXCLUDED.enabled THEN NULL \
+                        ELSE youtube_inbox.page_token END, \
+           pending_at = CASE WHEN NOT youtube_inbox.enabled AND EXCLUDED.enabled THEN NULL \
+                        ELSE youtube_inbox.pending_at END, \
            paused_reason = CASE WHEN youtube_inbox.paused_reason = 'budget' \
                            AND EXCLUDED.daily_units > youtube_inbox.daily_units THEN NULL \
                            ELSE youtube_inbox.paused_reason END, \
@@ -198,7 +202,8 @@ pub async fn save(db: &impl ConnectionTrait, account: Uuid, c: &Choice) -> Resul
 pub async fn resume(db: &impl ConnectionTrait, account: Uuid) -> Result<(), DbErr> {
     db.execute_raw(sql(
         "UPDATE youtube_inbox SET paused_reason = NULL, errors = 0, last_error = NULL, \
-         next_poll_at = now(), updated_at = now() WHERE social_account_id = $1",
+         page_token = NULL, pending_at = NULL, next_poll_at = now(), updated_at = now() \
+         WHERE social_account_id = $1",
         vec![account.into()],
     ))
     .await
@@ -209,7 +214,8 @@ pub async fn resume(db: &impl ConnectionTrait, account: Uuid) -> Result<(), DbEr
 pub fn pause_message(reason: &str, last_error: Option<&str>) -> String {
     match reason {
         "quota" => QUOTA_MESSAGE.into(),
-        "budget" => "Today's read budget for this channel is used up. Reading goes on after \
+        "budget" => "Today's read budget is used up (this channel's own, or the share of \
+                     YouTube's quota that all channels together may use). Reading goes on after \
                      midnight Pacific time, or raise the budget."
             .into(),
         _ => format!(
@@ -286,12 +292,14 @@ struct Round {
     soon: bool,
     videos: Vec<String>,
     reply_reads: usize,
+    /// Units this round may spend: what is left of the channel's day and of every channel's share.
+    limit: i32,
 }
 
 impl Round {
-    /// Fails with `Budget` when the day's budget cannot cover one more call.
-    fn room(&self, s: &Settings) -> Result<(), Stop> {
-        if s.daily_units - s.units_today - self.units < 1 {
+    /// Fails with `Budget` when the budgets cannot cover one more call.
+    fn room(&self) -> Result<(), Stop> {
+        if self.units >= self.limit {
             Err(Stop::Budget)
         } else {
             Ok(())
@@ -384,10 +392,10 @@ impl Sweep<'_> {
                 && !complete
                 && round.reply_reads < MAX_REPLY_READS
                 && self.started.elapsed() < READ_LIMIT
-                && round.room(self.s).is_ok()
+                && round.room().is_ok()
             {
                 round.reply_reads += 1;
-                round.units += 1;
+                round.units += 1; // YouTube charges a refused call too
                 let video = t.comment.video.as_deref();
                 replies = self
                     .app
@@ -431,13 +439,13 @@ impl Sweep<'_> {
                 round.soon = true;
                 return Ok(());
             }
-            round.room(self.s)?;
+            round.room()?;
+            round.units += 1; // YouTube charges a refused call too
             let r = self
                 .app
                 .youtube
                 .threads(self.token, &self.account.external_id, page.as_deref())
                 .await?;
-            round.units += 1;
             if round.pending.is_none() {
                 round.pending = r.items.first().map(|t| t.comment.at);
             }
@@ -461,7 +469,7 @@ impl Sweep<'_> {
 
 /// Keeps the title and thumbnail of the videos that comments came in on (1 unit for 50), for the
 /// context shown under a comment. A failure only costs the context.
-async fn videos(app: &AppState, token: &str, s: &Settings, round: &mut Round) -> Result<(), Stop> {
+async fn videos(app: &AppState, token: &str, round: &mut Round) -> Result<(), Stop> {
     if round.videos.is_empty() {
         return Ok(());
     }
@@ -484,9 +492,9 @@ async fn videos(app: &AppState, token: &str, s: &Settings, round: &mut Round) ->
         .filter(|v| !have.iter().any(|h| h == v))
         .collect();
     for ids in need.chunks(50) {
-        round.room(s)?;
+        round.room()?;
+        round.units += 1; // YouTube charges a refused call too
         let found = app.youtube.videos(token, ids).await?;
-        round.units += 1;
         for v in found {
             let stmt = sql(
                 "INSERT INTO youtube_videos (video_id, title, thumbnail) VALUES ($1, $2, $3) \
@@ -587,6 +595,16 @@ async fn poll(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         Ok(t) => t,
         Err(e) => return on_error(db, id, e).await,
     };
+    // Every channel's reads together stay inside the shared share, whatever each one was given.
+    let shared_left = app.youtube.inbox_units - shared_used(db).await?;
+    if shared_left < 1 {
+        return Ok(());
+    }
+    // A read after a long gap (switched off, or paused for days) is history too: whoever wrote in
+    // between has waited too long for an automation to answer.
+    let stale = s
+        .last_read_at
+        .is_none_or(|t| t < Utc::now() - Duration::minutes(i64::from(s.poll_minutes) * 2 + 10));
     let sweep = Sweep {
         app,
         account: &account,
@@ -594,14 +612,28 @@ async fn poll(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         s: &s,
         started: Instant::now(),
         floor: (Utc::now() - Duration::days(inbox::FIRST_DAYS)).fixed_offset(),
-        first: s.newest_at.is_none(),
+        first: s.newest_at.is_none() || (stale && s.page_token.is_none()),
     };
-    let mut round = Round::default();
+    let mut round = Round {
+        limit: i64::from(s.daily_units - s.units_today)
+            .min(shared_left)
+            .clamp(0, i32::MAX.into()) as i32,
+        ..Round::default()
+    };
     let mut stop = sweep.read(&mut round).await.err();
     if stop.is_none() || matches!(stop, Some(Stop::Budget)) {
         // Titles are context: a failure here is noted, never retried, and does not undo the read.
-        if let Err(Stop::Api(e)) = videos(app, &token, &s, &mut round).await {
-            tracing::warn!(account = %id, error = ?e, "youtube video titles not read");
+        match videos(app, &token, &mut round).await {
+            Err(Stop::Api(e @ PostError::Failed(_))) if stop.is_none() => {
+                // Only the quota pauses the channel; a title that cannot be read costs the context.
+                if matches!(&e, PostError::Failed(w) if is_quota(w)) {
+                    stop = Some(Stop::Api(e));
+                } else {
+                    tracing::warn!(account = %id, error = ?e, "youtube video titles not read");
+                }
+            }
+            Err(Stop::Db(e)) => return Err(e),
+            _ => {}
         }
     }
     if matches!(stop, Some(Stop::Budget)) {

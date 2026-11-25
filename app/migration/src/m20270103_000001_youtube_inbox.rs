@@ -12,7 +12,7 @@ pub struct Migration;
 // `page_token` and `pending_at` and goes on at the next tick. `paused_reason` stops polling until
 // a person resumes it (`quota`, `errors`) or the day turns (`budget`).
 // `youtube_threads` remembers how many replies a thread had when last read, so a thread with new
-// ones is read again; `youtube_videos` is the title and thumbnail shown under a comment. Both are
+// ones is read again (among the newest threads: older ones are not looked at); `youtube_videos` is the title and thumbnail shown under a comment. Both are
 // YouTube API data, kept at most 30 days (YouTube's developer policy) and then deleted.
 const UP: &str = "CREATE TABLE youtube_inbox (
   social_account_id uuid PRIMARY KEY REFERENCES social_accounts (id) ON DELETE CASCADE,
