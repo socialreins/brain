@@ -25483,6 +25483,83 @@ mod teams {
                 assert_eq!(res.status_code(), 404);
             }
 
+            /// An `@handle` that resolves becomes a mention of its DID and a `#tag` a tag, in a
+            /// public reply and in a DM; one that does not resolve stays plain text.
+            #[tokio::test]
+            #[serial]
+            async fn replies_and_dms_carry_mentions_and_tags() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                set_inbox(
+                    &me,
+                    json!({"notifications": [note("reply", "did:plc:fan1", "c1", "hi", &at(10), &me)],
+                        "convos": [{"id": "cv1", "members": [{"did": me}, {"did": "did:plc:dmer"}],
+                            "lastMessage": {"sentAt": at(5)}}],
+                        "messages": {"cv1": [dm("msg1", "did:plc:dmer", "hello", &at(5))]}}),
+                );
+                ingest(&db, &state, &account).await;
+                let all = all_inbox(&s, &cookie).await;
+                let page = items(&s, &cookie, all["id"].as_str().unwrap(), "").await;
+                let id_of = |text: &str| {
+                    page["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|i| i["text"] == text)
+                        .unwrap()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                };
+                let text = "Thanks @mia.test and @nobody.test, see https://x.io #launch";
+                for (to, via) in [("hi", "public"), ("hello", "dm")] {
+                    let res = req(
+                        &s,
+                        Method::POST,
+                        &format!("/v1/inbox-items/{}/reply", id_of(to)),
+                        &cookie,
+                    )
+                    .json(&json!({"text": text}))
+                    .await;
+                    assert_eq!(res.status_code(), 201, "{via}: {}", res.text());
+                }
+                let record = RECORDS.lock().unwrap().last().cloned().unwrap();
+                let sent = SENT.lock().unwrap().last().cloned().unwrap();
+                for facets in [&record["record"]["facets"], &sent["message"]["facets"]] {
+                    let kinds: Vec<(String, Value)> = facets
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|f| {
+                            let feature = &f["features"][0];
+                            let ty = feature["$type"]
+                                .as_str()
+                                .unwrap()
+                                .rsplit('#')
+                                .next()
+                                .unwrap()
+                                .to_owned();
+                            (
+                                ty,
+                                feature["did"]
+                                    .clone()
+                                    .as_str()
+                                    .map(Value::from)
+                                    .unwrap_or(feature["tag"].clone()),
+                            )
+                        })
+                        .collect();
+                    assert_eq!(
+                        kinds,
+                        [
+                            ("mention".to_owned(), json!("did:plc:mia")),
+                            ("link".to_owned(), Value::Null),
+                            ("tag".to_owned(), json!("launch"))
+                        ]
+                    );
+                }
+            }
+
             /// Replies to a post Bluesky will not show, or its author blocks us from, say so
             /// before anything is sent.
             #[tokio::test]
