@@ -1519,5 +1519,5 @@ async fn a_stopped_run_is_not_a_first_an_assignment_never_overrides_and_flows_do
     let _ = item;
     let runs = e.runs(&flow).await;
     assert!(runs.contains(&run("waiting", None)), "{runs:?}");
-    assert!(e.mock.seen("POST", "/2/users/1/likes").len() >= 1);
+    assert!(!e.mock.seen("POST", "/2/users/1/likes").is_empty());
 }
