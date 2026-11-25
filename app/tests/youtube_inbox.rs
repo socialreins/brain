@@ -32,7 +32,8 @@ const WEB: &str = "http://localhost:3000";
 const CHANNEL: &str = "UCus";
 const VIDEO: &str = "vid_12345A";
 
-/// 0 works, 1 quota used up, 2 a server error on every read, 3 YouTube refuses the token.
+/// 0 works, 1 quota used up, 2 a server error on every read, 3 YouTube refuses the token, 4
+/// comments are off on the video (every write).
 #[derive(Default)]
 struct Mock {
     mode: AtomicU8,
@@ -72,6 +73,11 @@ async fn handler(State(m): State<Arc<Mock>>, method: Method, uri: Uri, body: Byt
         }
         2 if method == Method::GET => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         3 => return StatusCode::UNAUTHORIZED.into_response(),
+        4 if method != Method::GET => {
+            let b = json!({"error": {"code": 403, "message": "off",
+                "errors": [{"reason": "commentsDisabled"}]}});
+            return (StatusCode::FORBIDDEN, Json(b)).into_response();
+        }
         _ => {}
     }
     match (method.as_str(), path.as_str()) {
@@ -632,4 +638,225 @@ async fn youtube_data_past_30_days_is_deleted() {
         .unwrap()
         .unwrap();
     assert_eq!(left.try_get::<i64>("", "n").unwrap(), 0);
+}
+
+impl Env {
+    async fn act(&self, item: Uuid, path: &str, body: Value) -> axum_test::TestResponse {
+        self.s
+            .post(&format!("/v1/inbox-items/{item}/{path}"))
+            .add_header("origin", WEB)
+            .add_header("cookie", self.cookie.clone())
+            .json(&body)
+            .await
+    }
+    async fn shown(&self, item: Uuid) -> Value {
+        self.s
+            .get(&format!("/v1/inbox-items/{item}"))
+            .add_header("cookie", self.cookie.clone())
+            .await
+            .json()
+    }
+    async fn read_in(&self) {
+        self.put(json!({"enabled": true})).await.assert_status_ok();
+        self.tick().await;
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn a_reply_goes_under_the_top_level_comment_and_can_be_taken_back() {
+    let e = env(false).await;
+    e.read_in().await;
+    // A reply to a reply goes under the same top-level comment: YouTube replies are one level deep.
+    let item = e.item("UgxTHREAD1.R1").await;
+    let res = e.act(item, "reply", json!({"text": "thanks!"})).await;
+    assert_eq!(res.status_code(), 201, "{}", res.text());
+    let posted = e.mock.seen("POST", "/youtube/v3/comments");
+    assert_eq!(posted.len(), 1);
+    assert_eq!(posted[0].1["snippet"]["parentId"], "UgxTHREAD1");
+    assert_eq!(posted[0].1["snippet"]["textOriginal"], "thanks!");
+    let got = res.json::<Value>();
+    assert_eq!(got["replies"][0]["remote_id"], "UgxTHREAD1.OURREPLY");
+    assert!(got["replied_at"].is_string());
+    assert_eq!(e.get().await["write_units_today"], 50);
+    // Only the channel can delete its own reply; owners and admins do.
+    let reply_id = got["replies"][0]["id"].as_str().unwrap().to_owned();
+    let res = e
+        .act(
+            item,
+            "moderate",
+            json!({"action": "delete_reply", "reply_id": reply_id}),
+        )
+        .await;
+    assert_eq!(res.status_code(), 200, "{}", res.text());
+    let dels = e.mock.seen("DELETE", "/youtube/v3/comments");
+    assert_eq!(dels.len(), 1);
+    assert!(
+        dels[0].0.contains("id=UgxTHREAD1.OURREPLY"),
+        "{}",
+        dels[0].0
+    );
+    let got = res.json::<Value>();
+    assert_eq!(got["replies"].as_array().unwrap().len(), 0);
+    assert_eq!(got["replied_at"], Value::Null, "unanswered again");
+    assert_eq!(e.get().await["write_units_today"], 100);
+    // A reply that is not this item's is not found, and nothing is called.
+    let res = e
+        .act(
+            item,
+            "moderate",
+            json!({"action": "delete_reply", "reply_id": Uuid::now_v7()}),
+        )
+        .await;
+    assert_eq!(res.status_code(), 422);
+    assert_eq!(e.mock.seen("DELETE", "/youtube/v3/comments").len(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn comments_can_be_held_published_rejected_and_the_author_banned() {
+    let e = env(false).await;
+    e.read_in().await;
+    let item = e.item("UgxTHREAD2").await;
+    let shown = e.shown(item).await;
+    assert_eq!(shown["moderation"]["can"], json!(["hold", "reject", "ban"]));
+    assert_eq!(shown["moderation"]["hidden"], false);
+    assert_eq!(
+        e.act(item, "moderate", json!({"action": "hold"}))
+            .await
+            .status_code(),
+        200
+    );
+    let call = &e
+        .mock
+        .seen("POST", "/youtube/v3/comments/setModerationStatus")[0];
+    assert!(
+        call.0.contains("moderationStatus=heldForReview") && call.0.contains("id=UgxTHREAD2"),
+        "{}",
+        call.0
+    );
+    let shown = e.shown(item).await;
+    assert_eq!(shown["moderation"]["hidden"], true);
+    assert_eq!(
+        shown["moderation"]["can"],
+        json!(["publish", "reject", "ban"])
+    );
+    e.act(item, "moderate", json!({"action": "publish"}))
+        .await
+        .assert_status_ok();
+    assert_eq!(e.shown(item).await["moderation"]["hidden"], false);
+    // Rejecting is for good: the item is done and takes no reply.
+    let res = e.act(item, "moderate", json!({"action": "ban"})).await;
+    assert_eq!(res.status_code(), 200);
+    let calls = e
+        .mock
+        .seen("POST", "/youtube/v3/comments/setModerationStatus");
+    assert!(
+        calls[2].0.contains("moderationStatus=rejected") && calls[2].0.contains("banAuthor=true"),
+        "{}",
+        calls[2].0
+    );
+    let shown = res.json::<Value>();
+    assert_eq!(
+        (
+            shown["state"].clone(),
+            shown["moderation"]["deleted"].clone()
+        ),
+        (json!("done"), json!(true))
+    );
+    assert_eq!(shown["moderation"]["can"], json!([]));
+    let res = e.act(item, "reply", json!({"text": "hi"})).await;
+    assert_eq!(res.status_code(), 422);
+    assert_eq!(res.json::<Value>()["error"], "rejected");
+    let res = e.act(item, "moderate", json!({"action": "hold"})).await;
+    assert_eq!(res.json::<Value>()["error"], "not_supported");
+    // Meta's words are not YouTube's.
+    assert_eq!(
+        e.act(item, "moderate", json!({"action": "hide"}))
+            .await
+            .status_code(),
+        422
+    );
+    assert_eq!(e.get().await["write_units_today"], 150);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_refused_write_says_what_to_do() {
+    let e = env(false).await;
+    e.read_in().await;
+    let item = e.item("UgxTHREAD2").await;
+    e.mock.mode.store(4, Ordering::SeqCst);
+    let res = e.act(item, "reply", json!({"text": "hi"})).await;
+    assert_eq!(res.status_code(), 422);
+    let got = res.json::<Value>();
+    assert_eq!(got["error"], "youtube_failed");
+    assert!(
+        got["message"]
+            .as_str()
+            .unwrap()
+            .contains("comments are turned off"),
+        "{got}"
+    );
+    let after = e.shown(item).await;
+    assert_eq!(after["replies"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        e.mock.seen("POST", "/youtube/v3/comments").len(),
+        1,
+        "never retried"
+    );
+    // A token YouTube refuses says to reconnect.
+    e.mock.mode.store(3, Ordering::SeqCst);
+    let res = e.act(item, "moderate", json!({"action": "hold"})).await;
+    assert_eq!(res.json::<Value>()["error"], "youtube_reconnect_required");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_channel_cannot_spend_more_than_its_write_budget_and_nothing_is_sent_for_a_rejected_thread(
+) {
+    let e = env(false).await;
+    e.read_in().await;
+    // Holding a held comment would spend 50 units for nothing: it is refused before YouTube.
+    let top = e.item("UgxTHREAD1").await;
+    e.act(top, "moderate", json!({"action": "hold"}))
+        .await
+        .assert_status_ok();
+    let again = e.act(top, "moderate", json!({"action": "hold"})).await;
+    assert_eq!(again.json::<Value>()["error"], "not_supported");
+    assert_eq!(
+        e.mock
+            .seen("POST", "/youtube/v3/comments/setModerationStatus")
+            .len(),
+        1
+    );
+    // A reply under a rejected comment is hidden with it: nothing is sent.
+    e.act(top, "moderate", json!({"action": "reject"}))
+        .await
+        .assert_status_ok();
+    let reply = e.item("UgxTHREAD1.R1").await;
+    let res = e.act(reply, "reply", json!({"text": "hi"})).await;
+    assert_eq!(res.json::<Value>()["error"], "rejected");
+    assert!(e.mock.seen("POST", "/youtube/v3/comments").is_empty());
+    // Past the day's write budget (40 calls) every write is refused with the reason.
+    e.sql(&format!(
+        "UPDATE youtube_inbox SET write_units_today = 1980 WHERE social_account_id = '{}'",
+        e.account
+    ))
+    .await;
+    let other = e.item("UgxTHREAD2").await;
+    let res = e.act(other, "reply", json!({"text": "hi"})).await;
+    assert_eq!(res.status_code(), 422);
+    let got = res.json::<Value>();
+    assert_eq!(got["error"], "youtube_write_budget");
+    assert!(got["message"]
+        .as_str()
+        .unwrap()
+        .contains("midnight Pacific"));
+    assert_eq!(
+        e.act(other, "moderate", json!({"action": "reject"}))
+            .await
+            .status_code(),
+        422
+    );
 }

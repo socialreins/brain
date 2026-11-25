@@ -63,7 +63,7 @@ use crate::{
     state::AppState,
 };
 
-pub const TRIGGERS: [&str; 8] = [
+pub const TRIGGERS: [&str; 9] = [
     "button_clicked",
     "comment_received",
     "dm_received",
@@ -71,6 +71,7 @@ pub const TRIGGERS: [&str; 8] = [
     "mention_received",
     "new_follower",
     "repost_received",
+    "story_mention",
     "story_reply",
 ];
 /// Automation runs that act, per team per day (`rate_limit::reserve_in`).
@@ -521,12 +522,24 @@ pub fn trigger_of(item: &inbox_items::Model) -> Option<&'static str> {
         "mention" => Some("mention_received"),
         "dm" if item.button_payload.is_some() => Some("button_clicked"),
         "dm" if item.story_reply => Some("story_reply"),
+        // Instagram: someone @mentioned the account in their story.
+        "dm" if story_mention(item) => Some("story_mention"),
         "dm" => Some("dm_received"),
         "follow" => Some("new_follower"),
         "like" => Some("like_received"),
         "repost" => Some("repost_received"),
         _ => None,
     }
+}
+
+/// Whether the DM is Instagram's notice that someone mentioned the account in a story (an
+/// attachment of kind `story_mention`).
+pub fn story_mention(item: &inbox_items::Model) -> bool {
+    item.platform == "instagram"
+        && item.attachments.as_array().is_some_and(|a| {
+            a.iter()
+                .any(|x| x["kind"].as_str() == Some("story_mention"))
+        })
 }
 
 /// A button payload: 1 to 64 characters of `a-z`, `0-9`, `_` and `-`.
@@ -548,10 +561,11 @@ fn check_conditions(trigger: &str, c: &mut Conditions) -> Result<(), &'static st
     let fits_trigger = (comment || like || c.post_remote_ids.is_empty())
         && (comment || mention || !c.first_per_author)
         && (trigger == "dm_received" || !c.first_message)
-        && (!(button || like || trigger == "new_follower") || c.keywords.is_empty())
+        && (!(button || like || matches!(trigger, "new_follower" | "story_mention"))
+            || c.keywords.is_empty())
         && (button != c.payloads.is_empty());
-    // A follow, a like, a repost and a click carry no text to read.
-    let textless = button || like || trigger == "new_follower";
+    // A follow, a like, a repost, a story mention and a click carry no text to read.
+    let textless = button || like || matches!(trigger, "new_follower" | "story_mention");
     let text_ok = !(textless && (c.has_link.is_some() || !c.sentiment.is_empty()))
         && c.sentiment.len() <= SENTIMENTS.len()
         && c.sentiment.iter().all(|i| SENTIMENTS.contains(&i.as_str()));
@@ -750,15 +764,34 @@ pub fn network_limits(
     }
     if !providers.is_empty()
         && providers.iter().all(|p| *p == "x")
-        && matches!(trigger, "new_follower" | "story_reply" | "button_clicked")
+        && matches!(
+            trigger,
+            "new_follower" | "story_reply" | "story_mention" | "button_clicked"
+        )
     {
         return Err("x_unsupported_trigger");
     }
     if !providers.is_empty()
         && providers.iter().all(|p| *p == "bluesky")
-        && matches!(trigger, "story_reply" | "button_clicked")
+        && matches!(trigger, "story_reply" | "story_mention" | "button_clicked")
     {
         return Err("bluesky_unsupported_trigger");
+    }
+    // Facebook and Instagram bring no follows and no mentions of the account: they never fire.
+    if matches!(trigger, "new_follower" | "mention_received")
+        && !providers.is_empty()
+        && providers
+            .iter()
+            .all(|p| matches!(*p, "facebook" | "instagram"))
+    {
+        return Err("meta_unsupported_trigger");
+    }
+    // A story mention is Instagram's alone.
+    if trigger == "story_mention"
+        && !providers.is_empty()
+        && providers.iter().all(|p| *p == "facebook")
+    {
+        return Err("facebook_unsupported_trigger");
     }
     if providers.is_empty()
         || !providers
@@ -3059,6 +3092,61 @@ mod tests {
         later.first_message = false;
         assert!(!matches(&welcome, &later));
         assert!(matches(&any, &later));
+    }
+
+    #[test]
+    fn a_dm_runs_the_most_specific_trigger_it_is() {
+        let now = chrono::Utc::now().fixed_offset();
+        let dm = |button: Option<&str>, story_reply: bool, mention: bool| inbox_items::Model {
+            id: Uuid::now_v7(),
+            team_id: Uuid::nil(),
+            social_account_id: Uuid::nil(),
+            platform: "instagram".into(),
+            kind: "dm".into(),
+            remote_id: "m".into(),
+            remote_cid: None,
+            parent_remote_id: None,
+            root_remote_id: None,
+            root_remote_cid: None,
+            convo_id: None,
+            post_id: None,
+            author_id: "a".into(),
+            author_handle: None,
+            author_name: None,
+            author_avatar: None,
+            text: String::new(),
+            received_at: now,
+            state: "open".into(),
+            replied_at: None,
+            permalink: None,
+            story_reply,
+            story_id: None,
+            story_url: None,
+            button_payload: button.map(str::to_owned),
+            contact_id: None,
+            assigned_to: None,
+            automated_at: None,
+            attachments: if mention {
+                serde_json::json!([{"kind": "story_mention", "url": "https://x.example/s"}])
+            } else {
+                serde_json::json!([])
+            },
+            moderation: serde_json::json!({}),
+            created_at: now,
+        };
+        assert_eq!(
+            trigger_of(&dm(Some("yes"), true, true)),
+            Some("button_clicked")
+        );
+        assert_eq!(trigger_of(&dm(None, true, true)), Some("story_reply"));
+        assert_eq!(trigger_of(&dm(None, false, true)), Some("story_mention"));
+        assert_eq!(trigger_of(&dm(None, false, false)), Some("dm_received"));
+        // Only Instagram sends a story mention.
+        let facebook = inbox_items::Model {
+            platform: "facebook".into(),
+            ..dm(None, false, true)
+        };
+        assert_eq!(trigger_of(&facebook), Some("dm_received"));
     }
 
     #[test]

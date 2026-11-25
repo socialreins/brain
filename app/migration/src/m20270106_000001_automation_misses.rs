@@ -12,7 +12,7 @@ pub struct Migration;
 const UP: &str = "ALTER TABLE automations DROP CONSTRAINT automations_trigger_check,
   ADD CONSTRAINT automations_trigger_check CHECK (trigger IN ('button_clicked',
     'comment_received', 'dm_received', 'like_received', 'mention_received', 'new_follower',
-    'repost_received', 'story_reply'));
+    'repost_received', 'story_mention', 'story_reply'));
 CREATE TABLE automation_misses (
   automation_id uuid NOT NULL REFERENCES automations (id) ON DELETE CASCADE,
   inbox_item_id uuid NOT NULL REFERENCES inbox_items (id) ON DELETE CASCADE,
@@ -28,7 +28,8 @@ const DOWN: &str = "DROP TABLE IF EXISTS automation_misses;
 DELETE FROM automations WHERE trigger IN ('like_received', 'repost_received');
 ALTER TABLE automations DROP CONSTRAINT automations_trigger_check,
   ADD CONSTRAINT automations_trigger_check CHECK (trigger IN ('button_clicked',
-    'comment_received', 'dm_received', 'mention_received', 'new_follower', 'story_reply'));";
+    'comment_received', 'dm_received', 'mention_received', 'new_follower', 'story_mention',
+    'story_reply'));";
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {

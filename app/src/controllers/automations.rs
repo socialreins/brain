@@ -44,7 +44,7 @@ pub struct Automation {
     /// When it was last switched on; items received before that never run it.
     pub activated_at: DateTime<FixedOffset>,
     /// `button_clicked`, `comment_received`, `dm_received`, `like_received`,
-    /// `mention_received`, `new_follower`, `repost_received` or `story_reply`.
+    /// `mention_received`, `new_follower`, `repost_received`, `story_mention` or `story_reply`.
     pub trigger: String,
     pub conditions: Conditions,
     /// Empty for a flow.
@@ -94,7 +94,7 @@ pub struct AutomationInput {
     /// 1 to 60 characters after trimming.
     pub name: String,
     /// `button_clicked`, `comment_received`, `dm_received`, `like_received`,
-    /// `mention_received`, `new_follower`, `repost_received` or `story_reply` (see `Conditions`
+    /// `mention_received`, `new_follower`, `repost_received`, `story_mention` (Instagram only, no keywords) or `story_reply` (see `Conditions`
     /// for the conditions each takes). `reply_publicly`, a fallback reply and `{page}` are for
     /// `comment_received` and `mention_received` only. `like_received` and `repost_received` (a
     /// like or repost of one of the account's posts, Bluesky only) take the scope and
@@ -870,7 +870,10 @@ async fn test(
         automation.trigger.as_str(),
         "new_follower" | "like_received" | "repost_received"
     );
-    if (text.is_empty() && !textless) || text.chars().count() > dry_run::MAX_SAMPLE_CHARS {
+    if (text.is_empty() && !textless)
+        || text.chars().count() > dry_run::MAX_SAMPLE_CHARS
+        || sample.age_minutes > dry_run::MAX_SAMPLE_AGE_MINUTES
+    {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_sample");
     }
     let sample = Sample {

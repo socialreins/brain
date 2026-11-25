@@ -16,6 +16,7 @@ pub mod mail;
 pub mod mcp;
 pub mod media;
 pub mod meta_inbox;
+pub mod meta_rules;
 pub mod metrics;
 pub mod models;
 pub mod newsletters;
