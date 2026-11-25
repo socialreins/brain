@@ -37,6 +37,7 @@ pub mod review_login;
 pub mod social_sets;
 pub mod stripe;
 pub mod subscribers;
+pub mod team_slugs;
 pub mod teams;
 pub mod threads;
 pub mod tiktok;
@@ -103,6 +104,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(admin::api().layer(DefaultBodyLimit::max(MAX_ADMIN_BODY_BYTES)))
         .merge(contact::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
         .merge(teams::api())
+        .merge(team_slugs::api())
         .merge(api_tokens::api())
         .merge(billing::api())
         .merge(ai_key::api())

@@ -261,11 +261,16 @@ cargo run -p socialreins-brain
   it in the transaction of anything that takes a post out of `scheduled` to publish it
   (`publish::claim`, and publish now through `publish::reserve_and`), so a post yields one copy
   at most. A copy's group id is a UUID v5 of the old one, so group mates agree without talking.
-- Team slugs (`teams.slug`, optional, set with `PATCH /v1/team`): `teams::team_by_code` is the
-  one place a request's `X-Team` or `?team=` becomes a team, by `code` or by slug. A slug never
-  equals a code (`rename` checks, `insert_team` draws again) and is unique on `lower(slug)`; the
-  code is permanent, the slug may change (5 times a day per team). One given up stops resolving at once and is
-  kept from other teams for 30 days (`team_slug_holds`, written in the same transaction).
+- Team slugs (`teams.slug`, optional): `teams::team_by_code` is the one place a request's
+  `X-Team` or `?team=` becomes a team, by `code` or by slug. A slug never equals a code (`insert_team`
+  draws again, `team_slugs::taken` refuses) and is unique on `lower(slug)`; the code is permanent. The
+  slug has its own routes in `controllers/team_slugs.rs` (`PATCH /team/slug`: owner, fresh sign-in;
+  `GET /slugs/check`; public `GET /public/team-slugs/{slug}`) and `POST /teams` takes one. A slug given
+  up (change, clear, team delete) is a `team_slug_history` row, written in the same transaction: it holds
+  the slug for other teams 90 days, feeds the web redirect for 400 days and counts the team's changes (3
+  per 30 days). `crates/core/src/team.rs` has the rules and `RESERVED_SLUGS`; the web repo's
+  `tests/unit/team-slug.test.ts` checks it covers every web route. Post notice mail links by
+  `COALESCE(slug, code)`.
 - `app/src/dry_run.rs`: `POST /v1/automations/test`, "Test this automation". It runs the real matching (`automations::mismatches`), `network_limits`, `{name}` and `{page}` filling and the AI step (`automations::ai_write`, shared with the real send, so the key choice, the monthly allowance and the checks are the same) on a sample from a stranger, and sends nothing, stores no inbox item or run and takes no daily hit. Keep it in step with `automations::run_matching` and `act` when a rule changes.
 - `app/src/x_inbox.rs` and `connectors/x/inbox.rs`: the X inbox. X has no webhooks we can use and
   bills every read (pay-per-use credits), so it is opt-in per account (`x_inbox.enabled`, off by
