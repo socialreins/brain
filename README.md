@@ -301,7 +301,7 @@ it (`409 slug_taken`), so an old link never lands on another team; the team that
 it back at any time. For 400 days `GET /v1/public/team-slugs/{slug}` answers `{"address"}`, the
 team's current slug or its code, and the web app redirects `/t/<old>/...` there with a permanent
 redirect, keeping the path and the query; after the 90 days another team may have taken the
-slug, and then it is theirs and nothing redirects. The lookup is public (a slug is in every link
+slug, and then it is theirs and nothing redirects (nor when two teams gave it up). The lookup is public (a slug is in every link
 a team shares) and limited to 600 calls a minute per IP. Everything else is keyed by the team's
 id: API tokens, posts, public post pages (`/p/<code>`), newsletter and invitation links and
 webhooks do not hold the slug and do not notice a change. Post notice mails link to

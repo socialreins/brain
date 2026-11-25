@@ -234,7 +234,7 @@ pub struct SlugAddress {
 
 /// Where the links of a slug a team gave up lead now, for the web app's redirect. Public, and
 /// `404` for a slug that is a team's code or current slug, one given up more than 400 days ago,
-/// one never used, and one whose team was deleted. Per-IP limit of 600 calls a minute.
+/// one never used, one whose team was deleted, and one that more than one team gave up. Per-IP limit of 600 calls a minute.
 #[utoipa::path(get, path = "/public/team-slugs/{slug}", tag = "teams",
     params(("slug" = String, Path)),
     responses((status = 200, body = SlugAddress,
@@ -252,12 +252,15 @@ async fn address(
     if slug.len() > 64 {
         return reply(StatusCode::NOT_FOUND, "not_found");
     }
-    // The newest retirement wins: the slug may have passed from one team to another. A slug a
-    // team holds now, or a code, is that team's address, not a redirect.
+    // A slug a team holds now, or a code, is that team's address, not a redirect. One that more
+    // than one team gave up inside the window is ambiguous (it passed from one team to another
+    // after its 90 days), so it leads nowhere rather than to the wrong team.
     let sql = "SELECT COALESCE(t.slug, t.code) AS address FROM team_slug_history h \
                JOIN teams t ON t.id = h.team_id WHERE h.slug = $1 \
                AND h.retired_at > now() - interval '400 days' \
                AND NOT EXISTS (SELECT 1 FROM teams c WHERE c.code = $1 OR lower(c.slug) = $1) \
+               AND NOT EXISTS (SELECT 1 FROM team_slug_history o WHERE o.slug = h.slug \
+                   AND o.team_id <> h.team_id AND o.retired_at > now() - interval '400 days') \
                ORDER BY h.retired_at DESC LIMIT 1";
     let stmt = Statement::from_sql_and_values(DbBackend::Postgres, sql, [slug.into()]);
     let found = async {

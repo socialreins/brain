@@ -2984,6 +2984,11 @@ mod teams {
         retired_days_ago(&db, &passed, 91).await;
         set_slug(&s, &other, json!(passed)).await.assert_status_ok();
         assert_eq!(redirect_for(&s, &passed).await, None);
+        // Once they let go of it too, it is a slug two teams gave up: no redirect to either.
+        set_slug(&s, &other, json!(fresh_slug()))
+            .await
+            .assert_status_ok();
+        assert_eq!(redirect_for(&s, &passed).await, None);
         // A deleted team leaves nothing to redirect to.
         let (_, doomed, _) = user(&s, &db).await;
         req(&s, Method::POST, "/v1/teams", &doomed)
