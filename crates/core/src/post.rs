@@ -293,6 +293,32 @@ pub fn x_weight(text: &str) -> usize {
     total
 }
 
+/// Whether `c` is part of an emoji: the pictograph blocks, symbols that default to emoji, the
+/// variation selector, the joiner, the keycap and the tag characters. Text-style symbols such as
+/// `(c)` or `TM` are left out unless a variation selector makes them an emoji.
+fn emoji_part(c: char) -> bool {
+    matches!(c as u32,
+        0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2B00..=0x2BFF | 0x2300..=0x23FF
+        | 0xFE0F | 0x200D | 0x20E3 | 0xE0020..=0xE007F)
+}
+
+/// What Threads counts against its 500-character limit: each character one, except an emoji
+/// (the Threads docs: "emojis are counted as the number of UTF-8 bytes"), which counts its bytes
+/// whole, so a family or a flag is the bytes of every part.
+/// shortcut: the emoji ranges in `emoji_part` are approximate, kept on the safe side for the
+/// common ones; widen them if Threads refuses a post this counts as under the limit.
+pub fn threads_length(text: &str) -> usize {
+    text.graphemes(true)
+        .map(|g| {
+            if g.chars().any(emoji_part) {
+                g.len()
+            } else {
+                g.chars().count()
+            }
+        })
+        .sum()
+}
+
 /// Checks a post for `platform` (`bluesky`, `threads`, `linkedin`, `facebook`, `instagram`,
 /// `youtube`, `x` or `tiktok`, the ones that publish today).
 pub fn validate(platform: &str, body: &str, media: &[String]) -> Result<(), Invalid> {
@@ -315,9 +341,14 @@ pub fn check(platform: &str, body: &str, media: &[String]) -> Vec<Problem> {
             ],
             BLUESKY_MAX_IMAGES,
         ),
-        // shortcut: counts characters, while Threads counts an emoji by its UTF-8 bytes, so an
-        // emoji-heavy post near 500 may still be refused at publish; count like Threads if it bites.
-        "threads" => (chars(THREADS_MAX_CHARS), THREADS_MAX_MEDIA),
+        "threads" => (
+            vec![(
+                threads_length(body),
+                THREADS_MAX_CHARS,
+                "characters, an emoji counting as its UTF-8 bytes",
+            )],
+            THREADS_MAX_MEDIA,
+        ),
         "linkedin" => (chars(LINKEDIN_MAX_CHARS), LINKEDIN_MAX_MEDIA),
         "facebook" => (chars(FACEBOOK_MAX_CHARS), FACEBOOK_MAX_MEDIA),
         "instagram" => (chars(INSTAGRAM_MAX_CHARS), INSTAGRAM_MAX_MEDIA),
@@ -1042,10 +1073,34 @@ mod tests {
     }
 
     #[test]
+    fn threads_counts_an_emoji_by_its_utf8_bytes() {
+        assert_eq!(threads_length("abc"), 3);
+        assert_eq!(threads_length("é©™"), 3);
+        assert_eq!(threads_length("😀"), 4);
+        // Woman, joiner, woman, joiner, girl: 4 + 3 + 4 + 3 + 4 bytes.
+        assert_eq!(threads_length("👩‍👩‍👧"), 18);
+        // Heart with a variation selector: 3 + 3 bytes; a flag is two 4-byte letters.
+        assert_eq!(threads_length("❤️"), 6);
+        assert_eq!(threads_length("🇧🇩"), 8);
+        // A digit with a keycap: 1 + 3 + 3 bytes.
+        assert_eq!(threads_length("1️⃣"), 7);
+    }
+
+    #[test]
     fn threads_limits() {
         let media = |n: usize| vec!["https://a.example/1.png".to_owned(); n];
         assert_eq!(validate("threads", &"a".repeat(500), &[]), Ok(()));
         assert_eq!(validate("threads", &"é".repeat(500), &[]), Ok(()));
+        // An emoji counts its UTF-8 bytes: 4 for most, so 125 of them fill the 500.
+        assert_eq!(validate("threads", &"😀".repeat(125), &[]), Ok(()));
+        assert_eq!(
+            validate("threads", &"😀".repeat(126), &[]),
+            Err(Invalid::TooLong)
+        );
+        assert_eq!(
+            validate("threads", &format!("{}😀", "a".repeat(497)), &[]),
+            Err(Invalid::TooLong)
+        );
         assert_eq!(
             validate("threads", &"a".repeat(501), &[]),
             Err(Invalid::TooLong)
