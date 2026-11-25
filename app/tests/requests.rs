@@ -26820,11 +26820,19 @@ mod teams {
                 ] {
                     let res = act(ok(on)).await;
                     assert_eq!(res.status_code(), 200, "{on}: {}", res.text());
-                    let state = s
-                        .get(&format!("/v1/inbox-items/{id}/actions"))
-                        .add_header("cookie", &cookie)
-                        .await
-                        .json::<Value>();
+                    // Bluesky's read side lags a write by a moment.
+                    let mut state = Value::Null;
+                    for _ in 0..8 {
+                        state = s
+                            .get(&format!("/v1/inbox-items/{id}/actions"))
+                            .add_header("cookie", &cookie)
+                            .await
+                            .json::<Value>();
+                        if state["viewer"][seen] == true {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                    }
                     assert_eq!(state["viewer"][seen], true, "{on}: {state}");
                     let res = act(ok(off)).await;
                     assert_eq!(res.status_code(), 200, "{off}: {}", res.text());
