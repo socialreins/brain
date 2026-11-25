@@ -3,7 +3,7 @@
 //! stores new items (Meta posts into the same table from its webhook, `meta_inbox`). New items then run
 //! the team's automations (`automations::run` picks the trigger from the item's kind). Replies, by people or automations, go out through `send`, at most
 //! once: nothing here retries a send.
-use std::sync::LazyLock;
+use std::{sync::LazyLock, time::Instant};
 
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 use sea_orm::{
@@ -393,13 +393,34 @@ async fn store_new(
         password: &secret,
     };
     let floor = (Utc::now() - Duration::days(FIRST_DAYS)).fixed_offset();
+    let started = Instant::now();
+    let budget = app.bluesky.inbox_budget;
+    let Some(row) = db
+        .query_one_raw(sql(
+            "SELECT notifications_cursor, notifications_pending_at, messages_resume_at \
+             FROM social_accounts WHERE id = $1",
+            vec![account.id.into()],
+        ))
+        .await?
+    else {
+        return Ok(None);
+    };
+    let cursor: Option<String> = row.try_get("", "notifications_cursor")?;
+    let pending: Option<DateTime<FixedOffset>> = row.try_get("", "notifications_pending_at")?;
+    let resume: Option<DateTime<FixedOffset>> = row.try_get("", "messages_resume_at")?;
     let since = account.notifications_seen_at.unwrap_or(floor).max(floor);
     let mut fresh = Vec::new();
-    match app.bluesky.notifications(&c, since).await {
-        Ok(list) => {
-            let newest = list.iter().map(|n| n.indexed_at).max();
+    // Notifications get half the time, so DMs are read even behind a long backlog.
+    let read = app
+        .bluesky
+        .notifications(&c, since, cursor.as_deref(), started + budget / 2)
+        .await;
+    match read {
+        Ok(read) => {
+            // Newest first, and the newest of a round that stops early is kept for its end.
+            let newest = read.found.iter().map(|n| n.indexed_at).max().max(pending);
             // Oldest first, so automations see comments in the order they came.
-            for n in list.iter().rev() {
+            for n in read.found.iter().rev() {
                 if n.author.did == account.external_id {
                     continue;
                 }
@@ -407,13 +428,20 @@ async fn store_new(
                     fresh.push(item);
                 }
             }
-            if let Some(t) = newest {
-                let stmt = sql(
-                    "UPDATE social_accounts SET notifications_seen_at = $2 WHERE id = $1",
-                    vec![account.id.into(), t.into()],
-                );
-                db.execute_raw(stmt).await?;
-            }
+            let stmt = match read.next {
+                Some(next) => sql(
+                    "UPDATE social_accounts SET notifications_cursor = $2, \
+                     notifications_pending_at = $3 WHERE id = $1",
+                    vec![account.id.into(), next.into(), newest.into()],
+                ),
+                None => sql(
+                    "UPDATE social_accounts SET notifications_seen_at = COALESCE($2, \
+                     notifications_seen_at), notifications_cursor = NULL, \
+                     notifications_pending_at = NULL WHERE id = $1",
+                    vec![account.id.into(), newest.into()],
+                ),
+            };
+            db.execute_raw(stmt).await?;
         }
         Err(InboxError::Reconnect) => {
             let stmt = sql(
@@ -424,23 +452,43 @@ async fn store_new(
             crate::expiry::flag_reconnect(db, account.id).await;
             return Ok(None);
         }
+        Err(InboxError::Refused { status: 400, .. }) if cursor.is_some() => {
+            // The saved page is gone: read from the newest again. What was stored stays, and
+            // storing it twice adds nothing.
+            tracing::warn!(account = %account.id, "notifications cursor refused, starting over");
+            let stmt = sql(
+                "UPDATE social_accounts SET notifications_cursor = NULL, \
+                 notifications_pending_at = NULL WHERE id = $1",
+                vec![account.id.into()],
+            );
+            db.execute_raw(stmt).await?;
+        }
         Err(e) => tracing::warn!(code = e.code(), account = %account.id, "notifications failed"),
     }
     let msince = account.messages_seen_at.unwrap_or(floor).max(floor);
-    let dm_access = match app.bluesky.messages(&c, msince).await {
-        Ok((list, newest)) => {
-            for m in list.iter().rev() {
+    let dm_access = match app
+        .bluesky
+        .messages(&c, msince, resume, started + budget)
+        .await
+    {
+        Ok(read) => {
+            for m in read.found.iter().rev() {
                 if let Some(item) = store_message(db, &account, m).await? {
                     fresh.push(item);
                 }
             }
-            if let Some(t) = newest {
-                let stmt = sql(
-                    "UPDATE social_accounts SET messages_seen_at = $2 WHERE id = $1",
+            let stmt = match read.resume {
+                Some(t) => sql(
+                    "UPDATE social_accounts SET messages_resume_at = $2 WHERE id = $1",
                     vec![account.id.into(), t.into()],
-                );
-                db.execute_raw(stmt).await?;
-            }
+                ),
+                None => sql(
+                    "UPDATE social_accounts SET messages_seen_at = COALESCE($2, \
+                     messages_seen_at), messages_resume_at = NULL WHERE id = $1",
+                    vec![account.id.into(), read.newest.into()],
+                ),
+            };
+            db.execute_raw(stmt).await?;
             true
         }
         // An outage (5xx) keeps what was known; only a refusal means no access.

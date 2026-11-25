@@ -3609,16 +3609,39 @@ mod teams {
             )
         }
 
-        async fn list_notifications(headers: axum::http::HeaderMap) -> Answer {
+        /// With `page` in the account's data, that many a page and the next index as the cursor
+        /// (a `cursor` of `stale` is refused); with `delay_ms`, each answer waits that long.
+        async fn list_notifications(
+            headers: axum::http::HeaderMap,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> Answer {
             let Some((did, _)) = caller(&headers) else {
                 return refused(401, "AuthenticationRequired");
             };
-            let list = inbox_of(&did)["notifications"].clone();
-            let list = if list.is_null() { json!([]) } else { list };
-            (
-                axum::http::StatusCode::OK,
-                Json(json!({ "notifications": list })),
-            )
+            let data = inbox_of(&did);
+            if let Some(ms) = data["delay_ms"].as_u64() {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
+            let all = data["notifications"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let Some(size) = data["page"].as_u64() else {
+                return (
+                    axum::http::StatusCode::OK,
+                    Json(json!({ "notifications": all })),
+                );
+            };
+            if q.get("cursor").is_some_and(|c| c == "stale") {
+                return refused(400, "InvalidRequest");
+            }
+            let from: usize = q.get("cursor").and_then(|c| c.parse().ok()).unwrap_or(0);
+            let to = (from + size as usize).min(all.len());
+            let mut body = json!({ "notifications": all[from.min(to)..to] });
+            if to < all.len() {
+                body["cursor"] = json!(to.to_string());
+            }
+            (axum::http::StatusCode::OK, Json(body))
         }
 
         /// The chat proxy: refuses tokens without DM access, like Bluesky.
@@ -23306,6 +23329,182 @@ mod teams {
                 assert_eq!(got[0]["results"].as_array().unwrap().len(), 2);
                 assert_eq!(sent_to(&convo), ["One", "Two"]);
                 assert_eq!(hits().await, 500);
+            }
+
+            /// (notifications cursor, notifications seen, messages seen, messages resume) of an
+            /// account, as stored.
+            async fn marks(
+                db: &DatabaseConnection,
+                account: &str,
+            ) -> (Option<String>, bool, bool, bool) {
+                let stmt = sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DbBackend::Postgres,
+                    "SELECT notifications_cursor, notifications_seen_at IS NOT NULL AS n, \
+                     messages_seen_at IS NOT NULL AS m, messages_resume_at IS NOT NULL AS r \
+                     FROM social_accounts WHERE id = $1",
+                    [account.parse::<uuid::Uuid>().unwrap().into()],
+                );
+                let row = sea_orm::ConnectionTrait::query_one_raw(db, stmt)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                (
+                    row.try_get("", "notifications_cursor").unwrap(),
+                    row.try_get("", "n").unwrap(),
+                    row.try_get("", "m").unwrap(),
+                    row.try_get("", "r").unwrap(),
+                )
+            }
+
+            async fn stored_count(db: &DatabaseConnection, team: &str) -> u64 {
+                inbox_items::Entity::find()
+                    .filter(inbox_items::Column::TeamId.eq(team.parse::<uuid::Uuid>().unwrap()))
+                    .count(db)
+                    .await
+                    .unwrap()
+            }
+
+            fn dm_in(id: &str, from: &str, when: &str) -> Value {
+                json!({"$type": "chat.bsky.convo.defs#messageView", "id": id,
+                    "text": id, "sender": {"did": from}, "sentAt": when})
+            }
+
+            fn convo_of(id: &str, me: &str, last: &str) -> Value {
+                json!({"id": id, "members": [{"did": me, "handle": "me.test"},
+                    {"did": "did:plc:dmer", "handle": "dmer.test"}],
+                    "lastMessage": {"sentAt": last}})
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_read_that_stops_early_carries_on_next_tick_without_loss_or_repeats() {
+                let (s, db, mut state) = on_mock().await;
+                // No time at all: one page and one conversation a tick.
+                state.bluesky.inbox_budget = std::time::Duration::ZERO;
+                let (_, team_id, account, me) = owner(&s, &db).await;
+                let (a, b, c) = (at(100), at(10), at(50));
+                set_inbox(
+                    &me,
+                    json!({
+                        "page": 2,
+                        "notifications": [
+                            note("reply", "did:plc:f1", "n1", "one", &at(10), &me),
+                            note("reply", "did:plc:f2", "n2", "two", &at(20), &me),
+                            note("reply", "did:plc:f3", "n3", "three", &at(30), &me),
+                            note("reply", "did:plc:f4", "n4", "four", &at(40), &me),
+                            note("reply", "did:plc:f5", "n5", "five", &at(50), &me),
+                        ],
+                        // B is the newest, but holds a message older than A's last: it must
+                        // still be read after A, whose time the round has reached.
+                        "convos": [convo_of("cvB", &me, &b), convo_of("cvC", &me, &c),
+                            convo_of("cvA", &me, &a)],
+                        "messages": {
+                            "cvA": [dm_in("a2", "did:plc:dmer", &a), dm_in("a1", "did:plc:dmer", &at(300))],
+                            "cvB": [dm_in("b2", "did:plc:dmer", &b), dm_in("b1", "did:plc:dmer", &at(200))],
+                            "cvC": [dm_in("c1", "did:plc:dmer", &c)],
+                        },
+                    }),
+                );
+                // Oldest conversation first: A (2 messages) and the 2 newest notifications.
+                ingest(&db, &state, &account).await;
+                assert_eq!(stored_count(&db, &team_id).await, 4);
+                assert_eq!(
+                    marks(&db, &account).await,
+                    (Some("2".into()), false, false, true)
+                );
+                ingest(&db, &state, &account).await;
+                assert_eq!(stored_count(&db, &team_id).await, 7, "2 more notes, C");
+                assert_eq!(
+                    marks(&db, &account).await,
+                    (Some("4".into()), false, false, true)
+                );
+                ingest(&db, &state, &account).await;
+                assert_eq!(
+                    stored_count(&db, &team_id).await,
+                    10,
+                    "the last note, B's two"
+                );
+                assert_eq!(marks(&db, &account).await, (None, true, true, false));
+                ingest(&db, &state, &account).await;
+                assert_eq!(stored_count(&db, &team_id).await, 10, "nothing again");
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_refused_saved_page_starts_the_read_over() {
+                let (s, db, mut state) = on_mock().await;
+                state.bluesky.inbox_budget = std::time::Duration::ZERO;
+                let (_, team_id, account, me) = owner(&s, &db).await;
+                let notes: Vec<Value> = (1..=5)
+                    .map(|i| {
+                        note(
+                            "reply",
+                            &format!("did:plc:g{i}"),
+                            &format!("s{i}"),
+                            "x",
+                            &at(i * 10),
+                            &me,
+                        )
+                    })
+                    .collect();
+                set_inbox(&me, json!({"page": 2, "notifications": notes}));
+                ingest(&db, &state, &account).await;
+                assert_eq!(marks(&db, &account).await.0, Some("2".into()));
+                sea_orm::ConnectionTrait::execute_unprepared(
+                    &db,
+                    &format!(
+                    "UPDATE social_accounts SET notifications_cursor = 'stale' WHERE id = '{account}'"),
+                )
+                .await
+                .unwrap();
+                ingest(&db, &state, &account).await;
+                assert_eq!(marks(&db, &account).await, (None, false, false, false));
+                for _ in 0..3 {
+                    ingest(&db, &state, &account).await;
+                }
+                assert_eq!(stored_count(&db, &team_id).await, 5);
+                // No conversations, so no messages mark.
+                assert_eq!(marks(&db, &account).await, (None, true, false, false));
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_slow_account_is_read_for_its_time_and_the_rest_next_tick() {
+                let (s, db, mut state) = on_mock().await;
+                state.bluesky.inbox_budget = std::time::Duration::from_millis(800);
+                let (_, team_id, account, me) = owner(&s, &db).await;
+                let notes: Vec<Value> = (1..=12)
+                    .map(|i| {
+                        note(
+                            "reply",
+                            &format!("did:plc:h{i}"),
+                            &format!("t{i}"),
+                            "x",
+                            &at(i * 10),
+                            &me,
+                        )
+                    })
+                    .collect();
+                // 12 pages of 150 ms is 1.8 s; half the budget stops a tick after 3 pages.
+                set_inbox(
+                    &me,
+                    json!({"page": 1, "delay_ms": 150, "notifications": notes}),
+                );
+                let started = std::time::Instant::now();
+                ingest(&db, &state, &account).await;
+                assert!(started.elapsed() < std::time::Duration::from_millis(1500));
+                let first = stored_count(&db, &team_id).await;
+                // The page cap alone would allow 6; the time stops it at about 3.
+                assert!((1..=4).contains(&first), "{first}");
+                assert!(marks(&db, &account).await.0.is_some());
+                for _ in 0..12 {
+                    if marks(&db, &account).await.0.is_none() {
+                        break;
+                    }
+                    ingest(&db, &state, &account).await;
+                }
+                assert_eq!(stored_count(&db, &team_id).await, 12);
+                assert!(marks(&db, &account).await.1);
             }
 
             #[tokio::test]
