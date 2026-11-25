@@ -242,8 +242,10 @@ pub async fn shared_used(db: &impl ConnectionTrait) -> Result<i64, DbErr> {
     r.map_or(Ok(0), |r| r.try_get("", "n"))
 }
 
-/// Counts what a write cost the channel today (shown, not limited).
-pub async fn charge_write(db: &impl ConnectionTrait, account: Uuid) {
+/// Reserves what one write costs the channel today, in one statement so two writes at once cannot
+/// both pass the budget: `false` when the channel's `MAX_WRITE_UNITS` a Pacific day is spent. The
+/// units stay spent when YouTube then refuses, since it charges a refused call too.
+async fn reserve_write(db: &impl ConnectionTrait, account: Uuid) -> Result<bool, DbErr> {
     let stmt = sql(
         &format!(
             "INSERT INTO youtube_inbox (social_account_id, write_units_today) VALUES ($1, $2) \
@@ -252,13 +254,14 @@ pub async fn charge_write(db: &impl ConnectionTrait, account: Uuid) {
                  ELSE youtube_inbox.write_units_today END) + $2, \
                units_today = CASE WHEN youtube_inbox.period < {TODAY} THEN 0 \
                  ELSE youtube_inbox.units_today END, \
-               period = {TODAY}"
+               period = {TODAY} \
+             WHERE (CASE WHEN youtube_inbox.period < {TODAY} THEN 0 \
+               ELSE youtube_inbox.write_units_today END) + $2 <= $3 \
+             RETURNING 1 AS ok"
         ),
-        vec![account.into(), WRITE_UNITS.into()],
+        vec![account.into(), WRITE_UNITS.into(), MAX_WRITE_UNITS.into()],
     );
-    if let Err(e) = db.execute_raw(stmt).await {
-        tracing::warn!(error = %e, "youtube write units not counted");
-    }
+    Ok(db.query_one_raw(stmt).await?.is_some())
 }
 
 /// Why a round stopped.
@@ -772,7 +775,7 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
 }
 
 // ---- What a person does to a comment: reply, hold, reject, delete our reply. Each is one call
-// (50 units) and never retried; what it cost is counted on the channel (`charge_write`).
+// (50 units) and never retried; what it cost is counted on the channel (`reserve_write`).
 
 /// YouTube's refusal as the inbox words it.
 fn refused(e: PostError) -> InboxError {
@@ -796,19 +799,18 @@ fn flag(item: &inbox_items::Model, key: &str) -> bool {
     item.moderation[key].as_bool() == Some(true)
 }
 
-/// Whether the channel may make another write today.
-async fn write_room(app: &AppState, account: &social_accounts::Model) -> Result<(), InboxError> {
-    let spent = load(&app.db, account.id)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "youtube write budget read failed");
-            InboxError::Invalid("youtube_write_budget")
-        })?
-        .map_or(0, |s| s.write_units_today);
-    if spent + WRITE_UNITS > MAX_WRITE_UNITS {
-        return Err(InboxError::Invalid("youtube_write_budget"));
+/// `reserve_write` as the inbox words it.
+async fn reserve(app: &AppState, account: &social_accounts::Model) -> Result<(), InboxError> {
+    match reserve_write(&app.db, account.id).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(InboxError::Invalid("youtube_write_budget")),
+        Err(e) => {
+            tracing::error!(error = %e, "youtube write budget failed");
+            Err(InboxError::YouTube(
+                "This could not be sent. Try again.".into(),
+            ))
+        }
     }
-    Ok(())
 }
 
 /// Replies publicly to `item` as the channel, once: under its top-level comment (YouTube replies
@@ -840,10 +842,9 @@ pub async fn send(
     if flag(item, "rejected") || parent.is_some_and(|m| m["rejected"].as_bool() == Some(true)) {
         return Err(InboxError::Invalid("rejected"));
     }
-    write_room(app, account).await?;
     let token = token_of(app, account).await?;
+    reserve(app, account).await?;
     let sent = app.youtube.reply(&token, top, text).await;
-    charge_write(&app.db, account.id).await;
     sent.map_err(refused)
 }
 
@@ -910,13 +911,13 @@ pub async fn moderate(
     if !moderations(item).contains(&action.as_str()) {
         return Ok(Err(InboxError::Invalid("not_supported")));
     }
-    if let Err(e) = write_room(app, account).await {
-        return Ok(Err(e));
-    }
     let token = match token_of(app, account).await {
         Ok(t) => t,
         Err(e) => return Ok(Err(e)),
     };
+    if let Err(e) = reserve(app, account).await {
+        return Ok(Err(e));
+    }
     let (status, ban, kept) = match action {
         Moderate::Hold => ("heldForReview", false, serde_json::json!({"held": true})),
         Moderate::Publish => ("published", false, serde_json::json!({"held": false})),
@@ -931,10 +932,10 @@ pub async fn moderate(
         .youtube
         .moderate(&token, &item.remote_id, status, ban)
         .await;
-    charge_write(&app.db, account.id).await;
-    // A comment that is gone (its author deleted it) is as hidden as a rejected one.
+    // A comment that is gone (its author deleted it) is as hidden as a rejected one. A ban needs
+    // the comment, so it is never taken as done.
     let gone = matches!(&done, Err(PostError::Failed(w)) if w.contains("is gone on YouTube"))
-        && matches!(action, Moderate::Reject | Moderate::Ban);
+        && action == Moderate::Reject;
     if let (Err(e), false) = (done, gone) {
         return Ok(Err(refused(e)));
     }
@@ -974,15 +975,14 @@ pub async fn delete_reply(
     let Some(remote) = remote else {
         return Ok(Err(InboxError::Invalid("reply_not_found")));
     };
-    if let Err(e) = write_room(app, account).await {
-        return Ok(Err(e));
-    }
     let token = match token_of(app, account).await {
         Ok(t) => t,
         Err(e) => return Ok(Err(e)),
     };
+    if let Err(e) = reserve(app, account).await {
+        return Ok(Err(e));
+    }
     let done = app.youtube.delete_comment(&token, &remote).await;
-    charge_write(&app.db, account.id).await;
     if let Err(e) = done {
         return Ok(Err(refused(e)));
     }
