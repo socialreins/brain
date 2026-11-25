@@ -3528,10 +3528,15 @@ mod teams {
                     "refreshJwt": "r"});
                 (axum::http::StatusCode::OK, Json(body))
             };
-            let profile = |Query(q): Query<HashMap<String, String>>| async move {
+            let profile = |headers: axum::http::HeaderMap,
+                           Query(q): Query<HashMap<String, String>>| async move {
                 let did = q.get("actor").cloned().unwrap_or_default();
+                // `profiles` (DID to its `viewer`) in the calling account's data.
+                let viewer = caller(&headers)
+                    .map(|(me, _)| inbox_of(&me)["profiles"][&did].clone())
+                    .unwrap_or(Value::Null);
                 Json(json!({"did": did, "displayName": format!("Name of {did}"),
-                    "avatar": "https://cdn.example.com/a.jpg"}))
+                    "avatar": "https://cdn.example.com/a.jpg", "viewer": viewer}))
             };
             let app = Router::new()
                 .route("/xrpc/com.atproto.identity.resolveHandle", get(resolve))
@@ -3549,6 +3554,8 @@ mod teams {
                     get(list_notifications),
                 )
                 .route("/xrpc/app.bsky.feed.getPosts", get(feed_posts))
+                .route("/xrpc/com.atproto.repo.getRecord", get(get_record))
+                .route("/xrpc/{method}", post(other_call))
                 .route("/xrpc/app.bsky.feed.getPostThread", get(post_thread))
                 .route("/xrpc/chat.bsky.convo.listConvos", get(list_convos))
                 .route("/xrpc/chat.bsky.convo.getMessages", get(get_messages))
@@ -3717,6 +3724,42 @@ mod teams {
             }
         }
 
+        /// The account's `records` (rkey to {value, cid}), else `RecordNotFound`.
+        async fn get_record(
+            headers: axum::http::HeaderMap,
+            Query(q): Query<HashMap<String, String>>,
+        ) -> Answer {
+            let Some((did, _)) = caller(&headers) else {
+                return refused(401, "AuthenticationRequired");
+            };
+            match inbox_of(&did)["records"][q.get("rkey").cloned().unwrap_or_default()].clone() {
+                Value::Null => refused(400, "RecordNotFound"),
+                found => (axum::http::StatusCode::OK, Json(found)),
+            }
+        }
+
+        /// Writes the mock only notes: mutes, `putRecord`, reports (`id` 77). A call with
+        /// `FAIL` anywhere in its body is refused as a server error.
+        async fn other_call(
+            headers: axum::http::HeaderMap,
+            Path(method): Path<String>,
+            Json(b): Json<Value>,
+        ) -> Answer {
+            if caller(&headers).is_none() {
+                return refused(401, "AuthenticationRequired");
+            }
+            if b.to_string().contains("FAIL") {
+                return refused(500, "InternalServerError");
+            }
+            CALLS.lock().unwrap().push((method.clone(), b));
+            let body = match method.as_str() {
+                "com.atproto.moderation.createReport" => json!({"id": 77}),
+                "com.atproto.repo.putRecord" => json!({"uri": "at://x/y/z", "cid": "bafyput"}),
+                _ => json!({}),
+            };
+            (axum::http::StatusCode::OK, Json(body))
+        }
+
         async fn list_convos(headers: axum::http::HeaderMap) -> Answer {
             let did = match chat_caller(&headers) {
                 Ok(d) => d,
@@ -3805,6 +3848,10 @@ mod teams {
         const SLOW_FOR: std::time::Duration = std::time::Duration::from_millis(400);
         static SLOW_NOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         static SLOW_MOST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        /// Every `deleteRecord` body the mock took, newest last.
+        static DELETES: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+        /// Every other write the mock took (`method`, body), newest last: mutes, reports, puts.
+        static CALLS: std::sync::Mutex<Vec<(String, Value)>> = std::sync::Mutex::new(Vec::new());
         /// The record key of every `deleteRecord` the mock took, newest last.
         static DELETED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -3993,9 +4040,11 @@ mod teams {
                 "{prefix}{}",
                 &uuid::Uuid::now_v7().simple().to_string()[20..]
             );
+            let rkey = b["rkey"].as_str().map(str::to_owned).unwrap_or(rkey);
             let uri = format!(
-                "at://{}/app.bsky.feed.post/{rkey}",
-                b["repo"].as_str().unwrap()
+                "at://{}/{}/{rkey}",
+                b["repo"].as_str().unwrap(),
+                b["collection"].as_str().unwrap_or("app.bsky.feed.post")
             );
             (
                 axum::http::StatusCode::OK,
@@ -4014,6 +4063,7 @@ mod teams {
                 let err = json!({"error": "InternalServerError"});
                 return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(err));
             }
+            DELETES.lock().unwrap().push(b.clone());
             DELETED
                 .lock()
                 .unwrap()
@@ -25136,6 +25186,178 @@ mod teams {
                 assert_eq!(res.json::<Value>()["error"], "post_unavailable");
             }
 
+            /// Like, repost, follow, mute, block, hide, delete our reply and report: each needs
+            /// `confirm`, checks the live state first, goes to the right place and is logged.
+            #[tokio::test]
+            #[serial]
+            async fn actions_are_confirmed_checked_logged_and_limited_by_role() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
+                let (member, _) = joined(&s, &db, &team_id, "member").await;
+                let c1 = "at://did:plc:fan1/app.bsky.feed.post/c1";
+                let root = format!("at://{me}/app.bsky.feed.post/root");
+                let theirs = "at://did:plc:other/app.bsky.feed.post/their-root";
+                let mut foreign = note("reply", "did:plc:fan9", "f1", "elsewhere", &at(25), &me);
+                foreign["record"]["reply"]["root"]["uri"] = json!(theirs);
+                let dm_convo = json!([{"id": "cv1", "members": [{"did": me}, {"did": "did:plc:dmer"}],
+                    "lastMessage": {"sentAt": at(5)}}]);
+                let data = |posts: Value, profiles: Value, records: Value| {
+                    json!({
+                        "notifications": [
+                            note("reply", "did:plc:fan1", "c1", "Love it", &at(30), &me),
+                            note("reply", "did:plc:FAILER", "c2", "hm", &at(20), &me),
+                            foreign,
+                        ],
+                        "convos": dm_convo,
+                        "messages": {"cv1": [dm("msg1", "did:plc:dmer", "hi", &at(5))]},
+                        "posts": posts, "profiles": profiles, "records": records,
+                    })
+                };
+                set_inbox(&me, data(json!({c1: {"uri": c1}}), json!({}), json!({})));
+                ingest(&db, &state, &account).await;
+                let all = all_inbox(&s, &cookie).await;
+                let page = items(&s, &cookie, all["id"].as_str().unwrap(), "").await;
+                let id_of = |text: &str| {
+                    page["items"].as_array().unwrap().iter().find(|i| i["text"] == text).unwrap()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                };
+                let (c1_id, bad_id, foreign_id, dm_id) =
+                    (id_of("Love it"), id_of("hm"), id_of("elsewhere"), id_of("hi"));
+                let act = |who: &str, id: &str, body: Value| {
+                    let r = req(&s, Method::POST, &format!("/v1/inbox-items/{id}/actions"), who);
+                    async move { r.json(&body).await }
+                };
+                let ok = |action: &str| json!({"action": action, "confirm": true});
+
+                // Nothing without a confirmation, nothing for a DM's post, nothing of ours.
+                let res = act(&cookie, &c1_id, json!({"action": "like"})).await;
+                assert_eq!((res.status_code(), res.json::<Value>()["error"].clone()), (422, json!("confirm_required")));
+                let res = act(&cookie, &dm_id, ok("like")).await;
+                assert_eq!(res.json::<Value>()["error"], "not_applicable");
+                let before = RECORDS.lock().unwrap().len();
+                assert_eq!(before, RECORDS.lock().unwrap().len(), "refused ones sent nothing");
+
+                // Like: a record of the post's uri and cid; again, with the like in place, no second.
+                let res = act(&member, &c1_id, ok("like")).await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                let made = RECORDS.lock().unwrap().last().cloned().unwrap();
+                assert_eq!(made["collection"], "app.bsky.feed.like");
+                assert_eq!(made["record"]["subject"], json!({"uri": c1, "cid": "cid-c1"}));
+                let liked = format!("at://{me}/app.bsky.feed.like/abc");
+                set_inbox(&me, data(json!({c1: {"uri": c1, "viewer": {"like": liked, "threadMuted": true}}}),
+                    json!({"did:plc:fan1": {"following": format!("at://{me}/app.bsky.graph.follow/fw")}}), json!({})));
+                let n = RECORDS.lock().unwrap().len();
+                let res = act(&member, &c1_id, ok("like")).await;
+                assert_eq!(res.json::<Value>()["remote_id"], liked);
+                assert_eq!(RECORDS.lock().unwrap().len(), n, "already liked");
+                let seen = fetch(&s, &member, &format!("/v1/inbox-items/{c1_id}/actions")).await;
+                assert_eq!(seen["viewer"]["liked"], true);
+                assert_eq!(seen["viewer"]["following"], true);
+                assert_eq!(seen["viewer"]["thread_muted"], true);
+                assert_eq!(seen["viewer"]["reposted"], false);
+                act(&member, &c1_id, ok("unlike")).await;
+                let gone = DELETES.lock().unwrap().last().cloned().unwrap();
+                assert_eq!((gone["collection"].clone(), gone["rkey"].clone()), (json!("app.bsky.feed.like"), json!("abc")));
+                act(&member, &c1_id, ok("unfollow")).await;
+                assert_eq!(DELETES.lock().unwrap().last().unwrap()["rkey"], "fw");
+                act(&member, &c1_id, ok("repost")).await;
+                assert_eq!(RECORDS.lock().unwrap().last().unwrap()["collection"], "app.bsky.feed.repost");
+                act(&member, &c1_id, ok("follow")).await;
+                assert_eq!(RECORDS.lock().unwrap().last().unwrap()["collection"], "app.bsky.graph.follow");
+
+                // Mutes go to Bluesky as they are; blocking, hiding and reporting are for managers.
+                act(&member, &c1_id, ok("mute_author")).await;
+                assert_eq!(CALLS.lock().unwrap().last().unwrap().1, json!({"actor": "did:plc:fan1"}));
+                act(&member, &c1_id, ok("mute_thread")).await;
+                assert_eq!(CALLS.lock().unwrap().last().unwrap().1, json!({"root": root}));
+                for action in ["block_author", "hide_reply", "report", "delete_reply"] {
+                    let res = act(&member, &c1_id, ok(action)).await;
+                    assert_eq!(res.status_code(), 403, "{action}");
+                }
+                let res = act(&cookie, &c1_id, ok("block_author")).await;
+                assert_eq!(res.status_code(), 200);
+                let made = RECORDS.lock().unwrap().last().cloned().unwrap();
+                assert_eq!((made["collection"].clone(), made["record"]["subject"].clone()),
+                    (json!("app.bsky.graph.block"), json!("did:plc:fan1")));
+
+                // Hiding a reply edits the thread's gate, keeping what it holds; only our threads.
+                let res = act(&cookie, &c1_id, ok("hide_reply")).await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                let made = RECORDS.lock().unwrap().last().cloned().unwrap();
+                assert_eq!(made["collection"], "app.bsky.feed.threadgate");
+                assert_eq!(made["rkey"], "root");
+                assert_eq!(made["record"]["hiddenReplies"], json!([c1]));
+                assert_eq!(made["record"]["post"], root);
+                let gate = json!({"value": {"$type": "app.bsky.feed.threadgate", "post": root,
+                    "createdAt": at(9), "allow": [], "hiddenReplies": ["at://x/y/old"]}, "cid": "bafygate"});
+                set_inbox(&me, data(json!({c1: {"uri": c1}}), json!({}), json!({"root": gate})));
+                act(&cookie, &c1_id, ok("hide_reply")).await;
+                let put = CALLS.lock().unwrap().last().cloned().unwrap();
+                assert_eq!(put.0, "com.atproto.repo.putRecord");
+                assert_eq!(put.1["record"]["hiddenReplies"], json!(["at://x/y/old", c1]));
+                assert_eq!(put.1["record"]["allow"], json!([]));
+                assert_eq!(put.1["swapRecord"], "bafygate");
+                let res = act(&cookie, &foreign_id, ok("hide_reply")).await;
+                assert_eq!(res.json::<Value>()["error"], "not_our_thread");
+
+                // Deleting a reply of ours takes the post out of our repo.
+                let sent = req(&s, Method::POST, &format!("/v1/inbox-items/{c1_id}/reply"), &cookie)
+                    .json(&json!({"text": "Thanks!"}))
+                    .await;
+                let reply = sent.json::<Value>()["replies"][0].clone();
+                let res = act(&cookie, &c1_id, json!({"action": "delete_reply", "confirm": true,
+                    "reply_id": reply["id"]})).await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                let gone = DELETES.lock().unwrap().last().cloned().unwrap();
+                assert_eq!((gone["repo"].clone(), gone["collection"].clone()), (json!(me), json!("app.bsky.feed.post")));
+                assert_eq!(reply["remote_url"].as_str().unwrap().rsplit('/').next(), gone["rkey"].as_str());
+                let res = act(&cookie, &c1_id, json!({"action": "delete_reply", "confirm": true,
+                    "reply_id": uuid::Uuid::now_v7()})).await;
+                assert_eq!(res.status_code(), 404);
+
+                // A report needs a reason, says what it is about, and is filed once.
+                let res = act(&cookie, &c1_id, json!({"action": "report", "confirm": true, "reason_type": "bogus"})).await;
+                assert_eq!(res.json::<Value>()["error"], "invalid_reason");
+                let spam = json!({"action": "report", "confirm": true, "reason_type": "spam", "reason": "Links to a scam"});
+                let res = act(&cookie, &c1_id, spam.clone()).await;
+                assert_eq!(res.json::<Value>()["remote_id"], "77");
+                let (method, body) = CALLS.lock().unwrap().last().cloned().unwrap();
+                assert_eq!(method, "com.atproto.moderation.createReport");
+                assert_eq!(body["reasonType"], "com.atproto.moderation.defs#reasonSpam");
+                assert_eq!(body["subject"], json!({"$type": "com.atproto.repo.strongRef", "uri": c1, "cid": "cid-c1"}));
+                assert_eq!(body["reason"], "Links to a scam");
+                let res = act(&cookie, &c1_id, spam.clone()).await;
+                assert_eq!(res.status_code(), 409);
+                let mut whole = spam;
+                whole["account"] = json!(true);
+                act(&cookie, &c1_id, whole).await;
+                let (_, body) = CALLS.lock().unwrap().last().cloned().unwrap();
+                assert_eq!(body["subject"], json!({"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:fan1"}));
+
+                // A refusal from Bluesky is said, and logged as failed.
+                let res = act(&cookie, &bad_id, ok("mute_author")).await;
+                assert_eq!(res.status_code(), 422);
+                assert_eq!(res.json::<Value>()["error"], "bluesky_refused");
+
+                // The log keeps every attempt, newest first, with who did it, and never the reason's text.
+                let seen = fetch(&s, &cookie, &format!("/v1/inbox-items/{c1_id}/actions")).await;
+                let log = seen["log"].as_array().unwrap();
+                assert_eq!(log[0]["action"], "report");
+                assert_eq!(log[0]["status"], "done");
+                assert_eq!(seen["hidden"], true);
+                assert!(!seen.to_string().contains("scam"));
+                assert!(log.iter().any(|l| l["action"] == "like" && l["done_by"].is_string()));
+                let bad = fetch(&s, &cookie, &format!("/v1/inbox-items/{bad_id}/actions")).await;
+                assert_eq!(bad["log"][0]["status"], "failed");
+                assert_eq!(bad["log"][0]["error"], "bluesky_refused");
+                let res = s.get("/v1/inbox-items/{c1_id}/actions".replace("{c1_id}", &uuid::Uuid::now_v7().to_string()).as_str())
+                    .add_header("cookie", &cookie)
+                    .await;
+                assert_eq!(res.status_code(), 404);
+            }
+
             /// Replies to a post Bluesky will not show, or its author blocks us from, say so
             /// before anything is sent.
             #[tokio::test]
@@ -25262,6 +25484,8 @@ mod teams {
                     ("/inbox-items/{id}/reply", "post"),
                     ("/inbox-items/{id}/conversation", "get"),
                     ("/inbox-items/{id}/thread", "get"),
+                    ("/inbox-items/{id}/actions", "get"),
+                    ("/inbox-items/{id}/actions", "post"),
                     ("/contacts", "get"),
                     ("/contacts/{id}", "get"),
                     ("/contacts/{id}", "patch"),
