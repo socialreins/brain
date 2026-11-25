@@ -62,15 +62,18 @@ fn yes() -> bool {
 #[derive(Serialize, ToSchema, Debug, Default, PartialEq, Eq)]
 pub struct PlannedStep {
     /// `send_dm`, `reply_publicly`, `ai_send_dm`, `ai_reply_publicly`, `fallback_public_reply`,
-    /// `tag_contact` or `wait`.
+    /// `tag_contact`, `notify_team`, `assign`, `hide_comment`, `like_comment`,
+    /// `stop_automations`, `wait` or `wait_for_reply` (a test goes on as if the person answered).
     #[serde(rename = "type")]
     pub kind: String,
-    /// `would_send`, `would_skip`, `would_fail`, `would_tag`, `would_wait` or `not_reached` (an
-    /// earlier send of a flow did not go out, so the run ends before it).
+    /// `would_send`, `would_skip`, `would_fail`, `would_tag`, `would_do` (a mail, an
+    /// assignment, a moderation call or a stop), `would_wait` or `not_reached` (an earlier send
+    /// of a flow did not go out, so the run ends before it).
     pub status: String,
     /// Why it would not go out, as a run's result gives it: `no_dm_access`, `dm_not_allowed`, `too_long`,
     /// `no_ai_key`, `no_ai_credits`, `ai_failed`, `ai_empty`, `ai_too_long`, `ai_link`,
-    /// `ai_leak`, `no_public_page`.
+    /// `ai_leak`, `no_public_page`, `not_supported` (a moderation action the network or item
+    /// does not take).
     pub reason: Option<String>,
     /// The final text, with `{name}` and `{page}` filled in or written by AI.
     pub text: Option<String>,
@@ -106,6 +109,9 @@ pub struct Outcome {
     /// automations: no steps), and `no_ai_key`, `no_ai_credits` or `ai_failed` when a `question`
     /// condition could not be judged (no steps).
     pub blocks: Vec<String>,
+    /// What a `sentiment` condition read the sample as (`positive`, `negative` or `neutral`);
+    /// null when the automation has none.
+    pub sentiment: Option<String>,
     pub steps: Vec<PlannedStep>,
 }
 
@@ -118,7 +124,10 @@ enum Part<'a> {
         buttons: &'a [Button],
     },
     Tag(&'a str),
-    Wait(u32),
+    /// Any other action that takes no time: its kind.
+    Effect(&'static str),
+    /// Minutes, and whether it is a `wait_for_reply`.
+    Wait(u32, bool),
 }
 
 /// The checked automation as the parts a run goes through, in order.
@@ -126,33 +135,42 @@ fn parts<'a>(actions: &'a [Action], steps: Option<&'a [Step]>) -> Vec<Part<'a>> 
     match steps {
         Some(steps) => steps
             .iter()
-            .filter_map(|s| match (s.sends(), s) {
-                (Some((via, template, buttons)), _) => Some(Part::Send {
+            .map(|s| match (s.sends(), s) {
+                (Some((via, template, buttons)), _) => Part::Send {
                     kind: s.kind(),
                     via,
                     template,
                     ai: s.ai(),
                     buttons,
-                }),
-                (None, Step::Wait { minutes }) => Some(Part::Wait(*minutes)),
-                (None, Step::TagContact { tag }) => Some(Part::Tag(tag)),
-                (None, _) => None,
+                },
+                (None, Step::Wait { minutes }) => Part::Wait(*minutes, false),
+                (None, Step::WaitForReply { minutes }) => Part::Wait(*minutes, true),
+                (None, Step::TagContact { tag }) => Part::Tag(tag),
+                (None, other) => Part::Effect(other.kind()),
             })
             .collect(),
         None => actions
             .iter()
-            .filter_map(|a| match (a.via_text(), a) {
-                (Some((via, template)), _) => Some(Part::Send {
+            .map(|a| match (a.via_text(), a) {
+                (Some((via, template)), _) => Part::Send {
                     kind: a.kind(),
                     via,
                     template,
                     ai: a.ai(),
                     buttons: &[],
-                }),
-                (None, Action::TagContact { tag }) => Some(Part::Tag(tag)),
-                (None, _) => None,
+                },
+                (None, Action::TagContact { tag }) => Part::Tag(tag),
+                (None, other) => Part::Effect(other.kind()),
             })
             .collect(),
+    }
+}
+
+fn wait_kind(for_reply: bool) -> &'static str {
+    if for_reply {
+        "wait_for_reply"
+    } else {
+        "wait"
     }
 }
 
@@ -313,10 +331,30 @@ pub async fn test(
         matched: mismatches.is_empty(),
         mismatches: mismatches.into_iter().map(Into::into).collect(),
         blocks: Vec::new(),
+        sentiment: None,
         steps: Vec::new(),
     };
     if !out.matched {
         return Ok(out);
+    }
+    // Read last, as a run does, and spent like one.
+    if !cond.sentiment.is_empty() && !rules::team_paused(db, item.team_id).await? {
+        let reference = format!("ai:test:{}", Uuid::now_v7());
+        match rules::read_sentiment(app, account, &item, &reference).await {
+            Ok(label) => {
+                out.sentiment = Some(label.into());
+                if !cond.sentiment.iter().any(|i| i == label) {
+                    out.matched = false;
+                    out.mismatches.push("sentiment_mismatch".into());
+                    return Ok(out);
+                }
+            }
+            Err(r) => {
+                out.blocks
+                    .push(r.reason.unwrap_or_else(|| "ai_failed".into()));
+                return Ok(out);
+            }
+        }
     }
     let provider = [account.provider.as_str()];
     // `invalid_text` here is an estimate for the longest possible name; the real text is checked below.
@@ -406,7 +444,8 @@ async fn walk(
             let (kind, tag, wait) = match part {
                 Part::Send { kind, .. } => (*kind, None, None),
                 Part::Tag(t) => ("tag_contact", Some(t.to_string()), None),
-                Part::Wait(m) => ("wait", None, Some(*m)),
+                Part::Effect(kind) => (*kind, None, None),
+                Part::Wait(m, reply) => (wait_kind(*reply), None, Some(*m)),
             };
             out.push(PlannedStep {
                 tag,
@@ -420,9 +459,10 @@ async fn walk(
                 tag: Some((*tag).to_owned()),
                 ..step("tag_contact", "would_tag")
             }),
-            Part::Wait(minutes) => out.push(PlannedStep {
+            Part::Effect(kind) => out.push(effect_step(kind, item)),
+            Part::Wait(minutes, reply) => out.push(PlannedStep {
                 wait_minutes: Some(*minutes),
-                ..step("wait", "would_wait")
+                ..step(wait_kind(*reply), "would_wait")
             }),
             Part::Send {
                 kind,
@@ -474,6 +514,25 @@ async fn walk(
         out.push(planned);
     }
     out
+}
+
+/// A mail, an assignment, a moderation call or a stop as it would go: a moderation call the
+/// network or the item does not take is skipped (`not_supported`), as a run records it.
+fn effect_step(kind: &str, item: &inbox_items::Model) -> PlannedStep {
+    let moderation = matches!(kind, "hide_comment" | "like_comment");
+    let can = crate::meta_inbox::moderations(item);
+    let wanted = if kind == "hide_comment" {
+        "hide"
+    } else {
+        "like"
+    };
+    if moderation && !can.contains(&wanted) {
+        return PlannedStep {
+            reason: Some("not_supported".into()),
+            ..step(kind, "would_skip")
+        };
+    }
+    step(kind, "would_do")
 }
 
 /// One send: its final text, or why it would not go out. An AI step is not written when the

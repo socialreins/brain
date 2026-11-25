@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use utoipa::ToSchema;
 
+mod comments;
+pub use comments::{Comment, Thread, Threads, Video};
+
 use super::{
     bluesky::PostError,
     google::{AUTH_URL, TOKEN_URL},
@@ -41,8 +44,18 @@ pub const VIDEO_TYPES: [&str; 2] = ["video/mp4", "video/quicktime"];
 /// locks what it uploads to private whatever the post chose (see README).
 pub const DEFAULT_PRIVACY: &str = "private";
 
+/// Of the 10,000 units a day, what the inbox may use unless `YOUTUBE_INBOX_UNITS` says otherwise.
+pub const DEFAULT_INBOX_UNITS: i64 = 4000;
+
 const QUOTA: &str = "YouTube's daily quota for this app is used up (an upload costs 1,600 of the \
                      10,000 units a day). Try again after midnight Pacific time.";
+
+/// The quota message as a person reads it; `is_quota` tells a refusal for it.
+pub const QUOTA_MESSAGE: &str = QUOTA;
+
+pub fn is_quota(message: &str) -> bool {
+    message == QUOTA
+}
 
 /// A YouTube post's per-post settings. None, or no `privacy`, uploads as private.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema, JsonSchema)]
@@ -77,6 +90,9 @@ pub struct YouTube {
     /// `CHUNK` and `RESUME_WAIT`; tests shorten them.
     pub chunk: u64,
     pub resume_wait: Duration,
+    /// Units a day all channels together may spend on the inbox (`YOUTUBE_INBOX_UNITS`), so
+    /// reading comments never uses the Google project's quota up before uploads do.
+    pub inbox_units: i64,
     client: reqwest::Client,
 }
 
@@ -228,6 +244,7 @@ impl YouTube {
             comment_wait: COMMENT_WAIT,
             chunk: CHUNK,
             resume_wait: RESUME_WAIT,
+            inbox_units: DEFAULT_INBOX_UNITS,
             client,
         })
     }

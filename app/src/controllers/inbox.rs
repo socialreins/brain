@@ -150,6 +150,13 @@ pub struct Item {
     /// (`POST /inbox-items/{id}/moderate`); `null` for any other item.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub moderation: Option<Moderation>,
+    /// YouTube comments: the video it is on, as last read (at most 7 days old); `null` for a
+    /// comment on the channel itself, a video not read yet, or any other item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video: Option<Video>,
+    /// YouTube replies: the comment it answers, while it is still kept; `null` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<ReplyTo>,
     /// Facebook and Instagram DMs: until when Meta takes a reply; `null` for any other item.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_window: Option<ReplyWindow>,
@@ -167,6 +174,22 @@ pub struct Item {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Conversation>)]
     pub conversation: Option<Option<Conversation>>,
+}
+
+/// The YouTube video a comment is on.
+#[derive(Serialize, ToSchema, Clone)]
+pub struct Video {
+    pub id: String,
+    pub title: String,
+    pub thumbnail_url: Option<String>,
+    pub url: String,
+}
+
+/// The YouTube comment a reply answers.
+#[derive(Serialize, ToSchema, Clone)]
+pub struct ReplyTo {
+    pub author_name: Option<String>,
+    pub text: String,
 }
 
 /// What was done to a Facebook or Instagram comment from the inbox, and what may be.
@@ -483,6 +506,66 @@ async fn last_messages(
     Ok(latest.into_iter().map(|(a, p, t)| ((a, p), t)).collect())
 }
 
+/// The videos (by id) and parent comments (by account and id) the YouTube items in `rows` sit under.
+async fn youtube_context(
+    db: &impl ConnectionTrait,
+    rows: &[inbox_items::Model],
+) -> Result<(HashMap<String, Video>, HashMap<(Uuid, String), ReplyTo>), DbErr> {
+    let yt: Vec<&inbox_items::Model> = rows.iter().filter(|i| i.platform == "youtube").collect();
+    if yt.is_empty() {
+        return Ok(Default::default());
+    }
+    let ids: Vec<String> = yt.iter().filter_map(|i| i.root_remote_id.clone()).collect();
+    let videos = db
+        .query_all_raw(sql(
+            "SELECT video_id, title, thumbnail FROM youtube_videos WHERE video_id = ANY($1)",
+            vec![ids.into()],
+        ))
+        .await?
+        .iter()
+        .map(|r| {
+            let id: String = r.try_get("", "video_id")?;
+            let url = crate::connectors::youtube::watch_url(&id);
+            let video = Video {
+                id: id.clone(),
+                title: r.try_get("", "title")?,
+                thumbnail_url: r.try_get("", "thumbnail")?,
+                url,
+            };
+            Ok((id, video))
+        })
+        .collect::<Result<_, DbErr>>()?;
+    let replies: Vec<&&inbox_items::Model> = yt
+        .iter()
+        .filter(|i| i.parent_remote_id.is_some() && i.parent_remote_id != i.root_remote_id)
+        .collect();
+    let parents = if replies.is_empty() {
+        HashMap::new()
+    } else {
+        inbox_items::Entity::find()
+            .filter(
+                inbox_items::Column::SocialAccountId
+                    .is_in(replies.iter().map(|i| i.social_account_id)),
+            )
+            .filter(
+                inbox_items::Column::RemoteId
+                    .is_in(replies.iter().filter_map(|i| i.parent_remote_id.clone())),
+            )
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|p| {
+                let to = ReplyTo {
+                    author_name: p.author_name.or(p.author_handle),
+                    text: p.text,
+                };
+                ((p.social_account_id, p.remote_id), to)
+            })
+            .collect()
+    };
+    Ok((videos, parents))
+}
+
 pub(super) async fn items_json(
     db: &impl ConnectionTrait,
     rows: Vec<inbox_items::Model>,
@@ -490,6 +573,7 @@ pub(super) async fn items_json(
 ) -> Result<Vec<Item>, DbErr> {
     let mut held = held_by(db, &rows).await?;
     let last = last_messages(db, &rows).await?;
+    let (videos, parents) = youtube_context(db, &rows).await?;
     let tags = tags_of(db, rows.iter().filter_map(|i| i.contact_id)).await?;
     let names: HashMap<Uuid, String> = users::Entity::find()
         .filter(users::Column::Id.is_in(rows.iter().filter_map(|i| i.assigned_to)))
@@ -536,6 +620,17 @@ pub(super) async fn items_json(
                             .collect(),
                     }
                 }),
+            video: i
+                .root_remote_id
+                .as_ref()
+                .and_then(|v| videos.get(v))
+                .cloned(),
+            reply_to: i
+                .parent_remote_id
+                .as_ref()
+                .filter(|_| i.parent_remote_id != i.root_remote_id)
+                .and_then(|p| parents.get(&(i.social_account_id, p.clone())))
+                .cloned(),
             reply_window: last
                 .get(&(i.social_account_id, i.author_id.clone()))
                 .map(|t| {
