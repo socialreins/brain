@@ -376,7 +376,7 @@ pub fn validate_steps(
 }
 
 /// Networks whose inbox can fire an automation.
-pub const AUTOMATED: [&str; 3] = ["bluesky", "facebook", "instagram"];
+pub const AUTOMATED: [&str; 4] = ["bluesky", "facebook", "instagram", "x"];
 /// Meta allows a message to a person only within 24 hours of their last one.
 const META_WINDOW_MINUTES: u32 = 24 * 60;
 /// And a private reply to a comment only within 7 days of it.
@@ -388,7 +388,11 @@ const META_PRIVATE_REPLY_MINUTES: u32 = 7 * 24 * 60;
 /// Instagram, the rules there are checked too, as a flow that breaks them could never finish:
 /// a comment gets one private reply, so one DM (`meta_one_private_reply`); a DM trigger's DM
 /// must go within 24 hours of the person's message (`meta_reply_window`); an Instagram DM is at
-/// most 1000 bytes (`invalid_text`). A mixed scope is left to fail item by item.
+/// most 1000 bytes (`invalid_text`). When every account is X, only the triggers X has can fire
+/// (`x_unsupported_trigger`): a comment (a reply to our post), a mention and a DM, never a follow,
+/// a story reply or a button tap. X has no private reply and no messaging window: a DM goes
+/// when the person follows the account or has DMs open, else it ends `skipped: dm_not_allowed`
+/// and the fallback public reply answers. A mixed scope is left to fail item by item.
 pub fn network_limits(
     trigger: &str,
     providers: &[&str],
@@ -397,6 +401,12 @@ pub fn network_limits(
 ) -> Result<(), &'static str> {
     if providers.iter().any(|p| !AUTOMATED.contains(p)) {
         return Err("unsupported_account");
+    }
+    if !providers.is_empty()
+        && providers.iter().all(|p| *p == "x")
+        && matches!(trigger, "new_follower" | "story_reply" | "button_clicked")
+    {
+        return Err("x_unsupported_trigger");
     }
     if providers.is_empty()
         || !providers
@@ -2050,8 +2060,28 @@ mod tests {
         let none: [Action; 0] = [];
         // Networks with no inbox can never fire it.
         assert_eq!(
-            network_limits("comment_received", &["x"], &none, Some(&[dm("hi")])),
+            network_limits("comment_received", &["tiktok"], &none, Some(&[dm("hi")])),
             Err("unsupported_account")
+        );
+        // X has comments, mentions and DMs; no follow, story or button triggers, and no
+        // Meta windows.
+        for ok in ["comment_received", "mention_received", "dm_received"] {
+            assert_eq!(
+                network_limits(ok, &["x"], &none, Some(&two)),
+                Ok(()),
+                "{ok}"
+            );
+        }
+        for no in ["new_follower", "story_reply", "button_clicked"] {
+            assert_eq!(
+                network_limits(no, &["x"], &none, Some(&[dm("hi")])),
+                Err("x_unsupported_trigger"),
+                "{no}"
+            );
+        }
+        assert_eq!(
+            network_limits("new_follower", &["x", "bluesky"], &none, None),
+            Ok(())
         );
         assert_eq!(
             network_limits(

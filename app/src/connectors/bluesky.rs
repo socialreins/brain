@@ -841,6 +841,10 @@ pub enum InboxError {
     /// Meta refused it for a permission or a messaging policy (codes 10 and 200 to 299); the
     /// scrubbed reason.
     MetaDenied(String),
+    /// X refused the token or a permission is missing: connect the account again.
+    XReconnect,
+    /// X refused the call, or could not be reached; what to tell a person (`connectors::x::inbox`).
+    X(String),
 }
 
 impl InboxError {
@@ -860,6 +864,8 @@ impl InboxError {
             Self::MetaReconnect => "meta_reconnect_required",
             Self::Meta(_) => "meta_failed",
             Self::MetaDenied(_) => "meta_denied",
+            Self::XReconnect => "x_reconnect_required",
+            Self::X(_) => "x_failed",
         }
     }
 
@@ -872,8 +878,8 @@ impl InboxError {
             Self::NoDmAccess => "The app password has no DM access. Make one with \"Allow access \
                                  to your direct messages\" and reconnect the account."
                 .into(),
-            Self::DmNotAllowed => "Bluesky did not take the DM: the recipient's settings do not \
-                                   allow messages from this account."
+            Self::DmNotAllowed => "The DM was not taken: the recipient's settings do not allow \
+                                   messages from this account."
                 .into(),
             Self::RateLimited => "The platform is rate limiting this account.".into(),
             Self::BlockedByAuthor => "The author of this post blocks this account, so a reply \
@@ -912,6 +918,10 @@ impl InboxError {
                 "Meta did not allow it: {why} The account may lack a permission for this, or \
                  Meta's messaging rules forbid it."
             ),
+            Self::XReconnect => "X refused the account's token or a permission is missing. \
+                                 Connect the account again under Connections."
+                .into(),
+            Self::X(why) => why.clone(),
         }
     }
 }

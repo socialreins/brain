@@ -99,7 +99,7 @@ impl Attachment {
 }
 
 /// Platforms whose accounts have an inbox.
-pub const INBOX_PLATFORMS: [&str; 3] = ["bluesky", "facebook", "instagram"];
+pub const INBOX_PLATFORMS: [&str; 4] = ["bluesky", "facebook", "instagram", "x"];
 /// Most accounts one inbox holds.
 pub const MAX_INBOX_ACCOUNTS: usize = 100;
 
@@ -814,8 +814,8 @@ pub fn fits(via: Via, text: &str) -> bool {
 }
 
 /// `text` fits a reply on `platform`: Facebook takes comments of 8000 characters and messages of
-/// 2000; Instagram comments of 2200 characters and messages of 1000 bytes; any other platform is
-/// held to `fits`.
+/// 2000; Instagram comments of 2200 characters and messages of 1000 bytes; X replies of 280
+/// weighted characters and messages of 10,000; any other platform is held to `fits`.
 pub fn fits_on(platform: &str, via: Via, text: &str) -> bool {
     let chars = text.chars().count();
     let some = !text.trim().is_empty();
@@ -824,6 +824,8 @@ pub fn fits_on(platform: &str, via: Via, text: &str) -> bool {
         ("facebook", Via::Dm) => some && chars <= 2000,
         ("instagram", Via::Public) => some && chars <= 2200,
         ("instagram", Via::Dm) => some && text.len() <= 1000,
+        ("x", Via::Public) => some && socialreins_core::post::check_x_short([text]).is_none(),
+        ("x", Via::Dm) => some && chars <= 10_000,
         _ => fits(via, text),
     }
 }
@@ -891,7 +893,7 @@ async fn send_inner(
     let lined = numbered(text, buttons);
     // `skip` still holds: the lines come after everything it names.
     let text = if meta { text } else { &lined };
-    if !meta && account.provider != "bluesky" {
+    if !meta && !matches!(account.provider.as_str(), "bluesky" | "x") {
         return Ok(Err(InboxError::Invalid("unsupported_platform")));
     }
     if !fits_on(&account.provider, via, text) {
@@ -899,6 +901,8 @@ async fn send_inner(
     }
     let sent = if meta {
         meta_inbox::send(app, account, item, via, text, (buttons, human)).await?
+    } else if account.provider == "x" {
+        crate::x_inbox::send(app, account, item, via, text).await
     } else {
         send_bluesky(app, account, item, (via, text, skip)).await
     };

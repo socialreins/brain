@@ -43,6 +43,7 @@ pub mod uploads;
 pub mod waitlist;
 pub mod webhooks;
 pub mod x;
+pub mod x_inbox;
 pub mod youtube;
 
 use axum::{
@@ -126,6 +127,7 @@ fn api() -> OpenApiRouter<AppState> {
         // A URL of 2048 characters and a template of 2000 can pass 4 KiB.
         .merge(feeds::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
         .merge(inbox::api())
+        .merge(x_inbox::api())
         .merge(contacts::api())
         .merge(broadcasts::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
         .merge(newsletters::api().layer(DefaultBodyLimit::max(MAX_NEWSLETTER_BODY_BYTES)))
