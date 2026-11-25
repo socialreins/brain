@@ -10,7 +10,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, 
 use crate::{
     automations, broadcasts,
     controllers::{idempotency, linkedin, pinterest, threads, x},
-    expiry, feeds, inbox, media, metrics, newsletters, publish,
+    expiry, feeds, inbox, media, meta_inbox, metrics, newsletters, publish,
     state::AppState,
     webhooks,
 };
@@ -141,6 +141,17 @@ pub fn spawn(app: AppState) {
             tick.tick().await;
             if let Err(e) = inbox::tick(&inbox_app).await {
                 tracing::warn!(error = %e, "inbox tick failed");
+            }
+        }
+    });
+    let meta_app = app.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if let Err(e) = meta_inbox::tick(&meta_app).await {
+                tracing::warn!(error = %e, "meta backfill tick failed");
             }
         }
     });
