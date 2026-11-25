@@ -934,6 +934,12 @@ impl InboxError {
             Self::Invalid("youtube_no_dm") => "YouTube has no direct messages and no private \
                                                replies. Only a public reply works."
                 .into(),
+            Self::Invalid("reply_not_found") => "That reply is not on this comment.".into(),
+            Self::Invalid("youtube_write_budget") => "This channel used the 40 replies and \
+                                                     moderation calls it may make a day (each \
+                                                     costs 50 of YouTube's quota units). Try \
+                                                     again after midnight Pacific time."
+                .into(),
             Self::Invalid("rejected") => "This comment was rejected, so it takes no reply.".into(),
             Self::Invalid(code) => format!("Not sent ({code})."),
             Self::MetaReconnect => "Meta refused the Page's token or a permission is missing. \

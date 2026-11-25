@@ -810,3 +810,53 @@ async fn a_refused_write_says_what_to_do() {
     let res = e.act(item, "moderate", json!({"action": "hold"})).await;
     assert_eq!(res.json::<Value>()["error"], "youtube_reconnect_required");
 }
+
+#[tokio::test]
+#[serial]
+async fn a_channel_cannot_spend_more_than_its_write_budget_and_nothing_is_sent_for_a_rejected_thread(
+) {
+    let e = env(false).await;
+    e.read_in().await;
+    // Holding a held comment would spend 50 units for nothing: it is refused before YouTube.
+    let top = e.item("UgxTHREAD1").await;
+    e.act(top, "moderate", json!({"action": "hold"}))
+        .await
+        .assert_status_ok();
+    let again = e.act(top, "moderate", json!({"action": "hold"})).await;
+    assert_eq!(again.json::<Value>()["error"], "not_supported");
+    assert_eq!(
+        e.mock
+            .seen("POST", "/youtube/v3/comments/setModerationStatus")
+            .len(),
+        1
+    );
+    // A reply under a rejected comment is hidden with it: nothing is sent.
+    e.act(top, "moderate", json!({"action": "reject"}))
+        .await
+        .assert_status_ok();
+    let reply = e.item("UgxTHREAD1.R1").await;
+    let res = e.act(reply, "reply", json!({"text": "hi"})).await;
+    assert_eq!(res.json::<Value>()["error"], "rejected");
+    assert!(e.mock.seen("POST", "/youtube/v3/comments").is_empty());
+    // Past the day's write budget (40 calls) every write is refused with the reason.
+    e.sql(&format!(
+        "UPDATE youtube_inbox SET write_units_today = 1980 WHERE social_account_id = '{}'",
+        e.account
+    ))
+    .await;
+    let other = e.item("UgxTHREAD2").await;
+    let res = e.act(other, "reply", json!({"text": "hi"})).await;
+    assert_eq!(res.status_code(), 422);
+    let got = res.json::<Value>();
+    assert_eq!(got["error"], "youtube_write_budget");
+    assert!(got["message"]
+        .as_str()
+        .unwrap()
+        .contains("midnight Pacific"));
+    assert_eq!(
+        e.act(other, "moderate", json!({"action": "reject"}))
+            .await
+            .status_code(),
+        422
+    );
+}
