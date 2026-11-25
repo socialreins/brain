@@ -917,6 +917,10 @@ impl InboxError {
             Self::Invalid("too_many_hidden") => "Bluesky keeps at most 300 hidden replies on \
                                                  a post."
                 .into(),
+            Self::Invalid("invalid_emoji") => "A reaction is one emoji.".into(),
+            Self::Invalid("convo_locked") => "This conversation is locked: no one can send \
+                                              messages in it now."
+                .into(),
             Self::Invalid("invalid_reason") => "Pick a reason for the report (spam, violation, \
                                                 misleading, sexual, rude or other); what you add \
                                                 takes up to 2000 characters."
@@ -1476,7 +1480,33 @@ impl Bluesky {
     ) -> Result<Messages, InboxError> {
         let q = [("limit", "50")];
         let page = self.xrpc(c, "chat.bsky.convo.listConvos", &q, None).await?;
-        let convos = page["convos"].as_array().cloned().unwrap_or_default();
+        let mut convos = page["convos"].as_array().cloned().unwrap_or_default();
+        // Message requests (people the account does not follow, who may write to it) are listed
+        // apart from the accepted conversations.
+        let mut requests_missed = false;
+        let asked = self
+            .xrpc(c, "chat.bsky.convo.listConvoRequests", &q, None)
+            .await;
+        match asked {
+            Ok(req) => {
+                for r in req["requests"].as_array().into_iter().flatten() {
+                    let fresh = r["id"]
+                        .as_str()
+                        .is_some_and(|id| !convos.iter().any(|k| k["id"].as_str() == Some(id)));
+                    // Group join requests the account made are not conversations to read.
+                    if fresh && r["lastMessage"].is_object() {
+                        convos.push(r.clone());
+                    }
+                }
+            }
+            Err(e @ (InboxError::Reconnect | InboxError::RateLimited)) => return Err(e),
+            // The service is down or timing out: the requests may be missing from this round.
+            Err(InboxError::Unreachable) | Err(InboxError::Refused { status: 500.., .. }) => {
+                requests_missed = true
+            }
+            // Refused or unknown (an older server): there are no requests to read.
+            Err(_) => {}
+        }
         let mut fresh: Vec<_> = convos
             .iter()
             .filter_map(|convo| {
@@ -1563,7 +1593,9 @@ impl Bluesky {
         }
         Ok(Messages {
             found,
-            newest,
+            // Without the requests, the mark stays where it was: the next round reads this
+            // one's conversations again (storing nothing twice) and the requests with them.
+            newest: newest.filter(|_| !requests_missed),
             resume: None,
             stopped: None,
         })
@@ -1634,6 +1666,9 @@ impl Bluesky {
             .xrpc(c, "chat.bsky.convo.sendMessage", &[], Some(&body))
             .await
             .map_err(|e| match e {
+                InboxError::Refused { ref code, .. } if code == "ConvoLocked" => {
+                    InboxError::Invalid("convo_locked")
+                }
                 // The chat service answers 400 when the recipient's settings refuse the sender.
                 InboxError::Refused { status: 400, .. } => InboxError::DmNotAllowed,
                 e => e,
