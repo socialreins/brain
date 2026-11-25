@@ -338,6 +338,12 @@ pub fn invents_link(text: &str, allowed: &str) -> bool {
     addresses(text).iter().any(|a| !allowed.contains(a))
 }
 
+/// Whether `text` holds a link, domain or email (an @handle alone is not one), read the way
+/// `invents_link` reads it.
+pub fn has_link(text: &str) -> bool {
+    addresses(text).iter().any(|a| !a.starts_with('@'))
+}
+
 /// Words in a row from the owner's prompt that a reply may not repeat: more is a leak of the
 /// instructions, not a reply.
 const LEAK_WORDS: usize = 12;
