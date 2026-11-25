@@ -349,6 +349,8 @@ fn media_store(var: impl Fn(&str) -> Option<String>) -> Result<Arc<dyn ObjectSto
                 .with_region(var("S3_REGION").unwrap_or_else(|| "auto".into()))
                 .with_access_key_id(key_id)
                 .with_secret_access_key(secret)
+                // 0.14 deletes with the bulk `POST ?delete`; keep the plain `DELETE /key` R2 has always had.
+                .with_disable_bulk_delete(true)
                 // object_store's defaults (30 s a request, retries within 180 s) end a read
                 // of a large video early: a request, and its retries, may take what the
                 // largest file takes at the slowest speed a download may have.
