@@ -21,7 +21,13 @@
 //!
 //! `tag_contact`, an action and a step, sends nothing: it adds a tag to the contact of the
 //! item's author (`inbox::add_tag`) and takes no hit of the daily cap. An automation still needs
-//! a send beside it.
+//! a send or one of the actions below beside it.
+//!
+//! `like_item`, `repost_item`, `follow_back`, `assign_item` and `notify_team`
+//! (`automation_effects`) do something on Bluesky or in the team instead of sending a text. Each
+//! is claimed like a send (a hit of the daily cap, once per item) and never retried.
+//! `stop_others` sends nothing and costs nothing: once its automation's run has started, the
+//! automations after it (they run oldest first) are not run on that item.
 use sea_orm::{
     sea_query::Query, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, DbErr,
     EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait, Value,
@@ -37,6 +43,8 @@ use uuid::Uuid;
 
 use crate::{
     ai,
+    automation_effects::{self, Effect},
+    automation_misses,
     billing::{self, AiSpent},
     connectors::bluesky::InboxError,
     controllers::ai_key::key_of,
@@ -50,12 +58,14 @@ use crate::{
     state::AppState,
 };
 
-pub const TRIGGERS: [&str; 6] = [
+pub const TRIGGERS: [&str; 8] = [
     "button_clicked",
     "comment_received",
     "dm_received",
+    "like_received",
     "mention_received",
     "new_follower",
+    "repost_received",
     "story_reply",
 ];
 /// Automation runs that act, per team per day (`rate_limit::reserve_in`).
@@ -158,6 +168,19 @@ pub enum Action {
         #[serde(deserialize_with = "tidy_tag")]
         tag: String,
     },
+    /// Likes the comment or mention (Bluesky; `comment_received` and `mention_received`).
+    LikeItem {},
+    /// Reposts the comment or mention (Bluesky; `comment_received` and `mention_received`).
+    RepostItem {},
+    /// Follows the item's author from the account (Bluesky; every trigger).
+    FollowBack {},
+    /// Assigns the item to a member of the team, unless someone has it already.
+    AssignItem { user_id: Uuid },
+    /// Emails the team's owners and admins the item's text and a link to it, at most 20 a team a
+    /// day. Nothing else about the person goes in it.
+    NotifyTeam {},
+    /// Once this automation's run starts, the automations after it do not run on the item.
+    StopOthers {},
 }
 
 /// A tag as contacts keep one, trimmed and lowercased; `validate` refuses what is still not one.
@@ -177,17 +200,35 @@ impl Action {
             Self::AiSendDm { .. } => "ai_send_dm",
             Self::AiReplyPublicly { .. } => "ai_reply_publicly",
             Self::TagContact { .. } => "tag_contact",
+            Self::LikeItem {} => "like_item",
+            Self::RepostItem {} => "repost_item",
+            Self::FollowBack {} => "follow_back",
+            Self::AssignItem { .. } => "assign_item",
+            Self::NotifyTeam {} => "notify_team",
+            Self::StopOthers {} => "stop_others",
         }
     }
 
-    /// How a send goes out and its text (an AI send's prompt); `None` for a `tag_contact`.
+    /// How a send goes out and its text (an AI send's prompt); `None` for anything else.
     pub(crate) fn via_text(&self) -> Option<(Via, &str)> {
         match self {
             Self::SendDm { text } => Some((Via::Dm, text)),
             Self::ReplyPublicly { text } => Some((Via::Public, text)),
             Self::AiSendDm { prompt } => Some((Via::Dm, prompt)),
             Self::AiReplyPublicly { prompt } => Some((Via::Public, prompt)),
-            Self::TagContact { .. } => None,
+            _ => None,
+        }
+    }
+
+    /// What it does on the platform or in the team instead of sending a text.
+    pub fn effect(&self) -> Option<Effect> {
+        match self {
+            Self::LikeItem {} => Some(Effect::Like),
+            Self::RepostItem {} => Some(Effect::Repost),
+            Self::FollowBack {} => Some(Effect::FollowBack),
+            Self::AssignItem { user_id } => Some(Effect::Assign(*user_id)),
+            Self::NotifyTeam {} => Some(Effect::Notify),
+            _ => None,
         }
     }
 
@@ -221,6 +262,18 @@ pub enum Step {
         #[serde(deserialize_with = "tidy_tag")]
         tag: String,
     },
+    /// As `Action::LikeItem {}`; the flow goes on whatever came of it.
+    LikeItem {},
+    /// As `Action::RepostItem {}`.
+    RepostItem {},
+    /// As `Action::FollowBack {}`.
+    FollowBack {},
+    /// As `Action::AssignItem`.
+    AssignItem { user_id: Uuid },
+    /// As `Action::NotifyTeam {}`.
+    NotifyTeam {},
+    /// As `Action::StopOthers {}`: it holds from the start of the run, wherever the step stands.
+    StopOthers {},
 }
 
 impl Step {
@@ -232,7 +285,30 @@ impl Step {
             Self::AiReplyPublicly { .. } => "ai_reply_publicly",
             Self::Wait { .. } => "wait",
             Self::TagContact { .. } => "tag_contact",
+            Self::LikeItem {} => "like_item",
+            Self::RepostItem {} => "repost_item",
+            Self::FollowBack {} => "follow_back",
+            Self::AssignItem { .. } => "assign_item",
+            Self::NotifyTeam {} => "notify_team",
+            Self::StopOthers {} => "stop_others",
         }
+    }
+
+    /// What it does on the platform or in the team instead of sending a text.
+    pub fn effect(&self) -> Option<Effect> {
+        match self {
+            Self::LikeItem {} => Some(Effect::Like),
+            Self::RepostItem {} => Some(Effect::Repost),
+            Self::FollowBack {} => Some(Effect::FollowBack),
+            Self::AssignItem { user_id } => Some(Effect::Assign(*user_id)),
+            Self::NotifyTeam {} => Some(Effect::Notify),
+            _ => None,
+        }
+    }
+
+    /// Takes a hit of the team's daily cap when it is claimed: a send or an effect.
+    pub(crate) fn takes_hit(&self) -> bool {
+        self.sends().is_some() || self.effect().is_some()
     }
 
     /// How a send step goes out, its text (an AI step's prompt) and its buttons; `None` for a
@@ -243,7 +319,7 @@ impl Step {
             Self::ReplyPublicly { text } => Some((Via::Public, text, &[])),
             Self::AiSendDm { prompt } => Some((Via::Dm, prompt, &[])),
             Self::AiReplyPublicly { prompt } => Some((Via::Public, prompt, &[])),
-            Self::Wait { .. } | Self::TagContact { .. } => None,
+            _ => None,
         }
     }
 
@@ -271,6 +347,8 @@ pub fn trigger_of(item: &inbox_items::Model) -> Option<&'static str> {
         "dm" if item.story_reply => Some("story_reply"),
         "dm" => Some("dm_received"),
         "follow" => Some("new_follower"),
+        "like" => Some("like_received"),
+        "repost" => Some("repost_received"),
         _ => None,
     }
 }
@@ -289,9 +367,12 @@ fn check_conditions(trigger: &str, c: &mut Conditions) -> Result<(), &'static st
     }
     let comment = trigger == "comment_received";
     let button = trigger == "button_clicked";
-    let fits_trigger = (comment || (c.post_remote_ids.is_empty() && !c.first_per_author))
+    // A like or repost names the post it is of, and has no text to look in.
+    let activity = matches!(trigger, "like_received" | "repost_received");
+    let fits_trigger = (comment || !c.first_per_author)
+        && (comment || activity || c.post_remote_ids.is_empty())
         && (trigger == "dm_received" || !c.first_message)
-        && (!(button || trigger == "new_follower") || c.keywords.is_empty())
+        && (!(button || activity || trigger == "new_follower") || c.keywords.is_empty())
         && (button != c.payloads.is_empty());
     let ids_ok = c.post_remote_ids.len() <= 100
         && c.post_remote_ids
@@ -336,8 +417,25 @@ pub fn validate_steps(
 ) -> Result<(), &'static str> {
     check_conditions(trigger, conditions)?;
     let wait = |s: Option<&Step>| matches!(s, Some(Step::Wait { .. }));
-    let sends = steps.iter().any(|s| s.sends().is_some());
-    if !sends || steps.len() > MAX_STEPS || wait(steps.first()) || wait(steps.last()) {
+    let does = steps.iter().any(Step::takes_hit);
+    if !does || steps.len() > MAX_STEPS || wait(steps.first()) || wait(steps.last()) {
+        return Err("invalid_steps");
+    }
+    // Each effect once, and the ones that need a post only where the trigger has one.
+    let kinds: Vec<&str> = steps
+        .iter()
+        .filter(|s| s.effect().is_some() || matches!(s, Step::StopOthers {}))
+        .map(Step::kind)
+        .collect();
+    let mut once = kinds.clone();
+    once.sort_unstable();
+    once.dedup();
+    if once.len() != kinds.len()
+        || (!public(trigger)
+            && steps
+                .iter()
+                .any(|s| s.effect().is_some_and(Effect::on_post)))
+    {
         return Err("invalid_steps");
     }
     for step in steps {
@@ -410,6 +508,20 @@ pub fn network_limits(
 ) -> Result<(), &'static str> {
     if providers.iter().any(|p| !AUTOMATED.contains(p)) {
         return Err("unsupported_account");
+    }
+    // Likes and reposts of our posts, and the actions that go to Bluesky's servers, are Bluesky
+    // only. A scope with a Bluesky account in it is left to fail item by item, as a mixed one is.
+    let no_bluesky = !providers.is_empty() && !providers.contains(&"bluesky");
+    if no_bluesky && matches!(trigger, "like_received" | "repost_received") {
+        return Err("bluesky_only_trigger");
+    }
+    let goes_to_bluesky = actions
+        .iter()
+        .filter_map(Action::effect)
+        .chain(steps.unwrap_or_default().iter().filter_map(Step::effect))
+        .any(Effect::bluesky_only);
+    if no_bluesky && goes_to_bluesky {
+        return Err("bluesky_only_action");
     }
     if !providers.is_empty()
         && providers.iter().all(|p| *p == "x")
@@ -508,8 +620,23 @@ pub fn validate(
     let (dms, tagged) = (sends().filter(|s| s.0 == Via::Dm).count(), tags.len());
     tags.sort();
     tags.dedup();
-    let sent = actions.len() - tagged;
-    if sent == 0 || dms > 1 || sent - dms > 1 {
+    let sent = sends().count();
+    let effects: Vec<Effect> = actions.iter().filter_map(Action::effect).collect();
+    let stops = actions
+        .iter()
+        .filter(|a| matches!(a, Action::StopOthers {}))
+        .count();
+    // Each effect and the stop once; a like or repost only where the trigger has a post.
+    let mut kinds: Vec<&str> = effects.iter().map(|e| e.kind()).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    if sent + effects.len() == 0
+        || dms > 1
+        || sent - dms > 1
+        || stops > 1
+        || kinds.len() != effects.len()
+        || (!public && effects.iter().any(|e| e.on_post()))
+    {
         return Err("invalid_actions");
     }
     if tagged > MAX_TAG_ACTIONS || tags.len() != tagged || !tags.iter().all(|t| tag_ok(t)) {
@@ -775,6 +902,14 @@ async fn run_matching(
     let Some(trigger) = trigger_of(item) else {
         return Ok(());
     };
+    // Comments from before the account was connected (a first read goes back 7 days) never
+    // run automations.
+    if item.received_at < account.created_at {
+        return Ok(());
+    }
+    // The automations this item is not for, or that were off when it came, say why.
+    automation_misses::record_unreached(db, item.team_id, item.id, trigger, item.received_at)
+        .await?;
     let autos = automations::Entity::find()
         .filter(automations::Column::TeamId.eq(item.team_id))
         .filter(automations::Column::Active.eq(true))
@@ -783,9 +918,7 @@ async fn run_matching(
         .order_by_asc(automations::Column::CreatedAt)
         .all(db)
         .await?;
-    // Comments from before the account was connected (a first read goes back 7 days) never
-    // run automations.
-    if autos.is_empty() || item.received_at < account.created_at {
+    if autos.is_empty() {
         return Ok(());
     }
     // Nothing runs on an item by a connected account (the team's own, or another team's), so
@@ -809,11 +942,22 @@ async fn run_matching(
             None => false,
         };
         if again {
+            for a in &autos {
+                let ids = (a.id, a.team_id, item.id);
+                automation_misses::record(db, ids, &["followed_before"]).await?;
+            }
             return Ok(());
         }
     }
     let sets = live_set_ids(db, account.id).await?;
+    // Set once an automation that stops the others has started its run on this item.
+    let mut stopped = false;
     for a in autos {
+        if stopped {
+            automation_misses::record(db, (a.id, a.team_id, item.id), &["stopped_by_other"])
+                .await?;
+            continue;
+        }
         let parsed = (
             serde_json::from_value::<Conditions>(a.conditions.clone()),
             serde_json::from_value::<Vec<Action>>(a.actions.clone()),
@@ -871,7 +1015,12 @@ async fn run_matching(
         let clicked = item.button_payload.as_ref();
         let named =
             trigger != "button_clicked" || clicked.is_some_and(|p| cond.payloads.contains(p));
-        if !named || !matches(&cond, &facts) {
+        let mut why = mismatches(&cond, &facts);
+        if !named {
+            why.push("button_not_named");
+        }
+        if !why.is_empty() {
+            automation_misses::record(db, (a.id, a.team_id, item.id), &why).await?;
             continue;
         }
         // An action that needs the post's page does not run without one, and leaves no run:
@@ -892,12 +1041,13 @@ async fn run_matching(
         };
         if needed && page.is_none() {
             tracing::info!(automation = %a.id, item = %item.id, "no public page, not run");
+            automation_misses::record(db, (a.id, a.team_id, item.id), &["no_public_page"]).await?;
             continue;
         }
         // The hit pays for the first send: a flow that starts on a tag has not sent yet.
         let sends = steps
             .as_ref()
-            .is_none_or(|s| s.first().is_some_and(|x| x.sends().is_some()));
+            .is_none_or(|s| s.first().is_some_and(Step::takes_hit));
         // Read for each automation, so a pause during the round holds the rest back.
         let held = match guard {
             Some(why) => Some(why),
@@ -912,6 +1062,11 @@ async fn run_matching(
         let Some(run_id) = claim(db, &a, item, steps.is_some(), sends, once).await? else {
             continue;
         };
+        stopped = actions.iter().any(|x| matches!(x, Action::StopOthers {}))
+            || steps
+                .iter()
+                .flatten()
+                .any(|x| matches!(x, Step::StopOthers {}));
         if let Some(steps) = &steps {
             let page = page.as_deref();
             let flow = Flow {
@@ -1022,6 +1177,36 @@ impl Flow<'_> {
                     }
                     continue;
                 }
+                // Held from the start of the run (`run_matching`); here it only shows in the results.
+                Step::StopOthers {} => {
+                    results.push(automation_effects::result(
+                        "stop_others",
+                        "done",
+                        None,
+                        None,
+                    ));
+                    if !self.step_on(run, &mut i, &results).await? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                // Whatever came of it, the flow goes on, as after a tag.
+                Step::LikeItem {}
+                | Step::RepostItem {}
+                | Step::FollowBack {}
+                | Step::AssignItem { .. }
+                | Step::NotifyTeam {} => {
+                    if let Some(effect) = self.steps[i].effect() {
+                        let (app, account, item) = (self.app, self.account, self.item);
+                        results.push(
+                            automation_effects::perform(app, account, item, self.a, effect).await,
+                        );
+                    }
+                    if !self.step_on(run, &mut i, &results).await? {
+                        return Ok(());
+                    }
+                    continue;
+                }
                 Step::SendDm { text, buttons } => (Via::Dm, text, buttons),
                 Step::ReplyPublicly { text } => (Via::Public, text, &[]),
                 Step::AiSendDm { prompt } => (Via::Dm, prompt, &[]),
@@ -1074,10 +1259,16 @@ impl Flow<'_> {
         let db = &self.app.db;
         *i += 1;
         let Some(next) = self.steps.get(*i) else {
-            settle(db, run, "sent", None, results).await?;
+            // Every send went (one that did not ended the run earlier); a flow of effects alone
+            // is as its effects went.
+            let (status, reason) = match results.iter().any(|r| r.status == "sent") {
+                true => ("sent", None),
+                false => summary(results),
+            };
+            settle(db, run, status, reason, results).await?;
             return Ok(false);
         };
-        claim_step(db, run, self.a, *i, next.sends().is_some(), results).await
+        claim_step(db, run, self.a, *i, next.takes_hit(), results).await
     }
 }
 
@@ -1233,6 +1424,12 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
         Vec::new()
     };
     lock.commit().await?;
+    // Every tenth minute, so the "why not" log stays small (a failure only delays it).
+    if chrono::Timelike::minute(&chrono::Utc::now()).is_multiple_of(10) {
+        if let Err(e) = automation_misses::prune(&app.db).await {
+            tracing::warn!(error = %e, "automation misses not pruned");
+        }
+    }
     work(app, &due, ROUND).await;
     Ok(())
 }
@@ -1324,7 +1521,7 @@ pub async fn resume(app: &AppState, run: &automation_runs::Model) -> Result<(), 
         return settle(db, run.id, "skipped", why, &results).await;
     }
     // Also where a run ends whose automation was switched off or given other steps since.
-    if !claim_step(db, run.id, &a, i, next.sends().is_some(), &results).await? {
+    if !claim_step(db, run.id, &a, i, next.takes_hit(), &results).await? {
         return Ok(());
     }
     let flow = Flow {
@@ -1573,6 +1770,15 @@ async fn act(
         let Some((via, template)) = action.via_text() else {
             if let Action::TagContact { tag } = action {
                 results.push(tag_contact(&app.db, item, tag).await);
+            } else if let Some(effect) = action.effect() {
+                results.push(automation_effects::perform(app, account, item, a, effect).await);
+            } else if matches!(action, Action::StopOthers {}) {
+                results.push(automation_effects::result(
+                    "stop_others",
+                    "done",
+                    None,
+                    None,
+                ));
             }
             continue;
         };
@@ -1808,8 +2014,13 @@ async fn ai_send(
 /// anything went, else `failed` when anything failed, else `skipped`; the reason is the first
 /// one given.
 pub fn summary(results: &[ActionResult]) -> (&'static str, Option<String>) {
-    let sends = || results.iter().filter(|r| r.kind != "tag_contact");
-    let status = if sends().any(|r| r.status == "sent") {
+    // A tag and a stop say nothing of whether the run did its work; an effect that was `done` did.
+    let sends = || {
+        results
+            .iter()
+            .filter(|r| !matches!(r.kind.as_str(), "tag_contact" | "stop_others"))
+    };
+    let status = if sends().any(|r| matches!(r.status.as_str(), "sent" | "done")) {
         "sent"
     } else if sends().any(|r| r.status == "failed") {
         "failed"
@@ -1832,6 +2043,229 @@ async fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn likes_and_reposts_are_triggers_and_effects_have_rules() {
+        let now = chrono::Utc::now().fixed_offset();
+        let item = |kind: &str| inbox_items::Model {
+            id: Uuid::now_v7(),
+            team_id: Uuid::nil(),
+            social_account_id: Uuid::nil(),
+            platform: "bluesky".into(),
+            kind: kind.into(),
+            remote_id: "r".into(),
+            remote_cid: None,
+            parent_remote_id: None,
+            root_remote_id: None,
+            root_remote_cid: None,
+            convo_id: None,
+            post_id: None,
+            author_id: "a".into(),
+            author_handle: None,
+            author_name: None,
+            author_avatar: None,
+            text: String::new(),
+            received_at: now,
+            state: "done".into(),
+            replied_at: None,
+            permalink: None,
+            story_reply: false,
+            story_id: None,
+            story_url: None,
+            button_payload: None,
+            contact_id: None,
+            assigned_to: None,
+            automated_at: None,
+            attachments: serde_json::json!([]),
+            moderation: serde_json::json!({}),
+            created_at: now,
+        };
+        assert_eq!(trigger_of(&item("like")), Some("like_received"));
+        assert_eq!(trigger_of(&item("repost")), Some("repost_received"));
+        let uid = Uuid::now_v7();
+        let ok = |trigger: &str, actions: Vec<Action>| {
+            validate(trigger, &mut Conditions::default(), &actions, None)
+        };
+        let follow = || Action::FollowBack {};
+        assert_eq!(ok("like_received", vec![follow()]), Ok(()));
+        assert_eq!(
+            ok("repost_received", vec![follow(), Action::NotifyTeam {}]),
+            Ok(())
+        );
+        // Like and repost need a post to act on; a stop and a tag are no work of their own.
+        assert_eq!(ok("comment_received", vec![Action::LikeItem {}]), Ok(()));
+        for (trigger, actions) in [
+            ("like_received", vec![Action::LikeItem {}]),
+            ("new_follower", vec![Action::RepostItem {}]),
+            ("like_received", vec![Action::StopOthers {}]),
+            (
+                "like_received",
+                vec![
+                    Action::StopOthers {},
+                    Action::TagContact { tag: "a".into() },
+                ],
+            ),
+            ("like_received", vec![follow(), follow()]),
+            (
+                "like_received",
+                vec![follow(), Action::StopOthers {}, Action::StopOthers {}],
+            ),
+            (
+                "like_received",
+                vec![
+                    Action::AssignItem { user_id: uid },
+                    Action::AssignItem { user_id: uid },
+                ],
+            ),
+        ] {
+            assert_eq!(
+                ok(trigger, actions.clone()),
+                Err("invalid_actions"),
+                "{trigger} {actions:?}"
+            );
+        }
+        // Conditions: a like names a post but has no words or "first".
+        let mut c = Conditions {
+            post_remote_ids: vec!["at://x/app.bsky.feed.post/1".into()],
+            ..Conditions::default()
+        };
+        assert_eq!(check_conditions("like_received", &mut c), Ok(()));
+        assert_eq!(
+            check_conditions("dm_received", &mut c),
+            Err("invalid_conditions")
+        );
+        for bad in [
+            Conditions {
+                keywords: vec!["a".into()],
+                ..Conditions::default()
+            },
+            Conditions {
+                first_per_author: true,
+                ..Conditions::default()
+            },
+        ] {
+            assert_eq!(
+                check_conditions("repost_received", &mut bad.clone()),
+                Err("invalid_conditions")
+            );
+        }
+        // Flows: effects count as the work, once each, and a like only under a post.
+        let flow = |trigger: &str, steps: &mut [Step]| {
+            validate_steps(trigger, &mut Conditions::default(), steps)
+        };
+        assert_eq!(
+            flow(
+                "like_received",
+                &mut [Step::FollowBack {}, Step::NotifyTeam {}]
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            flow("like_received", &mut [Step::TagContact { tag: "a".into() }]),
+            Err("invalid_steps")
+        );
+        assert_eq!(
+            flow("like_received", &mut [Step::LikeItem {}]),
+            Err("invalid_steps")
+        );
+        assert_eq!(
+            flow(
+                "comment_received",
+                &mut [
+                    Step::LikeItem {},
+                    Step::Wait { minutes: 5 },
+                    Step::FollowBack {}
+                ]
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            flow(
+                "comment_received",
+                &mut [Step::LikeItem {}, Step::LikeItem {}]
+            ),
+            Err("invalid_steps")
+        );
+        assert!(Step::NotifyTeam {}.takes_hit() && !Step::StopOthers {}.takes_hit());
+        assert!(!Step::Wait { minutes: 1 }.takes_hit());
+    }
+
+    #[test]
+    fn network_limits_keep_likes_and_bluesky_actions_on_bluesky() {
+        let none: [Action; 0] = [];
+        let follow = [Action::FollowBack {}];
+        for trigger in ["like_received", "repost_received"] {
+            assert_eq!(network_limits(trigger, &["bluesky"], &none, None), Ok(()));
+            assert_eq!(network_limits(trigger, &[], &none, None), Ok(()));
+            // A mixed scope is left to fail item by item, a scope with no Bluesky is refused.
+            assert_eq!(
+                network_limits(trigger, &["bluesky", "facebook"], &none, None),
+                Ok(())
+            );
+            for no in ["facebook", "instagram", "x"] {
+                assert_eq!(
+                    network_limits(trigger, &[no], &none, None),
+                    Err("bluesky_only_trigger"),
+                    "{no}"
+                );
+            }
+        }
+        for no in ["facebook", "x"] {
+            assert_eq!(
+                network_limits("comment_received", &[no], &follow, None),
+                Err("bluesky_only_action")
+            );
+            let steps = [Step::LikeItem {}];
+            assert_eq!(
+                network_limits("comment_received", &[no], &none, Some(&steps)),
+                Err("bluesky_only_action")
+            );
+        }
+        // Assigning and mailing the team go to nobody's servers.
+        let local = [
+            Action::NotifyTeam {},
+            Action::AssignItem {
+                user_id: Uuid::nil(),
+            },
+        ];
+        assert_eq!(
+            network_limits("comment_received", &["x"], &local, None),
+            Ok(())
+        );
+        assert_eq!(
+            network_limits("comment_received", &["bluesky"], &follow, None),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_run_that_only_did_effects_is_summed_up_by_them() {
+        let r = |kind: &str, status: &str, reason: Option<&str>| ActionResult {
+            kind: kind.into(),
+            status: status.into(),
+            reason: reason.map(Into::into),
+            ..Default::default()
+        };
+        assert_eq!(
+            summary(&[
+                r("follow_back", "done", None),
+                r("stop_others", "done", None)
+            ]),
+            ("sent", None)
+        );
+        assert_eq!(
+            summary(&[
+                r("follow_back", "skipped", Some("own_account")),
+                r("tag_contact", "done", None)
+            ]),
+            ("skipped", Some("own_account".into()))
+        );
+        assert_eq!(
+            summary(&[r("notify_team", "failed", Some("mail_failed"))]).0,
+            "failed"
+        );
+        assert_eq!(summary(&[r("stop_others", "done", None)]).0, "skipped");
+    }
 
     fn facts<'a>(sets: &'a [Uuid], text: &'a str) -> Facts<'a> {
         Facts {

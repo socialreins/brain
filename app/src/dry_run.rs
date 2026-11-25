@@ -10,6 +10,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
+    automation_effects::{self as effects, Effect},
     automations::{self as rules, Action, ActionResult, Conditions, Facts, Step, RUNS_PER_DAY},
     controllers::pages,
     inbox::{self, Button, Via},
@@ -59,15 +60,19 @@ fn yes() -> bool {
 #[derive(Serialize, ToSchema, Debug, Default, PartialEq, Eq)]
 pub struct PlannedStep {
     /// `send_dm`, `reply_publicly`, `ai_send_dm`, `ai_reply_publicly`, `fallback_public_reply`,
-    /// `tag_contact` or `wait`.
+    /// `tag_contact`, `like_item`, `repost_item`, `follow_back`, `assign_item`, `notify_team`,
+    /// `stop_others` or `wait`.
     #[serde(rename = "type")]
     pub kind: String,
-    /// `would_send`, `would_skip`, `would_fail`, `would_tag`, `would_wait` or `not_reached` (an
-    /// earlier send of a flow did not go out, so the run ends before it).
+    /// `would_send`, `would_skip`, `would_fail`, `would_tag`, `would_wait`, `would_do` (a like,
+    /// repost, follow, assignment, email or stop) or `not_reached` (an earlier send of a flow did
+    /// not go out, so the run ends before it).
     pub status: String,
     /// Why it would not go out, as a run's result gives it: `no_dm_access`, `dm_not_allowed`, `too_long`,
     /// `no_ai_key`, `no_ai_credits`, `ai_failed`, `ai_empty`, `ai_too_long`, `ai_link`,
-    /// `ai_leak`, `no_public_page`.
+    /// `ai_leak`, `no_public_page`, `daily_cap`, and for the others `unsupported_platform` (not
+    /// a Bluesky account), `no_member` (an assignee who left the team) and `mail_cap` (the
+    /// team's emails for today are used up).
     pub reason: Option<String>,
     /// The final text, with `{name}` and `{page}` filled in or written by AI.
     pub text: Option<String>,
@@ -78,6 +83,12 @@ pub struct PlannedStep {
     pub wait_minutes: Option<u32>,
     /// A `tag_contact`: the tag.
     pub tag: Option<String>,
+    /// A `notify_team`: how many owners and admins it would email.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipients: Option<u32>,
+    /// An `assign_item`: the member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<Uuid>,
     /// An AI step: `anthropic` or `openai`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -115,6 +126,8 @@ enum Part<'a> {
     },
     Tag(&'a str),
     Wait(u32),
+    Do(Effect),
+    Stop,
 }
 
 /// The checked automation as the parts a run goes through, in order.
@@ -132,7 +145,8 @@ fn parts<'a>(actions: &'a [Action], steps: Option<&'a [Step]>) -> Vec<Part<'a>> 
                 }),
                 (None, Step::Wait { minutes }) => Some(Part::Wait(*minutes)),
                 (None, Step::TagContact { tag }) => Some(Part::Tag(tag)),
-                (None, _) => None,
+                (None, Step::StopOthers {}) => Some(Part::Stop),
+                (None, step) => step.effect().map(Part::Do),
             })
             .collect(),
         None => actions
@@ -146,7 +160,8 @@ fn parts<'a>(actions: &'a [Action], steps: Option<&'a [Step]>) -> Vec<Part<'a>> 
                     buttons: &[],
                 }),
                 (None, Action::TagContact { tag }) => Some(Part::Tag(tag)),
-                (None, _) => None,
+                (None, Action::StopOthers {}) => Some(Part::Stop),
+                (None, action) => action.effect().map(Part::Do),
             })
             .collect(),
     }
@@ -186,6 +201,8 @@ fn item_of(
         "comment_received" => "comment",
         "mention_received" => "mention",
         "new_follower" => "follow",
+        "like_received" => "like",
+        "repost_received" => "repost",
         _ => "dm",
     };
     inbox_items::Model {
@@ -205,8 +222,8 @@ fn item_of(
         author_handle: None,
         author_name: s.author_name.clone().filter(|n| !n.trim().is_empty()),
         author_avatar: None,
-        // A follow carries no text.
-        text: if kind == "follow" {
+        // A follow, like or repost carries no text.
+        text: if matches!(kind, "follow" | "like" | "repost") {
             String::new()
         } else {
             s.text.clone()
@@ -386,6 +403,8 @@ async fn walk(
                 Part::Send { kind, .. } => (*kind, None, None),
                 Part::Tag(t) => ("tag_contact", Some(t.to_string()), None),
                 Part::Wait(m) => ("wait", None, Some(*m)),
+                Part::Do(e) => (e.kind(), None, None),
+                Part::Stop => ("stop_others", None, None),
             };
             out.push(PlannedStep {
                 tag,
@@ -403,6 +422,19 @@ async fn walk(
                 wait_minutes: Some(*minutes),
                 ..step("wait", "would_wait")
             }),
+            Part::Stop => out.push(step("stop_others", "would_do")),
+            // Each takes its hit of the daily cap like a send; in a flow none of them ends the run.
+            Part::Do(effect) => {
+                sends += 1;
+                out.push(if sends > room {
+                    PlannedStep {
+                        reason: Some("daily_cap".into()),
+                        ..step(effect.kind(), "would_skip")
+                    }
+                } else {
+                    plan_effect(app, account, item, *effect).await
+                });
+            }
             Part::Send {
                 kind,
                 via,
@@ -520,5 +552,68 @@ async fn plan_send(
         text: Some(sent),
         buttons: if meta { buttons.to_vec() } else { Vec::new() },
         ..step(kind, "would_send")
+    }
+}
+
+/// One action that is no send: whether it would go, without doing it. Mirrors
+/// `automation_effects::perform`, which refuses the same cases when it runs.
+async fn plan_effect(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    effect: Effect,
+) -> PlannedStep {
+    let kind = effect.kind();
+    let skipped = |reason: &str| PlannedStep {
+        reason: Some(reason.into()),
+        ..step(kind, "would_skip")
+    };
+    if effect.bluesky_only() && account.provider != "bluesky" {
+        return skipped("unsupported_platform");
+    }
+    let planned = async {
+        Ok::<_, DbErr>(match effect {
+            Effect::Like | Effect::Repost | Effect::FollowBack => step(kind, "would_do"),
+            Effect::Assign(user) if !effects::is_member(&app.db, item.team_id, user).await? => {
+                skipped("no_member")
+            }
+            Effect::Assign(user) => PlannedStep {
+                user_id: Some(user),
+                ..step(kind, "would_do")
+            },
+            Effect::Notify => {
+                let used = mail_used(&app.db, item.team_id).await?;
+                if used >= effects::MAILS_PER_DAY {
+                    skipped("mail_cap")
+                } else {
+                    let to = effects::recipients(&app.db, item.team_id).await?;
+                    PlannedStep {
+                        recipients: Some(to.len() as u32),
+                        ..step(kind, "would_do")
+                    }
+                }
+            }
+        })
+    };
+    planned.await.unwrap_or_else(|e| {
+        tracing::error!(error = %e, kind, "automation test could not plan an action");
+        PlannedStep {
+            reason: Some("internal".into()),
+            ..step(kind, "would_fail")
+        }
+    })
+}
+
+/// Emails an automation sent for the team in the last day.
+async fn mail_used(db: &DatabaseConnection, team: Uuid) -> Result<i64, DbErr> {
+    let stmt = Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT count(*) AS n FROM rate_limit_hits \
+         WHERE bucket = $1 AND created_at > now() - interval '1 day'",
+        [effects::mail_bucket(team).into()],
+    );
+    match db.query_one_raw(stmt).await? {
+        Some(r) => r.try_get("", "n"),
+        None => Ok(0),
     }
 }

@@ -1,4 +1,6 @@
 pub mod ai;
+pub mod automation_effects;
+pub mod automation_misses;
 pub mod automations;
 pub mod billing;
 pub mod bluesky_actions;
