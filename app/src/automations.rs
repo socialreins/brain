@@ -81,10 +81,12 @@ const UNCHANGED: &str = "r.steps_hash = md5($4::jsonb::text) AND EXISTS (SELECT 
     AND md5(a.steps::text) = r.steps_hash)";
 const CHANGED: &str = "automation_changed";
 /// Runs stored `skipped` for a safety reason (`paused`, `own_account`, `connected_account`,
-/// `cooldown`, `automation_cap`, or the team's `daily_cap`) did nothing: they are not an author's first run and never count
+/// `cooldown`, `automation_cap`, the team's `daily_cap`, or a question that was not judged to be
+/// one or could not be judged) did nothing: they are not an author's first run and never count
 /// toward a cool-down or an automation's cap. SQL on a run aliased `r`.
 const NOT_ACTED: &str = "(r.status = 'skipped' AND COALESCE(r.reason, '') IN ('paused', \
-    'own_account', 'connected_account', 'cooldown', 'automation_cap', 'daily_cap'))";
+    'own_account', 'connected_account', 'cooldown', 'automation_cap', 'daily_cap', \
+    'no_question', 'question_cap', 'no_ai_key', 'no_ai_credits', 'ai_failed'))";
 /// Longest `{name}` put into a text.
 pub(crate) const MAX_NAME_CHARS: usize = 64;
 /// What `{page}` counts as when a text is checked.
@@ -127,6 +129,139 @@ pub struct Conditions {
     /// payloads; 1 to 20, each 1 to 64 characters of `a-z`, `0-9`, `_` and `-`.
     #[serde(default)]
     pub payloads: Vec<String>,
+    /// Weekdays and hours it may act in, in a time zone. Absent: always.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<When>,
+    /// Only a message that asks a question. One with a `?` counts as one; any other is judged by
+    /// an AI model, paid like an AI reply. Not `new_follower` or `button_clicked`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub question: bool,
+    /// Only a message written in one of these languages (ISO 639-1 codes of `LANGUAGES`, at most
+    /// 10), detected from its text; a text too short or mixed to tell never matches. Not
+    /// `new_follower` or `button_clicked`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub languages: Vec<String>,
+}
+
+/// When an automation may act: on these weekdays, in these hours of the day, in `zone`. An
+/// overnight window has `from_hour` after `to_hour`.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct When {
+    /// An IANA time zone name such as `Asia/Dhaka`.
+    pub zone: String,
+    /// 0 (Monday) to 6 (Sunday); empty: every day.
+    #[serde(default)]
+    pub weekdays: Vec<u8>,
+    /// The first hour it may act, 0 to 23; with `to_hour`, or both absent: all day.
+    #[serde(default)]
+    pub from_hour: Option<u8>,
+    /// The hour it stops, 1 to 24, not the same as `from_hour`: 9 to 17 acts from 9:00 to 16:59.
+    #[serde(default)]
+    pub to_hour: Option<u8>,
+}
+
+impl When {
+    fn valid(&self) -> bool {
+        let hours = match (self.from_hour, self.to_hour) {
+            (None, None) => true,
+            (Some(f), Some(t)) => f <= 23 && (1..=24).contains(&t) && f != t,
+            _ => false,
+        };
+        hours
+            && self.zone.parse::<chrono_tz::Tz>().is_ok()
+            && self.weekdays.len() <= 7
+            && self.weekdays.iter().all(|d| *d <= 6)
+            && (self.from_hour.is_some() || !self.weekdays.is_empty())
+    }
+
+    /// `wrong_weekday` or `outside_hours` when `now` is not a time it may act.
+    fn mismatch(&self, now: chrono::DateTime<chrono::Utc>) -> Option<&'static str> {
+        use chrono::{Datelike, Timelike};
+        let local = now.with_timezone(&self.zone.parse::<chrono_tz::Tz>().ok()?);
+        let hour = local.hour() as u8;
+        let (overnight, to) = match (self.from_hour, self.to_hour) {
+            (Some(f), Some(t)) => (f >= t, t),
+            _ => (false, 0),
+        };
+        // An overnight window belongs to the day it starts: Friday 22 to 6 runs into Saturday
+        // morning, and those small hours are Friday's.
+        let day = if overnight && hour < to {
+            local.weekday().pred()
+        } else {
+            local.weekday()
+        };
+        if !self.weekdays.is_empty() && !self.weekdays.contains(&(day.num_days_from_monday() as u8))
+        {
+            return Some("wrong_weekday");
+        }
+        let (Some(from), Some(to)) = (self.from_hour, self.to_hour) else {
+            return None;
+        };
+        let inside = if from < to {
+            (from..to).contains(&hour)
+        } else {
+            hour >= from || hour < to
+        };
+        (!inside).then_some("outside_hours")
+    }
+}
+
+/// Languages a `languages` condition may name: the ISO 639-1 code and `whatlang`'s name for it.
+pub const LANGUAGES: [(&str, whatlang::Lang); 23] = {
+    use whatlang::Lang::*;
+    [
+        ("ar", Ara),
+        ("bn", Ben),
+        ("de", Deu),
+        ("en", Eng),
+        ("es", Spa),
+        ("fa", Pes),
+        ("fr", Fra),
+        ("he", Heb),
+        ("hi", Hin),
+        ("id", Ind),
+        ("it", Ita),
+        ("ja", Jpn),
+        ("ko", Kor),
+        ("nl", Nld),
+        ("pl", Pol),
+        ("pt", Por),
+        ("ru", Rus),
+        ("th", Tha),
+        ("tr", Tur),
+        ("uk", Ukr),
+        ("ur", Urd),
+        ("vi", Vie),
+        ("zh", Cmn),
+    ]
+};
+
+/// The least confidence (0 to 1) whatlang must have in a language for it to count. Its own
+/// `is_reliable` wants 0.8, which a plain English sentence of a dozen words does not reach.
+// shortcut: a very short text can be called the wrong language above this; raise it, or add the
+// platform's own language tag (X sends one with each post) when that shows up in real use.
+const MIN_LANGUAGE_CONFIDENCE: f64 = 0.3;
+/// The fewest letters a text needs for its language to be judged: "ok" or "lol" can be any.
+const MIN_LANGUAGE_LETTERS: usize = 12;
+
+/// The language of `text` as one of `LANGUAGES`' codes; `None` when it is another one or the
+/// detector is not sure (a very short or mixed text).
+pub fn language_of(text: &str) -> Option<&'static str> {
+    // Handles, links and hashtags say nothing of the language, and a few letters are too few.
+    let words: Vec<&str> = text
+        .split_whitespace()
+        .filter(|w| !w.starts_with(['@', '#']) && !w.contains("://"))
+        .collect();
+    let text = words.join(" ");
+    if text.chars().filter(|c| c.is_alphabetic()).count() < MIN_LANGUAGE_LETTERS {
+        return None;
+    }
+    let info = whatlang::detect(&text).filter(|i| i.confidence() >= MIN_LANGUAGE_CONFIDENCE)?;
+    LANGUAGES
+        .iter()
+        .find(|(_, l)| *l == info.lang())
+        .map(|(code, _)| *code)
 }
 
 /// What an automation does. Texts may hold `{name}`, the commenter's display name ("there"
@@ -289,7 +424,9 @@ fn check_conditions(trigger: &str, c: &mut Conditions) -> Result<(), &'static st
     }
     let comment = trigger == "comment_received";
     let button = trigger == "button_clicked";
-    let fits_trigger = (comment || (c.post_remote_ids.is_empty() && !c.first_per_author))
+    let mention = trigger == "mention_received";
+    let fits_trigger = (comment || c.post_remote_ids.is_empty())
+        && (comment || mention || !c.first_per_author)
         && (trigger == "dm_received" || !c.first_message)
         && (!(button || trigger == "new_follower") || c.keywords.is_empty())
         && (button != c.payloads.is_empty());
@@ -306,6 +443,25 @@ fn check_conditions(trigger: &str, c: &mut Conditions) -> Result<(), &'static st
     {
         return Err("invalid_conditions");
     }
+    let text_trigger = !(button || trigger == "new_follower");
+    let mut codes: Vec<&str> = c.languages.iter().map(String::as_str).collect();
+    codes.sort_unstable();
+    codes.dedup();
+    if c.when.as_ref().is_some_and(|w| !w.valid())
+        || ((c.question || !c.languages.is_empty()) && !text_trigger)
+        || c.languages.len() > 10
+        || codes.len() != c.languages.len()
+        || !codes
+            .iter()
+            .all(|l| LANGUAGES.iter().any(|(code, _)| code == l))
+    {
+        return Err("invalid_conditions");
+    }
+    if let Some(w) = &mut c.when {
+        w.weekdays.sort_unstable();
+        w.weekdays.dedup();
+    }
+    c.languages.sort();
     c.keywords = inbox::keywords(&c.keywords).ok_or("invalid_conditions")?;
     c.account_ids.sort();
     c.account_ids.dedup();
@@ -567,10 +723,14 @@ pub struct Facts<'a> {
     pub first_from_author: bool,
     /// No earlier DM item from the same author on the account.
     pub first_message: bool,
+    /// The moment the conditions on weekdays and hours are judged at.
+    pub now: chrono::DateTime<chrono::Utc>,
 }
 
 /// Why `f` does not meet `c`: one code per condition that fails (`wrong_set`, `wrong_account`,
-/// `wrong_post`, `no_keyword`, `not_first_from_author`, `not_first_message`); empty when it does.
+/// `wrong_post`, `no_keyword`, `not_first_from_author`, `not_first_message`, `wrong_weekday`,
+/// `outside_hours`, `wrong_language`); empty when it does. `question` is judged apart
+/// (`asks_question`), as it may cost an AI call.
 pub fn mismatches(c: &Conditions, f: &Facts<'_>) -> Vec<&'static str> {
     let text = f.text.to_lowercase();
     let post_ok = c.post_remote_ids.is_empty()
@@ -599,6 +759,12 @@ pub fn mismatches(c: &Conditions, f: &Facts<'_>) -> Vec<&'static str> {
     ]
     .into_iter()
     .filter_map(|(ok, why)| (!ok).then_some(why))
+    .chain(c.when.as_ref().and_then(|w| w.mismatch(f.now)))
+    .chain(
+        (!c.languages.is_empty()
+            && !language_of(f.text).is_some_and(|l| c.languages.iter().any(|x| x == l)))
+        .then_some("wrong_language"),
+    )
     .collect()
 }
 
@@ -866,6 +1032,7 @@ async fn run_matching(
             text: &item.text,
             first_from_author: first,
             first_message,
+            now: chrono::Utc::now(),
         };
         // A click runs the automations that name its button.
         let clicked = item.button_payload.as_ref();
@@ -907,6 +1074,25 @@ async fn run_matching(
         if let Some(why) = held {
             skip_run(db, &a, item, why).await?;
             continue;
+        }
+        // Last of the conditions, as it may cost an AI call: only a message that got this far.
+        if cond.question {
+            // A cool-down or cap that already holds the run is no reason to pay for a judgment.
+            if let Some(why) = limited(db, &a, item, Uuid::nil()).await? {
+                skip_run(db, &a, item, why).await?;
+                continue;
+            }
+            match asks_question(app, item, a.id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    skip_run(db, &a, item, "no_question").await?;
+                    continue;
+                }
+                Err(why) => {
+                    skip_run(db, &a, item, why).await?;
+                    continue;
+                }
+            }
         }
         let once = cond.first_per_author;
         let Some(run_id) = claim(db, &a, item, steps.is_some(), sends, once).await? else {
@@ -1641,6 +1827,144 @@ pub(crate) struct Written {
     pub model: Option<String>,
 }
 
+/// Whether the item's text asks a question: yes when it holds a question mark (no AI call), else
+/// judged by an AI model with the same key choice and payment as an AI reply, once per
+/// automation and item (`ai:q:...`, so a sweep never pays twice). `Err` is the reason the run is
+/// stored `skipped`: `no_ai_key`, `no_ai_credits` or `ai_failed`.
+pub(crate) async fn asks_question(
+    app: &AppState,
+    item: &inbox_items::Model,
+    automation: Uuid,
+) -> Result<bool, &'static str> {
+    if item.text.contains(['?', '\u{ff1f}', '\u{61f}', '\u{bf}']) {
+        return Ok(true);
+    }
+    if item.text.trim().is_empty() {
+        return Ok(false);
+    }
+    // Judging costs, and a stranger writes as much as they like: the team judges so many a day.
+    let cap = [(
+        format!("automation-judge:team:{}", item.team_id),
+        JUDGES_PER_DAY,
+    )];
+    match crate::rate_limit::daily_reserve(&app.db, &cap).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err("question_cap"),
+        Err(e) => {
+            tracing::error!(error = %e, item = %item.id, "question cap not read");
+            return Err("ai_failed");
+        }
+    }
+    let reference = format!("ai:q:{automation}:{}", item.id);
+    let access = ai_pay(app, item, &reference).await;
+    let AiAccess {
+        provider,
+        key,
+        paid,
+    } = access.map_err(|(_, reason)| reason)?;
+    let (system, user) = ai::question_prompt(&item.text);
+    let answer = app.ai.write(&provider, &key, &system, &user).await;
+    // The first word, whatever dresses it: "Yes.", "**no**", "yes, because".
+    let word = answer.as_ref().ok().and_then(|(a, _)| {
+        let first = a
+            .split(|c: char| !c.is_alphabetic())
+            .find(|w| !w.is_empty());
+        first.map(str::to_lowercase)
+    });
+    match word.as_deref() {
+        Some("yes") => Ok(true),
+        Some("no") => Ok(false),
+        _ => {
+            tracing::warn!(status = ?answer.err(), %provider, item = %item.id, "question not judged");
+            ai_refund(app, item, paid, &reference, "ai question unjudged").await;
+            Err("ai_failed")
+        }
+    }
+}
+
+/// Questions judged by AI, a team, a day.
+const JUDGES_PER_DAY: i64 = 300;
+
+/// Who pays for one AI call and with which key: the team's own key, free, else ours, which with
+/// billing on is paid under `reference` from the plan's monthly allowance, then an `ai` credit.
+struct AiAccess {
+    provider: String,
+    key: String,
+    /// What was paid, to give back when nothing usable came of the call.
+    paid: Option<billing::Kind>,
+}
+
+/// Picks the key and pays for the call before it is made. `Err` is the (status, reason) of the
+/// step that ends there: `skipped` `no_ai_key` or `no_ai_credits`, `failed` `ai_failed` (the
+/// reference was given back before) or `internal`.
+async fn ai_pay(
+    app: &AppState,
+    item: &inbox_items::Model,
+    reference: &str,
+) -> Result<AiAccess, (&'static str, &'static str)> {
+    let team_key = match key_of(app, item.team_id).await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(error = %e, item = %item.id, "ai key unreadable");
+            return Err(("failed", "internal"));
+        }
+    };
+    let metered = team_key.is_none() && app.billing_enabled;
+    let ours = || app.ai.own_key.clone().map(|k| ("anthropic".to_owned(), k));
+    let Some((provider, key)) = team_key.or_else(ours) else {
+        return Err(("skipped", "no_ai_key"));
+    };
+    let mut paid = None;
+    if metered {
+        let monthly = billing::limits_of(true, &app.db, item.team_id)
+            .await
+            .map(|l| l.ai_monthly.unwrap_or(0));
+        let spent = match monthly {
+            Ok(monthly) => {
+                billing::spend_ai(
+                    &app.db,
+                    item.team_id,
+                    monthly,
+                    reference,
+                    chrono::Utc::now(),
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+        match spent {
+            Ok(AiSpent::Paid(kind)) => paid = Some(kind),
+            Ok(AiSpent::Short) => return Err(("skipped", "no_ai_credits")),
+            Ok(AiSpent::Refunded) => return Err(("failed", "ai_failed")),
+            Err(e) => {
+                tracing::error!(error = %e, item = %item.id, "ai reply not paid");
+                return Err(("failed", "internal"));
+            }
+        }
+    }
+    Ok(AiAccess {
+        provider,
+        key,
+        paid,
+    })
+}
+
+/// Gives back what `ai_pay` took, when nothing usable came of the call.
+async fn ai_refund(
+    app: &AppState,
+    item: &inbox_items::Model,
+    paid: Option<billing::Kind>,
+    reference: &str,
+    why: &str,
+) {
+    if let Some(kind) = paid {
+        let back = billing::grant(&app.db, item.team_id, kind, 1, why, Some(reference));
+        if let Err(e) = back.await {
+            tracing::error!(error = %e, item = %item.id, "ai reply not given back");
+        }
+    }
+}
+
 /// Writes a reply with AI from the owner's `prompt` and the item's text, as `kind`. The team's
 /// own key goes first, free and unmetered; else ours, which with billing on is paid under
 /// `reference` from the plan's monthly allowance, then an `ai` credit (`billing::spend_ai`),
@@ -1663,46 +1987,14 @@ pub(crate) async fn ai_write(
         reason: Some(reason.into()),
         ..Default::default()
     };
-    let team_key = match key_of(app, item.team_id).await {
-        Ok(k) => k,
-        Err(e) => {
-            tracing::error!(error = %e, item = %item.id, "ai key unreadable");
-            return Err(ended("failed", "internal"));
-        }
+    let AiAccess {
+        provider,
+        key,
+        paid,
+    } = match ai_pay(app, item, reference).await {
+        Ok(a) => a,
+        Err((status, reason)) => return Err(ended(status, reason)),
     };
-    let metered = team_key.is_none() && app.billing_enabled;
-    let ours = || app.ai.own_key.clone().map(|k| ("anthropic".to_owned(), k));
-    let Some((provider, key)) = team_key.or_else(ours) else {
-        return Err(ended("skipped", "no_ai_key"));
-    };
-    let mut paid = None;
-    if metered {
-        let monthly = billing::limits_of(true, &app.db, item.team_id)
-            .await
-            .map(|l| l.ai_monthly.unwrap_or(0));
-        let spent = match monthly {
-            Ok(monthly) => {
-                billing::spend_ai(
-                    &app.db,
-                    item.team_id,
-                    monthly,
-                    reference,
-                    chrono::Utc::now(),
-                )
-                .await
-            }
-            Err(e) => Err(e),
-        };
-        match spent {
-            Ok(AiSpent::Paid(kind)) => paid = Some(kind),
-            Ok(AiSpent::Short) => return Err(ended("skipped", "no_ai_credits")),
-            Ok(AiSpent::Refunded) => return Err(ended("failed", "ai_failed")),
-            Err(e) => {
-                tracing::error!(error = %e, item = %item.id, "ai reply not paid");
-                return Err(ended("failed", "internal"));
-            }
-        }
-    }
     let public = via == Via::Public;
     let limit = ai::budget(&account.provider, via);
     let name = safe_name(item.author_name.as_deref());
@@ -1754,19 +2046,7 @@ pub(crate) async fn ai_write(
             model,
         }),
         Err(reason) => {
-            if let Some(kind) = paid {
-                let back = billing::grant(
-                    &app.db,
-                    item.team_id,
-                    kind,
-                    1,
-                    "ai reply unsent",
-                    Some(reference),
-                );
-                if let Err(e) = back.await {
-                    tracing::error!(error = %e, item = %item.id, "ai reply not given back");
-                }
-            }
+            ai_refund(app, item, paid, reference, "ai reply unsent").await;
             Err(ActionResult {
                 provider: Some(provider),
                 model,
@@ -1842,7 +2122,113 @@ mod tests {
             text,
             first_from_author: true,
             first_message: true,
+            now: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn hours_and_weekdays_are_judged_in_the_zone() {
+        use chrono::TimeZone;
+        // 2026-11-23 is a Monday.
+        let at = |h| {
+            chrono::Utc
+                .with_ymd_and_hms(2026, 11, 23, h, 30, 0)
+                .unwrap()
+        };
+        let office = When {
+            zone: "Asia/Dhaka".into(),
+            weekdays: vec![0, 1],
+            from_hour: Some(9),
+            to_hour: Some(17),
+        };
+        assert!(office.valid());
+        assert_eq!(office.mismatch(at(5)), None, "11:30 in Dhaka");
+        assert_eq!(office.mismatch(at(12)), Some("outside_hours"));
+        let tuesday = When {
+            weekdays: vec![1],
+            ..office.clone()
+        };
+        assert_eq!(tuesday.mismatch(at(5)), Some("wrong_weekday"));
+        let night = When {
+            zone: "UTC".into(),
+            weekdays: vec![],
+            from_hour: Some(22),
+            to_hour: Some(6),
+        };
+        assert_eq!(night.mismatch(at(23)), None);
+        assert_eq!(night.mismatch(at(5)), None);
+        assert_eq!(night.mismatch(at(6)), Some("outside_hours"));
+        // Friday 22 to 6 (2026-11-27 is a Friday) runs into Saturday morning, which is still
+        // Friday's night, and not into Friday's own small hours.
+        let friday_night = When {
+            weekdays: vec![4],
+            ..night.clone()
+        };
+        let sat = |h| chrono::Utc.with_ymd_and_hms(2026, 11, 28, h, 0, 0).unwrap();
+        let fri = |h| chrono::Utc.with_ymd_and_hms(2026, 11, 27, h, 0, 0).unwrap();
+        assert_eq!(friday_night.mismatch(fri(23)), None);
+        assert_eq!(friday_night.mismatch(sat(3)), None);
+        assert_eq!(friday_night.mismatch(fri(3)), Some("wrong_weekday"));
+        assert_eq!(friday_night.mismatch(sat(23)), Some("wrong_weekday"));
+        let all_day = When {
+            from_hour: None,
+            to_hour: None,
+            weekdays: vec![0],
+            ..night.clone()
+        };
+        assert_eq!(all_day.mismatch(at(12)), None);
+        for bad in [
+            When {
+                zone: "Nope".into(),
+                ..night.clone()
+            },
+            When {
+                to_hour: None,
+                ..night.clone()
+            },
+            When {
+                to_hour: Some(22),
+                ..night.clone()
+            },
+            When {
+                to_hour: Some(25),
+                ..night.clone()
+            },
+            When {
+                from_hour: None,
+                to_hour: None,
+                ..night.clone()
+            },
+        ] {
+            assert!(!bad.valid(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_language_is_known_only_when_the_text_is_clear() {
+        let en = "I would like to know where I can buy your new product in my town";
+        assert_eq!(language_of(en), Some("en"));
+        assert_eq!(
+            language_of("আমি আপনার নতুন পণ্যটি কোথায় কিনতে পারি তা জানতে চাই"),
+            Some("bn")
+        );
+        assert_eq!(language_of("Wo kann ich das kaufen?"), Some("de"));
+        assert_eq!(language_of(""), None);
+        // Too few letters, or only handles and links, say nothing.
+        assert_eq!(language_of("ok thanks lol"), None);
+        assert_eq!(
+            language_of(&format!("@someone https://x.com/a/b {en}")),
+            Some("en")
+        );
+        assert_eq!(
+            language_of("@someone @another https://example.com/page"),
+            None
+        );
+        let c = Conditions {
+            languages: vec!["bn".into()],
+            ..Default::default()
+        };
+        assert_eq!(mismatches(&c, &facts(&[], en)), vec!["wrong_language"]);
     }
 
     #[test]
@@ -1952,13 +2338,23 @@ mod tests {
             first_per_author: true,
             ..Conditions::default()
         };
-        for c in [post, author] {
+        for c in [post, author.clone()] {
             assert_eq!(ok("comment_received", c.clone(), &[dm()], None), Ok(()));
-            assert_eq!(
-                ok("mention_received", c, &[dm()], None),
-                Err("invalid_conditions")
-            );
         }
+        // A mention takes "first mention per person" but has no post to be under.
+        assert_eq!(ok("mention_received", author, &[dm()], None), Ok(()));
+        assert_eq!(
+            ok(
+                "mention_received",
+                Conditions {
+                    post_remote_ids: vec!["p".into()],
+                    ..Conditions::default()
+                },
+                &[dm()],
+                None
+            ),
+            Err("invalid_conditions")
+        );
         for t in ["dm_received", "story_reply", "new_follower"] {
             let none = Conditions::default();
             assert_eq!(
