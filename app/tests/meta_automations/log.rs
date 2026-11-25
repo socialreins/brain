@@ -201,3 +201,76 @@ async fn a_retry_waits_for_the_team_to_resume_and_for_the_automation_to_be_on() 
     assert_eq!(res.status_code(), 409);
     assert_eq!(e.mock.sent(), 1);
 }
+
+#[tokio::test]
+#[serial]
+async fn only_a_refused_send_is_retryable_not_a_run_cut_off_after_a_moderation_skip() {
+    let e = env().await;
+    let a = e
+        .automation(json!({"name": "Flow", "trigger": "comment_received",
+            "steps": [{"type": "hide_comment"}, {"type": "reply_publicly", "text": "hi"}]}))
+        .await;
+    let item = e.item("comment", &digits(), "hi", 0).await;
+    // A run cut off mid-send, whose last result is a rate-limited moderation skip.
+    e.sql(&format!(
+        "UPDATE automation_runs SET status = 'failed', reason = 'interrupted', \
+         results = '[{{\"type\": \"hide_comment\", \"status\": \"skipped\", \"reason\": \"rate_limited\"}}]' \
+         WHERE inbox_item_id = '{}'",
+        item.id
+    ))
+    .await;
+    let page = runs(&e, &a, "").await;
+    assert_eq!(page["runs"][0]["can_retry"], false);
+    let id = page["runs"][0]["id"].as_str().unwrap();
+    assert_eq!(
+        e.post(&retry_path(&a, id), json!({})).await.status_code(),
+        409
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn two_clicks_at_once_retry_once() {
+    let e = env().await;
+    let a = e.automation(reply_all(json!({}))).await;
+    e.mock.mode.store(1, Ordering::SeqCst);
+    e.item("comment", &digits(), "hi", 0).await;
+    let id = runs(&e, &a, "").await["runs"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    e.mock.mode.store(0, Ordering::SeqCst);
+    let path = retry_path(&a, &id);
+    let (one, two) = tokio::join!(e.post(&path, json!({})), e.post(&path, json!({})));
+    let mut codes = [one.status_code().as_u16(), two.status_code().as_u16()];
+    codes.sort();
+    assert_eq!(codes, [200, 409]);
+    // One refused attempt, one taken: never two replies.
+    let taken = e.mock.to("/comments").len() - 1;
+    assert_eq!(taken, 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_retry_does_not_cost_the_team_another_daily_hit() {
+    let e = env().await;
+    let a = e
+        .automation(json!({"name": "Flow", "trigger": "comment_received",
+            "steps": [{"type": "reply_publicly", "text": "one"}]}))
+        .await;
+    let bucket = automations::quota_bucket(e.team);
+    e.mock.mode.store(1, Ordering::SeqCst);
+    let item = e.item("comment", &digits(), "hi", 0).await;
+    assert_eq!(e.count_hits(&bucket).await, 1);
+    due(&e, item.id).await;
+    tick(&e).await;
+    e.mock.mode.store(0, Ordering::SeqCst);
+    due(&e, item.id).await;
+    tick(&e).await;
+    assert_eq!(e.run(&a, item.id).await.unwrap().0, "sent");
+    assert_eq!(
+        e.count_hits(&bucket).await,
+        1,
+        "one send, one hit, however many tries"
+    );
+}

@@ -469,6 +469,16 @@ pub fn validate_steps(
     let wait = |s: Option<&Step>| matches!(s, Some(Step::Wait { .. } | Step::WaitForReply { .. }));
     // At least one step that does something outside (a send, a mail, a moderation call).
     let sends = steps.iter().any(Step::outward);
+    // As in `validate`, each of these once.
+    let once = |f: fn(&Step) -> bool| steps.iter().filter(|s| f(s)).count() <= 1;
+    if !once(|s| matches!(s, Step::NotifyTeam))
+        || !once(|s| matches!(s, Step::Assign { .. }))
+        || !once(|s| matches!(s, Step::HideComment))
+        || !once(|s| matches!(s, Step::LikeComment))
+        || !once(|s| matches!(s, Step::StopAutomations))
+    {
+        return Err("invalid_steps");
+    }
     if !sends || steps.len() > MAX_STEPS || wait(steps.first()) || wait(steps.last()) {
         return Err("invalid_steps");
     }
@@ -918,7 +928,18 @@ async fn answers_waiting(
             item.received_at.into(),
         ],
     );
-    Ok(db.execute_raw(stmt).await?.rows_affected() > 0)
+    if db.execute_raw(stmt).await?.rows_affected() > 0 {
+        return Ok(true);
+    }
+    // Taken before (the sweep takes an item again after a crash): still nobody else's.
+    let stmt = sql(
+        "SELECT EXISTS (SELECT 1 FROM automation_runs WHERE reply_item_id = $1) AS taken",
+        vec![item.id.into()],
+    );
+    match db.query_one_raw(stmt).await? {
+        Some(r) => r.try_get("", "taken"),
+        None => Ok(false),
+    }
 }
 
 /// Items automations never finished (a crash, a restart, a database error) are older than this
@@ -1134,8 +1155,14 @@ async fn run_matching(
             skip_run(db, &a, item, why).await?;
             continue;
         }
-        // Read last, once all else matched: it costs a model call.
-        if !cond.intent.is_empty() {
+        // Read last, once all else matched: it costs a model call, so not for an item this
+        // automation already has a run for (the sweep took it again), nor one a cool-down or
+        // the automation's cap would stop.
+        if !cond.intent.is_empty() && !run_exists(db, &a, item).await? {
+            if let Some(why) = limited(db, &a, item, Uuid::nil()).await? {
+                skip_run(db, &a, item, why).await?;
+                continue;
+            }
             let reference = format!("ai:intent:{}:{}", a.id, item.id);
             // Our model's time is not free: a team reads at most as many texts a day as it may
             // start runs.
@@ -1166,6 +1193,11 @@ async fn run_matching(
         };
         let once = cond.first_per_author;
         let Some(run_id) = claim(db, &a, item, steps.is_some(), sends, once).await? else {
+            // The sweep took the item again: this automation did take it before, and the newer
+            // ones are still to leave it alone.
+            if stop && ran(db, &a, item).await? {
+                break;
+            }
             continue;
         };
         if let Some(steps) = &steps {
@@ -1190,6 +1222,42 @@ async fn run_matching(
         }
     }
     Ok(())
+}
+
+/// Whether `a` has a run on `item`, whatever it came to.
+async fn run_exists(
+    db: &impl ConnectionTrait,
+    a: &automations::Model,
+    item: &inbox_items::Model,
+) -> Result<bool, DbErr> {
+    let stmt = sql(
+        "SELECT EXISTS (SELECT 1 FROM automation_runs WHERE automation_id = $1 \
+         AND inbox_item_id = $2) AS yes",
+        vec![a.id.into(), item.id.into()],
+    );
+    match db.query_one_raw(stmt).await? {
+        Some(r) => r.try_get("", "yes"),
+        None => Ok(false),
+    }
+}
+
+/// Whether `a` took `item`: it has a run on it that did something (`NOT_ACTED`).
+async fn ran(
+    db: &impl ConnectionTrait,
+    a: &automations::Model,
+    item: &inbox_items::Model,
+) -> Result<bool, DbErr> {
+    let stmt = sql(
+        &format!(
+            "SELECT EXISTS (SELECT 1 FROM automation_runs r WHERE r.automation_id = $1 \
+             AND r.inbox_item_id = $2 AND NOT {NOT_ACTED}) AS yes"
+        ),
+        vec![a.id.into(), item.id.into()],
+    );
+    match db.query_one_raw(stmt).await? {
+        Some(r) => r.try_get("", "yes"),
+        None => Ok(false),
+    }
 }
 
 /// Why a connected account's item runs nothing: `own_account` when its author is another account
@@ -1331,7 +1399,9 @@ impl Flow<'_> {
                     )
                 }
             };
-            if is_rate_limited(&result) && retry_later(db, run, i, &results).await? {
+            // An AI step is written again at a retry, which costs a model call: a person decides.
+            let again = is_rate_limited(&result) && !self.steps[i].ai();
+            if again && retry_later(db, run, i, &results).await? {
                 // Parked: step `i` is sent again later, and this refusal is not kept.
                 return Ok(());
             }
@@ -1614,18 +1684,22 @@ async fn claim_step(
                WHERE id = $1 AND status = 'running' AND step_index = $2 - 1";
     let end = sql(end, values.clone());
     values.push(a.steps.clone().into());
+    // `paid`: a retry of a step whose first try took its hit.
     let claim = format!(
-        "UPDATE automation_runs r SET step_index = $2, results = $3, resume_at = NULL, \
-         awaiting_reply = false, updated_at = now() WHERE r.id = $1 AND r.status = 'running' \
-         AND r.step_index = $2 - 1 AND {UNCHANGED}"
+        "WITH was AS (SELECT retry_paid FROM automation_runs WHERE id = $1 FOR UPDATE) \
+         UPDATE automation_runs r SET step_index = $2, results = $3, resume_at = NULL, \
+         awaiting_reply = false, retry_paid = false, updated_at = now() FROM was \
+         WHERE r.id = $1 AND r.status = 'running' \
+         AND r.step_index = $2 - 1 AND {UNCHANGED} RETURNING was.retry_paid AS paid"
     );
-    if txn.execute_raw(sql(&claim, values)).await?.rows_affected() != 1 {
+    let Some(claimed) = txn.query_one_raw(sql(&claim, values)).await? else {
         txn.execute_raw(end).await?;
         txn.commit().await?;
         return Ok(false);
-    }
+    };
+    let paid: bool = claimed.try_get("", "paid")?;
     let cap = [(quota_bucket(a.team_id), RUNS_PER_DAY)];
-    if sends && reserve_in(&txn, &cap).await?.is_none() {
+    if sends && !paid && reserve_in(&txn, &cap).await?.is_none() {
         settle(&txn, run, "skipped", Some("daily_cap".into()), results).await?;
         txn.commit().await?;
         return Ok(false);
@@ -1649,7 +1723,8 @@ async fn retry_later(
 ) -> Result<bool, DbErr> {
     let stmt = sql(
         "UPDATE automation_runs SET status = 'waiting', step_index = $2 - 1, results = $3, \
-         retries = retries + 1, resume_at = now() + make_interval(mins => (retries + 1) * 5), \
+         retries = retries + 1, retry_paid = true, \
+         resume_at = now() + make_interval(mins => (retries + 1) * 5), \
          updated_at = now() WHERE id = $1 AND status = 'running' AND retries < $4",
         vec![
             run.into(),
@@ -1667,13 +1742,20 @@ pub fn retryable(run: &automation_runs::Model, a: &automations::Model) -> bool {
     let results: Vec<ActionResult> =
         serde_json::from_value(run.results.clone()).unwrap_or_default();
     let sends = |r: &&ActionResult| !matches!(r.kind.as_str(), "tag_contact" | "stop_automations");
-    let refused = match (run.step_index, results.last()) {
-        // A flow: the last step refused, whatever came before went out and stays done.
-        (Some(_), Some(last)) => is_rate_limited(last),
-        // An action list: nothing of it went out.
-        (None, Some(_)) => results.iter().filter(sends).all(is_rate_limited),
-        _ => false,
+    let send = |r: &ActionResult| {
+        matches!(
+            r.kind.as_str(),
+            "send_dm" | "reply_publicly" | "ai_send_dm" | "ai_reply_publicly"
+        )
     };
+    let refused = run.reason.as_deref() == Some("rate_limited")
+        && match (run.step_index, results.last()) {
+            // A flow: the last step is a send the platform refused; whatever came before went out and stays done.
+            (Some(_), Some(last)) => send(last) && is_rate_limited(last),
+            // An action list: nothing of it went out.
+            (None, Some(_)) => results.iter().filter(sends).all(is_rate_limited),
+            _ => false,
+        };
     refused
         && a.active
         && matches!(run.status.as_str(), "skipped" | "failed")
@@ -1701,25 +1783,40 @@ pub async fn retry(
             "UPDATE automation_runs r SET status = 'waiting', reason = NULL, \
              step_index = r.step_index - 1, \
              results = r.results - (jsonb_array_length(r.results) - 1), \
-             retries = r.retries + 1, resume_at = now(), updated_at = now() \
+             retries = r.retries + 1, retry_paid = true, resume_at = now(), updated_at = now() \
              WHERE r.id = $1 AND r.status IN ('skipped', 'failed') AND r.retries < $2 \
+             AND r.reason = 'rate_limited' AND r.retries = $4 \
              AND r.steps_hash = md5($3::jsonb::text) AND EXISTS (SELECT 1 FROM automations a \
              WHERE a.id = r.automation_id AND a.active AND md5(a.steps::text) = r.steps_hash)",
             vec![
                 run.id.into(),
                 MAX_MANUAL_RETRIES.into(),
                 a.steps.clone().into(),
+                run.retries.into(),
             ],
         )
     } else {
         sql(
             "UPDATE automation_runs r SET status = 'running', reason = NULL, results = '[]', \
              retries = r.retries + 1, updated_at = now() \
-             WHERE r.id = $1 AND r.status IN ('skipped', 'failed') AND r.retries < $2",
-            vec![run.id.into(), MAX_MANUAL_RETRIES.into()],
+             WHERE r.id = $1 AND r.status IN ('skipped', 'failed') AND r.retries < $2 \
+             AND r.reason = 'rate_limited' AND r.retries = $3",
+            vec![run.id.into(), MAX_MANUAL_RETRIES.into(), run.retries.into()],
         )
     };
+    // A run again takes its hit of the team's daily cap, as the first try did (a flow's step
+    // already did).
+    let cap = [(quota_bucket(a.team_id), RUNS_PER_DAY)];
+    let hits = if flow {
+        Vec::new()
+    } else {
+        match crate::rate_limit::daily_reserve(db, &cap).await? {
+            Some(ids) => ids,
+            None => return Ok(Err("daily_cap")),
+        }
+    };
     if db.execute_raw(stmt).await?.rows_affected() != 1 {
+        crate::rate_limit::daily_refund(db, &hits).await;
         return Ok(Err("not_retryable"));
     }
     if flow {
@@ -1768,7 +1865,7 @@ async fn park(
     let park = format!(
         "UPDATE automation_runs r SET status = 'waiting', results = $3, updated_at = now(), \
          resume_at = now() + make_interval(mins => $2), awaiting_reply = $5, \
-         reply_item_id = NULL WHERE r.id = $1 \
+         reply_item_id = CASE WHEN $5 THEN NULL ELSE r.reply_item_id END WHERE r.id = $1 \
          AND r.status = 'running' AND {UNCHANGED}"
     );
     let values = vec![
@@ -1920,7 +2017,13 @@ pub async fn resume(app: &AppState, run: &automation_runs::Model) -> Result<(), 
         (true, None) => {
             return settle(db, run.id, "skipped", Some("no_reply".into()), &results).await;
         }
-        (_, Some(id)) => inbox_items::Entity::find_by_id(id).one(db).await?,
+        (_, Some(id)) => match inbox_items::Entity::find_by_id(id).one(db).await? {
+            Some(reply) => Some(reply),
+            // The answer was deleted: a DM would go to the comment, a second private reply.
+            None => {
+                return settle(db, run.id, "skipped", Some("reply_gone".into()), &results).await;
+            }
+        },
         _ => None,
     };
     let holds = steps

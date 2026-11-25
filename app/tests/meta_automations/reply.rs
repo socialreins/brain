@@ -193,3 +193,76 @@ async fn a_test_lists_the_wait_and_goes_on_as_if_answered() {
     assert_eq!(out["steps"][2]["text"], "Here it is, Ada.");
     assert_eq!(e.mock.sent(), 0);
 }
+
+#[tokio::test]
+#[serial]
+async fn a_plain_wait_after_the_answer_keeps_sending_in_the_answers_conversation() {
+    let e = env().await;
+    let a = e
+        .automation(json!({"name": "Long", "trigger": "comment_received",
+            "steps": [{"type": "send_dm", "text": "Want it?"},
+                      {"type": "wait_for_reply", "minutes": 60},
+                      {"type": "send_dm", "text": "Here"},
+                      {"type": "wait", "minutes": 5},
+                      {"type": "send_dm", "text": "Anything else?"}]}))
+        .await;
+    let person = digits();
+    let comment = e.item("comment", &person, "the guide?", 0).await;
+    e.item("dm", &person, "yes", 0).await;
+    tick(&e).await;
+    due(&e, comment.id).await;
+    tick(&e).await;
+    assert_eq!(e.run(&a, comment.id).await.unwrap().0, "sent");
+    let sent = e.mock.to("/messages");
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    // Neither later message is a second private reply to the comment.
+    assert!(
+        sent[1..]
+            .iter()
+            .all(|m| !m.contains("comment_id") && m.contains(&person)),
+        "{sent:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn the_sweep_taking_an_answer_again_starts_nothing_else() {
+    let e = env().await;
+    let a = e.automation(guide_flow(60)).await;
+    let hello = e
+        .automation(json!({"name": "Hello", "trigger": "dm_received",
+            "actions": [{"type": "send_dm", "text": "Hi"}]}))
+        .await;
+    let person = digits();
+    let comment = e.item("comment", &person, "the guide?", 0).await;
+    let reply = e.item("dm", &person, "yes", 0).await;
+    // A crash before `automated_at`: the sweep runs the answer once more.
+    automations::run(&e.state, &e.account, &reply)
+        .await
+        .unwrap();
+    assert!(e.run(&hello, reply.id).await.is_none());
+    tick(&e).await;
+    assert_eq!(e.run(&a, comment.id).await.unwrap().0, "sent");
+}
+
+#[tokio::test]
+#[serial]
+async fn an_answer_that_is_gone_ends_the_run_instead_of_a_second_private_reply() {
+    let e = env().await;
+    let a = e.automation(guide_flow(60)).await;
+    let person = digits();
+    let comment = e.item("comment", &person, "the guide?", 0).await;
+    let reply = e.item("dm", &person, "yes", 0).await;
+    e.sql(&format!(
+        "DELETE FROM inbox_items WHERE id = '{}'",
+        reply.id
+    ))
+    .await;
+    tick(&e).await;
+    let (status, why) = e.run(&a, comment.id).await.unwrap();
+    assert_eq!(
+        (status.as_str(), why.as_deref()),
+        ("skipped", Some("reply_gone"))
+    );
+    assert_eq!(e.mock.to("/messages").len(), 1);
+}

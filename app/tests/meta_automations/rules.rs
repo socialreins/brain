@@ -241,3 +241,64 @@ async fn a_moderation_action_the_item_does_not_take_is_skipped() {
         assert_eq!(res.json::<Value>()["error"], "invalid_actions");
     }
 }
+
+#[tokio::test]
+async fn a_stop_holds_when_the_sweep_runs_the_item_again_and_the_model_is_not_asked_twice() {
+    let e = env_with(Opts {
+        ai_key: true,
+        ..Opts::default()
+    })
+    .await;
+    let stopper = e
+        .automation(reply_all(json!({"name": "First", "conditions": {"intent": ["question"]},
+            "actions": [{"type": "reply_publicly", "text": "Answer"}, {"type": "stop_automations"}]})))
+        .await;
+    let later = e.automation(reply_all(json!({"name": "Later"}))).await;
+    *e.mock.ai_reply.lock().unwrap() = "question".into();
+    let item = e.item("comment", &digits(), "how much?", 0).await;
+    assert!(e.run(&later, item.id).await.is_none());
+    assert_eq!(e.mock.ai_calls.load(Ordering::SeqCst), 1);
+    // The sweep runs it again: the stop still holds, and nothing is read again.
+    socialreins_brain::automations::run(&e.state, &e.account, &item)
+        .await
+        .unwrap();
+    assert!(e.run(&later, item.id).await.is_none());
+    assert_eq!(e.run(&stopper, item.id).await.unwrap().0, "sent");
+    assert_eq!(e.mock.ai_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(e.mock.to("/comments").len(), 1);
+}
+
+#[tokio::test]
+async fn a_person_in_a_cool_down_is_not_read_by_the_model() {
+    let e = env_with(Opts {
+        ai_key: true,
+        ..Opts::default()
+    })
+    .await;
+    let a = e
+        .automation(reply_all(json!({"conditions": {"intent": ["question"]},
+            "cooldown_minutes": 60})))
+        .await;
+    *e.mock.ai_reply.lock().unwrap() = "question".into();
+    let who = digits();
+    let first = e.item("comment", &who, "how much?", 0).await;
+    assert_eq!(e.run(&a, first.id).await.unwrap().0, "sent");
+    let again = e.item("comment", &who, "how much?!", 0).await;
+    assert_eq!(
+        e.run(&a, again.id).await.unwrap().1.as_deref(),
+        Some("cooldown")
+    );
+    assert_eq!(e.mock.ai_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_flow_names_each_one_off_action_once() {
+    let e = env().await;
+    let mut body = json!({"name": "Flow", "trigger": "comment_received",
+        "conditions": {"account_ids": [e.account.id]},
+        "steps": [{"type": "notify_team"}, {"type": "notify_team"},
+                  {"type": "reply_publicly", "text": "x"}]});
+    body["steps"][0] = json!({"type": "notify_team"});
+    let res = e.post("/v1/automations", body).await;
+    assert_eq!(res.json::<Value>()["error"], "invalid_steps");
+}

@@ -29,6 +29,8 @@ pub struct Model {
     /// Tries again after a rate limit refused a send (by itself, at most `MAX_RETRIES`, or by a
     /// person).
     pub retries: i32,
+    /// The step a retry sends again already took its hit of the team's daily cap.
+    pub retry_paid: bool,
     /// A flow's run: the md5 of the steps (as jsonb text) it started on.
     #[sea_orm(column_type = "Text", nullable)]
     pub steps_hash: Option<String>,
