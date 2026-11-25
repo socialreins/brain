@@ -1494,7 +1494,8 @@ async fn send_reply(
         Via::Public
     };
     let text = input.text.trim();
-    if !inbox::fits_on(&item.platform, via, text) {
+    // X's limit depends on the account's plan, so it is checked once the account is read.
+    if item.platform != "x" && !inbox::fits_on(&item.platform, via, text) {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_text");
     }
     if !app.post_limiter.hit(t.current.0.id) {
@@ -1508,6 +1509,9 @@ async fn send_reply(
         Ok(None) => return not_found(),
         Err(e) => return internal(e, "account read"),
     };
+    if item.platform == "x" && !inbox::fits_for(&account, via, text) {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_text");
+    }
     // One reply per item at a time, so a double click cannot send twice: the lock lives in
     // this transaction, held across the send.
     let guard = async {

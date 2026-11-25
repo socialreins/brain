@@ -26,6 +26,7 @@ pub mod state;
 pub mod stripe;
 pub mod turnstile;
 pub mod webhooks;
+pub mod x_automation;
 pub mod x_inbox;
 pub mod youtube_inbox;
 

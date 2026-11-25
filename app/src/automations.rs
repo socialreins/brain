@@ -322,8 +322,12 @@ pub enum Action {
     /// and the account sees it any more). `comment_received` only; elsewhere or on another
     /// network it is `skipped: not_supported`.
     HideComment,
-    /// Likes the comment as the Page (Facebook only; `skipped: not_supported` elsewhere).
+    /// Likes the comment as the Page (Facebook only; `skipped: not_supported` elsewhere). On X it
+    /// likes the post of the comment, a write X bills.
     LikeComment,
+    /// Reposts the post of the comment or mention. X only (`skipped: not_supported` elsewhere);
+    /// a write X bills. `comment_received` and `mention_received`.
+    Repost,
     /// Once this automation has started on an item, the team's later automations (newer ones)
     /// do not run on it.
     StopAutomations,
@@ -350,6 +354,7 @@ impl Action {
             Self::Assign { .. } => "assign",
             Self::HideComment => "hide_comment",
             Self::LikeComment => "like_comment",
+            Self::Repost => "repost",
             Self::StopAutomations => "stop_automations",
         }
     }
@@ -419,6 +424,8 @@ pub enum Step {
     HideComment,
     /// As `Action::LikeComment`.
     LikeComment,
+    /// As `Action::Repost`.
+    Repost,
     /// As `Action::StopAutomations`.
     StopAutomations,
 }
@@ -437,6 +444,7 @@ impl Step {
             Self::Assign { .. } => "assign",
             Self::HideComment => "hide_comment",
             Self::LikeComment => "like_comment",
+            Self::Repost => "repost",
             Self::StopAutomations => "stop_automations",
         }
     }
@@ -461,6 +469,7 @@ impl Step {
             Self::Assign { user_id } => Action::Assign { user_id: *user_id },
             Self::HideComment => Action::HideComment,
             Self::LikeComment => Action::LikeComment,
+            Self::Repost => Action::Repost,
             Self::StopAutomations => Action::StopAutomations,
             _ => return None,
         })
@@ -600,6 +609,7 @@ pub fn validate_steps(
         || !once(|s| matches!(s, Step::Assign { .. }))
         || !once(|s| matches!(s, Step::HideComment))
         || !once(|s| matches!(s, Step::LikeComment))
+        || !once(|s| matches!(s, Step::Repost))
         || !once(|s| matches!(s, Step::StopAutomations))
     {
         return Err("invalid_steps");
@@ -621,6 +631,7 @@ pub fn validate_steps(
             Step::HideComment | Step::LikeComment if trigger != "comment_received" => {
                 return Err("invalid_steps");
             }
+            Step::Repost if !public(trigger) => return Err("invalid_steps"),
             Step::SendDm { buttons, .. } => {
                 for b in buttons.iter_mut() {
                     b.label = b.label.trim().to_owned();
@@ -789,6 +800,8 @@ pub fn validate(
         || !once(|a| matches!(a, Action::Assign { .. }))
         || !once(|a| matches!(a, Action::HideComment))
         || !once(|a| matches!(a, Action::LikeComment))
+        || !once(|a| matches!(a, Action::Repost))
+        || (!public && actions.iter().any(|a| matches!(a, Action::Repost)))
         || !once(|a| matches!(a, Action::StopAutomations))
     {
         return Err("invalid_actions");
@@ -1482,6 +1495,7 @@ impl Flow<'_> {
                 | Step::Assign { .. }
                 | Step::HideComment
                 | Step::LikeComment
+                | Step::Repost
                 | Step::StopAutomations) => {
                     if let Some(action) = step.effect() {
                         let (app, account, item) = (self.app, self.account, self.item);
@@ -1599,6 +1613,10 @@ async fn effect(
                 done(kind, Some("internal"), true)
             }
         },
+        Action::HideComment | Action::LikeComment | Action::Repost if account.provider == "x" => {
+            x_react(app, account, item, action).await
+        }
+        Action::Repost => done(kind, Some("not_supported"), false),
         Action::HideComment | Action::LikeComment => {
             let m = if matches!(action, Action::HideComment) {
                 Moderate::Hide
@@ -1628,6 +1646,55 @@ async fn effect(
         }
         // A send never comes here.
         _ => done(kind, Some("not_supported"), false),
+    }
+}
+
+/// A like, repost or hide on X: acts on the post of the item, a write X bills, so the account's
+/// budget and the team's credits stop it as they stop a send (`x_automation::blocked`). `done`;
+/// `skipped` with the reason when it did not apply or could not go; `failed` when X refused it.
+async fn x_react(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    action: &Action,
+) -> ActionResult {
+    use crate::x_inbox::Action as Do;
+    let kind = action.kind();
+    let result = |status: &str, reason: Option<&str>| ActionResult {
+        kind: kind.into(),
+        status: status.into(),
+        reason: reason.map(str::to_owned),
+        ..Default::default()
+    };
+    let (what, comment_only) = match action {
+        Action::LikeComment => (Do::Like, true),
+        Action::HideComment => (Do::Hide, true),
+        _ => (Do::Repost, false),
+    };
+    if !matches!(item.kind.as_str(), "comment" | "mention")
+        || (comment_only && item.kind != "comment")
+    {
+        return result("skipped", Some("not_supported"));
+    }
+    match crate::x_automation::blocked(app, account).await {
+        Ok(Some(why)) => return result("skipped", Some(why)),
+        Ok(None) => {}
+        Err(e) => {
+            tracing::error!(error = %e, item = %item.id, "x budget not read");
+            return result("failed", Some("internal"));
+        }
+    }
+    match crate::x_inbox::act(app, account, item, what).await {
+        Ok(()) => {
+            if let Err(e) = crate::x_automation::spent(&app.db, account.id).await {
+                tracing::error!(error = %e, item = %item.id, "x write not counted against the budget");
+            }
+            result("done", None)
+        }
+        Err(e @ (InboxError::RateLimited | InboxError::Invalid("not_repliable"))) => {
+            result("skipped", Some(e.code()))
+        }
+        Err(e) => result("failed", Some(e.code())),
     }
 }
 
@@ -2362,7 +2429,10 @@ fn outcome(kind: &str, sent: Result<Result<String, InboxError>, DbErr>) -> Actio
             e @ (InboxError::DmNotAllowed
             | InboxError::NoDmAccess
             | InboxError::RateLimited
-            | InboxError::Invalid("outside_window" | "already_replied" | "dm_unavailable")),
+            | InboxError::Invalid(
+                "outside_window" | "already_replied" | "dm_unavailable" | "x_no_credits"
+                | "x_usage_capped" | "x_budget",
+            )),
         )) => ("skipped", Some(e.code().to_owned()), None),
         Ok(Err(e)) => ("failed", Some(e.code().to_owned()), None),
         Err(e) => {
@@ -2688,7 +2758,7 @@ pub(crate) async fn ai_write(
                 Err("ai_link")
             } else if ai::repeats_prompt(&text, prompt) {
                 Err("ai_leak")
-            } else if !inbox::fits_on(&account.provider, via, &text) {
+            } else if !inbox::fits_for(account, via, &text) {
                 Err("ai_too_long")
             } else {
                 Ok(text)
