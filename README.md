@@ -305,7 +305,7 @@ job in brain hard-deletes sets deleted over 30 days ago, one instance at a time 
 
 Posts go to every account of their platform in their social set; Bluesky (300 graphemes, 4
 images from public https URLs, a still image over 1 MB shrunk to fit, links become facets) and Threads (500
-characters, up to 20 JPEG or PNG images or MP4 or MOV videos as a carousel), LinkedIn (3000
+characters, an emoji counting its UTF-8 bytes, up to 20 JPEG or PNG images or MP4 or MOV videos as a carousel), LinkedIn (3000
 characters, up to 20 JPEG, PNG or GIF images, one MP4 video or one PDF as a document, no threads), Facebook (63206
 characters, up to 10 JPEG, PNG or GIF images or one MP4 or MOV video) and Instagram (2200
 characters, 1 to 20 JPEG images or MP4 or MOV videos, `media_required` without one), YouTube

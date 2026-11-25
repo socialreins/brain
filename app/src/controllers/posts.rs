@@ -240,7 +240,7 @@ pub struct PostInput {
     #[schema(value_type = Option<Vec<Uuid>>)]
     #[schemars(with = "Option<Vec<Uuid>>")]
     pub account_ids: Option<Option<Vec<Uuid>>>,
-    /// At most 300 graphemes on Bluesky, 500 characters on Threads, 3000 on LinkedIn, 63206 on Facebook, 2200 on
+    /// At most 300 graphemes on Bluesky, 500 characters on Threads (an emoji counts its UTF-8 bytes, 4 for most), 3000 on LinkedIn, 63206 on Facebook, 2200 on
     /// Instagram, 280 on X as X counts them (a link is 23, a CJK character or emoji 2; 25,000 when every X account of the set has a paid X plan, its connection's `long_posts`). On YouTube the first line is the video's title (required, at most 100 characters)
     /// and the rest its description (at most 5000 bytes); neither may hold `<` or `>`
     /// (`invalid_text`). On TikTok at most 2200 characters, the video's caption.
