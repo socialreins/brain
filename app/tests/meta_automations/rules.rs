@@ -33,7 +33,7 @@ async fn link_and_sentiment_conditions_are_checked() {
         let res = e.post("/v1/automations", body).await;
         assert_eq!(res.status_code(), 422, "{trigger}");
     }
-    let mut body = when(json!({"sentiment": ["negative", "positive", "negative"]}));
+    let mut body = when(json!({"sentiment": ["positive", "negative"]}));
     body["conditions"]["account_ids"] = json!([e.account.id]);
     let made = e.post("/v1/automations", body).await.json::<Value>();
     assert_eq!(
