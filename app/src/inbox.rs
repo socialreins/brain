@@ -604,6 +604,17 @@ pub async fn store(
     account: &social_accounts::Model,
     f: Fresh,
 ) -> Result<Option<inbox_items::Model>, DbErr> {
+    store_with(db, account, f, true).await
+}
+
+/// `store`; with `opt` false a `stop` or `start` changes nobody's broadcast opt-out (a message read
+/// late, which a newer one from its author may already have overruled).
+pub async fn store_with(
+    db: &DatabaseConnection,
+    account: &social_accounts::Model,
+    f: Fresh,
+    opt: bool,
+) -> Result<Option<inbox_items::Model>, DbErr> {
     let values: Vec<Value> = vec![
         Uuid::now_v7().into(),
         account.team_id.into(),
@@ -636,7 +647,8 @@ pub async fn store(
         .from_raw_sql(sql(INSERT, values))
         .one(db)
         .await?;
-    if let Some((i, out)) = item.as_ref().and_then(|i| Some((i, opt_out(i)?))) {
+    let said = item.as_ref().filter(|_| opt);
+    if let Some((i, out)) = said.and_then(|i| Some((i, opt_out(i)?))) {
         let person: Vec<Value> = vec![
             i.team_id.into(),
             i.platform.clone().into(),

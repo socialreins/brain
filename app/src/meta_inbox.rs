@@ -18,7 +18,10 @@
 //! still works, within Meta's windows); an older one is marked automated. The first read of an
 //! account marks every item automated, so connecting an account (or deploying this) never
 //! answers a week of old comments.
-use std::time::{Duration as Wait, Instant};
+use std::{
+    collections::HashSet,
+    time::{Duration as Wait, Instant},
+};
 
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 use sea_orm::ColumnTrait;
@@ -48,7 +51,7 @@ const MAX_PAYLOAD_CHARS: usize = 200;
 const BACKFILL_EVERY_MINUTES: i64 = 60;
 const BACKFILL_ACCOUNTS: i64 = 4;
 /// Longest one account's read takes; what it reached is kept and the rest waits for the next
-/// hour (shortcut: no resume cursor, since a read is capped at about 60 calls).
+/// hour (shortcut: no resume cursor, since a read is capped at about 110 calls).
 const BACKFILL_BUDGET: Wait = Wait::from_secs(30);
 /// Items asked for in a call, and the most pages one list is followed for.
 const PAGE_SIZE: &str = "25";
@@ -446,6 +449,15 @@ async fn private_reply_sent(app: &AppState, item: Uuid) -> Result<bool, DbErr> {
     }
 }
 
+/// What a read found: the items, and the ids of those someone from the account already answered
+/// outside the inbox (a human replying in Messenger or on the post), which no automation may
+/// answer again.
+#[derive(Default)]
+struct Found {
+    items: Vec<Fresh>,
+    answered: HashSet<String>,
+}
+
 /// A time as Graph writes it (`2026-11-25T10:00:00+0000`).
 fn graph_time(v: &Value) -> Option<DateTime<FixedOffset>> {
     let s = v.as_str()?;
@@ -484,6 +496,9 @@ fn listed_facebook_comment(v: &Value, post: &str, page: &str) -> Option<Fresh> {
 /// comment's `replies`); `parent` is the media for a top-level comment, else that comment.
 fn listed_instagram_comment(v: &Value, media: &str, parent: &str) -> Option<Fresh> {
     let (id, from) = (sid(&v["id"])?, &v["from"]);
+    // Graph may leave `from` out: the username then stands for the person (shortcut: it is not
+    // the id the webhook uses, so such a commenter's contact is separate).
+    let author = sid(&from["id"]).or_else(|| sid(&v["username"]))?;
     Some(Fresh {
         kind: "comment",
         remote_id: id,
@@ -494,7 +509,7 @@ fn listed_instagram_comment(v: &Value, media: &str, parent: &str) -> Option<Fres
         story: None,
         button_payload: None,
         author: Author {
-            did: sid(&from["id"])?,
+            did: author,
             handle: sid(&from["username"]).or_else(|| sid(&v["username"])),
             ..Author::default()
         },
@@ -542,6 +557,15 @@ fn listed_messages(conversation: &Value, me: &str, floor: DateTime<FixedOffset>)
         .collect()
 }
 
+/// When the account last wrote in a listed conversation.
+fn last_from(conversation: &Value, me: &str) -> Option<DateTime<FixedOffset>> {
+    let messages = conversation["messages"]["data"].as_array()?;
+    let mine = messages
+        .iter()
+        .filter(|m| sid(&m["from"]["id"]).as_deref() == Some(me));
+    mine.filter_map(|m| graph_time(&m["created_time"])).max()
+}
+
 /// Follows a Graph list through at most `pages` pages, giving `each` every entry until it says
 /// stop (`false`), the time is up or the list ends.
 async fn read_pages(
@@ -584,7 +608,7 @@ async fn facebook_comments(
     app: &AppState,
     (token, page): (&str, &str),
     (floor, deadline): (DateTime<FixedOffset>, Instant),
-    out: &mut Vec<Fresh>,
+    out: &mut Found,
 ) -> Result<(), InboxError> {
     let mut posts = Vec::new();
     let feed = format!("{page}/feed");
@@ -601,14 +625,23 @@ async fn facebook_comments(
     let fields = "id,message,from,created_time,parent{id},attachment{type,url,media}";
     for post in posts {
         let path = format!("{post}/comments");
-        let query = [("filter", "stream"), ("fields", fields), ("limit", "100")];
+        let query = [
+            ("filter", "stream"),
+            ("order", "reverse_chronological"),
+            ("fields", fields),
+            ("limit", "100"),
+        ];
         read_pages(
             app,
             token,
             (&path, &query),
             (COMMENT_PAGES, deadline),
             |c| {
-                out.extend(listed_facebook_comment(c, &post, page).filter(|f| f.at >= floor));
+                if sid(&c["from"]["id"]).as_deref() == Some(page) {
+                    out.answered.extend(sid(&c["parent"]["id"]));
+                }
+                let found = listed_facebook_comment(c, &post, page).filter(|f| f.at >= floor);
+                out.items.extend(found);
                 true
             },
         )
@@ -623,7 +656,7 @@ async fn instagram_comments(
     app: &AppState,
     (token, account): (&str, &str),
     (floor, deadline): (DateTime<FixedOffset>, Instant),
-    out: &mut Vec<Fresh>,
+    out: &mut Found,
 ) -> Result<(), InboxError> {
     let mut media = Vec::new();
     let since = floor.timestamp().to_string();
@@ -650,16 +683,19 @@ async fn instagram_comments(
             (COMMENT_PAGES, deadline),
             |c| {
                 let top = sid(&c["id"]).unwrap_or_default();
-                out.extend(listed_instagram_comment(c, &id, &id));
+                out.items.extend(listed_instagram_comment(c, &id, &id));
                 for r in c["replies"]["data"].as_array().into_iter().flatten() {
-                    out.extend(listed_instagram_comment(r, &id, &top));
+                    if sid(&r["from"]["id"]).as_deref() == Some(account) {
+                        out.answered.insert(top.clone());
+                    }
+                    out.items.extend(listed_instagram_comment(r, &id, &top));
                 }
                 true
             },
         )
         .await?;
     }
-    out.retain(|f| f.at >= floor);
+    out.items.retain(|f| f.at >= floor);
     Ok(())
 }
 
@@ -670,7 +706,7 @@ async fn conversations(
     app: &AppState,
     (token, page, me): (&str, &str, &str),
     (instagram, floor, deadline): (bool, DateTime<FixedOffset>, Instant),
-    out: &mut Vec<Fresh>,
+    out: &mut Found,
 ) -> Result<(), InboxError> {
     let path = format!("{page}/conversations");
     let fields = format!(
@@ -685,7 +721,13 @@ async fn conversations(
         if graph_time(&c["updated_time"]).is_some_and(|t| t < floor) {
             return false;
         }
-        out.extend(listed_messages(c, me, floor));
+        let ours = last_from(c, me);
+        for m in listed_messages(c, me, floor) {
+            if ours.is_some_and(|t| m.at <= t) {
+                out.answered.insert(m.remote_id.clone());
+            }
+            out.items.push(m);
+        }
         true
     })
     .await
@@ -710,7 +752,7 @@ pub async fn backfill(
     };
     let floor = (Utc::now() - Duration::days(inbox::FIRST_DAYS)).fixed_offset();
     let deadline = Instant::now() + BACKFILL_BUDGET;
-    let mut found = Vec::new();
+    let mut found = Found::default();
     let keys = (token.as_str(), account.external_id.as_str());
     let comments = if instagram {
         instagram_comments(app, keys, (floor, deadline), &mut found).await
@@ -740,16 +782,28 @@ pub async fn backfill(
             }
         }
     }
+    // Whatever the account itself wrote, by id (a comment's name may differ from its handle).
+    let Found {
+        mut items,
+        answered,
+    } = found;
+    items.retain(|f| f.author.did != account.external_id);
     // Oldest first, as a webhook would have delivered them.
-    found.sort_by_key(|f| f.at);
+    items.sort_by_key(|f| f.at);
     let mut added = 0;
     let old = Utc::now() - Duration::hours(AUTOMATE_WITHIN_HOURS);
-    for event in found {
-        if is_ours(app, account, &event).await? {
+    for event in items {
+        if is_ours(app, account, &event).await? || near_duplicate(app, account, &event).await? {
             continue;
         }
-        let stale = first || event.at < old;
-        if let Some(item) = inbox::store(&app.db, account, event).await? {
+        // Older than the connection (nothing could have reached it), or answered by a person.
+        let stale = first
+            || event.at < old
+            || event.at < account.created_at
+            || answered.contains(&event.remote_id);
+        // A late `stop` must not undo a newer `start` the webhook already stored.
+        let opt = !newer_message(app, account, &event).await?;
+        if let Some(item) = inbox::store_with(&app.db, account, event, opt).await? {
             added += 1;
             if stale {
                 let stmt = sql(
@@ -761,6 +815,59 @@ pub async fn backfill(
         }
     }
     Ok(added)
+}
+
+/// Whether a DM with this text from this author is already stored within two minutes of it,
+/// under another id (a message's id in a conversation listing is not guaranteed to be its
+/// webhook `mid`).
+async fn near_duplicate(
+    app: &AppState,
+    account: &social_accounts::Model,
+    event: &Fresh,
+) -> Result<bool, DbErr> {
+    if event.kind != "dm" {
+        return Ok(false);
+    }
+    let stmt = sql(
+        "SELECT EXISTS (SELECT 1 FROM inbox_items WHERE social_account_id = $1 AND kind = 'dm' \
+         AND author_id = $2 AND text = $3 AND received_at BETWEEN $4 - interval '2 minutes' \
+         AND $4 + interval '2 minutes') AS ok",
+        vec![
+            account.id.into(),
+            event.author.did.clone().into(),
+            event.text.clone().into(),
+            event.at.into(),
+        ],
+    );
+    match app.db.query_one_raw(stmt).await? {
+        Some(r) => r.try_get("", "ok"),
+        None => Ok(false),
+    }
+}
+
+/// Whether the author of the DM `event` has a newer DM stored for this team.
+async fn newer_message(
+    app: &AppState,
+    account: &social_accounts::Model,
+    event: &Fresh,
+) -> Result<bool, DbErr> {
+    if event.kind != "dm" {
+        return Ok(false);
+    }
+    let stmt = sql(
+        "SELECT EXISTS (SELECT 1 FROM inbox_items WHERE team_id = $1 AND platform = $2 \
+         AND author_id = $3 AND kind = 'dm' AND received_at > $4) AS ok",
+        vec![
+            account.team_id.into(),
+            account.provider.clone().into(),
+            event.author.did.clone().into(),
+            event.at.into(),
+        ],
+    );
+    match app.db.query_one_raw(stmt).await? {
+        Some(r) => r.try_get("", "ok"),
+        None => Ok(false),
+    }
 }
 
 /// One round: claims the accounts not read for an hour (or ever: a new connection), at most

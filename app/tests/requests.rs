@@ -18438,7 +18438,11 @@ mod teams {
                                         {"id": "m_new", "message": "hello", "created_time": ago(10),
                                          "from": {"id": "777", "name": "Ada"}},
                                         {"id": "m_ours", "message": "hi", "created_time": ago(9),
-                                         "from": {"id": "101", "name": "Cafe"}}]}},
+                                         "from": {"id": "101", "name": "Cafe"}},
+                                        {"id": "m_stop", "message": "STOP", "created_time": ago(300),
+                                         "from": {"id": "777", "name": "Ada"}},
+                                        {"id": "m_dup", "message": "ping", "created_time": ago(1),
+                                         "from": {"id": "888", "name": "Bo"}}]}},
                                     {"updated_time": ago(60 * 24 * 30), "messages": {"data": [
                                         {"id": "m_old", "message": "ancient",
                                          "created_time": ago(60 * 24 * 30), "from": {"id": "999"}}]}}]}),
@@ -19875,14 +19879,28 @@ mod teams {
                     let (s, db, state, _) = on_meta(true).await;
                     clean(&db).await;
                     let (_, team_id) = owner_connected(&s, &db).await;
-                    let fb = account(&db, &team_id, "facebook", "101").await;
-                    let ig = account(&db, &team_id, "instagram", "1784").await;
                     // One comment arrived by webhook before.
                     let late = page_comment("101_9_7", "already here", "888", now() - 1800);
                     assert_eq!(deliver(&s, &late).await.status_code(), 200);
-                    assert_eq!(stored(&db, &team_id).await.len(), 1);
+                    // And the same person said `start` after a `stop` the backfill will find.
+                    let start = page_message("101", "m_start", "777", "start");
+                    assert_eq!(deliver(&s, &start).await.status_code(), 200);
+                    // A message the webhook named by another id than the listing does.
+                    let ping = page_message("101", "webhook_mid", "888", "ping");
+                    assert_eq!(deliver(&s, &ping).await.status_code(), 200);
+                    assert_eq!(stored(&db, &team_id).await.len(), 3);
+                    // The accounts were connected a month ago.
+                    let stmt = sea_orm::Statement::from_string(
+                        sea_orm::DbBackend::Postgres,
+                        "UPDATE social_accounts SET created_at = now() - interval '30 days'",
+                    );
+                    sea_orm::ConnectionTrait::execute_raw(&db, stmt)
+                        .await
+                        .unwrap();
+                    let fb = account(&db, &team_id, "facebook", "101").await;
+                    let ig = account(&db, &team_id, "instagram", "1784").await;
 
-                    assert_eq!(meta_inbox::backfill(&state, &fb, false).await.unwrap(), 2);
+                    assert_eq!(meta_inbox::backfill(&state, &fb, false).await.unwrap(), 3);
                     assert_eq!(meta_inbox::backfill(&state, &fb, false).await.unwrap(), 0);
                     assert_eq!(meta_inbox::backfill(&state, &ig, false).await.unwrap(), 3);
                     let items = stored(&db, &team_id).await;
@@ -19890,7 +19908,17 @@ mod teams {
                     // Not the Page's own, not the old post's, not the old conversation's.
                     assert_eq!(
                         ids,
-                        ["101_9_5", "101_9_7", "ig5", "ig7", "ig_m1", "m_new"],
+                        [
+                            "101_9_5",
+                            "101_9_7",
+                            "ig5",
+                            "ig7",
+                            "ig_m1",
+                            "m_new",
+                            "m_start",
+                            "m_stop",
+                            "webhook_mid"
+                        ],
                         "{ids:?}"
                     );
                     let by = |id: &str| items.iter().find(|i| i.remote_id == id).unwrap();
@@ -19902,8 +19930,10 @@ mod teams {
                     // A comment of two days ago is never answered by an automation, a new one may be.
                     assert!(comment.automated_at.is_some());
                     assert!(by("ig5").automated_at.is_some());
-                    assert!(by("m_new").automated_at.is_none());
                     assert!(by("ig7").automated_at.is_none());
+                    assert!(by("ig_m1").automated_at.is_none());
+                    // A person at the account already wrote after it.
+                    assert!(by("m_new").automated_at.is_some());
                     let reply = by("ig7");
                     assert_eq!(reply.parent_remote_id.as_deref(), Some("ig5"));
                     assert_eq!(by("ig5").parent_remote_id.as_deref(), Some("17900000"));
@@ -19913,6 +19943,17 @@ mod teams {
                     assert_eq!((dm.kind.as_str(), dm.author_id.as_str()), ("dm", "777"));
                     assert_eq!(dm.convo_id.as_deref(), Some("777"));
                     assert_eq!(by("ig_m1").platform, "instagram");
+                    // The old `stop` is stored, but it did not opt the person out over their `start`.
+                    let stmt = sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Postgres,
+                        "SELECT count(*) AS n FROM contact_opt_outs WHERE team_id = $1 AND external_id = '777'",
+                        [team_id.parse::<uuid::Uuid>().unwrap().into()],
+                    );
+                    let row = sea_orm::ConnectionTrait::query_one_raw(&db, stmt)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
 
                     // A dead token ends the read and asks for a reconnect.
                     let row = social_accounts::ActiveModel {

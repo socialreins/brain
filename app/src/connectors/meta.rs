@@ -825,6 +825,7 @@ impl Meta {
         }
         let url = format!("{}/{}/{path}", self.graph_url, self.version);
         let req = self.client.get(url).query(query);
+        let req = req.timeout(Duration::from_secs(20));
         self.raw(req, Some(token), None, "Inbox")
             .await
             .map_err(inbox_error)
