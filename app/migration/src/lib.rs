@@ -66,7 +66,8 @@ mod m20261223_000001_media_alt;
 mod m20261224_000001_inbox_resume;
 mod m20261225_000001_waitlist_name;
 mod m20261226_000001_pinterest;
-mod m20261227_000001_meta_synced;
+mod m20261230_000001_bluesky_inbox_retry;
+mod m20261231_000001_meta_synced;
 
 pub struct Migrator;
 
@@ -140,7 +141,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261224_000001_inbox_resume::Migration),
             Box::new(m20261225_000001_waitlist_name::Migration),
             Box::new(m20261226_000001_pinterest::Migration),
-            Box::new(m20261227_000001_meta_synced::Migration),
+            Box::new(m20261230_000001_bluesky_inbox_retry::Migration),
+            Box::new(m20261231_000001_meta_synced::Migration),
             // inject-above (do not remove this comment)
         ]
     }

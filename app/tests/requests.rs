@@ -3548,6 +3548,7 @@ mod teams {
                     "/xrpc/app.bsky.notification.listNotifications",
                     get(list_notifications),
                 )
+                .route("/xrpc/app.bsky.feed.getPosts", get(feed_posts))
                 .route("/xrpc/chat.bsky.convo.listConvos", get(list_convos))
                 .route("/xrpc/chat.bsky.convo.getMessages", get(get_messages))
                 .route(
@@ -3635,6 +3636,14 @@ mod teams {
             if let Some(ms) = data["delay_ms"].as_u64() {
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
             }
+            // `fail_cursor` with `fail_status`: the page after it is refused with that status.
+            if let (Some(at), Some(code)) =
+                (data["fail_cursor"].as_str(), data["fail_status"].as_u64())
+            {
+                if q.get("cursor").is_some_and(|c| c == at) {
+                    return refused(code as u16, "Unavailable");
+                }
+            }
             let all = data["notifications"]
                 .as_array()
                 .cloned()
@@ -3669,6 +3678,29 @@ mod teams {
             }
         }
 
+        /// `app.bsky.feed.getPosts`: with `posts` (uri to post) in the account's data only those
+        /// are served, else every post asked for, plain.
+        async fn feed_posts(
+            headers: axum::http::HeaderMap,
+            axum::extract::RawQuery(raw): axum::extract::RawQuery,
+        ) -> Answer {
+            let Some((did, _)) = caller(&headers) else {
+                return refused(401, "AuthenticationRequired");
+            };
+            let data = inbox_of(&did);
+            let url =
+                reqwest::Url::parse(&format!("http://x/?{}", raw.unwrap_or_default())).unwrap();
+            let posts: Vec<Value> = url
+                .query_pairs()
+                .filter(|(k, _)| k == "uris")
+                .filter_map(|(_, uri)| match data["posts"].as_object() {
+                    Some(known) => known.get(uri.as_ref()).cloned(),
+                    None => Some(json!({"uri": uri, "author": {"did": "did:plc:x"}})),
+                })
+                .collect();
+            (axum::http::StatusCode::OK, Json(json!({ "posts": posts })))
+        }
+
         async fn list_convos(headers: axum::http::HeaderMap) -> Answer {
             let did = match chat_caller(&headers) {
                 Ok(d) => d,
@@ -3688,7 +3720,15 @@ mod teams {
                 Err(a) => return a,
             };
             let convo = q.get("convoId").cloned().unwrap_or_default();
-            let list = inbox_of(&did)["messages"][&convo].clone();
+            let data = inbox_of(&did);
+            // `fail_convo` (an id) with `fail_status`: that conversation's read is refused.
+            if data["fail_convo"] == convo.as_str() {
+                return refused(
+                    data["fail_status"].as_u64().unwrap_or(503) as u16,
+                    "Unavailable",
+                );
+            }
+            let list = data["messages"][&convo].clone();
             (
                 axum::http::StatusCode::OK,
                 Json(json!({ "messages": list })),
@@ -24785,6 +24825,195 @@ mod teams {
                 assert_eq!(stored_count(&db, &team_id).await, 5);
                 // No conversations, so no messages mark.
                 assert_eq!(marks(&db, &account).await, (None, true, false, false));
+            }
+
+            /// A page or conversation that fails after an earlier one keeps what that gave and
+            /// carries on from the failed one; a 429 also holds the account back for a while.
+            #[tokio::test]
+            #[serial]
+            async fn a_failure_partway_keeps_the_progress() {
+                for (status, held) in [(429, true), (503, false)] {
+                    let (s, db, state) = on_mock().await;
+                    let (_, team_id, account, me) = owner(&s, &db).await;
+                    let notes: Vec<Value> = (1..=5)
+                        .map(|i| {
+                            let who = format!("did:plc:p{i}");
+                            note("reply", &who, &format!("p{i}"), "x", &at(i * 10), &me)
+                        })
+                        .collect();
+                    let convos = json!([
+                        convo_of("cvB", &me, &at(10)),
+                        convo_of("cvA", &me, &at(100))
+                    ]);
+                    let messages = json!({
+                        "cvA": [dm_in("a1", "did:plc:dmer", &at(100))],
+                        "cvB": [dm_in("b1", "did:plc:dmer", &at(10))],
+                    });
+                    set_inbox(
+                        &me,
+                        json!({"page": 2, "fail_cursor": "2", "fail_status": status,
+                            "notifications": notes}),
+                    );
+                    ingest(&db, &state, &account).await;
+                    assert_eq!(
+                        stored_count(&db, &team_id).await,
+                        2,
+                        "{status}: page 1 kept"
+                    );
+                    assert_eq!(marks(&db, &account).await.0, Some("2".into()));
+                    let retry = format!(
+                        "SELECT inbox_retry_at IS NOT NULL AS h FROM social_accounts WHERE id = '{account}'"
+                    );
+                    let row = sea_orm::ConnectionTrait::query_one_raw(
+                        &db,
+                        sea_orm::Statement::from_string(sea_orm::DbBackend::Postgres, retry),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(row.try_get::<bool>("", "h").unwrap(), held, "{status}");
+
+                    // A conversation after the first failing keeps the first's messages.
+                    set_inbox(
+                        &me,
+                        json!({"notifications": [], "convos": convos, "messages": messages,
+                            "fail_convo": "cvB", "fail_status": status}),
+                    );
+                    sea_orm::ConnectionTrait::execute_unprepared(
+                        &db,
+                        &format!("UPDATE social_accounts SET notifications_cursor = NULL, \
+                            notifications_pending_at = NULL, inbox_retry_at = NULL WHERE id = '{account}'"),
+                    )
+                    .await
+                    .unwrap();
+                    let before = stored_count(&db, &team_id).await;
+                    ingest(&db, &state, &account).await;
+                    assert_eq!(stored_count(&db, &team_id).await, before + 1, "cvA kept");
+                    assert!(marks(&db, &account).await.3, "resumes after cvA");
+
+                    // The service is back: the rest arrives, once.
+                    set_inbox(
+                        &me,
+                        json!({"notifications": [], "convos": convos, "messages": messages}),
+                    );
+                    ingest(&db, &state, &account).await;
+                    ingest(&db, &state, &account).await;
+                    assert_eq!(stored_count(&db, &team_id).await, before + 2);
+                    assert!(!marks(&db, &account).await.3);
+                }
+            }
+
+            /// Two conversations with the same time: a failure on the second must not move the
+            /// resume mark past it, or its messages are never read.
+            #[tokio::test]
+            #[serial]
+            async fn a_failure_between_conversations_of_one_time_loses_nothing() {
+                let (s, db, state) = on_mock().await;
+                let (_, team_id, account, me) = owner(&s, &db).await;
+                let (early, same) = (at(500), at(100));
+                let convos = json!([
+                    convo_of("cvE", &me, &early),
+                    convo_of("cvA", &me, &same),
+                    convo_of("cvB", &me, &same),
+                ]);
+                let messages = json!({
+                    "cvE": [dm_in("e1", "did:plc:dmer", &early)],
+                    "cvA": [dm_in("a1", "did:plc:dmer", &same)],
+                    "cvB": [dm_in("b1", "did:plc:dmer", &same)],
+                });
+                let data = |fail: Option<&str>| {
+                    let mut d =
+                        json!({"notifications": [], "convos": convos, "messages": messages});
+                    if let Some(id) = fail {
+                        d["fail_convo"] = json!(id);
+                        d["fail_status"] = json!(503);
+                    }
+                    d
+                };
+                // Which of A and B is read second is the sort's choice: fail the one asked for
+                // last by failing both in turn, then recovering.
+                for failing in ["cvA", "cvB"] {
+                    set_inbox(&me, data(Some(failing)));
+                    ingest(&db, &state, &account).await;
+                }
+                set_inbox(&me, data(None));
+                for _ in 0..3 {
+                    ingest(&db, &state, &account).await;
+                }
+                assert_eq!(
+                    stored_count(&db, &team_id).await,
+                    3,
+                    "e1, a1 and b1, once each"
+                );
+            }
+
+            /// Replies to a post Bluesky will not show, or its author blocks us from, say so
+            /// before anything is sent.
+            #[tokio::test]
+            #[serial]
+            async fn replies_that_could_not_show_say_why_and_send_nothing() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                let uri = |k: &str| format!("at://did:plc:fan1/app.bsky.feed.post/{k}");
+                set_inbox(
+                    &me,
+                    json!({"notifications": [
+                        note("reply", "did:plc:fan1", "gone", "a", &at(10), &me),
+                        note("reply", "did:plc:fan1", "blocked", "b", &at(20), &me),
+                        note("reply", "did:plc:fan1", "gated", "c", &at(30), &me),
+                        note("reply", "did:plc:fan1", "fine", "d", &at(40), &me),
+                    ], "posts": {
+                        uri("blocked"): {"uri": uri("blocked"), "author": {"viewer": {"blockedBy": true}}},
+                        uri("gated"): {"uri": uri("gated"), "viewer": {"replyDisabled": true}},
+                        uri("fine"): {"uri": uri("fine"), "viewer": {"replyDisabled": false}},
+                    }}),
+                );
+                ingest(&db, &state, &account).await;
+                let all = all_inbox(&s, &cookie).await;
+                let page = items(&s, &cookie, all["id"].as_str().unwrap(), "").await;
+                let id_of = |text: &str| {
+                    page["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|i| i["text"] == text)
+                        .unwrap()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                };
+                let before = RECORDS.lock().unwrap().len();
+                for (text, code) in [
+                    ("a", "post_unavailable"),
+                    ("b", "blocked_by_author"),
+                    ("c", "replies_disabled"),
+                ] {
+                    let res = req(
+                        &s,
+                        Method::POST,
+                        &format!("/v1/inbox-items/{}/reply", id_of(text)),
+                        &cookie,
+                    )
+                    .json(&json!({"text": "hello"}))
+                    .await;
+                    assert_eq!(res.status_code(), 422, "{text}");
+                    let body = res.json::<Value>();
+                    assert_eq!(body["error"], code);
+                    assert!(body["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Nothing was sent"));
+                }
+                assert_eq!(RECORDS.lock().unwrap().len(), before, "nothing went out");
+                let res = req(
+                    &s,
+                    Method::POST,
+                    &format!("/v1/inbox-items/{}/reply", id_of("d")),
+                    &cookie,
+                )
+                .json(&json!({"text": "hello"}))
+                .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
             }
 
             #[tokio::test]
