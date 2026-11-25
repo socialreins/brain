@@ -33942,16 +33942,39 @@ mod waitlist_confirm {
 
     #[tokio::test]
     #[serial]
+    async fn the_name_is_frozen_once_the_email_is_verified() {
+        let (s, db, seen, _) = app().await;
+        let email = unique_email();
+        let token = join(&s, &email).await;
+        set_name(&s, &token, "Ann").await.assert_status_ok();
+        verify(&s, &token_of(&mails(&seen, &email).await[0])).await;
+        assert!(row(&db, &email).await.name_token_hash.is_none());
+        set_name(&s, &token, "Mallory").await.assert_status_ok();
+        assert_eq!(row(&db, &email).await.name.as_deref(), Some("Ann"));
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn a_waitlist_name_is_checked() {
         let (s, db, _, _) = app().await;
         let email = unique_email();
         let token = join(&s, &email).await;
-        for name in ["", "   ", "a\nb", "tab\there", "\u{7f}", &"x".repeat(81)] {
+        for name in [
+            "",
+            "   ",
+            "a\nb",
+            "tab\there",
+            "\u{7f}",
+            "a\u{202E}b",
+            "a\u{200B}b",
+            &"x".repeat(81),
+        ] {
             let res = set_name(&s, &token, name).await;
             assert_eq!(res.status_code(), 422, "{name:?}");
             res.assert_json(&json!({"error": "invalid_name"}));
         }
         assert!(row(&db, &email).await.name.is_none());
+        let (s, _, _, _) = app().await;
         set_name(&s, &token, &"x".repeat(80))
             .await
             .assert_status_ok();
@@ -33972,18 +33995,33 @@ mod waitlist_confirm {
     #[serial]
     async fn the_admin_list_shows_names_and_can_hide_stale_entries() {
         let (s, db, seen, _) = app().await;
-        let (named, stale, old_verified) = (unique_email(), unique_email(), unique_email());
+        let (named, stale, old_verified, old_approved) = (
+            unique_email(),
+            unique_email(),
+            unique_email(),
+            unique_email(),
+        );
         let token = join(&s, &named).await;
         set_name(&s, &token, "Ann").await.assert_status_ok();
         join(&s, &stale).await;
         join(&s, &old_verified).await;
+        join(&s, &old_approved).await;
         verify(&s, &token_of(&mails(&seen, &old_verified).await[0])).await;
         waitlist_signups::Entity::update_many()
             .col_expr(
                 waitlist_signups::Column::CreatedAt,
                 Expr::value((Utc::now() - Duration::days(31)).fixed_offset()),
             )
-            .filter(waitlist_signups::Column::Email.is_in([&stale, &old_verified]))
+            .filter(waitlist_signups::Column::Email.is_in([&stale, &old_verified, &old_approved]))
+            .exec(&db)
+            .await
+            .unwrap();
+        waitlist_signups::Entity::update_many()
+            .col_expr(
+                waitlist_signups::Column::ApprovedAt,
+                Expr::value(Utc::now().fixed_offset()),
+            )
+            .filter(waitlist_signups::Column::Email.eq(&old_approved))
             .exec(&db)
             .await
             .unwrap();

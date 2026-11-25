@@ -323,6 +323,7 @@ async fn verify(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Re
             Column::VerifiedAt,
             Expr::cust("COALESCE(verified_at, now())"),
         )
+        .col_expr(Column::NameTokenHash, Expr::value(None::<String>))
         .filter(Column::VerifyTokenHash.eq(token::hash(&secret)))
         .exec(&app.db)
         .await;
@@ -343,12 +344,13 @@ async fn verify(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Re
 pub struct NameBody {
     /// The `name_token` `POST /v1/waitlist` answered.
     pub token: Option<String>,
-    /// 1 to 80 characters after trimming, no control characters.
+    /// 1 to 80 characters after trimming, no control, invisible or direction-changing characters.
     pub name: Option<String>,
 }
 
 /// Adds the name of the signup that just joined, with the `name_token` its join answered, within
-/// an hour of joining. `200 {"status":"ok"}` for any well-formed token, also one that opens
+/// an hour of joining and until the email is verified (the first confirmation also drops the
+/// token). The name is unproven: anyone may join with someone else's email first. `200 {"status":"ok"}` for any well-formed token, also one that opens
 /// nothing (an email that was already on the list, or an expired token), so the answer reveals
 /// nothing about the list. `422 invalid_link` for a malformed token, `422 invalid_name` for a
 /// name that is empty, over 80 characters or holds a control character. Shares the waitlist IP
@@ -378,6 +380,8 @@ async fn set_name(State(app): State<AppState>, ClientIp(ip): ClientIp, request: 
         .col_expr(Column::Name, Expr::value(name))
         .filter(Column::NameTokenHash.eq(token::hash(&secret)))
         .filter(Column::CreatedAt.gt(window.fixed_offset()))
+        // Once the mailbox owner confirms, the name is frozen.
+        .filter(Column::VerifiedAt.is_null())
         .exec(&app.db)
         .await;
     match saved {
@@ -389,12 +393,18 @@ async fn set_name(State(app): State<AppState>, ClientIp(ip): ClientIp, request: 
     }
 }
 
-/// `name` trimmed, if it is 1 to 80 characters without a control character.
+/// A control character, or an invisible or direction-changing one (zero-width, line and
+/// paragraph separators, bidi overrides and isolates, byte order mark).
+fn hidden(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+}
+
+/// `name` trimmed, if it is 1 to 80 characters without a `hidden` one.
 fn clean_name(name: &str) -> Option<String> {
     let name = name.trim();
     let len = name.chars().count();
-    ((1..=MAX_NAME_LEN).contains(&len) && !name.chars().any(char::is_control))
-        .then(|| name.to_owned())
+    ((1..=MAX_NAME_LEN).contains(&len) && !name.chars().any(hidden)).then(|| name.to_owned())
 }
 
 #[derive(Serialize, ToSchema)]
@@ -434,7 +444,7 @@ pub struct AdminQuery {
     pub verified: Option<bool>,
     /// Only signups whose email contains this, in any case.
     pub q: Option<String>,
-    /// `true` leaves out unverified signups older than 30 days.
+    /// `true` leaves out unverified, unapproved signups older than 30 days.
     pub hide_stale: Option<bool>,
 }
 
@@ -537,6 +547,7 @@ async fn admin_list(
             list = list.filter(
                 Condition::any()
                     .add(Column::VerifiedAt.is_not_null())
+                    .add(Column::ApprovedAt.is_not_null())
                     .add(Column::CreatedAt.gte(cutoff)),
             );
         }
