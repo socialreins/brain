@@ -25,7 +25,9 @@
 //! (`teams.automations_paused_at`): matching items are stored `skipped: paused`, waiting runs
 //! are held until it is switched off again, and a run already between two sends finishes.
 //! Neither a paused, cooled-down nor capped skip counts as the author's first run
-//! (`first_per_author`) or as a run for a cool-down. Comments and DMs from any connected account
+//! (`first_per_author`), and a run that sent nothing does not start a cool-down. An item
+//! that never finished while the team was paused (a crash) is still taken up by the sweep once
+//! automations are switched on again. Comments and DMs from any connected account
 //! on the same network, of any team, never run automations (a loop guard).
 //!
 //! `tag_contact`, an action and a step, sends nothing: it adds a tag to the contact of the
@@ -107,7 +109,7 @@ fn auto_bucket(automation: Uuid) -> String {
 
 /// Skips that never ran: they leave the author's first run and a cool-down alone.
 const NOT_RAN: &str = "NOT (r.status = 'skipped' AND r.reason IN ('paused', 'cooldown', \
-    'automation_cap'))";
+    'automation_cap', 'daily_cap'))";
 
 /// `cooldown_minutes` and `daily_cap` as the API takes them: 1 minute to 30 days, 1 to 500.
 pub fn limits_ok(cooldown_minutes: Option<u32>, daily_cap: Option<u32>) -> bool {
@@ -1361,6 +1363,21 @@ async fn claim(
         );
         txn.execute_raw(held).await?;
     }
+    // Shared lock on the team row: switching the pause on waits for a claim in progress, and a
+    // claim after it sees the pause, so nothing starts once the owner was told all stopped.
+    let held = sql(
+        "SELECT automations_paused_at IS NOT NULL AS paused FROM teams WHERE id = $1 FOR SHARE",
+        vec![a.team_id.into()],
+    );
+    let paused: bool = match txn.query_one_raw(held).await? {
+        Some(r) => r.try_get("", "paused")?,
+        None => false,
+    };
+    if paused {
+        skip_run(&txn, a, item, "paused").await?;
+        txn.commit().await?;
+        return Ok(None);
+    }
     if gate.once {
         let taken = sql(
             &format!(
@@ -1385,7 +1402,7 @@ async fn claim(
             "SELECT EXISTS (SELECT 1 FROM automation_runs r \
              JOIN inbox_items i ON i.id = r.inbox_item_id \
              WHERE r.automation_id = $1 AND i.author_id = $2 AND i.platform = $3 \
-             AND i.id <> $4 AND r.status <> 'skipped' \
+             AND i.id <> $4 AND (r.status <> 'skipped' OR r.results @> '[{\"status\": \"sent\"}]') \
              AND r.created_at > now() - make_interval(mins => $5)) AS hot",
             vec![
                 a.id.into(),

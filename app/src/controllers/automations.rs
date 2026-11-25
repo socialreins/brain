@@ -113,14 +113,17 @@ pub struct AutomationInput {
     /// Not with `steps` (`422 invalid_fallback`).
     #[serde(default)]
     pub fallback_public_reply: Option<String>,
-    /// One person may start it at most once in this many minutes, 1 to 43200 (30 days). A run
-    /// that sent nothing does not count. Absent or null: no limit (`422 invalid_limits`).
-    #[serde(default)]
-    pub cooldown_minutes: Option<u32>,
-    /// At most this many runs start in a rolling day, 1 to 500. Absent or null: only the
-    /// team's daily cap.
-    #[serde(default)]
-    pub daily_cap: Option<u32>,
+    /// One person may start it at most once in this many minutes, 1 to 43200 (30 days); a
+    /// skipped run that sent nothing does not count (`422 invalid_limits`). Null: no limit.
+    /// Absent: no limit on create, unchanged on `PUT`.
+    #[serde(default, deserialize_with = "super::teams::present")]
+    #[schema(value_type = Option<u32>)]
+    pub cooldown_minutes: Option<Option<u32>>,
+    /// At most this many runs start in a rolling day, 1 to 500. Null: only the team's daily
+    /// cap. Absent as `cooldown_minutes`.
+    #[serde(default, deserialize_with = "super::teams::present")]
+    #[schema(value_type = Option<u32>)]
+    pub daily_cap: Option<Option<u32>>,
 }
 
 fn yes() -> bool {
@@ -217,7 +220,7 @@ async fn checked(
     let Some(name) = team::name(&input.name) else {
         return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name")));
     };
-    if !rules::limits_ok(input.cooldown_minutes, input.daily_cap) {
+    if !rules::limits_ok(input.cooldown_minutes.flatten(), input.daily_cap.flatten()) {
         return Ok(Err(reply(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_limits",
@@ -419,8 +422,8 @@ async fn create(
             actions: Set(serde_json::json!(input.actions.unwrap_or_default())),
             steps: Set(input.steps.map(|s| serde_json::json!(s))),
             fallback_public_reply: Set(input.fallback_public_reply),
-            cooldown_minutes: Set(input.cooldown_minutes.map(|m| m as i32)),
-            daily_cap: Set(input.daily_cap.map(|c| c as i32)),
+            cooldown_minutes: Set(input.cooldown_minutes.flatten().map(|m| m as i32)),
+            daily_cap: Set(input.daily_cap.flatten().map(|c| c as i32)),
             created_by: Set(Some(t.current.0.id)),
             ..Default::default()
         };
@@ -512,20 +515,25 @@ async fn update(
                 automations::Column::FallbackPublicReply,
                 input.fallback_public_reply.into(),
             )
-            .col_expr(
-                automations::Column::CooldownMinutes,
-                input.cooldown_minutes.map(|m| m as i32).into(),
-            )
-            .col_expr(
-                automations::Column::DailyCap,
-                input.daily_cap.map(|c| c as i32).into(),
-            )
             .filter(automations::Column::Id.eq(id))
             .filter(automations::Column::TeamId.eq(t.team.id))
             .exec(&txn)
             .await?;
         if done.rows_affected == 0 {
             return Ok(Err(not_found()));
+        }
+        // Absent keeps the limit a client that does not know them would otherwise drop.
+        for (column, value) in [
+            (automations::Column::CooldownMinutes, input.cooldown_minutes),
+            (automations::Column::DailyCap, input.daily_cap),
+        ] {
+            if let Some(value) = value {
+                automations::Entity::update_many()
+                    .col_expr(column, value.map(|v| v as i32).into())
+                    .filter(automations::Column::Id.eq(id))
+                    .exec(&txn)
+                    .await?;
+            }
         }
         let a = switch(&txn, t.team.id, id, input.active).await?;
         txn.commit().await?;

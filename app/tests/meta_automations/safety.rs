@@ -164,3 +164,112 @@ async fn limits_are_checked() {
         assert_eq!(res.json::<serde_json::Value>()["error"], "invalid_limits");
     }
 }
+
+#[tokio::test]
+async fn two_items_by_one_person_at_once_start_one_run() {
+    let e = env().await;
+    let a = e
+        .automation(reply_all(json!({"cooldown_minutes": 60})))
+        .await;
+    let (one, two) = tokio::join!(
+        e.item("comment", "777", "hi", 0),
+        e.item("comment", "777", "hi", 0)
+    );
+    let sent = [&one, &two]
+        .into_iter()
+        .map(|i| i.id)
+        .map(|id| e.run(&a, id));
+    let runs = futures_util::future::join_all(sent).await;
+    let statuses: Vec<_> = runs.into_iter().map(|r| r.unwrap().0).collect();
+    assert_eq!(
+        statuses.iter().filter(|s| *s == "sent").count(),
+        1,
+        "{statuses:?}"
+    );
+    assert_eq!(e.mock.to("/comments").len(), 1);
+}
+
+#[tokio::test]
+async fn a_skip_that_never_ran_leaves_the_first_comment_and_the_cool_down_alone() {
+    let e = env().await;
+    let a = e
+        .automation(reply_all(json!({"conditions": {"first_per_author": true},
+            "cooldown_minutes": 60, "daily_cap": 1})))
+        .await;
+    let first = e.item("comment", "1", "hi", 0).await;
+    assert_eq!(e.run(&a, first.id).await.unwrap().0, "sent");
+    // Another person meets the automation's own cap, which also shows when the team's day is
+    // used up too: the automation's reason wins.
+    e.sql(&format!(
+        "INSERT INTO rate_limit_hits (bucket) SELECT '{}' FROM generate_series(1, 500)",
+        automations::quota_bucket(e.team)
+    ))
+    .await;
+    let capped = e.item("comment", "2", "hi", 0).await;
+    let (_, reason) = e.run(&a, capped.id).await.unwrap();
+    assert_eq!(reason.as_deref(), Some("automation_cap"));
+    // Room again: person 2 is still new to the automation, so their next comment is a first.
+    e.sql("DELETE FROM rate_limit_hits WHERE bucket LIKE 'automation:%'")
+        .await;
+    let again = e.item("comment", "2", "hi again", 0).await;
+    assert_eq!(e.run(&a, again.id).await.unwrap().0, "sent");
+}
+
+#[tokio::test]
+async fn a_put_without_limits_keeps_them_and_null_clears_them() {
+    let e = env().await;
+    let a = e
+        .automation(reply_all(json!({"cooldown_minutes": 30, "daily_cap": 5})))
+        .await;
+    let put = |body: serde_json::Value| async {
+        let mut body = reply_all(body);
+        body["conditions"] = json!({"account_ids": [e.account.id]});
+        let res =
+            e.s.put(&format!("/v1/automations/{a}"))
+                .add_header("origin", WEB)
+                .add_header("cookie", e.cookie.clone())
+                .json(&body)
+                .await;
+        assert_eq!(res.status_code(), 200, "{}", res.text());
+        res.json::<serde_json::Value>()
+    };
+    let kept = put(json!({"name": "Renamed"})).await;
+    assert_eq!(
+        (kept["cooldown_minutes"].clone(), kept["daily_cap"].clone()),
+        (json!(30), json!(5))
+    );
+    let cleared = put(json!({"cooldown_minutes": null})).await;
+    assert_eq!(
+        (
+            cleared["cooldown_minutes"].clone(),
+            cleared["daily_cap"].clone()
+        ),
+        (json!(null), json!(5))
+    );
+}
+
+#[tokio::test]
+async fn a_test_reports_that_the_team_is_paused() {
+    let e = env().await;
+    let body = |_: ()| {
+        let mut automation = reply_all(json!({}));
+        automation["conditions"] = json!({"account_ids": [e.account.id]});
+        json!({"automation": automation,
+            "sample": {"account_id": e.account.id, "text": "hi", "author_name": "Ada"}})
+    };
+    let res = e.post("/v1/automations/test", body(())).await;
+    assert_eq!(res.json::<serde_json::Value>()["blocks"], json!([]));
+    e.patch("/v1/team", json!({"automations_paused": true}))
+        .await;
+    let res = e.post("/v1/automations/test", body(())).await;
+    assert_eq!(res.json::<serde_json::Value>()["blocks"], json!(["paused"]));
+}
+
+#[tokio::test]
+async fn an_author_id_on_another_network_is_not_one_of_our_accounts() {
+    let e = env().await;
+    let a = e.automation(reply_all(json!({}))).await;
+    new_account(&e.state, &e.db, e.team, "bluesky", "5551").await;
+    let i = e.item("comment", "5551", "hello", 0).await;
+    assert_eq!(e.run(&a, i.id).await.unwrap().0, "sent");
+}
