@@ -24,10 +24,11 @@ use super::{
     waitlist::{error, Error},
 };
 use crate::{
+    automation_misses::{self, Miss, Verdict},
     automations::{self as rules, Action, ActionResult, Conditions, Step},
     dry_run::{self, Outcome, Sample},
     inbox,
-    models::{automation_runs, automations, social_accounts, team_user, teams},
+    models::{automation_runs, automations, inbox_items, social_accounts, team_user, teams},
     state::AppState,
 };
 
@@ -42,8 +43,8 @@ pub struct Automation {
     pub active: bool,
     /// When it was last switched on; items received before that never run it.
     pub activated_at: DateTime<FixedOffset>,
-    /// `button_clicked`, `comment_received`, `dm_received`, `mention_received`, `new_follower`
-    /// or `story_reply`.
+    /// `button_clicked`, `comment_received`, `dm_received`, `like_received`,
+    /// `mention_received`, `new_follower`, `repost_received` or `story_reply`.
     pub trigger: String,
     pub conditions: Conditions,
     /// Empty for a flow.
@@ -92,9 +93,14 @@ pub struct ReasonCount {
 pub struct AutomationInput {
     /// 1 to 60 characters after trimming.
     pub name: String,
-    /// `button_clicked`, `comment_received`, `dm_received`, `mention_received`, `new_follower`
-    /// or `story_reply` (see `Conditions` for the conditions each takes). `reply_publicly`, a
-    /// fallback reply and `{page}` are for `comment_received` and `mention_received` only.
+    /// `button_clicked`, `comment_received`, `dm_received`, `like_received`,
+    /// `mention_received`, `new_follower`, `repost_received` or `story_reply` (see `Conditions`
+    /// for the conditions each takes). `reply_publicly`, a fallback reply and `{page}` are for
+    /// `comment_received` and `mention_received` only. `like_received` and `repost_received` (a
+    /// like or repost of one of the account's posts, Bluesky only) take the scope and
+    /// `post_remote_ids`, and only the actions that are no message and no tag: `follow_back`,
+    /// `notify_team`, `assign` and `stop_automations`. `like_comment` (Facebook, Bluesky) and
+    /// `repost_comment` (Bluesky) are for `comment_received` and `mention_received`.
     pub trigger: String,
     #[serde(default)]
     pub conditions: Conditions,
@@ -857,7 +863,12 @@ async fn test(
     }
     let TestInput { automation, sample } = input;
     let text = sample.text.trim();
-    if text.is_empty() || text.chars().count() > dry_run::MAX_SAMPLE_CHARS {
+    // A follow, like or repost carries no text.
+    let textless = matches!(
+        automation.trigger.as_str(),
+        "new_follower" | "like_received" | "repost_received"
+    );
+    if (text.is_empty() && !textless) || text.chars().count() > dry_run::MAX_SAMPLE_CHARS {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_sample");
     }
     let sample = Sample {
@@ -917,9 +928,76 @@ async fn test(
     }
 }
 
+#[derive(Serialize, ToSchema)]
+pub struct MissList {
+    /// Newest first, at most 50, kept 14 days.
+    pub misses: Vec<Miss>,
+}
+
+/// Recent items this automation was not run on, with why: the conditions that failed
+/// (`wrong_set`, `wrong_account`, `wrong_post`, `no_keyword`, `not_first_from_author`,
+/// `not_first_message`, `button_not_named` and the time, language and link conditions),
+/// `not_yet_on` (switched on after the item came), `followed_before` (a follower it welcomed
+/// already), `no_public_page` and `stopped_by_other` (an earlier automation on the item stops the
+/// others). Items for another trigger, or another account or set, are left out. Items it was held
+/// back on for a safety reason (paused, cool-down, caps) are in `runs`, skipped, with that
+/// reason. `GET /inbox-items/{id}/automations` has all of them for one item.
+#[utoipa::path(get, path = "/automations/{id}/misses", tag = "automations",
+    params(("id" = Uuid, Path)),
+    responses((status = 200, body = MissList), (status = 401, body = Error),
+        (status = 404, body = Error)))]
+async fn misses(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> Response {
+    let found = async {
+        if find(&app.db, t.team.id, id).await?.is_none() {
+            return Ok(None);
+        }
+        let misses = automation_misses::for_automation(&app.db, t.team.id, id).await?;
+        Ok::<_, DbErr>(Some(MissList { misses }))
+    };
+    match found.await {
+        Ok(Some(l)) => Json(l).into_response(),
+        Ok(None) => not_found(),
+        Err(e) => internal(e, "automation misses"),
+    }
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct VerdictList {
+    /// Oldest automation first; only those that were on when the item came and have a run or a
+    /// recorded reason.
+    pub automations: Vec<Verdict>,
+}
+
+/// What each automation did with an inbox item: `ran`, `failed` or `skipped` (a run, with its
+/// reason) or `not_matched` (with the codes of why). Kept 14 days after the item.
+#[utoipa::path(get, path = "/inbox-items/{id}/automations", tag = "automations",
+    params(("id" = Uuid, Path)),
+    responses((status = 200, body = VerdictList), (status = 401, body = Error),
+        (status = 404, body = Error)))]
+async fn item_verdicts(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> Response {
+    let found = async {
+        let item = inbox_items::Entity::find_by_id(id)
+            .filter(inbox_items::Column::TeamId.eq(t.team.id))
+            .one(&app.db)
+            .await?;
+        if item.is_none() {
+            return Ok(None);
+        }
+        let automations = automation_misses::for_item(&app.db, t.team.id, id).await?;
+        Ok::<_, DbErr>(Some(VerdictList { automations }))
+    };
+    match found.await {
+        Ok(Some(l)) => Json(l).into_response(),
+        Ok(None) => not_found(),
+        Err(e) => internal(e, "item automations"),
+    }
+}
+
 pub fn api() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(test))
+        .routes(routes!(misses))
+        .routes(routes!(item_verdicts))
         .routes(routes!(list, create))
         .routes(routes!(show, update, destroy))
         .routes(routes!(enable))

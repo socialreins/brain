@@ -27289,6 +27289,407 @@ mod teams {
                 );
             }
 
+            async fn me_id(s: &TestServer, cookie: &str) -> String {
+                let me = s.get("/auth/me").add_header("cookie", cookie).await;
+                me.json::<Value>()["id"].as_str().unwrap().to_owned()
+            }
+
+            async fn count_hits(db: &DatabaseConnection, bucket: String) -> i64 {
+                let stmt = sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DbBackend::Postgres,
+                    "SELECT count(*) AS n FROM rate_limit_hits WHERE bucket = $1",
+                    [bucket.into()],
+                );
+                let row = sea_orm::ConnectionTrait::query_one_raw(db, stmt).await;
+                row.unwrap().unwrap().try_get::<i64>("", "n").unwrap()
+            }
+
+            fn made(collection: &str, subject: &str) -> usize {
+                let same = |r: &&Value| {
+                    let to = &r["record"]["subject"];
+                    r["collection"] == collection && (to == subject || to["uri"] == subject)
+                };
+                RECORDS.lock().unwrap().iter().filter(same).count()
+            }
+
+            /// The activity item `kind` by `author` is stored once, found in the activity list.
+            async fn activity_item(s: &TestServer, cookie: &str, kind: &str) -> String {
+                let all = all_inbox(s, cookie).await;
+                let all_id = all["id"].as_str().unwrap();
+                let page = items(s, cookie, all_id, &format!("?kind={kind}")).await;
+                page["items"][0]["id"].as_str().unwrap().to_owned()
+            }
+
+            /// Likes and reposts of our posts run `like_received` and `repost_received` (optionally
+            /// for one post); follow back, notify, assign and a flow of them act once per item and
+            /// take a hit each; what did not match is logged with why.
+            #[tokio::test]
+            #[serial]
+            async fn likes_and_reposts_run_automations_and_the_misses_say_why() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
+                let uid = me_id(&s, &cookie).await;
+                let root = format!("at://{me}/app.bsky.feed.post/root");
+                let other = format!("at://{me}/app.bsky.feed.post/other");
+                for (body, code) in [
+                    // A like has no post of its own to like or repost, and nothing to reply under.
+                    (
+                        json!({"trigger": "like_received", "actions": [{"type": "like_comment"}]}),
+                        "invalid_actions",
+                    ),
+                    (
+                        json!({"trigger": "new_follower", "actions": [{"type": "repost_comment"}]}),
+                        "invalid_actions",
+                    ),
+                    (
+                        json!({"trigger": "like_received",
+                            "actions": [{"type": "reply_publicly", "text": "x"}]}),
+                        "invalid_actions",
+                    ),
+                    // A stop alone does nothing; each action once; an assignee must be a member.
+                    (
+                        json!({"trigger": "like_received", "actions": [{"type": "stop_automations"}]}),
+                        "invalid_actions",
+                    ),
+                    (
+                        json!({"trigger": "like_received",
+                            "actions": [{"type": "follow_back"}, {"type": "follow_back"}]}),
+                        "invalid_actions",
+                    ),
+                    (
+                        json!({"trigger": "like_received", "actions": [
+                            {"type": "assign", "user_id": uuid::Uuid::now_v7()}]}),
+                        "invalid_actions",
+                    ),
+                    // A like has no text to look in, and is never an author's "first comment".
+                    (
+                        json!({"trigger": "like_received", "conditions": {"keywords": ["x"]},
+                            "actions": [{"type": "follow_back"}]}),
+                        "invalid_conditions",
+                    ),
+                    (
+                        json!({"trigger": "repost_received",
+                            "conditions": {"first_per_author": true},
+                            "actions": [{"type": "follow_back"}]}),
+                        "invalid_conditions",
+                    ),
+                    (
+                        json!({"trigger": "repost_received", "steps": [{"type": "like_comment"}]}),
+                        "invalid_steps",
+                    ),
+                    (
+                        json!({"trigger": "like_received", "steps": [
+                            {"type": "stop_automations"}, {"type": "wait", "minutes": 5}]}),
+                        "invalid_steps",
+                    ),
+                ] {
+                    let mut body = body;
+                    body["name"] = json!("x");
+                    let res = req(&s, Method::POST, "/v1/automations", &cookie)
+                        .json(&body)
+                        .await;
+                    assert_eq!(res.status_code(), 422, "{body}");
+                    assert_eq!(res.json::<Value>()["error"], code, "{body}");
+                }
+                let liked = automation(
+                    &s,
+                    &cookie,
+                    json!({"name": "Follow likers", "trigger": "like_received",
+                        "actions": [{"type": "follow_back"}, {"type": "notify_team"}]}),
+                )
+                .await;
+                let flowed = automation(
+                    &s,
+                    &cookie,
+                    json!({"name": "Assign likers", "trigger": "like_received", "steps": [
+                        {"type": "notify_team"},
+                        {"type": "assign", "user_id": uid}]}),
+                )
+                .await;
+                let reposted = automation(
+                    &s,
+                    &cookie,
+                    json!({"name": "Reposts of the other post", "trigger": "repost_received",
+                        "conditions": {"post_remote_ids": [other]},
+                        "actions": [{"type": "follow_back"}]}),
+                )
+                .await;
+                let on_root = automation(
+                    &s,
+                    &cookie,
+                    json!({"name": "Reposts of the root", "trigger": "repost_received",
+                        "conditions": {"post_remote_ids": [root]},
+                        "actions": [{"type": "assign", "user_id": uid}]}),
+                )
+                .await;
+                set_inbox(
+                    &me,
+                    json!({
+                        "notifications": [
+                            activity("repost", "did:plc:reposterxx", "rx1", &root, &at(-2)),
+                            activity("like", "did:plc:likerxx", "lx1", &root, &at(-1)),
+                        ],
+                        "convos": [], "messages": {},
+                    }),
+                );
+                ingest(&db, &state, &account).await;
+                ingest(&db, &state, &account).await;
+
+                let got = runs(&s, &cookie, &liked).await;
+                assert_eq!(got.len(), 1, "{got:?}");
+                assert_eq!(got[0]["status"], "sent", "{got:?}");
+                let kinds: Vec<_> = got[0]["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| (r["type"].clone(), r["status"].clone()))
+                    .collect();
+                assert_eq!(
+                    kinds,
+                    [
+                        (json!("follow_back"), json!("done")),
+                        (json!("notify_team"), json!("done"))
+                    ]
+                );
+                // Followed the liker, once, and the repost's author not (that automation is for
+                // the other post).
+                assert_eq!(made("app.bsky.graph.follow", "did:plc:likerxx"), 1);
+                assert_eq!(made("app.bsky.graph.follow", "did:plc:reposterxx"), 0);
+                let got = runs(&s, &cookie, &flowed).await;
+                assert_eq!(got.len(), 1, "{got:?}");
+                assert_eq!(got[0]["status"], "sent", "{got:?}");
+                assert_eq!(got[0]["step_index"], 1);
+                let like_id = activity_item(&s, &cookie, "like").await;
+                let item = fetch(&s, &cookie, &format!("/v1/inbox-items/{like_id}")).await;
+                assert_eq!(item["assigned_to"]["id"], uid);
+                // One hit for the first automation's run and one for the flow (its mail; an
+                // assignment goes to nobody outside, so it takes none, as the repost
+                // automation's only action); two notifications.
+                assert_eq!(
+                    count_hits(&db, format!("automation:team:{team_id}")).await,
+                    2
+                );
+                assert_eq!(
+                    count_hits(&db, format!("automation:notice:{team_id}")).await,
+                    2
+                );
+
+                // The repost: the automation for the other post says so, and the one for the
+                // root ran.
+                assert!(runs(&s, &cookie, &reposted).await.is_empty());
+                assert_eq!(runs(&s, &cookie, &on_root).await.len(), 1);
+                let miss = fetch(&s, &cookie, &format!("/v1/automations/{reposted}/misses")).await;
+                let list = miss["misses"].as_array().unwrap();
+                assert_eq!(list.len(), 1, "{miss}");
+                assert_eq!(list[0]["reasons"], json!(["wrong_post"]));
+                assert_eq!(
+                    (&list[0]["kind"], &list[0]["author"]),
+                    (&json!("repost"), &json!("Fan rx1"))
+                );
+                // The like automations were not for it: no list entry, a verdict on the item.
+                let none = fetch(&s, &cookie, &format!("/v1/automations/{liked}/misses")).await;
+                assert_eq!(none["misses"].as_array().unwrap().len(), 0, "{none}");
+                let repost_id = activity_item(&s, &cookie, "repost").await;
+                let v = fetch(
+                    &s,
+                    &cookie,
+                    &format!("/v1/inbox-items/{repost_id}/automations"),
+                )
+                .await;
+                let verdict = |id: &str| {
+                    v["automations"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|a| a["automation_id"] == id)
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                };
+                assert_eq!(verdict(&liked)["reasons"], json!(["wrong_trigger"]));
+                assert_eq!(verdict(&liked)["outcome"], "not_matched");
+                assert_eq!(verdict(&reposted)["reasons"], json!(["wrong_post"]));
+                assert_eq!(verdict(&on_root)["outcome"], "ran");
+                // Never over the team boundary.
+                let (stranger, ..) = owner(&s, &db).await;
+                let res = s
+                    .get(&format!("/v1/inbox-items/{repost_id}/automations"))
+                    .add_header("cookie", &stranger)
+                    .await;
+                assert_eq!(res.status_code(), 404);
+                let res = s
+                    .get(&format!("/v1/automations/{reposted}/misses"))
+                    .add_header("cookie", &stranger)
+                    .await;
+                assert_eq!(res.status_code(), 404);
+
+                // Switched off, an automation says nothing; after 14 days a miss goes.
+                exec(
+                    &db,
+                    "UPDATE automation_misses SET created_at = now() - interval '15 days' \
+                     WHERE reasons = ARRAY['wrong_post']",
+                )
+                .await;
+                socialreins_brain::automation_misses::prune(&db)
+                    .await
+                    .unwrap();
+                let miss = fetch(&s, &cookie, &format!("/v1/automations/{reposted}/misses")).await;
+                assert_eq!(miss["misses"].as_array().unwrap().len(), 0, "{miss}");
+            }
+
+            /// `like_comment` and `repost_comment` go through the inbox's own like and repost (a record
+            /// in the account's repo, a row in `inbox_actions`); `stop_automations` holds back the
+            /// automations after it on that item and says so.
+            #[tokio::test]
+            #[serial]
+            async fn comment_automations_like_repost_and_stop_the_others() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                let c1 = "at://did:plc:stopfan/app.bsky.feed.post/cstop";
+                let first = automation(
+                    &s,
+                    &cookie,
+                    json!({"name": "Like and repost", "trigger": "comment_received", "actions": [
+                        {"type": "like_comment"}, {"type": "repost_comment"}, {"type": "stop_automations"}]}),
+                )
+                .await;
+                let second = automation(
+                    &s,
+                    &cookie,
+                    json!({"name": "Never", "trigger": "comment_received",
+                        "actions": [{"type": "follow_back"}]}),
+                )
+                .await;
+                set_inbox(
+                    &me,
+                    json!({
+                        "notifications": [note("reply", "did:plc:stopfan", "cstop", "Love it stop", &at(-2), &me)],
+                        "convos": [], "messages": {},
+                        "posts": {c1: {"uri": c1}}, "profiles": {},
+                    }),
+                );
+                ingest(&db, &state, &account).await;
+                ingest(&db, &state, &account).await;
+                assert_eq!(made("app.bsky.feed.like", c1), 1);
+                assert_eq!(made("app.bsky.feed.repost", c1), 1);
+                assert_eq!(made("app.bsky.graph.follow", "did:plc:stopfan"), 0);
+                let got = runs(&s, &cookie, &first).await;
+                assert_eq!(got.len(), 1, "{got:?}");
+                let kinds: Vec<_> = got[0]["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| (r["type"].clone(), r["status"].clone()))
+                    .collect();
+                assert_eq!(
+                    kinds,
+                    [
+                        (json!("like_comment"), json!("done")),
+                        (json!("repost_comment"), json!("done")),
+                        (json!("stop_automations"), json!("done")),
+                    ]
+                );
+                assert_eq!(got[0]["status"], "sent");
+                assert!(runs(&s, &cookie, &second).await.is_empty());
+                let miss = fetch(&s, &cookie, &format!("/v1/automations/{second}/misses")).await;
+                assert_eq!(
+                    miss["misses"][0]["reasons"],
+                    json!(["stopped_by_other"]),
+                    "{miss}"
+                );
+                // Logged like a person's click, but by nobody.
+                let n = {
+                    let stmt = sea_orm::Statement::from_string(
+                        sea_orm::DbBackend::Postgres,
+                        format!(
+                            "SELECT count(*) AS n FROM inbox_actions WHERE team_id = \
+                             (SELECT team_id FROM social_accounts WHERE id = '{account}') \
+                             AND done_by IS NULL AND status = 'done' \
+                             AND action IN ('like', 'repost')"
+                        ),
+                    );
+                    let row = sea_orm::ConnectionTrait::query_one_raw(&db, stmt).await;
+                    row.unwrap().unwrap().try_get::<i64>("", "n").unwrap()
+                };
+                assert_eq!(n, 2);
+            }
+
+            /// "Test this automation" shows the new triggers and actions and does none of them.
+            #[tokio::test]
+            #[serial]
+            async fn testing_the_new_actions_does_nothing_and_says_what_would_happen() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, account, me) = owner(&s, &db).await;
+                let uid = me_id(&s, &cookie).await;
+                let root = format!("at://{me}/app.bsky.feed.post/root");
+                let sample = json!({"account_id": account, "text": "", "post_remote_id": root});
+                let try_it = |automation: Value, sample: Value| {
+                    let r = req(&s, Method::POST, "/v1/automations/test", &cookie);
+                    async move {
+                        let res = r
+                            .json(&json!({"automation": automation, "sample": sample}))
+                            .await;
+                        (res.status_code(), res.json::<Value>())
+                    }
+                };
+                let before = RECORDS.lock().unwrap().len();
+                let (status, out) = try_it(
+                    json!({"name": "t", "trigger": "like_received",
+                        "conditions": {"post_remote_ids": [root]},
+                        "actions": [{"type": "follow_back"}, {"type": "assign", "user_id": uid},
+                            {"type": "notify_team"}, {"type": "stop_automations"}]}),
+                    sample.clone(),
+                )
+                .await;
+                assert_eq!(status, 200, "{out}");
+                assert_eq!(out["matched"], true);
+                let steps: Vec<_> = out["steps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| {
+                        (
+                            p["type"].as_str().unwrap().to_owned(),
+                            p["status"].as_str().unwrap().to_owned(),
+                        )
+                    })
+                    .collect();
+                let would = |t: &str| (t.to_owned(), "would_do".to_owned());
+                assert_eq!(
+                    steps,
+                    [
+                        would("follow_back"),
+                        would("assign"),
+                        would("notify_team"),
+                        would("stop_automations")
+                    ]
+                );
+                // Another post: no match, and why.
+                let elsewhere = json!({"account_id": account, "text": "",
+                    "post_remote_id": format!("at://{me}/app.bsky.feed.post/else")});
+                let (_, out) = try_it(
+                    json!({"name": "t", "trigger": "repost_received",
+                        "conditions": {"post_remote_ids": [root]},
+                        "actions": [{"type": "follow_back"}]}),
+                    elsewhere,
+                )
+                .await;
+                assert_eq!(out["matched"], false);
+                assert_eq!(out["mismatches"], json!(["wrong_post"]));
+                // A comment: like and repost would go.
+                let (_, out) = try_it(
+                    json!({"name": "t", "trigger": "comment_received",
+                        "actions": [{"type": "like_comment"}, {"type": "repost_comment"}]}),
+                    json!({"account_id": account, "text": "hello"}),
+                )
+                .await;
+                assert_eq!(out["steps"][0]["status"], "would_do", "{out}");
+                assert_eq!(RECORDS.lock().unwrap().len(), before);
+                assert_eq!(
+                    count_hits(&db, format!("automation:notice:{team_id}")).await,
+                    0
+                );
+            }
+
             /// Acts on the real Bluesky test account's own posts only: a root post and a reply
             /// of its own, made here and deleted at the end. Never follows, blocks, mutes or
             /// reports anyone (those are only mocked). Needs BLUESKY_TEST_HANDLE and
