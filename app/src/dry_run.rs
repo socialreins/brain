@@ -46,7 +46,7 @@ pub struct Sample {
     /// For a `button_clicked` trigger: the payload of the button clicked.
     #[serde(default)]
     pub button_payload: Option<String>,
-    /// Bluesky only: whether the author could receive our DM (they follow the account, or allow
+    /// Bluesky and X: whether the author could receive our DM (they follow the account, or allow
     /// DMs from anyone). `false` shows what a refusal does: the DM is skipped `dm_not_allowed`
     /// and the fallback public reply takes its place. Default `true`.
     #[serde(default = "yes")]
@@ -601,8 +601,10 @@ async fn plan_send(
     // X stops an automation when the budget or the credits are used up, or the DM scope is
     // missing; the test says so as a run would.
     if account.provider == "x" {
-        if let Some(why) = x_automation::blocked(app, account).await.ok().flatten() {
-            return skipped(why);
+        match x_automation::blocked(app, account).await {
+            Ok(Some(why)) => return skipped(why),
+            Ok(None) => {}
+            Err(_) => return skipped("internal"),
         }
         if via == Via::Dm && !Granted::of(account.meta["scope"].as_str()).dms {
             return skipped("x_reconnect_required");

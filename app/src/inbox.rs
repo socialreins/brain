@@ -922,8 +922,12 @@ async fn send_inner(
     } else {
         send_bluesky(app, account, item, (via, text, skip)).await
     };
-    if x_auto && sent.is_ok() {
-        crate::x_automation::spent(&app.db, account.id).await?;
+    // Every write X took is counted against the account's budget, a person's too (which the
+    // budget never blocks); a failure to count is logged, as the reply is already out.
+    if account.provider == "x" && sent.is_ok() {
+        if let Err(e) = crate::x_automation::spent(&app.db, account.id).await {
+            tracing::error!(error = %e, item = %item.id, "x write not counted against the budget");
+        }
     }
     let remote_id = match sent {
         Ok(id) => id,

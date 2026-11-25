@@ -178,12 +178,15 @@ pub async fn blocked(
     })
 }
 
-/// Counts one write against the account's monthly budget, after X took it.
+/// Counts one write against the account's monthly budget, after X took it. A new month also
+/// ends a pause for the budget, as the poll does.
 pub async fn spent(db: &impl ConnectionTrait, account: Uuid) -> Result<(), DbErr> {
     let stmt = Statement::from_sql_and_values(
         DbBackend::Postgres,
         "UPDATE x_inbox SET spent_micros = (CASE WHEN period < \
          (date_trunc('month', now() AT TIME ZONE 'UTC'))::date THEN 0 ELSE spent_micros END) + $2, \
+         paused_reason = CASE WHEN paused_reason = 'budget' AND period < \
+         (date_trunc('month', now() AT TIME ZONE 'UTC'))::date THEN NULL ELSE paused_reason END, \
          period = (date_trunc('month', now() AT TIME ZONE 'UTC'))::date, updated_at = now() \
          WHERE social_account_id = $1",
         [account.into(), WRITE_MICROS.into()],

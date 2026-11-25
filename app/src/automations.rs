@@ -2794,6 +2794,29 @@ async fn ai_send(
     prompt: &str,
     reference: &str,
 ) -> ActionResult {
+    // X stops an automation that cannot pay a write before the model is paid for a text.
+    if account.provider == "x" {
+        let stopped = match crate::x_automation::blocked(app, account).await {
+            Ok(why) => why,
+            Err(e) => {
+                tracing::error!(error = %e, item = %item.id, "x budget not read");
+                Some("internal")
+            }
+        };
+        if let Some(why) = stopped {
+            let status = if why == "internal" {
+                "failed"
+            } else {
+                "skipped"
+            };
+            return ActionResult {
+                kind: kind.into(),
+                status: status.into(),
+                reason: Some(why.into()),
+                ..Default::default()
+            };
+        }
+    }
     let written = match ai_write(app, account, item, (kind, via, prompt), reference).await {
         Ok(w) => w,
         Err(ended) => return ended,

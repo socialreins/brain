@@ -1546,3 +1546,62 @@ async fn x_likes_hides_and_reposts_for_an_automation_and_counts_each_write() {
     assert_eq!(runs, vec![run("sent", None)]);
     assert_eq!(e.mock.seen("POST", "/2/users/1/retweets").len(), 2);
 }
+
+#[tokio::test]
+#[serial]
+async fn a_used_up_budget_stops_reactions_and_ai_before_they_cost_but_never_a_person() {
+    let e = env(ALL, false).await;
+    e.put(json!({"enabled": true, "budget_usd": 0.1}))
+        .await
+        .assert_status_ok();
+    e.sql(&format!(
+        "UPDATE x_inbox SET spent_micros = 100000 WHERE social_account_id = '{}'",
+        e.account
+    ))
+    .await;
+    *e.mock.ai.lock().unwrap() = "Thanks for writing".into();
+    let react = e
+        .automation(json!({"name": "React", "trigger": "comment_received", "actions": [{"type": "like_comment"}, {"type": "repost"}]}))
+        .await;
+    let ai = e
+        .automation(json!({"name": "Ai", "trigger": "comment_received", "actions": [{"type": "ai_reply_publicly", "prompt": "Thank them"}]}))
+        .await;
+    let item = e.arrive_as("comment", &who(), "hello").await;
+    // Nothing reached X and the model was never paid for.
+    assert_eq!(
+        e.mock.seen("POST", "/2/users/1/likes").len()
+            + e.mock.seen("POST", "/2/users/1/retweets").len(),
+        0
+    );
+    assert_eq!(e.mock.seen("POST", "/v1/messages").len(), 0);
+    assert_eq!(e.runs(&react).await, vec![run("skipped", Some("x_budget"))]);
+    assert_eq!(e.runs(&ai).await, vec![run("skipped", Some("x_budget"))]);
+    // A person's own reply is never held back by it, and is counted.
+    let res = e
+        .post(
+            &format!("/v1/inbox-items/{item}/reply"),
+            json!({"text": "hi"}),
+        )
+        .await;
+    assert_eq!(res.status_code(), 201, "{}", res.text());
+    let r =
+        e.db.query_one_raw(Statement::from_string(
+            DbBackend::Postgres,
+            format!(
+                "SELECT spent_micros FROM x_inbox WHERE social_account_id = '{}'",
+                e.account
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.try_get::<i64>("", "spent_micros").unwrap(), 115_000);
+    // A repost needs a post to repost: a DM trigger refuses it on save.
+    let dm = json!({"name": "x", "trigger": "dm_received", "actions": [{"type": "repost"}]});
+    assert_eq!(
+        e.req(Method::POST, "/v1/automations", dm)
+            .await
+            .status_code(),
+        422
+    );
+}
