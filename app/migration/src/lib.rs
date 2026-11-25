@@ -68,8 +68,8 @@ mod m20261225_000001_waitlist_name;
 mod m20261226_000001_pinterest;
 mod m20261230_000001_bluesky_inbox_retry;
 mod m20261230_000002_bluesky_activity_kinds;
-mod m20261231_000001_meta_synced;
 mod m20261230_000003_inbox_actions;
+mod m20261231_000001_meta_synced;
 
 pub struct Migrator;
 
