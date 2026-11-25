@@ -1,7 +1,7 @@
 //! Connected social accounts of the current team. Members list them; owners and admins connect,
 //! regroup and disconnect them. Tokens never leave brain: they are sealed at rest and absent from
 //! every response. Every account stays in the team's default set. OAuth providers connect in
-//! their own controllers (`threads.rs`, `meta.rs`, `linkedin.rs`, `youtube.rs`, `x.rs`) and save through `save_account`. The list takes an API
+//! their own controllers (`threads.rs`, `meta.rs`, `linkedin.rs`, `youtube.rs`, `x.rs`, `tiktok.rs`, `pinterest.rs`) and save through `save_account`. The list takes an API
 //! token too; a set token sees only its set's accounts, each showing that set alone.
 use std::collections::{HashMap, HashSet};
 
@@ -81,6 +81,12 @@ pub struct Connection {
     /// when unset, so what X reported decides.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    /// Pinterest: the board a pin goes to when its post names none (`PUT
+    /// /connections/{id}/pinterest`), and its name. Absent when none is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_board_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_board_name: Option<String>,
     /// `ok`; `expiring` when the token ends within 7 days and nothing renews it (the end is
     /// `token_expires_at`); `reconnect` when it expired or the platform refused it. Connect the
     /// account again (the provider's connect link) to clear either.
@@ -92,7 +98,7 @@ pub struct Connection {
 
 #[derive(Serialize, ToSchema)]
 pub struct Provider {
-    /// `bluesky`, `meta`, `threads`, `linkedin`, `x`, `tiktok` or `youtube`.
+    /// `bluesky`, `meta`, `threads`, `linkedin`, `x`, `tiktok`, `youtube` or `pinterest`.
     pub provider: String,
     /// Whether this install has the provider's app credentials; Bluesky needs none.
     pub configured: bool,
@@ -188,6 +194,8 @@ fn connection_json(a: social_accounts::Model, set_ids: Vec<Uuid>) -> Connection 
         long_posts: super::x::x_long_posts(&a.meta),
         detected_long_posts: a.meta["long_posts"].as_bool(),
         plan: a.meta["plan"].as_str().map(str::to_owned),
+        default_board_id: a.meta["default_board_id"].as_str().map(str::to_owned),
+        default_board_name: a.meta["default_board_name"].as_str().map(str::to_owned),
         set_ids,
         created_at: a.created_at,
     }

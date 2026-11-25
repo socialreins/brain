@@ -74,6 +74,7 @@ pub struct AppState {
     pub youtube: crate::connectors::youtube::YouTube,
     pub x: crate::connectors::x::X,
     pub tiktok: crate::connectors::tiktok::TikTok,
+    pub pinterest: crate::connectors::pinterest::Pinterest,
     /// The Meta app for connecting, and its two publishers.
     pub meta: crate::connectors::meta::Meta,
     pub facebook: crate::connectors::meta::Facebook,
@@ -132,6 +133,7 @@ impl AppState {
             youtube: config.youtube.clone(),
             x: config.x.clone(),
             tiktok: config.tiktok.clone(),
+            pinterest: config.pinterest.clone(),
             meta: config.meta.clone(),
             facebook: crate::connectors::meta::Facebook(config.meta.clone()),
             instagram: crate::connectors::meta::Instagram(config.meta.clone()),

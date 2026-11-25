@@ -27,6 +27,7 @@ use crate::{
         bluesky::{self, Bluesky},
         linkedin::{self, LinkedIn},
         meta::{self, Facebook, Instagram},
+        pinterest::{self, Pinterest},
         threads::{self, Threads},
         tiktok::{self, TikTok},
         x::{self, X},
@@ -166,6 +167,18 @@ pub trait Publisher: Send + Sync {
         body: &str,
         media: &[Attachment],
         _: &youtube::Options,
+    ) -> Result<Remote, PublishError> {
+        self.publish(account, secret, body, media, None).await
+    }
+
+    /// `publish` with the Pinterest settings the user chose for the post. Only Pinterest has any.
+    async fn publish_with_pinterest(
+        &self,
+        account: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        _: &pinterest::Options,
     ) -> Result<Remote, PublishError> {
         self.publish(account, secret, body, media, None).await
     }
@@ -689,6 +702,141 @@ impl Publisher for TikTok {
     }
 }
 
+impl Pinterest {
+    /// One pin on the board the post names, else the account's default: one JPEG or PNG image, 2
+    /// to 5 of them (a carousel), or one MP4 or MOV video. The post's body is the description.
+    /// `secret` is already renewed (`credential`). Pinterest takes one alt text for the pin: the
+    /// first one given, cut to its limit.
+    async fn pin(
+        &self,
+        account: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        options: &pinterest::Options,
+    ) -> Result<Remote, PublishError> {
+        let board = options
+            .board_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .or_else(|| account.meta["default_board_id"].as_str())
+            .ok_or_else(|| {
+                PublishError::Failed(
+                    "No board to pin to. Choose a board for this pin, or set the account's default board under Connections."
+                        .into(),
+                )
+            })?;
+        let image = |a: &Attachment| pinterest::IMAGE_TYPES.contains(&a.content_type.as_str());
+        let videos = media
+            .iter()
+            .filter(|a| a.content_type.starts_with("video/"));
+        let source = match (videos.count(), media) {
+            (1, [v]) if pinterest::VIDEO_TYPES.contains(&v.content_type.as_str()) => {
+                pinterest::Media::Video(&v.bytes, &v.content_type)
+            }
+            (0, [one]) if image(one) => pinterest::Media::Image(&one.url),
+            (0, many) if (2..=5).contains(&many.len()) && many.iter().all(image) => {
+                pinterest::Media::Carousel(many.iter().map(|a| a.url.as_str()).collect())
+            }
+            _ => {
+                return Err(PublishError::Failed(
+                    "A Pinterest pin needs one MP4 or MOV video, or 1 to 5 JPEG or PNG images."
+                        .into(),
+                ))
+            }
+        };
+        let mut alts = media.iter().map(|a| a.alt.trim()).filter(|a| !a.is_empty());
+        let alt = alts.next();
+        let notes = (alts.count() > 0)
+            .then_some("Pinterest takes one alt text for a pin, so only the first was used.")
+            .into_iter()
+            .chain(
+                alt.filter(|a| a.chars().count() > socialreins_core::post::PINTEREST_MAX_ALT)
+                    .map(|_| "The alt text was cut to Pinterest's limit of 500 characters."),
+            );
+        for note in notes {
+            let _ = crate::connectors::ALT_NOTES.try_with(|n| n.borrow_mut().push(note.to_owned()));
+        }
+        let alt: Option<String> = alt.map(|a| {
+            a.chars()
+                .take(socialreins_core::post::PINTEREST_MAX_ALT)
+                .collect()
+        });
+        let (title, link) = pinterest::title_and_link(options);
+        let pin = pinterest::Pin {
+            board_id: board,
+            title,
+            description: body.trim(),
+            link,
+            alt: alt.as_deref(),
+        };
+        let id = self.post(secret, &pin, &source).await?;
+        let url = pinterest::pin_url(&id);
+        Ok(Remote {
+            id,
+            cid: String::new(),
+            url,
+        })
+    }
+}
+
+#[async_trait]
+impl Publisher for Pinterest {
+    /// A post without Pinterest settings goes to the account's default board.
+    async fn publish(
+        &self,
+        account: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        _: Option<(&Remote, &Remote)>,
+    ) -> Result<Remote, PublishError> {
+        let options = pinterest::Options::default();
+        self.pin(account, secret, body, media, &options).await
+    }
+
+    async fn publish_with_pinterest(
+        &self,
+        account: &social_accounts::Model,
+        secret: &str,
+        body: &str,
+        media: &[Attachment],
+        options: &pinterest::Options,
+    ) -> Result<Remote, PublishError> {
+        self.pin(account, secret, body, media, options).await
+    }
+
+    async fn delete(
+        &self,
+        _: &social_accounts::Model,
+        secret: &str,
+        remote_id: &str,
+    ) -> Result<(), PublishError> {
+        self.delete_pin(secret, remote_id).await
+    }
+
+    fn url(&self, _: &social_accounts::Model, remote_id: &str) -> Option<String> {
+        pinterest::pin_url(remote_id)
+    }
+
+    fn name(&self) -> &'static str {
+        "Pinterest"
+    }
+
+    fn reconnect(&self) -> &'static str {
+        PINTEREST_RECONNECT
+    }
+
+    fn by_url(&self) -> bool {
+        true
+    }
+
+    fn timeout(&self) -> Duration {
+        pinterest::PUBLISH_TIMEOUT
+    }
+}
+
 #[async_trait]
 impl Publisher for Facebook {
     async fn publish(
@@ -872,6 +1020,7 @@ pub fn publisher<'a>(app: &'a AppState, platform: &str) -> Option<&'a dyn Publis
         "youtube" => Some(&app.youtube),
         "x" => Some(&app.x),
         "tiktok" => Some(&app.tiktok),
+        "pinterest" => Some(&app.pinterest),
         "facebook" => Some(&app.facebook),
         "instagram" => Some(&app.instagram),
         _ => None,
@@ -975,6 +1124,9 @@ pub const YOUTUBE_RECONNECT: &str = "Google refused the channel's token, or acce
                                       Reconnect the channel under Connections.";
 pub const TIKTOK_RECONNECT: &str = "TikTok refused the account's token, or access was removed. \
                                      Reconnect the account under Connections.";
+pub const PINTEREST_RECONNECT: &str =
+    "Pinterest refused the account's token, or access was removed. \
+                                        Reconnect the account under Connections.";
 pub const X_RECONNECT: &str = "X refused the account's token, or access was removed. \
                                Reconnect the account under Connections.";
 pub const META_RECONNECT: &str = "Meta refused the Page's token or a permission is missing. \
@@ -1034,6 +1186,9 @@ async fn read_credential(
     }
     if account.provider == "tiktok" {
         return crate::controllers::tiktok::fresh_token(app, account).await;
+    }
+    if account.provider == "pinterest" {
+        return crate::controllers::pinterest::fresh_token(app, account).await;
     }
     app.cipher
         .decrypt(&account.access_token)
@@ -1872,6 +2027,7 @@ async fn ingest(app: &AppState, post: &posts::Model) -> Media {
     let to_jpeg: &[&str] = match post.platform.as_str() {
         "instagram" => &["image/png", "image/webp"],
         "tiktok" => &["image/png"],
+        "pinterest" => &["image/webp"],
         _ => &[],
     };
     for (url, got) in found.iter_mut() {
@@ -2230,14 +2386,15 @@ pub async fn claim_target(db: &DatabaseConnection, id: Uuid) -> Result<bool, DbE
     Ok(db.execute_raw(stmt).await?.rows_affected() == 1)
 }
 
-/// What `send` posts: the body, the media links with their alt texts, and the cover, TikTok and
-/// YouTube settings.
+/// What `send` posts: the body, the media links with their alt texts, and the cover, TikTok,
+/// YouTube and Pinterest settings.
 type Content<'a> = (
     &'a str,
     (&'a [String], &'a [String]),
     Option<&'a Attachment>,
     Option<&'a tiktok::Options>,
     Option<&'a youtube::Options>,
+    Option<&'a pinterest::Options>,
 );
 
 /// One post (or thread part), its media read from storage, with its time limit; `Err` holds what
@@ -2247,7 +2404,7 @@ async fn send(
     publisher: &dyn Publisher,
     account: &social_accounts::Model,
     secret: &str,
-    (body, (media, alt), cover, tiktok, youtube): Content<'_>,
+    (body, (media, alt), cover, tiktok, youtube, pinterest): Content<'_>,
     reply: Option<(&Remote, &Remote)>,
 ) -> Result<(Remote, Option<String>), String> {
     let how = (publisher.by_url(), account.provider.as_str());
@@ -2268,23 +2425,28 @@ async fn send(
         }
     }
     let sent = async {
-        match (cover, tiktok, youtube) {
-            (Some(c), _, _) => {
+        match (cover, tiktok, youtube, pinterest) {
+            (Some(c), _, _, _) => {
                 publisher
                     .publish_with_cover(account, secret, body, &media, c)
                     .await
             }
-            (None, Some(t), _) => {
+            (None, Some(t), _, _) => {
                 publisher
                     .publish_with_tiktok(account, secret, body, &media, t)
                     .await
             }
-            (None, None, Some(y)) => {
+            (None, None, Some(y), _) => {
                 publisher
                     .publish_with_youtube(account, secret, body, &media, y)
                     .await
             }
-            (None, None, None) => {
+            (None, None, None, Some(p)) => {
+                publisher
+                    .publish_with_pinterest(account, secret, body, &media, p)
+                    .await
+            }
+            (None, None, None, None) => {
                 publisher
                     .publish(account, secret, body, &media, reply)
                     .await
@@ -2421,6 +2583,18 @@ async fn publish_target_held(
         Some(Ok(options)) => Some(options),
         None => None,
     };
+    let pinterest = match post
+        .pinterest
+        .clone()
+        .map(serde_json::from_value::<pinterest::Options>)
+    {
+        Some(Err(_)) => {
+            let msg = "The Pinterest settings of this post could not be read. Open the post, choose them again and save it.";
+            return fail_target(db, id, msg).await;
+        }
+        Some(Ok(options)) => Some(options),
+        None => None,
+    };
     let with = (app, stored);
     let in_call = cover.as_ref().filter(|_| publisher.cover_in_publish());
     // A retried thread goes on from the parts already out: its root and saved parts stay.
@@ -2475,6 +2649,7 @@ async fn publish_target_held(
                     in_call,
                     tiktok.as_ref(),
                     youtube.as_ref(),
+                    pinterest.as_ref(),
                 ),
                 None,
             )
@@ -2539,6 +2714,7 @@ async fn publish_target_held(
         let content = (
             part.body.as_str(),
             (part.media.as_slice(), part.media_alt.as_slice()),
+            None,
             None,
             None,
             None,

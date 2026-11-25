@@ -9,8 +9,8 @@ use socialreins_core::crypto::Cipher;
 
 use crate::{
     connectors::{
-        bluesky::Bluesky, google::Google, linkedin::LinkedIn, meta, threads::Threads,
-        tiktok::TikTok, x::X, youtube::YouTube,
+        bluesky::Bluesky, google::Google, linkedin::LinkedIn, meta, pinterest::Pinterest,
+        threads::Threads, tiktok::TikTok, x::X, youtube::YouTube,
     },
     mail::Mailer,
     media::Media,
@@ -22,13 +22,14 @@ const BLUESKY_APPVIEW: &str = "https://public.api.bsky.app";
 const PLC_DIRECTORY: &str = "https://plc.directory";
 
 /// Each OAuth provider and the env vars of its app; it is offered once both are set.
-const PROVIDER_APPS: [(&str, [&str; 2]); 6] = [
+const PROVIDER_APPS: [(&str, [&str; 2]); 7] = [
     ("meta", ["META_APP_ID", "META_APP_SECRET"]),
     ("threads", ["THREADS_APP_ID", "THREADS_APP_SECRET"]),
     ("linkedin", ["LINKEDIN_CLIENT_ID", "LINKEDIN_CLIENT_SECRET"]),
     ("x", ["X_CLIENT_ID", "X_CLIENT_SECRET"]),
     ("tiktok", ["TIKTOK_CLIENT_KEY", "TIKTOK_CLIENT_SECRET"]),
     ("youtube", ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"]),
+    ("pinterest", ["PINTEREST_APP_ID", "PINTEREST_APP_SECRET"]),
 ];
 
 /// No `Debug`: `database_url` carries a password.
@@ -111,6 +112,10 @@ pub struct Config {
     /// redirect URI `{BRAIN_URL}/connect/tiktok/callback`. Renewing a token needs them too;
     /// posting with a live one does not.
     pub tiktok: TikTok,
+    /// `PINTEREST_APP_ID` and `PINTEREST_APP_SECRET`: connecting Pinterest accounts, with the
+    /// redirect URI `{BRAIN_URL}/connect/pinterest/callback`. Renewing a token needs them too;
+    /// posting with a live one does not.
+    pub pinterest: Pinterest,
     /// `META_APP_ID` and `META_APP_SECRET`: connecting Facebook Pages and Instagram accounts,
     /// with the redirect URI `{BRAIN_URL}/connect/meta/callback`, on Graph API
     /// `META_GRAPH_VERSION` (default `v26.0`). Publishing with a stored Page token needs neither.
@@ -220,6 +225,7 @@ impl Config {
             youtube: YouTube::new(var("GOOGLE_CLIENT_ID").zip(var("GOOGLE_CLIENT_SECRET")))?,
             x: X::new(var("X_CLIENT_ID").zip(var("X_CLIENT_SECRET")))?,
             tiktok: TikTok::new(var("TIKTOK_CLIENT_KEY").zip(var("TIKTOK_CLIENT_SECRET")))?,
+            pinterest: Pinterest::new(var("PINTEREST_APP_ID").zip(var("PINTEREST_APP_SECRET")))?,
             meta: {
                 let mut meta = meta::Meta::new(
                     var("META_APP_ID").zip(var("META_APP_SECRET")),

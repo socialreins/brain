@@ -7,7 +7,7 @@ scheduling and publishing posts across platforms. For the project overview, road
 other repos, see the main repo [socialreins/socialreins](https://github.com/socialreins/socialreins).
 
 brain is the whole backend: sign-in (email link, passkey, Google), teams and invitations,
-connections to Facebook, Instagram, Threads, LinkedIn, Bluesky, X, TikTok and YouTube, and the
+connections to Facebook, Instagram, Threads, LinkedIn, Bluesky, X, TikTok, YouTube and Pinterest, and the
 workers that publish and schedule posts and take them down where the platform allows it. It serves the REST API under `/v1`, the
 MCP server at `/mcp` for AI assistants, and the waitlist behind the socialreins.com landing
 page. To install it or connect an assistant, start with the
@@ -94,6 +94,10 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | GET | `/v1/connections/{id}/tiktok` | What a connected TikTok account may post now (any member; a set token only for its set's account): `{"nickname","username","privacy_level_options","comment_disabled","duet_disabled","stitch_disabled","max_video_post_duration_sec","can_post","reason"}`, read live from TikTok's creator info. `can_post` false (a daily limit, a ban, the app's user cap, no level offered) comes with `reason`, still `200`. `409 reconnect_required` for a dead token, `502 tiktok_failed` when TikTok cannot be reached |
 | GET | `/connections/tiktok/redirect` | Like the Threads one: sends the browser to TikTok (scopes `user.info.basic,video.upload,video.publish`) to connect an account |
 | GET | `/connect/tiktok/callback` | Where TikTok sends the browser back (register `{BRAIN_URL}/connect/tiktok/callback` in the TikTok app); lands on `{WEB_URL}/app/connections?connected=tiktok` or `?connect_error=<code>&provider=tiktok` |
+| GET | `/v1/connections/{id}/pinterest/boards` | The boards of a connected Pinterest account (up to 1000; secret boards are not listed) and its default board, read live: `{"boards":[{"id","name","privacy"}],"default_board_id"}` (any member; a set token only for its set's account). `409 reconnect_required` for a dead token, `502 pinterest_failed` when Pinterest cannot be reached |
+| PUT | `/v1/connections/{id}/pinterest` | Sets the account's default board, the one a pin goes to when its post names none: `{"default_board_id": "..." \| null}` answers `{"default_board_id","default_board_name"}`. The board must be one of the account's (`422 invalid_board`). Owners and admins, web origin only |
+| GET | `/connections/pinterest/redirect` | Like the Threads one: sends the browser to Pinterest (scopes `boards:read,boards:write,pins:read,pins:write,user_accounts:read`) to connect an account |
+| GET | `/connect/pinterest/callback` | Where Pinterest sends the browser back (register `{BRAIN_URL}/connect/pinterest/callback` in the Pinterest app); lands on `{WEB_URL}/app/connections?connected=pinterest` or `?connect_error=<code>&provider=pinterest` |
 | GET | `/connections/meta/redirect` | Like the Threads one: sends the browser to Facebook Login for Pages and their linked Instagram accounts |
 | GET, POST | `/webhooks/meta` | Meta's webhook (register `{BRAIN_URL}/webhooks/meta` in the Meta app). `GET` is the subscribe handshake: `hub.mode=subscribe` and a `hub.verify_token` equal to `META_WEBHOOK_VERIFY_TOKEN` get `hub.challenge` back as plain text, else `403`; `404` while the variable is unset. `POST` needs `X-Hub-Signature-256` (HMAC-SHA256 of the raw body under `META_APP_SECRET`, `403` otherwise, `404` without the secret), takes at most 256 KiB, and answers `200` once the items are stored |
 | GET | `/connect/meta/callback` | Where Meta sends the browser back (register `{BRAIN_URL}/connect/meta/callback` in the Meta app); lands on `{WEB_URL}/app/connections?pick=meta` when there is something to pick, `?connected=meta` when not, or `?connect_error=<code>&provider=meta` |
@@ -106,11 +110,11 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | PATCH, DELETE | `/v1/social-sets/{id}` | Rename (`{"name"}`, the default set too); delete (sign-in from the last 10 minutes, not the default set), restorable for 30 days. Owner, admin |
 | POST | `/v1/social-sets/{id}/restore` | Restore a set deleted in the last 30 days, with its accounts (owner, admin) |
 | GET, PUT | `/v1/social-sets/{id}/queue` | The set's posting queue: `{"time_zone","slots":[{"weekday","time"}],"next"}` (weekday 0 is Sunday, `time` is `HH:MM` in the IANA `time_zone`, `UTC` until saved; `next` is the next 10 slot times with no `scheduled` post of the set). `PUT {"time_zone","slots"}` replaces both (any member): `422 invalid_time_zone`, `invalid_slot`, `duplicate_slot`, `too_many_slots` (over 50). A slot missing on a spring-forward day is skipped, an ambiguous fall-back one is its first occurrence |
-| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&group_id=&approval=&repeat=&from=&to=` on `scheduled_at`, `approval` being `pending`, `approved` or `rejected`, `repeat=true` the posts with a repeat rule; the default set's id gives every set's posts), or create one (`{"social_set_id","platform":"bluesky","account_ids":[ids],"body","media":[urls],"thread":[{"body","media"}],"first_comment","cover","tiktok","youtube","scheduled_at","queue"}`; any member). `"queue": true` instead of `scheduled_at` schedules it at the earliest free slot of the set's queue, picked under a lock per set so two calls never share one (`422 queue_with_scheduled_at` with both, `422 queue_empty` without slots; `PUT` answers `422 queue_not_supported`). `first_comment`: see "First comment" below; `cover`: see "Video cover"; `tiktok`: see "TikTok settings"; `youtube`: see YouTube below. `thread`: up to 25 follow-up posts, each a reply to the one before and checked like the post (`422 {"error","part"}` names a bad one); `?validate_only=true` checks without creating (see "Validate only"); each part is saved on its target as it goes out, a target whose part fails is `failed` naming it with the parts before it kept, and a takedown deletes the parts last first, then the root |
+| GET, POST | `/v1/posts` | The current team's posts (`?social_set_id=&status=&group_id=&approval=&repeat=&from=&to=` on `scheduled_at`, `approval` being `pending`, `approved` or `rejected`, `repeat=true` the posts with a repeat rule; the default set's id gives every set's posts), or create one (`{"social_set_id","platform":"bluesky","account_ids":[ids],"body","media":[urls],"thread":[{"body","media"}],"first_comment","cover","tiktok","youtube","pinterest","scheduled_at","queue"}`; any member). `"queue": true` instead of `scheduled_at` schedules it at the earliest free slot of the set's queue, picked under a lock per set so two calls never share one (`422 queue_with_scheduled_at` with both, `422 queue_empty` without slots; `PUT` answers `422 queue_not_supported`). `first_comment`: see "First comment" below; `cover`: see "Video cover"; `tiktok`: see "TikTok settings"; `youtube`: see YouTube below; `pinterest`: see Pinterest below. `thread`: up to 25 follow-up posts, each a reply to the one before and checked like the post (`422 {"error","part"}` names a bad one); `?validate_only=true` checks without creating (see "Validate only"); each part is saved on its target as it goes out, a target whose part fails is `failed` naming it with the parts before it kept, and a takedown deletes the parts last first, then the root |
 | GET, PUT, DELETE | `/v1/posts/{id}` | One post with its `targets`; replace a `draft` or `scheduled` one; delete (`204` for draft or scheduled, `200` after taking a published one down, `422 takedown_failed` with a `message`, `409` for queued or failed) |
 | GET, PUT | `/v1/posts/{id}/page` | The post's public page, one per post or per group: `{"enabled","details","code","live"}` (`code` is `null` before the first save, `live` says whether the public route serves it now). `PUT {"enabled","details"}` saves it whatever the post's status and makes the permanent 10-character `code` the first time: `422 details_too_long` over 5000 characters, `422 public_pages_off` for `enabled: true` while the team has public pages off |
 | GET | `/v1/public/pages/{code}` | Public, no sign-in: `{"team","body","media","thread","details","published_at","links":[{"platform","url"}]}` from the first published post of the page, `links` from every published target. `404` unless the page is enabled, its team has public pages on and a post of it is `published`. `Cache-Control: public, max-age=60`; 120 requests a minute per IP |
-| POST | `/v1/post-groups` | One post per platform of a set in one call (`{"social_set_id","platforms","account_ids","body","media","scheduled_at","queue","list_id","position","thread","first_comment","cover","tiktok","youtube","overrides":{"<platform>":{"body","media","thread","first_comment","cover","tiktok","youtube"}}}`; `platforms` defaults to those brain publishes to with a connected account; bodies up to 64 KiB): `201 {"group_id","posts","skipped"}`; `"queue": true` puts the whole group at one free slot of the queue; an invalid post creates nothing and its error names the `platform`, unless `"on_invalid":"skip"` (see "Validate only"). `?validate_only=true` checks without creating |
+| POST | `/v1/post-groups` | One post per platform of a set in one call (`{"social_set_id","platforms","account_ids","body","media","scheduled_at","queue","list_id","position","thread","first_comment","cover","tiktok","youtube","pinterest","overrides":{"<platform>":{"body","media","thread","first_comment","cover","tiktok","youtube","pinterest"}}}`; `platforms` defaults to those brain publishes to with a connected account; bodies up to 64 KiB): `201 {"group_id","posts","skipped"}`; `"queue": true` puts the whole group at one free slot of the queue; an invalid post creates nothing and its error names the `platform`, unless `"on_invalid":"skip"` (see "Validate only"). `?validate_only=true` checks without creating |
 | POST | `/v1/posts/{id}/publish` | Publish a draft or scheduled post now: `202` with the post `queued`; poll it for the result. `403 approval_required` for a member while the team requires approval, unless the post is `approved`, and for anyone when the post is `rejected`. An owner's, admin's or token's publish of a `pending` post approves it |
 | POST | `/v1/posts/{id}/metrics/refresh` | Read the post's metrics from its platforms now: `200` with the post. At most once a minute per post (`429 refreshed_recently`); a post with nothing to read comes back as it is. Any member or a token that is not read-only. See "Analytics" |
 | GET | `/v1/analytics` | Metrics of the posts published in a range of UTC days (`?social_set_id=&from=YYYY-MM-DD&to=YYYY-MM-DD`, default the last 30 days, at most 366): `{"supported":[..],"totals":{"posts","likes","comments","shares","views"},"by_platform":[{"platform","posts","likes","comments","shares","views","supported"}],"by_day":[{"date","posts","likes","comments","shares","views"}],"top_posts":[..]}`. Any member, read-only tokens too; `422 invalid_range`. See "Analytics" |
@@ -626,6 +630,57 @@ id is the publish id; the permalink is `https://www.tiktok.com/@{username}/video
 video is public. TikTok gives apps no way to delete a post, so a take down fails with a message
 that says to delete it in the TikTok app and the post stays `published`.
 
+Pinterest (when `PINTEREST_APP_ID` and `PINTEREST_APP_SECRET` are set) connects an account through
+the same OAuth checks as Threads, with its own redirect URI
+`{BRAIN_URL}/connect/pinterest/callback`, state and cookie (`sr_pinterest`, scoped to
+`/connect/pinterest`). The callback swaps the code at `POST api.pinterest.com/v5/oauth/token`
+(HTTP Basic with the app id and secret, `continuous_refresh=true`), needs the refresh token and
+the scopes `boards:read`, `pins:read`, `pins:write` and `user_accounts:read` (error code
+`missing_scopes` when one is missing; `pinterest_failed` besides the Threads codes), reads
+`GET /v5/user_account` (id, username, name, picture) and saves a `pinterest` account
+(`external_id` is Pinterest's id) in the team's default set. Pinterest lists `boards:write` beside
+the others for creating a pin, so brain asks for it; brain never creates or changes a board. The
+access token lasts 30 days, the refresh token 60 days from the last refresh: a token with under an
+hour left is renewed before a call under a lock on the account row (the refresh token Pinterest
+sends back is saved in the same transaction), and a daily job renews every account with 10 days or
+less left, so an account nobody posts to does not lose its refresh token. A refused refresh, or a
+`401`, flags the account for a reconnect.
+
+**Pinterest settings.** A Pinterest post is a pin: the body is the description (at most 800
+characters), the media 1 to 5 JPEG or PNG images (2 or more make a carousel; a WebP is turned
+into a JPEG) or one MP4 or MOV video, never both (`media_required` without any; no threads, first
+comment or cover). The post may carry `pinterest`: `{"board_id","title","link"}` (saved as
+`posts.pinterest`, returned on the post): `board_id` is one of the account's boards
+(`GET /v1/connections/{id}/pinterest/boards`), else the account's default board (`PUT
+/v1/connections/{id}/pinterest`, kept across a reconnect); `title` at most 100 characters
+(`pinterest_title_too_long`); `link` an http or https address of at most 2048 characters
+(`invalid_pinterest_link`); a board id that is not digits is `invalid_pinterest_board`. A post
+with no board named, for a set that holds a Pinterest account with no default board, is
+`422 pinterest_board_required` naming that `social_account_id`. The pin's alt text is the first
+non-blank alt text of its images, cut to Pinterest's 500 characters (a pin has one: a second
+text, or the cut, is noted in the target's `alt_error`). Other platforms answer
+`pinterest_not_supported`. A group takes `pinterest` for its Pinterest post only, with an override
+(`overrides.pinterest.pinterest`). Feeds cannot post to Pinterest (an item has no image).
+
+Images are not uploaded: Pinterest downloads each from brain's unguessable `/media/` links
+(`image_url`, or `multiple_image_urls` for a carousel), in the `POST /v5/pins` call. A video is
+registered (`POST /v5/media`), uploaded as a form to the storage address Pinterest names (a
+streamed file read from brain's store, no bearer token sent there), asked about
+(`GET /v5/media/{id}`) every three seconds for up to four minutes until it is processed, then
+pinned (`media_source` `video_id`, with a cover taken from the first second); a video that is
+still processing then fails the target with nothing posted. The saved id is the pin id and the
+permalink `https://www.pinterest.com/pin/{id}/`. A take down is `DELETE /v5/pins/{id}` (a pin
+already gone counts as down). A `429` fails the target as "nothing was posted" and so gets the
+one automatic retry; a `403` naming a scope asks for a reconnect.
+
+Pinterest has no comment or message API brain can poll, so there is no inbox or automation for
+it. **Access tiers.** A new Pinterest app has Trial access, which is not live: every pin or board
+it creates is only visible to the account that made it, and a Trial app may make 1,000 requests a
+day and 300 writes (pin creates and deletes) a day in all, for every user of the app. Standard
+access (an upgrade request with a screen recording of the OAuth flow and a pin made through the
+app) makes pins public and limits writes to 100 a minute per user. Brain's calls are the same in
+both; only Pinterest's rules differ.
+
 X (when `X_CLIENT_ID` and `X_CLIENT_SECRET` are set) connects an account through the same OAuth
 checks as Threads (state cookie `sr_x`, scoped to `/connect/x`), as a confidential Web App client
 with PKCE. The app needs User authentication settings with read and write permission and the
@@ -974,6 +1029,7 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET` | no | Both to connect LinkedIn profiles (redirect URI `{BRAIN_URL}/connect/linkedin/callback`). Publishing with connected accounts needs neither |
 | `X_CLIENT_ID`, `X_CLIENT_SECRET` | no | Both to connect X accounts (a Web App client, redirect URI `{BRAIN_URL}/connect/x/callback`). Publishing with a live token needs neither, renewing one does |
 | `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET` | no | Connect TikTok accounts (redirect URI `{BRAIN_URL}/connect/tiktok/callback`) |
+| `PINTEREST_APP_ID`, `PINTEREST_APP_SECRET` | no | Both to connect Pinterest accounts (redirect URI `{BRAIN_URL}/connect/pinterest/callback`). Publishing with a live token needs neither, renewing one does |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | no | Both or neither. Turn on Google sign-in (OAuth client of type Web application, redirect URI `{BRAIN_URL}/auth/google/callback`). They also turn on connecting YouTube channels (add the redirect URI `{BRAIN_URL}/connect/youtube/callback` to the same client) |
 | `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | no | Both or neither. Turn on a Cloudflare Turnstile captcha: `POST /auth/link` and `/v1/contact` then need a `turnstile_token`. Off when unset |
 | `ADMIN_EMAILS` | no | Comma-separated emails, any case, whose signed-in users may use the admin console, `/v1/admin/*` (and get `is_admin: true` from `/auth/me`). None when unset |

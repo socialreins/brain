@@ -3,6 +3,7 @@ pub mod bluesky;
 pub mod google;
 pub mod linkedin;
 pub mod meta;
+pub mod pinterest;
 pub mod threads;
 pub mod tiktok;
 pub mod x;

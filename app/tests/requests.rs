@@ -4459,7 +4459,16 @@ mod teams {
                 .collect();
             assert_eq!(
                 names,
-                ["bluesky", "meta", "threads", "linkedin", "x", "tiktok", "youtube"]
+                [
+                    "bluesky",
+                    "meta",
+                    "threads",
+                    "linkedin",
+                    "x",
+                    "tiktok",
+                    "youtube",
+                    "pinterest"
+                ]
             );
             assert_eq!(body[0]["configured"], true);
             // The web origin check on a state-changing route.
@@ -15483,6 +15492,1057 @@ mod teams {
                         .await;
                     assert_eq!(res.status_code(), 409, "{}", res.text());
                     res.assert_json(&json!({"error": "reconnect_required"}));
+                }
+            }
+
+            /// Pinterest: the connect flow, pins of one image, a carousel or a video against a mock
+            /// of API v5, boards and the default board, token renewal, and take down.
+            mod pinterest_api {
+                use super::threads_api::{location, set_role};
+                use super::*;
+                use axum::{
+                    body::Bytes,
+                    extract::{Form, Path, Query},
+                    http::{HeaderMap, StatusCode},
+                    routing::{delete, get, post},
+                    Json, Router,
+                };
+                use base64::engine::general_purpose::STANDARD;
+                use socialreins_brain::connectors::pinterest::Pinterest;
+                use std::sync::atomic::{AtomicU64, Ordering};
+
+                const ALL: &str =
+                    "boards:read boards:write pins:read pins:write user_accounts:read";
+
+                /// Every `POST /pins` body, newest last.
+                static PINS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+                /// Every token request form, newest last.
+                static FORMS: std::sync::Mutex<Vec<HashMap<String, String>>> =
+                    std::sync::Mutex::new(Vec::new());
+                /// The bearer of every call that needs one, newest last.
+                static BEARERS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                /// Every video upload: (form field names, bytes of the request).
+                static UPLOADS: std::sync::Mutex<Vec<(Vec<String>, usize)>> =
+                    std::sync::Mutex::new(Vec::new());
+                static DELETED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                static REFRESHES: AtomicU64 = AtomicU64::new(0);
+                static MEDIA_CHECKS: AtomicU64 = AtomicU64::new(0);
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                /// 0: pins work, 1: Pinterest refuses the scope, 2: it limits the rate, 3: a
+                /// video never finishes processing.
+                static MODE: AtomicU64 = AtomicU64::new(0);
+
+                type Answer = (StatusCode, Json<Value>);
+
+                fn refused(status: StatusCode, message: &str) -> Answer {
+                    (status, Json(json!({"code": 29, "message": message})))
+                }
+
+                fn bearer_ok(h: &HeaderMap) -> bool {
+                    let bearer = h.get("authorization").and_then(|v| v.to_str().ok());
+                    BEARERS
+                        .lock()
+                        .unwrap()
+                        .push(bearer.unwrap_or_default().to_owned());
+                    matches!(bearer, Some("Bearer pn" | "Bearer pnrefreshed"))
+                }
+
+                fn expired() -> Answer {
+                    refused(StatusCode::UNAUTHORIZED, "Authentication failed.")
+                }
+
+                fn jpeg() -> ([(&'static str, &'static str); 1], Vec<u8>) {
+                    let mut bytes = vec![7u8; 64];
+                    bytes[..4].copy_from_slice(b"\xFF\xD8\xFF\xE0");
+                    ([("content-type", "image/jpeg")], bytes)
+                }
+
+                /// The newest pin made with this description: other posts due in the shared
+                /// database may publish too, so a test finds its own.
+                fn sent_pin(description: &str) -> Value {
+                    let pins = PINS.lock().unwrap();
+                    pins.iter()
+                        .rev()
+                        .find(|p| p["description"] == description)
+                        .cloned()
+                        .expect("a pin with that description")
+                }
+
+                /// Pinterest (token endpoint, profile, boards, pins, media), plus JPEGs and an
+                /// MP4. Code `good` gives a token with every scope, `noscope` one without
+                /// `pins:write`, `norefresh` no refresh token.
+                async fn mock_pinterest() -> String {
+                    MODE.store(0, Ordering::SeqCst);
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let base = format!("http://{}", listener.local_addr().unwrap());
+                    let upload_url = format!("{base}/upload");
+                    let token = |h: HeaderMap, Form(f): Form<HashMap<String, String>>| async move {
+                        let want = format!("Basic {}", STANDARD.encode("pid:psecret"));
+                        let app =
+                            h.get("authorization").and_then(|v| v.to_str().ok()) == Some(&want);
+                        FORMS.lock().unwrap().push(f.clone());
+                        let get = |k: &str| f.get(k).map(String::as_str).unwrap_or_default();
+                        let code = (get("grant_type"), get("code"), get("refresh_token"));
+                        let good = |scope: &str, refresh: Option<&str>| {
+                            let mut v = json!({"access_token": "pn", "token_type": "bearer",
+                                "expires_in": 2592000, "scope": scope});
+                            if let Some(r) = refresh {
+                                v["refresh_token"] = json!(r);
+                            }
+                            (StatusCode::OK, Json(v))
+                        };
+                        match (app, code) {
+                            (true, ("authorization_code", "good", _)) => {
+                                good(ALL, Some("prefresh"))
+                            }
+                            (true, ("authorization_code", "noscope", _)) => {
+                                good("boards:read pins:read user_accounts:read", Some("prefresh"))
+                            }
+                            (true, ("authorization_code", "norefresh", _)) => good(ALL, None),
+                            (true, ("refresh_token", _, "prefresh")) => {
+                                REFRESHES.fetch_add(1, Ordering::SeqCst);
+                                (
+                                    StatusCode::OK,
+                                    Json(json!({"access_token": "pnrefreshed",
+                                        "expires_in": 2592000, "refresh_token": "prefresh2",
+                                        "scope": ALL})),
+                                )
+                            }
+                            (true, ("refresh_token", _, "prefresh2")) => {
+                                REFRESHES.fetch_add(1, Ordering::SeqCst);
+                                (
+                                    StatusCode::OK,
+                                    Json(json!({"access_token": "pnrefreshed",
+                                        "expires_in": 2592000, "scope": ALL})),
+                                )
+                            }
+                            _ => refused(StatusCode::BAD_REQUEST, "Invalid grant."),
+                        }
+                    };
+                    let user = |h: HeaderMap| async move {
+                        if !bearer_ok(&h) {
+                            return expired();
+                        }
+                        (
+                            StatusCode::OK,
+                            Json(json!({"id": "1001", "username": "annpins",
+                                "business_name": "Ann Pins", "account_type": "BUSINESS",
+                                "profile_image": "https://i.pinimg.com/ann.jpg"})),
+                        )
+                    };
+                    let boards = |h: HeaderMap, Query(q): Query<HashMap<String, String>>| async move {
+                        if !bearer_ok(&h) {
+                            return expired();
+                        }
+                        let page = if q.get("bookmark").map(String::as_str) == Some("more") {
+                            json!({"items": [{"id": "333", "name": "Third", "privacy": "PUBLIC"}]})
+                        } else {
+                            json!({"items": [
+                                {"id": "111", "name": "Recipes", "privacy": "PUBLIC"},
+                                {"id": "222", "name": "Travel", "privacy": "PROTECTED"}],
+                                "bookmark": "more"})
+                        };
+                        (StatusCode::OK, Json(page))
+                    };
+                    let board = |h: HeaderMap, Path(id): Path<String>| async move {
+                        if !bearer_ok(&h) {
+                            return expired();
+                        }
+                        match id.as_str() {
+                            "111" => (
+                                StatusCode::OK,
+                                Json(json!({"id": "111", "name": "Recipes", "privacy": "PUBLIC"})),
+                            ),
+                            "222" => (
+                                StatusCode::OK,
+                                Json(
+                                    json!({"id": "222", "name": "Travel", "privacy": "PROTECTED"}),
+                                ),
+                            ),
+                            _ => refused(StatusCode::NOT_FOUND, "Board not found."),
+                        }
+                    };
+                    let pin = |h: HeaderMap, Json(body): Json<Value>| async move {
+                        if !bearer_ok(&h) {
+                            return expired();
+                        }
+                        PINS.lock().unwrap().push(body);
+                        match MODE.load(Ordering::SeqCst) {
+                            1 => refused(StatusCode::FORBIDDEN, "Missing the pins:write scope."),
+                            2 => refused(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded."),
+                            _ => {
+                                let n = NEXT.fetch_add(1, Ordering::SeqCst);
+                                (StatusCode::CREATED, Json(json!({"id": format!("80{n}")})))
+                            }
+                        }
+                    };
+                    let unpin = |h: HeaderMap, Path(id): Path<String>| async move {
+                        if !bearer_ok(&h) {
+                            return (StatusCode::UNAUTHORIZED, Json(Value::Null));
+                        }
+                        DELETED.lock().unwrap().push(id.clone());
+                        if id == "999" {
+                            return (
+                                StatusCode::NOT_FOUND,
+                                Json(json!({"code": 2, "message": "gone"})),
+                            );
+                        }
+                        (StatusCode::NO_CONTENT, Json(Value::Null))
+                    };
+                    let register = move |h: HeaderMap, Json(body): Json<Value>| {
+                        let url = upload_url.clone();
+                        async move {
+                            if !bearer_ok(&h) || body["media_type"] != "video" {
+                                return expired();
+                            }
+                            MEDIA_CHECKS.store(0, Ordering::SeqCst);
+                            (
+                                StatusCode::CREATED,
+                                Json(json!({"media_id": "77", "media_type": "video",
+                                    "upload_url": url,
+                                    "upload_parameters": {"key": "k1", "policy": "p1",
+                                        "Content-Type": "video/mp4"}})),
+                            )
+                        }
+                    };
+                    let media = |h: HeaderMap, Path(id): Path<String>| async move {
+                        if !bearer_ok(&h) || id != "77" {
+                            return expired();
+                        }
+                        let n = MEDIA_CHECKS.fetch_add(1, Ordering::SeqCst);
+                        let status = match (MODE.load(Ordering::SeqCst), n) {
+                            (3, _) => "processing",
+                            (_, 0) => "registered",
+                            (_, 1) => "processing",
+                            _ => "succeeded",
+                        };
+                        (
+                            StatusCode::OK,
+                            Json(json!({"media_id": "77", "status": status})),
+                        )
+                    };
+                    let upload = |h: HeaderMap, body: Bytes| async move {
+                        // No bearer: the address is Pinterest's storage, not its API.
+                        assert!(h.get("authorization").is_none());
+                        let text = String::from_utf8_lossy(&body).into_owned();
+                        let names = text
+                            .split("form-data; name=\"")
+                            .skip(1)
+                            .filter_map(|p| p.split('"').next())
+                            .map(str::to_owned)
+                            .collect();
+                        UPLOADS.lock().unwrap().push((names, body.len()));
+                        StatusCode::NO_CONTENT
+                    };
+                    let mut mp4 = vec![0u8; 256];
+                    mp4[..12].copy_from_slice(b"\0\0\0\x18ftypisom");
+                    let app = Router::new()
+                        .route("/oauth/token", post(token))
+                        .route("/user_account", get(user))
+                        .route("/boards", get(boards))
+                        .route("/boards/{id}", get(board))
+                        .route("/pins", post(pin))
+                        .route("/pins/{id}", delete(unpin))
+                        .route("/media", post(register))
+                        .route("/media/{id}", get(media))
+                        .route("/upload", post(upload))
+                        .route("/a.jpg", get(|| async { jpeg() }))
+                        .route("/b.jpg", get(|| async { jpeg() }))
+                        .route("/c.jpg", get(|| async { jpeg() }))
+                        .route("/img.gif", get(|| async { image("image/gif", 64) }))
+                        .route("/photo.png", get(|| async { real_png() }))
+                        .route(
+                            "/clip.mp4",
+                            get(move || async move { ([("content-type", "video/mp4")], mp4) }),
+                        );
+                    tokio::spawn(async move { axum::serve(listener, app).await });
+                    base
+                }
+
+                /// A brain with Pinterest set up on the mock, its state, and the mock.
+                async fn on_pinterest(
+                    configured: bool,
+                ) -> (TestServer, DatabaseConnection, AppState, String) {
+                    let base = mock_pinterest().await;
+                    let mut config = Config::from_env().expect("test config");
+                    config.trust_proxy = true;
+                    let app = configured.then(|| ("pid".to_owned(), "psecret".to_owned()));
+                    let mut p = Pinterest::new(app).unwrap();
+                    p.api_url = base.clone();
+                    p.poll_every = std::time::Duration::from_millis(5);
+                    config.pinterest = p;
+                    let disk = object_store::local::LocalFileSystem::new_with_prefix(media_dir())
+                        .unwrap()
+                        .with_automatic_cleanup(true);
+                    config.media = Media::new(std::sync::Arc::new(disk), true);
+                    let db = socialreins_brain::connect(&config)
+                        .await
+                        .expect("database reachable");
+                    let state = AppState::new(db.clone(), &config);
+                    let app = controllers::router(state.clone(), &config);
+                    (TestServer::new(app).unwrap(), db, state, base)
+                }
+
+                /// Starts a connect: (state, `sr_pinterest=...`).
+                async fn begin(s: &TestServer, cookie: &str) -> (String, String) {
+                    let res = s
+                        .get("/connections/pinterest/redirect")
+                        .add_header("cookie", cookie)
+                        .await;
+                    let (to, q) = location(&res);
+                    assert!(to.starts_with("https://www.pinterest.com/oauth/?"), "{to}");
+                    assert_eq!(q["client_id"], "pid");
+                    assert_eq!(q["response_type"], "code");
+                    assert_eq!(
+                        q["redirect_uri"],
+                        "http://localhost:8080/connect/pinterest/callback"
+                    );
+                    assert_eq!(
+                        q["scope"],
+                        "boards:read,boards:write,pins:read,pins:write,user_accounts:read"
+                    );
+                    let set = res
+                        .iter_headers_by_name("set-cookie")
+                        .map(|v| v.to_str().unwrap().to_owned())
+                        .find(|c| c.starts_with("sr_pinterest="))
+                        .unwrap();
+                    assert!(set.contains("HttpOnly") && set.contains("Path=/connect/pinterest"));
+                    (
+                        q["state"].clone(),
+                        set.split(';').next().unwrap().to_owned(),
+                    )
+                }
+
+                /// Pinterest's redirect back: where it lands, as `(connected, connect_error)`.
+                async fn finish(
+                    s: &TestServer,
+                    cookies: &str,
+                    query: &str,
+                ) -> (Option<String>, Option<String>) {
+                    let res = s
+                        .get(&format!("/connect/pinterest/callback?{query}"))
+                        .add_header("cookie", cookies)
+                        .await;
+                    let (to, q) = location(&res);
+                    assert!(
+                        to.starts_with("http://localhost:3000/app/connections?"),
+                        "{to}"
+                    );
+                    if q.contains_key("connect_error") {
+                        assert_eq!(q["provider"], "pinterest");
+                    }
+                    (q.get("connected").cloned(), q.get("connect_error").cloned())
+                }
+
+                async fn connect_with(s: &TestServer, cookie: &str, code: &str) {
+                    let (state, flow) = begin(s, cookie).await;
+                    let both = format!("{cookie}; {flow}");
+                    let got = finish(s, &both, &format!("code={code}&state={state}")).await;
+                    assert_eq!(got, (Some("pinterest".into()), None));
+                }
+
+                async fn pinterest_account(
+                    db: &DatabaseConnection,
+                    team_id: &str,
+                ) -> social_accounts::Model {
+                    social_accounts::Entity::find()
+                        .filter(
+                            social_accounts::Column::TeamId
+                                .eq(team_id.parse::<uuid::Uuid>().unwrap()),
+                        )
+                        .filter(social_accounts::Column::Provider.eq("pinterest"))
+                        .one(db)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                }
+
+                /// Sets the account's access token and the seconds it has left.
+                async fn set_token(db: &DatabaseConnection, account: uuid::Uuid, secs: i64) {
+                    let row = social_accounts::ActiveModel {
+                        id: Set(account),
+                        access_token: Set(cipher().encrypt(b"old")),
+                        token_expires_at: Set(Some(
+                            (Utc::now() + Duration::seconds(secs)).fixed_offset(),
+                        )),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(row).exec(db).await.unwrap();
+                }
+
+                fn pin_post(set: &str, body: &str, media: &[&str]) -> Value {
+                    let mut v = input(set, body, Some(&past()));
+                    v["platform"] = json!("pinterest");
+                    v["media"] = json!(media
+                        .iter()
+                        .map(|m| format!("https://a.example{m}"))
+                        .collect::<Vec<_>>());
+                    v
+                }
+
+                async fn put_default(
+                    s: &TestServer,
+                    cookie: &str,
+                    id: &str,
+                    board: Value,
+                ) -> axum_test::TestResponse {
+                    req(
+                        s,
+                        Method::PUT,
+                        &format!("/v1/connections/{id}/pinterest"),
+                        cookie,
+                    )
+                    .json(&json!({ "default_board_id": board }))
+                    .await
+                }
+
+                /// A connected team with default board 111: (server, db, state, mock base, cookie,
+                /// team id, set id).
+                async fn team() -> (
+                    TestServer,
+                    DatabaseConnection,
+                    AppState,
+                    String,
+                    String,
+                    String,
+                    String,
+                ) {
+                    let (s, db, state, base) = on_pinterest(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    connect_with(&s, &cookie, "good").await;
+                    let id = pinterest_account(&db, &team_id).await.id.to_string();
+                    let res = put_default(&s, &cookie, &id, json!("111")).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let set = default_set(&db, &team_id).await.to_string();
+                    (s, db, state, base, cookie, team_id, set)
+                }
+
+                /// Saves a pin of the mock's files with `extra` merged in and publishes it: the post.
+                async fn publish_with(
+                    s: &TestServer,
+                    (db, state, base): (&DatabaseConnection, &AppState, &str),
+                    (cookie, set): (&str, &str),
+                    (body, paths): (&str, &[&str]),
+                    extra: Value,
+                ) -> Value {
+                    let mut post = pin_post(set, body, paths);
+                    for (k, v) in extra.as_object().into_iter().flatten() {
+                        post[k] = v.clone();
+                    }
+                    let res = create(s, cookie, post).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let id = id_of(&res);
+                    set_media(db, base, &id, paths).await;
+                    publish::tick(state).await.unwrap();
+                    get_post(s, cookie, &id).await
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connect_saves_the_account_and_a_sealed_refresh_token() {
+                    let (s, db, _, _) = on_pinterest(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team_id = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    let (state, flow) = begin(&s, &cookie).await;
+                    let both = format!("{cookie}; {flow}");
+                    let query = format!("code=good&state={state}");
+                    let res = s
+                        .get(&format!("/connect/pinterest/callback?{query}"))
+                        .add_header("cookie", &both)
+                        .await;
+                    let (_, q) = location(&res);
+                    assert_eq!(q["connected"], "pinterest");
+                    // Pinterest was asked for the refresh token that renews with use.
+                    let form = FORMS.lock().unwrap().last().cloned().unwrap();
+                    assert_eq!(form["continuous_refresh"], "true");
+                    assert_eq!(form["grant_type"], "authorization_code");
+                    assert_eq!(
+                        form["redirect_uri"],
+                        "http://localhost:8080/connect/pinterest/callback"
+                    );
+                    let cookies: Vec<String> = res
+                        .iter_headers_by_name("set-cookie")
+                        .map(|v| v.to_str().unwrap().to_owned())
+                        .collect();
+                    assert_eq!(cookies.len(), 1, "{cookies:?}");
+                    assert!(cookies[0].starts_with("sr_pinterest=;"), "{cookies:?}");
+
+                    let listed = list(&s, &cookie).await;
+                    assert_eq!(listed.len(), 1);
+                    let a = &listed[0];
+                    assert_eq!(a["provider"], "pinterest");
+                    assert_eq!(a["external_id"], "1001");
+                    assert_eq!(a["handle"], "annpins");
+                    assert_eq!(a["display_name"], "Ann Pins");
+                    assert_eq!(a["avatar_url"], "https://i.pinimg.com/ann.jpg");
+                    assert_eq!(a["status"], "ok");
+                    assert!(a.get("default_board_id").is_none());
+                    let set = default_set(&db, &team_id).await.to_string();
+                    assert_eq!(a["set_ids"], json!([set]));
+                    assert!(a.get("access_token").is_none() && !a.to_string().contains("prefresh"));
+                    let row = pinterest_account(&db, &team_id).await;
+                    assert_eq!(cipher().decrypt(&row.access_token).unwrap(), b"pn");
+                    let sealed = row.meta["refresh_token"].as_str().unwrap();
+                    assert!(!sealed.contains("prefresh"));
+                    let plain = cipher()
+                        .decrypt(&URL_SAFE_NO_PAD.decode(sealed).unwrap())
+                        .unwrap();
+                    assert_eq!(plain, b"prefresh");
+                    // The state works once, and a reconnect keeps the one row and its default board.
+                    assert_eq!(
+                        finish(&s, &both, &query).await,
+                        (None, Some("expired".into()))
+                    );
+                    let id = a["id"].as_str().unwrap();
+                    let res = put_default(&s, &cookie, id, json!("222")).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    connect_with(&s, &cookie, "good").await;
+                    let again = list(&s, &cookie).await;
+                    assert_eq!(again.len(), 1);
+                    assert_eq!(again[0]["id"], a["id"]);
+                    assert_eq!(again[0]["default_board_id"], "222");
+                    assert_eq!(again[0]["default_board_name"], "Travel");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connect_refuses_strangers_members_and_installs_without_the_app() {
+                    let (s, db, _, _) = on_pinterest(true).await;
+                    let (_, cookie, user_id) = user(&s, &db).await;
+                    let back = |res: axum_test::TestResponse| location(&res).1;
+                    let res = s.get("/connections/pinterest/redirect").await;
+                    assert_eq!(back(res)["connect_error"], "unauthorized");
+                    let (state, flow) = begin(&s, &cookie).await;
+                    set_role(&db, user_id, "member").await;
+                    let both = format!("{cookie}; {flow}");
+                    let q = format!("code=good&state={state}");
+                    assert_eq!(finish(&s, &both, &q).await, (None, Some("expired".into())));
+                    assert!(list(&s, &cookie).await.is_empty());
+
+                    // Without PINTEREST_APP_ID and PINTEREST_APP_SECRET connect says so.
+                    let (s, db, _, _) = on_pinterest(false).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let res = s
+                        .get("/connections/pinterest/redirect")
+                        .add_header("cookie", &cookie)
+                        .await;
+                    assert_eq!(back(res)["connect_error"], "not_configured");
+                    let providers = s
+                        .get("/v1/connections/providers")
+                        .add_header("cookie", &cookie)
+                        .await
+                        .json::<Vec<Value>>();
+                    let me = providers.iter().find(|p| p["provider"] == "pinterest");
+                    assert_eq!(me.unwrap()["configured"], false);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn connects_that_go_wrong_land_with_a_code_and_save_nothing() {
+                    let (s, db, _, _) = on_pinterest(true).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    for (q, want) in [
+                        ("error=access_denied", "cancelled"),
+                        ("code=bad", "pinterest_failed"),
+                        ("code=norefresh", "pinterest_failed"),
+                        ("code=noscope", "missing_scopes"),
+                    ] {
+                        let (state, flow) = begin(&s, &cookie).await;
+                        let both = format!("{cookie}; {flow}");
+                        let got = finish(&s, &both, &format!("{q}&state={state}")).await;
+                        assert_eq!(got, (None, Some(want.into())), "{q}");
+                    }
+                    assert!(list(&s, &cookie).await.is_empty());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn boards_are_listed_across_pages_and_a_default_is_set_and_cleared() {
+                    let (s, db, _, _, cookie, team_id, _) = team().await;
+                    let id = pinterest_account(&db, &team_id).await.id.to_string();
+                    let res = s
+                        .get(&format!("/v1/connections/{id}/pinterest/boards"))
+                        .add_header("cookie", &cookie)
+                        .await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let got = res.json::<Value>();
+                    let names: Vec<&str> = got["boards"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|b| b["name"].as_str().unwrap())
+                        .collect();
+                    assert_eq!(names, ["Recipes", "Travel", "Third"]);
+                    assert_eq!(got["default_board_id"], "111");
+                    assert!(!got.to_string().contains("pn\""));
+
+                    // A board that is not the account's is refused, and nothing changes.
+                    let res = put_default(&s, &cookie, &id, json!("424242")).await;
+                    assert_eq!(res.status_code(), 422, "{}", res.text());
+                    assert_eq!(res.json::<Value>()["error"], "invalid_board");
+                    let row = pinterest_account(&db, &team_id).await;
+                    assert_eq!(row.meta["default_board_id"], "111");
+                    // Blank or null removes it.
+                    let res = put_default(&s, &cookie, &id, Value::Null).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let row = pinterest_account(&db, &team_id).await;
+                    assert!(row.meta.get("default_board_id").is_none());
+                    assert!(row.meta["refresh_token"].is_string());
+                    // A member may read the boards but not change the default.
+                    let (member, _) = joined(&s, &db, &team_id, "member").await;
+                    let res = put_default(&s, &member, &id, json!("111")).await;
+                    assert_eq!(res.status_code(), 403, "{}", res.text());
+                    let res = s
+                        .get(&format!("/v1/connections/{id}/pinterest/boards"))
+                        .add_header("cookie", &member)
+                        .await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    // The same call for an account that is not Pinterest's is not found.
+                    let res = s
+                        .get(&format!(
+                            "/v1/connections/{}/pinterest/boards",
+                            uuid::Uuid::now_v7()
+                        ))
+                        .add_header("cookie", &cookie)
+                        .await;
+                    assert_eq!(res.status_code(), 404);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn an_image_pin_goes_to_the_named_board_with_title_link_and_alt_text() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let ctx = (&db, &state, base.as_str());
+                    let extra = json!({"pinterest": {"board_id": "222", "title": "  Lisbon in a day ",
+                        "link": "https://a.example/lisbon"},
+                        "media_alt": ["A tram on a hill"]});
+                    let p = publish_with(
+                        &s,
+                        ctx,
+                        (&cookie, &set),
+                        (" Trip notes ", &["/a.jpg"]),
+                        extra,
+                    )
+                    .await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(p["pinterest"]["board_id"], "222");
+                    let sent = sent_pin("Trip notes");
+                    assert_eq!(sent["board_id"], "222");
+                    assert_eq!(sent["title"], "Lisbon in a day");
+                    assert_eq!(sent["description"], "Trip notes");
+                    assert_eq!(sent["link"], "https://a.example/lisbon");
+                    assert_eq!(sent["alt_text"], "A tram on a hill");
+                    assert_eq!(sent["media_source"]["source_type"], "image_url");
+                    let url = sent["media_source"]["url"].as_str().unwrap();
+                    assert!(url.starts_with("http://localhost:8080/media/"), "{url}");
+                    let t = &p["targets"][0];
+                    assert!(t["remote_id"].as_str().unwrap().starts_with("80"));
+                    let id = t["remote_id"].as_str().unwrap();
+                    assert_eq!(
+                        t["remote_url"],
+                        format!("https://www.pinterest.com/pin/{id}/")
+                    );
+                    assert_eq!(
+                        BEARERS.lock().unwrap().last().map(String::as_str),
+                        Some("Bearer pn")
+                    );
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_pin_without_a_board_uses_the_accounts_default_and_a_png_goes_as_is() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let ctx = (&db, &state, base.as_str());
+                    let p = publish_with(
+                        &s,
+                        ctx,
+                        (&cookie, &set),
+                        ("Plain pin", &["/photo.png"]),
+                        json!({}),
+                    )
+                    .await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let sent = sent_pin("Plain pin");
+                    assert_eq!(sent["board_id"], "111");
+                    assert!(sent.get("title").is_none() && sent.get("link").is_none());
+                    assert!(sent.get("alt_text").is_none());
+                    let url = sent["media_source"]["url"].as_str().unwrap();
+                    assert!(url.ends_with(".png"), "{url}");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn two_to_five_images_make_a_carousel_and_the_first_alt_text_is_used() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let ctx = (&db, &state, base.as_str());
+                    let long = "x".repeat(600);
+                    let extra = json!({"media_alt": [long, "second"]});
+                    let paths = ["/a.jpg", "/b.jpg", "/c.jpg"];
+                    let p = publish_with(&s, ctx, (&cookie, &set), ("Three", &paths), extra).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let sent = sent_pin("Three");
+                    let source = &sent["media_source"];
+                    assert_eq!(source["source_type"], "multiple_image_urls");
+                    assert_eq!(source["items"].as_array().unwrap().len(), 3);
+                    for item in source["items"].as_array().unwrap() {
+                        let url = item["url"].as_str().unwrap();
+                        assert!(url.starts_with("http://localhost:8080/media/"), "{url}");
+                    }
+                    // Pinterest takes one alt text of at most 500 characters.
+                    assert_eq!(sent["alt_text"].as_str().unwrap().chars().count(), 500);
+                    let note = p["targets"][0]["alt_error"].as_str().unwrap();
+                    assert!(note.contains("only the first was used"), "{note}");
+                    assert!(note.contains("cut to Pinterest's limit of 500"), "{note}");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_video_is_uploaded_processed_and_pinned() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let uploads = UPLOADS.lock().unwrap().len();
+                    let ctx = (&db, &state, base.as_str());
+                    let extra = json!({"pinterest": {"title": "Clip"}});
+                    let p =
+                        publish_with(&s, ctx, (&cookie, &set), ("A clip", &["/clip.mp4"]), extra)
+                            .await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let (fields, size) = UPLOADS.lock().unwrap()[uploads].clone();
+                    for field in ["key", "policy", "Content-Type", "file"] {
+                        assert!(fields.iter().any(|f| f == field), "{field} in {fields:?}");
+                    }
+                    assert_eq!(fields.last().map(String::as_str), Some("file"));
+                    assert!(size >= 256, "{size}");
+                    // It asked until Pinterest said the video was ready.
+                    assert!(MEDIA_CHECKS.load(Ordering::SeqCst) >= 3);
+                    let sent = sent_pin("A clip");
+                    assert_eq!(sent["board_id"], "111");
+                    assert_eq!(sent["media_source"]["source_type"], "video_id");
+                    assert_eq!(sent["media_source"]["media_id"], "77");
+                    assert!(sent["media_source"]["cover_image_key_frame_time"].is_number());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_video_that_never_finishes_processing_fails_without_a_pin() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    MODE.store(3, Ordering::SeqCst);
+                    let ctx = (&db, &state, base.as_str());
+                    let p =
+                        publish_with(&s, ctx, (&cookie, &set), ("v", &["/clip.mp4"]), json!({}))
+                            .await;
+                    assert_ne!(p["status"], "published", "{p}");
+                    let msg = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(msg.contains("still processing"), "{msg}");
+                    assert!(p["targets"][0]["remote_id"].is_null());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_file_a_pin_cannot_take_fails_without_calling_pinterest() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let ctx = (&db, &state, base.as_str());
+                    // A GIF is refused when it publishes; a video next to images is refused when
+                    // saved by the facts the probes find, and by the publisher otherwise.
+                    let p = publish_with(&s, ctx, (&cookie, &set), ("a", &["/img.gif"]), json!({}))
+                        .await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    let msg = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(
+                        msg.contains("one MP4 or MOV video, or 1 to 5 JPEG or PNG"),
+                        "{msg}"
+                    );
+                    assert!(p["targets"][0]["remote_id"].is_null());
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_refused_scope_and_a_rate_limit_say_what_to_do() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let ctx = (&db, &state, base.as_str());
+                    MODE.store(1, Ordering::SeqCst);
+                    let p =
+                        publish_with(&s, ctx, (&cookie, &set), ("a", &["/a.jpg"]), json!({})).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    let msg = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(msg.contains("refused a permission"), "{msg}");
+                    MODE.store(2, Ordering::SeqCst);
+                    let p =
+                        publish_with(&s, ctx, (&cookie, &set), ("b", &["/a.jpg"]), json!({})).await;
+                    let msg = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(
+                        msg.contains("limiting") && msg.contains("Nothing was posted"),
+                        "{msg}"
+                    );
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn settings_are_checked_when_saved() {
+                    let (s, _, _, _, cookie, _, set) = team().await;
+                    let long = "t".repeat(101);
+                    for (settings, want) in [
+                        (json!({"board_id": "12x"}), "invalid_pinterest_board"),
+                        (json!({"title": long}), "pinterest_title_too_long"),
+                        (json!({"link": "ftp://a.example"}), "invalid_pinterest_link"),
+                    ] {
+                        let mut post = pin_post(&set, "hi", &["/a.jpg"]);
+                        post["pinterest"] = settings.clone();
+                        let res = create(&s, &cookie, post).await;
+                        assert_eq!(res.status_code(), 422, "{settings}");
+                        let body = res.json::<Value>();
+                        assert_eq!(body["error"], want, "{body}");
+                        assert_eq!(body["platform"], "pinterest");
+                        assert_eq!(body["field"], "pinterest");
+                    }
+                    // Settings on a post for another platform.
+                    let mut post = input(&set, "hi", Some(&past()));
+                    post["pinterest"] = json!({"board_id": "111"});
+                    let res = create(&s, &cookie, post).await;
+                    assert_eq!(res.status_code(), 422);
+                    assert_eq!(res.json::<Value>()["error"], "pinterest_not_supported");
+                    // A pin needs an image or a video, and an unknown field is refused.
+                    let mut post = pin_post(&set, "hi", &[]);
+                    post["media"] = json!([]);
+                    let res = create(&s, &cookie, post).await;
+                    assert_eq!(res.json::<Value>()["error"], "media_required");
+                    let mut post = pin_post(&set, "hi", &["/a.jpg"]);
+                    post["pinterest"] = json!({"colour": "red"});
+                    assert_eq!(create(&s, &cookie, post).await.status_code(), 422);
+                    let long = "d".repeat(801);
+                    let res = create(&s, &cookie, pin_post(&set, &long, &["/a.jpg"])).await;
+                    assert_eq!(res.json::<Value>()["error"], "too_long");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_pin_with_no_board_anywhere_is_refused_when_saved() {
+                    let (s, db, state, base, cookie, team_id, set) = team().await;
+                    let id = pinterest_account(&db, &team_id).await.id.to_string();
+                    put_default(&s, &cookie, &id, Value::Null).await;
+                    let res = create(&s, &cookie, pin_post(&set, "hi", &["/a.jpg"])).await;
+                    assert_eq!(res.status_code(), 422, "{}", res.text());
+                    let body = res.json::<Value>();
+                    assert_eq!(body["error"], "pinterest_board_required");
+                    assert_eq!(body["social_account_id"], id);
+                    assert!(body["detail"].as_str().unwrap().contains("@annpins"));
+                    // Naming a board is enough.
+                    let mut post = pin_post(&set, "hi", &["/a.jpg"]);
+                    post["pinterest"] = json!({"board_id": "111"});
+                    assert_eq!(create(&s, &cookie, post).await.status_code(), 201);
+                    // A saved pin whose default board was removed fails clearly at publish.
+                    put_default(&s, &cookie, &id, json!("111")).await;
+                    let res = create(&s, &cookie, pin_post(&set, "later", &["/b.jpg"])).await;
+                    let pid = id_of(&res);
+                    set_media(&db, &base, &pid, &["/b.jpg"]).await;
+                    put_default(&s, &cookie, &id, Value::Null).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &pid).await;
+                    let msg = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(msg.contains("No board to pin to"), "{msg}");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_token_near_its_end_is_renewed_and_the_refresh_token_kept() {
+                    let (s, db, state, base, cookie, team_id, set) = team().await;
+                    let account = pinterest_account(&db, &team_id).await.id;
+                    set_token(&db, account, 30).await;
+                    let renewed = REFRESHES.load(Ordering::SeqCst);
+                    let ctx = (&db, &state, base.as_str());
+                    let p =
+                        publish_with(&s, ctx, (&cookie, &set), ("a", &["/a.jpg"]), json!({})).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(REFRESHES.load(Ordering::SeqCst), renewed + 1);
+                    assert_eq!(
+                        BEARERS.lock().unwrap().last().map(String::as_str),
+                        Some("Bearer pnrefreshed")
+                    );
+                    let row = pinterest_account(&db, &team_id).await;
+                    assert_eq!(cipher().decrypt(&row.access_token).unwrap(), b"pnrefreshed");
+                    let sealed = row.meta["refresh_token"].as_str().unwrap();
+                    let plain = cipher()
+                        .decrypt(&URL_SAFE_NO_PAD.decode(sealed).unwrap())
+                        .unwrap();
+                    assert_eq!(plain, b"prefresh2");
+                    // The default board is not lost by a renewal, and a live token is not renewed again.
+                    assert_eq!(row.meta["default_board_id"], "111");
+                    let p =
+                        publish_with(&s, ctx, (&cookie, &set), ("b", &["/a.jpg"]), json!({})).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(REFRESHES.load(Ordering::SeqCst), renewed + 1);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn two_renewals_at_once_spend_the_refresh_token_once() {
+                    let (_, db, state, _, _, team_id, _) = team().await;
+                    let row = pinterest_account(&db, &team_id).await;
+                    set_token(&db, row.id, 30).await;
+                    let renewed = REFRESHES.load(Ordering::SeqCst);
+                    let fresh = |a: social_accounts::Model| {
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            controllers::pinterest::fresh_token(&state, &a).await
+                        })
+                    };
+                    let (one, two) = (fresh(row.clone()), fresh(row));
+                    let (one, two) = (one.await.unwrap(), two.await.unwrap());
+                    assert_eq!(one.unwrap(), "pnrefreshed");
+                    assert_eq!(two.unwrap(), "pnrefreshed");
+                    assert_eq!(REFRESHES.load(Ordering::SeqCst), renewed + 1);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn the_daily_job_renews_tokens_with_ten_days_or_less_left() {
+                    let (_, db, state, _, _, team_id, _) = team().await;
+                    let row = pinterest_account(&db, &team_id).await;
+                    let renewed = REFRESHES.load(Ordering::SeqCst);
+                    // 20 days left: left alone.
+                    set_token(&db, row.id, 20 * 86_400).await;
+                    controllers::pinterest::refresh_tokens(&state)
+                        .await
+                        .unwrap();
+                    assert_eq!(REFRESHES.load(Ordering::SeqCst), renewed);
+                    // 5 days left: renewed.
+                    set_token(&db, row.id, 5 * 86_400).await;
+                    let done = controllers::pinterest::refresh_tokens(&state)
+                        .await
+                        .unwrap();
+                    assert!(done >= 1);
+                    assert_eq!(REFRESHES.load(Ordering::SeqCst), renewed + 1);
+                    let after = pinterest_account(&db, &team_id).await;
+                    assert!(after.token_expires_at.unwrap() > Utc::now() + Duration::days(29));
+                    // A refresh token Pinterest refuses flags the account for a reconnect.
+                    let bad = social_accounts::ActiveModel {
+                        id: Set(row.id),
+                        token_expires_at: Set(Some(
+                            (Utc::now() + Duration::days(1)).fixed_offset(),
+                        )),
+                        meta: Set(json!({"refresh_token":
+                            URL_SAFE_NO_PAD.encode(cipher().encrypt(b"revoked"))})),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(bad)
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                    controllers::pinterest::refresh_tokens(&state)
+                        .await
+                        .unwrap();
+                    let flagged = pinterest_account(&db, &team_id).await;
+                    assert_eq!(flagged.meta["reconnect"], true);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_refresh_token_pinterest_refuses_asks_for_a_reconnect() {
+                    let (s, db, state, base, cookie, team_id, set) = team().await;
+                    let account = pinterest_account(&db, &team_id).await.id;
+                    set_token(&db, account, 30).await;
+                    let row = social_accounts::ActiveModel {
+                        id: Set(account),
+                        meta: Set(json!({"default_board_id": "111", "refresh_token":
+                            URL_SAFE_NO_PAD.encode(cipher().encrypt(b"revoked"))})),
+                        ..Default::default()
+                    };
+                    social_accounts::Entity::update(row)
+                        .exec(&db)
+                        .await
+                        .unwrap();
+                    let ctx = (&db, &state, base.as_str());
+                    let p =
+                        publish_with(&s, ctx, (&cookie, &set), ("a", &["/a.jpg"]), json!({})).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    let msg = p["targets"][0]["error"].as_str().unwrap();
+                    assert!(
+                        msg.contains("Reconnect the account under Connections"),
+                        "{msg}"
+                    );
+                    let listed = list(&s, &cookie).await;
+                    assert_eq!(listed[0]["status"], "reconnect");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn take_down_deletes_the_pin() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let ctx = (&db, &state, base.as_str());
+                    let p =
+                        publish_with(&s, ctx, (&cookie, &set), ("a", &["/a.jpg"]), json!({})).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    let id = p["id"].as_str().unwrap();
+                    let pin = p["targets"][0]["remote_id"].as_str().unwrap().to_owned();
+                    let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    assert!(DELETED.lock().unwrap().contains(&pin));
+                    assert_eq!(get_post(&s, &cookie, id).await["status"], "deleted");
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_pin_already_gone_counts_as_taken_down() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let ctx = (&db, &state, base.as_str());
+                    let p =
+                        publish_with(&s, ctx, (&cookie, &set), ("a", &["/a.jpg"]), json!({})).await;
+                    let id = p["id"].as_str().unwrap();
+                    sea_orm::ConnectionTrait::execute_unprepared(
+                        &db,
+                        &format!(
+                            "UPDATE post_targets SET remote_id = '999' WHERE post_id = '{id}'"
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                    let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    assert!(DELETED.lock().unwrap().contains(&"999".to_owned()));
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_group_gives_pinterest_its_own_settings_and_a_feed_cannot_use_it() {
+                    let (s, db, state, base, cookie, _, set) = team().await;
+                    let body = json!({"social_set_id": set, "platforms": ["pinterest"],
+                        "body": "Group pin", "media": ["https://a.example/a.jpg"],
+                        "scheduled_at": past(),
+                        "pinterest": {"title": "From the group"},
+                        "overrides": {"pinterest": {"pinterest": {"board_id": "222"}}}});
+                    let res = req(&s, Method::POST, "/v1/post-groups", &cookie)
+                        .json(&body)
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    for post in res.json::<Value>()["posts"].as_array().unwrap() {
+                        set_media(&db, &base, post["id"].as_str().unwrap(), &["/a.jpg"]).await;
+                    }
+                    publish::tick(&state).await.unwrap();
+                    let sent = PINS
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .rev()
+                        .find(|p| p["description"] == "Group pin")
+                        .cloned()
+                        .unwrap();
+                    // The override replaces the group's settings whole.
+                    assert_eq!(sent["board_id"], "222");
+                    assert!(sent.get("title").is_none());
+                    let res = req(&s, Method::POST, "/v1/feeds", &cookie)
+                        .json(
+                            &json!({"url": "https://a.example/feed.xml", "social_set_id": set,
+                            "platforms": ["pinterest"], "template": "{title}", "mode": "draft"}),
+                        )
+                        .await;
+                    assert_eq!(res.status_code(), 422, "{}", res.text());
+                    assert_eq!(res.json::<Value>()["error"], "platform_not_supported");
                 }
             }
 

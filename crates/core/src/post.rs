@@ -27,6 +27,13 @@ pub const YOUTUBE_MAX_DESCRIPTION: usize = 5000;
 /// posts).
 pub const TIKTOK_MAX_CHARS: usize = 2200;
 pub const TIKTOK_MAX_MEDIA: usize = 35;
+/// Pinterest: a pin's description is the body (800 characters), with 1 image to 5 (a carousel) or
+/// one video; its title takes 100 characters, its alt text 500 and its link 2048 (Pinterest's v5
+/// API reference).
+pub const PINTEREST_MAX_DESCRIPTION: usize = 800;
+pub const PINTEREST_MAX_MEDIA: usize = 5;
+pub const PINTEREST_MAX_TITLE: usize = 100;
+pub const PINTEREST_MAX_ALT: usize = 500;
 /// X: 280 weighted characters (`x_weight`), 4 images or one video or GIF.
 pub const X_MAX_WEIGHT: usize = 280;
 /// X for an account with long posts (Premium, Premium+ or Basic): 25,000 weighted characters.
@@ -89,6 +96,16 @@ pub enum Invalid {
     YouTubeUnsupported,
     /// Not `private`, `unlisted` or `public`.
     InvalidYouTubePrivacy,
+    /// Pinterest settings on a post for another platform.
+    PinterestUnsupported,
+    /// A board id that is not digits.
+    InvalidPinterestBoard,
+    /// A title over `PINTEREST_MAX_TITLE`.
+    PinterestTitleTooLong,
+    /// A link that is not an http or https address of at most 2048 characters.
+    InvalidPinterestLink,
+    /// No board named, and an account of the set has no default board.
+    PinterestBoardRequired,
     /// A media file of a type the platform does not take (known from its first bytes).
     MediaTypeUnsupported,
     /// A video (or a PDF, or a GIF on X) next to other media where the platform takes it alone.
@@ -132,6 +149,11 @@ impl Invalid {
             Self::TikTokBrandedPrivate => "tiktok_branded_content_private",
             Self::YouTubeUnsupported => "youtube_not_supported",
             Self::InvalidYouTubePrivacy => "invalid_youtube_privacy",
+            Self::PinterestUnsupported => "pinterest_not_supported",
+            Self::InvalidPinterestBoard => "invalid_pinterest_board",
+            Self::PinterestTitleTooLong => "pinterest_title_too_long",
+            Self::InvalidPinterestLink => "invalid_pinterest_link",
+            Self::PinterestBoardRequired => "pinterest_board_required",
             Self::MediaTypeUnsupported => "media_type_not_supported",
             Self::MixedMedia => "mixed_media",
             Self::MediaTooLarge => "media_too_large",
@@ -171,6 +193,11 @@ impl Invalid {
             | Self::TikTokBrandedPrivate
             | Self::TikTokPrivacyNotOffered => "tiktok",
             Self::YouTubeUnsupported | Self::InvalidYouTubePrivacy => "youtube",
+            Self::PinterestUnsupported
+            | Self::InvalidPinterestBoard
+            | Self::PinterestTitleTooLong
+            | Self::InvalidPinterestLink
+            | Self::PinterestBoardRequired => "pinterest",
             Self::InvalidAlt | Self::AltTooLong => "media_alt",
         }
     }
@@ -232,6 +259,15 @@ pub fn https_url(url: &str) -> bool {
         && !host.is_empty()
         && !host.contains('@')
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// A web link: `http://` or `https://`, a host, no spaces or control characters, at most 2048
+/// bytes. Where a post's own media must be `https_url`, a pin may lead to a plain http page.
+pub fn web_url(url: &str) -> bool {
+    https_url(url)
+        || url
+            .strip_prefix("http://")
+            .is_some_and(|rest| https_url(&format!("https://{rest}")))
 }
 
 /// A YouTube post's `(title, description)`: the body's first line, and the rest, both trimmed.
@@ -338,6 +374,8 @@ pub fn check(platform: &str, body: &str, media: &[String]) -> Vec<Problem> {
             )],
             TIKTOK_MAX_MEDIA,
         ),
+        // A pin's description is the body, and Pinterest needs an image or a video.
+        "pinterest" => (chars(PINTEREST_MAX_DESCRIPTION), PINTEREST_MAX_MEDIA),
         "youtube" => {
             let (title, description) = youtube_text(body);
             let lengths = vec![
@@ -361,7 +399,7 @@ pub fn check(platform: &str, body: &str, media: &[String]) -> Vec<Problem> {
     if body.trim().is_empty() && (media.is_empty() || platform == "youtube") {
         found.push(Problem::new(Invalid::Empty));
     }
-    if matches!(platform, "instagram" | "youtube" | "tiktok") && media.is_empty() {
+    if matches!(platform, "instagram" | "youtube" | "tiktok" | "pinterest") && media.is_empty() {
         found.push(Problem::new(Invalid::MediaRequired));
     }
     if platform == "youtube" && body.contains(['<', '>']) {
@@ -548,6 +586,11 @@ fn media_types(platform: &str) -> (&'static [&'static str], &'static str) {
             "a JPEG, PNG or WebP image or an MP4 or MOV video",
         ),
         "youtube" => (&[MP4, MOV], "an MP4 or MOV video"),
+        // Publishing turns WebP images into JPEGs for Pinterest.
+        "pinterest" => (
+            &[JPEG, PNG, WEBP, MP4, MOV],
+            "a JPEG, PNG or WebP image or an MP4 or MOV video",
+        ),
         "x" => (
             &[JPEG, PNG, WEBP, GIF, MP4, MOV],
             "a JPEG, PNG, WebP or GIF image or an MP4 or MOV video",
@@ -578,6 +621,9 @@ fn alone(platform: &str, t: &str) -> Option<&'static str> {
             Some("X takes up to 4 images, or one GIF, or one video, but not a mix.")
         }
         "tiktok" if video => Some("A TikTok post needs one MP4 or MOV video, or photos, not both."),
+        "pinterest" if video => Some(
+            "A Pinterest pin takes one video, or 1 to 5 images, but not both or several videos.",
+        ),
         _ => None,
     }
 }
@@ -779,6 +825,47 @@ pub fn validate_youtube(platform: &str, settings: Option<Option<&str>>) -> Resul
         Some(p) if !YOUTUBE_PRIVACY.contains(&p) => Err(Invalid::InvalidYouTubePrivacy),
         _ => Ok(()),
     }
+}
+
+/// What a user chose for a Pinterest pin, as far as its rules go without a call.
+pub struct PinterestChoice<'a> {
+    pub board_id: Option<&'a str>,
+    pub title: Option<&'a str>,
+    pub link: Option<&'a str>,
+}
+
+/// Every problem of a post's Pinterest settings for `platform`: only Pinterest takes them, a board
+/// id is digits, the title fits and the link is a web address. Blank values count as absent.
+pub fn check_pinterest(platform: &str, choice: Option<PinterestChoice>) -> Vec<Problem> {
+    let Some(c) = choice else {
+        return Vec::new();
+    };
+    if platform != "pinterest" {
+        return vec![Problem::new(Invalid::PinterestUnsupported)];
+    }
+    let mut found = Vec::new();
+    fn some(v: Option<&str>) -> Option<&str> {
+        v.map(str::trim).filter(|s| !s.is_empty())
+    }
+    if some(c.board_id).is_some_and(|b| !b.bytes().all(|b| b.is_ascii_digit())) {
+        found.push(Problem::new(Invalid::InvalidPinterestBoard));
+    }
+    if let Some(n) = some(c.title)
+        .map(|t| t.chars().count())
+        .filter(|n| *n > PINTEREST_MAX_TITLE)
+    {
+        let detail = format!("The title is {n} characters; the limit is {PINTEREST_MAX_TITLE}.");
+        found.push(Problem::over(
+            Invalid::PinterestTitleTooLong,
+            PINTEREST_MAX_TITLE as u64,
+            n as u64,
+            detail,
+        ));
+    }
+    if some(c.link).is_some_and(|l| !web_url(l)) {
+        found.push(Problem::new(Invalid::InvalidPinterestLink));
+    }
+    found
 }
 
 /// The first of `bodies` (a post's, then each thread part's) over `X_MAX_WEIGHT`, the limit of an
@@ -1609,5 +1696,92 @@ mod tests {
         assert!(links("xhttps://example.com").is_empty());
         assert!(links("https:// alone").is_empty());
         assert_eq!(links("https://a.io").len(), 1);
+    }
+
+    #[test]
+    fn pinterest_takes_a_description_on_one_to_five_images_or_one_video() {
+        let media = |n: usize| vec!["https://a.example/1.jpg".to_owned(); n];
+        assert_eq!(validate("pinterest", "hi", &media(1)), Ok(()));
+        assert_eq!(validate("pinterest", "", &media(1)), Ok(()));
+        assert_eq!(validate("pinterest", "hi", &media(5)), Ok(()));
+        assert_eq!(
+            validate("pinterest", "hi", &media(6)),
+            Err(Invalid::TooManyImages)
+        );
+        assert_eq!(
+            validate("pinterest", "hi", &[]),
+            Err(Invalid::MediaRequired)
+        );
+        assert_eq!(validate("pinterest", "", &[]), Err(Invalid::Empty));
+        assert_eq!(validate("pinterest", &"a".repeat(800), &media(1)), Ok(()));
+        assert_eq!(
+            validate("pinterest", &"a".repeat(801), &media(1)),
+            Err(Invalid::TooLong)
+        );
+        // No thread, first comment or cover on a pin.
+        assert_eq!(
+            validate_thread("pinterest", &[("two", &media(0)[..])]),
+            Err((Invalid::ThreadUnsupported, None))
+        );
+        assert_eq!(
+            validate_first_comment("pinterest", Some("hi")),
+            Err(Invalid::FirstCommentUnsupported)
+        );
+    }
+
+    #[test]
+    fn a_pin_takes_images_or_a_video_but_not_both() {
+        let f = |t| {
+            Some(MediaFact {
+                content_type: t,
+                size: Some(1000),
+                animated: false,
+            })
+        };
+        let code = |facts: &[Option<MediaFact>]| {
+            validate_media_facts("pinterest", facts).map_err(|(i, _)| i.code())
+        };
+        assert_eq!(code(&[f(JPEG), f(PNG), f(WEBP)]), Ok(()));
+        assert_eq!(code(&[f(MP4)]), Ok(()));
+        assert_eq!(code(&[f(MP4), f(JPEG)]), Err("mixed_media"));
+        assert_eq!(code(&[f(MP4), f(MOV)]), Err("mixed_media"));
+        assert_eq!(code(&[f(GIF)]), Err("media_type_not_supported"));
+    }
+
+    #[test]
+    fn pinterest_settings_are_checked_without_a_call() {
+        let c = |board, title, link| {
+            Some(PinterestChoice {
+                board_id: board,
+                title,
+                link,
+            })
+        };
+        let codes =
+            |p: Vec<Problem>| -> Vec<&'static str> { p.iter().map(|p| p.invalid.code()).collect() };
+        assert!(check_pinterest("x", None).is_empty());
+        assert!(check_pinterest("pinterest", None).is_empty());
+        assert_eq!(
+            codes(check_pinterest("x", c(None, None, None))),
+            ["pinterest_not_supported"]
+        );
+        let ok = c(Some("123"), Some("A title"), Some("http://a.example/p?x=1"));
+        assert!(check_pinterest("pinterest", ok).is_empty());
+        // Blank means absent.
+        assert!(check_pinterest("pinterest", c(Some(" "), Some(" "), Some(""))).is_empty());
+        let long = "t".repeat(101);
+        let bad = c(Some("12a"), Some(long.as_str()), Some("ftp://a.example"));
+        assert_eq!(
+            codes(check_pinterest("pinterest", bad)),
+            [
+                "invalid_pinterest_board",
+                "pinterest_title_too_long",
+                "invalid_pinterest_link"
+            ]
+        );
+        assert!(check_pinterest("pinterest", c(None, Some(&"t".repeat(100)), None)).is_empty());
+        assert!(web_url("https://a.example/x") && web_url("http://a.example"));
+        assert!(!web_url("http://") && !web_url("javascript:alert(1)"));
+        assert!(!web_url("http://a.example/a b"));
     }
 }

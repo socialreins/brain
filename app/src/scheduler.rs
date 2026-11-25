@@ -9,7 +9,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, 
 
 use crate::{
     automations, broadcasts,
-    controllers::{idempotency, linkedin, threads, x},
+    controllers::{idempotency, linkedin, pinterest, threads, x},
     expiry, feeds, inbox, media, metrics, newsletters, publish,
     state::AppState,
     webhooks,
@@ -42,6 +42,11 @@ pub fn spawn(app: AppState) {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(accounts = n, "renewed linkedin tokens"),
                 Err(e) => tracing::warn!(error = %e, "linkedin token refresh failed"),
+            }
+            match pinterest::refresh_tokens(&threads_app).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(accounts = n, "renewed pinterest tokens"),
+                Err(e) => tracing::warn!(error = %e, "pinterest token refresh failed"),
             }
             match expiry::notify(&threads_app).await {
                 Ok(0) => {}

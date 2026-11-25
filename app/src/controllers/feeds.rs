@@ -68,8 +68,8 @@ pub struct FeedInput {
     pub url: String,
     /// Required: a live set of the team; a set token's own.
     pub social_set_id: Option<Uuid>,
-    /// Required, not empty: platforms the set has an account for. `tiktok` and `youtube` are
-    /// `422 platform_not_supported` (an item has no video).
+    /// Required, not empty: platforms the set has an account for. `tiktok`, `youtube` and `pinterest` are
+    /// `422 platform_not_supported` (an item has no video or image).
     #[serde(default)]
     pub platforms: Vec<String>,
     /// Each post's text, 1 to 2000 characters, default `{title}\n{link}`. `{title}`, `{link}`
@@ -179,7 +179,7 @@ async fn checked(
     platforms.retain(|p| seen.insert(p.clone()));
     if let Some(p) = platforms
         .iter()
-        .find(|p| matches!(p.as_str(), "tiktok" | "youtube"))
+        .find(|p| matches!(p.as_str(), "tiktok" | "youtube" | "pinterest"))
     {
         let body = json!({"error": "platform_not_supported", "platform": p});
         return Ok(Err(
@@ -236,7 +236,7 @@ pub async fn list_feeds(app: &AppState, a: &Actor) -> Response {
 /// Adds a feed (owner, admin or a full token). The feed is read once: one that cannot be read or
 /// parsed is `422 {"error":"feed_unreadable","reason"}`, and the items it holds now are marked
 /// seen, so only later ones are posted. `422 {"error":"invalid_feed","field"}` names a bad
-/// field, `422 {"error":"platform_not_supported","platform"}` TikTok or YouTube, and a 21st feed
+/// field, `422 {"error":"platform_not_supported","platform"}` TikTok, YouTube or Pinterest, and a 21st feed
 /// is `422 too_many_feeds`.
 #[utoipa::path(post, path = "/feeds", tag = "feeds",
     security(("session" = []), ("api_token" = [])), request_body = FeedInput,
