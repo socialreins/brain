@@ -5,6 +5,7 @@ pub mod broadcasts;
 pub mod config;
 pub mod connectors;
 pub mod controllers;
+pub mod dry_run;
 pub mod expiry;
 pub mod feeds;
 pub mod inbox;

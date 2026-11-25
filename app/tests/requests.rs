@@ -22066,6 +22066,215 @@ mod teams {
                     assert_eq!(spend("a5", jan).await.unwrap(), Paid(Kind::AiPlan));
                     assert_eq!(billing::balance(&db, team, Kind::Ai).await.unwrap(), 0);
                 }
+
+                /// "Test this automation" matches and writes like a run but sends nothing,
+                /// stores no item or run, and says what would stop it.
+                #[tokio::test]
+                #[serial]
+                async fn testing_an_automation_sends_and_stores_nothing() {
+                    use sea_orm::{ColumnTrait, ConnectionTrait, PaginatorTrait, QueryFilter};
+                    let (s, db, _) = on_ai(false, Some(OUR_KEY)).await;
+                    let (cookie, team, account, _) = owner(&s, &db).await;
+                    let try_it = |automation: Value, sample: Value| {
+                        let body = json!({"automation": automation, "sample": sample});
+                        let (s, cookie) = (&s, &cookie);
+                        async move {
+                            req(s, Method::POST, "/v1/automations/test", cookie)
+                                .json(&body)
+                                .await
+                        }
+                    };
+                    let sample = |text: &str| json!({"account_id": account, "text": text, "author_name": "Fan"});
+                    let automation = |steps: Value| {
+                        json!({"name": "t", "trigger": "comment_received",
+                            "conditions": {"keywords": ["guide"]}, "steps": steps})
+                    };
+                    let team: uuid::Uuid = team.parse().unwrap();
+                    let items = || {
+                        socialreins_brain::models::inbox_items::Entity::find()
+                            .filter(socialreins_brain::models::inbox_items::Column::TeamId.eq(team))
+                            .count(&db)
+                    };
+                    let runs = || {
+                        socialreins_brain::models::automation_runs::Entity::find()
+                            .filter(
+                                socialreins_brain::models::automation_runs::Column::TeamId.eq(team),
+                            )
+                            .count(&db)
+                    };
+                    let (sent0, calls0) =
+                        (SENT.lock().unwrap().len(), AI_CALLS.lock().unwrap().len());
+
+                    // A match: each send with its final text, a wait and a tag.
+                    let flow = automation(json!([
+                        {"type": "send_dm", "text": "Hi {name}!",
+                            "buttons": [{"label": "More", "payload": "more"}]},
+                        {"type": "wait", "minutes": 10},
+                        {"type": "tag_contact", "tag": "VIP"},
+                        {"type": "reply_publicly", "text": "Thanks {name}"}]));
+                    let res = try_it(flow.clone(), sample("Guide please")).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let out = res.json::<Value>();
+                    assert_eq!(out["matched"], true, "{out}");
+                    assert_eq!(out["blocks"], json!([]));
+                    let got: Vec<(&str, &str)> = out["steps"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|x| (x["type"].as_str().unwrap(), x["status"].as_str().unwrap()))
+                        .collect();
+                    assert_eq!(
+                        got,
+                        [
+                            ("send_dm", "would_send"),
+                            ("wait", "would_wait"),
+                            ("tag_contact", "would_tag"),
+                            ("reply_publicly", "would_send")
+                        ]
+                    );
+                    // Bluesky has no buttons: the label comes as a numbered line.
+                    assert_eq!(out["steps"][0]["text"], "Hi Fan!\n1. More");
+                    assert_eq!(out["steps"][1]["wait_minutes"], 10);
+                    assert_eq!(out["steps"][2]["tag"], "vip");
+                    assert_eq!(out["steps"][3]["text"], "Thanks Fan");
+
+                    // No match: why, and no steps.
+                    let out = try_it(flow, sample("hello")).await.json::<Value>();
+                    assert_eq!(out["matched"], false);
+                    assert_eq!(out["mismatches"], json!(["no_keyword"]));
+                    assert_eq!(out["steps"], json!([]));
+
+                    // An AI step is written by the model, with the provider and model.
+                    reply("Thanks! The guide: https://shop.example/guide");
+                    let ai = automation(json!([{"type": "ai_send_dm", "prompt": PROMPT}]));
+                    let out = try_it(ai.clone(), sample("guide")).await.json::<Value>();
+                    let step = &out["steps"][0];
+                    assert_eq!(step["status"], "would_send", "{out}");
+                    assert_eq!(
+                        step["text"],
+                        "Thanks! The guide: https://shop.example/guide"
+                    );
+                    assert_eq!(step["provider"], "anthropic");
+                    assert_eq!(step["model"], socialreins_brain::ai::ANTHROPIC_MODEL);
+                    assert_eq!(AI_CALLS.lock().unwrap().len(), calls0 + 1);
+                    // The same checks as a run: an invented link is refused.
+                    reply("Grab it at evil.example now");
+                    let out = try_it(ai.clone(), sample("guide")).await.json::<Value>();
+                    assert_eq!(out["steps"][0]["status"], "would_fail");
+                    assert_eq!(out["steps"][0]["reason"], "ai_link");
+
+                    // A text holding {page} on a post with no page: it would not run.
+                    let paged = automation(json!([{"type": "send_dm", "text": "See {page}"}]));
+                    let out = try_it(paged, sample("guide")).await.json::<Value>();
+                    assert_eq!(out["blocks"], json!(["no_public_page"]));
+                    assert_eq!(out["steps"], json!([]));
+
+                    // An account without DM access: the DM would be skipped, the rest not reached.
+                    db.execute_raw(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Postgres,
+                        "UPDATE social_accounts SET dm_access = false WHERE id = $1::uuid",
+                        [account.clone().into()],
+                    ))
+                    .await
+                    .unwrap();
+                    let dm = automation(json!([
+                        {"type": "send_dm", "text": "Hi"},
+                        {"type": "reply_publicly", "text": "Hello"}]));
+                    let out = try_it(dm, sample("guide")).await.json::<Value>();
+                    assert_eq!(out["steps"][0]["status"], "would_skip", "{out}");
+                    assert_eq!(out["steps"][0]["reason"], "no_dm_access");
+                    assert_eq!(out["steps"][1]["status"], "not_reached");
+                    // Actions instead of a flow: the fallback reply takes the DM's place.
+                    let actions = json!({"name": "t", "trigger": "comment_received",
+                        "actions": [{"type": "send_dm", "text": "Hi"}],
+                        "fallback_public_reply": "Check your DMs {name}"});
+                    let out = try_it(actions, sample("guide")).await.json::<Value>();
+                    assert_eq!(out["steps"][1]["type"], "fallback_public_reply");
+                    assert_eq!(out["steps"][1]["text"], "Check your DMs Fan");
+
+                    // Checked like a save, and only the team's own accounts.
+                    let bad = json!({"name": "t", "trigger": "comment_received", "actions": []});
+                    let res = try_it(bad, sample("guide")).await;
+                    assert_eq!(res.status_code(), 422);
+                    let res = try_it(
+                        automation(json!([{"type": "send_dm", "text": "Hi"}])),
+                        json!({"account_id": uuid::Uuid::now_v7(), "text": "guide"}),
+                    )
+                    .await;
+                    assert_eq!(res.status_code(), 422);
+                    assert_eq!(res.json::<Value>()["error"], "invalid_sample");
+
+                    // Through all of it: nothing sent, nothing stored.
+                    assert_eq!(SENT.lock().unwrap().len(), sent0);
+                    assert_eq!((items().await.unwrap(), runs().await.unwrap()), (0, 0));
+                }
+
+                /// A test that writes with our key counts against the allowance like a run, and
+                /// a test no one may run (a member) or past the daily limit is refused.
+                #[tokio::test]
+                #[serial]
+                async fn testing_counts_against_the_ai_allowance_and_is_limited() {
+                    use sea_orm::ConnectionTrait;
+                    let (s, db, _) = on_ai(true, Some(OUR_KEY)).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team: uuid::Uuid = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    let sql = |q: &str| {
+                        sea_orm::Statement::from_sql_and_values(
+                            sea_orm::DbBackend::Postgres,
+                            q,
+                            [team.into()],
+                        )
+                    };
+                    db.execute_raw(sql(
+                        "INSERT INTO subscriptions (team_id, plan_id, status, provider) \
+                         VALUES ($1, 'automation', 'active', 'comp') ON CONFLICT (team_id) DO NOTHING",
+                    ))
+                    .await
+                    .unwrap();
+                    let res = connect(&s, &cookie, &new_handle(), DM_APP_PASSWORD).await;
+                    let account = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                    let body = json!({"automation": {"name": "t", "trigger": "comment_received",
+                        "actions": [{"type": "ai_send_dm", "prompt": "Say hi"}]},
+                        "sample": {"account_id": account, "text": "hello"}});
+                    let usage = || async {
+                        let b = req(&s, Method::GET, "/v1/team/billing", &cookie)
+                            .await
+                            .json::<Value>();
+                        b["usage"]["ai_replies"].as_i64().unwrap()
+                    };
+                    reply("Hi there!");
+                    let res = req(&s, Method::POST, "/v1/automations/test", &cookie)
+                        .json(&body)
+                        .await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    assert_eq!(res.json::<Value>()["steps"][0]["status"], "would_send");
+                    assert_eq!(usage().await, 1);
+                    // An unusable answer is given back, as in a run.
+                    reply("");
+                    let out = req(&s, Method::POST, "/v1/automations/test", &cookie)
+                        .json(&body)
+                        .await
+                        .json::<Value>();
+                    assert_eq!(out["steps"][0]["reason"], "ai_empty");
+                    assert_eq!(usage().await, 1);
+
+                    // Over the daily limit.
+                    db.execute_raw(sql(
+                        "INSERT INTO rate_limit_hits (bucket) \
+                         SELECT 'automation_test:team:' || $1::uuid::text FROM generate_series(1, 100)",
+                    ))
+                    .await
+                    .unwrap();
+                    let res = req(&s, Method::POST, "/v1/automations/test", &cookie)
+                        .json(&body)
+                        .await;
+                    assert_eq!(res.status_code(), 429);
+                    assert_eq!(usage().await, 1);
+                }
             }
 
             fn dm(id: &str, from: &str, text: &str, when: &str) -> Value {

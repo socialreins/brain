@@ -25,6 +25,7 @@ use super::{
 };
 use crate::{
     automations::{self as rules, Action, ActionResult, Conditions, Step},
+    dry_run::{self, Outcome, Sample},
     inbox,
     models::{automation_runs, automations, social_accounts, teams},
     state::AppState,
@@ -662,8 +663,87 @@ async fn runs(
     }
 }
 
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TestInput {
+    /// The automation to try, in the shape `POST /automations` takes (checked the same way,
+    /// saved nowhere), so an edit can be tried before it is saved. `active` is ignored.
+    pub automation: AutomationInput,
+    pub sample: Sample,
+}
+
+/// Tries an automation on a sample comment, mention or message from a stranger, as the account
+/// in `sample.account_id`: whether it matches (or why not), any rule that would stop it, and
+/// each action with its final text, AI text included. Nothing is sent and no inbox item or run
+/// is stored. An AI step is written by the real model with the real key choice and counted
+/// against the AI allowance like a run. At most 100 tests a team a day (`429 rate_limited`).
+/// Owners and admins on the Automation plan.
+#[utoipa::path(post, path = "/automations/test", tag = "automations", request_body = TestInput,
+    responses((status = 200, body = Outcome), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 422, body = Error), (status = 429, body = Error)))]
+async fn test(
+    _: FromWeb,
+    State(app): State<AppState>,
+    t: InTeam,
+    Body(input): Body<TestInput>,
+) -> Response {
+    if !t.role.manages() {
+        return forbidden();
+    }
+    if let Some(res) = super::billing::needs_automation(&app, t.team.id).await {
+        return res;
+    }
+    let TestInput { automation, sample } = input;
+    let text = sample.text.trim();
+    if text.is_empty() || text.chars().count() > dry_run::MAX_SAMPLE_CHARS {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_sample");
+    }
+    let sample = Sample {
+        text: text.to_owned(),
+        ..sample
+    };
+    let tried = async {
+        let (_, input) = match checked(&app.db, t.team.id, automation).await? {
+            Ok(v) => v,
+            Err(res) => return Ok(Err(res)),
+        };
+        let account = social_accounts::Entity::find_by_id(sample.account_id)
+            .filter(social_accounts::Column::TeamId.eq(t.team.id))
+            .one(&app.db)
+            .await?;
+        let Some(account) = account.filter(|a| rules::AUTOMATED.contains(&a.provider.as_str()))
+        else {
+            return Ok(Err(reply(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_sample",
+            )));
+        };
+        let caps = [(dry_run::quota_bucket(t.team.id), dry_run::TESTS_PER_DAY)];
+        if crate::rate_limit::daily_reserve(&app.db, &caps)
+            .await?
+            .is_none()
+        {
+            return Ok(Err(reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited")));
+        }
+        let given = (
+            input.trigger.as_str(),
+            &input.conditions,
+            input.actions.as_deref().unwrap_or_default(),
+            input.steps.as_deref(),
+            input.fallback_public_reply.as_deref(),
+        );
+        Ok::<_, DbErr>(Ok(dry_run::test(&app, &account, given, &sample).await?))
+    };
+    match tried.await {
+        Ok(Ok(outcome)) => Json(outcome).into_response(),
+        Ok(Err(res)) => res,
+        Err(e) => internal(e, "automation test"),
+    }
+}
+
 pub fn api() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
+        .routes(routes!(test))
         .routes(routes!(list, create))
         .routes(routes!(show, update, destroy))
         .routes(routes!(enable))
