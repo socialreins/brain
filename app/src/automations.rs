@@ -718,7 +718,7 @@ pub fn validate_steps(
 }
 
 /// Networks whose inbox can fire an automation.
-pub const AUTOMATED: [&str; 4] = ["bluesky", "facebook", "instagram", "x"];
+pub const AUTOMATED: [&str; 5] = ["bluesky", "facebook", "instagram", "x", "youtube"];
 /// Meta allows a message to a person only within 24 hours of their last one.
 const META_WINDOW_MINUTES: u32 = 24 * 60;
 /// And a private reply to a comment only within 7 days of it.
@@ -738,7 +738,10 @@ const META_PRIVATE_REPLY_MINUTES: u32 = 7 * 24 * 60;
 /// button tap never come (`bluesky_unsupported_trigger`; its buttons are numbered lines the
 /// person answers with a DM keyword). Bluesky has no private reply either: a DM goes only to
 /// someone who follows the account or allows DMs from anyone, and a welcome DM to a new
-/// follower normally does, as they follow us (unless they closed their DMs). A mixed scope is left to fail item by item.
+/// follower normally does, as they follow us (unless they closed their DMs). When every account
+/// is YouTube, only a comment can fire it (`youtube_unsupported_trigger`: no mentions, DMs,
+/// follows, story replies or buttons) and only public replies can answer (`youtube_no_dm`: YouTube
+/// has no DM and no private reply). A mixed scope is left to fail item by item.
 pub fn network_limits(
     trigger: &str,
     providers: &[&str],
@@ -776,6 +779,21 @@ pub fn network_limits(
         )
     {
         return Err("x_unsupported_trigger");
+    }
+    if !providers.is_empty() && providers.iter().all(|p| *p == "youtube") {
+        if trigger != "comment_received" {
+            return Err("youtube_unsupported_trigger");
+        }
+        let dm_step = steps
+            .unwrap_or_default()
+            .iter()
+            .any(|s| matches!(s, Step::SendDm { .. } | Step::AiSendDm { .. }));
+        let dm_action = actions
+            .iter()
+            .any(|a| matches!(a, Action::SendDm { .. } | Action::AiSendDm { .. }));
+        if dm_step || dm_action {
+            return Err("youtube_no_dm");
+        }
     }
     if !providers.is_empty()
         && providers.iter().all(|p| *p == "bluesky")
@@ -2571,8 +2589,8 @@ fn outcome(kind: &str, sent: Result<Result<String, InboxError>, DbErr>) -> Actio
             | InboxError::NoDmAccess
             | InboxError::RateLimited
             | InboxError::Invalid(
-                "outside_window" | "already_replied" | "dm_unavailable" | "x_no_credits"
-                | "x_usage_capped" | "x_budget",
+                "outside_window" | "already_replied" | "dm_unavailable" | "youtube_no_dm"
+                | "x_no_credits" | "x_usage_capped" | "x_budget",
             )),
         )) => ("skipped", Some(e.code().to_owned()), None),
         Ok(Err(e)) => ("failed", Some(e.code().to_owned()), None),
@@ -2935,6 +2953,10 @@ async fn ai_send(
     prompt: &str,
     reference: &str,
 ) -> ActionResult {
+    // YouTube has no DM: skip before the AI call is paid for.
+    if via == Via::Dm && account.provider == "youtube" {
+        return outcome(kind, Ok(Err(InboxError::Invalid("youtube_no_dm"))));
+    }
     // X stops an automation that cannot pay a write before the model is paid for a text.
     if account.provider == "x" {
         let stopped = match crate::x_automation::blocked(app, account).await {
@@ -3765,6 +3787,7 @@ mod tests {
 
     #[test]
     fn network_limits_follow_what_each_network_allows() {
+        let reply = |t: &str| Step::ReplyPublicly { text: t.into() };
         let dm = |t: &str| Step::SendDm {
             text: t.into(),
             buttons: vec![],
@@ -3796,6 +3819,47 @@ mod tests {
         assert_eq!(
             network_limits("new_follower", &["x", "bluesky"], &none, None),
             Ok(())
+        );
+        // YouTube has comments only, answered in public.
+        assert_eq!(
+            network_limits(
+                "comment_received",
+                &["youtube"],
+                &none,
+                Some(&[reply("hi")])
+            ),
+            Ok(())
+        );
+        for no in [
+            "mention_received",
+            "dm_received",
+            "new_follower",
+            "story_reply",
+            "button_clicked",
+        ] {
+            assert_eq!(
+                network_limits(no, &["youtube"], &none, None),
+                Err("youtube_unsupported_trigger"),
+                "{no}"
+            );
+        }
+        assert_eq!(
+            network_limits(
+                "comment_received",
+                &["youtube"],
+                &none,
+                Some(&[reply("hi"), dm("hi")])
+            ),
+            Err("youtube_no_dm")
+        );
+        assert_eq!(
+            network_limits(
+                "comment_received",
+                &["youtube"],
+                &[Action::SendDm { text: "hi".into() }],
+                None
+            ),
+            Err("youtube_no_dm")
         );
         // Bluesky has no story replies or button taps; a follow, a comment, a mention and a DM
         // are all its own, and a mixed scope is left to fail item by item.
