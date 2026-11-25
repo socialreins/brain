@@ -46,13 +46,14 @@ pub mod youtube;
 
 use axum::{
     extract::DefaultBodyLimit,
-    http::{header, Method},
+    http::{header, HeaderValue, Method},
     middleware::from_fn_with_state,
     routing::get,
     Json, Router,
 };
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
+    set_header::SetResponseHeaderLayer,
     trace::TraceLayer,
 };
 use utoipa::{
@@ -221,6 +222,11 @@ pub fn router(state: AppState, config: &Config) -> Router {
         )
         .layer(cors)
         .layer(TraceLayer::new_for_http().make_span_with(span))
+        // Browsers ignore this over plain http, so local dev is unaffected; it matches the web app's.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000"),
+        ))
         .with_state(state)
 }
 
