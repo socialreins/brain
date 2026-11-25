@@ -19,6 +19,7 @@ pub mod google;
 pub mod health;
 pub mod idempotency;
 pub mod inbox;
+pub mod inbox_actions;
 pub mod library;
 pub mod linkedin;
 pub mod lists;
@@ -127,6 +128,7 @@ fn api() -> OpenApiRouter<AppState> {
         // A URL of 2048 characters and a template of 2000 can pass 4 KiB.
         .merge(feeds::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
         .merge(inbox::api())
+        .merge(inbox_actions::api())
         .merge(x_inbox::api())
         .merge(contacts::api())
         .merge(broadcasts::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))

@@ -160,6 +160,13 @@ cargo run -p socialreins-brain
   Likes and reposts of the account's posts (`like`, `repost`; with follows, `inbox::ACTIVITY`) are
   stored `done` and left out of lists, counts and `kind`-less queries via `inbox::NOT_ACTIVITY`;
   `kind=activity` lists them. `GET /inbox-items/{id}/thread` reads `getPostThread` upwards live.
+- `app/src/bluesky_actions.rs` and `controllers/inbox_actions.rs`: like, repost, follow, mute, block,
+  hide a reply (the threadgate's `hiddenReplies` on our own root post), delete our reply and report
+  (`com.atproto.moderation.createReport` through the PDS with the moderation service as
+  `atproto-proxy`) from an inbox item. Each is confirmed in the body, checks the live state first
+  where it makes a record, and is logged in `inbox_actions` whatever came of it. Block, hide, delete
+  and report are for owners and admins (`Action::manages`). Tests only mock these: never report,
+  block, follow or message a real account from one.
 - Pinterest per-post settings (`posts.pinterest`, `connectors::pinterest::Options`: `board_id`, `title`, `link`): validated on save by `post::check_pinterest`, and `posts::pinterest_board` refuses a post with no board named and a Pinterest account of the set without `meta.default_board_id` (no call). `Publisher::publish_with_pinterest` hands them to `Pinterest::pin`, which sends images by brain's `/media/` link and a video as a registered form upload that it polls; the pin's alt text is the first image's, cut to 500. The token renews under a row lock like TikTok's (`controllers::pinterest::renew`), and a daily job (`refresh_tokens`) keeps the 60-day refresh token alive. Pinterest has no inbox, automation or analytics here.
 - `app/src/meta_inbox.rs` and `controllers/meta_webhook.rs`: `/webhooks/meta`. The signature of
   the raw body is checked before anything is parsed; items are stored before the `200` (unique
