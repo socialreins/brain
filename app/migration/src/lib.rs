@@ -72,6 +72,7 @@ mod m20261230_000002_bluesky_activity_kinds;
 mod m20261230_000003_inbox_actions;
 mod m20261231_000001_meta_synced;
 mod m20270101_000001_inbox_moderation;
+mod m20270102_000001_automation_safety;
 
 pub struct Migrator;
 
@@ -151,6 +152,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261230_000003_inbox_actions::Migration),
             Box::new(m20261231_000001_meta_synced::Migration),
             Box::new(m20270101_000001_inbox_moderation::Migration),
+            Box::new(m20270102_000001_automation_safety::Migration),
             // inject-above (do not remove this comment)
         ]
     }

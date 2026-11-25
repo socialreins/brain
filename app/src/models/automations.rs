@@ -26,6 +26,10 @@ pub struct Model {
     pub steps: Option<Json>,
     #[sea_orm(column_type = "Text", nullable)]
     pub fallback_public_reply: Option<String>,
+    /// One person starts it at most once in this many minutes; null: no limit.
+    pub cooldown_minutes: Option<i32>,
+    /// At most this many runs start a day; null: only the team's cap.
+    pub daily_cap: Option<i32>,
     pub created_by: Option<Uuid>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,

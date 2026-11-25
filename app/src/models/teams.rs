@@ -28,6 +28,8 @@ pub struct Model {
     pub newsletter_sender_logo: Option<String>,
     /// A member's scheduled posts wait for an owner or admin to approve them (`posts.approval`).
     pub require_approval: bool,
+    /// When the team paused every automation; null when it did not (`automations::paused`).
+    pub automations_paused_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }

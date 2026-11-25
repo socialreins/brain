@@ -19,6 +19,15 @@
 //! the owner's prompt and the item's text (`ai_send`, `crate::ai`). They are sends like the others:
 //! the same claim, daily cap and run results, which name the provider and model.
 //!
+//! Safety: an automation may hold a `cooldown_minutes` (one person starts it at most once in
+//! that long) and a `daily_cap` (at most that many runs start a day); a run they stop is stored
+//! `skipped: cooldown` or `skipped: automation_cap`. A team can pause every automation
+//! (`teams.automations_paused_at`): matching items are stored `skipped: paused`, waiting runs
+//! are held until it is switched off again, and a run already between two sends finishes.
+//! Neither a paused, cooled-down nor capped skip counts as the author's first run
+//! (`first_per_author`) or as a run for a cool-down. Comments and DMs from any connected account
+//! on the same network, of any team, never run automations (a loop guard).
+//!
 //! `tag_contact`, an action and a step, sends nothing: it adds a tag to the contact of the
 //! item's author (`inbox::add_tag`) and takes no hit of the daily cap. An automation still needs
 //! a send beside it.
@@ -89,6 +98,21 @@ const MAX_PAGE_CHARS: usize = 100;
 
 pub fn quota_bucket(team_id: Uuid) -> String {
     format!("automation:team:{team_id}")
+}
+
+/// The rolling day of runs one automation may start (`automations.daily_cap`).
+fn auto_bucket(automation: Uuid) -> String {
+    format!("automation:runs:{automation}")
+}
+
+/// Skips that never ran: they leave the author's first run and a cool-down alone.
+const NOT_RAN: &str = "NOT (r.status = 'skipped' AND r.reason IN ('paused', 'cooldown', \
+    'automation_cap'))";
+
+/// `cooldown_minutes` and `daily_cap` as the API takes them: 1 minute to 30 days, 1 to 500.
+pub fn limits_ok(cooldown_minutes: Option<u32>, daily_cap: Option<u32>) -> bool {
+    cooldown_minutes.is_none_or(|m| (1..=43_200).contains(&m))
+        && daily_cap.is_none_or(|c| (1..=500).contains(&c))
 }
 
 /// When an automation acts on an item. Empty lists mean "any". At most one of
@@ -773,10 +797,10 @@ async fn run_matching(
     if autos.is_empty() || item.received_at < account.created_at {
         return Ok(());
     }
-    // Comments by the team's own accounts never run them either, so two automated accounts
-    // cannot answer each other in a loop.
+    // Items by any account connected to SocialReins on this network, of this team or another,
+    // never run them either, so two automated accounts cannot answer each other in a loop.
     let own = social_accounts::Entity::find()
-        .filter(social_accounts::Column::TeamId.eq(item.team_id))
+        .filter(social_accounts::Column::Provider.eq(&item.platform))
         .filter(social_accounts::Column::ExternalId.eq(&item.author_id))
         .one(db)
         .await?;
@@ -804,6 +828,7 @@ async fn run_matching(
         }
     }
     let sets = live_set_ids(db, account.id).await?;
+    let paused = paused(db, item.team_id).await?;
     for a in autos {
         let parsed = (
             serde_json::from_value::<Conditions>(a.conditions.clone()),
@@ -816,9 +841,12 @@ async fn run_matching(
         };
         let first = if cond.first_per_author {
             let stmt = sql(
-                "SELECT NOT EXISTS (SELECT 1 FROM automation_runs r \
-                 JOIN inbox_items i ON i.id = r.inbox_item_id \
-                 WHERE r.automation_id = $1 AND i.author_id = $2 AND i.id <> $3) AS ok",
+                &format!(
+                    "SELECT NOT EXISTS (SELECT 1 FROM automation_runs r \
+                     JOIN inbox_items i ON i.id = r.inbox_item_id \
+                     WHERE r.automation_id = $1 AND i.author_id = $2 AND i.id <> $3 \
+                     AND {NOT_RAN}) AS ok"
+                ),
                 vec![a.id.into(), item.author_id.clone().into(), item.id.into()],
             );
             match db.query_one_raw(stmt).await? {
@@ -882,12 +910,20 @@ async fn run_matching(
             tracing::info!(automation = %a.id, item = %item.id, "no public page, not run");
             continue;
         }
+        if paused {
+            skip_run(db, &a, item, "paused").await?;
+            continue;
+        }
         // The hit pays for the first send: a flow that starts on a tag has not sent yet.
         let sends = steps
             .as_ref()
             .is_none_or(|s| s.first().is_some_and(|x| x.sends().is_some()));
-        let once = cond.first_per_author;
-        let Some(run_id) = claim(db, &a, item, steps.is_some(), sends, once).await? else {
+        let gate = Gate {
+            once: cond.first_per_author,
+            cooldown: a.cooldown_minutes,
+            cap: a.daily_cap,
+        };
+        let Some(run_id) = claim(db, &a, item, steps.is_some(), sends, gate).await? else {
             continue;
         };
         if let Some(steps) = &steps {
@@ -1165,9 +1201,10 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
 async fn claim_due(db: &impl ConnectionTrait) -> Result<Vec<automation_runs::Model>, DbErr> {
     let stmt = sql(
         "UPDATE automation_runs SET status = 'running', updated_at = now() \
-         WHERE id IN (SELECT id FROM automation_runs WHERE status = 'waiting' \
-         AND resume_at <= now() ORDER BY resume_at LIMIT $1 FOR UPDATE SKIP LOCKED) \
-         RETURNING *",
+         WHERE id IN (SELECT id FROM automation_runs r WHERE status = 'waiting' \
+         AND resume_at <= now() AND NOT EXISTS (SELECT 1 FROM teams t WHERE t.id = r.team_id \
+         AND t.automations_paused_at IS NOT NULL) \
+         ORDER BY resume_at LIMIT $1 FOR UPDATE SKIP LOCKED) RETURNING *",
         vec![RESUME_BATCH.into()],
     );
     automation_runs::Entity::find()
@@ -1254,33 +1291,84 @@ pub async fn resume(app: &AppState, run: &automation_runs::Model) -> Result<(), 
     flow.advance(run.id, i, results).await
 }
 
+/// Whether the team paused its automations.
+pub async fn paused(db: &impl ConnectionTrait, team: Uuid) -> Result<bool, DbErr> {
+    let stmt = sql(
+        "SELECT automations_paused_at IS NOT NULL AS paused FROM teams WHERE id = $1",
+        vec![team.into()],
+    );
+    match db.query_one_raw(stmt).await? {
+        Some(r) => r.try_get("", "paused"),
+        None => Ok(false),
+    }
+}
+
+/// Stores a run of `a` on `item` that did not start, `skipped` for `reason`; nothing when the
+/// item has a run of it already.
+async fn skip_run(
+    db: &impl ConnectionTrait,
+    a: &automations::Model,
+    item: &inbox_items::Model,
+    reason: &str,
+) -> Result<(), DbErr> {
+    let stmt = sql(
+        "INSERT INTO automation_runs (id, automation_id, inbox_item_id, team_id, status, reason) \
+         VALUES ($1, $2, $3, $4, 'skipped', $5) ON CONFLICT (automation_id, inbox_item_id) \
+         DO NOTHING",
+        vec![
+            Uuid::now_v7().into(),
+            a.id.into(),
+            item.id.into(),
+            a.team_id.into(),
+            reason.to_owned().into(),
+        ],
+    );
+    db.execute_raw(stmt).await.map(|_| ())
+}
+
+/// What stops a run before it starts: `once` (the author's first run only), `cooldown` (minutes
+/// since the author last started this automation) and `cap` (runs a rolling day).
+#[derive(Clone, Copy, Default)]
+struct Gate {
+    once: bool,
+    cooldown: Option<i32>,
+    cap: Option<i32>,
+}
+
 /// Inserts the run and, when it `sends` first, reserves its hit of the daily cap in one
 /// transaction. `None` when the item already has a run of this automation, or the cap is
-/// reached (the run is then stored `skipped: daily_cap`). A `flow`'s run starts at step 0; a
-/// send there is what the hit pays for, and a later one takes its own (`claim_step`).
+/// reached (the run is then stored `skipped: daily_cap`), or the author is cooling down
+/// (`skipped: cooldown`) or the automation's own daily cap is reached (`skipped:
+/// automation_cap`). A `flow`'s run starts at step 0; a send there is what the hit pays for, and
+/// a later one takes its own (`claim_step`).
 async fn claim(
     db: &DatabaseConnection,
     a: &automations::Model,
     item: &inbox_items::Model,
     flow: bool,
     sends: bool,
-    first_per_author: bool,
+    gate: Gate,
 ) -> Result<Option<Uuid>, DbErr> {
     let txn = db.begin().await?;
     let id = Uuid::now_v7();
-    // Two items by one author run at once (the round and the sweep, two instances): the check
-    // `run_matching` made is taken again under a lock on the automation and author, so only one
-    // becomes the author's first.
-    if first_per_author {
+    // Two items by one author run at once (the round and the sweep, two instances): the checks
+    // `run_matching` made are taken again under a lock on the automation and author, so only one
+    // becomes the author's first, and the cool-down holds.
+    if gate.once || gate.cooldown.is_some() {
         let held = sql(
             "SELECT pg_advisory_xact_lock(hashtextextended($1::text || ':' || $2, 0))",
             vec![a.id.into(), item.author_id.clone().into()],
         );
         txn.execute_raw(held).await?;
+    }
+    if gate.once {
         let taken = sql(
-            "SELECT EXISTS (SELECT 1 FROM automation_runs r \
-             JOIN inbox_items i ON i.id = r.inbox_item_id \
-             WHERE r.automation_id = $1 AND i.author_id = $2 AND i.id <> $3) AS taken",
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM automation_runs r \
+                 JOIN inbox_items i ON i.id = r.inbox_item_id \
+                 WHERE r.automation_id = $1 AND i.author_id = $2 AND i.id <> $3 \
+                 AND {NOT_RAN}) AS taken"
+            ),
             vec![a.id.into(), item.author_id.clone().into(), item.id.into()],
         );
         let taken: bool = match txn.query_one_raw(taken).await? {
@@ -1288,6 +1376,32 @@ async fn claim(
             None => false,
         };
         if taken {
+            return Ok(None);
+        }
+    }
+    if let Some(minutes) = gate.cooldown {
+        // A run that sent nothing (skipped) leaves the person free to try again.
+        let hot = sql(
+            "SELECT EXISTS (SELECT 1 FROM automation_runs r \
+             JOIN inbox_items i ON i.id = r.inbox_item_id \
+             WHERE r.automation_id = $1 AND i.author_id = $2 AND i.platform = $3 \
+             AND i.id <> $4 AND r.status <> 'skipped' \
+             AND r.created_at > now() - make_interval(mins => $5)) AS hot",
+            vec![
+                a.id.into(),
+                item.author_id.clone().into(),
+                item.platform.clone().into(),
+                item.id.into(),
+                minutes.into(),
+            ],
+        );
+        let hot: bool = match txn.query_one_raw(hot).await? {
+            Some(r) => r.try_get("", "hot")?,
+            None => false,
+        };
+        if hot {
+            skip_run(&txn, a, item, "cooldown").await?;
+            txn.commit().await?;
             return Ok(None);
         }
     }
@@ -1307,11 +1421,23 @@ async fn claim(
     if txn.execute_raw(stmt).await?.rows_affected() != 1 {
         return Ok(None);
     }
-    let cap = [(quota_bucket(a.team_id), RUNS_PER_DAY)];
-    if sends && reserve_in(&txn, &cap).await?.is_none() {
+    let mut caps = Vec::new();
+    if sends {
+        caps.push((quota_bucket(a.team_id), RUNS_PER_DAY));
+    }
+    if let Some(cap) = gate.cap {
+        caps.push((auto_bucket(a.id), i64::from(cap)));
+    }
+    if !caps.is_empty() && reserve_in(&txn, &caps).await?.is_none() {
+        // Own cap first: the team's is only the reason when this automation had room.
+        let own = match gate.cap {
+            Some(cap) => bucket_full(&txn, &auto_bucket(a.id), i64::from(cap)).await?,
+            None => false,
+        };
+        let reason = if own { "automation_cap" } else { "daily_cap" };
         let stmt = sql(
-            "UPDATE automation_runs SET status = 'skipped', reason = 'daily_cap' WHERE id = $1",
-            vec![id.into()],
+            "UPDATE automation_runs SET status = 'skipped', reason = $2 WHERE id = $1",
+            vec![id.into(), reason.to_owned().into()],
         );
         txn.execute_raw(stmt).await?;
         txn.commit().await?;
@@ -1319,6 +1445,20 @@ async fn claim(
     }
     txn.commit().await?;
     Ok(Some(id))
+}
+
+/// Whether `bucket` has `cap` hits in the last day.
+async fn bucket_full(db: &impl ConnectionTrait, bucket: &str, cap: i64) -> Result<bool, DbErr> {
+    let stmt = sql(
+        "SELECT count(*) AS n FROM rate_limit_hits \
+         WHERE bucket = $1 AND created_at > now() - interval '1 day'",
+        vec![bucket.to_owned().into()],
+    );
+    let n: i64 = match db.query_one_raw(stmt).await? {
+        Some(r) => r.try_get("", "n")?,
+        None => 0,
+    };
+    Ok(n >= cap)
 }
 
 /// One action's outcome, as stored in a run's `results`.

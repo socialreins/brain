@@ -53,6 +53,12 @@ pub struct Automation {
     /// A public reply sent when a `send_dm` could not go (`dm_not_allowed`, `no_dm_access`)
     /// and no `reply_publicly` went out.
     pub fallback_public_reply: Option<String>,
+    /// One person starts it at most once in this many minutes (a run that sent nothing does not
+    /// count); null: no limit.
+    pub cooldown_minutes: Option<i32>,
+    /// At most this many runs start in a rolling day (more are `skipped: automation_cap`); null:
+    /// only the team's cap.
+    pub daily_cap: Option<i32>,
     pub created_by: Option<Uuid>,
     pub created_at: DateTime<FixedOffset>,
     pub updated_at: DateTime<FixedOffset>,
@@ -107,6 +113,14 @@ pub struct AutomationInput {
     /// Not with `steps` (`422 invalid_fallback`).
     #[serde(default)]
     pub fallback_public_reply: Option<String>,
+    /// One person may start it at most once in this many minutes, 1 to 43200 (30 days). A run
+    /// that sent nothing does not count. Absent or null: no limit (`422 invalid_limits`).
+    #[serde(default)]
+    pub cooldown_minutes: Option<u32>,
+    /// At most this many runs start in a rolling day, 1 to 500. Absent or null: only the
+    /// team's daily cap.
+    #[serde(default)]
+    pub daily_cap: Option<u32>,
 }
 
 fn yes() -> bool {
@@ -122,7 +136,9 @@ pub struct Run {
     /// run is `sent` once every step went out, else it has the status of the send that ended it.
     pub status: String,
     /// Why not everything was sent: `dm_not_allowed`, `no_dm_access`, `rate_limited`,
-    /// `no_public_page`, `daily_cap`, `reconnect_required`, `interrupted`, `bluesky_refused`, ...
+    /// `no_public_page`, `daily_cap` (the team's), `automation_cap` (this automation's),
+    /// `cooldown` (the person started it lately), `paused` (the team paused its automations),
+    /// `reconnect_required`, `interrupted`, `bluesky_refused`, ...
     /// and, for a waiting run of a flow that was switched off or whose steps were changed,
     /// `automation_changed`.
     pub reason: Option<String>,
@@ -172,6 +188,8 @@ fn automation_json(a: automations::Model) -> Automation {
         actions: serde_json::from_value(a.actions).unwrap_or_default(),
         steps: a.steps.and_then(|s| serde_json::from_value(s).ok()),
         fallback_public_reply: a.fallback_public_reply,
+        cooldown_minutes: a.cooldown_minutes,
+        daily_cap: a.daily_cap,
         created_by: a.created_by,
         created_at: a.created_at,
         updated_at: a.updated_at,
@@ -199,6 +217,12 @@ async fn checked(
     let Some(name) = team::name(&input.name) else {
         return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name")));
     };
+    if !rules::limits_ok(input.cooldown_minutes, input.daily_cap) {
+        return Ok(Err(reply(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_limits",
+        )));
+    }
     input.fallback_public_reply = input
         .fallback_public_reply
         .map(|f| f.trim().to_owned())
@@ -351,7 +375,8 @@ async fn show(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> R
 /// Creates an automation; it acts on items received from now on. Owners and admins; at
 /// most 50 per team. Unknown fields, triggers, condition keys and action types are refused
 /// (`422 invalid_body`, `invalid_trigger`, `invalid_conditions`, `invalid_actions`,
-/// `invalid_text`, `invalid_fallback`, and for a flow `invalid_steps` and `actions_and_steps`).
+/// `invalid_text`, `invalid_fallback`, `invalid_limits`, and for a flow `invalid_steps` and
+/// `actions_and_steps`).
 #[utoipa::path(post, path = "/automations", tag = "automations", request_body = AutomationInput,
     responses((status = 201, body = Automation), (status = 401, body = Error),
         (status = 403, body = Error), (status = 409, body = Error), (status = 422, body = Error)))]
@@ -394,6 +419,8 @@ async fn create(
             actions: Set(serde_json::json!(input.actions.unwrap_or_default())),
             steps: Set(input.steps.map(|s| serde_json::json!(s))),
             fallback_public_reply: Set(input.fallback_public_reply),
+            cooldown_minutes: Set(input.cooldown_minutes.map(|m| m as i32)),
+            daily_cap: Set(input.daily_cap.map(|c| c as i32)),
             created_by: Set(Some(t.current.0.id)),
             ..Default::default()
         };
@@ -484,6 +511,14 @@ async fn update(
             .col_expr(
                 automations::Column::FallbackPublicReply,
                 input.fallback_public_reply.into(),
+            )
+            .col_expr(
+                automations::Column::CooldownMinutes,
+                input.cooldown_minutes.map(|m| m as i32).into(),
+            )
+            .col_expr(
+                automations::Column::DailyCap,
+                input.daily_cap.map(|c| c as i32).into(),
             )
             .filter(automations::Column::Id.eq(id))
             .filter(automations::Column::TeamId.eq(t.team.id))

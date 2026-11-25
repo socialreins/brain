@@ -2297,7 +2297,8 @@ mod teams {
             ok.json::<Value>(),
             json!({"id": team["id"], "name": team["name"], "code": team["code"],
                 "slug": null, "public_pages": false, "newsletter": false,
-                "newsletter_sender": null, "require_approval": false, "role": "admin"})
+                "newsletter_sender": null, "require_approval": false,
+                "automations_paused": false, "automations_paused_at": null, "role": "admin"})
         );
         assert_eq!(current(&s, &invited).await["id"], team["id"]);
         assert_eq!(memberships(&db, invited_id).await, 2);

@@ -67,6 +67,11 @@ pub struct Team {
     pub newsletter_sender: Option<Sender>,
     /// A member's scheduled posts wait for an owner or admin (`POST /posts/{id}/approve`).
     pub require_approval: bool,
+    /// Every automation of the team is paused: nothing new runs and waiting flows are held
+    /// (`PATCH /team`).
+    pub automations_paused: bool,
+    /// When they were paused; null when they are not.
+    pub automations_paused_at: Option<DateTime<FixedOffset>>,
     /// The caller's role: `owner`, `admin` or `member`.
     pub role: String,
 }
@@ -173,6 +178,9 @@ pub struct TeamChange {
     /// Whether a member's scheduled posts need an owner's or admin's approval before they
     /// publish. Switching it off releases the posts still waiting. Absent: unchanged.
     pub require_approval: Option<bool>,
+    /// Pauses (`true`) or resumes every automation of the team at once. Items that come while
+    /// paused are never answered later. Absent: unchanged.
+    pub automations_paused: Option<bool>,
     /// Who the team's newsletters are from, with the postal address. `null` clears it. Absent:
     /// unchanged.
     #[serde(default, deserialize_with = "present")]
@@ -245,6 +253,8 @@ pub(crate) fn team_json(team: &teams::Model, role: Role) -> Team {
                 logo: team.newsletter_sender_logo.clone(),
             }),
         require_approval: team.require_approval,
+        automations_paused: team.automations_paused_at.is_some(),
+        automations_paused_at: team.automations_paused_at,
         role: role.as_str().into(),
     }
 }
@@ -598,7 +608,8 @@ async fn show(t: InTeam) -> Response {
 }
 
 /// Renames the current team (`name`) or switches its public pages (`public_pages`) or their
-/// newsletter sign-up (`newsletter`) or post approvals (`require_approval`), or sets or clears
+/// newsletter sign-up (`newsletter`) or post approvals (`require_approval`) or pauses every
+/// automation (`automations_paused`), or sets or clears
 /// its `slug` or who its newsletters are from (`newsletter_sender`, `422 invalid_sender` with
 /// the bad `field`, `name`, `address` or `logo`; a change clears `tested_at` of the team's draft
 /// newsletters). Owners and admins only. A bad slug is `422 invalid_slug` with a `reason`
@@ -639,6 +650,12 @@ async fn rename(
     }
     if let Some(on) = body.require_approval {
         row.require_approval = Set(on);
+    }
+    // Switching on again keeps the first time, so a repeat call does not move it.
+    match (body.automations_paused, t.team.automations_paused_at) {
+        (Some(true), None) => row.automations_paused_at = Set(Some(Utc::now().fixed_offset())),
+        (Some(false), Some(_)) => row.automations_paused_at = Set(None),
+        _ => {}
     }
     let mut sender_changed = false;
     if let Some(from) = body.newsletter_sender {

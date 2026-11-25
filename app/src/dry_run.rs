@@ -86,7 +86,8 @@ pub struct Outcome {
     /// `button_not_named`. (A sample is always its author's first comment or message, so the
     /// first-only conditions pass.)
     pub mismatches: Vec<String>,
-    /// Rules that would stop it: `no_public_page` (a text holds `{page}` and the post has no
+    /// Rules that would stop it: `paused` (the team paused its automations; the steps are still
+    /// listed), `no_public_page` (a text holds `{page}` and the post has no
     /// live page: the automation does not run, so there are no steps), and the Facebook and
     /// Instagram rules of `network_limits` that make a send fail (`meta_one_private_reply`,
     /// `meta_reply_window`; the steps are still listed, as a run would go as far as it can).
@@ -301,6 +302,10 @@ pub async fn test(
     };
     if !out.matched {
         return Ok(out);
+    }
+    // A paused team's automations match but start nothing: the steps are still listed.
+    if rules::paused(db, item.team_id).await? {
+        out.blocks.push("paused".into());
     }
     let provider = [account.provider.as_str()];
     // `invalid_text` here is an estimate for the longest possible name; the real text is checked below.
