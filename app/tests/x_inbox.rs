@@ -1297,7 +1297,10 @@ async fn a_question_is_paid_for_once_and_given_back_when_it_cannot_be_judged() {
     // A question mark costs nothing.
     e.arrive(&who(), "Where can I buy this?").await;
     assert_eq!(ledger().await, (before, 3));
+}
 
+#[tokio::test]
+#[serial]
 async fn actions_like_repost_hide_assign_notify_and_stop_the_rest() {
     let e = env(ALL, false).await;
     let me =
