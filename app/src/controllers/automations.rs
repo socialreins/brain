@@ -44,7 +44,7 @@ pub struct Automation {
     /// When it was last switched on; items received before that never run it.
     pub activated_at: DateTime<FixedOffset>,
     /// `button_clicked`, `comment_received`, `dm_received`, `mention_received`, `new_follower`
-    /// or `story_reply`.
+    /// `story_mention` (Instagram: someone mentioned the account in a story) or `story_reply`.
     pub trigger: String,
     pub conditions: Conditions,
     /// Empty for a flow.
@@ -94,7 +94,7 @@ pub struct AutomationInput {
     /// 1 to 60 characters after trimming.
     pub name: String,
     /// `button_clicked`, `comment_received`, `dm_received`, `mention_received`, `new_follower`
-    /// or `story_reply` (see `Conditions` for the conditions each takes). `reply_publicly`, a
+    /// `story_mention` (Instagram only, no keywords) or `story_reply` (see `Conditions` for the conditions each takes). `reply_publicly`, a
     /// fallback reply and `{page}` are for `comment_received` and `mention_received` only.
     pub trigger: String,
     #[serde(default)]
@@ -903,7 +903,10 @@ async fn test(
     }
     let TestInput { automation, sample } = input;
     let text = sample.text.trim();
-    if text.is_empty() || text.chars().count() > dry_run::MAX_SAMPLE_CHARS {
+    if text.is_empty()
+        || text.chars().count() > dry_run::MAX_SAMPLE_CHARS
+        || sample.age_minutes > dry_run::MAX_SAMPLE_AGE_MINUTES
+    {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_sample");
     }
     let sample = Sample {

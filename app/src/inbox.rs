@@ -67,7 +67,8 @@ const MAX_URL_CHARS: usize = 2048;
 /// the kind's label.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq, Eq)]
 pub struct Attachment {
-    /// `image`, `video`, `sticker`, `gif`, `audio`, `file` or `link`.
+    /// `image`, `video`, `sticker`, `gif`, `audio`, `file`, `link` or `story_mention` (Instagram:
+    /// the DM is someone mentioning the account in their story; the file is the story).
     pub kind: String,
     /// The file itself, or the page a `link` points to.
     pub url: String,
@@ -826,6 +827,8 @@ pub fn fits_on(platform: &str, via: Via, text: &str) -> bool {
         ("instagram", Via::Dm) => some && text.len() <= 1000,
         ("x", Via::Public) => some && socialreins_core::post::check_x_short([text]).is_none(),
         ("x", Via::Dm) => some && chars <= 10_000,
+        ("youtube", Via::Public) => some && chars <= 10_000,
+        ("youtube", Via::Dm) => false,
         _ => fits(via, text),
     }
 }
@@ -901,8 +904,11 @@ async fn send_inner(
     let lined = numbered(text, buttons);
     // `skip` still holds: the lines come after everything it names.
     let text = if meta { text } else { &lined };
-    if !meta && !matches!(account.provider.as_str(), "bluesky" | "x") {
+    if !meta && !matches!(account.provider.as_str(), "bluesky" | "x" | "youtube") {
         return Ok(Err(InboxError::Invalid("unsupported_platform")));
+    }
+    if account.provider == "youtube" && via == Via::Dm {
+        return Ok(Err(InboxError::Invalid("youtube_no_dm")));
     }
     if !fits_for(account, via, text) {
         return Ok(Err(InboxError::Invalid("too_long")));
@@ -919,6 +925,8 @@ async fn send_inner(
         meta_inbox::send(app, account, item, via, text, (buttons, human)).await?
     } else if account.provider == "x" {
         crate::x_inbox::send(app, account, item, via, text).await
+    } else if account.provider == "youtube" {
+        crate::youtube_inbox::send(app, account, item, text).await
     } else {
         send_bluesky(app, account, item, (via, text, skip)).await
     };

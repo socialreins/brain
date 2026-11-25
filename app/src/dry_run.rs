@@ -14,6 +14,7 @@ use crate::{
     connectors::x::inbox::Granted,
     controllers::pages,
     inbox::{self, Button, Via},
+    meta_rules::Clock,
     models::{inbox_items, social_accounts},
     state::AppState,
     x_automation,
@@ -23,6 +24,8 @@ use crate::{
 pub const TESTS_PER_DAY: i64 = 100;
 /// Longest sample text, in characters.
 pub const MAX_SAMPLE_CHARS: usize = 2000;
+/// Oldest a sample may be (`Sample::age_minutes`): 30 days.
+pub const MAX_SAMPLE_AGE_MINUTES: u32 = 30 * 24 * 60;
 
 pub fn quota_bucket(team_id: Uuid) -> String {
     format!("automation_test:team:{team_id}")
@@ -54,6 +57,16 @@ pub struct Sample {
     /// When the sample arrives, for the weekday and hour conditions. Absent: now.
     #[serde(default)]
     pub at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Facebook and Instagram: how many minutes ago the comment, or the person's last message,
+    /// came (0 to 43200, default 0). Meta takes a private reply to a comment within 7 days and
+    /// any other message within 24 hours of the person's last, so an older one shows the refusal
+    /// a real run would get (`outside_window`).
+    #[serde(default)]
+    pub age_minutes: u32,
+    /// Facebook and Instagram, for a comment: a private reply to it already went out. Meta takes
+    /// one per comment, so the DM would be skipped `already_replied`.
+    #[serde(default)]
+    pub private_reply_sent: bool,
 }
 
 fn yes() -> bool {
@@ -114,6 +127,10 @@ pub struct Outcome {
     /// What a `sentiment` condition read the sample as (`positive`, `negative` or `neutral`);
     /// null when the automation has none.
     pub sentiment: Option<String>,
+    /// What a person testing may want to know: `human_agent_by_hand` (Meta's 24 hour window is
+    /// closed, but a person could still answer by hand until 7 days with the HUMAN_AGENT tag,
+    /// which an automation never uses) or `human_agent_off` (the app does not hold that feature).
+    pub notes: Vec<String>,
     pub steps: Vec<PlannedStep>,
     /// On X: what this run would cost, counting the writes that would go out (the read of the
     /// sample itself included). Absent on other networks.
@@ -253,7 +270,11 @@ fn item_of(
         contact_id: None,
         assigned_to: None,
         automated_at: None,
-        attachments: serde_json::json!([]),
+        attachments: if trigger == "story_mention" {
+            serde_json::json!([{"kind": "story_mention", "url": "https://sample.invalid/story"}])
+        } else {
+            serde_json::json!([])
+        },
         moderation: serde_json::json!({}),
         created_at: chrono::Utc::now().fixed_offset(),
     }
@@ -338,6 +359,7 @@ pub async fn test(
         mismatches: mismatches.into_iter().map(Into::into).collect(),
         blocks: Vec::new(),
         sentiment: None,
+        notes: Vec::new(),
         steps: Vec::new(),
         cost: None,
     };
@@ -407,14 +429,20 @@ pub async fn test(
         }
     }
     let room = cap_room(db, item.team_id).await?;
+    let meta = matches!(account.provider.as_str(), "facebook" | "instagram")
+        .then(|| Clock::new(trigger, sample.age_minutes, sample.private_reply_sent));
     let walked = Walk {
         flow: steps.is_some(),
         fallback,
         page,
         room,
         dm_open: sample.author_can_dm,
+        meta,
+        human_agent: app.meta.human_agent,
     };
-    out.steps = walk(app, account, &item, &parts, walked).await;
+    let (planned, notes) = walk(app, account, &item, &parts, walked).await;
+    out.steps = planned;
+    out.notes = notes;
     if account.provider == "x" {
         let acts = |k: &str| matches!(k, "like_comment" | "hide_comment" | "repost");
         let writes = out.steps.iter().filter(|s| {
@@ -436,6 +464,9 @@ struct Walk<'a> {
     room: i64,
     /// Bluesky: the author could take our DM (`Sample::author_can_dm`).
     dm_open: bool,
+    /// Facebook and Instagram: Meta's windows (`meta_rules`).
+    meta: Option<Clock>,
+    human_agent: bool,
 }
 
 async fn walk(
@@ -449,8 +480,11 @@ async fn walk(
         page,
         room,
         dm_open,
+        mut meta,
+        human_agent,
     }: Walk<'_>,
-) -> Vec<PlannedStep> {
+) -> (Vec<PlannedStep>, Vec<String>) {
+    let mut notes: Vec<String> = Vec::new();
     let mut sends = 0;
     let mut out: Vec<PlannedStep> = Vec::new();
     let mut stopped = false;
@@ -475,10 +509,15 @@ async fn walk(
                 ..step("tag_contact", "would_tag")
             }),
             Part::Effect(kind) => out.push(effect_step(kind, item, account, app).await),
-            Part::Wait(minutes, reply) => out.push(PlannedStep {
-                wait_minutes: Some(*minutes),
-                ..step(wait_kind(*reply), "would_wait")
-            }),
+            Part::Wait(minutes, reply) => {
+                if let Some(clock) = meta.as_mut() {
+                    clock.wait(*minutes, *reply);
+                }
+                out.push(PlannedStep {
+                    wait_minutes: Some(*minutes),
+                    ..step(wait_kind(*reply), "would_wait")
+                });
+            }
             Part::Send {
                 kind,
                 via,
@@ -494,7 +533,24 @@ async fn walk(
                     }
                 } else {
                     let send = (*kind, *via, *template, *ai, *buttons);
-                    plan_send(app, account, item, send, (page.as_deref(), dm_open)).await
+                    let planned =
+                        plan_send(app, account, item, send, (page.as_deref(), dm_open)).await;
+                    // As `send` does: the text is checked first, then Meta's windows, and a private
+                    // reply is used up only once it would go out.
+                    let refusal = meta
+                        .as_mut()
+                        .filter(|_| *via == Via::Dm && planned.status == "would_send")
+                        .and_then(|c| c.dm(human_agent).err());
+                    match refusal {
+                        Some(no) => {
+                            notes.extend(no.note.map(String::from).filter(|n| !notes.contains(n)));
+                            PlannedStep {
+                                reason: Some(no.reason.into()),
+                                ..step(kind, "would_skip")
+                            }
+                        }
+                        None => planned,
+                    }
                 };
                 stopped = flow && planned.status != "would_send";
                 out.push(planned);
@@ -504,7 +560,10 @@ async fn walk(
     let refused = |r: &PlannedStep| {
         matches!(r.kind.as_str(), "send_dm" | "ai_send_dm")
             && r.status != "would_send"
-            && matches!(r.reason.as_deref(), Some("no_dm_access" | "dm_not_allowed"))
+            && matches!(
+                r.reason.as_deref(),
+                Some("no_dm_access" | "dm_not_allowed" | "outside_window" | "already_replied")
+            )
     };
     let replied = |r: &PlannedStep| {
         matches!(r.kind.as_str(), "reply_publicly" | "ai_reply_publicly")
@@ -528,7 +587,7 @@ async fn walk(
         };
         out.push(planned);
     }
-    out
+    (out, notes)
 }
 
 /// A mail, an assignment, a moderation call or a stop as it would go: a moderation call the

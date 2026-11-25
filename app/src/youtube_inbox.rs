@@ -35,7 +35,7 @@ use uuid::Uuid;
 use crate::{
     automations,
     connectors::{
-        bluesky::PostError,
+        bluesky::{InboxError, PostError},
         youtube::{is_quota, Comment, Thread, QUOTA_MESSAGE},
     },
     controllers,
@@ -53,6 +53,9 @@ pub const MIN_DAILY_UNITS: i32 = 20;
 pub const MAX_DAILY_UNITS: i32 = 2000;
 /// What a reply, a moderation call or a delete costs.
 pub const WRITE_UNITS: i32 = 50;
+/// Most units a channel's replies and moderation may cost in a Pacific day (40 calls), so a member
+/// toggling a button cannot spend the Google project's quota.
+pub const MAX_WRITE_UNITS: i32 = 2000;
 /// Pages of 100 threads one tick may read, and longest it may take, for one channel.
 const MAX_PAGES: usize = 5;
 const READ_LIMIT: Wait = Wait::from_secs(20);
@@ -239,8 +242,10 @@ pub async fn shared_used(db: &impl ConnectionTrait) -> Result<i64, DbErr> {
     r.map_or(Ok(0), |r| r.try_get("", "n"))
 }
 
-/// Counts what a write cost the channel today (shown, not limited).
-pub async fn charge_write(db: &impl ConnectionTrait, account: Uuid) {
+/// Reserves what one write costs the channel today, in one statement so two writes at once cannot
+/// both pass the budget: `false` when the channel's `MAX_WRITE_UNITS` a Pacific day is spent. The
+/// units stay spent when YouTube then refuses, since it charges a refused call too.
+async fn reserve_write(db: &impl ConnectionTrait, account: Uuid) -> Result<bool, DbErr> {
     let stmt = sql(
         &format!(
             "INSERT INTO youtube_inbox (social_account_id, write_units_today) VALUES ($1, $2) \
@@ -249,13 +254,14 @@ pub async fn charge_write(db: &impl ConnectionTrait, account: Uuid) {
                  ELSE youtube_inbox.write_units_today END) + $2, \
                units_today = CASE WHEN youtube_inbox.period < {TODAY} THEN 0 \
                  ELSE youtube_inbox.units_today END, \
-               period = {TODAY}"
+               period = {TODAY} \
+             WHERE (CASE WHEN youtube_inbox.period < {TODAY} THEN 0 \
+               ELSE youtube_inbox.write_units_today END) + $2 <= $3 \
+             RETURNING 1 AS ok"
         ),
-        vec![account.into(), WRITE_UNITS.into()],
+        vec![account.into(), WRITE_UNITS.into(), MAX_WRITE_UNITS.into()],
     );
-    if let Err(e) = db.execute_raw(stmt).await {
-        tracing::warn!(error = %e, "youtube write units not counted");
-    }
+    Ok(db.query_one_raw(stmt).await?.is_some())
 }
 
 /// Why a round stopped.
@@ -766,4 +772,228 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
         let _ = read.await;
     }
     Ok(())
+}
+
+// ---- What a person does to a comment: reply, hold, reject, delete our reply. Each is one call
+// (50 units) and never retried; what it cost is counted on the channel (`reserve_write`).
+
+/// YouTube's refusal as the inbox words it.
+fn refused(e: PostError) -> InboxError {
+    match e {
+        PostError::Reconnect | PostError::Denied => InboxError::YouTubeReconnect,
+        PostError::Failed(why) => InboxError::YouTube(why),
+    }
+}
+
+async fn token_of(app: &AppState, account: &social_accounts::Model) -> Result<String, InboxError> {
+    match controllers::youtube::fresh_token(app, account).await {
+        Err(PostError::Reconnect) => {
+            crate::expiry::flag_reconnect(&app.db, account.id).await;
+            Err(InboxError::YouTubeReconnect)
+        }
+        other => other.map_err(refused),
+    }
+}
+
+fn flag(item: &inbox_items::Model, key: &str) -> bool {
+    item.moderation[key].as_bool() == Some(true)
+}
+
+/// `reserve_write` as the inbox words it.
+async fn reserve(app: &AppState, account: &social_accounts::Model) -> Result<(), InboxError> {
+    match reserve_write(&app.db, account.id).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(InboxError::Invalid("youtube_write_budget")),
+        Err(e) => {
+            tracing::error!(error = %e, "youtube write budget failed");
+            Err(InboxError::YouTube(
+                "This could not be sent. Try again.".into(),
+            ))
+        }
+    }
+}
+
+/// Replies publicly to `item` as the channel, once: under its top-level comment (YouTube replies
+/// are one level deep, so a reply to a reply goes under the same top-level comment, and a reply
+/// id is `<top-level id>.<suffix>`). A DM does not exist on YouTube. The id of what went out.
+pub async fn send(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    text: &str,
+) -> Result<String, InboxError> {
+    if item.kind != "comment" {
+        return Err(InboxError::Invalid("not_repliable"));
+    }
+    let top = item.remote_id.split('.').next().unwrap_or(&item.remote_id);
+    // A rejected comment, or a reply under one, is hidden for good: YouTube would refuse (and charge).
+    let parent = app
+        .db
+        .query_one_raw(sql(
+            "SELECT moderation FROM inbox_items WHERE social_account_id = $1 AND remote_id = $2",
+            vec![account.id.into(), top.into()],
+        ))
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "youtube parent read failed");
+            InboxError::YouTube("This could not be sent. Try again.".into())
+        })?
+        .and_then(|r| r.try_get::<serde_json::Value>("", "moderation").ok());
+    if flag(item, "rejected") || parent.is_some_and(|m| m["rejected"].as_bool() == Some(true)) {
+        return Err(InboxError::Invalid("rejected"));
+    }
+    let token = token_of(app, account).await?;
+    reserve(app, account).await?;
+    let sent = app.youtube.reply(&token, top, text).await;
+    sent.map_err(refused)
+}
+
+/// What a person can do to a comment of a channel's video, besides reply.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Moderate {
+    /// Hide it until the owner approves it (`heldForReview`).
+    Hold,
+    /// Show a held comment again.
+    Publish,
+    /// Hide it for good.
+    Reject,
+    /// Hide it for good and ban its author from the channel's comments.
+    Ban,
+}
+
+impl Moderate {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "hold" => Some(Self::Hold),
+            "publish" => Some(Self::Publish),
+            "reject" => Some(Self::Reject),
+            "ban" => Some(Self::Ban),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hold => "hold",
+            Self::Publish => "publish",
+            Self::Reject => "reject",
+            Self::Ban => "ban",
+        }
+    }
+}
+
+/// The actions that work on `item` now: hold or publish again, reject, and reject with a ban.
+/// Nothing for a rejected comment (YouTube never shows it again) or an item that is no comment.
+pub fn moderations(item: &inbox_items::Model) -> Vec<&'static str> {
+    if item.platform != "youtube" || item.kind != "comment" || flag(item, "rejected") {
+        return Vec::new();
+    }
+    vec![
+        if flag(item, "held") {
+            "publish"
+        } else {
+            "hold"
+        },
+        "reject",
+        "ban",
+    ]
+}
+
+/// Moderates a comment on YouTube and keeps what was done on the item (a rejected comment is also
+/// `done`). The inner `Err` says why nothing was done.
+pub async fn moderate(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    action: Moderate,
+) -> Result<Result<(), InboxError>, DbErr> {
+    // Only what changes something: holding a held comment would spend 50 units for nothing.
+    if !moderations(item).contains(&action.as_str()) {
+        return Ok(Err(InboxError::Invalid("not_supported")));
+    }
+    let token = match token_of(app, account).await {
+        Ok(t) => t,
+        Err(e) => return Ok(Err(e)),
+    };
+    if let Err(e) = reserve(app, account).await {
+        return Ok(Err(e));
+    }
+    let (status, ban, kept) = match action {
+        Moderate::Hold => ("heldForReview", false, serde_json::json!({"held": true})),
+        Moderate::Publish => ("published", false, serde_json::json!({"held": false})),
+        Moderate::Reject => ("rejected", false, serde_json::json!({"rejected": true})),
+        Moderate::Ban => (
+            "rejected",
+            true,
+            serde_json::json!({"rejected": true, "banned": true}),
+        ),
+    };
+    let done = app
+        .youtube
+        .moderate(&token, &item.remote_id, status, ban)
+        .await;
+    // A comment that is gone (its author deleted it) is as hidden as a rejected one. A ban needs
+    // the comment, so it is never taken as done.
+    let gone = matches!(&done, Err(PostError::Failed(w)) if w.contains("is gone on YouTube"))
+        && action == Moderate::Reject;
+    if let (Err(e), false) = (done, gone) {
+        return Ok(Err(refused(e)));
+    }
+    let state = if action == Moderate::Reject || action == Moderate::Ban {
+        ", state = 'done'"
+    } else {
+        ""
+    };
+    let stmt = sql(
+        &format!(
+            "UPDATE inbox_items SET moderation = moderation || $2::jsonb{state} WHERE id = $1"
+        ),
+        vec![item.id.into(), kept.into()],
+    );
+    app.db.execute_raw(stmt).await?;
+    Ok(Ok(()))
+}
+
+/// Deletes a public reply of the channel that went out from this inbox (`reply` is one of the
+/// item's replies): only its author, the channel, can. The reply is then gone from the item, and
+/// the item is unanswered again when it was the last one.
+pub async fn delete_reply(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    reply: Uuid,
+) -> Result<Result<(), InboxError>, DbErr> {
+    let found = app
+        .db
+        .query_one_raw(sql(
+            "SELECT remote_id FROM inbox_replies WHERE id = $1 AND inbox_item_id = $2 \
+             AND kind = 'public'",
+            vec![reply.into(), item.id.into()],
+        ))
+        .await?;
+    let remote: Option<String> = found.map_or(Ok(None), |r| r.try_get("", "remote_id"))?;
+    let Some(remote) = remote else {
+        return Ok(Err(InboxError::Invalid("reply_not_found")));
+    };
+    let token = match token_of(app, account).await {
+        Ok(t) => t,
+        Err(e) => return Ok(Err(e)),
+    };
+    if let Err(e) = reserve(app, account).await {
+        return Ok(Err(e));
+    }
+    let done = app.youtube.delete_comment(&token, &remote).await;
+    if let Err(e) = done {
+        return Ok(Err(refused(e)));
+    }
+    // One statement, so the reply and the item's answered mark never disagree.
+    app.db
+        .execute_raw(sql(
+            "WITH d AS (DELETE FROM inbox_replies WHERE id = $1) \
+             UPDATE inbox_items SET replied_at = (SELECT max(created_at) FROM inbox_replies \
+             WHERE inbox_item_id = $2 AND id <> $1) WHERE id = $2",
+            vec![reply.into(), item.id.into()],
+        ))
+        .await?;
+    Ok(Ok(()))
 }
