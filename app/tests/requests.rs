@@ -15531,13 +15531,10 @@ mod teams {
                     };
                     if let Some((db, account, _)) = due {
                         m.revoked.lock().unwrap().push(who.to_owned());
-                        sea_orm::ConnectionTrait::execute_unprepared(
-                            &db,
-                            &format!(
-                                "UPDATE social_accounts SET token_expires_at = now() + \
+                        db.execute_unprepared(&format!(
+                            "UPDATE social_accounts SET token_expires_at = now() + \
                              interval '1 minute' WHERE id = '{account}'"
-                            ),
-                        )
+                        ))
                         .await
                         .unwrap();
                     }
