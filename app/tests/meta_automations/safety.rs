@@ -138,13 +138,14 @@ async fn items_from_any_connected_account_on_the_network_never_run_automations()
     let a = e.automation(reply_all(json!({}))).await;
     // Another team's Page, and one of this team's own.
     let other = env().await;
-    let mine = new_account(&e.state, &e.db, e.team, "facebook", "5551").await;
-    let theirs = new_account(&e.state, &e.db, other.team, "facebook", "5552").await;
+    let (one, two, three) = (digits(), digits(), digits());
+    let mine = new_account(&e.state, &e.db, e.team, "facebook", &one).await;
+    let theirs = new_account(&e.state, &e.db, other.team, "facebook", &two).await;
     for who in [&mine.external_id, &theirs.external_id] {
         let i = e.item("comment", who, "hello", 0).await;
         assert!(e.run(&a, i.id).await.is_none(), "{who}");
     }
-    let stranger = e.item("comment", "5553", "hello", 0).await;
+    let stranger = e.item("comment", &three, "hello", 0).await;
     assert_eq!(e.run(&a, stranger.id).await.unwrap().0, "sent");
 }
 
@@ -209,8 +210,11 @@ async fn a_skip_that_never_ran_leaves_the_first_comment_and_the_cool_down_alone(
     let (_, reason) = e.run(&a, capped.id).await.unwrap();
     assert_eq!(reason.as_deref(), Some("automation_cap"));
     // Room again: person 2 is still new to the automation, so their next comment is a first.
-    e.sql("DELETE FROM rate_limit_hits WHERE bucket LIKE 'automation:%'")
-        .await;
+    e.sql(&format!(
+        "DELETE FROM rate_limit_hits WHERE bucket IN ('automation:runs:{a}', '{}')",
+        automations::quota_bucket(e.team)
+    ))
+    .await;
     let again = e.item("comment", "2", "hi again", 0).await;
     assert_eq!(e.run(&a, again.id).await.unwrap().0, "sent");
 }
@@ -269,7 +273,8 @@ async fn a_test_reports_that_the_team_is_paused() {
 async fn an_author_id_on_another_network_is_not_one_of_our_accounts() {
     let e = env().await;
     let a = e.automation(reply_all(json!({}))).await;
-    new_account(&e.state, &e.db, e.team, "bluesky", "5551").await;
-    let i = e.item("comment", "5551", "hello", 0).await;
+    let id = digits();
+    new_account(&e.state, &e.db, e.team, "bluesky", &id).await;
+    let i = e.item("comment", &id, "hello", 0).await;
     assert_eq!(e.run(&a, i.id).await.unwrap().0, "sent");
 }

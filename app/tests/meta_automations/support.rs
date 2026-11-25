@@ -296,3 +296,8 @@ pub fn reply_all(extra: Value) -> Value {
     }
     body
 }
+
+/// A fresh Graph-style id: accounts and people outlive a test in the shared database.
+pub fn digits() -> String {
+    (Uuid::now_v7().as_u128() % 1_000_000_000_000_000).to_string()
+}
