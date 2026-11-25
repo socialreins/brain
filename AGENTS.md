@@ -151,6 +151,12 @@ cargo run -p socialreins-brain
   and remote id), so a reread adds nothing; a refused saved cursor starts the read over. Trade-off:
   while a long backlog is read back, items newer than the round's first page wait until it ends.
   Only the 50 latest conversations are listed, so older ones with news past that are never seen.
+  A page or conversation that fails after an earlier one (`Notifications::stopped`,
+  `Messages::stopped`) keeps what the earlier ones gave and resumes at the failed one; a 429
+  also sets `inbox_retry_at` (5 minutes) so the tick skips the account, a refused password sets
+  `inbox_error_at` and flags the account for reconnecting (`inbox::read_failed`). A public reply
+  first asks `getPosts` (`Bluesky::can_reply`) whether the post still shows, its author blocks
+  the account or its threadgate bars replies, and sends nothing when so.
 - Pinterest per-post settings (`posts.pinterest`, `connectors::pinterest::Options`: `board_id`, `title`, `link`): validated on save by `post::check_pinterest`, and `posts::pinterest_board` refuses a post with no board named and a Pinterest account of the set without `meta.default_board_id` (no call). `Publisher::publish_with_pinterest` hands them to `Pinterest::pin`, which sends images by brain's `/media/` link and a video as a registered form upload that it polls; the pin's alt text is the first image's, cut to 500. The token renews under a row lock like TikTok's (`controllers::pinterest::renew`), and a daily job (`refresh_tokens`) keeps the 60-day refresh token alive. Pinterest has no inbox, automation or analytics here.
 - `app/src/meta_inbox.rs` and `controllers/meta_webhook.rs`: `/webhooks/meta`. The signature of
   the raw body is checked before anything is parsed; items are stored before the `200` (unique

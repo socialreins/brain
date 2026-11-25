@@ -44,6 +44,8 @@ static ACCOUNT_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(8));
 /// After the platform refuses the stored password, ingest leaves the account alone this long,
 /// so a revoked password is not tried every minute.
 const PAUSE_MINUTES: i64 = 60;
+/// After the platform rate limits an account's read, the tick leaves it alone this long.
+const RETRY_MINUTES: i64 = 5;
 /// Longest item text kept.
 const MAX_TEXT_CHARS: usize = 10_000;
 /// Bluesky chat limits a message to 1000 graphemes and 10000 bytes.
@@ -315,6 +317,9 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
                 .add(social_accounts::Column::InboxErrorAt.is_null())
                 .add(social_accounts::Column::InboxErrorAt.lt(paused)),
         )
+        .filter(sea_orm::sea_query::Expr::cust(
+            "(inbox_retry_at IS NULL OR inbox_retry_at < now())",
+        ))
         .all(&app.db)
         .await?;
     let reads: Vec<_> = accounts
@@ -372,6 +377,33 @@ pub async fn ingest(app: &AppState, account: social_accounts::Model) -> Result<(
         run_fresh(app, &account, &fresh).await;
     }
     Ok(())
+}
+
+/// What a failed read means for the account. A refused password pauses it for an hour and flags
+/// it for reconnecting; a rate limit leaves it alone for `RETRY_MINUTES`. True when the round
+/// should end there.
+async fn read_failed(
+    db: &DatabaseConnection,
+    account: &social_accounts::Model,
+    e: &InboxError,
+) -> Result<bool, DbErr> {
+    let stmt = match e {
+        InboxError::Reconnect => sql(
+            "UPDATE social_accounts SET inbox_error_at = now() WHERE id = $1",
+            vec![account.id.into()],
+        ),
+        InboxError::RateLimited => sql(
+            "UPDATE social_accounts SET inbox_retry_at = now() + make_interval(mins => $2) \
+             WHERE id = $1",
+            vec![account.id.into(), (RETRY_MINUTES as i32).into()],
+        ),
+        _ => return Ok(false),
+    };
+    db.execute_raw(stmt).await?;
+    if *e == InboxError::Reconnect {
+        crate::expiry::flag_reconnect(db, account.id).await;
+    }
+    Ok(true)
 }
 
 /// The storing half of `ingest`: the account as it now is and its new items, or `None` when
@@ -442,15 +474,13 @@ async fn store_new(
                 ),
             };
             db.execute_raw(stmt).await?;
-        }
-        Err(InboxError::Reconnect) => {
-            let stmt = sql(
-                "UPDATE social_accounts SET inbox_error_at = now() WHERE id = $1",
-                vec![account.id.into()],
-            );
-            db.execute_raw(stmt).await?;
-            crate::expiry::flag_reconnect(db, account.id).await;
-            return Ok(None);
+            if let Some(e) = read.stopped {
+                // What the earlier pages gave is stored and the cursor sits on the failed page.
+                tracing::warn!(code = e.code(), account = %account.id, "notifications stopped, progress kept");
+                if read_failed(db, &account, &e).await? {
+                    return Ok(Some((account, fresh)));
+                }
+            }
         }
         Err(InboxError::Refused { status: 400, .. }) if cursor.is_some() => {
             // The saved page is gone: read from the newest again. What was stored stays, and
@@ -463,7 +493,12 @@ async fn store_new(
             );
             db.execute_raw(stmt).await?;
         }
-        Err(e) => tracing::warn!(code = e.code(), account = %account.id, "notifications failed"),
+        Err(e) => {
+            tracing::warn!(code = e.code(), account = %account.id, "notifications failed");
+            if read_failed(db, &account, &e).await? {
+                return Ok(Some((account, fresh)));
+            }
+        }
     }
     let msince = account.messages_seen_at.unwrap_or(floor).max(floor);
     let dm_access = match app
@@ -489,6 +524,10 @@ async fn store_new(
                 ),
             };
             db.execute_raw(stmt).await?;
+            if let Some(e) = read.stopped {
+                tracing::warn!(code = e.code(), account = %account.id, "messages stopped, progress kept");
+                read_failed(db, &account, &e).await?;
+            }
             true
         }
         // An outage (5xx) keeps what was known; only a refusal means no access.
@@ -500,6 +539,7 @@ async fn store_new(
         ) => false,
         Err(e) => {
             tracing::warn!(code = e.code(), account = %account.id, "messages failed");
+            read_failed(db, &account, &e).await?;
             account.dm_access
         }
     };
@@ -809,7 +849,13 @@ pub async fn send_with(
     };
     let remote_id = match sent {
         Ok(id) => id,
-        Err(e) => return Ok(Err(e)),
+        Err(e) => {
+            // A refused password is the account's state, not this send's: say so everywhere.
+            if e == InboxError::Reconnect && !meta {
+                crate::expiry::flag_reconnect(&app.db, account.id).await;
+            }
+            return Ok(Err(e));
+        }
     };
     let reply = inbox_replies::ActiveModel {
         id: sea_orm::ActiveValue::Set(Uuid::now_v7()),
@@ -862,6 +908,7 @@ async fn send_bluesky(
                 .zip(item.root_remote_cid.as_deref());
             match (item.kind.as_str(), parent, root) {
                 ("comment" | "mention", Some(parent), Some(root)) => {
+                    app.bluesky.can_reply(&c, parent.0).await?;
                     app.bluesky.reply(&c, text, skip, parent, root).await
                 }
                 _ => Err(InboxError::Invalid("not_repliable")),
