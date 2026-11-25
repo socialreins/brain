@@ -64,6 +64,7 @@ mod m20261221_000001_post_notices;
 mod m20261222_000001_repeat_ended_notice;
 mod m20261223_000001_media_alt;
 mod m20261224_000001_inbox_resume;
+mod m20261225_000001_waitlist_name;
 
 pub struct Migrator;
 
@@ -135,6 +136,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261222_000001_repeat_ended_notice::Migration),
             Box::new(m20261223_000001_media_alt::Migration),
             Box::new(m20261224_000001_inbox_resume::Migration),
+            Box::new(m20261225_000001_waitlist_name::Migration),
             // inject-above (do not remove this comment)
         ]
     }

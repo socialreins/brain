@@ -1,6 +1,7 @@
 //! The socialreins.com waitlist: `POST /v1/waitlist` joins and emails a confirmation link to the
-//! web app, which posts its token to `POST /v1/waitlist/verify`, `GET /v1/waitlist/count` counts every signup, and
-//! `GET /v1/admin/waitlist` lists them for `ADMIN_EMAILS` (approve and delete: `admin.rs`).
+//! web app, which posts its token to `POST /v1/waitlist/verify`, `POST /v1/waitlist/name` adds an
+//! optional name for the signup that just joined, `GET /v1/waitlist/count` counts the verified
+//! signups, and `GET /v1/admin/waitlist` lists them for `ADMIN_EMAILS` (approve and delete: `admin.rs`).
 use std::time::{Duration as StdDuration, Instant};
 
 use axum::{
@@ -31,6 +32,11 @@ use crate::{
 };
 
 const MAX_SOURCE_LEN: usize = 100;
+const MAX_NAME_LEN: usize = 80;
+/// How long after joining the `name_token` of `POST /v1/waitlist` may set the name.
+const NAME_WINDOW_HOURS: i64 = 1;
+/// An unverified signup older than this is stale: the admin list can leave it out.
+const STALE_DAYS: i64 = 30;
 /// An unverified email gets at most one confirmation email per hour, however often it signs up.
 const RESEND_AFTER_HOURS: i64 = 1;
 /// Confirmation emails across all signups per rolling 24 hours, since the form has no captcha.
@@ -60,6 +66,16 @@ pub struct Status {
 }
 
 #[derive(Serialize, ToSchema)]
+pub struct Joined {
+    /// Always `ok`: the response never says whether the email was already on the list.
+    pub status: String,
+    /// Lets the browser that just joined add a name with `POST /v1/waitlist/name` within an
+    /// hour. Always present and shaped the same; for an email already on the list it opens
+    /// nothing, so no one can change another person's name.
+    pub name_token: String,
+}
+
+#[derive(Serialize, ToSchema)]
 pub struct Error {
     /// A machine-readable code. Every route may answer `invalid_json`, `invalid_body`,
     /// `unsupported_media_type`, `payload_too_large` or `internal`; the others are per route,
@@ -85,12 +101,12 @@ pub(crate) fn rejected(r: &JsonRejection) -> Reply {
     error(r.status(), code)
 }
 
-/// `200 {"status":"ok"}` for a new email and a known one alike. A new or unverified email gets a
+/// `200 {"status":"ok","name_token":...}` for a new email and a known one alike. A new or unverified email gets a
 /// confirmation link by email, at most once an hour, 20 a day per IP and 500 a day overall; the mail goes
 /// out after the reply, so neither the body nor the timing says whether the email was already on
 /// the list.
 #[utoipa::path(post, path = "/waitlist", tag = "waitlist", request_body = NewSignup,
-    responses((status = 200, body = Status), (status = 400, body = Error),
+    responses((status = 200, body = Joined), (status = 400, body = Error),
         (status = 413, body = Error), (status = 415, body = Error), (status = 422, body = Error),
         (status = 429, body = Error), (status = 500, body = Error)))]
 async fn join(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Request) -> Reply {
@@ -115,7 +131,8 @@ async fn join(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Requ
     {
         return error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_source");
     }
-    let secret = match add(&app, &email, source).await {
+    let name_token = token::new();
+    let secret = match join_row(&app, &email, source, Some(token::hash(&name_token))).await {
         Ok(secret) => secret,
         Err(e) => {
             tracing::error!(error = %e, "waitlist join failed");
@@ -126,7 +143,10 @@ async fn join(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Requ
         // A failed mail keeps the row and the ok reply; the error carries no email or token.
         tokio::spawn(async move { send_confirmation(&app, ip, &email, &secret, JOINED).await });
     }
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "ok", "name_token": name_token})),
+    )
 }
 
 /// The confirmation email's first line after `POST /v1/waitlist`.
@@ -142,10 +162,21 @@ pub(crate) async fn add(
     email: &str,
     source: Option<String>,
 ) -> Result<Option<String>, sea_orm::DbErr> {
+    join_row(app, email, source, None).await
+}
+
+/// `add`, storing `name_token_hash` on a new row only.
+async fn join_row(
+    app: &AppState,
+    email: &str,
+    source: Option<String>,
+    name_token_hash: Option<String>,
+) -> Result<Option<String>, sea_orm::DbErr> {
     let row = waitlist_signups::ActiveModel {
         id: Set(Uuid::now_v7()),
         email: Set(email.to_owned()),
         source: Set(source),
+        name_token_hash: Set(name_token_hash),
         ..Default::default()
     };
     // DO NOTHING on a known email: the first signup (and its source) wins, and the reply is the same.
@@ -308,13 +339,71 @@ async fn verify(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Re
     }
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct NameBody {
+    /// The `name_token` `POST /v1/waitlist` answered.
+    pub token: Option<String>,
+    /// 1 to 80 characters after trimming, no control characters.
+    pub name: Option<String>,
+}
+
+/// Adds the name of the signup that just joined, with the `name_token` its join answered, within
+/// an hour of joining. `200 {"status":"ok"}` for any well-formed token, also one that opens
+/// nothing (an email that was already on the list, or an expired token), so the answer reveals
+/// nothing about the list. `422 invalid_link` for a malformed token, `422 invalid_name` for a
+/// name that is empty, over 80 characters or holds a control character. Shares the waitlist IP
+/// limit.
+#[utoipa::path(post, path = "/waitlist/name", tag = "waitlist", request_body = NameBody,
+    responses((status = 200, body = Status), (status = 400, body = Error),
+        (status = 413, body = Error), (status = 415, body = Error), (status = 422, body = Error),
+        (status = 429, body = Error), (status = 500, body = Error)))]
+async fn set_name(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Request) -> Reply {
+    use waitlist_signups::Column;
+    if !app.waitlist_limiter.allow(ip) {
+        return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    }
+    let body = match Json::<NameBody>::from_request(request, &()).await {
+        Ok(Json(body)) => body,
+        Err(r) => return rejected(&r),
+    };
+    let secret = body.token.unwrap_or_default();
+    if secret.len() != 64 || !secret.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_link");
+    }
+    let Some(name) = body.name.as_deref().and_then(clean_name) else {
+        return error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name");
+    };
+    let window = Utc::now() - Duration::hours(NAME_WINDOW_HOURS);
+    let saved = waitlist_signups::Entity::update_many()
+        .col_expr(Column::Name, Expr::value(name))
+        .filter(Column::NameTokenHash.eq(token::hash(&secret)))
+        .filter(Column::CreatedAt.gt(window.fixed_offset()))
+        .exec(&app.db)
+        .await;
+    match saved {
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))),
+        Err(e) => {
+            tracing::error!(error = %e, "waitlist name failed");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        }
+    }
+}
+
+/// `name` trimmed, if it is 1 to 80 characters without a control character.
+fn clean_name(name: &str) -> Option<String> {
+    let name = name.trim();
+    let len = name.chars().count();
+    ((1..=MAX_NAME_LEN).contains(&len) && !name.chars().any(char::is_control))
+        .then(|| name.to_owned())
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct Count {
-    /// Every signup, verified or not. Up to 30 seconds old.
+    /// Verified signups. Up to 30 seconds old.
     pub count: u64,
 }
 
-/// The number of signups, for the landing page. Cached in memory for 30 seconds.
+/// The number of verified signups, for the landing page. Cached in memory for 30 seconds.
 #[utoipa::path(get, path = "/waitlist/count", tag = "waitlist",
     responses((status = 200, body = Count), (status = 500, body = Error)))]
 async fn count(State(app): State<AppState>) -> Response {
@@ -325,7 +414,11 @@ async fn count(State(app): State<AppState>) -> Response {
     if let Some((_, n)) = cached.filter(|(at, _)| at.elapsed() < COUNT_TTL) {
         return Json(Count { count: n }).into_response();
     }
-    let n = match waitlist_signups::Entity::find().count(&app.db).await {
+    let n = match waitlist_signups::Entity::find()
+        .filter(waitlist_signups::Column::VerifiedAt.is_not_null())
+        .count(&app.db)
+        .await
+    {
         Ok(n) => n,
         Err(e) => return internal(e, "waitlist count"),
     };
@@ -341,6 +434,8 @@ pub struct AdminQuery {
     pub verified: Option<bool>,
     /// Only signups whose email contains this, in any case.
     pub q: Option<String>,
+    /// `true` leaves out unverified signups older than 30 days.
+    pub hide_stale: Option<bool>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -348,6 +443,8 @@ pub struct AdminSignup {
     pub id: Uuid,
     pub email: String,
     pub source: Option<String>,
+    /// What the person asked to be called, if they said.
+    pub name: Option<String>,
     pub created_at: DateTime<FixedOffset>,
     pub verified_at: Option<DateTime<FixedOffset>>,
     /// When an admin approved the email for sign-up.
@@ -360,6 +457,7 @@ impl From<waitlist_signups::Model> for AdminSignup {
             id: r.id,
             email: r.email,
             source: r.source,
+            name: r.name,
             created_at: r.created_at,
             verified_at: r.verified_at,
             approved_at: r.approved_at,
@@ -434,6 +532,14 @@ async fn admin_list(
                 Column::VerifiedAt.is_null()
             });
         }
+        if q.hide_stale == Some(true) {
+            let cutoff = (Utc::now() - Duration::days(STALE_DAYS)).fixed_offset();
+            list = list.filter(
+                Condition::any()
+                    .add(Column::VerifiedAt.is_not_null())
+                    .add(Column::CreatedAt.gte(cutoff)),
+            );
+        }
         if let Some(q) = q.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
             // Stored emails are lowercase, so lowercasing `q` makes the match case-insensitive.
             // Cut at 200 characters, the cap the other admin lists put on `q`.
@@ -465,6 +571,7 @@ pub fn api() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(join))
         .routes(routes!(verify))
+        .routes(routes!(set_name))
         .routes(routes!(count))
         .routes(routes!(admin_list))
 }

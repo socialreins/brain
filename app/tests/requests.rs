@@ -68,7 +68,9 @@ async fn waitlist_signup_is_stored_lowercased() {
         .json(&json!({"email": format!("  {}  ", email.to_uppercase()), "source": "landing"}))
         .await;
     res.assert_status_ok();
-    res.assert_json(&json!({"status": "ok"}));
+    let body = res.json::<Value>();
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["name_token"].as_str().map(str::len), Some(64));
     let row = waitlist_signups::Entity::find()
         .filter(waitlist_signups::Column::Email.eq(&email))
         .one(&db)
@@ -76,6 +78,7 @@ async fn waitlist_signup_is_stored_lowercased() {
         .unwrap()
         .expect("row stored");
     assert_eq!(row.source.as_deref(), Some("landing"));
+    assert!(row.verified_at.is_none(), "a new entry starts unverified");
 }
 
 #[tokio::test]
@@ -90,7 +93,15 @@ async fn duplicate_signup_answers_the_same_and_keeps_one_row() {
         .await;
     assert_eq!(first.status_code(), 200);
     assert_eq!(again.status_code(), 200);
-    assert_eq!(first.json::<Value>(), again.json::<Value>());
+    let keys = |r: &axum_test::TestResponse| {
+        r.json::<Value>()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(keys(&first), keys(&again), "the same answer shape");
     assert_eq!(rows(&db, &email).await, 1);
 }
 
@@ -33659,10 +33670,13 @@ mod waitlist_confirm {
         assert!(none.is_none());
     }
 
-    async fn join(s: &TestServer, email: &str) {
+    /// Joins and returns the `name_token` the answer carries.
+    async fn join(s: &TestServer, email: &str) -> String {
         let res = s.post("/v1/waitlist").json(&json!({"email": email})).await;
         res.assert_status_ok();
-        res.assert_json(&json!({"status": "ok"}));
+        let body = res.json::<Value>();
+        assert_eq!(body["status"], "ok");
+        body["name_token"].as_str().unwrap().to_owned()
     }
 
     /// Posts `token` the way the web page does: `true` when verified, `false` for `invalid_link`.
@@ -33856,18 +33870,158 @@ mod waitlist_confirm {
 
     #[tokio::test]
     #[serial]
-    async fn count_is_every_signup_cached() {
-        let (s, db, _, _) = app().await;
+    async fn count_is_the_verified_signups_cached() {
+        let (s, db, seen, _) = app().await;
         let res = s.get("/v1/waitlist/count").await;
         res.assert_status_ok();
-        let all = waitlist_signups::Entity::find().count(&db).await.unwrap();
-        res.assert_json(&json!({"count": all}));
-        join(&s, &unique_email()).await;
-        let again = s.get("/v1/waitlist/count").await.json::<Value>();
-        assert_eq!(again["count"], all, "served from the 30 second cache");
+        let verified = || async {
+            waitlist_signups::Entity::find()
+                .filter(waitlist_signups::Column::VerifiedAt.is_not_null())
+                .count(&db)
+                .await
+                .unwrap()
+        };
+        let before = verified().await;
+        res.assert_json(&json!({"count": before}));
+        let email = unique_email();
+        join(&s, &email).await;
         let (fresh, _, _, _) = app().await;
         let now = fresh.get("/v1/waitlist/count").await.json::<Value>();
-        assert_eq!(now["count"], all + 1);
+        assert_eq!(now["count"], before, "an unverified signup is not counted");
+        verify(&s, &token_of(&mails(&seen, &email).await[0])).await;
+        let again = s.get("/v1/waitlist/count").await.json::<Value>();
+        assert_eq!(again["count"], before, "served from the 30 second cache");
+        let (fresh, _, _, _) = app().await;
+        let now = fresh.get("/v1/waitlist/count").await.json::<Value>();
+        assert_eq!(now["count"], before + 1);
+    }
+
+    async fn set_name(s: &TestServer, token: &str, name: &str) -> axum_test::TestResponse {
+        s.post("/v1/waitlist/name")
+            .json(&json!({"token": token, "name": name}))
+            .await
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_joiner_can_add_a_name_and_a_stranger_cannot() {
+        let (s, db, _, _) = app().await;
+        let email = unique_email();
+        let token = join(&s, &email).await;
+        let res = set_name(&s, &token, "  Ann Lee  ").await;
+        res.assert_status_ok();
+        res.assert_json(&json!({"status": "ok"}));
+        assert_eq!(row(&db, &email).await.name.as_deref(), Some("Ann Lee"));
+        set_name(&s, &token, "Anna").await.assert_status_ok();
+        assert_eq!(row(&db, &email).await.name.as_deref(), Some("Anna"));
+
+        // A second join of the same email gets a token that opens nothing, and the same answer.
+        let other = join(&s, &email).await;
+        assert_ne!(other, token);
+        let res = set_name(&s, &other, "Mallory").await;
+        res.assert_status_ok();
+        res.assert_json(&json!({"status": "ok"}));
+        assert_eq!(row(&db, &email).await.name.as_deref(), Some("Anna"));
+        set_name(&s, &"0".repeat(64), "Mallory")
+            .await
+            .assert_status_ok();
+
+        // The token stops working an hour after the join.
+        waitlist_signups::Entity::update_many()
+            .col_expr(
+                waitlist_signups::Column::CreatedAt,
+                Expr::value((Utc::now() - Duration::minutes(61)).fixed_offset()),
+            )
+            .filter(waitlist_signups::Column::Email.eq(&email))
+            .exec(&db)
+            .await
+            .unwrap();
+        set_name(&s, &token, "Late").await.assert_status_ok();
+        assert_eq!(row(&db, &email).await.name.as_deref(), Some("Anna"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_waitlist_name_is_checked() {
+        let (s, db, _, _) = app().await;
+        let email = unique_email();
+        let token = join(&s, &email).await;
+        for name in ["", "   ", "a\nb", "tab\there", "\u{7f}", &"x".repeat(81)] {
+            let res = set_name(&s, &token, name).await;
+            assert_eq!(res.status_code(), 422, "{name:?}");
+            res.assert_json(&json!({"error": "invalid_name"}));
+        }
+        assert!(row(&db, &email).await.name.is_none());
+        set_name(&s, &token, &"x".repeat(80))
+            .await
+            .assert_status_ok();
+        set_name(&s, &token, "Zoë 李").await.assert_status_ok();
+        assert_eq!(row(&db, &email).await.name.as_deref(), Some("Zoë 李"));
+        // A fresh server, since each client IP gets 10 waitlist calls a minute.
+        let (s, _, _, _) = app().await;
+        for token in ["", "abc", &format!("{token}0")] {
+            let res = set_name(&s, token, "Ann").await;
+            assert_eq!(res.status_code(), 422, "{token}");
+            res.assert_json(&json!({"error": "invalid_link"}));
+        }
+        let get = s.get("/v1/waitlist/name").await;
+        assert_eq!(get.status_code(), 405);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_admin_list_shows_names_and_can_hide_stale_entries() {
+        let (s, db, seen, _) = app().await;
+        let (named, stale, old_verified) = (unique_email(), unique_email(), unique_email());
+        let token = join(&s, &named).await;
+        set_name(&s, &token, "Ann").await.assert_status_ok();
+        join(&s, &stale).await;
+        join(&s, &old_verified).await;
+        verify(&s, &token_of(&mails(&seen, &old_verified).await[0])).await;
+        waitlist_signups::Entity::update_many()
+            .col_expr(
+                waitlist_signups::Column::CreatedAt,
+                Expr::value((Utc::now() - Duration::days(31)).fixed_offset()),
+            )
+            .filter(waitlist_signups::Column::Email.is_in([&stale, &old_verified]))
+            .exec(&db)
+            .await
+            .unwrap();
+        let admin = signed_in(&s, &db, ADMIN).await;
+        let (sr, ad) = (&s, &admin);
+        let list = move |q: &'static str| async move {
+            sr.get(&format!("/v1/admin/waitlist{q}"))
+                .add_header("cookie", ad)
+                .await
+                .json::<Value>()
+        };
+        let find = |body: &Value, email: &str| {
+            body["signups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["email"] == email)
+                .cloned()
+        };
+        let all = list("").await;
+        assert_eq!(find(&all, &named).unwrap()["name"], "Ann");
+        assert!(find(&all, &stale).unwrap()["name"].is_null());
+        assert!(find(&all, &stale).is_some());
+        let kept = list("?hide_stale=true").await;
+        assert!(
+            find(&kept, &named).is_some(),
+            "a recent unverified entry stays"
+        );
+        assert!(
+            find(&kept, &old_verified).is_some(),
+            "a verified entry stays"
+        );
+        assert!(
+            find(&kept, &stale).is_none(),
+            "an old unverified entry goes"
+        );
+        assert_eq!(kept["total"], all["total"], "totals stay overall");
+        assert!(find(&list("?hide_stale=false").await, &stale).is_some());
     }
 
     /// A session cookie for `email`, signed in by magic link.
@@ -33948,6 +34102,7 @@ mod waitlist_confirm {
         let doc = s.get("/openapi.json").await.json::<Value>();
         for (path, method) in [
             ("/waitlist/verify", "post"),
+            ("/waitlist/name", "post"),
             ("/waitlist/count", "get"),
             ("/admin/waitlist", "get"),
         ] {
