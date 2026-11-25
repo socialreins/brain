@@ -46,7 +46,8 @@ cargo run -p socialreins-brain
   `openai_url` are overridable for tests. A reply that is empty, too long for the network (`inbox::fits_on`)
   or holds a link, domain, email or @handle that is not in the owner's prompt (exact normalised hosts, after
   NFKC, zero-width characters and look-alike or spelled-out dots) is never sent. Keys and prompts are never logged.
-- `app/src/controllers/waitlist.rs`: the public waitlist. No captcha: each new or unverified
+- `app/src/controllers/waitlist.rs`: the public waitlist. Turnstile when configured (`turnstile::check`, after the
+  body is read and before anything is stored), and each new or unverified
   email gets a confirmation link to the web app, which posts the token to
   `POST /v1/waitlist/verify` (never a state-changing GET: mail scanners open links). Mail goes
   out after the reply, at most hourly per email, 20 a day per IP and 500 a day overall

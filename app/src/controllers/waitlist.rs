@@ -28,12 +28,13 @@ use crate::{
     models::waitlist_signups,
     rate_limit::{self, daily_refund, daily_reserve, ClientIp},
     state::AppState,
+    turnstile,
 };
 
 const MAX_SOURCE_LEN: usize = 100;
 /// An unverified email gets at most one confirmation email per hour, however often it signs up.
 const RESEND_AFTER_HOURS: i64 = 1;
-/// Confirmation emails across all signups per rolling 24 hours, since the form has no captcha.
+/// Confirmation emails across all signups per rolling 24 hours, a second guard behind the optional captcha.
 const CONFIRMATIONS_PER_DAY: i64 = 500;
 /// Confirmation emails one client IP (IPv6 by /64) may trigger per rolling 24 hours, so one
 /// source cannot use up the global allowance.
@@ -49,7 +50,8 @@ pub struct NewSignup {
     pub email: String,
     /// Where the signup came from, e.g. `landing-hero`. At most 100 characters.
     pub source: Option<String>,
-    /// Ignored: accepted so older clients that still send a Turnstile token keep working.
+    /// The Turnstile widget's token; required when `GET /auth/providers` gives a
+    /// `turnstile_site_key`, else ignored.
     pub turnstile_token: Option<String>,
 }
 
@@ -64,7 +66,7 @@ pub struct Error {
     /// A machine-readable code. Every route may answer `invalid_json`, `invalid_body`,
     /// `unsupported_media_type`, `payload_too_large` or `internal`; the others are per route,
     /// e.g. `invalid_email`, `invalid_source`, `invalid_query`, `rate_limited`, `unauthorized`, `forbidden`,
-    /// `forbidden_origin`, `not_found`, and `captcha_failed` or `captcha_unavailable` on `/contact`.
+    /// `forbidden_origin`, `not_found`, and `captcha_failed` or `captcha_unavailable` on `/contact` and `/waitlist`.
     pub error: String,
 }
 
@@ -86,13 +88,13 @@ pub(crate) fn rejected(r: &JsonRejection) -> Reply {
 }
 
 /// `200 {"status":"ok"}` for a new email and a known one alike. A new or unverified email gets a
-/// confirmation link by email, at most once an hour, 20 a day per IP and 500 a day overall; the mail goes
-/// out after the reply, so neither the body nor the timing says whether the email was already on
-/// the list.
+/// confirmation link by email, at most once an hour, 20 a day per IP and 500 a day overall; with
+/// Turnstile on, a good `turnstile_token` is needed first. The mail goes out after the reply, so
+/// neither the body nor the timing says whether the email was already on the list.
 #[utoipa::path(post, path = "/waitlist", tag = "waitlist", request_body = NewSignup,
     responses((status = 200, body = Status), (status = 400, body = Error),
         (status = 413, body = Error), (status = 415, body = Error), (status = 422, body = Error),
-        (status = 429, body = Error), (status = 500, body = Error)))]
+        (status = 429, body = Error), (status = 500, body = Error), (status = 503, body = Error)))]
 async fn join(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Request) -> Reply {
     // Counted before the body is read, so malformed requests use up the limit too.
     if !app.waitlist_limiter.allow(ip) {
@@ -114,6 +116,11 @@ async fn join(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Requ
         .is_some_and(|s| s.chars().count() > MAX_SOURCE_LEN)
     {
         return error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_source");
+    }
+    if let Err(r) =
+        turnstile::check(app.turnstile.as_ref(), body.turnstile_token.as_deref(), ip).await
+    {
+        return r;
     }
     let secret = match add(&app, &email, source).await {
         Ok(secret) => secret,

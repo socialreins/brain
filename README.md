@@ -183,12 +183,11 @@ takes a name of 1 to 100 characters on one line, an email and a message of 1 to 
 characters (`422` `invalid_name`, `invalid_email` or `invalid_message`), and mails them to
 `CONTACT_TO` with the sender as Reply-To. Each client IP gets 5 an hour, then `429`.
 
-With `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY` set, `POST /auth/link` and `/v1/contact`
-need a `turnstile_token` from the widget, checked with Cloudflare after the
+With `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY` set, `POST /auth/link`, `/v1/contact` and
+`/v1/waitlist` need a `turnstile_token` from the widget, checked with Cloudflare after the
 rate limit and before anything is stored or sent: a missing or rejected token gets
 `422 {"error":"captcha_failed"}`, and Cloudflare unreachable for 5 seconds gets
-`503 {"error":"captcha_unavailable"}`. With Turnstile off the field is ignored, and
-`/v1/waitlist` always ignores it.
+`503 {"error":"captcha_unavailable"}`. With Turnstile off the field is ignored.
 
 Sign-in is by magic link, Google or passkey; there are no passwords. `POST /auth/link` answers the same `202`, at the same speed,
 whether or not the email has an account (or is refused by `REGISTRATION_DISABLED` or `SIGNUP_DOMAINS`, see sign-up rules below): the lookup
@@ -970,7 +969,7 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `X_CLIENT_ID`, `X_CLIENT_SECRET` | no | Both to connect X accounts (a Web App client, redirect URI `{BRAIN_URL}/connect/x/callback`). Publishing with a live token needs neither, renewing one does |
 | `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET` | no | Connect TikTok accounts (redirect URI `{BRAIN_URL}/connect/tiktok/callback`) |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | no | Both or neither. Turn on Google sign-in (OAuth client of type Web application, redirect URI `{BRAIN_URL}/auth/google/callback`). They also turn on connecting YouTube channels (add the redirect URI `{BRAIN_URL}/connect/youtube/callback` to the same client) |
-| `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | no | Both or neither. Turn on a Cloudflare Turnstile captcha: `POST /auth/link` and `/v1/contact` then need a `turnstile_token`. Off when unset |
+| `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | no | Both or neither. Turn on a Cloudflare Turnstile captcha: `POST /auth/link`, `/v1/contact` and `/v1/waitlist` then need a `turnstile_token`. Off when unset |
 | `ADMIN_EMAILS` | no | Comma-separated emails, any case, whose signed-in users may use the admin console, `/v1/admin/*` (and get `is_admin: true` from `/auth/me`). None when unset |
 | `REVIEW_LOGIN_TOKEN` | no | Turns on `GET /review-login/{token}`, a sign-in to a demo account for Meta App Review. Unset (the default) the route is a `404`. Remove it after the review: see [App Review login](#app-review-login) |
 | `MEDIA_DIR` | no | `./media` (`/var/lib/brain/media` in the image). Where post media is kept while a post publishes, when no bucket is set. Files go once the post settles, so an ephemeral disk is fine. A download cut off by a restart leaves a temp file, which the hourly sweep removes once it is an hour old. Assumes a single brain instance: with more than one replica, use the `S3_*` bucket |

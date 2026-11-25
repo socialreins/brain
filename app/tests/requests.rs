@@ -33282,7 +33282,7 @@ mod captcha_and_contact {
         json!({"name": "Jane", "email": unique_email(), "message": "Hi", "turnstile_token": token})
     }
 
-    /// Each form with `token`: its path, body and success status. The waitlist has no captcha.
+    /// Each form with `token`: its path, body and success status. The waitlist has its own tests.
     fn forms(token: Option<&str>) -> [(&'static str, Value, u16); 2] {
         let email = json!({"email": unique_email(), "turnstile_token": token});
         [
@@ -33293,14 +33293,41 @@ mod captcha_and_contact {
 
     #[tokio::test]
     #[serial]
-    async fn waitlist_ignores_turnstile() {
+    async fn waitlist_needs_a_good_token_when_turnstile_is_on() {
         let (s, db, _) = app(Some(siteverify().await)).await;
         for token in [None, Some("bad")] {
             let email = unique_email();
-            let body = json!({"email": email, "turnstile_token": token});
-            s.post("/v1/waitlist").json(&body).await.assert_status_ok();
-            assert_eq!(rows(&db, &email).await, 1);
+            let res = s
+                .post("/v1/waitlist")
+                .json(&json!({"email": email, "turnstile_token": token}))
+                .await;
+            assert_eq!(res.status_code(), 422, "{token:?}");
+            res.assert_json(&json!({"error": "captcha_failed"}));
+            assert_eq!(
+                rows(&db, &email).await,
+                0,
+                "nothing stored before the captcha"
+            );
         }
+        let email = unique_email();
+        let body = json!({"email": email, "turnstile_token": "good"});
+        s.post("/v1/waitlist").json(&body).await.assert_status_ok();
+        assert_eq!(rows(&db, &email).await, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn waitlist_fails_closed_and_ignores_the_token_when_off() {
+        let (s, db, _) = app(Some(down().await)).await;
+        let body = json!({"email": unique_email(), "turnstile_token": "good"});
+        let res = s.post("/v1/waitlist").json(&body).await;
+        assert_eq!(res.status_code(), 503);
+        res.assert_json(&json!({"error": "captcha_unavailable"}));
+        let (s, _, _) = app(None).await;
+        let email = unique_email();
+        let body = json!({"email": email, "turnstile_token": "anything"});
+        s.post("/v1/waitlist").json(&body).await.assert_status_ok();
+        assert_eq!(rows(&db, &email).await, 1);
     }
 
     #[tokio::test]
