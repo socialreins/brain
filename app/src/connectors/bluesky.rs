@@ -838,6 +838,9 @@ pub enum InboxError {
     MetaReconnect,
     /// Meta refused the call, or could not be reached; the scrubbed reason.
     Meta(String),
+    /// Meta refused it for a permission or a messaging policy (codes 10 and 200 to 299); the
+    /// scrubbed reason.
+    MetaDenied(String),
     /// X refused the token or a permission is missing: connect the account again.
     XReconnect,
     /// X refused the call, or could not be reached; what to tell a person (`connectors::x::inbox`).
@@ -860,6 +863,7 @@ impl InboxError {
             // Not `reconnect_required`: the web app words that one for Bluesky.
             Self::MetaReconnect => "meta_reconnect_required",
             Self::Meta(_) => "meta_failed",
+            Self::MetaDenied(_) => "meta_denied",
             Self::XReconnect => "x_reconnect_required",
             Self::X(_) => "x_failed",
         }
@@ -899,6 +903,12 @@ impl InboxError {
             Self::Invalid("dm_unavailable") => {
                 "Meta cannot deliver a message to this person.".into()
             }
+            Self::Invalid("not_found") => {
+                "It is gone on Facebook or Instagram (deleted, or the person removed it).".into()
+            }
+            Self::Invalid("not_supported") => "Facebook and Instagram do not allow this on \
+                                               this item."
+                .into(),
             Self::Invalid("not_applicable") => "That does not apply to this item.".into(),
             Self::Invalid("own_account") => "That is one of your own accounts.".into(),
             Self::Invalid("not_our_thread") => "Only replies under a post of this account can \
@@ -916,6 +926,10 @@ impl InboxError {
                                     Connect the account again under Connections."
                 .into(),
             Self::Meta(why) => format!("Meta did not take it: {why}"),
+            Self::MetaDenied(why) => format!(
+                "Meta did not allow it: {why} The account may lack a permission for this, or \
+                 Meta's messaging rules forbid it."
+            ),
             Self::XReconnect => "X refused the account's token or a permission is missing. \
                                  Connect the account again under Connections."
                 .into(),
