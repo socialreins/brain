@@ -39,6 +39,7 @@ use crate::{
     meta_inbox,
     models::{inbox_items, inbox_replies, inboxes, social_accounts, team_user, users},
     state::AppState,
+    youtube_inbox,
 };
 
 /// Most inboxes one team holds, "All" included.
@@ -605,19 +606,25 @@ pub(super) async fn items_json(
     Ok(rows
         .into_iter()
         .map(|i| Item {
-            moderation: matches!(i.platform.as_str(), "facebook" | "instagram")
+            moderation: matches!(i.platform.as_str(), "facebook" | "instagram" | "youtube")
                 .then(|| i.kind == "comment")
                 .filter(|comment| *comment)
                 .map(|_| {
                     let flag = |k: &str| i.moderation[k].as_bool() == Some(true);
+                    let youtube = i.platform == "youtube";
                     Moderation {
-                        hidden: flag("hidden"),
+                        // A YouTube comment is hidden while held for review, deleted once rejected.
+                        hidden: flag(if youtube { "held" } else { "hidden" }),
                         liked: flag("liked"),
-                        deleted: flag("deleted"),
-                        can: meta_inbox::moderations(&i)
-                            .into_iter()
-                            .map(String::from)
-                            .collect(),
+                        deleted: flag(if youtube { "rejected" } else { "deleted" }),
+                        can: if youtube {
+                            crate::youtube_inbox::moderations(&i)
+                        } else {
+                            meta_inbox::moderations(&i)
+                        }
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
                     }
                 }),
             video: i
@@ -1559,9 +1566,12 @@ async fn send_reply(
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ModerateInput {
-    /// `hide`, `unhide`, `delete`, `like` or `unlike`; the item's `moderation.can` says which
-    /// work on it.
+    /// `hide`, `unhide`, `delete`, `like` or `unlike` on Facebook and Instagram; `hold`,
+    /// `publish`, `reject`, `ban` or `delete_reply` on YouTube. The item's `moderation.can` says
+    /// which work on it.
     pub action: String,
+    /// `delete_reply` (YouTube): the reply (`replies[].id` of the item) to delete.
+    pub reply_id: Option<Uuid>,
 }
 
 /// Moderates a Facebook or Instagram comment on the platform: hide or show it, delete it (owners
@@ -1582,17 +1592,29 @@ async fn moderate_item(
     Path(id): Path<Uuid>,
     Body(input): Body<ModerateInput>,
 ) -> Response {
-    let Some(action) = Moderate::parse(input.action.trim()) else {
-        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_action");
-    };
-    if action == Moderate::Delete && !t.role.manages() {
-        return forbidden();
-    }
     let item = match find_item(&app.db, t.team.id, id).await {
         Ok(Some(i)) => i,
         Ok(None) => return not_found(),
         Err(e) => return internal(e, "inbox item read"),
     };
+    let youtube = item.platform == "youtube";
+    let wanted = input.action.trim();
+    let meta_action = Moderate::parse(wanted).filter(|_| !youtube);
+    let yt_action = youtube_inbox::Moderate::parse(wanted).filter(|_| youtube);
+    let delete_reply = youtube && wanted == "delete_reply" && input.reply_id.is_some();
+    if meta_action.is_none() && yt_action.is_none() && !delete_reply {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_action");
+    }
+    // Deleting, rejecting, banning and deleting a reply are for owners and admins.
+    let destructive = meta_action == Some(Moderate::Delete)
+        || delete_reply
+        || matches!(
+            yt_action,
+            Some(youtube_inbox::Moderate::Reject | youtube_inbox::Moderate::Ban)
+        );
+    if destructive && !t.role.manages() {
+        return forbidden();
+    }
     let account = match social_accounts::Entity::find_by_id(item.social_account_id)
         .one(&app.db)
         .await
@@ -1604,7 +1626,13 @@ async fn moderate_item(
     if !app.moderate_limiter.hit(t.current.0.id) {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
-    match meta_inbox::moderate(&app, &account, &item, action).await {
+    let done = match (meta_action, yt_action, input.reply_id) {
+        (Some(a), _, _) => meta_inbox::moderate(&app, &account, &item, a).await,
+        (_, Some(a), _) => youtube_inbox::moderate(&app, &account, &item, a).await,
+        (_, _, Some(reply)) => youtube_inbox::delete_reply(&app, &account, &item, reply).await,
+        _ => return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_action"),
+    };
+    match done {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return send_error(&e),
         Err(e) => return internal(e, "inbox moderation"),

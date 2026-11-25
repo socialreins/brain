@@ -35,7 +35,7 @@ use uuid::Uuid;
 use crate::{
     automations,
     connectors::{
-        bluesky::PostError,
+        bluesky::{InboxError, PostError},
         youtube::{is_quota, Comment, Thread, QUOTA_MESSAGE},
     },
     controllers,
@@ -766,4 +766,201 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
         let _ = read.await;
     }
     Ok(())
+}
+
+// ---- What a person does to a comment: reply, hold, reject, delete our reply. Each is one call
+// (50 units) and never retried; what it cost is counted on the channel (`charge_write`).
+
+/// YouTube's refusal as the inbox words it.
+fn refused(e: PostError) -> InboxError {
+    match e {
+        PostError::Reconnect | PostError::Denied => InboxError::YouTubeReconnect,
+        PostError::Failed(why) => InboxError::YouTube(why),
+    }
+}
+
+async fn token_of(app: &AppState, account: &social_accounts::Model) -> Result<String, InboxError> {
+    match controllers::youtube::fresh_token(app, account).await {
+        Err(PostError::Reconnect) => {
+            crate::expiry::flag_reconnect(&app.db, account.id).await;
+            Err(InboxError::YouTubeReconnect)
+        }
+        other => other.map_err(refused),
+    }
+}
+
+fn flag(item: &inbox_items::Model, key: &str) -> bool {
+    item.moderation[key].as_bool() == Some(true)
+}
+
+/// Replies publicly to `item` as the channel, once: under its top-level comment (YouTube replies
+/// are one level deep, so a reply to a reply goes under the same top-level comment, and a reply
+/// id is `<top-level id>.<suffix>`). A DM does not exist on YouTube. The id of what went out.
+pub async fn send(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    text: &str,
+) -> Result<String, InboxError> {
+    if item.kind != "comment" {
+        return Err(InboxError::Invalid("not_repliable"));
+    }
+    if flag(item, "rejected") {
+        return Err(InboxError::Invalid("rejected"));
+    }
+    let top = item.remote_id.split('.').next().unwrap_or(&item.remote_id);
+    let token = token_of(app, account).await?;
+    let sent = app.youtube.reply(&token, top, text).await;
+    charge_write(&app.db, account.id).await;
+    sent.map_err(refused)
+}
+
+/// What a person can do to a comment of a channel's video, besides reply.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Moderate {
+    /// Hide it until the owner approves it (`heldForReview`).
+    Hold,
+    /// Show a held comment again.
+    Publish,
+    /// Hide it for good.
+    Reject,
+    /// Hide it for good and ban its author from the channel's comments.
+    Ban,
+}
+
+impl Moderate {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "hold" => Some(Self::Hold),
+            "publish" => Some(Self::Publish),
+            "reject" => Some(Self::Reject),
+            "ban" => Some(Self::Ban),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hold => "hold",
+            Self::Publish => "publish",
+            Self::Reject => "reject",
+            Self::Ban => "ban",
+        }
+    }
+}
+
+/// The actions that work on `item` now: hold or publish again, reject, and reject with a ban.
+/// Nothing for a rejected comment (YouTube never shows it again) or an item that is no comment.
+pub fn moderations(item: &inbox_items::Model) -> Vec<&'static str> {
+    if item.platform != "youtube" || item.kind != "comment" || flag(item, "rejected") {
+        return Vec::new();
+    }
+    vec![
+        if flag(item, "held") {
+            "publish"
+        } else {
+            "hold"
+        },
+        "reject",
+        "ban",
+    ]
+}
+
+/// Moderates a comment on YouTube and keeps what was done on the item (a rejected comment is also
+/// `done`). The inner `Err` says why nothing was done.
+pub async fn moderate(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    action: Moderate,
+) -> Result<Result<(), InboxError>, DbErr> {
+    // Either way round: holding what is held is allowed and does nothing new.
+    let can = moderations(item);
+    let holds = matches!(action, Moderate::Hold | Moderate::Publish);
+    let fits = can.contains(&action.as_str())
+        || (holds && can.iter().any(|c| *c == "hold" || *c == "publish"));
+    if !fits {
+        return Ok(Err(InboxError::Invalid("not_supported")));
+    }
+    let token = match token_of(app, account).await {
+        Ok(t) => t,
+        Err(e) => return Ok(Err(e)),
+    };
+    let (status, ban, kept) = match action {
+        Moderate::Hold => ("heldForReview", false, serde_json::json!({"held": true})),
+        Moderate::Publish => ("published", false, serde_json::json!({"held": false})),
+        Moderate::Reject => ("rejected", false, serde_json::json!({"rejected": true})),
+        Moderate::Ban => (
+            "rejected",
+            true,
+            serde_json::json!({"rejected": true, "banned": true}),
+        ),
+    };
+    let done = app
+        .youtube
+        .moderate(&token, &item.remote_id, status, ban)
+        .await;
+    charge_write(&app.db, account.id).await;
+    if let Err(e) = done {
+        return Ok(Err(refused(e)));
+    }
+    let state = if action == Moderate::Reject || action == Moderate::Ban {
+        ", state = 'done'"
+    } else {
+        ""
+    };
+    let stmt = sql(
+        &format!(
+            "UPDATE inbox_items SET moderation = moderation || $2::jsonb{state} WHERE id = $1"
+        ),
+        vec![item.id.into(), kept.into()],
+    );
+    app.db.execute_raw(stmt).await?;
+    Ok(Ok(()))
+}
+
+/// Deletes a public reply of the channel that went out from this inbox (`reply` is one of the
+/// item's replies): only its author, the channel, can. The reply is then gone from the item, and
+/// the item is unanswered again when it was the last one.
+pub async fn delete_reply(
+    app: &AppState,
+    account: &social_accounts::Model,
+    item: &inbox_items::Model,
+    reply: Uuid,
+) -> Result<Result<(), InboxError>, DbErr> {
+    let found = app
+        .db
+        .query_one_raw(sql(
+            "SELECT remote_id FROM inbox_replies WHERE id = $1 AND inbox_item_id = $2 \
+             AND kind = 'public'",
+            vec![reply.into(), item.id.into()],
+        ))
+        .await?;
+    let remote: Option<String> = found.map_or(Ok(None), |r| r.try_get("", "remote_id"))?;
+    let Some(remote) = remote else {
+        return Ok(Err(InboxError::Invalid("not_found")));
+    };
+    let token = match token_of(app, account).await {
+        Ok(t) => t,
+        Err(e) => return Ok(Err(e)),
+    };
+    let done = app.youtube.delete_comment(&token, &remote).await;
+    charge_write(&app.db, account.id).await;
+    if let Err(e) = done {
+        return Ok(Err(refused(e)));
+    }
+    app.db
+        .execute_raw(sql(
+            "DELETE FROM inbox_replies WHERE id = $1",
+            vec![reply.into()],
+        ))
+        .await?;
+    app.db
+        .execute_raw(sql(
+            "UPDATE inbox_items SET replied_at = (SELECT max(created_at) FROM inbox_replies \
+             WHERE inbox_item_id = $1) WHERE id = $1",
+            vec![item.id.into()],
+        ))
+        .await?;
+    Ok(Ok(()))
 }
