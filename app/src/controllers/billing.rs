@@ -28,7 +28,8 @@ pub struct PlanLimits {
     pub members: Option<i64>,
     /// Automations, broadcasts and newsletters.
     pub automation: bool,
-    /// Contacts the automations may keep; `null` is unlimited.
+    /// Contacts the team may keep; `null` is unlimited. Past it a new person is no contact (their
+    /// message still arrives); the ones there stay and keep updating.
     pub contacts: Option<i64>,
     /// Custom inboxes ("All" never counts); `null` is unlimited.
     pub inboxes: Option<i64>,
@@ -41,6 +42,7 @@ pub struct PlanLimits {
 pub struct Usage {
     pub accounts: i64,
     pub members: i64,
+    pub contacts: i64,
     /// Custom inboxes ("All" left out).
     pub inboxes: i64,
     /// AI replies on our key this calendar month (UTC) paid from the monthly allowance.
@@ -70,6 +72,9 @@ pub struct Billing {
     /// What the team may use now. With billing on and no live plan, nothing.
     pub limits: PlanLimits,
     pub usage: Usage,
+    /// Whether checkout would start with the 7-day trial: the team never had a plan and this
+    /// person has not had a trial in any team.
+    pub trial_available: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -142,9 +147,10 @@ async fn show(State(app): State<AppState>, t: InTeam) -> Response {
         Ok(s) => s,
         Err(e) => return internal(e, "billing read"),
     };
-    let (accounts, members, inboxes, ai_replies) = match (
+    let (accounts, members, contacts, inboxes, ai_replies) = match (
         count(&app, "social_accounts", t.team.id).await,
         count(&app, "team_user", t.team.id).await,
+        count(&app, "contacts", t.team.id).await,
         count(
             &app,
             "(SELECT team_id FROM inboxes WHERE NOT is_all) i",
@@ -153,13 +159,21 @@ async fn show(State(app): State<AppState>, t: InTeam) -> Response {
         .await,
         billing::ai_used(&app.db, t.team.id, Utc::now()).await,
     ) {
-        (Ok(a), Ok(m), Ok(i), Ok(ai)) => (a, m, i, ai),
-        (Err(e), _, _, _) | (_, Err(e), _, _) | (_, _, Err(e), _) | (_, _, _, Err(e)) => {
-            return internal(e, "billing usage")
-        }
+        (Ok(a), Ok(m), Ok(c), Ok(i), Ok(ai)) => (a, m, c, i, ai),
+        (Err(e), _, _, _, _)
+        | (_, Err(e), _, _, _)
+        | (_, _, Err(e), _, _)
+        | (_, _, _, Err(e), _)
+        | (_, _, _, _, Err(e)) => return internal(e, "billing usage"),
     };
+    let trial_available = sub.is_none()
+        && matches!(
+            super::stripe::trial_offer(&app, &t.current.0.email).await,
+            Ok(Some(_))
+        );
     Json(Billing {
         enabled: app.billing_enabled,
+        trial_available,
         limits: limits(billing::effective(app.billing_enabled, sub.as_ref())),
         plan: sub.map(|s| Plan {
             id: s.plan_id,
@@ -173,6 +187,7 @@ async fn show(State(app): State<AppState>, t: InTeam) -> Response {
         usage: Usage {
             accounts,
             members,
+            contacts,
             inboxes,
             ai_replies,
         },
