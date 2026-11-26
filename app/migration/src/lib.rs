@@ -88,8 +88,8 @@ mod m20270107_000001_number_inbox_items;
 mod m20270107_000001_number_inboxes;
 mod m20270107_000001_number_newsletters;
 mod m20270107_000001_number_post_lists;
-mod m20270110_000001_posts_live_idx;
 mod m20270109_000001_bluesky_read_stamp;
+mod m20270110_000001_posts_live_idx;
 mod url_numbers;
 
 pub struct Migrator;
