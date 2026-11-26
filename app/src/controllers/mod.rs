@@ -3,6 +3,7 @@
 //! the media library and snippets, inboxes, contacts, broadcasts, newsletters,
 //! automations, public post pages), `/webhooks/meta` (Facebook and Instagram deliveries), `/mcp` (see `crate::mcp`), the Threads and Meta connect pages and
 //! `/media/{name}` (stored post files for platforms that download them).
+pub mod account;
 pub mod admin;
 pub mod ai_key;
 pub mod analytics;
@@ -112,6 +113,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(waitlist::api())
         .merge(admin::api().layer(DefaultBodyLimit::max(MAX_ADMIN_BODY_BYTES)))
         .merge(contact::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
+        .merge(account::api())
         .merge(teams::api())
         .merge(team_slugs::api())
         .merge(api_tokens::api())

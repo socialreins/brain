@@ -92,7 +92,8 @@ pub(crate) async fn trial_offer(app: &AppState, email: &str) -> Result<Option<St
     let used = app
         .db
         .query_one_raw(stmt(
-            "SELECT 1 FROM trial_uses WHERE person_key = $1",
+            "SELECT 1 FROM trial_uses WHERE person_key IN \
+             ($1, encode(sha256(convert_to($1, 'UTF8')), 'hex'))",
             vec![key.clone().into()],
         ))
         .await?;
