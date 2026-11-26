@@ -49,6 +49,9 @@ const LIST_LIMIT: u64 = 5000;
 #[derive(Deserialize, ToSchema)]
 pub struct Subscribe {
     pub email: String,
+    /// The Turnstile widget's token; required when `GET /auth/providers` gives a
+    /// `turnstile_site_key`, else ignored.
+    pub turnstile_token: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -107,6 +110,10 @@ async fn subscribe(
     let Some(address) = email::normalize(&body.email) else {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_email");
     };
+    let token = body.turnstile_token.as_deref();
+    if let Err(r) = crate::turnstile::check(app.turnstile.as_ref(), token, ip).await {
+        return r.into_response();
+    }
     let team = match pages::live(&app.db, code.clone()).await {
         Ok(Some((_, team, _))) if team.newsletter => team,
         Ok(_) => return reply(StatusCode::NOT_FOUND, "not_found"),

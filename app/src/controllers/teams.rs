@@ -34,8 +34,9 @@ use super::{
 };
 use crate::{
     models::{social_sets, team_invitations, team_user, teams, users},
-    rate_limit::{daily_refund, daily_reserve},
+    rate_limit::{daily_refund, daily_reserve, ClientIp},
     state::AppState,
+    turnstile,
 };
 
 const INVITATION_DAYS: i64 = 7;
@@ -45,6 +46,9 @@ const INVITES_PER_TEAM_EMAIL: i64 = 3;
 const INVITES_PER_EMAIL: i64 = 20;
 const INVITES_PER_TEAM: i64 = 50;
 const INVITES_PER_INVITER: i64 = 50;
+/// From one IP address, and in all: a few throwaway accounts cannot use the mail up between them.
+const INVITES_PER_IP: i64 = 60;
+const INVITES_PER_DAY: i64 = 500;
 
 #[derive(Serialize, ToSchema)]
 pub struct Team {
@@ -207,6 +211,9 @@ pub struct NewInvitation {
     pub email: String,
     /// `admin` or `member`.
     pub role: String,
+    /// The Turnstile widget's token; required when `GET /auth/providers` gives a
+    /// `turnstile_site_key`, else ignored.
+    pub turnstile_token: Option<String>,
 }
 
 fn reply(status: StatusCode, code: &str) -> Response {
@@ -969,6 +976,7 @@ async fn remove(
 async fn invite(
     _: FromWeb,
     State(app): State<AppState>,
+    ClientIp(ip): ClientIp,
     t: InTeam,
     Body(body): Body<NewInvitation>,
 ) -> Response {
@@ -985,6 +993,10 @@ async fn invite(
     let Some(email) = email::normalize(&body.email) else {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_email");
     };
+    let token = body.turnstile_token.as_deref();
+    if let Err(r) = turnstile::check(app.turnstile.as_ref(), token, ip).await {
+        return r.into_response();
+    }
     let role = match Role::parse(&body.role) {
         Some(r @ (Role::Admin | Role::Member)) => r,
         _ => return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_role"),
@@ -1005,7 +1017,13 @@ async fn invite(
     }
     // Daily caps per address in this team, per address overall (a ceiling high enough that
     // throwaway teams cannot use it to block real invitations), per team and per inviter.
+    let ip_key = ip.map_or_else(
+        || "unknown".into(),
+        |ip| crate::rate_limit::bucket(ip).to_string(),
+    );
     let caps = [
+        (format!("invite:ip:{ip_key}"), INVITES_PER_IP),
+        ("invite:all".to_owned(), INVITES_PER_DAY),
         (
             format!("invite:team-email:{}:{email}", t.team.id),
             INVITES_PER_TEAM_EMAIL,

@@ -29952,6 +29952,8 @@ mod teams {
 
                 /// A brain on the mock Bluesky whose mail goes to a fake Resend (`endpoint`
                 /// given) or the one this makes, and what that took.
+                const PAGES_ADMIN: &str = "pages-admin@example.com";
+
                 async fn with_mail(
                     endpoint: Option<String>,
                 ) -> (TestServer, DatabaseConnection, Sent) {
@@ -29980,6 +29982,8 @@ mod teams {
                         "b@example.com",
                     )
                     .unwrap();
+                    config.contact_to = Some("ops@example.com".into());
+                    config.admin_emails = vec![PAGES_ADMIN.into()];
                     let db = socialreins_brain::connect(&config).await.unwrap();
                     let state = AppState::new(db.clone(), &config);
                     let app = controllers::router(state, &config);
@@ -30031,6 +30035,138 @@ mod teams {
                     let res = req(s, Method::GET, "/v1/subscribers", cookie).await;
                     res.assert_status_ok();
                     res.json::<Value>()["subscribers"].clone()
+                }
+
+                /// "Report this page": stored, mailed to the operators, limited; an admin takes the page
+                /// down and the team cannot bring it back.
+                #[tokio::test]
+                #[serial]
+                async fn a_page_can_be_reported_and_an_admin_can_take_it_down() {
+                    let (s, db, seen) = with_mail(None).await;
+                    let (owner, team_id, account) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    pages_on(&s, &owner, true).await;
+                    let id = new_post(&s, &owner, &set, "hello").await;
+                    let code = put_page(&s, &owner, &id, true, "x").await.json::<Value>()["code"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    // Daily caps outlive a run, so each run speaks from its own addresses.
+                    let b = uuid::Uuid::now_v7().into_bytes();
+                    let net = format!("10.{}.{}", b[14], b[15]);
+                    let report = |body: Value, ip: &str| {
+                        s.post(&format!("/v1/public/pages/{code}/report"))
+                            .add_header("x-forwarded-for", ip.to_owned())
+                            .json(&body)
+                    };
+                    // A draft is no page: nothing to report.
+                    let res = report(json!({"reason": "spam"}), &format!("{net}.1")).await;
+                    assert_eq!(res.status_code(), 404);
+                    publish(&db, &id, &account, "https://bsky.test/a").await;
+                    assert_eq!(public(&s, &code).await.status_code(), 200);
+
+                    for (bad, why) in [
+                        (json!({"reason": "rude"}), "invalid_reason"),
+                        (
+                            json!({"reason": "spam", "message": "x".repeat(1001)}),
+                            "invalid_message",
+                        ),
+                        (json!({"reason": "spam", "email": "nope"}), "invalid_email"),
+                    ] {
+                        let res = report(bad, &format!("{net}.2")).await;
+                        assert_eq!(res.status_code(), 422);
+                        assert_eq!(res.json::<Value>()["error"], why);
+                    }
+                    let before = seen.lock().unwrap().len();
+                    let res = report(
+                        json!({"reason": "phishing", "message": "asks for passwords",
+                            "email": "Reporter@Example.com"}),
+                        &format!("{net}.3"),
+                    )
+                    .await;
+                    assert_eq!(res.status_code(), 202, "{}", res.text());
+                    let sent = seen.lock().unwrap()[before..].to_vec();
+                    assert_eq!(sent.len(), 1, "{sent:?}");
+                    let mail = sent[0].to_string();
+                    assert!(
+                        mail.contains("ops@example.com") && mail.contains(&code),
+                        "{mail}"
+                    );
+                    assert!(
+                        mail.contains("asks for passwords")
+                            && mail.contains("reporter@example.com")
+                    );
+                    let n = db
+                        .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                            sea_orm::DbBackend::Postgres,
+                            "SELECT count(*)::bigint AS n FROM page_reports r JOIN post_pages p \
+                             ON p.id = r.page_id WHERE p.code = $1",
+                            [code.clone().into()],
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .try_get::<i64>("", "n")
+                        .unwrap();
+                    assert_eq!(n, 1);
+                    // One address: 5 an hour (the contact form's limit).
+                    let mut last = 202;
+                    for _ in 0..6 {
+                        last = report(json!({"reason": "spam"}), &format!("{net}.3"))
+                            .await
+                            .status_code()
+                            .as_u16();
+                    }
+                    assert_eq!(last, 429);
+
+                    // Only an admin takes a page down.
+                    let takedown = |cookie: &str, down: bool| {
+                        req(
+                            &s,
+                            Method::PUT,
+                            &format!("/v1/admin/pages/{code}/takedown"),
+                            cookie,
+                        )
+                        .json(&json!({"taken_down": down}))
+                    };
+                    assert_eq!(takedown(&owner, true).await.status_code(), 403);
+                    assert_eq!(public(&s, &code).await.status_code(), 200);
+                    let admin = sign_in(&s, &db, PAGES_ADMIN).await.unwrap();
+                    let list = req(&s, Method::GET, "/v1/admin/page-reports", &admin).await;
+                    list.assert_status_ok();
+                    let list = list.json::<Value>();
+                    let all = list["reports"].as_array().unwrap();
+                    let row = all.iter().find(|r| r["reason"] == "phishing").unwrap();
+                    assert_eq!(row["code"], code.as_str());
+                    assert_eq!(row["message"], "asks for passwords");
+                    // The first one and the four more the address got through.
+                    assert_eq!(row["reports"], 5);
+                    assert_eq!(row["taken_down"], false);
+                    assert_eq!(takedown(&admin, true).await.status_code(), 204);
+                    assert_eq!(public(&s, &code).await.status_code(), 404);
+                    assert_eq!(page(&s, &owner, &id).await["live"], false);
+                    // The team's own switch cannot undo it.
+                    put_page(&s, &owner, &id, true, "again")
+                        .await
+                        .assert_status_ok();
+                    assert_eq!(public(&s, &code).await.status_code(), 404);
+                    assert_eq!(
+                        report(json!({"reason": "spam"}), &format!("{net}.4"))
+                            .await
+                            .status_code(),
+                        404
+                    );
+                    assert_eq!(takedown(&admin, false).await.status_code(), 204);
+                    assert_eq!(public(&s, &code).await.status_code(), 200);
+                    let res = req(
+                        &s,
+                        Method::PUT,
+                        "/v1/admin/pages/nosuchcode/takedown",
+                        &admin,
+                    )
+                    .json(&json!({"taken_down": true}))
+                    .await;
+                    assert_eq!(res.status_code(), 404);
                 }
 
                 #[tokio::test]
@@ -38054,6 +38190,60 @@ mod captcha_and_contact {
         for (path, body, status) in forms(Some("good")) {
             let res = s.post(path).json(&body).await;
             assert_eq!(res.status_code(), status, "{path}");
+        }
+    }
+
+    /// The forms that mail a stranger on someone else's behalf (an invitation, a newsletter
+    /// confirmation) and the page report need the token too, before anything is looked up.
+    #[tokio::test]
+    #[serial]
+    async fn invitations_subscriptions_and_reports_need_a_good_token_when_turnstile_is_on() {
+        let (s, db, seen) = app(Some(siteverify().await)).await;
+        let secret = auth::link(&db, &unique_email(), chrono::Duration::minutes(15)).await;
+        let b = socialreins_core::token::new().into_bytes();
+        let res = s
+            .post("/auth/magic")
+            .add_header("origin", "http://localhost:8080")
+            .add_header("x-forwarded-for", format!("10.{}.{}.{}", b[0], b[1], b[2]))
+            .form(&[("token", secret.as_str())])
+            .await;
+        let cookie = auth::session(res.header("set-cookie").to_str().unwrap());
+        let invite = |token: Option<&str>| {
+            s.post("/v1/team/invitations")
+                .add_header("origin", "http://localhost:3000")
+                .add_header("cookie", cookie.clone())
+                .json(&json!({"email": unique_email(), "role": "member", "turnstile_token": token}))
+        };
+        let before = seen.lock().unwrap().len();
+        for token in [None, Some("bad")] {
+            let res = invite(token).await;
+            assert_eq!(res.status_code(), 422, "{token:?}");
+            res.assert_json(&json!({"error": "captcha_failed"}));
+        }
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            before,
+            "no mail before the captcha"
+        );
+        assert_eq!(invite(Some("good")).await.status_code(), 201);
+        // Public forms: the captcha comes before the page is looked up (an unknown code is a 404 only after).
+        let ip = format!("10.{}.{}.9", b[3], b[4]);
+        for path in ["subscribe", "report"] {
+            let url = format!("/v1/public/pages/nosuchcode/{path}");
+            let body = |token: Option<&str>| json!({"email": unique_email(), "reason": "spam", "turnstile_token": token});
+            let res = s
+                .post(&url)
+                .add_header("x-forwarded-for", ip.clone())
+                .json(&body(None))
+                .await;
+            assert_eq!(res.status_code(), 422, "{path}");
+            res.assert_json(&json!({"error": "captcha_failed"}));
+            let res = s
+                .post(&url)
+                .add_header("x-forwarded-for", ip.clone())
+                .json(&body(Some("good")))
+                .await;
+            assert_eq!(res.status_code(), 404, "{path}");
         }
     }
 
