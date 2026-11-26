@@ -20,7 +20,7 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
-    // Wait for Postgres instead of dying: Railway stops restarting a crashing process.
+    // Wait for Postgres instead of dying: a restart loop on a down database only fills the logs.
     let db = connect_when_ready(&config, Duration::from_secs(300), Duration::from_secs(5)).await?;
     if config.review_login_token.is_none() {
         controllers::review_login::close(&db).await?;
