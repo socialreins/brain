@@ -141,7 +141,11 @@ async fn join(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Requ
     };
     if let Some(secret) = secret {
         // A failed mail keeps the row and the ok reply; the error carries no email or token.
-        tokio::spawn(async move { send_confirmation(&app, ip, &email, &secret, JOINED).await });
+        let sending = crate::mail::Sending::begin();
+        tokio::spawn(async move {
+            let _sending = sending;
+            send_confirmation(&app, ip, &email, &secret, JOINED).await
+        });
     }
     (
         StatusCode::OK,
