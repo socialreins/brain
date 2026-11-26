@@ -836,7 +836,9 @@ async fn list(State(app): State<AppState>, t: InTeam) -> Response {
     let found = async {
         let stmt = Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "INSERT INTO inboxes (id, team_id, name, is_all) VALUES ($1, $2, 'All', true) \
+            // `WHERE NOT EXISTS`: a proposed row takes a number from the identity, kept or not.
+            "INSERT INTO inboxes (id, team_id, name, is_all) SELECT $1, $2, 'All', true \
+             WHERE NOT EXISTS (SELECT 1 FROM inboxes WHERE team_id = $2 AND is_all) \
              ON CONFLICT (team_id) WHERE is_all DO NOTHING",
             [Uuid::now_v7().into(), t.team.id.into()],
         );

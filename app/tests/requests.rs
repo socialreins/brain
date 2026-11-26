@@ -23123,11 +23123,11 @@ mod teams {
                 res.json()
             }
 
-            /// Where each counter stands: inbox items, contacts.
-            async fn counters(db: &DatabaseConnection) -> (i64, i64) {
+            /// Where each counter stands: inbox items, contacts, inboxes.
+            async fn counters(db: &DatabaseConnection) -> (i64, i64, i64) {
                 use sea_orm::{ConnectionTrait, DbBackend, Statement};
                 let mut last = Vec::new();
-                for table in ["inbox_items", "contacts"] {
+                for table in ["inbox_items", "contacts", "inboxes"] {
                     let sql = format!("SELECT last_value FROM {table}_number_seq");
                     let row = db
                         .query_one_raw(Statement::from_string(DbBackend::Postgres, sql))
@@ -23136,7 +23136,7 @@ mod teams {
                         .unwrap();
                     last.push(row.try_get::<i64>("", "last_value").unwrap());
                 }
-                (last[0], last[1])
+                (last[0], last[1], last[2])
             }
 
             #[tokio::test]
@@ -23147,8 +23147,10 @@ mod teams {
                 set_inbox(&me, three_people(&me));
                 ingest(&db, &state, &account).await;
                 // Reading the same items again changes them and takes no number from the counters.
+                all_inbox(&s, &cookie).await;
                 let before = counters(&db).await;
                 ingest(&db, &state, &account).await;
+                all_inbox(&s, &cookie).await;
                 assert_eq!(counters(&db).await, before, "a re-read burns no number");
                 let (other, ..) = owner(&s, &db).await;
 
