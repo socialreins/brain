@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use axum::{
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -26,6 +26,7 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use super::numbered::{ListId, PostParam, ID_PARAM};
 use super::{
     api_tokens::Actor,
     auth::{internal, Body},
@@ -42,6 +43,9 @@ use crate::{
 #[derive(Serialize, ToSchema)]
 pub struct PostList {
     pub id: Uuid,
+    /// The list's number, unique over every team: the address web pages use. Every `{id}` of a
+    /// list route takes it as well as `id`.
+    pub number: i64,
     /// `null` for a team-wide list.
     pub social_set_id: Option<Uuid>,
     pub name: String,
@@ -72,6 +76,8 @@ pub struct Item {
 #[derive(Serialize, ToSchema)]
 pub struct ListRef {
     pub id: Uuid,
+    /// The list's `number`.
+    pub number: i64,
     pub name: String,
     pub position: i64,
 }
@@ -117,6 +123,7 @@ fn invalid(code: &str) -> Response {
 fn list_json(l: post_lists::Model) -> PostList {
     PostList {
         id: l.id,
+        number: l.number,
         social_set_id: l.social_set_id,
         name: l.name,
         remote_ids: l.remote_ids,
@@ -172,6 +179,7 @@ const JOINS: &str = "FROM post_list_items i JOIN post_lists l ON l.id = i.list_i
 
 struct Placed {
     list_id: Uuid,
+    number: i64,
     name: String,
     post_id: Uuid,
     position: i64,
@@ -186,8 +194,8 @@ async fn placed(
     posts: Option<&[Uuid]>,
 ) -> Result<Vec<Placed>, DbErr> {
     let sql = format!(
-        "SELECT list_id, name, post_id, position FROM ( \
-           SELECT i.list_id, l.name, l.created_at, i.post_id, \
+        "SELECT list_id, number, name, post_id, position FROM ( \
+           SELECT i.list_id, l.number, l.name, l.created_at, i.post_id, \
              row_number() OVER (PARTITION BY i.list_id ORDER BY i.position) AS position \
            {JOINS} \
            WHERE l.team_id = $1 AND l.deleted_at IS NULL AND {SEEN} \
@@ -214,6 +222,7 @@ async fn placed(
         .map(|r| {
             Ok(Placed {
                 list_id: r.try_get("", "list_id")?,
+                number: r.try_get("", "number")?,
                 name: r.try_get("", "name")?,
                 post_id: r.try_get("", "post_id")?,
                 position: r.try_get("", "position")?,
@@ -235,6 +244,7 @@ pub(crate) async fn lists_of(
     for p in placed(db, a, None, Some(posts)).await? {
         map.entry(p.post_id).or_default().push(ListRef {
             id: p.list_id,
+            number: p.number,
             name: p.name,
             position: p.position,
         });
@@ -453,10 +463,10 @@ pub async fn create_list(app: &AppState, a: &Actor, input: ListInput) -> Respons
 
 /// One list with its posts in order.
 #[utoipa::path(get, path = "/lists/{id}", tag = "lists",
-    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path)),
+    security(("session" = []), ("api_token" = [])), params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = ListDetail), (status = 401, body = Error),
         (status = 404, body = Error)))]
-async fn show(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
+async fn show(State(app): State<AppState>, a: Actor, ListId(id): ListId) -> Response {
     get_list(&app, &a, id).await
 }
 
@@ -473,13 +483,13 @@ fn may_edit(a: &Actor, l: &post_lists::Model) -> bool {
 /// Renames a list. A set token cannot rename a team-wide list (`403`).
 #[utoipa::path(patch, path = "/lists/{id}", tag = "lists",
     security(("session" = []), ("api_token" = [])), request_body = ListName,
-    params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    params(("id" = String, Path, description = ID_PARAM), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 200, body = ListDetail), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 422, body = Error)))]
 async fn rename(
     State(app): State<AppState>,
     a: Actor,
-    Path(id): Path<Uuid>,
+    ListId(id): ListId,
     Body(input): Body<ListName>,
 ) -> Response {
     let Some(name) = team::name(&input.name) else {
@@ -514,10 +524,10 @@ async fn rename(
 /// Deletes a list; its posts stay. A set token cannot delete a team-wide list (`403`).
 #[utoipa::path(delete, path = "/lists/{id}", tag = "lists",
     security(("session" = []), ("api_token" = [])),
-    params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    params(("id" = String, Path, description = ID_PARAM), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
         (status = 404, body = Error)))]
-async fn destroy(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
+async fn destroy(State(app): State<AppState>, a: Actor, ListId(id): ListId) -> Response {
     let done = async {
         let Some(l) = find(&app.db, &a, id, false).await? else {
             return Ok(Err(not_found()));
@@ -547,13 +557,13 @@ async fn destroy(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) ->
 /// invalid_set`).
 #[utoipa::path(post, path = "/lists/{id}/posts", tag = "lists",
     security(("session" = []), ("api_token" = [])), request_body = AddPost,
-    params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    params(("id" = String, Path, description = ID_PARAM), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 200, body = ListDetail), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 422, body = Error)))]
 async fn add(
     State(app): State<AppState>,
     a: Actor,
-    Path(id): Path<Uuid>,
+    ListId(id): ListId,
     Body(input): Body<AddPost>,
 ) -> Response {
     add_post(&app, &a, id, input).await
@@ -582,13 +592,14 @@ pub async fn add_post(app: &AppState, a: &Actor, id: Uuid, input: AddPost) -> Re
 /// Takes a post the caller sees out of the list; the posts after it move up.
 #[utoipa::path(delete, path = "/lists/{id}/posts/{post_id}", tag = "lists",
     security(("session" = []), ("api_token" = [])),
-    params(("id" = Uuid, Path), ("post_id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    params(("id" = String, Path, description = ID_PARAM), ("post_id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
         (status = 404, body = Error)))]
 async fn remove(
     State(app): State<AppState>,
     a: Actor,
-    Path((id, post_id)): Path<(Uuid, Uuid)>,
+    ListId(id): ListId,
+    PostParam(post_id): PostParam,
 ) -> Response {
     remove_post(&app, &a, id, post_id).await
 }
@@ -623,13 +634,13 @@ pub async fn remove_post(app: &AppState, a: &Actor, id: Uuid, post_id: Uuid) -> 
 /// `422 invalid_order`); posts out of a set token's reach keep their places.
 #[utoipa::path(put, path = "/lists/{id}/order", tag = "lists",
     security(("session" = []), ("api_token" = [])), request_body = Order,
-    params(("id" = Uuid, Path), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
+    params(("id" = String, Path, description = ID_PARAM), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 200, body = ListDetail), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 422, body = Error)))]
 async fn reorder(
     State(app): State<AppState>,
     a: Actor,
-    Path(id): Path<Uuid>,
+    ListId(id): ListId,
     Body(input): Body<Order>,
 ) -> Response {
     reorder_list(&app, &a, id, input).await

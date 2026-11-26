@@ -81,6 +81,7 @@ mod m20270103_000001_youtube_inbox;
 mod m20270104_000001_run_retries;
 mod m20270105_000001_story_mention_trigger;
 mod m20270106_000001_automation_misses;
+mod m20270107_000001_url_numbers;
 
 pub struct Migrator;
 
@@ -169,6 +170,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20270103_000001_threads_inbox::Migration),
             Box::new(m20270105_000001_story_mention_trigger::Migration),
             Box::new(m20270106_000001_automation_misses::Migration),
+            Box::new(m20270107_000001_url_numbers::Migration),
             // inject-above (do not remove this comment)
         ]
     }

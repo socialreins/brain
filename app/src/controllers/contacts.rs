@@ -4,7 +4,7 @@
 //! contact out of broadcasts (`crate::broadcasts`). Like the inbox,
 //! these routes take a session only.
 use axum::{
-    extract::{rejection::QueryRejection, Path, Query, State},
+    extract::{rejection::QueryRejection, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -21,6 +21,7 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use super::numbered::{ContactId, ID_PARAM};
 use super::{
     auth::{internal, Body, FromWeb},
     inbox::{items_json, tags_of, Item},
@@ -42,6 +43,9 @@ const RECENT: u64 = 20;
 #[derive(Serialize, ToSchema)]
 pub struct Contact {
     pub id: Uuid,
+    /// The contact's number, unique over every team: the address web pages use. Every `{id}` of a
+    /// contact route takes it as well as `id`.
+    pub number: i64,
     pub platform: String,
     /// The platform's id of the person, e.g. a Bluesky DID.
     pub external_id: String,
@@ -155,6 +159,7 @@ async fn contacts_json(
         .map(|(r, id)| {
             Ok(Contact {
                 id,
+                number: r.try_get("", "number")?,
                 platform: r.try_get("", "platform")?,
                 external_id: r.try_get("", "external_id")?,
                 handle: r.try_get("", "handle")?,
@@ -291,10 +296,10 @@ async fn list(
 }
 
 /// One contact with its 20 latest inbox items.
-#[utoipa::path(get, path = "/contacts/{id}", tag = "contacts", params(("id" = Uuid, Path)),
+#[utoipa::path(get, path = "/contacts/{id}", tag = "contacts", params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = ContactDetail), (status = 401, body = Error),
         (status = 404, body = Error)))]
-async fn show(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> Response {
+async fn show(State(app): State<AppState>, t: InTeam, ContactId(id): ContactId) -> Response {
     let found = async {
         let Some(contact) = find(&app.db, t.team.id, id).await? else {
             return Ok(None);
@@ -333,14 +338,14 @@ fn checked_tags(raw: &[String]) -> Option<Vec<String>> {
 /// member, but only owners and admins opt a contact back in (`opted_out: false`, else `403
 /// forbidden`). `422 invalid_contact` names the bad `field` (`notes` or `tags`).
 #[utoipa::path(patch, path = "/contacts/{id}", tag = "contacts", request_body = ContactChange,
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Contact), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 422, body = Error)))]
 async fn change(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    ContactId(id): ContactId,
     Body(input): Body<ContactChange>,
 ) -> Response {
     // Opting someone back in widens who a broadcast reaches.
@@ -403,14 +408,14 @@ async fn change(
 /// Deletes a contact with its notes and tags. Owners and admins. An opt-out of broadcasts is
 /// kept (the platform and the person's id on it), so a later contact of theirs is opted out. Its inbox items stay, without
 /// a contact; a later item of the same person makes a new one.
-#[utoipa::path(delete, path = "/contacts/{id}", tag = "contacts", params(("id" = Uuid, Path)),
+#[utoipa::path(delete, path = "/contacts/{id}", tag = "contacts", params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
         (status = 404, body = Error)))]
 async fn destroy(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    ContactId(id): ContactId,
 ) -> Response {
     if !t.role.manages() {
         return reply(StatusCode::FORBIDDEN, "forbidden");

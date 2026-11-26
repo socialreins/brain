@@ -2,7 +2,7 @@
 //! (`crate::broadcasts`). Members list and read them; owners and admins write, preview, send,
 //! cancel and read recipients. Like contacts, these routes take a session only.
 use axum::{
-    extract::{rejection::QueryRejection, Path, Query, State},
+    extract::{rejection::QueryRejection, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -15,6 +15,7 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use super::numbered::{BroadcastId, ID_PARAM};
 use super::{
     auth::{internal, Body, FromWeb},
     teams::InTeam,
@@ -56,6 +57,9 @@ pub struct Counts {
 #[derive(Serialize, ToSchema)]
 pub struct Broadcast {
     pub id: Uuid,
+    /// The broadcast's number, unique over every team: the address web pages use. Every `{id}` of a
+    /// broadcast route takes it as well as `id`.
+    pub number: i64,
     pub name: String,
     /// `{name}` stands for the contact's display name ("there" without a usable one).
     pub text: String,
@@ -99,6 +103,8 @@ pub struct Recipient {
     pub id: Uuid,
     /// `null`, like the three fields after it, once the contact was deleted.
     pub contact_id: Option<Uuid>,
+    /// The contact's `number`; `null` with `contact_id`.
+    pub contact_number: Option<i64>,
     pub display_name: Option<String>,
     pub handle: Option<String>,
     pub platform: Option<String>,
@@ -182,6 +188,7 @@ const SELECT: &str = "SELECT b.*, n.* FROM broadcasts b, LATERAL (SELECT count(*
 fn broadcast_json(r: &QueryResult) -> Result<Broadcast, DbErr> {
     Ok(Broadcast {
         id: r.try_get("", "id")?,
+        number: r.try_get("", "number")?,
         name: r.try_get("", "name")?,
         text: r.try_get("", "text")?,
         tag: r.try_get("", "tag")?,
@@ -279,10 +286,10 @@ async fn create(
 }
 
 /// One broadcast with its counts. Every member.
-#[utoipa::path(get, path = "/broadcasts/{id}", tag = "broadcasts", params(("id" = Uuid, Path)),
+#[utoipa::path(get, path = "/broadcasts/{id}", tag = "broadcasts", params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Broadcast), (status = 401, body = Error),
         (status = 404, body = Error)))]
-async fn show(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> Response {
+async fn show(State(app): State<AppState>, t: InTeam, BroadcastId(id): BroadcastId) -> Response {
     shown(&app, t.team.id, id, StatusCode::OK).await
 }
 
@@ -298,7 +305,7 @@ async fn refused(app: &AppState, team: Uuid, id: Uuid, code: &str) -> Response {
 
 /// Replaces a draft. Owners and admins. `409 already_started` for anything but a draft.
 #[utoipa::path(put, path = "/broadcasts/{id}", tag = "broadcasts", request_body = BroadcastInput,
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Broadcast), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error)))]
@@ -306,7 +313,7 @@ async fn update(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    BroadcastId(id): BroadcastId,
     Body(input): Body<BroadcastInput>,
 ) -> Response {
     if !t.role.manages() {
@@ -335,14 +342,14 @@ async fn update(
 
 /// Deletes a draft or a finished broadcast with its recipients. Owners and admins.
 /// `409 still_sending` while it sends or is paused: cancel it first.
-#[utoipa::path(delete, path = "/broadcasts/{id}", tag = "broadcasts", params(("id" = Uuid, Path)),
+#[utoipa::path(delete, path = "/broadcasts/{id}", tag = "broadcasts", params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
         (status = 404, body = Error), (status = 409, body = Error)))]
 async fn destroy(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    BroadcastId(id): BroadcastId,
 ) -> Response {
     if !t.role.manages() {
         return forbidden();
@@ -371,14 +378,14 @@ async fn preview_of(app: &AppState, team: Uuid, id: Uuid) -> Result<Option<Previ
 /// Instagram only within 24 hours of its last message to that account. Nobody is reachable
 /// within 24 hours of a broadcast that went out to them (`recently_messaged`).
 #[utoipa::path(post, path = "/broadcasts/{id}/preview", tag = "broadcasts",
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Preview), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error)))]
 async fn preview(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    BroadcastId(id): BroadcastId,
 ) -> Response {
     if !t.role.manages() {
         return forbidden();
@@ -400,7 +407,7 @@ async fn preview(
 /// outage, a dead token), or 5 failed sends in a row, makes it `paused` with a `pause_reason`:
 /// it then waits for `POST /broadcasts/{id}/resume`.
 #[utoipa::path(post, path = "/broadcasts/{id}/send", tag = "broadcasts", request_body = SendInput,
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Broadcast), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error), (status = 429, body = Error)))]
@@ -408,7 +415,7 @@ async fn send(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    BroadcastId(id): BroadcastId,
     Body(input): Body<SendInput>,
 ) -> Response {
     if !t.role.manages() {
@@ -447,14 +454,14 @@ async fn send(
 /// Cancels a sending or paused broadcast: recipients not sent to yet are `skipped`
 /// (`cancelled`), the ones sent to stay. Owners and admins. `409 not_sending` otherwise.
 #[utoipa::path(post, path = "/broadcasts/{id}/cancel", tag = "broadcasts",
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Broadcast), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error)))]
 async fn cancel(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    BroadcastId(id): BroadcastId,
 ) -> Response {
     if !t.role.manages() {
         return forbidden();
@@ -471,14 +478,14 @@ async fn cancel(
 /// and admins. `409 not_paused` otherwise, `409 another_sending` while another broadcast of the
 /// team sends.
 #[utoipa::path(post, path = "/broadcasts/{id}/resume", tag = "broadcasts",
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Broadcast), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error)))]
 async fn resume(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    BroadcastId(id): BroadcastId,
 ) -> Response {
     if !t.role.manages() {
         return forbidden();
@@ -495,13 +502,13 @@ async fn resume(
 /// A broadcast's recipients with how each ended, 100 a page in a fixed order. Owners and
 /// admins. `status` narrows the page.
 #[utoipa::path(get, path = "/broadcasts/{id}/recipients", tag = "broadcasts",
-    params(("id" = Uuid, Path), RecipientQuery),
+    params(("id" = String, Path, description = ID_PARAM), RecipientQuery),
     responses((status = 200, body = RecipientPage), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 422, body = Error)))]
 async fn recipients(
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    BroadcastId(id): BroadcastId,
     q: Result<Query<RecipientQuery>, QueryRejection>,
 ) -> Response {
     if !t.role.manages() {
@@ -512,7 +519,7 @@ async fn recipients(
         Ok(Query(q)) if q.status.as_ref().is_none_or(status_ok) => q,
         _ => return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query"),
     };
-    let sql = "SELECT r.id, r.contact_id, r.status, r.reason, r.updated_at, c.display_name, \
+    let sql = "SELECT r.id, r.contact_id, c.number AS contact_number, r.status, r.reason, r.updated_at, c.display_name, \
                c.handle, c.platform FROM broadcast_recipients r \
                LEFT JOIN contacts c ON c.id = r.contact_id WHERE r.broadcast_id = $1 \
                AND ($2::text IS NULL OR r.status = $2) AND ($3::uuid IS NULL OR r.id > $3) \
@@ -534,6 +541,7 @@ async fn recipients(
                 Ok(Recipient {
                     id: r.try_get("", "id")?,
                     contact_id: r.try_get("", "contact_id")?,
+                    contact_number: r.try_get("", "contact_number")?,
                     display_name: r.try_get("", "display_name")?,
                     handle: r.try_get("", "handle")?,
                     platform: r.try_get("", "platform")?,

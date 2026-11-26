@@ -2015,7 +2015,7 @@ async fn notify_team(
         item.kind,
         crate::expiry::label(&item.platform),
         app.web_url,
-        item.id,
+        item.number,
     );
     let mut sent = false;
     for r in to {
@@ -3342,6 +3342,7 @@ mod tests {
         let now = chrono::Utc::now().fixed_offset();
         let dm = |button: Option<&str>, story_reply: bool, mention: bool| inbox_items::Model {
             id: Uuid::now_v7(),
+            number: 0,
             team_id: Uuid::nil(),
             social_account_id: Uuid::nil(),
             platform: "instagram".into(),
@@ -3785,6 +3786,7 @@ mod tests {
         let now = chrono::Utc::now().fixed_offset();
         let item = |kind: &str| inbox_items::Model {
             id: Uuid::now_v7(),
+            number: 0,
             team_id: Uuid::nil(),
             social_account_id: Uuid::nil(),
             platform: "bluesky".into(),

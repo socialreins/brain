@@ -27,6 +27,7 @@ pub mod media;
 pub mod meta;
 pub mod meta_webhook;
 pub mod newsletters;
+pub mod numbered;
 pub mod oauth;
 pub mod pages;
 pub mod passkeys;

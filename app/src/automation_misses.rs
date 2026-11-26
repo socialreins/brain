@@ -105,6 +105,8 @@ pub async fn prune(db: &impl ConnectionTrait) -> Result<(), DbErr> {
 #[derive(Serialize, ToSchema, Debug, PartialEq, Eq)]
 pub struct Verdict {
     pub automation_id: Uuid,
+    /// The automation's `number`.
+    pub automation_number: i64,
     pub name: String,
     /// `ran` (a run that did something, or is still going), `failed` or `skipped` (a run held
     /// back or that went nowhere; `reasons` holds its reason) or `not_matched` (it never started;
@@ -123,7 +125,7 @@ pub async fn for_item(
 ) -> Result<Vec<Verdict>, DbErr> {
     let rows = db
         .query_all_raw(sql(
-            "SELECT a.id, a.name, r.status AS run_status, r.reason AS run_reason, \
+            "SELECT a.id, a.number, a.name, r.status AS run_status, r.reason AS run_reason, \
              m.reasons AS miss FROM automations a \
              LEFT JOIN automation_runs r ON r.automation_id = a.id AND r.inbox_item_id = $2 \
              LEFT JOIN automation_misses m ON m.automation_id = a.id AND m.inbox_item_id = $2 \
@@ -144,6 +146,7 @@ pub async fn for_item(
             };
             Ok(Verdict {
                 automation_id: r.try_get("", "id")?,
+                automation_number: r.try_get("", "number")?,
                 name: r.try_get("", "name")?,
                 outcome: outcome.into(),
                 reasons,
@@ -156,6 +159,8 @@ pub async fn for_item(
 #[derive(Serialize, ToSchema, Debug)]
 pub struct Miss {
     pub inbox_item_id: Uuid,
+    /// The item's `number`.
+    pub inbox_item_number: i64,
     pub reasons: Vec<String>,
     pub created_at: DateTime<FixedOffset>,
     /// `comment`, `mention`, `dm`, `follow`, `like` or `repost`.
@@ -177,7 +182,7 @@ pub async fn for_automation(
     let rows = db
         .query_all_raw(sql(
             &format!(
-                "SELECT m.inbox_item_id, m.reasons, m.created_at, i.kind, i.platform, \
+                "SELECT m.inbox_item_id, i.number AS inbox_item_number, m.reasons, m.created_at, i.kind, i.platform, \
              COALESCE(i.author_name, i.author_handle) AS author, left(i.text, 200) AS text \
              FROM automation_misses m JOIN inbox_items i ON i.id = m.inbox_item_id \
              WHERE m.team_id = $1 AND m.automation_id = $2 AND NOT m.{NOISE} \
@@ -190,6 +195,7 @@ pub async fn for_automation(
         .map(|r| {
             Ok(Miss {
                 inbox_item_id: r.try_get("", "inbox_item_id")?,
+                inbox_item_number: r.try_get("", "inbox_item_number")?,
                 reasons: r.try_get("", "reasons")?,
                 created_at: r.try_get("", "created_at")?,
                 kind: r.try_get("", "kind")?,

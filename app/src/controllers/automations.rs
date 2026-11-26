@@ -2,7 +2,7 @@
 //! Members read them and their runs; owners and admins create, change, switch and delete them,
 //! as with inboxes and sets.
 use axum::{
-    extract::{rejection::QueryRejection, Path, Query, State},
+    extract::{rejection::QueryRejection, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -18,6 +18,7 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use super::numbered::{self, AutomationId, ItemId, RunId, ID_PARAM};
 use super::{
     auth::{internal, Body, FromWeb},
     teams::InTeam,
@@ -40,6 +41,9 @@ const PAGE: u64 = 50;
 #[derive(Serialize, ToSchema)]
 pub struct Automation {
     pub id: Uuid,
+    /// The automation's number, unique over every team: the address web pages use. Every `{id}`
+    /// of an automation route takes it as well as `id`.
+    pub number: i64,
     pub name: String,
     pub active: bool,
     /// When it was last switched on; items received before that never run it.
@@ -152,6 +156,8 @@ pub struct Run {
     pub id: Uuid,
     pub automation_id: Uuid,
     pub inbox_item_id: Uuid,
+    /// The item's `number`.
+    pub inbox_item_number: i64,
     /// `running`, `waiting` (a flow at a `wait` step), `sent`, `failed` or `skipped`. A flow's
     /// run is `sent` once every step went out, else it has the status of the send that ended it.
     pub status: String,
@@ -205,7 +211,11 @@ fn not_found() -> Response {
     reply(StatusCode::NOT_FOUND, "not_found")
 }
 
-fn run_json(r: automation_runs::Model, a: Option<&automations::Model>) -> Run {
+fn run_json(
+    r: automation_runs::Model,
+    a: Option<&automations::Model>,
+    items: &std::collections::HashMap<Uuid, i64>,
+) -> Run {
     Run {
         can_retry: a.is_some_and(|a| rules::retryable(&r, a)),
         retries: r.retries,
@@ -213,6 +223,7 @@ fn run_json(r: automation_runs::Model, a: Option<&automations::Model>) -> Run {
         id: r.id,
         automation_id: r.automation_id,
         inbox_item_id: r.inbox_item_id,
+        inbox_item_number: items.get(&r.inbox_item_id).copied().unwrap_or_default(),
         status: r.status,
         reason: r.reason,
         results: serde_json::from_value(r.results).unwrap_or_default(),
@@ -225,6 +236,7 @@ fn run_json(r: automation_runs::Model, a: Option<&automations::Model>) -> Run {
 fn automation_json(a: automations::Model) -> Automation {
     Automation {
         id: a.id,
+        number: a.number,
         name: a.name,
         active: a.active,
         activated_at: a.activated_at,
@@ -513,10 +525,10 @@ async fn list(State(app): State<AppState>, t: InTeam) -> Response {
 }
 
 /// One automation, with its run counts by status and last run.
-#[utoipa::path(get, path = "/automations/{id}", tag = "automations", params(("id" = Uuid, Path)),
+#[utoipa::path(get, path = "/automations/{id}", tag = "automations", params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Automation), (status = 401, body = Error),
         (status = 404, body = Error)))]
-async fn show(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> Response {
+async fn show(State(app): State<AppState>, t: InTeam, AutomationId(id): AutomationId) -> Response {
     let found = async {
         let Some(a) = find(&app.db, t.team.id, id).await? else {
             return Ok(None);
@@ -632,14 +644,14 @@ async fn switch(
 /// Replaces an automation. Owners and admins. Its runs stay; changing its steps (or switching
 /// it off) ends its waiting runs as `skipped: automation_changed`.
 #[utoipa::path(put, path = "/automations/{id}", tag = "automations",
-    request_body = AutomationInput, params(("id" = Uuid, Path)),
+    request_body = AutomationInput, params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Automation), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 422, body = Error)))]
 async fn update(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    AutomationId(id): AutomationId,
     Body(input): Body<AutomationInput>,
 ) -> Response {
     if !t.role.manages() {
@@ -760,14 +772,14 @@ async fn set_active(app: &AppState, t: &InTeam, id: Uuid, active: bool) -> Respo
 
 /// Switches an automation on; it acts on items received from now on. Owners and admins.
 #[utoipa::path(post, path = "/automations/{id}/enable", tag = "automations",
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Automation), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error)))]
 async fn enable(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    AutomationId(id): AutomationId,
 ) -> Response {
     set_active(&app, &t, id, true).await
 }
@@ -775,14 +787,14 @@ async fn enable(
 /// Switches an automation off. Owners and admins. Its waiting runs end as
 /// `skipped: automation_changed`.
 #[utoipa::path(post, path = "/automations/{id}/disable", tag = "automations",
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Automation), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error)))]
 async fn disable(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    AutomationId(id): AutomationId,
 ) -> Response {
     set_active(&app, &t, id, false).await
 }
@@ -790,14 +802,14 @@ async fn disable(
 /// Deletes an automation and its runs, waiting ones included; replies it sent stay on their
 /// items. Owners and admins.
 #[utoipa::path(delete, path = "/automations/{id}", tag = "automations",
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
         (status = 404, body = Error)))]
 async fn destroy(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    AutomationId(id): AutomationId,
 ) -> Response {
     if !t.role.manages() {
         return forbidden();
@@ -817,13 +829,13 @@ async fn destroy(
 /// An automation's runs, newest first, 50 a page. At most 500 runs act per team a day (a flow
 /// counts once per send step); past that a run is `skipped: daily_cap`.
 #[utoipa::path(get, path = "/automations/{id}/runs", tag = "automations",
-    params(("id" = Uuid, Path), RunQuery),
+    params(("id" = String, Path, description = ID_PARAM), RunQuery),
     responses((status = 200, body = RunPage), (status = 401, body = Error),
         (status = 404, body = Error), (status = 422, body = Error)))]
 async fn runs(
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    AutomationId(id): AutomationId,
     q: Result<Query<RunQuery>, QueryRejection>,
 ) -> Response {
     let Ok(Query(q)) = q else {
@@ -854,9 +866,11 @@ async fn runs(
         let more = rows.len() as u64 > PAGE;
         rows.truncate(PAGE as usize);
         let next_cursor = more.then(|| rows.last().map(|r| r.id)).flatten();
+        let items =
+            numbered::numbers(&app.db, "inbox_items", rows.iter().map(|r| r.inbox_item_id)).await?;
         let runs = rows
             .into_iter()
-            .map(|r| run_json(r, automation.as_ref()))
+            .map(|r| run_json(r, automation.as_ref(), &items))
             .collect();
         Ok::<_, DbErr>(Some(RunPage { runs, next_cursor }))
     };
@@ -873,14 +887,15 @@ async fn runs(
 /// admins. `409 not_retryable` for any other run (a send that failed some other way may have
 /// gone out), `409 paused` while the team's automations are paused.
 #[utoipa::path(post, path = "/automations/{id}/runs/{run_id}/retry", tag = "automations",
-    params(("id" = Uuid, Path), ("run_id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM), ("run_id" = Uuid, Path)),
     responses((status = 200, body = Run), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error)))]
 async fn retry(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path((id, run_id)): Path<(Uuid, Uuid)>,
+    AutomationId(id): AutomationId,
+    RunId(run_id): RunId,
 ) -> Response {
     if !t.role.manages() {
         return forbidden();
@@ -903,7 +918,12 @@ async fn retry(
         let run = automation_runs::Entity::find_by_id(run_id)
             .one(&app.db)
             .await?;
-        Ok::<_, DbErr>(run.map(|r| run_json(r, Some(&a))).ok_or_else(not_found))
+        let items =
+            numbered::numbers(&app.db, "inbox_items", run.iter().map(|r| r.inbox_item_id)).await?;
+        Ok::<_, DbErr>(
+            run.map(|r| run_json(r, Some(&a), &items))
+                .ok_or_else(not_found),
+        )
     };
     match done.await {
         Ok(Ok(run)) => Json(run).into_response(),
@@ -1028,10 +1048,14 @@ pub struct MissList {
 /// back on for a safety reason (paused, cool-down, caps) are in `runs`, skipped, with that
 /// reason. `GET /inbox-items/{id}/automations` has all of them for one item.
 #[utoipa::path(get, path = "/automations/{id}/misses", tag = "automations",
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = MissList), (status = 401, body = Error),
         (status = 404, body = Error)))]
-async fn misses(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> Response {
+async fn misses(
+    State(app): State<AppState>,
+    t: InTeam,
+    AutomationId(id): AutomationId,
+) -> Response {
     let found = async {
         if find(&app.db, t.team.id, id).await?.is_none() {
             return Ok(None);
@@ -1056,10 +1080,10 @@ pub struct VerdictList {
 /// What each automation did with an inbox item: `ran`, `failed` or `skipped` (a run, with its
 /// reason) or `not_matched` (with the codes of why). Kept 14 days after the item.
 #[utoipa::path(get, path = "/inbox-items/{id}/automations", tag = "automations",
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = VerdictList), (status = 401, body = Error),
         (status = 404, body = Error)))]
-async fn item_verdicts(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> Response {
+async fn item_verdicts(State(app): State<AppState>, t: InTeam, ItemId(id): ItemId) -> Response {
     let found = async {
         let item = inbox_items::Entity::find_by_id(id)
             .filter(inbox_items::Column::TeamId.eq(t.team.id))
