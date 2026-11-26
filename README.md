@@ -1072,6 +1072,7 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | Variable | Required | Default |
 |---|---|---|
 | `DATABASE_URL` | yes | |
+| `DATABASE_MAX_CONNECTIONS` | no | `20` (5 to 500). The most connections one brain process opens to Postgres; a request waits 5 seconds for one, then fails. Keep it under Postgres's `max_connections` divided by the number of replicas (and leave room for other clients): a pool larger than the database allows turns into connection errors at boot |
 | `ENCRYPTION_KEY` | yes | Encrypts platform tokens and Bluesky app passwords at rest (AES-256-GCM). 32 bytes, base64: `openssl rand -base64 32`. brain refuses to start without a valid one. Keep it with your database backups: losing or changing it makes every connected account need reconnecting |
 | `PORT` | no | `8080` |
 | `CORS_ORIGINS` | no | The origin of `WEB_URL`. Comma-separated; hosted sets `https://socialreins.com,https://www.socialreins.com` |
