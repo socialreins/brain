@@ -61,6 +61,10 @@ use axum::{
 };
 use tower_http::{
     catch_panic::CatchPanicLayer,
+    compression::{
+        predicate::{Predicate as _, SizeAbove},
+        CompressionLayer,
+    },
     cors::{AllowOrigin, CorsLayer},
     set_header::SetResponseHeaderLayer,
     trace::TraceLayer,
@@ -263,7 +267,27 @@ pub fn router(state: AppState, config: &Config) -> Router {
             header::STRICT_TRANSPORT_SECURITY,
             HeaderValue::from_static("max-age=31536000"),
         ))
+        // JSON only: a post list is several MB and compresses 5 to 8 times, while media streams
+        // (`/media`) are already compressed and are sent with a length and ranges.
+        .layer(CompressionLayer::new().compress_when(SizeAbove::new(1024).and(JsonOnly)))
         .with_state(state)
+}
+
+/// Compresses responses whose type is JSON (`application/json`, `application/problem+json`).
+#[derive(Clone, Copy)]
+struct JsonOnly;
+
+impl tower_http::compression::predicate::Predicate for JsonOnly {
+    fn should_compress<B>(&self, response: &axum::http::Response<B>) -> bool
+    where
+        B: axum::body::HttpBody,
+    {
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|t| t.starts_with("application/") && t.contains("json"))
+    }
 }
 
 #[cfg(test)]
