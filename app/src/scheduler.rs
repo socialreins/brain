@@ -219,6 +219,10 @@ pub fn spawn(app: AppState) {
             // Run as its own task: a panic in a round is logged and the next tick still comes,
             // instead of ending this loop and leaving every scheduled post unpublished.
             let round = app.clone();
+            // Before `begin`, so the round already judges lateness without our own downtime.
+            if let Err(e) = publish::note_tick(&app.db).await {
+                tracing::warn!(error = %e, "publish tick not recorded");
+            }
             match tokio::spawn(async move { publish::begin(&round).await }).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => tracing::warn!(error = %e, "publish tick failed"),
