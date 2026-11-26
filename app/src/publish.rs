@@ -1446,7 +1446,7 @@ async fn claim(
            FROM posts d \
            WHERE d.status = 'scheduled' AND d.scheduled_at <= now() \
            AND ($8::uuid IS NULL OR d.team_id = $8) \
-           AND d.scheduled_at >= now() - make_interval(mins => $4) \
+           AND post_lateness(d.scheduled_at) <= make_interval(mins => $4) \
            AND d.approval IS DISTINCT FROM 'rejected' \
            AND (d.approval IS DISTINCT FROM 'pending' OR NOT EXISTS ( \
                 SELECT 1 FROM teams t WHERE t.id = d.team_id AND t.require_approval)) \
@@ -1496,8 +1496,37 @@ async fn claim(
     Ok(claimed)
 }
 
-/// A scheduled post this many minutes past its time is never published (decision 0008).
+/// A scheduled post this many minutes past its time is never published (decision 0008), not
+/// counting the time brain itself was not running (`note_tick`, `post_lateness`).
 pub const LATE_MINUTES: i64 = 60;
+
+/// A publish round later than this after the last one means brain was down in between.
+const MISSED_TICKS: &str = "2 minutes";
+/// The longest stretch of downtime that is given back to the posts due in it.
+const MAX_DOWNTIME: &str = "24 hours";
+
+/// Records that the publish loop is running. When it last ran more than `MISSED_TICKS` ago,
+/// that stretch (at most `MAX_DOWNTIME`) is kept as brain's own downtime: `post_lateness`
+/// takes it off a post's lateness, so a deploy that fails or a Postgres that is away for hours
+/// does not draft every post due meanwhile. Call it before `begin`. One statement under the
+/// publish lock's rule: another instance doing the same only keeps the stamp fresher.
+pub async fn note_tick(db: &DatabaseConnection) -> Result<(), DbErr> {
+    if POST_SLOTS.is_closed() {
+        return Ok(());
+    }
+    db.execute_unprepared(&format!(
+        "INSERT INTO scheduler_ticks (name, at) VALUES ('publish', now()) \
+         ON CONFLICT (name) DO UPDATE SET \
+           down_from = CASE WHEN now() - scheduler_ticks.at > interval '{MISSED_TICKS}' \
+             THEN GREATEST(scheduler_ticks.at, now() - interval '{MAX_DOWNTIME}') \
+             ELSE scheduler_ticks.down_from END, \
+           down_to = CASE WHEN now() - scheduler_ticks.at > interval '{MISSED_TICKS}' \
+             THEN now() ELSE scheduler_ticks.down_to END, \
+           at = now()"
+    ))
+    .await
+    .map(|_| ())
+}
 /// Starts the `error` of a post `draft_late` put back. It names the due time in the set's queue
 /// zone (UTC without one, or with a zone Postgres does not know), the zone the web shows the post in.
 pub const LATE: &str = "Not posted: it was due at";
@@ -1522,6 +1551,7 @@ pub async fn draft_late(db: &DatabaseConnection, running: &[Uuid]) -> Result<Vec
         sql(
             "SELECT p.id FROM posts p \
              WHERE p.scheduled_at < now() - make_interval(mins => $1) \
+             AND post_lateness(p.scheduled_at) > make_interval(mins => $1) \
              AND p.approval IS DISTINCT FROM 'rejected' AND p.id <> ALL($3::uuid[]) \
              AND (p.status = 'scheduled' OR (p.status = 'queued' AND NOT p.fanned_out \
                AND p.updated_at < now() - make_interval(mins => $2))) \
