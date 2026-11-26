@@ -1129,28 +1129,93 @@ pub fn items_sql(
         );
     }
     values.push(((limit + 1) as i64).into());
-    let from = if grouped {
-        // shortcut: the windows read every item in the inbox's scope for each page; keep a
-        // conversations table once a team's inbox is too large for that.
-        format!(
-            "(SELECT i.*, count(*) OVER w AS conv_count, \
-             count(*) FILTER (WHERE i.state = 'open') OVER w AS conv_open, \
-             min(i.received_at) OVER w AS conv_first, bool_or({hit}) OVER w AS conv_hit, \
-             row_number() OVER (w ORDER BY i.received_at DESC, i.id DESC) AS conv_rank \
-             FROM inbox_items i WHERE i.team_id = $1{scope} \
-             WINDOW w AS (PARTITION BY \
-             CASE WHEN i.kind = 'dm' AND i.contact_id IS NOT NULL THEN i.social_account_id END, \
-             CASE WHEN i.kind = 'dm' AND i.contact_id IS NOT NULL THEN i.contact_id ELSE i.id END)) \
-             i WHERE i.conv_rank = 1"
-        )
-    } else {
-        format!("inbox_items i WHERE i.team_id = $1{scope}")
-    };
+    let n = values.len();
+    if grouped {
+        return Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            grouped_sql(&scope, &rest, &hit, n, state),
+            values,
+        );
+    }
     let sql = format!(
-        "SELECT i.* FROM {from}{rest} ORDER BY i.received_at DESC, i.id DESC LIMIT ${}",
-        values.len()
+        "SELECT i.* FROM inbox_items i WHERE i.team_id = $1{scope}{rest} \
+         ORDER BY i.received_at DESC, i.id DESC LIMIT ${n}"
     );
     Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
+}
+
+/// `scope` (written for the alias `i`) for another alias of `inbox_items`.
+fn scope_as(scope: &str, alias: &str) -> String {
+    scope
+        .replace(" i.", &format!(" {alias}."))
+        .replace("(i.", &format!("({alias}."))
+}
+
+/// The grouped page: two arms, each ordered and cut at `$limit` on its own so Postgres reads the
+/// newest items first and stops once a page is found, not the team's whole inbox (a window over
+/// every item was 1.1 s at 400,000 items, on every load and every 30 s refresh).
+/// - singles: every item that is not a DM from a known contact is a group of its own;
+/// - conversations: the DMs of one account and contact. The head is the newest DM of the scope
+///   that no newer DM of the scope follows (one probe of `inbox_items_conversation_idx`), and
+///   `conv_*` are counted over that conversation's items in the scope for the page's heads only.
+///   For `state` `open` the conversations are found from the open DMs (a conversation is open
+///   when one of its items is), so the work follows what is open, not the history.
+///
+/// `state`, `q` and `assigned` (`rest`) narrow the groups after their `conv_*` are known.
+fn grouped_sql(scope: &str, rest: &str, hit: &str, limit: usize, state: Option<&str>) -> String {
+    let (h, n, o) = (
+        scope_as(scope, "h"),
+        scope_as(scope, "n"),
+        scope_as(scope, "o"),
+    );
+    let single = "NOT (i.kind = 'dm' AND i.contact_id IS NOT NULL)";
+    // A single is open or done by its own state: said plainly, so the open index can serve it.
+    let single_state = match state {
+        Some("open") => " AND i.state = 'open'",
+        Some(_) => " AND i.state <> 'open'",
+        None => "",
+    };
+    let count = format!(
+        "SELECT count(*) AS conv_count, \
+         count(*) FILTER (WHERE i.state = 'open') AS conv_open, \
+         min(i.received_at) AS conv_first, bool_or({hit}) AS conv_hit \
+         FROM inbox_items i WHERE i.team_id = $1{scope} AND i.kind = 'dm' \
+         AND i.contact_id = h.contact_id AND i.social_account_id = h.social_account_id"
+    );
+    let heads = if state == Some("open") {
+        format!(
+            "FROM (SELECT DISTINCT o.social_account_id, o.contact_id FROM inbox_items o \
+             WHERE o.team_id = $1{o} AND o.kind = 'dm' AND o.contact_id IS NOT NULL \
+             AND o.state = 'open') k \
+             CROSS JOIN LATERAL (SELECT h.* FROM inbox_items h WHERE h.team_id = $1{h} \
+               AND h.kind = 'dm' AND h.contact_id = k.contact_id \
+               AND h.social_account_id = k.social_account_id \
+               ORDER BY h.received_at DESC, h.id DESC LIMIT 1) h \
+             CROSS JOIN LATERAL ({count}) c"
+        )
+    } else {
+        format!(
+            "FROM inbox_items h CROSS JOIN LATERAL ({count}) c \
+             WHERE h.team_id = $1{h} AND h.kind = 'dm' AND h.contact_id IS NOT NULL \
+             AND NOT EXISTS (SELECT 1 FROM inbox_items n WHERE n.team_id = $1{n} \
+               AND n.kind = 'dm' AND n.contact_id = h.contact_id \
+               AND n.social_account_id = h.social_account_id \
+               AND (n.received_at, n.id) > (h.received_at, h.id))"
+        )
+    };
+    format!(
+        "SELECT i.* FROM (\
+         (SELECT i.* FROM (SELECT i.*, 1::bigint AS conv_count, \
+            (CASE WHEN i.state = 'open' THEN 1 ELSE 0 END)::bigint AS conv_open, \
+            i.received_at AS conv_first, {hit} AS conv_hit \
+            FROM inbox_items i WHERE i.team_id = $1{scope} AND {single}{single_state}) i \
+          WHERE TRUE{rest} ORDER BY i.received_at DESC, i.id DESC LIMIT ${limit}) \
+         UNION ALL \
+         (SELECT i.* FROM (SELECT h.*, c.conv_count, c.conv_open, c.conv_first, c.conv_hit \
+            {heads}) i \
+          WHERE TRUE{rest} ORDER BY i.received_at DESC, i.id DESC LIMIT ${limit})\
+         ) i ORDER BY i.received_at DESC, i.id DESC LIMIT ${limit}"
+    )
 }
 
 /// An inbox's items, newest first, a page at a time.
@@ -1732,6 +1797,31 @@ pub fn api() -> OpenApiRouter<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scope_of_a_grouped_page_is_written_for_every_alias_it_uses() {
+        let mut values = Vec::new();
+        let f = Filters {
+            kinds: vec!["dm".into()],
+            keywords: vec!["hi".into()],
+            unanswered: true,
+        };
+        let scope = inbox::filter_sql(Some(Uuid::nil()), &f, &mut values)
+            + inbox::NOT_ACTIVITY
+            + " AND EXISTS (SELECT 1 FROM contact_tags ct WHERE ct.contact_id = i.contact_id)";
+        for alias in ["h", "n"] {
+            let other = scope_as(&scope, alias);
+            assert!(!other.contains(" i.") && !other.contains("(i."), "{other}");
+            assert!(other.contains(&format!("{alias}.contact_id")), "{other}");
+            assert!(other.contains("ia.inbox_id"), "{other}");
+        }
+        for state in [None, Some("open"), Some("done")] {
+            let sql = grouped_sql(&scope, " AND i.conv_open > 0", "TRUE", 51, state);
+            assert!(sql.contains("UNION ALL") && sql.contains("LIMIT $51"));
+            assert_eq!(sql.contains("SELECT DISTINCT o."), state == Some("open"));
+            assert!(!sql.contains(" o.kind IN ($") || state == Some("open"));
+        }
+    }
 
     #[test]
     fn item_pages_filter_then_page() {
