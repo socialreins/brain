@@ -21,23 +21,25 @@ pub const RESTORE_DAYS: i64 = 30;
 /// Advisory lock key held by the instance that purges.
 const PURGE_LOCK: i64 = 0x0050_5552_4745_5345;
 
-/// First wait after a round panicked; it doubles per panic in a row up to `BACKOFF_CAP_TIMES`
-/// times this, so a round that always panics is tried about once a minute, never in a hot loop.
-const BACKOFF: Duration = Duration::from_secs(5);
-const BACKOFF_CAP_TIMES: u32 = 12;
+/// The longest wait after panics in a row.
+const BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+/// How long to wait after the `panics`-th panic in a row: one period, doubling, up to
+/// `BACKOFF_MAX` (the next tick still waits out its own period). A round that always panics
+/// is retried slower and slower, never in a hot loop.
+fn backoff(period: Duration, panics: u32) -> Duration {
+    period
+        .saturating_mul(2u32.saturating_pow(panics.saturating_sub(1)))
+        .min(BACKOFF_MAX)
+}
 
 /// Runs `round(state)` now and then every `period` (a late round delays the next), each round
 /// as its own task: a panic is logged as an error with the loop's `name` and the loop waits a
 /// bounded back-off and carries on, instead of ending for good with `/health` still ok.
 /// Dropping the returned future (the runtime stopping) aborts the round with it. Rounds are
 /// not waited for beyond their own return: a round that starts longer work spawns it itself.
-async fn every<S, F, Fut>(
-    name: &'static str,
-    period: Duration,
-    backoff: Duration,
-    state: S,
-    round: F,
-) where
+async fn every<S, F, Fut>(name: &'static str, period: Duration, state: S, round: F)
+where
     S: Clone,
     F: Fn(S) -> Fut,
     Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -54,10 +56,7 @@ async fn every<S, F, Fut>(
             Some(Err(e)) => {
                 panics = panics.saturating_add(1);
                 tracing::error!(job = name, error = %e, consecutive_panics = panics, "background round panicked");
-                let wait = backoff
-                    .saturating_mul(2u32.saturating_pow(panics - 1))
-                    .min(backoff * BACKOFF_CAP_TIMES);
-                tokio::time::sleep(wait).await;
+                tokio::time::sleep(backoff(period, panics)).await;
             }
             _ => panics = 0,
         }
@@ -69,7 +68,7 @@ where
     F: Fn(AppState) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(every(name, period, BACKOFF, app.clone(), round));
+    tokio::spawn(every(name, period, app.clone(), round));
 }
 
 /// Starts the jobs; each first runs right away, so a restart also fails targets cut off
@@ -203,7 +202,7 @@ pub fn spawn(app: AppState) {
             Ok(Err(e)) => tracing::warn!(error = %e, "releasing unstarted posts failed"),
             Err(e) => tracing::error!(error = %e, "releasing unstarted posts panicked"),
         }
-        every("publish", min, BACKOFF, publish_app, |app| async move {
+        every("publish", min, publish_app, |app| async move {
             // Before `begin`, so the round already judges lateness without our own downtime.
             if let Err(e) = publish::note_tick(&app.db).await {
                 tracing::warn!(error = %e, "publish tick not recorded");
@@ -287,18 +286,12 @@ mod tests {
     #[tokio::test]
     async fn a_panicking_round_does_not_end_the_loop() {
         let rounds = Arc::new(AtomicU32::new(0));
-        let job = tokio::spawn(every(
-            "test",
-            5 * MS,
-            MS,
-            rounds.clone(),
-            |rounds| async move {
-                // The first round panics, the ones after it count.
-                if rounds.fetch_add(1, SeqCst) == 0 {
-                    panic!("boom");
-                }
-            },
-        ));
+        let job = tokio::spawn(every("test", 5 * MS, rounds.clone(), |rounds| async move {
+            // The first round panics, the ones after it count.
+            if rounds.fetch_add(1, SeqCst) == 0 {
+                panic!("boom");
+            }
+        }));
         tokio::time::sleep(300 * MS).await;
         assert!(!job.is_finished(), "the loop ended");
         assert!(
@@ -321,7 +314,6 @@ mod tests {
         let job = tokio::spawn(every(
             "test",
             5 * MS,
-            MS,
             (started.clone(), dropped.clone()),
             |(started, dropped)| async move {
                 let _guard = Dropped(dropped);
@@ -336,5 +328,16 @@ mod tests {
         tokio::time::sleep(50 * MS).await;
         assert_eq!(dropped.load(SeqCst), 1, "the round outlived the loop");
         assert_eq!(started.load(SeqCst), 1, "a round started after the stop");
+    }
+
+    #[test]
+    fn the_wait_after_panics_doubles_and_is_bounded() {
+        let min = Duration::from_secs(60);
+        assert_eq!(backoff(min, 1), min);
+        assert_eq!(backoff(min, 2), 2 * min);
+        assert_eq!(backoff(min, 3), 4 * min);
+        assert_eq!(backoff(min, 4), BACKOFF_MAX);
+        assert_eq!(backoff(min, u32::MAX), BACKOFF_MAX);
+        assert_eq!(backoff(Duration::from_secs(24 * 3600), 1), BACKOFF_MAX);
     }
 }
