@@ -33,7 +33,7 @@ Put the `age1...` line into `AGE_RECIPIENT` and the file in a password manager a
 
 ## Run on Railway
 
-New service from this repository, **Root Directory** `ops/backup`, builder Dockerfile, **Cron Schedule** `0 */6 * * *` (UTC), restart policy Never, no public domain. A cron service starts the container, runs it once and stops; a run still going at the next tick is skipped. Railway marks a non-zero exit as crashed: turn on deploy-crash notifications for the project (Settings, Notifications, or a webhook) so you are told.
+New service from this repository: **Root Directory** `ops/backup` (the Dockerfile is found there), **Cron Schedule** `0 */6 * * *` (UTC), **Restart Policy** Never, **Watch Paths** `/ops/backup/**` (so brain commits do not rebuild it), no public domain, the variables above. A cron service starts the container at each tick, runs it once and stops; a run still going at the next tick is skipped, and a deploy does not run it (it waits for the next tick; to run now set the cron to `*/5 * * * *`, redeploy, and set it back). A non-zero exit shows the run as **Crashed** (checked: a bad `AGE_RECIPIENT` made `age` fail and the deployment showed CRASHED, nothing uploaded). Turn on deploy-crash notifications for the project (Railway, Settings, Notifications, or a webhook on `Deployment.crashed`) so you are told.
 
 ## Run anywhere else
 
