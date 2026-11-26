@@ -135,7 +135,11 @@ async fn subscribe(
         }
     };
     // A failed mail keeps the row and the ok reply; the error carries no email or token.
-    tokio::spawn(async move { send_confirmation(&app, &reserved, &address, &secret).await });
+    let sending = crate::mail::Sending::begin();
+    tokio::spawn(async move {
+        let _sending = sending;
+        send_confirmation(&app, &reserved, &address, &secret).await
+    });
     Json(serde_json::json!({"status": "ok"})).into_response()
 }
 

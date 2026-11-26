@@ -75,7 +75,7 @@ pub async fn send_due(app: &AppState) {
            SELECT post_id, kind FROM post_notices WHERE sent_at IS NULL \
            AND (retry_at IS NULL OR retry_at <= now()) \
            ORDER BY created_at LIMIT 50 FOR UPDATE SKIP LOCKED) \
-         RETURNING post_id, team_id, kind, tries",
+         RETURNING post_id, team_id, kind, tries, sent_at",
         vec![],
     );
     let rows = match app.db.query_all_raw(claim).await {
@@ -88,15 +88,16 @@ pub async fn send_due(app: &AppState) {
             let team: Uuid = row.try_get("", "team_id")?;
             let kind: String = row.try_get("", "kind")?;
             let tries: i32 = row.try_get("", "tries")?;
-            Ok::<_, DbErr>((post, team, kind, tries))
+            let claimed: chrono::DateTime<chrono::Utc> = row.try_get("", "sent_at")?;
+            Ok::<_, DbErr>((post, team, kind, (tries, claimed)))
         })();
-        let Ok((post, team, kind, tries)) = got else {
+        let Ok((post, team, kind, claim)) = got else {
             continue;
         };
         let Some(kind) = Kind::parse(&kind) else {
             continue;
         };
-        if let Err(e) = send_one(app, post, team, (kind, tries)).await {
+        if let Err(e) = send_one(app, post, team, (kind, claim)).await {
             tracing::warn!(error = %e, %post, "post notice not sent");
         }
     }
@@ -106,7 +107,7 @@ async fn send_one(
     app: &AppState,
     post: Uuid,
     team: Uuid,
-    (kind, tries): (Kind, i32),
+    (kind, (tries, claimed)): (Kind, (i32, chrono::DateTime<chrono::Utc>)),
 ) -> Result<(), DbErr> {
     let cap = [(format!("post-mail:team:{team}"), PER_DAY)];
     let Some(hit) = rate_limit::daily_reserve(&app.db, &cap).await? else {
@@ -141,7 +142,7 @@ async fn send_one(
         .await?;
     let link = format!("{}/t/{code}/posts/{number}", app.web_url);
     let (subject, text) = compose(kind, &platform, &body, error.as_deref(), &link);
-    let (mut sent, mut failed) = (0, 0);
+    let (mut sent, mut failed, mut down) = (0, 0, true);
     for r in to {
         let email: String = r.try_get("", "email")?;
         match app
@@ -152,27 +153,32 @@ async fn send_one(
             Ok(()) => sent += 1,
             Err(e) => {
                 failed += 1;
+                // A refused address or key will not be fixed by trying again.
+                down &= crate::mail::transient(&e);
                 tracing::warn!(error = %e, %post, "post notice mail not sent");
             }
         }
     }
-    // Nobody got it: the mail provider is down. Give the notice and the day's hit back, and try
-    // again in a while (5, 10, 15 ... minutes). If anyone got it, it is done: the rest would
-    // only get it twice.
-    if sent == 0 && failed > 0 {
-        rate_limit::daily_refund(&app.db, &hit).await;
+    // Nobody got it and the mail provider is down (or slow): give the notice back and try again
+    // in a while (5, 10, 15 ... minutes). If anyone got it, it is done: the rest would only get
+    // it twice. Only the claim made by this round is given back (`sent_at`): a notice queued
+    // again meanwhile and claimed by another round is theirs.
+    if sent == 0 && failed > 0 && down {
         let back = sql(
             "UPDATE post_notices SET sent_at = NULL, tries = tries + 1, \
              retry_at = now() + make_interval(mins => 5 * ($4 + 1)) \
-             WHERE post_id = $1 AND kind = $2 AND tries < $3 AND sent_at IS NOT NULL",
+             WHERE post_id = $1 AND kind = $2 AND tries < $3 AND sent_at = $5",
             vec![
                 post.into(),
                 kind.as_str().into(),
                 RETRIES.into(),
                 tries.into(),
+                claimed.into(),
             ],
         );
-        app.db.execute_raw(back).await?;
+        if app.db.execute_raw(back).await?.rows_affected() == 1 {
+            rate_limit::daily_refund(&app.db, &hit).await;
+        }
     }
     Ok(())
 }

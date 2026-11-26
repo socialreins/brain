@@ -23,9 +23,10 @@ pub struct List<'a> {
 /// Waits before the two more tries of `Mailer::send`.
 const RETRY_WAITS: [Duration; 2] = [Duration::from_millis(500), Duration::from_millis(1500)];
 
-/// Whether a `deliver` error is the provider being slow or down (a timeout, no connection, a
-/// 429 or a 5xx), which another try can fix, and not a refusal.
-fn transient(error: &str) -> bool {
+/// Whether a `deliver` error is the provider being briefly down (no connection, a 429 or a 5xx),
+/// which another try can fix, and not a refusal. A timeout is not retried in place (each
+/// takes 15 seconds); the notice that was being sent is given back and tried later instead.
+pub fn transient(error: &str) -> bool {
     let status = error.strip_prefix("resend status ");
     matches!(error, "resend timeout" | "resend connection")
         || status.is_some_and(|c| c == "429" || c.starts_with('5'))
@@ -129,7 +130,7 @@ impl Mailer {
                 .deliver(to, None, subject, body.clone(), Some(page.clone()), None)
                 .await;
             match (sent, waits.next()) {
-                (Err(e), Some(wait)) if transient(&e) => {
+                (Err(e), Some(wait)) if transient(&e) && !e.ends_with("timeout") => {
                     tracing::warn!(error = %e, "mail not sent, trying again");
                     tokio::time::sleep(wait).await;
                 }
