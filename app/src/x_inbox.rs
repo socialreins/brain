@@ -389,7 +389,7 @@ async fn keep<T>(
         }
         round
             .fresh
-            .extend(inbox::store(&app.db, account, fresh).await?);
+            .extend(inbox::store(&app.db, account, fresh, app.billing_enabled).await?);
     }
     Ok(())
 }

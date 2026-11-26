@@ -1013,13 +1013,55 @@ fn run(status: &str, reason: Option<&str>) -> (String, Option<String>) {
     (status.to_owned(), reason.map(str::to_owned))
 }
 
+/// A new automation answers one person once in 10 minutes unless it says otherwise; 0 is "no
+/// cool-down"; a save that names none keeps what the automation has.
+#[tokio::test]
+#[serial]
+async fn a_new_automation_gets_a_ten_minute_cooldown_unless_told_otherwise() {
+    let e = env(ALL, false).await;
+    let read = |id: String| {
+        let e = &e;
+        async move {
+            let res = e
+                .req(Method::GET, &format!("/v1/automations/{id}"), json!(null))
+                .await;
+            res.json::<Value>()["cooldown_minutes"].clone()
+        }
+    };
+    let made = e.automation(json!({})).await;
+    assert_eq!(read(made.clone()).await, 10);
+    let none = e.automation(json!({"cooldown_minutes": 0})).await;
+    assert_eq!(read(none).await, Value::Null);
+    let five = e.automation(json!({"cooldown_minutes": 5})).await;
+    assert_eq!(read(five.clone()).await, 5);
+    // null says "none" as well, so a client that sends back what it read can clear it.
+    let null = e.automation(json!({"cooldown_minutes": null})).await;
+    assert_eq!(read(null).await, Value::Null);
+    let body = json!({"name": "Thanks", "trigger": "mention_received", "cooldown_minutes": null,
+        "conditions": {"account_ids": [e.account]},
+        "actions": [{"type": "reply_publicly", "text": "thanks"}]});
+    let res = e
+        .req(Method::PUT, &format!("/v1/automations/{five}"), body)
+        .await;
+    assert_eq!(res.status_code(), 200, "{}", res.text());
+    assert_eq!(res.json::<Value>()["cooldown_minutes"], Value::Null);
+    // A save without the field keeps the stored one (an old client cannot lift it by accident).
+    let body = json!({"name": "Renamed", "trigger": "mention_received",
+        "conditions": {"account_ids": [e.account]},
+        "actions": [{"type": "reply_publicly", "text": "thanks"}]});
+    let res = e
+        .req(Method::PUT, &format!("/v1/automations/{made}"), body)
+        .await;
+    assert_eq!(res.status_code(), 200, "{}", res.text());
+    assert_eq!(res.json::<Value>()["cooldown_minutes"], 10);
+}
+
 #[tokio::test]
 #[serial]
 async fn a_cooldown_a_daily_cap_and_the_pause_switch_hold_an_automation_back() {
     let e = env(ALL, false).await;
     // Out of range values are refused.
     for (bad, code) in [
-        (json!({"cooldown_minutes": 0}), "invalid_cooldown"),
         (json!({"cooldown_minutes": 20000}), "invalid_cooldown"),
         (json!({"daily_cap": 0}), "invalid_daily_cap"),
         (json!({"daily_cap": 501}), "invalid_daily_cap"),
@@ -1054,7 +1096,7 @@ async fn a_cooldown_a_daily_cap_and_the_pause_switch_hold_an_automation_back() {
         ]
     );
     // Lifting both, then pausing the team: nothing goes out and the run log says why.
-    let body = json!({"name": "Thanks", "trigger": "mention_received",
+    let body = json!({"name": "Thanks", "trigger": "mention_received", "cooldown_minutes": 0,
         "conditions": {"account_ids": [e.account]},
         "actions": [{"type": "reply_publicly", "text": "thanks"}]});
     let res = e

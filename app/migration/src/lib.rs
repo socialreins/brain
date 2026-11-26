@@ -90,6 +90,7 @@ mod m20270107_000001_number_newsletters;
 mod m20270107_000001_number_post_lists;
 mod m20270109_000001_bluesky_read_stamp;
 mod m20270110_000001_scheduler_ticks;
+mod m20270110_000001_trial_uses;
 mod url_numbers;
 
 pub struct Migrator;
@@ -186,6 +187,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20270107_000001_number_inboxes::Migration),
             Box::new(m20270107_000001_number_inbox_items::Migration),
             Box::new(m20270107_000001_number_contacts::Migration),
+            Box::new(m20270110_000001_trial_uses::Migration),
             Box::new(m20270109_000001_bluesky_read_stamp::Migration),
             Box::new(m20270110_000001_scheduler_ticks::Migration),
             // inject-above (do not remove this comment)

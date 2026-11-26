@@ -29,10 +29,16 @@ const MAX_INPUT_CHARS: usize = 1000;
 /// Longest part of the person's name the model sees, in characters.
 const MAX_NAME_CHARS: usize = 64;
 
+/// What a team may use a day of our key when billing is off, unless `AI_DAILY_CAP` says otherwise.
+pub const DEFAULT_DAILY_CAP: i64 = 200;
+
 #[derive(Clone)]
 pub struct Ai {
     /// `ANTHROPIC_API_KEY`: ours, for teams without their own key.
     pub own_key: Option<String>,
+    /// `AI_DAILY_CAP`: AI replies and judgments a team may use a day on our key when billing is
+    /// off (with billing on the plan's allowance and credits pay). 0 is no cap.
+    pub daily_cap: i64,
     pub anthropic_url: String,
     pub openai_url: String,
     client: reqwest::Client,
@@ -47,6 +53,7 @@ impl Ai {
             .map_err(|_| "the AI HTTP client could not be built")?;
         Ok(Self {
             own_key,
+            daily_cap: DEFAULT_DAILY_CAP,
             anthropic_url: ANTHROPIC_URL.into(),
             openai_url: OPENAI_URL.into(),
             client,

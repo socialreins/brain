@@ -281,7 +281,7 @@ impl Env {
             button_payload: None,
             attachments,
         };
-        let item = inbox::store(&self.db, &self.account, fresh)
+        let item = inbox::store(&self.db, &self.account, fresh, self.state.billing_enabled)
             .await
             .unwrap()
             .expect("a new item");

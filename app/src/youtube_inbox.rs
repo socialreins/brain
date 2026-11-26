@@ -372,8 +372,14 @@ impl Sweep<'_> {
         if c.author.did == self.account.external_id || c.at < self.floor {
             return Ok(());
         }
-        let stored =
-            inbox::store_with(&self.app.db, self.account, fresh_of(c), (true, self.first)).await?;
+        let stored = inbox::store_with(
+            &self.app.db,
+            self.account,
+            fresh_of(c),
+            (true, self.first),
+            self.app.billing_enabled,
+        )
+        .await?;
         if let Some(item) = stored {
             if let Some(v) = &c.video {
                 if !round.videos.contains(v) {
