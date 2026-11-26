@@ -37599,6 +37599,12 @@ mod teams {
             CALLS.lock().unwrap().iter().filter(|c| c.0 == path).count()
         }
 
+        async fn put(db: &DatabaseConnection, sql: &str, value: &str) {
+            let stmt =
+                Statement::from_sql_and_values(DbBackend::Postgres, sql, [value.to_owned().into()]);
+            db.execute_raw(stmt).await.unwrap();
+        }
+
         async fn put_sub(
             db: &DatabaseConnection,
             team: &str,
@@ -38469,6 +38475,45 @@ mod teams {
         /// again in a new team of the same person, not even under another `+tag`.
         #[tokio::test]
         #[serial]
+        async fn a_late_trial_event_does_not_write_a_deleted_persons_address_back() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let key = format!("gone{}@example.com", uuid::Uuid::now_v7().simple());
+            // What deleting the account leaves: the key as a hash.
+            let sql = "INSERT INTO trial_uses (person_key) \
+                       VALUES (encode(sha256(convert_to($1::text, 'UTF8')), 'hex'))";
+            put(&db, sql, &key).await;
+            let now = Utc::now().timestamp();
+            let mut e: Value = serde_json::from_str(&sub_event(
+                &format!("evt_late_{}", *RUN),
+                now,
+                &format!("sub_late_{}", *RUN),
+                &team,
+                "trialing",
+                "price_s",
+            ))
+            .unwrap();
+            e["data"]["object"]["metadata"]["trial_key"] = key.clone().into();
+            assert_eq!(
+                deliver(&s, &e.to_string(), WHSEC, now).await.status_code(),
+                200
+            );
+            let plain = "SELECT count(*) AS n FROM trial_uses WHERE person_key = $1";
+            let row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    plain,
+                    [key.into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
+        }
+
+        #[tokio::test]
+        #[serial]
         async fn a_person_gets_one_trial_not_one_per_team() {
             let (s, db) = on(true).await;
             let (_, owner, _) = user(&s, &db).await;
@@ -38622,6 +38667,833 @@ mod teams {
                 .unwrap()
                 .unwrap();
             assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
+        }
+    }
+
+    /// Self-serve export and deletion (`controllers::account`, decision 0019).
+    mod account_api {
+        use super::*;
+        use axum::{
+            extract::Path, http::StatusCode, routing::delete as route_delete, Json as AxJson,
+            Router,
+        };
+        use sea_orm::{ConnectionTrait, DbBackend, Statement, Value as DbValue};
+        use socialreins_brain::{
+            controllers::account::{MEMBER, NOT_EXPORTED, OWN, TEAM_PARTS},
+            mail::Mailer,
+            stripe::Stripe,
+        };
+        use std::{collections::BTreeSet, sync::Mutex};
+
+        /// The subscriptions the mock Stripe was asked to cancel.
+        static CANCELLED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        /// Stripe and Resend on local mocks: `sub_fail` is refused, `sub_gone` is already ended.
+        async fn app() -> (
+            TestServer,
+            DatabaseConnection,
+            crate::captcha_and_contact::Seen,
+        ) {
+            let cancel = |Path(id): Path<String>| async move {
+                CANCELLED.lock().unwrap().push(id.clone());
+                match id.as_str() {
+                    "sub_fail" => (
+                        StatusCode::BAD_REQUEST,
+                        AxJson(json!({"error": {"code": "api_error"}})),
+                    ),
+                    "sub_gone" => (
+                        StatusCode::NOT_FOUND,
+                        AxJson(json!({"error": {"code": "resource_missing"}})),
+                    ),
+                    _ => (
+                        StatusCode::OK,
+                        AxJson(json!({"id": id, "status": "canceled"})),
+                    ),
+                }
+            };
+            let stripe = Router::new().route("/v1/subscriptions/{id}", route_delete(cancel));
+            let base = crate::captcha_and_contact::serve(stripe).await;
+            let (url, seen) = crate::captcha_and_contact::resend().await;
+            let (s, db) = server_where(move |c| {
+                let none = |p| (p, "month", None);
+                let mut stripe = Stripe::new(
+                    Some("sk_test_mock".into()),
+                    None,
+                    [none("a"), none("b"), none("c"), none("d")],
+                    [("x100", None), ("x500", None)],
+                )
+                .unwrap();
+                stripe.api_url = base;
+                c.stripe = stripe;
+                c.mailer = Mailer::resend_at(&url, "re_test", "brain@example.com").unwrap();
+            })
+            .await;
+            (s, db, seen)
+        }
+
+        async fn exec(db: &DatabaseConnection, sql: &str, values: Vec<DbValue>) {
+            let stmt = Statement::from_sql_and_values(DbBackend::Postgres, sql, values);
+            db.execute_raw(stmt).await.unwrap();
+        }
+
+        async fn count(db: &DatabaseConnection, sql: &str, values: Vec<DbValue>) -> i64 {
+            let stmt = Statement::from_sql_and_values(DbBackend::Postgres, sql, values);
+            let row = db.query_one_raw(stmt).await.unwrap().unwrap();
+            row.try_get("", "n").unwrap()
+        }
+
+        fn id(s: &str) -> uuid::Uuid {
+            s.parse().unwrap()
+        }
+
+        /// Rows of every kind in `team`, with secrets spelled `MARK...` so a leak is easy to find;
+        /// `tag` is in each text. `sub` is the team's Stripe subscription.
+        async fn seed(db: &DatabaseConnection, team: &str, user: uuid::Uuid, tag: &str, sub: &str) {
+            let (team, account, post) = (id(team), uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+            let item = uuid::Uuid::now_v7();
+            let u = || uuid::Uuid::now_v7();
+            exec(
+                db,
+                "INSERT INTO social_accounts (id, team_id, provider, external_id, handle, \
+                 access_token, meta, created_by) VALUES ($1, $2, 'bluesky', $3, $4, \
+                 convert_to('MARK-access', 'UTF8'), '{\"refresh\": \"MARK-meta\"}', $5)",
+                vec![
+                    account.into(),
+                    team.into(),
+                    format!("did:{tag}").into(),
+                    format!("{tag}.bsky.social").into(),
+                    user.into(),
+                ],
+            )
+            .await;
+            exec(
+                db,
+                "INSERT INTO posts (id, team_id, social_set_id, platform, body, status, \
+                 created_by) VALUES ($1, $2, (SELECT id FROM social_sets WHERE team_id = $2 \
+                 AND is_default LIMIT 1), 'bluesky', $3, 'published', $4)",
+                vec![
+                    post.into(),
+                    team.into(),
+                    format!("post {tag}").into(),
+                    user.into(),
+                ],
+            )
+            .await;
+            exec(
+                db,
+                "INSERT INTO post_targets (id, post_id, social_account_id, status, remote_id) \
+                 VALUES ($1, $2, $3, 'published', 'at://x')",
+                vec![u().into(), post.into(), account.into()],
+            )
+            .await;
+            exec(
+                db,
+                "INSERT INTO contacts (id, team_id, platform, external_id, handle, notes, \
+                 first_seen_at, last_seen_at) VALUES ($1, $2, 'bluesky', $3, $3, $4, now(), now())",
+                vec![
+                    u().into(),
+                    team.into(),
+                    format!("fan-{tag}").into(),
+                    format!("note {tag}").into(),
+                ],
+            )
+            .await;
+            exec(
+                db,
+                "INSERT INTO inbox_items (id, team_id, social_account_id, platform, kind, \
+                 remote_id, author_id, text, received_at) VALUES ($1, $2, $3, 'bluesky', 'dm', \
+                 $4, 'a', $5, now())",
+                vec![
+                    item.into(),
+                    team.into(),
+                    account.into(),
+                    format!("r-{tag}").into(),
+                    format!("dm {tag}").into(),
+                ],
+            )
+            .await;
+            exec(
+                db,
+                "INSERT INTO credit_ledger (id, team_id, kind, amount, reason) \
+                 VALUES ($1, $2, 'ai', 5, 'grant')",
+                vec![u().into(), team.into()],
+            )
+            .await;
+            exec(
+                db,
+                "INSERT INTO api_tokens (id, team_id, name, prefix_hint, token_hash, \
+                 created_by) VALUES ($1, $2, 'ci', 'MARKHINT', $3, $4)",
+                vec![
+                    u().into(),
+                    team.into(),
+                    format!("MARKHASH{}", u()).into(),
+                    user.into(),
+                ],
+            )
+            .await;
+            exec(
+                db,
+                "INSERT INTO subscriptions (team_id, plan_id, status, provider, \
+                 provider_customer_id, provider_subscription_id) \
+                 VALUES ($1, 'scheduler', 'active', 'stripe', 'cus_MARK', $2)",
+                vec![team.into(), sub.to_owned().into()],
+            )
+            .await;
+            exec(
+                db,
+                "INSERT INTO team_webhooks (team_id, url, secret) \
+                 VALUES ($1, 'https://example.com/hook', convert_to('MARK-hook', 'UTF8'))",
+                vec![team.into()],
+            )
+            .await;
+        }
+
+        fn export(s: &TestServer, cookie: &str) -> TestRequest {
+            req(s, Method::POST, "/v1/account/export", cookie)
+        }
+
+        fn team_entry(v: &Value, team: &str) -> Value {
+            v["teams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["team"]["id"] == team)
+                .unwrap()
+                .clone()
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn export_has_the_data_and_none_of_the_secrets() {
+            let (s, db, _) = app().await;
+            let (email, a, a_id) = user(&s, &db).await;
+            let team = current(&s, &a).await["id"].as_str().unwrap().to_owned();
+            seed(
+                &db,
+                &team,
+                a_id,
+                "alpha",
+                &format!("sub_MARK{}", a_id.simple()),
+            )
+            .await;
+            exec(
+                &db,
+                "INSERT INTO passkeys (id, user_id, name, credential_id, credential) \
+                VALUES ($1, $2, 'Laptop', convert_to('MARK-' || $1::text, 'UTF8'), '{\"k\": \"MARK-pk\"}')",
+                vec![uuid::Uuid::now_v7().into(), a_id.into()],
+            )
+            .await;
+            let (_, b, b_id) = user(&s, &db).await;
+            let team_b = current(&s, &b).await["id"].as_str().unwrap().to_owned();
+            seed(
+                &db,
+                &team_b,
+                b_id,
+                "bravo",
+                &format!("sub_MARK{}", b_id.simple()),
+            )
+            .await;
+
+            let res = export(&s, &a).await;
+            assert_eq!(res.status_code(), 200);
+            assert!(res
+                .header("content-disposition")
+                .to_str()
+                .unwrap()
+                .starts_with("attachment"));
+            assert_eq!(res.header("cache-control"), "no-store");
+            let text = res.text();
+            // No secret of any table, no other team's data, no key name that holds one.
+            assert!(!text.contains("MARK"), "a secret is in the export");
+            assert!(!text.contains("bravo"));
+            for key in [
+                "access_token",
+                "token_hash",
+                "prefix_hint",
+                "\"secret\"",
+                "credential",
+                "provider_customer_id",
+                "provider_subscription_id",
+                "\"meta\"",
+            ] {
+                assert!(!text.contains(key), "{key}");
+            }
+            let v: Value = serde_json::from_str(&text).unwrap();
+            assert!(v["readme"].as_str().unwrap().contains("plain member"));
+            assert_eq!(v["complete"], true);
+            assert_eq!(v["profile"]["email"], email);
+            assert_eq!(v["passkeys"][0]["name"], "Laptop");
+            assert_eq!(v["memberships"][0]["role"], "owner");
+            let t = team_entry(&v, &team);
+            assert_eq!(t["role"], "owner");
+            assert_eq!(t["posts"][0]["body"], "post alpha");
+            assert_eq!(t["post_targets"].as_array().unwrap().len(), 1);
+            assert_eq!(t["social_accounts"][0]["handle"], "alpha.bsky.social");
+            assert_eq!(t["contacts"][0]["notes"], "note alpha");
+            assert_eq!(t["inbox_items"][0]["text"], "dm alpha");
+            assert_eq!(t["credit_ledger"][0]["amount"], 5);
+            assert_eq!(t["api_tokens"][0]["name"], "ci");
+            assert_eq!(t["billing"]["plan_id"], "scheduler");
+            assert_eq!(t["webhook"]["url"], "https://example.com/hook");
+            assert!(t["social_sets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["is_default"] == true));
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn export_is_session_only_and_from_the_web_app() {
+            let (s, db, _) = app().await;
+            let (_, a, _) = user(&s, &db).await;
+            let secret = {
+                let res = req(&s, Method::POST, "/v1/api-tokens", &a)
+                    .json(&json!({"name": "t", "read_only": false}))
+                    .await;
+                res.json::<Value>()["secret"].as_str().unwrap().to_owned()
+            };
+            let by_token = s
+                .post("/v1/account/export")
+                .add_header("origin", WEB)
+                .add_header("authorization", format!("Bearer {secret}"))
+                .await;
+            assert_eq!(by_token.status_code(), 401);
+            let cross_site = s
+                .post("/v1/account/export")
+                .add_header("origin", "https://evil.example")
+                .add_header("cookie", a.clone())
+                .await;
+            assert_eq!(cross_site.status_code(), 403);
+            let signed_out = s.post("/v1/account/export").add_header("origin", WEB).await;
+            assert_eq!(signed_out.status_code(), 401);
+            // The refused calls did not use up the hour.
+            assert_eq!(export(&s, &a).await.status_code(), 200);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn members_get_their_own_posts_and_no_team_data() {
+            let (s, db, _) = app().await;
+            let (_, owner, owner_id) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            seed(
+                &db,
+                &team,
+                owner_id,
+                "alpha",
+                &format!("sub_MARK{}", owner_id.simple()),
+            )
+            .await;
+            let (member, member_id) = joined(&s, &db, &team, "member").await;
+            let (admin, _) = joined(&s, &db, &team, "admin").await;
+            exec(
+                &db,
+                "INSERT INTO posts (id, team_id, social_set_id, platform, body, status, \
+                created_by) VALUES ($1, $2, (SELECT id FROM social_sets WHERE team_id = $2 \
+                AND is_default LIMIT 1), 'bluesky', 'mine', 'draft', $3)",
+                vec![
+                    uuid::Uuid::now_v7().into(),
+                    id(&team).into(),
+                    member_id.into(),
+                ],
+            )
+            .await;
+
+            let res = export(&s, &member).await;
+            let text = res.text();
+            let t = team_entry(&serde_json::from_str(&text).unwrap(), &team);
+            assert_eq!(t["role"], "member");
+            assert_eq!(t["posts"].as_array().unwrap().len(), 1);
+            assert_eq!(t["posts"][0]["body"], "mine");
+            for key in [
+                "contacts",
+                "inbox_items",
+                "billing",
+                "api_tokens",
+                "credit_ledger",
+                "social_accounts",
+                "automations",
+                "newsletters",
+            ] {
+                assert!(t.get(key).is_none(), "{key}");
+            }
+            assert!(
+                !text.contains("alpha"),
+                "the team's contacts and inbox are not a member's"
+            );
+
+            // An admin holds the team's contacts and inbox, so they are in theirs.
+            let v: Value = export(&s, &admin).await.json();
+            let t = team_entry(&v, &team);
+            assert_eq!(t["role"], "admin");
+            assert_eq!(t["posts"].as_array().unwrap().len(), 2);
+            assert_eq!(t["contacts"][0]["notes"], "note alpha");
+            assert_eq!(t["inbox_items"][0]["text"], "dm alpha");
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn one_export_an_hour_for_each_user() {
+            let (s, db, _) = app().await;
+            let (_, a, a_id) = user(&s, &db).await;
+            let (_, b, _) = user(&s, &db).await;
+            assert_eq!(export(&s, &a).await.status_code(), 200);
+            let again = export(&s, &a).await;
+            assert_eq!(again.status_code(), 429);
+            again.assert_json(&json!({"error": "rate_limited"}));
+            assert_eq!(export(&s, &b).await.status_code(), 200);
+            let bucket = format!("export:{a_id}");
+            exec(
+                &db,
+                "UPDATE rate_limit_hits SET created_at = now() - interval '61 minutes' \
+                WHERE bucket = $1",
+                vec![bucket.into()],
+            )
+            .await;
+            assert_eq!(export(&s, &a).await.status_code(), 200);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn a_long_list_is_written_in_pages_without_losing_or_repeating_a_row() {
+            let (s, db, _) = app().await;
+            let (_, a, _) = user(&s, &db).await;
+            let team = current(&s, &a).await["id"].as_str().unwrap().to_owned();
+            exec(&db, "INSERT INTO snippets (id, team_id, kind, name, body) \
+                SELECT gen_random_uuid(), $1, 'reply', 'n' || g, 'b' FROM generate_series(1, 450) g",
+                vec![id(&team).into()]).await;
+            let v: Value = export(&s, &a).await.json();
+            let ids: BTreeSet<String> = team_entry(&v, &team)["snippets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(ids.len(), 450);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn every_column_is_exported_or_left_out_on_purpose() {
+            let (_s, db) = server_where(|_| {}).await;
+            let columns = |table: &str| {
+                let sql = "SELECT column_name AS c FROM information_schema.columns \
+                           WHERE table_schema = 'public' AND table_name = $1";
+                let stmt = Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    sql,
+                    [table.to_owned().into()],
+                );
+                let db = &db;
+                async move {
+                    let rows = db.query_all_raw(stmt).await.unwrap();
+                    rows.iter()
+                        .map(|r| r.try_get::<String>("", "c").unwrap())
+                        .collect::<BTreeSet<_>>()
+                }
+            };
+            let split = |text: &str| {
+                text.split(',')
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>()
+            };
+            let parts = || OWN.iter().chain(MEMBER).chain(TEAM_PARTS);
+            for p in parts() {
+                let listed = split(p.cols)
+                    .union(&split(p.skip))
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                assert!(split(p.cols).is_disjoint(&split(p.skip)), "{}", p.key);
+                assert_eq!(
+                    columns(p.table).await,
+                    listed,
+                    "{}: list each column of {} in cols or skip",
+                    p.key,
+                    p.table
+                );
+            }
+            // A table with a team_id nobody decided about: add it to TEAM_PARTS or NOT_EXPORTED.
+            let sql = "SELECT table_name AS t FROM information_schema.columns \
+                       WHERE table_schema = 'public' AND column_name = 'team_id'";
+            let tables = db
+                .query_all_raw(Statement::from_string(DbBackend::Postgres, sql))
+                .await
+                .unwrap();
+            let known: BTreeSet<&str> = TEAM_PARTS
+                .iter()
+                .map(|p| p.table)
+                .chain(NOT_EXPORTED.iter().copied())
+                .collect();
+            // `teams` itself has no team_id; the deleted-with-the-team tables are the ones to watch.
+            for t in tables {
+                let table: String = t.try_get("", "t").unwrap();
+                assert!(
+                    known.contains(table.as_str()),
+                    "{table} has a team_id and is neither exported nor in NOT_EXPORTED"
+                );
+            }
+        }
+
+        fn delete(s: &TestServer, cookie: &str, email: &str) -> TestRequest {
+            req(s, Method::DELETE, "/v1/account", cookie).json(&json!({"email": email}))
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn deleting_needs_a_fresh_sign_in_and_the_typed_email() {
+            let (s, db, _) = app().await;
+            let (email, a, a_id) = user(&s, &db).await;
+            let hash = token::hash(a.trim_start_matches("sr_session="));
+            let age = |minutes: i64| {
+                let row = sessions::ActiveModel {
+                    token_hash: Set(hash.clone()),
+                    created_at: Set((Utc::now() - Duration::minutes(minutes)).fixed_offset()),
+                    ..Default::default()
+                };
+                sessions::Entity::update(row).exec(&db)
+            };
+            age(11).await.unwrap();
+            let old = delete(&s, &a, &email).await;
+            assert_eq!(old.status_code(), 403);
+            old.assert_json(&json!({"error": "reauth_required"}));
+            age(0).await.unwrap();
+            for wrong in ["", "someone@example.com", &format!("x{email}")] {
+                let res = delete(&s, &a, wrong).await;
+                assert_eq!(res.status_code(), 422, "{wrong}");
+                res.assert_json(&json!({"error": "email_mismatch"}));
+            }
+            let cross_site = s
+                .method(Method::DELETE, "/v1/account")
+                .add_header("origin", "https://evil.example")
+                .add_header("cookie", a.clone())
+                .json(&json!({"email": email}))
+                .await;
+            assert_eq!(cross_site.status_code(), 403);
+            assert_eq!(
+                count(
+                    &db,
+                    "SELECT count(*) AS n FROM users WHERE id = $1",
+                    vec![a_id.into()]
+                )
+                .await,
+                1
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn deleting_removes_the_person_and_their_own_team_and_nobody_else() {
+            let (s, db, seen) = app().await;
+            let (email, a, a_id) = user(&s, &db).await;
+            let team = current(&s, &a).await["id"].as_str().unwrap().to_owned();
+            let sub = format!("sub_a_{}", a_id.simple());
+            seed(&db, &team, a_id, "alpha", &sub).await;
+            // A plain member of someone else's team, with a post and a token made there.
+            let (_, owner, owner_id) = user(&s, &db).await;
+            let other = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            seed(
+                &db,
+                &other,
+                owner_id,
+                "other",
+                &format!("sub_MARK{}", owner_id.simple()),
+            )
+            .await;
+            // `a` joins `other` as a member.
+            let secret = invitation(
+                &db,
+                &other,
+                &email,
+                "member",
+                Some(owner_id),
+                Duration::days(7),
+            )
+            .await;
+            let joined_other =
+                req(&s, Method::POST, &format!("/v1/invitations/{secret}"), &a).await;
+            joined_other.assert_status_ok();
+            exec(
+                &db,
+                "INSERT INTO api_tokens (id, team_id, name, prefix_hint, token_hash, created_by) \
+                VALUES ($1, $2, 'mine', 'h', $3, $4)",
+                vec![
+                    uuid::Uuid::now_v7().into(),
+                    id(&other).into(),
+                    format!("H{}", uuid::Uuid::now_v7()).into(),
+                    a_id.into(),
+                ],
+            )
+            .await;
+            exec(
+                &db,
+                "UPDATE posts SET created_by = $1 WHERE team_id = $2",
+                vec![a_id.into(), id(&other).into()],
+            )
+            .await;
+            exec(
+                &db,
+                "INSERT INTO passkeys (id, user_id, name, credential_id, credential) \
+                VALUES ($1, $2, 'Laptop', convert_to($1::text, 'UTF8'), '{}')",
+                vec![uuid::Uuid::now_v7().into(), a_id.into()],
+            )
+            .await;
+            exec(
+                &db,
+                "INSERT INTO waitlist_signups (id, email) VALUES ($1, $2)",
+                vec![uuid::Uuid::now_v7().into(), email.clone().into()],
+            )
+            .await;
+            let key = socialreins_core::email::person_key(&email).unwrap();
+            exec(
+                &db,
+                "INSERT INTO trial_uses (person_key, team_id) VALUES ($1, $2)",
+                vec![key.clone().into(), id(&team).into()],
+            )
+            .await;
+            let before = count(&db, "SELECT count(*) AS n FROM account_deletions", vec![]).await;
+            let others = || {
+                let sql = "SELECT (SELECT count(*) FROM posts WHERE team_id = $1) \
+                    + (SELECT count(*) FROM social_accounts WHERE team_id = $1) \
+                    + (SELECT count(*) FROM contacts WHERE team_id = $1) \
+                    + (SELECT count(*) FROM subscriptions WHERE team_id = $1) \
+                    + (SELECT count(*) FROM team_user WHERE team_id = $1) AS n";
+                count(&db, sql, vec![id(&other).into()])
+            };
+            let others_before = others().await;
+
+            let res = delete(&s, &a, &email.to_uppercase()).await;
+            assert_eq!(res.status_code(), 204, "{}", res.text());
+            assert!(res
+                .header("set-cookie")
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0"));
+            assert_eq!(
+                s.get("/auth/me")
+                    .add_header("cookie", &a)
+                    .await
+                    .status_code(),
+                401
+            );
+
+            let gone = |sql: &'static str, value: DbValue| count(&db, sql, vec![value]);
+            assert_eq!(
+                gone("SELECT count(*) AS n FROM users WHERE id = $1", a_id.into()).await,
+                0
+            );
+            assert_eq!(
+                gone(
+                    "SELECT count(*) AS n FROM sessions WHERE user_id = $1",
+                    a_id.into()
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+                gone(
+                    "SELECT count(*) AS n FROM passkeys WHERE user_id = $1",
+                    a_id.into()
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+                gone(
+                    "SELECT count(*) AS n FROM team_user WHERE user_id = $1",
+                    a_id.into()
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+                gone(
+                    "SELECT count(*) AS n FROM api_tokens WHERE created_by = $1",
+                    a_id.into()
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+                gone(
+                    "SELECT count(*) AS n FROM waitlist_signups WHERE email = $1",
+                    email.clone().into()
+                )
+                .await,
+                0
+            );
+            for sql in [
+                "SELECT count(*) AS n FROM teams WHERE id = $1",
+                "SELECT count(*) AS n FROM posts WHERE team_id = $1",
+                "SELECT count(*) AS n FROM social_accounts WHERE team_id = $1",
+                "SELECT count(*) AS n FROM contacts WHERE team_id = $1",
+                "SELECT count(*) AS n FROM inbox_items WHERE team_id = $1",
+                "SELECT count(*) AS n FROM subscriptions WHERE team_id = $1",
+                "SELECT count(*) AS n FROM api_tokens WHERE team_id = $1",
+                "SELECT count(*) AS n FROM credit_ledger WHERE team_id = $1",
+                "SELECT count(*) AS n FROM team_webhooks WHERE team_id = $1",
+                "SELECT count(*) AS n FROM social_sets WHERE team_id = $1",
+            ] {
+                assert_eq!(gone(sql, id(&team).into()).await, 0, "{sql}");
+            }
+            // The team they only belonged to goes on, without them and their tokens.
+            assert_eq!(others().await, others_before - 1);
+            assert_eq!(
+                gone(
+                    "SELECT count(*) AS n FROM posts WHERE team_id = $1 AND created_by IS NULL",
+                    id(&other).into()
+                )
+                .await,
+                1
+            );
+            // The trial record is a hash now, not the address.
+            assert_eq!(
+                gone(
+                    "SELECT count(*) AS n FROM trial_uses WHERE person_key = $1",
+                    key.clone().into()
+                )
+                .await,
+                0
+            );
+            let hashed = "SELECT count(*) AS n FROM trial_uses WHERE team_id IS NULL AND \
+                person_key = encode(sha256(convert_to($1, 'UTF8')), 'hex')";
+            assert_eq!(count(&db, hashed, vec![key.into()]).await, 1);
+            // The one subscription was cancelled, once; one audit row with counts only.
+            assert_eq!(
+                CANCELLED
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| **c == sub)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                count(&db, "SELECT count(*) AS n FROM account_deletions", vec![]).await,
+                before + 1
+            );
+            let last = "SELECT count(*) AS n FROM (SELECT * FROM account_deletions ORDER BY id DESC LIMIT 1) l \
+                WHERE teams_deleted = 1 AND teams_left = 1 AND subscriptions_cancelled = 1";
+            assert_eq!(count(&db, last, vec![]).await, 1);
+            // The mail is sent after the reply.
+            let mut mail = None;
+            for _ in 0..50 {
+                mail = seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m["to"][0] == email.as_str())
+                    .cloned();
+                if mail.is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            let mail = mail.expect("confirmation mail");
+            assert_eq!(mail["subject"], "Your SocialReins account was deleted");
+            assert!(mail["text"].as_str().unwrap().contains("30 days"));
+            // The address can sign up again, as a new person.
+            let again = sign_in(&s, &db, &email).await.unwrap();
+            let me = s
+                .get("/auth/me")
+                .add_header("cookie", &again)
+                .await
+                .json::<Value>();
+            assert_ne!(me["id"], a_id.to_string());
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn an_owner_of_a_shared_team_hands_it_over_first() {
+            let (s, db, _) = app().await;
+            let (email, a, a_id) = user(&s, &db).await;
+            let made = req(&s, Method::POST, "/v1/teams", &a)
+                .json(&json!({"name": "Acme Co"}))
+                .await;
+            let acme = made.json::<Value>();
+            let acme_id = acme["id"].as_str().unwrap().to_owned();
+            let (_, m_id) = joined(&s, &db, &acme_id, "admin").await;
+            let res = delete(&s, &a, &email).await;
+            assert_eq!(res.status_code(), 409);
+            res.assert_json(&json!({"error": "owns_shared_team", "teams": ["Acme Co"]}));
+            let teams = "SELECT count(*) AS n FROM teams WHERE id IN \
+                (SELECT team_id FROM team_user WHERE user_id = $1)";
+            assert_eq!(
+                count(
+                    &db,
+                    "SELECT count(*) AS n FROM users WHERE id = $1",
+                    vec![a_id.into()]
+                )
+                .await,
+                1
+            );
+            assert_eq!(count(&db, teams, vec![a_id.into()]).await, 2);
+            // Handing the team over lets the person go; the team stays with its new owner.
+            let promote = req(&s, Method::PATCH, &format!("/v1/team/members/{m_id}"), &a)
+                .add_header("x-team", acme["code"].as_str().unwrap())
+                .json(&json!({"role": "owner"}))
+                .await;
+            assert_eq!(promote.status_code(), 200, "{}", promote.text());
+            assert_eq!(delete(&s, &a, &email).await.status_code(), 204);
+            let acme_rows = count(
+                &db,
+                "SELECT count(*) AS n FROM teams WHERE id = $1",
+                vec![id(&acme_id).into()],
+            )
+            .await;
+            assert_eq!(acme_rows, 1);
+            let left = "SELECT count(*) AS n FROM team_user WHERE team_id = $1";
+            assert_eq!(count(&db, left, vec![id(&acme_id).into()]).await, 1);
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn a_plan_stripe_will_not_cancel_stops_the_delete_with_nothing_removed() {
+            let (s, db, _) = app().await;
+            let (email, a, a_id) = user(&s, &db).await;
+            let team = current(&s, &a).await["id"].as_str().unwrap().to_owned();
+            seed(&db, &team, a_id, "alpha", "sub_fail").await;
+            let before = count(&db, "SELECT count(*) AS n FROM account_deletions", vec![]).await;
+            let res = delete(&s, &a, &email).await;
+            assert_eq!(res.status_code(), 502);
+            res.assert_json(&json!({"error": "stripe_failed"}));
+            let still = |sql: &'static str| count(&db, sql, vec![id(&team).into()]);
+            assert_eq!(
+                still("SELECT count(*) AS n FROM teams WHERE id = $1").await,
+                1
+            );
+            assert_eq!(
+                still("SELECT count(*) AS n FROM posts WHERE team_id = $1").await,
+                1
+            );
+            assert_eq!(
+                count(
+                    &db,
+                    "SELECT count(*) AS n FROM users WHERE id = $1",
+                    vec![a_id.into()]
+                )
+                .await,
+                1
+            );
+            assert_eq!(
+                count(&db, "SELECT count(*) AS n FROM account_deletions", vec![]).await,
+                before
+            );
+            // The session still works, and a plan Stripe has already ended is no reason to stop.
+            current(&s, &a).await;
+            exec(
+                &db,
+                "UPDATE subscriptions SET provider_subscription_id = 'sub_gone' WHERE team_id = $1",
+                vec![id(&team).into()],
+            )
+            .await;
+            assert_eq!(delete(&s, &a, &email).await.status_code(), 204);
+            assert_eq!(
+                still("SELECT count(*) AS n FROM teams WHERE id = $1").await,
+                0
+            );
         }
     }
 }

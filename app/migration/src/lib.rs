@@ -95,6 +95,7 @@ mod m20270110_000001_trial_uses;
 mod m20270110_000002_page_reports;
 mod m20270111_000001_scaling_indexes;
 mod m20270112_000001_post_notice_retries;
+mod m20270113_000001_account_deletions;
 mod url_numbers;
 
 pub struct Migrator;
@@ -198,6 +199,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20270110_000001_posts_live_idx::Migration),
             Box::new(m20270111_000001_scaling_indexes::Migration),
             Box::new(m20270112_000001_post_notice_retries::Migration),
+            Box::new(m20270113_000001_account_deletions::Migration),
             // inject-above (do not remove this comment)
         ]
     }
