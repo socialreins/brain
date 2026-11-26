@@ -29,6 +29,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     for warning in config.warnings(on_railway) {
         tracing::warn!("{warning}");
     }
+    publish::set_drain(config.publish_drain);
     let state = AppState::new(db, &config);
     scheduler::spawn(state.clone());
     let app = controllers::router(state, &config);

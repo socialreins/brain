@@ -326,6 +326,8 @@ cargo run -p socialreins-brain
   `webhooks::with_event`, so its event is queued in the same statement; README documents the
   payload and signature.
 
+- Shutdown: `publish::drain` waits `PUBLISH_DRAIN_SECONDS` (default 120; `Config::publish_drain`, `publish::set_drain`) for posts publishing; a publish-now post still waiting for a slot goes back to `scheduled` with its daily-cap hit given back (`hand_back_reserved`) instead of waiting as left behind. The X token call has its own 20 s timeout (`TOKEN_TIMEOUT`) since it runs under the account's row lock.
+
 ## Rules
 
 - No em dashes in any text: code, comments, docs, commit messages, PR bodies. Use a comma, a
