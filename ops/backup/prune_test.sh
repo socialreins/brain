@@ -2,7 +2,8 @@
 # bash ops/backup/prune_test.sh: needs GNU date (the image has it; on macOS use `brew install coreutils` and PATH).
 set -euo pipefail
 cd "$(dirname "$0")"
-export NOW=$(date -u -d 2026-12-01T00:00:00Z +%s)
+NOW=$(date -u -d 2026-12-01T00:00:00Z +%s)
+export NOW
 k() { echo "backups/db/socialreins-$1.dump.age"; }
 keys=$( {
   # 0-2 days old: all four of the day kept

@@ -4,7 +4,7 @@
 # ISO week up to 30 days; everything older goes. `NOW` (epoch seconds) is for the test.
 set -euo pipefail
 now=${NOW:-$(date -u +%s)}
-last_day= last_week=
+last_day='' last_week=''
 while read -r key; do
   [[ $key =~ ([0-9]{8})T([0-9]{2})([0-9]{2})([0-9]{2})Z ]] || continue # a foreign object: never touch
   d=${BASH_REMATCH[1]}
