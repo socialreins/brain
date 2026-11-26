@@ -13,7 +13,10 @@ pub struct Migration;
 // - `inbox_items_post_idx`: deleting a post sets `inbox_items.post_id` to null, which without an
 //   index reads every inbox item of every team.
 // - `social_accounts_provider_external_idx`, `social_accounts_threads_handle_idx`: `loop_guard`
-//   asks which team owns an account by provider and external id, and a Threads one by handle.
+//   asks which team owns an account by provider and external id, and a Threads one by handle
+//   (not partial on the provider: the query binds it, and a generic plan cannot use a partial index).
+// - `inbox_items_open_idx (team_id) WHERE open` and `post_targets_account_idx` are now covered by
+//   the new indexes' first columns and stay for now: dropping an index is its own decision.
 // - `post_targets_account_remote_idx`: an inbox item finds the post it answers by the account and
 //   the remote id of a target.
 const INDEXES: [(&str, &str); 5] = [
@@ -31,7 +34,7 @@ const INDEXES: [(&str, &str); 5] = [
     ),
     (
         "social_accounts_threads_handle_idx",
-        "social_accounts (lower(handle)) WHERE provider = 'threads'",
+        "social_accounts (lower(handle))",
     ),
     (
         "post_targets_account_remote_idx",

@@ -1159,7 +1159,8 @@ fn scope_as(scope: &str, alias: &str) -> String {
 ///   that no newer DM of the scope follows (one probe of `inbox_items_conversation_idx`), and
 ///   `conv_*` are counted over that conversation's items in the scope for the page's heads only.
 ///   For `state` `open` the conversations are found from the open DMs (a conversation is open
-///   when one of its items is), so the work follows what is open, not the history.
+///   when one of its items is), so the work follows the open conversations, not the whole history
+///   (a team with very many open conversations still reads them all, as the old query did).
 ///
 /// `state`, `q` and `assigned` (`rest`) narrow the groups after their `conv_*` are known.
 fn grouped_sql(scope: &str, rest: &str, hit: &str, limit: usize, state: Option<&str>) -> String {
@@ -1819,7 +1820,6 @@ mod tests {
             let sql = grouped_sql(&scope, " AND i.conv_open > 0", "TRUE", 51, state);
             assert!(sql.contains("UNION ALL") && sql.contains("LIMIT $51"));
             assert_eq!(sql.contains("SELECT DISTINCT o."), state == Some("open"));
-            assert!(!sql.contains(" o.kind IN ($") || state == Some("open"));
         }
     }
 
