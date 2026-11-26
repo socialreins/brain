@@ -15,6 +15,8 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub details: String,
     pub enabled: bool,
+    /// Set by an admin: the page is not served whatever `enabled` says, and a team cannot undo it.
+    pub taken_down_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }
