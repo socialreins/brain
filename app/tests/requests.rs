@@ -39768,6 +39768,8 @@ mod admin_console {
             (Method::GET, "/v1/admin/waitlist".to_owned()),
             (Method::POST, format!("/v1/admin/waitlist/{id}/approve")),
             (Method::DELETE, format!("/v1/admin/waitlist/{id}")),
+            (Method::GET, "/v1/admin/waitlist-invites?count=1".to_owned()),
+            (Method::POST, "/v1/admin/waitlist-invites".to_owned()),
             (Method::GET, "/v1/admin/settings/signup".to_owned()),
             (Method::PUT, "/v1/admin/settings/signup".to_owned()),
             (
@@ -39861,7 +39863,7 @@ mod admin_console {
                 "teams": 2,
                 "accounts": {"total": 3, "by_provider": {"bluesky": 2, "threads": 1}},
                 "posts": {"draft": 1, "failed": 0, "published": 1, "scheduled": 2},
-                "waitlist": {"total": 2, "verified": 1, "approved": 1},
+                "waitlist": {"total": 2, "verified": 1, "approved": 1, "signed_up": 0},
             })
         );
         c.done().await;
@@ -40393,6 +40395,202 @@ mod admin_console {
         c.done().await;
     }
 
+    /// Puts `email` on the waitlist, verified, joined `age_days` ago, and returns its id.
+    async fn verified_signup(c: &Console, email: &str, age_days: i64) -> String {
+        let id = c.waitlisted(email).await;
+        c.sql(&format!(
+            "UPDATE waitlist_signups SET verified_at = now(), \
+             created_at = now() - interval '{age_days} days' WHERE email = '{email}'"
+        ))
+        .await;
+        id
+    }
+
+    async fn invited_count(c: &Console) -> i64 {
+        let n = c.get("/v1/admin/overview", &c.admin().await).await;
+        n["waitlist"]["approved"].as_i64().unwrap()
+    }
+
+    /// The batch invites the oldest verified signups once each: the preview names them, the
+    /// confirm approves and mails them, a repeat or an unverified id sends nothing, and an
+    /// invited address signs up although the rules refuse it.
+    #[tokio::test]
+    #[serial]
+    async fn a_batch_invites_the_oldest_verified_signups_once() {
+        let c = console(|c| c.signup_domains = vec!["only-this.test".into(), ADMIN.into()]).await;
+        let admin = c.admin().await;
+        let (old, mid, new, unverified) = (
+            unique_email(),
+            unique_email(),
+            unique_email(),
+            unique_email(),
+        );
+        let old_id = verified_signup(&c, &old, 30).await;
+        let mid_id = verified_signup(&c, &mid, 20).await;
+        let new_id = verified_signup(&c, &new, 10).await;
+        let unverified_id = c.waitlisted(&unverified).await;
+        assert!(c.sign_in(&old).await.is_none(), "refused before the invite");
+
+        let preview = c.get("/v1/admin/waitlist-invites?count=2", &admin).await;
+        assert_eq!(preview["eligible"], 3);
+        assert_eq!(preview["left_today"], 100);
+        let ids = |v: &Value| -> Vec<String> {
+            v["selected"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            ids(&preview),
+            [old_id.clone(), mid_id.clone()],
+            "oldest first"
+        );
+        assert_eq!(invited_count(&c).await, 0, "a preview changes nothing");
+
+        let invite = |ids: Vec<&String>| {
+            c.req(Method::POST, "/v1/admin/waitlist-invites", &admin)
+                .json(&json!({"ids": ids}))
+        };
+        let res = invite(vec![&mid_id, &old_id]).await;
+        res.assert_status_ok();
+        res.assert_json(&json!({"sent": 2, "failed": 0, "capped": 0, "skipped": 0, "unsure": 0}));
+        for email in [&old, &mid] {
+            let mails = c.approval_mails(email);
+            assert_eq!(mails.len(), 1, "one invite each");
+            let text = mails[0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("7-day free trial") && text.contains("/signup"),
+                "{text}"
+            );
+        }
+        assert_eq!(invited_count(&c).await, 2);
+        assert!(c.sign_in(&old).await.is_some(), "invited, so allowed");
+
+        // The same ids again, and an id that is not verified: nobody is mailed twice.
+        let res = invite(vec![&old_id, &mid_id, &unverified_id]).await;
+        res.assert_json(&json!({"sent": 0, "failed": 0, "capped": 0, "skipped": 3, "unsure": 0}));
+        assert_eq!(c.approval_mails(&old).len(), 1);
+        assert!(c.approval_mails(&unverified).is_empty());
+        let preview = c.get("/v1/admin/waitlist-invites?count=5", &admin).await;
+        assert_eq!(ids(&preview), std::slice::from_ref(&new_id));
+
+        let overview = c.get("/v1/admin/overview", &admin).await;
+        assert_eq!(overview["waitlist"]["approved"], 2);
+        assert_eq!(
+            overview["waitlist"]["signed_up"], 1,
+            "only old has signed in"
+        );
+        c.done().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_batch_needs_a_recent_sign_in_and_sane_input() {
+        let c = console(|_| {}).await;
+        let admin = c.admin().await;
+        let id = verified_signup(&c, &unique_email(), 1).await;
+        for count in ["0", "51", "x", ""] {
+            let res = c
+                .req(
+                    Method::GET,
+                    &format!("/v1/admin/waitlist-invites?count={count}"),
+                    &admin,
+                )
+                .await;
+            assert_eq!(error_of(&res), (422, "invalid_count".into()), "{count}");
+        }
+        let missing = c
+            .req(Method::GET, "/v1/admin/waitlist-invites", &admin)
+            .await;
+        assert_eq!(error_of(&missing), (422, "invalid_count".into()));
+        let post = |ids: Value| {
+            c.req(Method::POST, "/v1/admin/waitlist-invites", &admin)
+                .json(&json!({"ids": ids}))
+        };
+        let none = post(json!([])).await;
+        assert_eq!(error_of(&none), (422, "invalid_ids".into()));
+        let many: Vec<String> = (0..51).map(|_| uuid::Uuid::now_v7().to_string()).collect();
+        let too_many = post(json!(many)).await;
+        assert_eq!(error_of(&too_many), (422, "invalid_ids".into()));
+        c.sql("UPDATE sessions SET created_at = now() - interval '11 minutes'")
+            .await;
+        let stale = post(json!([id])).await;
+        assert_eq!(error_of(&stale), (403, "reauth_required".into()));
+        assert_eq!(approved_rows(&c).await, 0);
+        c.done().await;
+    }
+
+    async fn approved_rows(c: &Console) -> i64 {
+        let n =
+            c.db.query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Postgres,
+                "SELECT count(*) AS n FROM waitlist_signups WHERE approved_at IS NOT NULL",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        n.try_get("", "n").unwrap()
+    }
+
+    /// At 100 invite mails in 24 hours the rest wait: not approved, not mailed.
+    #[tokio::test]
+    #[serial]
+    async fn a_batch_stops_at_the_daily_cap() {
+        let c = console(|_| {}).await;
+        let admin = c.admin().await;
+        c.sql(
+            "INSERT INTO rate_limit_hits (bucket) \
+             SELECT 'waitlist:invite' FROM generate_series(1, 99)",
+        )
+        .await;
+        let mut ids = Vec::new();
+        for age in [30, 20, 10] {
+            ids.push(verified_signup(&c, &unique_email(), age).await);
+        }
+        let left = c.get("/v1/admin/waitlist-invites?count=3", &admin).await;
+        assert_eq!(left["left_today"], 1);
+        let res = c
+            .req(Method::POST, "/v1/admin/waitlist-invites", &admin)
+            .json(&json!({"ids": ids}))
+            .await;
+        res.assert_json(&json!({"sent": 1, "failed": 0, "capped": 2, "skipped": 0, "unsure": 0}));
+        assert_eq!(approved_rows(&c).await, 1);
+        let left = c.get("/v1/admin/waitlist-invites?count=3", &admin).await;
+        assert_eq!(left["left_today"], 0);
+        assert_eq!(
+            left["eligible"], 2,
+            "the capped two can be invited tomorrow"
+        );
+        c.done().await;
+    }
+
+    /// A mail that cannot be sent leaves the signup not invited and the cap unused.
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_invite_mail_leaves_the_signup_to_try_again() {
+        let c = console(|c| {
+            c.mailer =
+                Mailer::resend_at("http://127.0.0.1:9/emails", "k", "a@example.com").unwrap();
+        })
+        .await;
+        let admin = c.admin().await;
+        let id = verified_signup(&c, &unique_email(), 5).await;
+        let res = c
+            .req(Method::POST, "/v1/admin/waitlist-invites", &admin)
+            .json(&json!({"ids": [id]}))
+            .await;
+        res.assert_json(&json!({"sent": 0, "failed": 1, "capped": 0, "skipped": 0, "unsure": 0}));
+        assert_eq!(approved_rows(&c).await, 0);
+        let left = c.get("/v1/admin/waitlist-invites?count=1", &admin).await;
+        assert_eq!(
+            (left["eligible"].as_i64(), left["left_today"].as_i64()),
+            (Some(1), Some(100))
+        );
+        c.done().await;
+    }
+
     #[tokio::test]
     #[serial]
     async fn openapi_documents_the_console() {
@@ -40404,6 +40602,8 @@ mod admin_console {
             ("/admin/teams", "get"),
             ("/admin/waitlist/{id}/approve", "post"),
             ("/admin/waitlist/{id}", "delete"),
+            ("/admin/waitlist-invites", "get"),
+            ("/admin/waitlist-invites", "post"),
             ("/admin/settings/signup", "get"),
             ("/admin/settings/signup", "put"),
         ] {
