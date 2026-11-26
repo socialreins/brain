@@ -90,6 +90,9 @@ async fn register_start(_: FromWeb, State(app): State<AppState>, current: Curren
         return reply(StatusCode::FORBIDDEN, "reauth_required");
     }
     let user = &current.0;
+    if super::review_login::is_demo_email(&user.email) {
+        return reply(StatusCode::FORBIDDEN, "review_account");
+    }
     let existing = match own_passkeys(&app, user.id).await {
         Ok(rows) => rows,
         Err(e) => return internal(e, "passkey list"),

@@ -33,6 +33,33 @@ async fn demo(db: &DatabaseConnection) -> Option<users::Model> {
         .unwrap()
 }
 
+/// A live API token of `team` made by `by`, written straight in: the demo user cannot make one.
+async fn seed_token(db: &DatabaseConnection, team: &str, by: uuid::Uuid) -> String {
+    use sea_orm::ConnectionTrait;
+    let secret = format!("sr_team_live_{}", uuid::Uuid::now_v7().simple());
+    db.execute_unprepared(&format!(
+        "INSERT INTO api_tokens (id, team_id, name, token_hash, prefix_hint, created_by) \
+         VALUES ('{}', '{team}', 'kept', '{}', 'sr_team_live_x', '{by}')",
+        uuid::Uuid::now_v7(),
+        socialreins_core::token::hash(&secret)
+    ))
+    .await
+    .unwrap();
+    secret
+}
+
+/// An invitation to `team` made by `by`, written straight in.
+async fn seed_invitation(db: &DatabaseConnection, team: &str, by: uuid::Uuid) {
+    use sea_orm::ConnectionTrait;
+    let id = uuid::Uuid::now_v7();
+    db.execute_unprepared(&format!(
+        "INSERT INTO team_invitations (id, team_id, email, role, token_hash, invited_by, expires_at) \
+         VALUES ('{id}', '{team}', '{id}@example.com', 'admin', '{id}', '{by}', now() + interval '1 day')"
+    ))
+    .await
+    .unwrap();
+}
+
 /// Sessions the demo user holds, 0 while it does not exist.
 async fn demo_sessions(db: &DatabaseConnection) -> u64 {
     let Some(user) = demo(db).await else {
@@ -119,28 +146,20 @@ async fn switching_the_link_off_ends_its_sessions_and_tokens() {
     let res = s.get(&format!("/review-login/{TOKEN}")).await;
     let cookie = res.header("set-cookie").to_str().unwrap().to_owned();
     let cookie = cookie.split(';').next().unwrap().to_owned();
-    let made = s
-        .post("/v1/api-tokens")
-        .add_header("cookie", &cookie)
-        .add_header("origin", "http://localhost:3000")
-        .json(&json!({"name": "kept by a reviewer"}))
-        .await;
-    assert_eq!(made.status_code(), 201, "{}", made.text());
-    let secret = made.json::<Value>()["secret"].as_str().unwrap().to_owned();
+    let me = s.get("/auth/me").add_header("cookie", &cookie).await;
+    let team = me.json::<Value>()["current_team"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let user_id = demo(&db).await.unwrap().id;
+    let secret = seed_token(&db, &team, user_id).await;
     let with_token = || {
         s.get("/v1/posts")
             .add_header("authorization", format!("Bearer {secret}"))
     };
     with_token().await.assert_status_ok();
     // An invitation sent from the demo account would let its holder join the team later.
-    let invited = s
-        .post("/v1/team/invitations")
-        .add_header("cookie", &cookie)
-        .add_header("origin", "http://localhost:3000")
-        .json(&json!({"email": format!("{}@example.com", uuid::Uuid::now_v7()), "role": "admin"}))
-        .await;
-    assert_eq!(invited.status_code(), 201, "{}", invited.text());
-    let user_id = demo(&db).await.unwrap().id;
+    seed_invitation(&db, &team, user_id).await;
     let invitations = || async {
         team_invitations::Entity::find()
             .filter(team_invitations::Column::InvitedBy.eq(user_id))
@@ -165,19 +184,17 @@ async fn switching_the_link_off_ends_its_sessions_and_tokens() {
     let second = by_demo("/v1/teams", json!({"name": "Second"})).await;
     assert_eq!(second.status_code(), 201, "{}", second.text());
     let second = second.json::<Value>()["id"].as_str().unwrap().to_owned();
-    let made = by_demo("/v1/api-tokens", json!({"name": "second team"})).await;
-    assert_eq!(made.status_code(), 201, "{}", made.text());
-    let other_secret = made.json::<Value>()["secret"].as_str().unwrap().to_owned();
-    let invite = json!({"email": format!("{}@example.com", uuid::Uuid::now_v7()), "role": "admin"});
-    let invited = by_demo("/v1/team/invitations", invite).await;
-    assert_eq!(invited.status_code(), 201, "{}", invited.text());
     let other = uuid::Uuid::now_v7();
     db.execute_unprepared(&format!(
-        "INSERT INTO users (id, email, name) VALUES ('{other}', '{other}@example.com', 'Other'); \
-         INSERT INTO team_user (team_id, user_id, role) VALUES ('{second}', '{other}', 'owner'); \
-         UPDATE team_user SET role = 'admin' WHERE team_id = '{second}' AND user_id = '{user_id}'; \
-         UPDATE api_tokens SET created_by = '{other}' WHERE team_id = '{second}'; \
-         UPDATE team_invitations SET invited_by = '{other}' WHERE team_id = '{second}'"
+        "INSERT INTO users (id, email, name) VALUES ('{other}', '{other}@example.com', 'Other')"
+    ))
+    .await
+    .unwrap();
+    let other_secret = seed_token(&db, &second, other).await;
+    seed_invitation(&db, &second, other).await;
+    db.execute_unprepared(&format!(
+        "INSERT INTO team_user (team_id, user_id, role) VALUES ('{second}', '{other}', 'owner'); \
+         UPDATE team_user SET role = 'admin' WHERE team_id = '{second}' AND user_id = '{user_id}'"
     ))
     .await
     .unwrap();
@@ -308,4 +325,49 @@ async fn refuses_when_the_demo_email_is_an_admin() {
     assert_eq!(res.status_code(), 404);
     assert!(res.maybe_header("set-cookie").is_none());
     assert_eq!(demo_sessions(&db).await, before, "no session was created");
+}
+
+/// What outlives the link (a passkey, an API token, an invitation) is refused to the demo user,
+/// so a reviewer's flow cannot leave a way back in.
+#[tokio::test]
+#[serial]
+async fn the_demo_user_cannot_make_what_outlives_the_link() {
+    let (s, _db) = enabled().await;
+    let res = s.get(&format!("/review-login/{TOKEN}")).await;
+    let cookie = res.header("set-cookie").to_str().unwrap().to_owned();
+    let cookie = cookie.split(';').next().unwrap().to_owned();
+    let post = |path: &str, body: Value| {
+        s.post(path)
+            .add_header("cookie", &cookie)
+            .add_header("origin", "http://localhost:3000")
+            .json(&body)
+    };
+    for (path, body) in [
+        ("/v1/api-tokens", json!({"name": "mine"})),
+        (
+            "/v1/team/invitations",
+            json!({"email": "a@example.com", "role": "member"}),
+        ),
+        ("/auth/passkeys/register/start", json!({})),
+    ] {
+        let res = post(path, body).await;
+        assert_eq!(res.status_code(), 403, "{path}");
+        assert_eq!(res.json::<Value>()["error"], "review_account", "{path}");
+    }
+}
+
+/// The boot warnings: a standing review link, a missing `TRUST_PROXY` behind Railway, Stripe set
+/// with billing off.
+#[test]
+fn boot_warnings_name_the_slips() {
+    let mut config = Config::from_env().expect("DATABASE_URL must point at a test Postgres");
+    config.review_login_token = None;
+    config.trust_proxy = false;
+    config.billing_enabled = false;
+    assert!(config.warnings(false).is_empty());
+    assert_eq!(config.warnings(true).len(), 1, "TRUST_PROXY behind Railway");
+    config.trust_proxy = true;
+    assert!(config.warnings(true).is_empty());
+    config.review_login_token = Some(TOKEN.into());
+    assert_eq!(config.warnings(true).len(), 1, "the review link");
 }
