@@ -9090,6 +9090,18 @@ mod teams {
                 let res = create(&s, &cookie, input(&set, "three", None)).await;
                 assert_eq!(res.status_code(), 409);
                 res.assert_json(&json!({"error": "too_many_posts"}));
+                // One with a target that is up (a partial send) is kept for a take down.
+                run(format!(
+                    "INSERT INTO post_targets (id, post_id, status, remote_id) \
+                     VALUES (gen_random_uuid(), '{failed}', 'failed', 'up')"
+                ))
+                .await;
+                let res = req(&s, Method::DELETE, &format!("/v1/posts/{failed}"), &cookie).await;
+                assert_eq!(res.status_code(), 409);
+                run(format!(
+                    "DELETE FROM post_targets WHERE post_id = '{failed}'"
+                ))
+                .await;
                 let res = req(&s, Method::DELETE, &format!("/v1/posts/{failed}"), &cookie).await;
                 assert_eq!(res.status_code(), 204);
                 assert_eq!(

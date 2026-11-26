@@ -2883,6 +2883,12 @@ pub async fn delete_post(app: &AppState, a: &Actor, id: Uuid) -> Response {
             let gone = posts::Entity::delete_many()
                 .filter(posts::Column::Id.eq(id))
                 .filter(posts::Column::Status.is_in(["draft", "scheduled", "failed"]))
+                // A failed post some of whose targets are up (a retry after a partial send) stays:
+                // deleting it would lose what to take down.
+                .filter(sea_orm::sea_query::Expr::cust(
+                    "(posts.status <> 'failed' OR NOT EXISTS (SELECT 1 FROM post_targets t \
+                     WHERE t.post_id = posts.id AND t.remote_id IS NOT NULL))",
+                ))
                 .filter(in_scope(a))
                 .exec(&app.db)
                 .await;
