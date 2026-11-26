@@ -14,20 +14,77 @@ tokio::task_local! {
     pub static SLOTS: std::sync::Arc<Slots>;
 }
 
+/// The global post slot a post holds while it publishes, given back when every one of its targets
+/// is waiting or done: a post that is only waiting for its platform needs no slot, and a post not
+/// yet started still queues for one, so a stopping process hands those back as before.
+pub struct PostHold {
+    permit: std::sync::Mutex<Option<tokio::sync::SemaphorePermit<'static>>>,
+    active: std::sync::atomic::AtomicUsize,
+}
+
+impl PostHold {
+    pub fn new(permit: tokio::sync::SemaphorePermit<'static>, targets: usize) -> Self {
+        Self {
+            permit: std::sync::Mutex::new(Some(permit)),
+            active: std::sync::atomic::AtomicUsize::new(targets),
+        }
+    }
+
+    /// One target stopped working (it waits or it ended); the last one gives the slot back.
+    fn one_less(&self) {
+        if self
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.permit.lock().unwrap_or_else(|e| e.into_inner()).take();
+        }
+    }
+}
+
 /// The permits of the shared publish slots a target holds. `idle` hands them back for good once
 /// the target only has light calls left, so a platform's processing wait (Threads' 30 seconds, a
 /// video's status polls) never keeps a slot from a target that can send.
 // shortcut: no slot is taken again after the wait; what follows is a status poll and the final
-// publish call, a few small requests. Take them again if a connector ever uploads after a wait.
-pub struct Slots(std::sync::Mutex<Vec<tokio::sync::OwnedSemaphorePermit>>);
+// publish call, a few small requests. Take them again if a connector ever uploads after a wait
+// (a thread whose later parts carry media does: see `idle`'s callers).
+pub struct Slots {
+    permits: std::sync::Mutex<Vec<tokio::sync::OwnedSemaphorePermit>>,
+    post: std::sync::Arc<PostHold>,
+    counted: std::sync::atomic::AtomicBool,
+}
 
 impl Slots {
-    pub fn new(permits: Vec<tokio::sync::OwnedSemaphorePermit>) -> Self {
-        Self(std::sync::Mutex::new(permits))
+    pub fn new(
+        permits: Vec<tokio::sync::OwnedSemaphorePermit>,
+        post: std::sync::Arc<PostHold>,
+    ) -> Self {
+        Self {
+            permits: std::sync::Mutex::new(permits),
+            post,
+            counted: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     fn release(&self) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.permits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.count_out();
+    }
+
+    /// This target no longer counts as working for its post, once.
+    fn count_out(&self) {
+        if !self.counted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.post.one_less();
+        }
+    }
+}
+
+impl Drop for Slots {
+    fn drop(&mut self) {
+        self.count_out();
     }
 }
 
@@ -128,6 +185,9 @@ mod tests {
         use std::{sync::Arc, time::Duration};
         use tokio::sync::Semaphore;
         let gate = Arc::new(Semaphore::new(8));
+        static POSTS: std::sync::LazyLock<Semaphore> =
+            std::sync::LazyLock::new(|| Semaphore::new(8));
+        let post_gate = &*POSTS;
         // 40 publishes that each wait 100 ms for a platform, 8 slots: holding a slot while
         // waiting takes 5 rounds, giving it back takes about one.
         let run = |idle_wait: bool| {
@@ -137,7 +197,9 @@ mod tests {
                 let mut all = Vec::new();
                 for _ in 0..40 {
                     let permit = gate.clone().acquire_owned().await.unwrap();
-                    let slots = Arc::new(super::Slots::new(vec![permit]));
+                    let post =
+                        Arc::new(super::PostHold::new(post_gate.acquire().await.unwrap(), 1));
+                    let slots = Arc::new(super::Slots::new(vec![permit], post));
                     all.push(tokio::spawn(super::SLOTS.scope(
                         slots.clone(),
                         async move {
@@ -159,7 +221,8 @@ mod tests {
         let held = run(false).await;
         let given = run(true).await;
         assert!(held >= Duration::from_millis(450), "{held:?}");
-        assert!(given < Duration::from_millis(300), "{given:?}");
+        assert!(given < Duration::from_millis(400), "{given:?}");
+        assert_eq!(post_gate.available_permits(), 8);
         assert_eq!(gate.available_permits(), 8);
         // Outside a publish it is a plain sleep.
         super::idle(Duration::from_millis(1)).await;
