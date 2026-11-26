@@ -292,7 +292,9 @@ pub async fn ingest(app: &AppState, payload: &Value, fresh: &mut Stored) -> Resu
                 if is_ours(app, &account, event).await? {
                     continue;
                 }
-                if let Some(item) = inbox::store(&app.db, &account, event.clone()).await? {
+                if let Some(item) =
+                    inbox::store(&app.db, &account, event.clone(), app.billing_enabled).await?
+                {
                     fresh.push((account.clone(), item));
                 }
             }
@@ -905,7 +907,7 @@ pub async fn backfill(
             || answered.contains(&event.remote_id);
         // A late `stop` must not undo a newer `start` the webhook already stored.
         let opt = !newer_message(app, account, &event).await?;
-        if inbox::store_with(&app.db, account, event, (opt, stale))
+        if inbox::store_with(&app.db, account, event, (opt, stale), app.billing_enabled)
             .await?
             .is_some()
         {

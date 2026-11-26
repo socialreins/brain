@@ -135,6 +135,23 @@ pub struct Config {
 }
 
 impl Config {
+    /// Settings that start fine but are probably a slip, logged once at boot. `on_railway` is
+    /// whether `RAILWAY_ENVIRONMENT` is set. Not errors: production runs with Stripe set and
+    /// billing off on purpose until launch.
+    pub fn warnings(&self, on_railway: bool) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.stripe.configured() && !self.billing_enabled {
+            out.push("STRIPE_SECRET_KEY is set but BILLING_ENABLED is not: every team has every plan feature and unmetered use of our AI key (capped by AI_DAILY_CAP only)");
+        }
+        if on_railway && !self.trust_proxy {
+            out.push("TRUST_PROXY is not true behind Railway's proxy: every visitor shares one address, so per-IP limits are global");
+        }
+        if self.review_login_token.is_some() {
+            out.push("REVIEW_LOGIN_TOKEN is set: a link signs in as the demo team's owner; remove it when the app review ends");
+        }
+        out
+    }
+
     pub fn from_env() -> Result<Self, String> {
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
         let database_url = var("DATABASE_URL").ok_or("missing required variable: DATABASE_URL")?;
@@ -266,7 +283,11 @@ impl Config {
                     ("x500", var("STRIPE_PRICE_X500")),
                 ],
             )?,
-            ai: crate::ai::Ai::new(var("ANTHROPIC_API_KEY"))?,
+            ai: {
+                let mut ai = crate::ai::Ai::new(var("ANTHROPIC_API_KEY"))?;
+                ai.daily_cap = ai_daily_cap(var("AI_DAILY_CAP"))?;
+                ai
+            },
         })
     }
 }
@@ -358,6 +379,16 @@ fn inbox_units(value: Option<String>) -> Result<i64, String> {
         None => Ok(crate::connectors::youtube::DEFAULT_INBOX_UNITS),
         Some(Ok(n)) if (0..=10_000).contains(&n) => Ok(n),
         Some(_) => Err("YOUTUBE_INBOX_UNITS: a number of units from 0 to 10000".into()),
+    }
+}
+
+/// `AI_DAILY_CAP`: AI calls a team a day on `ANTHROPIC_API_KEY` while billing is off, 0 to 100,000
+/// (default 200, 0 for none: a self-hoster paying for their own key may want that).
+fn ai_daily_cap(value: Option<String>) -> Result<i64, String> {
+    match value.map(|v| v.trim().parse::<i64>()) {
+        None => Ok(crate::ai::DEFAULT_DAILY_CAP),
+        Some(Ok(n)) if (0..=100_000).contains(&n) => Ok(n),
+        Some(_) => Err("AI_DAILY_CAP: a number of calls from 0 to 100000".into()),
     }
 }
 

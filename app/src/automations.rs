@@ -107,7 +107,7 @@ const CHANGED: &str = "automation_changed";
 const NOT_ACTED: &str = "(r.status = 'skipped' AND (r.results = '[]'::jsonb OR \
     COALESCE(r.reason, '') IN ('paused', 'own_account', 'connected_account', 'cooldown', \
     'automation_cap', 'daily_cap', 'no_question', 'question_cap', 'no_ai_key', \
-    'no_ai_credits', 'ai_failed')))";
+    'no_ai_credits', 'ai_daily_cap', 'ai_failed')))";
 /// Longest `{name}` put into a text.
 pub(crate) const MAX_NAME_CHARS: usize = 64;
 /// What `{page}` counts as when a text is checked.
@@ -2925,12 +2925,26 @@ async fn ai_pay(
             return Err(("failed", "internal"));
         }
     };
-    let metered = team_key.is_none() && app.billing_enabled;
+    let team_key_none = team_key.is_none();
+    let metered = team_key_none && app.billing_enabled;
     let ours = || app.ai.own_key.clone().map(|k| ("anthropic".to_owned(), k));
     let Some((provider, key)) = team_key.or_else(ours) else {
         return Err(("skipped", "no_ai_key"));
     };
     let mut paid = None;
+    // Billing off is a free install, but our own key is never open: a team gets so many calls a day.
+    let ours_unmetered = team_key_none && !app.billing_enabled && app.ai.own_key.is_some();
+    if ours_unmetered && app.ai.daily_cap > 0 {
+        let cap = [(format!("ai-own:team:{}", item.team_id), app.ai.daily_cap)];
+        match crate::rate_limit::daily_reserve(&app.db, &cap).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(("skipped", "ai_daily_cap")),
+            Err(e) => {
+                tracing::error!(error = %e, item = %item.id, "ai daily cap not read");
+                return Err(("failed", "internal"));
+            }
+        }
+    }
     if metered {
         let monthly = billing::limits_of(true, &app.db, item.team_id)
             .await

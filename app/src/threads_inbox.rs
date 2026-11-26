@@ -385,7 +385,9 @@ async fn store(
     let mut fresh = Vec::new();
     for f in items.into_iter().filter(|f| !held.contains(&f.remote_id)) {
         let stale = first || f.at < old || f.at < account.created_at;
-        if let Some(item) = inbox::store_with(&app.db, account, f, (false, stale)).await? {
+        if let Some(item) =
+            inbox::store_with(&app.db, account, f, (false, stale), app.billing_enabled).await?
+        {
             if !stale {
                 fresh.push(item);
             }

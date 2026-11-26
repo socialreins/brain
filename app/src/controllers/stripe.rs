@@ -83,6 +83,22 @@ async fn held(app: &AppState, team: Uuid) -> Result<Option<(String, Option<Strin
     .transpose()
 }
 
+/// The key of the person who would get a trial, when they have not had one: `Some` means the
+/// trial is on offer. Trials are per person (decision 0015), so a new team does not start another.
+pub(crate) async fn trial_offer(app: &AppState, email: &str) -> Result<Option<String>, DbErr> {
+    let Some(key) = socialreins_core::email::person_key(email) else {
+        return Ok(None);
+    };
+    let used = app
+        .db
+        .query_one_raw(stmt(
+            "SELECT 1 FROM trial_uses WHERE person_key = $1",
+            vec![key.clone().into()],
+        ))
+        .await?;
+    Ok(used.is_none().then_some(key))
+}
+
 /// The owner's checks every call here shares: only an owner, with a sign-in from the last 10
 /// minutes, and only where billing is on and Stripe is set up.
 fn gate(app: &AppState, t: &InTeam) -> Option<Response> {
@@ -102,7 +118,8 @@ fn gate(app: &AppState, t: &InTeam) -> Option<Response> {
 }
 
 /// Starts a subscription: answers the Stripe Checkout page to send the browser to. The team's
-/// first subscription has a 7-day trial; a team that had one before pays at once. `409
+/// first subscription has a 7-day trial, once for each person (a person who had a trial in any
+/// team pays at once, and so does a team that had a subscription before). `409
 /// already_subscribed` while a plan is live (change it in the portal), `422 invalid_plan`,
 /// `503 billing_unavailable` when billing or Stripe is off, `502 stripe_failed` when Stripe
 /// refuses. Owners only, with a sign-in from the last 10 minutes (else `403 reauth_required`).
@@ -154,8 +171,16 @@ async fn checkout(
         ),
     ];
     if sub.is_none() {
-        let days = TRIAL_DAYS.to_string();
-        form.push(("subscription_data[trial_period_days]".to_owned(), days));
+        let offer = match trial_offer(&app, &t.current.0.email).await {
+            Ok(o) => o,
+            Err(e) => return internal(e, "trial read"),
+        };
+        if let Some(key) = offer {
+            let days = TRIAL_DAYS.to_string();
+            form.push(("subscription_data[trial_period_days]".to_owned(), days));
+            // The webhook writes the trial down under this key once Stripe starts it.
+            form.push(("subscription_data[metadata][trial_key]".to_owned(), key));
+        }
     }
     match sub.and_then(|(_, customer)| customer) {
         Some(customer) => form.push(("customer".to_owned(), customer)),
@@ -412,6 +437,20 @@ async fn apply_subscription(
         .await?
         .rows_affected()
         == 1;
+    // A trial that really began is that person's one trial, whatever happens to the team later.
+    if let (true, Some(key), Some(_)) = (
+        written,
+        sub["metadata"]["trial_key"]
+            .as_str()
+            .filter(|k| !k.is_empty()),
+        time(&sub["trial_end"]),
+    ) {
+        db.execute_raw(stmt(
+            "INSERT INTO trial_uses (person_key, team_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            vec![key.into(), team.into()],
+        ))
+        .await?;
+    }
     Ok(Outcome::Applied(
         written && was_live && !billing::live(status),
     ))

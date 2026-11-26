@@ -138,7 +138,8 @@ pub struct AutomationInput {
     #[serde(default)]
     pub fallback_public_reply: Option<String>,
     /// Minutes, 1 to 10080: it does not answer the same person again within this time (the
-    /// run is stored `skipped: cooldown`). Absent: no cool-down.
+    /// run is stored `skipped: cooldown`). 0: no cool-down. Absent: 10 minutes on a new
+    /// automation (`POST`), the stored value kept on `PUT`.
     #[serde(default)]
     pub cooldown_minutes: Option<u32>,
     /// 1 to 500: most runs of this automation in 24 hours (a run past it is stored `skipped:
@@ -265,6 +266,11 @@ async fn find(
         .await
 }
 
+/// The cool-down a new automation gets when its input names none: one answer to the same person
+/// in 10 minutes, so a hostile bot cannot run an automation into its daily cap. Automations made
+/// before this keep what they stored (a null stays "no cool-down").
+const DEFAULT_COOLDOWN_MINUTES: i32 = 10;
+
 /// The input checked and normalized; `Err` holds the 422 reply.
 async fn checked(
     db: &DatabaseConnection,
@@ -275,7 +281,8 @@ async fn checked(
         return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name")));
     };
     let in_range = |v: Option<u32>, max: u32| v.is_none_or(|v| (1..=max).contains(&v));
-    if !in_range(input.cooldown_minutes, 10_080) {
+    // 0 is "no cool-down", asked for on purpose.
+    if input.cooldown_minutes.is_some_and(|v| v > 10_080) {
         return Ok(Err(reply(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_cooldown",
@@ -598,7 +605,11 @@ async fn create(
             actions: Set(serde_json::json!(input.actions.unwrap_or_default())),
             steps: Set(input.steps.map(|s| serde_json::json!(s))),
             fallback_public_reply: Set(input.fallback_public_reply),
-            cooldown_minutes: Set(input.cooldown_minutes.map(|v| v as i32)),
+            cooldown_minutes: Set(match input.cooldown_minutes {
+                None => Some(DEFAULT_COOLDOWN_MINUTES),
+                Some(0) => None,
+                Some(v) => Some(v as i32),
+            }),
             daily_cap: Set(input.daily_cap.map(|v| v as i32)),
             created_by: Set(Some(t.current.0.id)),
             ..Default::default()
@@ -699,7 +710,12 @@ async fn update(
             )
             .col_expr(
                 automations::Column::CooldownMinutes,
-                input.cooldown_minutes.map(|v| v as i32).into(),
+                match input.cooldown_minutes {
+                    None => old.cooldown_minutes,
+                    Some(0) => None,
+                    Some(v) => Some(v as i32),
+                }
+                .into(),
             )
             .col_expr(
                 automations::Column::DailyCap,

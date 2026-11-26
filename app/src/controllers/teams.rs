@@ -976,6 +976,9 @@ async fn invite(
         return forbidden();
     }
     let inviter = &t.current.0;
+    if super::review_login::is_demo_email(&inviter.email) {
+        return reply(StatusCode::FORBIDDEN, "review_account");
+    }
     if !app.invitation_limiter.hit(inviter.id) {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }

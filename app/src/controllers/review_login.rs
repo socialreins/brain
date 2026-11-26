@@ -82,6 +82,13 @@ async fn demo_user(app: &AppState) -> Result<users::Model, sea_orm::DbErr> {
         .ok_or_else(|| sea_orm::DbErr::RecordNotFound("demo user vanished after insert".into()))
 }
 
+/// Whether `email` is the demo user's. The demo user (App Review) may not make what outlives its
+/// link: a passkey, an API token or an invitation; `close` could not tell those from a reviewer's
+/// own, and a reviewer's flow (connect, publish, inbox) needs none of them.
+pub fn is_demo_email(email: &str) -> bool {
+    email == DEMO_EMAIL
+}
+
 /// Whether `user_id` is the demo user. `teams::change_member` refuses to demote or remove it
 /// where it is an owner: someone signed in through the link could otherwise make their own
 /// account an owner and take the demo user out, and `close` would no longer find the team.

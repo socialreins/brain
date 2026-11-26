@@ -24,6 +24,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if config.review_login_token.is_none() {
         controllers::review_login::close(&db).await?;
     }
+    let on_railway = std::env::var_os("RAILWAY_ENVIRONMENT").is_some();
+    for warning in config.warnings(on_railway) {
+        tracing::warn!("{warning}");
+    }
     let state = AppState::new(db, &config);
     scheduler::spawn(state.clone());
     let app = controllers::router(state, &config);
