@@ -243,7 +243,9 @@ pub fn router(state: AppState, config: &Config) -> Router {
         .merge(media::routes())
         .nest(
             "/v1",
-            v1.layer(from_fn_with_state(state.clone(), idempotency::layer))
+            // Inside the idempotency layer, which must see a 5xx (and free its key) rather than a panic.
+            v1.layer(CatchPanicLayer::custom(panic_response))
+                .layer(from_fn_with_state(state.clone(), idempotency::layer))
                 .layer(DefaultBodyLimit::max(MAX_BODY_BYTES)),
         )
         .route("/openapi.json", get(move || async move { Json(doc) }))
@@ -252,9 +254,10 @@ pub fn router(state: AppState, config: &Config) -> Router {
                 .nest_service("/mcp", mcp::service(&state))
                 .route_layer(from_fn_with_state(state.clone(), mcp::auth::layer)),
         )
+        // Innermost, so the 500 still gets the CORS headers and the request span.
+        .layer(CatchPanicLayer::custom(panic_response))
         .layer(cors)
         .layer(TraceLayer::new_for_http().make_span_with(span))
-        .layer(CatchPanicLayer::custom(panic_response))
         // Browsers ignore this over plain http, so local dev is unaffected; it matches the web app's.
         .layer(SetResponseHeaderLayer::overriding(
             header::STRICT_TRANSPORT_SECURITY,
