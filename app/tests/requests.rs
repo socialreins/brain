@@ -5364,6 +5364,10 @@ mod teams {
                 let db = socialreins_brain::connect(&config)
                     .await
                     .expect("database reachable");
+                // No downtime on record (`publish::note_tick`): lateness is plain.
+                sea_orm::ConnectionTrait::execute_unprepared(&db, "DELETE FROM scheduler_ticks")
+                    .await
+                    .unwrap();
                 let mut state = AppState::new(db.clone(), &config);
                 // Upload links only: sign-in still checks the real brain URL.
                 if let Some(url) = brain_url {
@@ -9303,6 +9307,65 @@ mod teams {
                     let p = get_post(&s, &cookie, &left).await;
                     assert_eq!(p["status"], "draft", "{p}");
                     assert_eq!(RECORDS.lock().unwrap().len(), records + 1);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn time_brain_was_down_does_not_make_a_post_late() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let soon = Some(past());
+                    // The publish loop last ran 80 minutes ago: its next round records that
+                    // stretch as our own downtime.
+                    exec(
+                        &db,
+                        "INSERT INTO scheduler_ticks (name, at) \
+                         VALUES ('publish', now() - interval '80 minutes')"
+                            .into(),
+                    )
+                    .await;
+                    publish::note_tick(&db).await.unwrap();
+                    // Due 90 minutes ago, 80 of them down: 10 late. Due 150 minutes ago: 70 late.
+                    let kept =
+                        due_ago(&s, &db, &cookie, input(&set, "kept", soon.as_deref()), 90).await;
+                    let gone =
+                        due_ago(&s, &db, &cookie, input(&set, "gone", soon.as_deref()), 150).await;
+                    // Rounds that follow find brain running: they keep the stretch.
+                    publish::note_tick(&db).await.unwrap();
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &kept).await["status"], "published");
+                    let p = get_post(&s, &cookie, &gone).await;
+                    assert_eq!(p["status"], "draft", "{p}");
+                    // A post the first round could not take is judged by the same stretch later.
+                    let later =
+                        due_ago(&s, &db, &cookie, input(&set, "later", soon.as_deref()), 95).await;
+                    publish::note_tick(&db).await.unwrap();
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &later).await["status"], "published");
+                    exec(&db, "DELETE FROM scheduler_ticks".into()).await;
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_round_a_minute_after_the_last_is_no_downtime() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let soon = Some(past());
+                    exec(
+                        &db,
+                        "INSERT INTO scheduler_ticks (name, at) \
+                         VALUES ('publish', now() - interval '70 seconds')"
+                            .into(),
+                    )
+                    .await;
+                    publish::note_tick(&db).await.unwrap();
+                    let late =
+                        due_ago(&s, &db, &cookie, input(&set, "late", soon.as_deref()), 61).await;
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &late).await["status"], "draft");
+                    exec(&db, "DELETE FROM scheduler_ticks".into()).await;
                 }
 
                 #[tokio::test]

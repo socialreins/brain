@@ -36,6 +36,9 @@ const PROVIDER_APPS: [(&str, [&str; 2]); 7] = [
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
+    /// `DATABASE_MAX_CONNECTIONS` (default 20, 5 to 500): the most connections this process
+    /// opens to Postgres. Keep it under Postgres's `max_connections` divided by the replicas.
+    pub database_max_connections: u32,
     pub port: u16,
     pub cors_origins: Vec<HeaderValue>,
     /// `RAILWAY_GIT_COMMIT_SHA`, else `GIT_COMMIT` (baked into published images), else `dev`.
@@ -138,6 +141,7 @@ impl Config {
     pub fn from_env() -> Result<Self, String> {
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
         let database_url = var("DATABASE_URL").ok_or("missing required variable: DATABASE_URL")?;
+        let database_max_connections = max_connections(var("DATABASE_MAX_CONNECTIONS"))?;
         let port = match var("PORT") {
             Some(p) => p.parse().map_err(|_| "PORT: not a port number")?,
             None => 8080,
@@ -194,6 +198,7 @@ impl Config {
         );
         Ok(Self {
             database_url,
+            database_max_connections,
             port,
             cors_origins: parse_origins(&origins)?,
             git_commit: var("RAILWAY_GIT_COMMIT_SHA")
@@ -338,6 +343,15 @@ fn admin_emails(raw: Option<String>) -> Result<Vec<String>, String> {
         .collect()
 }
 
+/// `DATABASE_MAX_CONNECTIONS`: 5 to 500, default 20.
+fn max_connections(value: Option<String>) -> Result<u32, String> {
+    match value.map(|v| v.trim().parse::<u32>()) {
+        None => Ok(20),
+        Some(Ok(n)) if (5..=500).contains(&n) => Ok(n),
+        Some(_) => Err("DATABASE_MAX_CONNECTIONS: a number from 5 to 500".into()),
+    }
+}
+
 /// `MEDIA_MAX_BYTES`: the largest video stored, in bytes. Default and most: 1 GiB
 /// (`media::MAX_BYTES`), which saving a post checks against whatever this says.
 fn media_max_bytes(value: Option<String>) -> Result<usize, String> {
@@ -461,6 +475,17 @@ fn parse_origins(list: &str) -> Result<Vec<HeaderValue>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pool_size_defaults_to_20_and_is_bounded() {
+        let size = |v: &str| super::max_connections(Some(v.into()));
+        assert_eq!(super::max_connections(None), Ok(20));
+        assert_eq!(size(" 35 "), Ok(35));
+        assert_eq!(size("5"), Ok(5));
+        for bad in ["4", "1", "0", "501", "-3", "many", ""] {
+            assert!(size(bad).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn review_token_needs_32_characters() {
         assert_eq!(super::review_login_token(None), Ok(None));
