@@ -725,7 +725,11 @@ async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -
             // In the background: a slow mail service must not hold Stripe's answer.
             if let Some((team, notice)) = notice {
                 let app = app.clone();
-                tokio::spawn(async move { tell_owners(&app, team, notice).await });
+                let sending = crate::mail::Sending::begin();
+                tokio::spawn(async move {
+                    let _sending = sending;
+                    tell_owners(&app, team, notice).await
+                });
             }
             StatusCode::OK.into_response()
         }

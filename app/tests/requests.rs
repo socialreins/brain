@@ -10361,6 +10361,106 @@ mod teams {
                     assert_eq!(mail_for(&seen.lock().unwrap(), &owner).len(), 10);
                 }
 
+                /// A failure notice that reached nobody (the mail provider is down) goes back,
+                /// keeps the team's daily allowance, and is mailed once the provider is back.
+                #[tokio::test]
+                #[serial]
+                async fn a_notice_is_tried_again_when_the_mail_provider_is_down() {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    let (s, db, state) = on_mock().await;
+                    let down = std::sync::Arc::new(AtomicBool::new(true));
+                    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+                    let (flag, log) = (down.clone(), seen.clone());
+                    let app = axum::Router::new().route(
+                        "/emails",
+                        axum::routing::post(move |Json(body): Json<Value>| async move {
+                            if flag.load(Ordering::SeqCst) {
+                                return (
+                                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                    Json(json!({})),
+                                );
+                            }
+                            log.lock().unwrap().push(body);
+                            (axum::http::StatusCode::OK, Json(json!({"id": "x"})))
+                        }),
+                    );
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let url = format!("http://{}/emails", listener.local_addr().unwrap());
+                    tokio::spawn(async move { axum::serve(listener, app).await });
+                    let mut state = state.clone();
+                    state.mailer = socialreins_brain::mail::Mailer::resend_at(
+                        &url,
+                        "re_test",
+                        "b@example.com",
+                    )
+                    .unwrap();
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    exec(
+                        &db,
+                        "UPDATE post_notices SET sent_at = now() WHERE sent_at IS NULL".into(),
+                    )
+                    .await;
+                    let id =
+                        id_of(&create(&s, &cookie, input(&set, "REJECT me", Some(&past()))).await);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "failed");
+                    publish::tick(&state).await.unwrap();
+                    let row = |sql: String| {
+                        let db = &db;
+                        async move {
+                            db.query_one_raw(sea_orm::Statement::from_string(
+                                sea_orm::DbBackend::Postgres,
+                                sql,
+                            ))
+                            .await
+                            .unwrap()
+                            .unwrap()
+                        }
+                    };
+                    let notice = || {
+                        row(format!(
+                            "SELECT sent_at IS NULL AS unsent, tries, retry_at > now() AS later \
+                             FROM post_notices WHERE post_id = '{id}'"
+                        ))
+                    };
+                    let n = notice().await;
+                    assert!(n.try_get::<bool>("", "unsent").unwrap());
+                    assert_eq!(n.try_get::<i32>("", "tries").unwrap(), 1);
+                    assert!(n.try_get::<bool>("", "later").unwrap());
+                    let hits = row(format!(
+                        "SELECT count(*)::int AS n FROM rate_limit_hits \
+                         WHERE bucket = 'post-mail:team:{team_id}'"
+                    ))
+                    .await;
+                    assert_eq!(
+                        hits.try_get::<i32>("", "n").unwrap(),
+                        0,
+                        "allowance given back"
+                    );
+                    // Not before its time.
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(notice().await.try_get::<i32>("", "tries").unwrap(), 1);
+                    // The provider is back and the wait is over: mailed, once.
+                    down.store(false, Ordering::SeqCst);
+                    exec(
+                        &db,
+                        format!("UPDATE post_notices SET retry_at = now() WHERE post_id = '{id}'"),
+                    )
+                    .await;
+                    publish::tick(&state).await.unwrap();
+                    publish::tick(&state).await.unwrap();
+                    let n = notice().await;
+                    assert!(!n.try_get::<bool>("", "unsent").unwrap());
+                    let subjects: Vec<String> = seen
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|m| m["subject"].as_str().unwrap().to_owned())
+                        .collect();
+                    assert_eq!(subjects, ["Your Bluesky post failed"], "{subjects:?}");
+                }
+
                 async fn status_of(db: &DatabaseConnection, id: &str) -> String {
                     posts::Entity::find_by_id(id.parse::<uuid::Uuid>().unwrap())
                         .one(db)
@@ -38873,8 +38973,15 @@ mod waitlist_confirm {
         let email = unique_email();
         join(&s, &email).await;
         assert_eq!(rows(&db, &email).await, 1);
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let r = row(&db, &email).await;
+        // The mail is tried three times (`Mailer::send`) before it counts as failed.
+        let mut r = row(&db, &email).await;
+        for _ in 0..40 {
+            if r.verify_sent_at.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            r = row(&db, &email).await;
+        }
         assert!(
             r.verify_sent_at.is_none(),
             "a failed send does not throttle"
