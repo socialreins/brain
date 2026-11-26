@@ -7,7 +7,7 @@ Run it as a cron job every 6 hours (`0 */6 * * *`). Each run:
 1. dumps the database (`pg_dump --format=custom`) and checks the archive reads back (`pg_restore --list`),
 2. encrypts it, deletes the plaintext, uploads `backups/db/socialreins-<UTC time>.dump.age` with its sha256 stored as object metadata, and checks the stored size,
 3. writes `backups/latest.json` (`time`, `key`, `size`, `sha256`, `seconds`),
-4. prunes: every dump for 2 days, then the first of each UTC day until 14 days, then the first of each ISO week until 30 days, then nothing (`prune.sh`, tested by `prune_test.sh`). Only keys that match the dump name pattern under `backups/db/` are ever deleted.
+4. prunes: every dump for 2 days, then the first of each UTC day until 14 days, then the first of each ISO week until 30 days, then nothing (`prune.sh`, tested by `prune_test.sh`). Only keys named `socialreins-<UTC time>.dump.age` under `backups/db/` are ever deleted.
 5. pings `HEARTBEAT_URL` if set.
 
 Any failure exits non-zero. The recovery point is therefore at most 6 hours, plus the length of one run (a minute or less at 250 MB).
@@ -22,6 +22,7 @@ Any failure exits non-zero. The recovery point is therefore at most 6 hours, plu
 | `BACKUP_PREFIX` | Optional, default `backups`. Brain's media cleanup only reads `posts/`, so keep this off that prefix. |
 | `HEARTBEAT_URL` | Optional. Pinged after a good run (a [healthchecks.io](https://healthchecks.io) free check, UptimeRobot heartbeat, ...). A monitor that alerts when the ping is missing also catches a job that stopped running. |
 | `DUMP_TIMEOUT` | Optional seconds, default 1800. |
+| `MIN_DUMP_BYTES` | Optional, default 1. A run whose encrypted dump is smaller fails before uploading (a wrong or empty database must not replace good history). Set it to about a tenth of a normal dump. |
 
 ## Keys
 
@@ -58,5 +59,5 @@ Then follow the restore runbook (reconcile due posts before a brain starts on it
 
 ## Where to look when it fails
 
-- Railway, the backup service, Deployments: the last run's log ends with `backup ok: ...` or the failing command.
+- Railway, the backup service, Deployments: the last run's log has `backup ok: ...` or ends at the failing command.
 - `backups/latest.json` in the bucket: its `time` is the last good run. Older than 7 hours means the job is not working.

@@ -14,7 +14,7 @@ keys=$( {
   k 20261110T000000Z; k 20261112T060000Z; k 20261109T060000Z
   # 40 days old
   k 20261021T000000Z
-  echo backups/latest.json
+  echo backups/latest.json; echo 'backups/db/readme-20200101T000000Z.txt'; echo 'backups/db/my notes 20200101T000000Z old'; echo backups/db/socialreins-20269999T000000Z.dump.age
 } )
 got=$(echo "$keys" | ./prune.sh | sort)
 want=$( {

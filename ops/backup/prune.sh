@@ -6,9 +6,10 @@ set -euo pipefail
 now=${NOW:-$(date -u +%s)}
 last_day='' last_week=''
 while read -r key; do
-  [[ $key =~ ([0-9]{8})T([0-9]{2})([0-9]{2})([0-9]{2})Z ]] || continue # a foreign object: never touch
-  d=${BASH_REMATCH[1]}
-  t=$(date -u -d "${d:0:4}-${d:4:2}-${d:6:2} ${BASH_REMATCH[2]}:${BASH_REMATCH[3]}:${BASH_REMATCH[4]}" +%s)
+  # Only our own dump names: anything else under the prefix is never touched.
+  [[ $key =~ (^|/)socialreins-([0-9]{8})T([0-9]{2})([0-9]{2})([0-9]{2})Z\.dump\.age$ ]] || continue
+  d=${BASH_REMATCH[2]}
+  t=$(date -u -d "${d:0:4}-${d:4:2}-${d:6:2} ${BASH_REMATCH[3]}:${BASH_REMATCH[4]}:${BASH_REMATCH[5]}" +%s 2>/dev/null) || continue # impossible date
   age=$((now - t))
   week=$(date -u -d "${d:0:4}-${d:4:2}-${d:6:2}" +%G%V)
   first_of_day=0 first_of_week=0
