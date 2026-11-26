@@ -69,8 +69,8 @@ pub async fn connect(config: &config::Config) -> Result<DatabaseConnection, DbEr
 }
 
 /// `connect`, tried again every `retry` until it works or `wait` has passed: a Postgres that
-/// restarts or fails over while brain starts costs a few seconds, not an outage that ends when
-/// Railway gives up restarting the process. Whatever stops it for longer is returned.
+/// restarts or fails over while brain starts costs a few seconds, not a restart loop. Whatever stops it for longer is
+/// returned.
 pub async fn connect_when_ready(
     config: &config::Config,
     wait: Duration,
