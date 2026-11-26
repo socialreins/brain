@@ -78,13 +78,15 @@ pub async fn connect_when_ready(
 ) -> Result<DatabaseConnection, DbErr> {
     let give_up = tokio::time::Instant::now() + wait;
     loop {
-        match connect(config).await {
+        let e = match connect(config).await {
             Ok(db) => return Ok(db),
-            Err(e) if tokio::time::Instant::now() + retry < give_up => {
-                tracing::warn!(error = %e, "database not ready, trying again");
-                tokio::time::sleep(retry).await;
-            }
-            Err(e) => return Err(e),
+            // sea-orm puts the whole URL in some errors, and it carries the password.
+            Err(e) => e.to_string().replace(&config.database_url, "DATABASE_URL"),
+        };
+        if tokio::time::Instant::now() + retry >= give_up {
+            return Err(DbErr::Custom(e));
         }
+        tracing::warn!(error = %e, "database not ready, trying again");
+        tokio::time::sleep(retry).await;
     }
 }

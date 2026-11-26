@@ -1503,13 +1503,14 @@ pub const LATE_MINUTES: i64 = 60;
 /// A publish round later than this after the last one means brain was down in between.
 const MISSED_TICKS: &str = "2 minutes";
 /// The longest stretch of downtime that is given back to the posts due in it.
-const MAX_DOWNTIME: &str = "24 hours";
+const MAX_DOWNTIME: &str = "6 hours";
 
 /// Records that the publish loop is running. When it last ran more than `MISSED_TICKS` ago,
-/// that stretch (at most `MAX_DOWNTIME`) is kept as brain's own downtime: `post_lateness`
+/// that stretch (at most `MAX_DOWNTIME`, so a post is at most about that much later than its time and any longer outage still drafts what was due before it) is kept as brain's own downtime: `post_lateness`
 /// takes it off a post's lateness, so a deploy that fails or a Postgres that is away for hours
-/// does not draft every post due meanwhile. Call it before `begin`. One statement under the
-/// publish lock's rule: another instance doing the same only keeps the stamp fresher.
+/// does not draft every post due meanwhile. Call it before `begin`. Another instance doing the
+/// same only keeps the stamp fresher.
+// shortcut: only the last stretch is kept, so a second gap replaces the first; keep a list of stretches if that bites.
 pub async fn note_tick(db: &DatabaseConnection) -> Result<(), DbErr> {
     if POST_SLOTS.is_closed() {
         return Ok(());

@@ -70,6 +70,16 @@ async fn boot_gives_up_after_the_wait() {
 
 #[tokio::test]
 #[serial]
+async fn a_database_url_never_reaches_the_log_through_the_error() {
+    let mut config = Config::from_env().expect("DATABASE_URL must point at a test Postgres");
+    config.database_url = "postgres://brain:hunter2@127.0.0.1:notaport/db".into();
+    let res = connect_when_ready(&config, Duration::from_secs(1), Duration::from_millis(300)).await;
+    let text = res.unwrap_err().to_string();
+    assert!(!text.contains("hunter2"), "{text}");
+}
+
+#[tokio::test]
+#[serial]
 async fn a_full_pool_fails_a_request_in_seconds_not_half_a_minute() {
     let mut config = Config::from_env().expect("DATABASE_URL must point at a test Postgres");
     config.database_max_connections = 2;
