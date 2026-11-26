@@ -30,6 +30,7 @@ use crate::{
         pinterest::{self, Pinterest},
         threads::{self, Threads},
         tiktok::{self, TikTok},
+        unsent,
         x::{self, X},
         youtube::{self, YouTube},
     },
@@ -2131,8 +2132,12 @@ fn media_error(fail: Fail, n: usize, platform: &str, cap: usize) -> String {
              SocialReins could not get past Drive's confirmation page. Try again, or use \
              another link."
         ),
-        Fail::Http(code) => format!("Image {n} could not be downloaded (HTTP {code})."),
-        Fail::Unreachable => format!("Image {n} could not be downloaded."),
+        // A host or store that failed for a moment: nothing was posted, so the target tries once more.
+        Fail::Http(code) => unsent(
+            format!("Image {n} could not be downloaded (HTTP {code})."),
+            matches!(code, 429 | 500..=599),
+        ),
+        Fail::Unreachable => unsent(format!("Image {n} could not be downloaded."), true),
         Fail::TooLarge => format!(
             "Image {n} is over {} MB, the largest video SocialReins takes.",
             cap / 1_000_000
@@ -2145,14 +2150,17 @@ fn media_error(fail: Fail, n: usize, platform: &str, cap: usize) -> String {
             format!("Image {n} is not a JPEG, PNG or GIF image, an MP4 video or a PDF.")
         }
         Fail::Unsupported => format!("Image {n} is not a JPEG, PNG, WebP or GIF."),
-        Fail::Storage => format!("Image {n} could not be stored. Try again."),
+        Fail::Storage => unsent(format!("Image {n} could not be stored. Try again."), true),
         Fail::TimedOut => format!(
             "Image {n} did not download in time: it came slower than 2 MB a second, or the \
              post's media took over 12 minutes together. Use a faster link."
         ),
-        Fail::Stalled => format!(
-            "Image {n} stopped downloading: its server sent nothing for 30 seconds. Try again, \
-             or use another link."
+        Fail::Stalled => unsent(
+            format!(
+                "Image {n} stopped downloading: its server sent nothing for 30 seconds. Try \
+                 again, or use another link."
+            ),
+            true,
         ),
     }
 }
@@ -2252,6 +2260,39 @@ async fn load(
     Ok(files)
 }
 
+/// Saves what the platform answered for a post that is out, trying again after a short wait: a
+/// pool timeout or a blink of the database must not leave a live post with no id. If every try
+/// fails the remote id is logged for a person (`error` level) and the target fails with `lost`,
+/// which says it may be live, so it is never sent again; with the database still down, recovery
+/// fails it later with a like message.
+async fn save_sent(
+    db: &DatabaseConnection,
+    id: Uuid,
+    (stmt, remote_id): (Statement, &str),
+    lost: &str,
+) -> Result<(), DbErr> {
+    let mut last = None;
+    for wait in SAVE_WAITS {
+        tokio::time::sleep(wait).await;
+        match db.execute_raw(stmt.clone()).await {
+            Ok(_) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+    }
+    let e = last.expect("SAVE_WAITS is not empty");
+    tracing::error!(error = %e, target = %id, remote_id, "post is live but its id was not saved");
+    let _ = fail_target(db, id, lost).await;
+    Err(e)
+}
+
+/// Waits before each try of `save_sent`.
+const SAVE_WAITS: [Duration; 4] = [
+    Duration::ZERO,
+    Duration::from_millis(200),
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+];
+
 /// Credits held for the X posts of one target, until it is known how many went out.
 struct XHold {
     reference: String,
@@ -2259,6 +2300,16 @@ struct XHold {
     /// Posts the platform took in this attempt, counted as each `send` returns, before anything
     /// is saved: a post that is out but not recorded is still paid for.
     sent: i64,
+}
+
+impl XHold {
+    /// A call that failed with an unknown outcome (a timeout, a cut-off: `outcome_unknown`) may
+    /// have been taken and billed by X, so it stays paid for.
+    fn failed(&mut self, msg: &str) {
+        if outcome_unknown(Some(msg)) {
+            self.sent += 1;
+        }
+    }
 }
 
 /// Gives back the credits held for X posts that did not go out. A failure here is logged; the
@@ -2521,6 +2572,32 @@ async fn publish_target_held(
     if !claim_target(db, id).await? {
         return Ok(());
     }
+    // A database error before the first call to the platform sent nothing: give the target the
+    // one retry of an unsent failure (`fail_target`) instead of leaving it `publishing` for
+    // `recover_stuck` to call "may have posted" 31 minutes on.
+    let mut sending = false;
+    match publish_claimed(app, post, id, stored, hold, &mut sending).await {
+        Err(e) if !sending => {
+            tracing::warn!(error = %e, target = %id, "database error before anything was sent");
+            let msg = unsent("Publishing hit a database error.".into(), true);
+            let _ = fail_target(db, id, &msg).await;
+            Err(e)
+        }
+        done => done,
+    }
+}
+
+/// `publish_target_held` once the target is claimed. `sending` is set true right before the
+/// first call to the platform, so the caller knows an error came before anything was sent.
+async fn publish_claimed(
+    app: &AppState,
+    post: &posts::Model,
+    id: Uuid,
+    stored: &Media,
+    hold: &mut Option<XHold>,
+    sending: &mut bool,
+) -> Result<(), DbErr> {
+    let db = &app.db;
     let target = post_targets::Entity::find_by_id(id).one(db).await?;
     let account = match target.as_ref().and_then(|t| t.social_account_id) {
         Some(a) => social_accounts::Entity::find_by_id(a).one(db).await?,
@@ -2635,6 +2712,7 @@ async fn publish_target_held(
             }
         }
     }
+    *sending = true;
     let root = match resumed {
         Some(root) => root,
         None => {
@@ -2661,7 +2739,12 @@ async fn publish_target_held(
                     }
                     (remote, note)
                 }
-                Err(msg) => return fail_target(db, id, &msg).await,
+                Err(msg) => {
+                    if let Some(h) = hold.as_mut() {
+                        h.failed(&msg);
+                    }
+                    return fail_target(db, id, &msg).await;
+                }
             };
             let (root, alt_note) = root;
             // The remote id first: whatever fails after this, the post is known to be live.
@@ -2679,7 +2762,8 @@ async fn publish_target_held(
                     alt_note.into(),
                 ],
             );
-            db.execute_raw(stmt).await?;
+            let lost = "It went out but could not be saved: it may be live, check the account.";
+            save_sent(db, id, (stmt, &root.id), lost).await?;
             root
         }
     };
@@ -2741,6 +2825,9 @@ async fn publish_target_held(
                     i + 1,
                     thread.len()
                 );
+                if let Some(h) = hold.as_mut() {
+                    h.failed(&msg);
+                }
                 return fail_target(db, id, &msg).await;
             }
         };
@@ -2755,12 +2842,7 @@ async fn publish_target_held(
              ELSE alt_error || ' ' || $3 END, updated_at = now() WHERE id = $1",
             vec![id.into(), saved.into(), alt_note.into()],
         );
-        if let Err(e) = db.execute_raw(stmt).await {
-            let msg = unsaved_part(i + 1, thread.len());
-            // Best effort: with the database down, recovery fails it later with a like message.
-            let _ = fail_target(db, id, &msg).await;
-            return Err(e);
-        }
+        save_sent(db, id, (stmt, &made.id), &unsaved_part(i + 1, thread.len())).await?;
         parent = made;
     }
     // A post with a first comment is claimed for it in this same statement (`posting`, only
@@ -3216,5 +3298,46 @@ mod tests {
         assert_eq!(video(512_000_000, "x"), None);
         assert_eq!(video(1 << 30, "youtube"), None);
         assert_eq!(problem("application/pdf", "threads"), None);
+    }
+
+    #[test]
+    fn an_unknown_outcome_keeps_its_x_credit_and_a_refusal_gives_it_back() {
+        let mut hold = XHold {
+            reference: "r".into(),
+            amount: 3,
+            sent: 1,
+        };
+        hold.failed("X refused it (403). Nothing was posted.");
+        assert_eq!(hold.sent, 1);
+        hold.failed(TIMED_OUT);
+        assert_eq!(hold.sent, 2);
+        hold.failed(&cut_off_part(2, 3));
+        assert_eq!(hold.sent, 3);
+        assert_eq!(hold.amount - hold.sent, 0);
+    }
+
+    #[test]
+    fn only_a_media_failure_that_can_pass_is_marked_unsent() {
+        let fail = |f| media_error(f, 1, "bluesky", 0);
+        for f in [
+            Fail::Storage,
+            Fail::Unreachable,
+            Fail::Stalled,
+            Fail::Http(503),
+            Fail::Http(429),
+        ] {
+            assert!(retry_safe(&fail(f)), "{f:?}");
+        }
+        for f in [
+            Fail::Http(404),
+            Fail::Http(403),
+            Fail::Blocked,
+            Fail::NotShared,
+            Fail::TooLarge,
+            Fail::Unsupported,
+            Fail::TimedOut,
+        ] {
+            assert!(!retry_safe(&fail(f)), "{f:?}");
+        }
     }
 }

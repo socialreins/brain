@@ -3883,6 +3883,24 @@ mod teams {
                         image("image/png", 64)
                     }),
                 )
+                .route(
+                    "/flaky.png",
+                    get(|| async {
+                        if FLAKY
+                            .try_update(
+                                std::sync::atomic::Ordering::SeqCst,
+                                std::sync::atomic::Ordering::SeqCst,
+                                |n| n.checked_sub(1),
+                            )
+                            .is_ok()
+                        {
+                            return axum::response::IntoResponse::into_response(
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            );
+                        }
+                        axum::response::IntoResponse::into_response(image("image/png", 64))
+                    }),
+                )
                 .route("/big.png", get(|| async { image("image/png", 1_000_001) }))
                 .route("/big.gif", get(|| async { image("image/gif", 1_000_001) }))
                 .route("/noise.png", get(|| async { noise_png() }))
@@ -3895,6 +3913,9 @@ mod teams {
             tokio::spawn(async move { axum::serve(listener, app).await });
             base
         }
+
+        /// How many more requests for `/flaky.png` the mock answers with a 503.
+        static FLAKY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
         /// What the mock's inbox endpoints answer, per account DID: `notifications` (a list),
         /// `convos` (a list) and `messages` (convo id to list).
@@ -9806,6 +9827,130 @@ mod teams {
                     assert_eq!(p["status"], "published", "{p}");
                     assert_eq!(p["targets"][0]["retried"], true);
                     assert_eq!(p["targets"][0]["error"], Value::Null);
+                }
+
+                /// A store or a media host that fails for a moment sent nothing, so the target
+                /// goes out again by itself, once (decision 0008).
+                #[tokio::test]
+                #[serial]
+                async fn a_media_host_that_fails_for_a_moment_is_retried_once() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let base = pds_of(&db, &team_id).await;
+                    let records = RECORDS.lock().unwrap().len();
+                    FLAKY.store(1, std::sync::atomic::Ordering::SeqCst);
+                    let id = id_of(&create(&s, &cookie, input(&set, "pic", Some(&past()))).await);
+                    set_media(&db, &base, &id, &["/flaky.png"]).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "queued", "{p}");
+                    let t = &p["targets"][0];
+                    assert_eq!(t["status"], "pending", "{p}");
+                    assert_eq!(t["retried"], true);
+                    let why = t["error"].as_str().unwrap();
+                    assert!(why.contains("(HTTP 503)"), "{why}");
+                    assert!(why.ends_with("Nothing was posted."), "{why}");
+                    assert_eq!(RECORDS.lock().unwrap().len(), records, "nothing was sent");
+                    // Due: the host answers now, and the post goes out once.
+                    retry_now(&db, &id).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(RECORDS.lock().unwrap().len(), records + 1);
+
+                    // Down on the retry too: failed for good, after the one retry.
+                    FLAKY.store(2, std::sync::atomic::Ordering::SeqCst);
+                    let id = id_of(&create(&s, &cookie, input(&set, "pic2", Some(&past()))).await);
+                    set_media(&db, &base, &id, &["/flaky.png"]).await;
+                    publish::tick(&state).await.unwrap();
+                    retry_now(&db, &id).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    assert_eq!(RECORDS.lock().unwrap().len(), records + 1);
+
+                    // A file that is not there is never retried: a 404 stays final.
+                    let id = id_of(&create(&s, &cookie, input(&set, "gone", Some(&past()))).await);
+                    set_media(&db, &base, &id, &["/no/such.png"]).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    assert_eq!(p["targets"][0]["retried"], false);
+                }
+
+                /// Fails the update that saves a post's remote id the first `fails` times.
+                async fn fail_remote_id_saves(db: &DatabaseConnection, fails: u32) {
+                    exec(
+                        db,
+                        format!(
+                            "DROP TRIGGER IF EXISTS rel_fail ON post_targets; \
+                             DROP SEQUENCE IF EXISTS rel_fail_seq; \
+                             CREATE SEQUENCE rel_fail_seq; \
+                             CREATE OR REPLACE FUNCTION rel_fail() RETURNS trigger AS $$ BEGIN \
+                               IF NEW.remote_id IS NOT NULL AND OLD.remote_id IS NULL \
+                                  AND nextval('rel_fail_seq') <= {fails} THEN \
+                                 RAISE EXCEPTION 'injected'; END IF; RETURN NEW; END $$ \
+                               LANGUAGE plpgsql; \
+                             CREATE TRIGGER rel_fail BEFORE UPDATE ON post_targets \
+                               FOR EACH ROW EXECUTE FUNCTION rel_fail()"
+                        ),
+                    )
+                    .await;
+                }
+
+                async fn stop_failing_saves(db: &DatabaseConnection) {
+                    exec(
+                        db,
+                        "DROP TRIGGER IF EXISTS rel_fail ON post_targets; \
+                         DROP SEQUENCE IF EXISTS rel_fail_seq"
+                            .into(),
+                    )
+                    .await;
+                }
+
+                /// The platform took the post: its id is saved even through a database that
+                /// blinks, and when it cannot be saved the target says it may be live.
+                #[tokio::test]
+                #[serial]
+                async fn a_live_post_keeps_its_id_through_a_database_blink() {
+                    use futures_util::FutureExt;
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let body = std::panic::AssertUnwindSafe(async {
+                        // Two failed saves, the third works.
+                        fail_remote_id_saves(&db, 2).await;
+                        let id =
+                            id_of(&create(&s, &cookie, input(&set, "blink", Some(&past()))).await);
+                        publish::tick(&state).await.unwrap();
+                        let p = get_post(&s, &cookie, &id).await;
+                        assert_eq!(p["status"], "published", "{p}");
+                        assert!(p["targets"][0]["remote_id"].is_string(), "{p}");
+
+                        // Never saved: failed at once as "may be live", no retry offered.
+                        let records = RECORDS.lock().unwrap().len();
+                        fail_remote_id_saves(&db, 1000).await;
+                        let id =
+                            id_of(&create(&s, &cookie, input(&set, "lost", Some(&past()))).await);
+                        publish::tick(&state).await.unwrap();
+                        let p = get_post(&s, &cookie, &id).await;
+                        assert_eq!(p["status"], "failed", "{p}");
+                        let t = &p["targets"][0];
+                        assert_eq!(t["remote_id"], Value::Null, "{p}");
+                        assert!(t["error"].as_str().unwrap().contains("may be live"), "{p}");
+                        assert_eq!(RECORDS.lock().unwrap().len(), records + 1, "sent once");
+                        stop_failing_saves(&db).await;
+                        let res =
+                            req(&s, Method::POST, &format!("/v1/posts/{id}/retry"), &cookie).await;
+                        assert_eq!(res.status_code(), 409, "{}", res.text());
+                    })
+                    .catch_unwind()
+                    .await;
+                    stop_failing_saves(&db).await;
+                    if let Err(e) = body {
+                        std::panic::resume_unwind(e);
+                    }
                 }
 
                 #[tokio::test]
@@ -18146,6 +18291,65 @@ mod teams {
                     let p = get_post(&s, &cookie, &id).await;
                     assert_eq!(p["targets"][0]["status"], "failed", "{p}");
                     assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 4);
+                }
+
+                /// A database error after the target is claimed and before X is called sent
+                /// nothing: the target retries once, and the credit is not lost.
+                #[tokio::test]
+                #[serial]
+                async fn a_database_error_before_the_call_to_x_is_retried_not_stranded() {
+                    use futures_util::FutureExt;
+                    use socialreins_brain::billing::{self, Kind};
+                    let (s, db, mut state, _, mock, cookie, team_id, set) = team().await;
+                    state.billing_enabled = true;
+                    let team: uuid::Uuid = team_id.parse().unwrap();
+                    on_plan(&db, team, "active").await;
+                    billing::grant(&db, team, Kind::X, 3, "test", None)
+                        .await
+                        .unwrap();
+                    let before = mock.tweets.lock().unwrap().len();
+                    let body = std::panic::AssertUnwindSafe(async {
+                        // The credit spend (the first thing after the claim) fails.
+                        db.execute_unprepared(
+                            "CREATE OR REPLACE FUNCTION rel_boom() RETURNS trigger AS $$ BEGIN \
+                               RAISE EXCEPTION 'injected'; END $$ LANGUAGE plpgsql; \
+                             CREATE TRIGGER rel_boom BEFORE INSERT ON credit_ledger \
+                               FOR EACH ROW WHEN (NEW.reason = 'x post') \
+                               EXECUTE FUNCTION rel_boom()",
+                        )
+                        .await
+                        .unwrap();
+                        let id = id_of(&create(&s, &cookie, x_post(&set, "Blink")).await);
+                        publish::tick(&state).await.unwrap();
+                        let p = get_post(&s, &cookie, &id).await;
+                        let t = &p["targets"][0];
+                        assert_eq!(t["status"], "pending", "{p}");
+                        assert_eq!(t["retried"], true, "{p}");
+                        let why = t["error"].as_str().unwrap();
+                        assert!(why.ends_with("Nothing was posted."), "{why}");
+                        assert_eq!(mock.tweets.lock().unwrap().len(), before);
+                        db.execute_unprepared("DROP TRIGGER rel_boom ON credit_ledger")
+                            .await
+                            .unwrap();
+                        // Due again: it goes out, and costs its one credit.
+                        db.execute_unprepared(&format!(
+                            "UPDATE post_targets SET retry_at = now() - interval '1 second' \
+                             WHERE post_id = '{id}'"
+                        ))
+                        .await
+                        .unwrap();
+                        publish::tick(&state).await.unwrap();
+                        assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                        assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 2);
+                    })
+                    .catch_unwind()
+                    .await;
+                    db.execute_unprepared("DROP TRIGGER IF EXISTS rel_boom ON credit_ledger")
+                        .await
+                        .unwrap();
+                    if let Err(e) = body {
+                        std::panic::resume_unwind(e);
+                    }
                 }
 
                 /// Several X posts due at once for a team with one credit: one goes out, not all.
