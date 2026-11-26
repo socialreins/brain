@@ -39,6 +39,10 @@ pub struct Config {
     /// `DATABASE_MAX_CONNECTIONS` (default 20, 5 to 500): the most connections this process
     /// opens to Postgres. Keep it under Postgres's `max_connections` divided by the replicas.
     pub database_max_connections: u32,
+    /// `PUBLISH_DRAIN_SECONDS` (default 120, 10 to 3000): how long a stopping process waits for
+    /// the posts it is publishing (`publish::drain`). Set `RAILWAY_DEPLOYMENT_DRAINING_SECONDS`
+    /// above it, or Railway kills the process first.
+    pub publish_drain: std::time::Duration,
     pub port: u16,
     pub cors_origins: Vec<HeaderValue>,
     /// `RAILWAY_GIT_COMMIT_SHA`, else `GIT_COMMIT` (baked into published images), else `dev`.
@@ -159,6 +163,8 @@ impl Config {
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
         let database_url = var("DATABASE_URL").ok_or("missing required variable: DATABASE_URL")?;
         let database_max_connections = max_connections(var("DATABASE_MAX_CONNECTIONS"))?;
+        let publish_drain =
+            std::time::Duration::from_secs(publish_drain(var("PUBLISH_DRAIN_SECONDS"))?);
         let port = match var("PORT") {
             Some(p) => p.parse().map_err(|_| "PORT: not a port number")?,
             None => 8080,
@@ -216,6 +222,7 @@ impl Config {
         Ok(Self {
             database_url,
             database_max_connections,
+            publish_drain,
             port,
             cors_origins: parse_origins(&origins)?,
             git_commit: var("RAILWAY_GIT_COMMIT_SHA")
@@ -364,6 +371,15 @@ fn admin_emails(raw: Option<String>) -> Result<Vec<String>, String> {
         .collect()
 }
 
+/// `PUBLISH_DRAIN_SECONDS`: 10 to 3000, default 120 (`publish::DRAIN`).
+fn publish_drain(value: Option<String>) -> Result<u64, String> {
+    match value.map(|v| v.trim().parse::<u64>()) {
+        None => Ok(crate::publish::DRAIN.as_secs()),
+        Some(Ok(n)) if (10..=3000).contains(&n) => Ok(n),
+        Some(_) => Err("PUBLISH_DRAIN_SECONDS: a number from 10 to 3000".into()),
+    }
+}
+
 /// `DATABASE_MAX_CONNECTIONS`: 5 to 500, default 20.
 fn max_connections(value: Option<String>) -> Result<u32, String> {
     match value.map(|v| v.trim().parse::<u32>()) {
@@ -506,6 +522,16 @@ fn parse_origins(list: &str) -> Result<Vec<HeaderValue>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_publish_drain_defaults_to_two_minutes_and_is_bounded() {
+        let drain = |v: &str| super::publish_drain(Some(v.into()));
+        assert_eq!(super::publish_drain(None), Ok(120));
+        assert_eq!(drain(" 540 "), Ok(540));
+        for bad in ["9", "3001", "-1", "soon", ""] {
+            assert!(drain(bad).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn pool_size_defaults_to_20_and_is_bounded() {
         let size = |v: &str| super::max_connections(Some(v.into()));

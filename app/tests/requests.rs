@@ -2129,6 +2129,45 @@ mod teams {
 
     #[tokio::test]
     #[serial]
+    async fn a_user_who_left_their_current_team_lands_in_the_oldest_one() {
+        use sea_orm::ConnectionTrait;
+        let (s, db) = server_where(|_| {}).await;
+        let (_, cookie, id) = user(&s, &db).await;
+        let personal = current(&s, &cookie).await;
+        let made = req(&s, Method::POST, "/v1/teams", &cookie)
+            .json(&json!({"name": "Acme"}))
+            .await;
+        assert_eq!(made.status_code(), 201);
+        let acme = made.json::<Value>();
+        // The new team is current; the user then leaves it (a row removed, current team kept).
+        assert_eq!(current(&s, &cookie).await["id"], acme["id"]);
+        let stmt = sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Postgres,
+            format!(
+                "DELETE FROM team_user WHERE user_id = '{id}' AND team_id = '{}'",
+                acme["id"].as_str().unwrap()
+            ),
+        );
+        db.execute_raw(stmt).await.unwrap();
+        // The oldest membership answers, and it becomes the current team again.
+        assert_eq!(current(&s, &cookie).await["id"], personal["id"]);
+        let row = users::Entity::find_by_id(id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.current_team_id.unwrap().to_string(), personal["id"]);
+        // Naming the team they left is a 404, as for a team that does not exist.
+        let named = s
+            .get("/v1/team")
+            .add_header("cookie", cookie.clone())
+            .add_header("x-team", acme["code"].as_str().unwrap())
+            .await;
+        assert_eq!(named.status_code(), 404);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn create_switch_rename_and_delete() {
         let (s, db) = server_where(|_| {}).await;
         let (_, cookie, id) = user(&s, &db).await;
@@ -9440,6 +9479,81 @@ mod teams {
                     assert_eq!(RECORDS.lock().unwrap().len(), records + 1);
                 }
 
+                /// A publish-now post that waited for a slot as the process stopped goes back to
+                /// `scheduled` with its hit of the daily cap given back; one with a target stays.
+                #[tokio::test]
+                #[serial]
+                async fn a_publish_now_post_left_waiting_at_shutdown_is_handed_back() {
+                    let (s, db, _state) = on_mock().await;
+                    let (cookie, team_id, account) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let hits = |team: &str| {
+                        let db = &db;
+                        let team = team.to_owned();
+                        async move {
+                            let row = sea_orm::ConnectionTrait::query_one_raw(
+                                db,
+                                sea_orm::Statement::from_string(
+                                    sea_orm::DbBackend::Postgres,
+                                    format!(
+                                        "SELECT count(*)::int AS n FROM rate_limit_hits \
+                                         WHERE bucket = 'publish:team:{team}'"
+                                    ),
+                                ),
+                            )
+                            .await
+                            .unwrap()
+                            .unwrap();
+                            row.try_get::<i32>("", "n").unwrap()
+                        }
+                    };
+                    let id = id_of(&create(&s, &cookie, input(&set, "now", None)).await);
+                    let before = hits(&team_id).await;
+                    exec(
+                        &db,
+                        format!(
+                            "INSERT INTO rate_limit_hits (bucket) VALUES ('publish:team:{team_id}'); \
+                             UPDATE posts SET status = 'queued', quota_reserved = true, \
+                             scheduled_at = now() WHERE id = '{id}'"
+                        ),
+                    )
+                    .await;
+                    assert_eq!(hits(&team_id).await, before + 1);
+                    publish::hand_back_reserved(&db, id.parse().unwrap())
+                        .await
+                        .unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "scheduled", "{p}");
+                    assert_eq!(hits(&team_id).await, before, "the hit is back");
+                    // Handed back once: a second call changes nothing.
+                    publish::hand_back_reserved(&db, id.parse().unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(hits(&team_id).await, before);
+                    // Underway (a target exists): left alone.
+                    exec(
+                        &db,
+                        format!(
+                            "INSERT INTO rate_limit_hits (bucket) VALUES ('publish:team:{team_id}'); \
+                             UPDATE posts SET status = 'queued', quota_reserved = true WHERE id = '{id}'"
+                        ),
+                    )
+                    .await;
+                    exec(
+                        &db,
+                        format!(
+                            "INSERT INTO post_targets (id, post_id, social_account_id, status) \
+                             VALUES (gen_random_uuid(), '{id}', '{account}', 'pending')"
+                        ),
+                    )
+                    .await;
+                    publish::hand_back_reserved(&db, id.parse().unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(status_of(&db, &id).await, "queued");
+                    assert_eq!(hits(&team_id).await, before + 1);
+                }
+
                 #[tokio::test]
                 #[serial]
                 async fn time_brain_was_down_does_not_make_a_post_late() {
@@ -10359,6 +10473,106 @@ mod teams {
                         publish::tick(&state).await.unwrap();
                     }
                     assert_eq!(mail_for(&seen.lock().unwrap(), &owner).len(), 10);
+                }
+
+                /// A failure notice that reached nobody (the mail provider is down) goes back,
+                /// keeps the team's daily allowance, and is mailed once the provider is back.
+                #[tokio::test]
+                #[serial]
+                async fn a_notice_is_tried_again_when_the_mail_provider_is_down() {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    let (s, db, state) = on_mock().await;
+                    let down = std::sync::Arc::new(AtomicBool::new(true));
+                    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+                    let (flag, log) = (down.clone(), seen.clone());
+                    let app = axum::Router::new().route(
+                        "/emails",
+                        axum::routing::post(move |Json(body): Json<Value>| async move {
+                            if flag.load(Ordering::SeqCst) {
+                                return (
+                                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                    Json(json!({})),
+                                );
+                            }
+                            log.lock().unwrap().push(body);
+                            (axum::http::StatusCode::OK, Json(json!({"id": "x"})))
+                        }),
+                    );
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let url = format!("http://{}/emails", listener.local_addr().unwrap());
+                    tokio::spawn(async move { axum::serve(listener, app).await });
+                    let mut state = state.clone();
+                    state.mailer = socialreins_brain::mail::Mailer::resend_at(
+                        &url,
+                        "re_test",
+                        "b@example.com",
+                    )
+                    .unwrap();
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    exec(
+                        &db,
+                        "UPDATE post_notices SET sent_at = now() WHERE sent_at IS NULL".into(),
+                    )
+                    .await;
+                    let id =
+                        id_of(&create(&s, &cookie, input(&set, "REJECT me", Some(&past()))).await);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "failed");
+                    publish::tick(&state).await.unwrap();
+                    let row = |sql: String| {
+                        let db = &db;
+                        async move {
+                            db.query_one_raw(sea_orm::Statement::from_string(
+                                sea_orm::DbBackend::Postgres,
+                                sql,
+                            ))
+                            .await
+                            .unwrap()
+                            .unwrap()
+                        }
+                    };
+                    let notice = || {
+                        row(format!(
+                            "SELECT sent_at IS NULL AS unsent, tries, retry_at > now() AS later \
+                             FROM post_notices WHERE post_id = '{id}'"
+                        ))
+                    };
+                    let n = notice().await;
+                    assert!(n.try_get::<bool>("", "unsent").unwrap());
+                    assert_eq!(n.try_get::<i32>("", "tries").unwrap(), 1);
+                    assert!(n.try_get::<bool>("", "later").unwrap());
+                    let hits = row(format!(
+                        "SELECT count(*)::int AS n FROM rate_limit_hits \
+                         WHERE bucket = 'post-mail:team:{team_id}'"
+                    ))
+                    .await;
+                    assert_eq!(
+                        hits.try_get::<i32>("", "n").unwrap(),
+                        0,
+                        "allowance given back"
+                    );
+                    // Not before its time.
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(notice().await.try_get::<i32>("", "tries").unwrap(), 1);
+                    // The provider is back and the wait is over: mailed, once.
+                    down.store(false, Ordering::SeqCst);
+                    exec(
+                        &db,
+                        format!("UPDATE post_notices SET retry_at = now() WHERE post_id = '{id}'"),
+                    )
+                    .await;
+                    publish::tick(&state).await.unwrap();
+                    publish::tick(&state).await.unwrap();
+                    let n = notice().await;
+                    assert!(!n.try_get::<bool>("", "unsent").unwrap());
+                    let subjects: Vec<String> = seen
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|m| m["subject"].as_str().unwrap().to_owned())
+                        .collect();
+                    assert_eq!(subjects, ["Your Bluesky post failed"], "{subjects:?}");
                 }
 
                 async fn status_of(db: &DatabaseConnection, id: &str) -> String {
@@ -37289,6 +37503,8 @@ mod teams {
         /// Every call the mock took: (path, basic-auth user, form).
         static CALLS: Mutex<Vec<Call>> = Mutex::new(Vec::new());
         type Call = (String, String, Vec<(String, String)>);
+        /// The `Idempotency-Key` of every checkout the mock took.
+        static KEYS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
         async fn mock() -> String {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -37305,6 +37521,9 @@ mod teams {
                     )
                     .unwrap();
                     let fail = form.iter().any(|(k, v)| k == "customer" && v == "cus_fail");
+                    if let Some(k) = headers.get("idempotency-key") {
+                        KEYS.lock().unwrap().push(k.to_str().unwrap().to_owned());
+                    }
                     CALLS.lock().unwrap().push((path.into(), user, form));
                     if fail {
                         return (
@@ -37632,6 +37851,134 @@ mod teams {
                 .await
                 .unwrap();
             assert!(kept.is_none());
+        }
+
+        /// A double click opens one checkout: the same team and price in the same minute send
+        /// the same `Idempotency-Key`, another price or team another one.
+        #[tokio::test]
+        #[serial]
+        async fn a_checkout_carries_a_key_that_repeats_for_the_same_click() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let (_, other, _) = user(&s, &db).await;
+            let before = KEYS.lock().unwrap().len();
+            // A minute rolling over mid-test would split a pair: start just after a boundary.
+            let into_minute = Utc::now().timestamp() % 60;
+            if into_minute > 55 {
+                tokio::time::sleep(std::time::Duration::from_secs((61 - into_minute) as u64)).await;
+            }
+            for (who, pack) in [
+                (&owner, "x100"),
+                (&owner, "x100"),
+                (&owner, "x500"),
+                (&other, "x100"),
+            ] {
+                let res = req(&s, Method::POST, "/v1/team/billing/credits", who)
+                    .json(&json!({"pack": pack}))
+                    .await;
+                res.assert_status_ok();
+            }
+            let keys = KEYS.lock().unwrap()[before..].to_vec();
+            assert_eq!(keys.len(), 4, "{keys:?}");
+            assert_eq!(keys[0], keys[1], "the same click");
+            assert_ne!(keys[0], keys[2], "another pack");
+            assert_ne!(keys[0], keys[3], "another team");
+            assert!(keys[0].starts_with("checkout:"), "{keys:?}");
+        }
+
+        /// What only a person can fix reaches `ADMIN_EMAILS` by mail, once per event: a paid
+        /// session with no team, a refund, a dispute.
+        #[tokio::test]
+        #[serial]
+        async fn payments_that_need_a_person_mail_the_admins() {
+            let base = mock().await;
+            let (url, seen) = crate::captcha_and_contact::resend().await;
+            let (s, db) = server_where(|c| {
+                c.billing_enabled = true;
+                let mut st = Stripe::new(
+                    Some("sk_test_mock".into()),
+                    Some(WHSEC.into()),
+                    [
+                        ("scheduler", "month", Some("price_s".into())),
+                        ("automation", "month", None),
+                        ("scheduler", "year", None),
+                        ("automation", "year", None),
+                    ],
+                    [
+                        ("x100", Some("price_p1".into())),
+                        ("x500", Some("price_p5".into())),
+                    ],
+                )
+                .unwrap();
+                st.api_url = base;
+                c.stripe = st;
+                c.admin_emails = vec!["ops@example.com".into()];
+                c.mailer = socialreins_brain::mail::Mailer::resend_at(
+                    &url,
+                    "re_test",
+                    "brain@example.com",
+                )
+                .unwrap();
+            })
+            .await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let now = Utc::now().timestamp();
+            let to_admin = || {
+                seen.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|m| m["to"] == json!(["ops@example.com"]))
+                    .map(|m| {
+                        (
+                            m["subject"].as_str().unwrap().to_owned(),
+                            m["text"].as_str().unwrap().to_owned(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let settle = || tokio::time::sleep(std::time::Duration::from_millis(500));
+            // A paid session with no known pack.
+            let bad = paid_event("evt_a1", "cs_a1", &team, "x9", "paid");
+            assert_eq!(deliver(&s, &bad, WHSEC, now).await.status_code(), 200);
+            settle().await;
+            let mails = to_admin();
+            assert_eq!(mails.len(), 1, "{mails:?}");
+            assert_eq!(
+                mails[0].0,
+                "SocialReins: a paid Stripe checkout needs a person"
+            );
+            assert!(mails[0].1.contains("cs_a1"), "{}", mails[0].1);
+            // A good purchase mails nobody.
+            let good = paid_event("evt_a2", "cs_a2", &team, "x100", "paid");
+            assert_eq!(deliver(&s, &good, WHSEC, now).await.status_code(), 200);
+            settle().await;
+            assert_eq!(to_admin().len(), 1);
+            // A refund, once even if Stripe sends it twice; a dispute too.
+            let charge = |id: &str, kind: &str, object: &str| {
+                json!({
+                    "id": format!("{id}_{}", *RUN), "type": kind, "created": now,
+                    "data": {"object": {"id": object, "metadata": {"team_id": team, "pack": "x100"}}}
+                })
+                .to_string()
+            };
+            let refund = charge("evt_a3", "charge.refunded", "ch_1");
+            for _ in 0..2 {
+                assert_eq!(deliver(&s, &refund, WHSEC, now).await.status_code(), 200);
+            }
+            let dispute = charge("evt_a4", "charge.dispute.created", "dp_1");
+            assert_eq!(deliver(&s, &dispute, WHSEC, now).await.status_code(), 200);
+            settle().await;
+            let mails = to_admin();
+            assert_eq!(mails.len(), 3, "{mails:?}");
+            assert_eq!(
+                mails[1].0,
+                "SocialReins: a Stripe payment was refunded or disputed"
+            );
+            assert!(
+                mails[1].1.contains("ch_1") && mails[2].1.contains("dp_1"),
+                "{mails:?}"
+            );
         }
 
         /// The owners hear when a trial is about to end, on the first failed renewal (not each
@@ -38873,8 +39220,15 @@ mod waitlist_confirm {
         let email = unique_email();
         join(&s, &email).await;
         assert_eq!(rows(&db, &email).await, 1);
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let r = row(&db, &email).await;
+        // The mail is tried three times (`Mailer::send`) before it counts as failed.
+        let mut r = row(&db, &email).await;
+        for _ in 0..40 {
+            if r.verify_sent_at.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            r = row(&db, &email).await;
+        }
         assert!(
             r.verify_sent_at.is_none(),
             "a failed send does not throttle"

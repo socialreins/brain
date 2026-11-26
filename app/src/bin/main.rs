@@ -1,7 +1,7 @@
 use std::{process::ExitCode, time::Duration};
 
 use socialreins_brain::{
-    config::Config, connect_when_ready, controllers, publish, scheduler, state::AppState,
+    config::Config, connect_when_ready, controllers, mail, publish, scheduler, state::AppState,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -29,6 +29,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     for warning in config.warnings(on_railway) {
         tracing::warn!("{warning}");
     }
+    publish::set_drain(config.publish_drain);
     let state = AppState::new(db, &config);
     scheduler::spawn(state.clone());
     let app = controllers::router(state, &config);
@@ -50,6 +51,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .with_graceful_shutdown(shutdown())
     .await?;
     publish::drain().await;
+    // Sign-in links are sent after their 202.
+    mail::drain(Duration::from_secs(20)).await;
     Ok(())
 }
 
