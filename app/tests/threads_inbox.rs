@@ -1088,3 +1088,58 @@ async fn test_this_automation_plans_what_threads_can_do() {
         .await;
     assert_eq!(res.status_code(), 422, "{}", res.text());
 }
+
+#[tokio::test]
+#[serial]
+async fn one_tick_reads_every_account_that_is_due_and_the_oldest_read_goes_first() {
+    let e = env().await;
+    // 40 accounts, 10 of them read before (the others never): the mock knows only account 1, so
+    // their reads fail after the first call, which is enough to see that each was reached.
+    for i in 0..40 {
+        let synced = if i < 10 {
+            "now() - make_interval(mins => 10 + $3)"
+        } else {
+            "NULL"
+        };
+        e.db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            format!(
+                "INSERT INTO social_accounts (id, team_id, provider, external_id, handle, \
+                 access_token, token_expires_at, meta, created_at, threads_synced_at) VALUES \
+                 ($1, $2, 'threads', $4, 'x', $5, now() + interval '40 days', '{{}}', \
+                 now() - interval '30 days', {synced})"
+            ),
+            vec![
+                Uuid::now_v7().into(),
+                e.team.into(),
+                i.into(),
+                format!("e{i}").into(),
+                e.state.cipher.encrypt(b"ttok").into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    }
+    threads_inbox::tick(&e.state).await.unwrap();
+    let calls = e.mock.calls.lock().unwrap().clone();
+    for i in 0..40 {
+        let prefix = format!("/v1.0/e{i}/");
+        assert!(
+            calls.iter().any(|c| c.1.starts_with(&prefix)),
+            "account e{i} was not read in the tick"
+        );
+    }
+    let r =
+        e.db.query_one_raw(Statement::from_string(
+            DbBackend::Postgres,
+            format!(
+                "SELECT count(*) AS n FROM social_accounts WHERE team_id = '{}' \
+                 AND provider = 'threads' AND threads_synced_at < now() - interval '1 minute'",
+                e.team
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.try_get::<i64>("", "n").unwrap(), 0, "all were stamped");
+}
