@@ -13,8 +13,8 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, DbErr, EntityTrait, PaginatorTrait,
-    QueryFilter, Statement, TransactionTrait,
+    ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, DbErr, EntityTrait, FromQueryResult,
+    PaginatorTrait, QueryFilter, Statement, TransactionTrait,
 };
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::json;
@@ -677,17 +677,26 @@ pub(crate) async fn signed_in(
     let Some(secret) = session_token(headers) else {
         return Ok(None);
     };
-    let session = sessions::Entity::find_by_id(token::hash(secret))
-        .filter(sessions::Column::ExpiresAt.gt(Utc::now().fixed_offset()))
-        .one(&app.db)
-        .await?;
-    let Some(session) = session else {
+    // One round trip for the session and its user (two queries before every request otherwise).
+    let stmt = Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT u.*, s.token_hash AS s_token_hash, s.user_id AS s_user_id, \
+         s.expires_at AS s_expires_at, s.created_at AS s_created_at \
+         FROM sessions s JOIN users u ON u.id = s.user_id \
+         WHERE s.token_hash = $1 AND s.expires_at > now()",
+        [token::hash(secret).into()],
+    );
+    let Some(row) = app.db.query_one_raw(stmt).await? else {
         return Ok(None);
     };
-    let user = users::Entity::find_by_id(session.user_id)
-        .one(&app.db)
-        .await?;
-    Ok(user.map(|u| CurrentUser(u, session)))
+    let user = users::Model::from_query_result(&row, "")?;
+    let session = sessions::Model {
+        token_hash: row.try_get("", "s_token_hash")?,
+        user_id: row.try_get("", "s_user_id")?,
+        expires_at: row.try_get("", "s_expires_at")?,
+        created_at: row.try_get("", "s_created_at")?,
+    };
+    Ok(Some(CurrentUser(user, session)))
 }
 
 /// The public fields of `user`, as `GET /auth/me` returns them.
