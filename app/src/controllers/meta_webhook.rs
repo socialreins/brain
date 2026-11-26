@@ -46,6 +46,10 @@ async fn verify(State(app): State<AppState>, Query(q): Query<HashMap<String, Str
     }
 }
 
+/// Deliveries whose items are followed up (names, links, automations) at once across the process.
+static FOLLOW_UPS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(8));
+
 /// `POST /webhooks/meta`: `403` unless `X-Hub-Signature-256` is the HMAC-SHA256 of the raw body
 /// under `META_APP_SECRET` (`404` while Meta is not set up). A signed delivery is answered
 /// `200` once its items are stored, whatever it holds; a database failure is a `500`, so Meta
@@ -70,7 +74,12 @@ async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -
     // Even after an error: a redelivery finds these items stored and would not run them again.
     if !fresh.is_empty() {
         let later = app.clone();
-        tokio::spawn(async move { meta_inbox::follow_up(&later, fresh).await });
+        tokio::spawn(async move {
+            // Waits its turn: a burst of deliveries (a viral post) must not run every automation
+            // at once. What is still waiting is stored, and the sweep takes it after 2 minutes.
+            let _turn = FOLLOW_UPS.acquire().await;
+            meta_inbox::follow_up(&later, fresh).await
+        });
     }
     match stored {
         Ok(()) => StatusCode::OK.into_response(),
