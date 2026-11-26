@@ -37297,6 +37297,11 @@ mod teams {
             let (_, owner, _) = user(&s, &db).await;
             let (_, other, _) = user(&s, &db).await;
             let before = KEYS.lock().unwrap().len();
+            // A minute rolling over mid-test would split a pair: start just after a boundary.
+            let into_minute = Utc::now().timestamp() % 60;
+            if into_minute > 55 {
+                tokio::time::sleep(std::time::Duration::from_secs((61 - into_minute) as u64)).await;
+            }
             for (who, pack) in [
                 (&owner, "x100"),
                 (&owner, "x100"),
@@ -37384,21 +37389,30 @@ mod teams {
             assert_eq!(deliver(&s, &good, WHSEC, now).await.status_code(), 200);
             settle().await;
             assert_eq!(to_admin().len(), 1);
-            // A refund, once even if Stripe sends it twice.
-            let refund = json!({
-                "id": format!("evt_a3_{}", *RUN), "type": "charge.refunded", "created": now,
-                "data": {"object": {"id": "ch_1", "metadata": {"team_id": team, "pack": "x100"}}}
-            })
-            .to_string();
+            // A refund, once even if Stripe sends it twice; a dispute too.
+            let charge = |id: &str, kind: &str, object: &str| {
+                json!({
+                    "id": format!("{id}_{}", *RUN), "type": kind, "created": now,
+                    "data": {"object": {"id": object, "metadata": {"team_id": team, "pack": "x100"}}}
+                })
+                .to_string()
+            };
+            let refund = charge("evt_a3", "charge.refunded", "ch_1");
             for _ in 0..2 {
                 assert_eq!(deliver(&s, &refund, WHSEC, now).await.status_code(), 200);
             }
+            let dispute = charge("evt_a4", "charge.dispute.created", "dp_1");
+            assert_eq!(deliver(&s, &dispute, WHSEC, now).await.status_code(), 200);
             settle().await;
             let mails = to_admin();
-            assert_eq!(mails.len(), 2, "{mails:?}");
+            assert_eq!(mails.len(), 3, "{mails:?}");
             assert_eq!(
                 mails[1].0,
                 "SocialReins: a Stripe payment was refunded or disputed"
+            );
+            assert!(
+                mails[1].1.contains("ch_1") && mails[2].1.contains("dp_1"),
+                "{mails:?}"
             );
         }
 
