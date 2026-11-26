@@ -349,7 +349,8 @@ pub struct NewReport {
 /// report is stored and mailed to `CONTACT_TO`; an admin can then take the page down
 /// (`PUT /admin/pages/{code}/takedown`). `404` unless the page is live. `422 invalid_reason`,
 /// `invalid_message`, `invalid_email`; `429` past 5 an hour for an address (the contact form's
-/// limit) or the daily caps (10 a day for an address, 20 for a page, 200 in all).
+/// limit). Past the daily caps (10 a day for an address, 20 for a page, 200 in all) the report is
+/// still stored and shown to admins, only the mail is not sent.
 #[utoipa::path(post, path = "/public/pages/{code}/report", tag = "posts",
     params(("code" = String, Path)), request_body = NewReport,
     responses((status = 202, body = serde_json::Value), (status = 400, body = Error),
@@ -376,7 +377,9 @@ async fn report(
     }
     let message = body.message.as_deref().map(str::trim).unwrap_or_default();
     if message.chars().count() > MAX_REPORT_CHARS
-        || message.chars().any(|c| c.is_control() && c != '\n')
+        || message
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
     {
         return invalid("invalid_message");
     }
@@ -402,20 +405,6 @@ async fn report(
         Ok(None) => return reply(StatusCode::NOT_FOUND, "not_found"),
         Err(e) => return internal(e, "report page read"),
     };
-    let ip_key = ip.map_or_else(
-        || "unknown".into(),
-        |ip| crate::rate_limit::bucket(ip).to_string(),
-    );
-    let caps = [
-        (format!("page-report:ip:{ip_key}"), REPORTS_PER_IP),
-        (format!("page-report:page:{}", page.id), REPORTS_PER_PAGE),
-        ("page-report:all".to_owned(), REPORTS_PER_DAY),
-    ];
-    match crate::rate_limit::daily_reserve(&app.db, &caps).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
-        Err(e) => return internal(e, "report cap"),
-    }
     let sql = "INSERT INTO page_reports (id, page_id, reason, message, contact) \
                VALUES ($1, $2, $3, $4, $5)";
     let values = [
@@ -436,7 +425,24 @@ async fn report(
     if let Err(e) = stored {
         return internal(e, "report insert");
     }
-    if let Some(to) = app.contact_to.clone() {
+    // The report is stored whatever happens next, so a flood cannot silence real reports; the caps
+    // only decide whether it is also mailed (the admin list always has it).
+    let mut caps = vec![
+        (format!("page-report:page:{}", page.id), REPORTS_PER_PAGE),
+        ("page-report:all".to_owned(), REPORTS_PER_DAY),
+    ];
+    if let Some(ip) = ip {
+        let key = format!("page-report:ip:{}", crate::rate_limit::bucket(ip));
+        caps.push((key, REPORTS_PER_IP));
+    }
+    let mailed = match crate::rate_limit::daily_reserve(&app.db, &caps).await {
+        Ok(slot) => slot.is_some(),
+        Err(e) => {
+            tracing::error!(error = %e, "page report cap not read");
+            false
+        }
+    };
+    if let (true, Some(to)) = (mailed, app.contact_to.clone()) {
         let text = format!(
             "Page: {}/p/{code}\nTeam: {}\nReason: {}\nFrom: {}\n\n{message}\n\nTake it down in the admin console: {}/admin/reports\n",
             app.web_url,

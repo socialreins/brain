@@ -30119,6 +30119,24 @@ mod teams {
                     }
                     assert_eq!(last, 429);
 
+                    // Past the page's daily cap a report is stored all the same, only not mailed.
+                    sql(
+                        &db,
+                        format!(
+                            "INSERT INTO rate_limit_hits (bucket) \
+                             SELECT 'page-report:page:' || id FROM post_pages, generate_series(1, 20) WHERE code = '{code}'"
+                        ),
+                    )
+                    .await;
+                    let mails = seen.lock().unwrap().len();
+                    let res = report(
+                        json!({"reason": "other", "message": "capped\tnote"}),
+                        &format!("{net}.5"),
+                    )
+                    .await;
+                    assert_eq!(res.status_code(), 202, "{}", res.text());
+                    assert_eq!(seen.lock().unwrap().len(), mails, "no mail past the cap");
+
                     // Only an admin takes a page down.
                     let takedown = |cookie: &str, down: bool| {
                         req(
@@ -30139,8 +30157,8 @@ mod teams {
                     let row = all.iter().find(|r| r["reason"] == "phishing").unwrap();
                     assert_eq!(row["code"], code.as_str());
                     assert_eq!(row["message"], "asks for passwords");
-                    // The first one and the four more the address got through.
-                    assert_eq!(row["reports"], 5);
+                    // The first one, the four more the address got through, and the capped one.
+                    assert_eq!(row["reports"], 6);
                     assert_eq!(row["taken_down"], false);
                     assert_eq!(takedown(&admin, true).await.status_code(), 204);
                     assert_eq!(public(&s, &code).await.status_code(), 404);
