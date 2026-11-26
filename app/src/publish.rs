@@ -1058,7 +1058,14 @@ pub const SET_DELETED: &str =
 /// (`drain`). Keep it under the grace the platform gives between SIGTERM and the kill (on
 /// Railway `RAILWAY_DEPLOYMENT_DRAINING_SECONDS`, which has to be set above this to matter: 180
 /// on SocialReins). A Threads post, which waits for its media to process, can take a minute or two.
+/// This is the default; `PUBLISH_DRAIN_SECONDS` (`set_drain`) changes it.
 pub const DRAIN: Duration = Duration::from_secs(120);
+static DRAIN_LIMIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
+/// Sets how long `drain` waits (`Config::publish_drain`), once, at start.
+pub fn set_drain(limit: Duration) {
+    let _ = DRAIN_LIMIT.set(limit);
+}
 static STOPPED: std::sync::OnceLock<tokio::time::Instant> = std::sync::OnceLock::new();
 
 /// The process is about to exit (SIGTERM): no round claims a post any more (`begin`), and a post
@@ -1069,6 +1076,25 @@ pub fn stop() {
     POST_SLOTS.close();
 }
 
+/// `publish_post` calls in progress, a publish-now one that only waits for a slot included:
+/// `drain` waits for them too, so a post that hands itself back does it before the process exits.
+static RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct Running;
+
+impl Running {
+    fn begin() -> Self {
+        RUNNING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Running
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        RUNNING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// After `stop`: waits until no post is publishing or handing itself back, at most `DRAIN`
 /// from the stop. A post still publishing then is cut off as by a crash (`recover_stuck`).
 pub async fn drain() {
@@ -1076,10 +1102,11 @@ pub async fn drain() {
         .get()
         .copied()
         .unwrap_or_else(tokio::time::Instant::now)
-        + DRAIN;
+        + DRAIN_LIMIT.get().copied().unwrap_or(DRAIN);
     let idle = async {
         while POST_SLOTS.available_permits() < POSTS_AT_ONCE
             || in_flight(|flying| !flying.is_empty())
+            || RUNNING.load(std::sync::atomic::Ordering::SeqCst) > 0
         {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -1664,6 +1691,25 @@ async fn release(db: &DatabaseConnection, id: Uuid) -> Result<(), DbErr> {
     release_where(db, Some(id)).await.map(|_| ())
 }
 
+/// A post that waited for a slot as the process stopped and holds a hit of the daily cap
+/// (publish now) goes back to `scheduled` with the hit given back, so the next process takes it
+/// at its first round, not as left behind `STUCK_MINUTES` later. Nothing is touched once a target
+/// exists. Its time is the moment publish now was pressed, well inside the late window.
+pub async fn hand_back_reserved(db: &DatabaseConnection, id: Uuid) -> Result<(), DbErr> {
+    let stmt = sql(
+        "WITH back AS (UPDATE posts SET status = 'scheduled', quota_reserved = false, \
+           updated_at = now() WHERE id = $1 AND status = 'queued' AND quota_reserved \
+           AND NOT fanned_out \
+           AND NOT EXISTS (SELECT 1 FROM post_targets t WHERE t.post_id = posts.id) \
+           RETURNING team_id) \
+         DELETE FROM rate_limit_hits WHERE id = (SELECT h.id FROM rate_limit_hits h, back \
+           WHERE h.bucket = 'publish:team:' || back.team_id::text \
+           ORDER BY h.created_at DESC LIMIT 1 FOR UPDATE OF h SKIP LOCKED)",
+        vec![id.into()],
+    );
+    db.execute_raw(stmt).await.map(|_| ())
+}
+
 /// On start: `release` for every post, so the posts a killed process had claimed and not started
 /// go out at the next round, not `STUCK_MINUTES` later. Safe beside other instances: a post one
 /// of them claimed is only put back while it has no quota reserved, and that instance's run then
@@ -1810,6 +1856,7 @@ const PLAN_ENDED: &str = "The team's plan has ended. The post goes out if a plan
 /// Publishes a `queued` post: one target per account of its platform in its set, each
 /// published at most once, then the post settles.
 pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
+    let _running = Running::begin();
     let db = &app.db;
     // The team's own slot first, so posts waiting on it never hold a shared one.
     let team = posts::Entity::find_by_id(id)
@@ -1823,7 +1870,8 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
     };
     let _team_slot = team_slot(&TEAM_POSTS, team).acquire_owned().await;
     let Ok(_slot) = POST_SLOTS.acquire().await else {
-        return release(db, id).await;
+        release(db, id).await?;
+        return hand_back_reserved(db, id).await;
     };
     let Some(post) = posts::Entity::find_by_id(id).one(db).await? else {
         return Ok(());

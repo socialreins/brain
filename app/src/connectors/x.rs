@@ -104,6 +104,9 @@ impl Profile {
     }
 }
 
+/// The longest the token endpoint may take.
+const TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Deserialize)]
 struct TokenAnswer {
     access_token: String,
@@ -339,7 +342,10 @@ impl X {
             .client
             .post(format!("{}/2/oauth2/token", self.api_url))
             .basic_auth(id, Some(secret))
-            .form(form);
+            .form(form)
+            // The token call holds the account's row lock (`controllers::x::renew`): not the
+            // client's 120 seconds.
+            .timeout(TOKEN_TIMEOUT);
         let body = self.send(req, step, true).await?;
         let t: TokenAnswer = serde_json::from_value(body)
             .map_err(|_| failed(format!("{step}: X sent no token.")))?;

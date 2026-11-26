@@ -9440,6 +9440,81 @@ mod teams {
                     assert_eq!(RECORDS.lock().unwrap().len(), records + 1);
                 }
 
+                /// A publish-now post that waited for a slot as the process stopped goes back to
+                /// `scheduled` with its hit of the daily cap given back; one with a target stays.
+                #[tokio::test]
+                #[serial]
+                async fn a_publish_now_post_left_waiting_at_shutdown_is_handed_back() {
+                    let (s, db, _state) = on_mock().await;
+                    let (cookie, team_id, account) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let hits = |team: &str| {
+                        let db = &db;
+                        let team = team.to_owned();
+                        async move {
+                            let row = sea_orm::ConnectionTrait::query_one_raw(
+                                db,
+                                sea_orm::Statement::from_string(
+                                    sea_orm::DbBackend::Postgres,
+                                    format!(
+                                        "SELECT count(*)::int AS n FROM rate_limit_hits \
+                                         WHERE bucket = 'publish:team:{team}'"
+                                    ),
+                                ),
+                            )
+                            .await
+                            .unwrap()
+                            .unwrap();
+                            row.try_get::<i32>("", "n").unwrap()
+                        }
+                    };
+                    let id = id_of(&create(&s, &cookie, input(&set, "now", None)).await);
+                    let before = hits(&team_id).await;
+                    exec(
+                        &db,
+                        format!(
+                            "INSERT INTO rate_limit_hits (bucket) VALUES ('publish:team:{team_id}'); \
+                             UPDATE posts SET status = 'queued', quota_reserved = true, \
+                             scheduled_at = now() WHERE id = '{id}'"
+                        ),
+                    )
+                    .await;
+                    assert_eq!(hits(&team_id).await, before + 1);
+                    publish::hand_back_reserved(&db, id.parse().unwrap())
+                        .await
+                        .unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "scheduled", "{p}");
+                    assert_eq!(hits(&team_id).await, before, "the hit is back");
+                    // Handed back once: a second call changes nothing.
+                    publish::hand_back_reserved(&db, id.parse().unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(hits(&team_id).await, before);
+                    // Underway (a target exists): left alone.
+                    exec(
+                        &db,
+                        format!(
+                            "INSERT INTO rate_limit_hits (bucket) VALUES ('publish:team:{team_id}'); \
+                             UPDATE posts SET status = 'queued', quota_reserved = true WHERE id = '{id}'"
+                        ),
+                    )
+                    .await;
+                    exec(
+                        &db,
+                        format!(
+                            "INSERT INTO post_targets (id, post_id, social_account_id, status) \
+                             VALUES (gen_random_uuid(), '{id}', '{account}', 'pending')"
+                        ),
+                    )
+                    .await;
+                    publish::hand_back_reserved(&db, id.parse().unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(status_of(&db, &id).await, "queued");
+                    assert_eq!(hits(&team_id).await, before + 1);
+                }
+
                 #[tokio::test]
                 #[serial]
                 async fn time_brain_was_down_does_not_make_a_post_late() {
