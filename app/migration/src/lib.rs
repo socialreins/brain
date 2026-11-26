@@ -92,6 +92,7 @@ mod m20270109_000001_bluesky_read_stamp;
 mod m20270110_000001_posts_live_idx;
 mod m20270110_000001_scheduler_ticks;
 mod m20270110_000001_trial_uses;
+mod m20270110_000002_page_reports;
 mod m20270111_000001_scaling_indexes;
 mod url_numbers;
 
@@ -190,6 +191,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20270107_000001_number_inbox_items::Migration),
             Box::new(m20270107_000001_number_contacts::Migration),
             Box::new(m20270110_000001_trial_uses::Migration),
+            Box::new(m20270110_000002_page_reports::Migration),
             Box::new(m20270109_000001_bluesky_read_stamp::Migration),
             Box::new(m20270110_000001_scheduler_ticks::Migration),
             Box::new(m20270110_000001_posts_live_idx::Migration),
