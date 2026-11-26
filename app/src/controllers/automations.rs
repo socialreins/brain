@@ -156,8 +156,8 @@ pub struct Run {
     pub id: Uuid,
     pub automation_id: Uuid,
     pub inbox_item_id: Uuid,
-    /// The item's `number`.
-    pub inbox_item_number: i64,
+    /// The item's `number`; `null` once the item is gone.
+    pub inbox_item_number: Option<i64>,
     /// `running`, `waiting` (a flow at a `wait` step), `sent`, `failed` or `skipped`. A flow's
     /// run is `sent` once every step went out, else it has the status of the send that ended it.
     pub status: String,
@@ -223,7 +223,7 @@ fn run_json(
         id: r.id,
         automation_id: r.automation_id,
         inbox_item_id: r.inbox_item_id,
-        inbox_item_number: items.get(&r.inbox_item_id).copied().unwrap_or_default(),
+        inbox_item_number: items.get(&r.inbox_item_id).copied(),
         status: r.status,
         reason: r.reason,
         results: serde_json::from_value(r.results).unwrap_or_default(),
