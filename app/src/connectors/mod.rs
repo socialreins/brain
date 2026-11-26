@@ -221,7 +221,7 @@ mod tests {
         let held = run(false).await;
         let given = run(true).await;
         assert!(held >= Duration::from_millis(450), "{held:?}");
-        assert!(given < Duration::from_millis(400), "{given:?}");
+        assert!(given * 2 < held, "{given:?} against {held:?}");
         assert_eq!(post_gate.available_permits(), 8);
         assert_eq!(gate.available_permits(), 8);
         // Outside a publish it is a plain sleep.

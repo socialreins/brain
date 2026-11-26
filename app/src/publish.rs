@@ -1812,6 +1812,9 @@ const PLAN_ENDED: &str = "The team's plan has ended. The post goes out if a plan
 /// published at most once, then the post settles.
 pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
     let db = &app.db;
+    // A publish now or a retry starts here without a round (`begin`) having marked the post: it
+    // is in flight until this returns, for `drain` (a no-op for a post a round already marked).
+    let _flight = in_flight(|flying| flying.insert(id)).then(|| Flight(id));
     // The team's own slot first, so posts waiting on it never hold a shared one.
     let team = posts::Entity::find_by_id(id)
         .select_only()
