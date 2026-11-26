@@ -143,24 +143,31 @@ impl Stripe {
     }
 
     async fn post(&self, path: &str, form: &[(String, String)]) -> Result<Value, StripeError> {
-        self.call(reqwest::Method::POST, path, form).await
+        self.call(reqwest::Method::POST, path, form, None).await
     }
 
+    /// `idempotency`: Stripe's `Idempotency-Key`, so the same call made twice (a double click, a
+    /// retry) answers the first one's result instead of making a second thing.
     async fn call(
         &self,
         method: reqwest::Method,
         path: &str,
         form: &[(String, String)],
+        idempotency: Option<&str>,
     ) -> Result<Value, StripeError> {
         let key = self
             .secret
             .as_deref()
             .ok_or_else(|| StripeError(None, "not_configured".into()))?;
-        let res = self
+        let mut req = self
             .client
             .request(method, format!("{}{path}", self.api_url))
             .basic_auth(key, None::<&str>)
-            .form(form)
+            .form(form);
+        if let Some(k) = idempotency {
+            req = req.header("Idempotency-Key", k);
+        }
+        let res = req
             .send()
             .await
             .map_err(|_| StripeError(None, "unreachable".into()))?;
@@ -179,9 +186,23 @@ impl Stripe {
         ))
     }
 
-    /// A Checkout Session for a subscription: the URL to send the customer to.
-    pub async fn checkout(&self, form: &[(String, String)]) -> Result<String, StripeError> {
-        self.post("/v1/checkout/sessions", form).await?["url"]
+    /// A Checkout Session: the URL to send the customer to. Called twice with the same `key`
+    /// (and form) within Stripe's 24 hours it answers the same session, so two clicks start one
+    /// checkout, not two.
+    pub async fn checkout(
+        &self,
+        form: &[(String, String)],
+        key: &str,
+    ) -> Result<String, StripeError> {
+        let session = self
+            .call(
+                reqwest::Method::POST,
+                "/v1/checkout/sessions",
+                form,
+                Some(key),
+            )
+            .await?;
+        session["url"]
             .as_str()
             .map(str::to_owned)
             .ok_or_else(|| StripeError(None, "no_url".into()))
@@ -197,6 +218,7 @@ impl Stripe {
             reqwest::Method::DELETE,
             &format!("/v1/subscriptions/{id}"),
             &[],
+            None,
         )
         .await
         .map(|_| ())

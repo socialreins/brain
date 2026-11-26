@@ -326,6 +326,7 @@ cargo run -p socialreins-brain
   `webhooks::with_event`, so its event is queued in the same statement; README documents the
   payload and signature.
 
+- `app/src/controllers/stripe.rs`: a checkout call carries Stripe's `Idempotency-Key` (`checkout_key`: team, price, minute), so a double click opens one session. What only a person can fix (a paid session with no team or pack, a refund or dispute, a second subscription that could not be cancelled) is mailed to `ADMIN_EMAILS` (`alert_admins`) as well as logged. There is still no reconciliation against Stripe's event list: subscription state comes only from webhooks.
 - Provider outages (`x_inbox::tick`, `youtube_inbox::tick`, `inbox::read_failed`, `automations::advance`): an X or YouTube inbox paused for `errors` ends the pause by itself after `RESUME_HOURS` (2) and reads once, re-pausing at once if that still fails (`budget`, `quota` and `credits` pauses are not touched); a Bluesky account whose read failed with an outage is left alone `OUTAGE_MINUTES`; a flow's AI step whose provider gave no answer (timeout, 429, 5xx) is parked and tried again in 5, 10 and 15 minutes like a rate-limited send (`ActionResult::unavailable`, `ai_reference`), the credit given back each time.
 
 ## Rules
