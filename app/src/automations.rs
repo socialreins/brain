@@ -1745,7 +1745,7 @@ impl Flow<'_> {
             };
             let result = match with_page(template, self.page) {
                 _ if self.steps[i].ai() => {
-                    let reference = ai_reference(db, run, i).await?;
+                    let reference = ai_reference(db, self.a.team_id, run, i).await?;
                     let (app, account, item) = (self.app, self.account, target);
                     ai_send(
                         app, account, item, self.a.id, kind, via, template, &reference,
@@ -2178,23 +2178,28 @@ async fn claim_step(
     Ok(true)
 }
 
-/// What an AI step pays under: `ai:{run}:{step}`, and once the step has been tried again
-/// (`retry_later`) `ai:{run}:{step}:{tries}`, because the credit of a try that failed was given
-/// back and a reference given back is never paid again.
-async fn ai_reference(db: &DatabaseConnection, run: Uuid, i: usize) -> Result<String, DbErr> {
+/// What an AI step pays under: `ai:{run}:{step}`, and `ai:{run}:{step}:{n}` once `n` earlier
+/// tries of the step were paid back (a provider that gave no answer, `retry_later`): a reference
+/// given back is never paid again. A try that was paid and sent (a person's retry of a refused
+/// send) keeps its reference, so it is never paid twice.
+async fn ai_reference(
+    db: &DatabaseConnection,
+    team: Uuid,
+    run: Uuid,
+    i: usize,
+) -> Result<String, DbErr> {
+    let base = format!("ai:{run}:{i}");
     let row = db
         .query_one_raw(sql(
-            "SELECT retries FROM automation_runs WHERE id = $1",
-            vec![run.into()],
+            "SELECT count(*)::int AS n FROM credit_ledger WHERE team_id = $1 \
+             AND kind IN ('ai', 'ai_plan') AND amount > 0 AND (ref = $2 OR ref LIKE $2 || ':%')",
+            vec![team.into(), base.clone().into()],
         ))
         .await?;
-    let tries: i32 = row
-        .map(|r| r.try_get("", "retries"))
-        .transpose()?
-        .unwrap_or(0);
-    Ok(match tries {
-        0 => format!("ai:{run}:{i}"),
-        n => format!("ai:{run}:{i}:{n}"),
+    let back: i32 = row.map(|r| r.try_get("", "n")).transpose()?.unwrap_or(0);
+    Ok(match back {
+        0 => base,
+        n => format!("{base}:{n}"),
     })
 }
 

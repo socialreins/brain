@@ -226,7 +226,7 @@ pub fn pause_message(reason: &str, last_error: Option<&str>) -> String {
                      on the 1st (UTC), or raise the budget."
             .into(),
         _ => format!(
-            "X failed {MAX_ERRORS} times in a row{}. It tries again by itself every {RESUME_HOURS} hours; check the account, then resume.",
+            "X failed {MAX_ERRORS} times in a row{}. It tries again by itself {RESUME_HOURS} hours after; check the account, then resume.",
             last_error.map(|e| format!(" ({e})")).unwrap_or_default()
         ),
     }
@@ -707,7 +707,7 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
         .execute_raw(sql(
             &format!(
                 "UPDATE x_inbox SET paused_reason = NULL, errors = {}, next_poll_at = now(), \
-                 updated_at = now() WHERE paused_reason = 'errors' \
+                 updated_at = now() WHERE enabled AND paused_reason = 'errors' \
                  AND updated_at < now() - make_interval(hours => {RESUME_HOURS})",
                 MAX_ERRORS - 1
             ),
