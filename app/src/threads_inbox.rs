@@ -20,12 +20,14 @@
 //! Sends (a public reply) go through `inbox::send`, once, and a reply or a hide is never retried.
 use std::{
     collections::HashSet,
+    sync::LazyLock,
     time::{Duration as Wait, Instant},
 };
 
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, EntityTrait, Statement, Value as Param};
 use serde_json::Value;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::{
@@ -40,9 +42,18 @@ use crate::{
     state::AppState,
 };
 
-/// An account is read again this long after its last read; `READ_ACCOUNTS` start a tick.
+/// An account is read again this long after its last read. A tick claims `READ_CHUNK` accounts at
+/// a time, oldest read first, reads `READ_SLOTS` at once and claims the next chunk until nothing
+/// is due or `TICK_BUDGET` is spent, so the rate follows what is due and how fast Threads
+/// answers, not a fixed number a minute (it was 6, which fit 30 accounts in 5 minutes).
 const FAST_EVERY_MINUTES: i64 = 5;
-const READ_ACCOUNTS: i64 = 6;
+const READ_CHUNK: i64 = 16;
+const READ_SLOTS: usize = 8;
+/// No new chunk is claimed after this; the next tick carries on (a claimed account is stamped,
+/// so a chunk is read in this tick or left for 5 minutes, never lost).
+const TICK_BUDGET: Wait = Wait::from_secs(45);
+/// Accounts read at once across the process.
+static SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(READ_SLOTS));
 /// The hourly pass reads the whole window and probes the permission.
 const FULL_EVERY_MINUTES: i64 = 60;
 /// A fast pass reads this many days of posts; a full or first pass `inbox::FIRST_DAYS`.
@@ -394,11 +405,20 @@ async fn store(
     Ok(fresh)
 }
 
-/// One round: claims the accounts due (never read, or not for 5 minutes) that are not known to
-/// need a reconnect or the replies permission, at most `READ_ACCOUNTS`, by stamping them so a
-/// second instance skips them and a crash costs one interval, and reads each. An account whose
-/// token was refused in the last hour, or that was rate limited in the last minutes, waits.
+/// One tick: rounds of due accounts, oldest read first, until none is due or `TICK_BUDGET` is
+/// spent. A round claims at most `READ_CHUNK` accounts (never read, or not for 5 minutes) that
+/// are not known to need a reconnect or the replies permission, by stamping them so a second
+/// instance skips them and a crash costs one interval, and reads them `READ_SLOTS` at a time. An
+/// account whose token was refused in the last hour, or that was rate limited in the last
+/// minutes, waits.
 pub async fn tick(app: &AppState) -> Result<(), DbErr> {
+    let deadline = Instant::now() + TICK_BUDGET;
+    while round(app).await? == READ_CHUNK as usize && Instant::now() < deadline {}
+    Ok(())
+}
+
+/// One chunk: claims it and reads it, returning how many accounts it claimed.
+async fn round(app: &AppState) -> Result<usize, DbErr> {
     let claim = sql(
         "WITH due AS (SELECT id, threads_synced_at IS NULL AS first, \
            (threads_full_at IS NULL OR threads_full_at < now() - make_interval(mins => $2)) \
@@ -417,31 +437,45 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
             (FAST_EVERY_MINUTES as i32).into(),
             (FULL_EVERY_MINUTES as i32).into(),
             PAUSE_MINUTES.into(),
-            READ_ACCOUNTS.into(),
+            READ_CHUNK.into(),
         ],
     );
-    for row in app.db.query_all_raw(claim).await? {
+    let rows = app.db.query_all_raw(claim).await?;
+    let claimed = rows.len();
+    let mut reads = Vec::new();
+    for row in rows {
         let id: Uuid = row.try_get("", "id")?;
         let (first, full): (bool, bool) = (row.try_get("", "first")?, row.try_get("", "full")?);
-        let Some(account) = social_accounts::Entity::find_by_id(id).one(&app.db).await? else {
-            continue;
-        };
-        match read(app, &account, (first, full)).await {
-            // A reply goes out after about 30 seconds, so the sends do not hold up the next account.
-            Ok(items) => {
-                let app = app.clone();
-                tokio::spawn(async move {
-                    for item in items {
-                        if let Err(e) = automations::run(&app, &account, &item).await {
-                            tracing::error!(error = %e, item = %item.id, "automations failed");
+        let app = app.clone();
+        reads.push(tokio::spawn(async move {
+            let Ok(_slot) = SLOTS.acquire().await else {
+                return;
+            };
+            let account = match social_accounts::Entity::find_by_id(id).one(&app.db).await {
+                Ok(Some(a)) => a,
+                Ok(None) => return,
+                Err(e) => return tracing::error!(error = %e, account = %id, "threads read failed"),
+            };
+            match read(&app, &account, (first, full)).await {
+                // A reply goes out after about 30 seconds, so the sends do not hold up the next
+                // account (nor this slot).
+                Ok(items) => {
+                    tokio::spawn(async move {
+                        for item in items {
+                            if let Err(e) = automations::run(&app, &account, &item).await {
+                                tracing::error!(error = %e, item = %item.id, "automations failed");
+                            }
                         }
-                    }
-                });
+                    });
+                }
+                Err(e) => tracing::error!(error = %e, account = %id, "threads read failed"),
             }
-            Err(e) => tracing::error!(error = %e, account = %id, "threads read failed"),
-        }
+        }));
     }
-    Ok(())
+    for r in reads {
+        let _ = r.await;
+    }
+    Ok(claimed)
 }
 
 /// A delivery of the Threads webhook names these users (a mention's `target_id`, the owner of
