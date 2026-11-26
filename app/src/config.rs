@@ -228,7 +228,12 @@ impl Config {
                 threads.webhook_token = var("THREADS_WEBHOOK_VERIFY_TOKEN");
                 threads
             },
-            linkedin: LinkedIn::new(var("LINKEDIN_CLIENT_ID").zip(var("LINKEDIN_CLIENT_SECRET")))?,
+            linkedin: {
+                let mut linkedin =
+                    LinkedIn::new(var("LINKEDIN_CLIENT_ID").zip(var("LINKEDIN_CLIENT_SECRET")))?;
+                linkedin.community_api = flag("LINKEDIN_COMMUNITY_API")?;
+                linkedin
+            },
             youtube: {
                 let mut youtube =
                     YouTube::new(var("GOOGLE_CLIENT_ID").zip(var("GOOGLE_CLIENT_SECRET")))?;

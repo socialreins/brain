@@ -719,10 +719,11 @@ pub fn validate_steps(
 }
 
 /// Networks whose inbox can fire an automation.
-pub const AUTOMATED: [&str; 6] = [
+pub const AUTOMATED: [&str; 7] = [
     "bluesky",
     "facebook",
     "instagram",
+    "linkedin",
     "threads",
     "x",
     "youtube",
@@ -754,7 +755,13 @@ const META_PRIVATE_REPLY_MINUTES: u32 = 7 * 24 * 60;
 /// is left to fail item by item: a DM to a Threads item is skipped (`threads_no_dm`) and the
 /// fallback public reply answers. When every account is YouTube, only a comment can fire it (`youtube_unsupported_trigger`: no mentions, DMs,
 /// follows, story replies or buttons) and only public replies can answer (`youtube_no_dm`: YouTube
-/// has no DM and no private reply). A mixed scope is left to fail item by item.
+/// has no DM and no private reply). When every account is LinkedIn, the same: only a comment can
+/// fire it (`linkedin_unsupported_trigger`), no DM may be sent (`linkedin_no_dm`: LinkedIn gives
+/// apps no messaging) and a comment cannot be hidden (`linkedin_no_hide`: only deleted, which an
+/// automation never does); a reply holds 1250 characters (an AI reply; an automation's own text
+/// stays within the shared 300). Whether the account can read comments at all is its
+/// capability (`linkedin_inbox::capability`), checked where accounts are known. A mixed scope
+/// is left to fail item by item.
 pub fn network_limits(
     trigger: &str,
     providers: &[&str],
@@ -845,6 +852,24 @@ pub fn network_limits(
             .any(|a| matches!(a, Action::SendDm { .. } | Action::AiSendDm { .. }));
         if dm_step || dm_action {
             return Err("youtube_no_dm");
+        }
+    }
+    // LinkedIn: comments only, answered in public (or liked); no messaging, no hiding.
+    if !providers.is_empty() && providers.iter().all(|p| *p == "linkedin") {
+        if trigger != "comment_received" {
+            return Err("linkedin_unsupported_trigger");
+        }
+        let dm = actions
+            .iter()
+            .any(|a| a.via_text().is_some_and(|s| s.0 == Via::Dm))
+            || steps.is_some_and(|s| s.iter().any(|x| x.sends().is_some_and(|s| s.0 == Via::Dm)));
+        if dm {
+            return Err("linkedin_no_dm");
+        }
+        let hide = actions.iter().any(|a| matches!(a, Action::HideComment))
+            || steps.is_some_and(|s| s.iter().any(|x| matches!(x, Step::HideComment)));
+        if hide {
+            return Err("linkedin_no_hide");
         }
     }
     if !providers.is_empty()
@@ -1812,6 +1837,18 @@ async fn effect(
                 done(kind, Some("internal"), true)
             }
         },
+        Action::LikeComment if account.provider == "linkedin" => {
+            if item.kind != "comment" {
+                return done(kind, Some("not_supported"), false);
+            }
+            match crate::linkedin_inbox::like(app, account, item).await {
+                Ok(()) => done(kind, None, false),
+                Err(e) => {
+                    let calm = matches!(e, InboxError::Invalid(_) | InboxError::RateLimited);
+                    done(kind, Some(e.code()), !calm)
+                }
+            }
+        }
         Action::HideComment | Action::LikeComment | Action::RepostComment
             if account.provider == "x" =>
         {
@@ -2674,6 +2711,11 @@ fn outcome(kind: &str, sent: Result<Result<String, InboxError>, DbErr>) -> Actio
                 | "threads_no_dm"
                 | "threads_replies_closed"
                 | "youtube_no_dm"
+                | "linkedin_no_dm"
+                | "linkedin_needs_approval"
+                | "linkedin_personal_profile"
+                | "linkedin_needs_scope"
+                | "linkedin_call_budget"
                 | "x_no_credits"
                 | "x_usage_capped"
                 | "x_budget",
@@ -3040,9 +3082,13 @@ async fn ai_send(
     prompt: &str,
     reference: &str,
 ) -> ActionResult {
-    // YouTube has no DM: skip before the AI call is paid for.
-    if via == Via::Dm && account.provider == "youtube" {
-        return outcome(kind, Ok(Err(InboxError::Invalid("youtube_no_dm"))));
+    // YouTube and LinkedIn have no DM: skip before the AI call is paid for.
+    if via == Via::Dm && matches!(account.provider.as_str(), "youtube" | "linkedin") {
+        let why = match account.provider.as_str() {
+            "youtube" => "youtube_no_dm",
+            _ => "linkedin_no_dm",
+        };
+        return outcome(kind, Ok(Err(InboxError::Invalid(why))));
     }
     // X stops an automation that cannot pay a write before the model is paid for a text.
     if account.provider == "x" {
@@ -4013,6 +4059,55 @@ mod tests {
             ),
             Err("youtube_no_dm")
         );
+        // LinkedIn has comments only, answered in public: no DM, no hiding.
+        assert_eq!(
+            network_limits(
+                "comment_received",
+                &["linkedin"],
+                &none,
+                Some(&[reply("hi")])
+            ),
+            Ok(())
+        );
+        for no in [
+            "mention_received",
+            "dm_received",
+            "new_follower",
+            "button_clicked",
+        ] {
+            assert_eq!(
+                network_limits(no, &["linkedin"], &none, None),
+                Err("linkedin_unsupported_trigger"),
+                "{no}"
+            );
+        }
+        assert_eq!(
+            network_limits("comment_received", &["linkedin"], &none, Some(&[dm("hi")])),
+            Err("linkedin_no_dm")
+        );
+        assert_eq!(
+            network_limits(
+                "comment_received",
+                &["linkedin"],
+                &[Action::SendDm { text: "hi".into() }],
+                None
+            ),
+            Err("linkedin_no_dm")
+        );
+        assert_eq!(
+            network_limits(
+                "comment_received",
+                &["linkedin"],
+                &[Action::HideComment],
+                None
+            ),
+            Err("linkedin_no_hide")
+        );
+        // A mixed scope is left to fail item by item.
+        assert_eq!(
+            network_limits("dm_received", &["linkedin", "bluesky"], &none, None),
+            Ok(())
+        );
         // Bluesky has no story replies or button taps; a follow, a comment, a mention and a DM
         // are all its own, and a mixed scope is left to fail item by item.
         for no in ["story_reply", "button_clicked"] {
@@ -4037,7 +4132,7 @@ mod tests {
         assert_eq!(
             network_limits(
                 "dm_received",
-                &["bluesky", "linkedin"],
+                &["bluesky", "tiktok"],
                 &none,
                 Some(&[dm("hi")])
             ),

@@ -256,7 +256,7 @@ async fn find(
 /// The input checked and normalized; `Err` holds the 422 reply.
 async fn checked(
     db: &DatabaseConnection,
-    team_id: Uuid,
+    (team_id, linkedin_on): (Uuid, Option<bool>),
     mut input: AutomationInput,
 ) -> Result<Result<(String, AutomationInput), Response>, DbErr> {
     let Some(name) = team::name(&input.name) else {
@@ -324,7 +324,16 @@ async fn checked(
             )));
         }
     }
-    if let Some(code) = scope_limits(db, team_id, &input.trigger, c, actions, steps).await? {
+    if let Some(code) = scope_limits(
+        db,
+        (team_id, linkedin_on),
+        &input.trigger,
+        c,
+        actions,
+        steps,
+    )
+    .await?
+    {
         return Ok(Err(reply(StatusCode::UNPROCESSABLE_ENTITY, code)));
     }
     // Limited to X accounts alone, its replies are held to what X takes (280, or 25,000 on a
@@ -378,7 +387,7 @@ async fn x_accounts(
 /// `rules::network_limits` for an automation limited to accounts by name; `None` otherwise.
 async fn scope_limits(
     db: &impl ConnectionTrait,
-    team_id: Uuid,
+    (team_id, linkedin_on): (Uuid, Option<bool>),
     trigger: &str,
     c: &Conditions,
     actions: &[Action],
@@ -387,16 +396,29 @@ async fn scope_limits(
     if c.account_ids.is_empty() {
         return Ok(None);
     }
-    let providers: Vec<String> = social_accounts::Entity::find()
+    let named: Vec<(String, serde_json::Value)> = social_accounts::Entity::find()
         .select_only()
         .column(social_accounts::Column::Provider)
+        .column(social_accounts::Column::Meta)
         .filter(social_accounts::Column::TeamId.eq(team_id))
         .filter(social_accounts::Column::Id.is_in(c.account_ids.iter().copied()))
         .into_tuple()
         .all(db)
         .await?;
-    let providers: Vec<&str> = providers.iter().map(String::as_str).collect();
-    Ok(rules::network_limits(trigger, &providers, actions, steps).err())
+    let providers: Vec<&str> = named.iter().map(|(p, _)| p.as_str()).collect();
+    if let Some(why) = rules::network_limits(trigger, &providers, actions, steps).err() {
+        return Ok(Some(why));
+    }
+    // A LinkedIn account that cannot read comments yet (no approval, a personal profile, a Page
+    // without the scopes) could never fire it: said plainly, before it is switched on.
+    let blocked = named
+        .iter()
+        .filter(|(p, _)| p == "linkedin")
+        .filter_map(|(_, meta)| {
+            linkedin_on.map(|on| crate::linkedin_inbox::capability_of(on, meta))
+        })
+        .find(|c| *c != crate::linkedin_inbox::Capability::Ready);
+    Ok(blocked.map(crate::linkedin_inbox::Capability::code))
 }
 
 /// Run counts by status and the last run, per automation of the team (or of `only` that one).
@@ -532,7 +554,13 @@ async fn create(
         return res;
     }
     let made = async {
-        let (name, input) = match checked(&app.db, t.team.id, input).await? {
+        let (name, input) = match checked(
+            &app.db,
+            (t.team.id, Some(app.linkedin.community_api)),
+            input,
+        )
+        .await?
+        {
             Ok(v) => v,
             Err(res) => return Ok(Err(res)),
         };
@@ -623,7 +651,13 @@ async fn update(
         }
     }
     let saved = async {
-        let (name, input) = match checked(&app.db, t.team.id, input).await? {
+        let (name, input) = match checked(
+            &app.db,
+            (t.team.id, Some(app.linkedin.community_api)),
+            input,
+        )
+        .await?
+        {
             Ok(v) => v,
             Err(res) => return Ok(Err(res)),
         };
@@ -703,7 +737,7 @@ async fn set_active(app: &AppState, t: &InTeam, id: Uuid, active: bool) -> Respo
             };
             scope_limits(
                 &app.db,
-                t.team.id,
+                (t.team.id, Some(app.linkedin.community_api)),
                 &a.trigger,
                 &c,
                 &actions,
@@ -927,7 +961,7 @@ async fn test(
         ..sample
     };
     let tried = async {
-        let (_, input) = match checked(&app.db, t.team.id, automation).await? {
+        let (_, input) = match checked(&app.db, (t.team.id, None), automation).await? {
             Ok(v) => v,
             Err(res) => return Ok(Err(res)),
         };
@@ -1086,8 +1120,61 @@ async fn estimate(
     }
 }
 
+/// One LinkedIn account and whether automations can run on it.
+#[derive(Serialize, ToSchema)]
+pub struct LinkedInAccount {
+    pub id: Uuid,
+    /// `ready`, `linkedin_needs_approval` (LinkedIn has not approved the Community Management API
+    /// for this app), `linkedin_personal_profile` (apps cannot read comments on a member's
+    /// posts) or `linkedin_needs_scope` (a Page connected without the comment permissions).
+    pub status: String,
+    /// What it means and what to do; empty when ready.
+    pub message: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct LinkedInStatus {
+    /// Whether this server says LinkedIn approved the Community Management API for the app
+    /// (`LINKEDIN_COMMUNITY_API`). Off until then, and every account is `linkedin_needs_approval`.
+    pub approved: bool,
+    pub accounts: Vec<LinkedInAccount>,
+}
+
+/// Whether automations can run on each of the team's LinkedIn accounts. Automations on LinkedIn
+/// answer and like comments on a Page's posts and send no messages; nothing is read or sent for
+/// an account that is not `ready`.
+#[utoipa::path(get, path = "/automations/linkedin", tag = "automations",
+    responses((status = 200, body = LinkedInStatus), (status = 401, body = Error)))]
+async fn linkedin(State(app): State<AppState>, t: InTeam) -> Response {
+    let found = social_accounts::Entity::find()
+        .filter(social_accounts::Column::TeamId.eq(t.team.id))
+        .filter(social_accounts::Column::Provider.eq("linkedin"))
+        .order_by_asc(social_accounts::Column::CreatedAt)
+        .all(&app.db)
+        .await;
+    match found {
+        Ok(rows) => Json(LinkedInStatus {
+            approved: app.linkedin.community_api,
+            accounts: rows
+                .iter()
+                .map(|a| {
+                    let c = crate::linkedin_inbox::capability(&app, a);
+                    LinkedInAccount {
+                        id: a.id,
+                        status: c.code().into(),
+                        message: c.message().into(),
+                    }
+                })
+                .collect(),
+        })
+        .into_response(),
+        Err(e) => internal(e, "linkedin automations"),
+    }
+}
+
 pub fn api() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
+        .routes(routes!(linkedin))
         .routes(routes!(estimate))
         .routes(routes!(test))
         .routes(routes!(misses))
