@@ -2285,6 +2285,24 @@ async fn save_sent(
     Err(e)
 }
 
+/// Saves thread part number `at` (0 is the first after the root): only while `parts` holds
+/// exactly the `at` parts before it, so a try repeated after the first one committed (its answer
+/// lost) changes nothing instead of saving the part twice.
+pub fn part_saved(
+    id: Uuid,
+    part: serde_json::Value,
+    alt_note: Option<String>,
+    at: usize,
+) -> Statement {
+    sql(
+        "UPDATE post_targets SET parts = parts || $2, alt_error = CASE \
+         WHEN $3::text IS NULL THEN alt_error WHEN alt_error IS NULL THEN $3 \
+         ELSE alt_error || ' ' || $3 END, updated_at = now() \
+         WHERE id = $1 AND jsonb_array_length(parts) = $4",
+        vec![id.into(), part.into(), alt_note.into(), (at as i32).into()],
+    )
+}
+
 /// Waits before each try of `save_sent`.
 const SAVE_WAITS: [Duration; 4] = [
     Duration::ZERO,
@@ -2303,10 +2321,14 @@ struct XHold {
 }
 
 impl XHold {
-    /// A call that failed with an unknown outcome (a timeout, a cut-off: `outcome_unknown`) may
-    /// have been taken and billed by X, so it stays paid for.
+    /// A call that failed with an unknown outcome (a timeout, a cut-off: `outcome_unknown`, or a
+    /// dropped connection) may have been taken and billed by X, so it stays paid for. A 5xx
+    /// answer is not told apart from a refusal and is still given back.
     fn failed(&mut self, msg: &str) {
-        if outcome_unknown(Some(msg)) {
+        // A dropped connection that was not certainly never opened may have carried the post.
+        let dropped =
+            msg.contains("could not be reached") && !msg.contains(crate::connectors::UNSENT);
+        if outcome_unknown(Some(msg)) || dropped {
             self.sent += 1;
         }
     }
@@ -2836,12 +2858,7 @@ async fn publish_claimed(
             "remote_url": made.url.clone().or_else(|| publisher.url(&account, &made.id)),
             "published_at": chrono::Utc::now().fixed_offset(),
         }]);
-        let stmt = sql(
-            "UPDATE post_targets SET parts = parts || $2, alt_error = CASE \
-             WHEN $3::text IS NULL THEN alt_error WHEN alt_error IS NULL THEN $3 \
-             ELSE alt_error || ' ' || $3 END, updated_at = now() WHERE id = $1",
-            vec![id.into(), saved.into(), alt_note.into()],
-        );
+        let stmt = part_saved(id, saved, alt_note, i);
         save_sent(db, id, (stmt, &made.id), &unsaved_part(i + 1, thread.len())).await?;
         parent = made;
     }
@@ -3314,6 +3331,15 @@ mod tests {
         hold.failed(&cut_off_part(2, 3));
         assert_eq!(hold.sent, 3);
         assert_eq!(hold.amount - hold.sent, 0);
+        let mut hold = XHold {
+            reference: "r".into(),
+            amount: 2,
+            sent: 0,
+        };
+        hold.failed(&unsent("Publish: X could not be reached.".into(), true));
+        assert_eq!(hold.sent, 0, "never connected");
+        hold.failed("Publish: X could not be reached.");
+        assert_eq!(hold.sent, 1, "dropped");
     }
 
     #[test]

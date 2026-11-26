@@ -9879,6 +9879,50 @@ mod teams {
                     assert_eq!(p["targets"][0]["retried"], false);
                 }
 
+                /// Saving a thread part twice (the first try committed, its answer was lost)
+                /// leaves one part.
+                #[tokio::test]
+                #[serial]
+                async fn a_thread_part_is_saved_once_however_often_the_save_is_tried() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let id = id_of(&create(&s, &cookie, input(&set, "root", Some(&past()))).await);
+                    publish::tick(&state).await.unwrap();
+                    let target: uuid::Uuid = get_post(&s, &cookie, &id).await["targets"][0]["id"]
+                        .as_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    let part = json!({"remote_id": "p1", "cid": "", "remote_url": null,
+                        "published_at": "2026-01-01T00:00:00Z"});
+                    for _ in 0..3 {
+                        let stmt = publish::part_saved(target, part.clone(), None, 0);
+                        sea_orm::ConnectionTrait::execute_raw(&db, stmt)
+                            .await
+                            .unwrap();
+                    }
+                    let row = post_targets::Entity::find_by_id(target)
+                        .one(&db)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(row.parts.as_array().unwrap().len(), 1);
+                    // The next part goes after it.
+                    let next = json!({"remote_id": "p2", "cid": "", "remote_url": null,
+                        "published_at": "2026-01-01T00:00:01Z"});
+                    let stmt = publish::part_saved(target, next, None, 1);
+                    sea_orm::ConnectionTrait::execute_raw(&db, stmt)
+                        .await
+                        .unwrap();
+                    let row = post_targets::Entity::find_by_id(target)
+                        .one(&db)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(row.parts.as_array().unwrap().len(), 2);
+                }
+
                 /// Fails the update that saves a post's remote id the first `fails` times.
                 async fn fail_remote_id_saves(db: &DatabaseConnection, fails: u32) {
                     exec(
@@ -9903,6 +9947,7 @@ mod teams {
                     exec(
                         db,
                         "DROP TRIGGER IF EXISTS rel_fail ON post_targets; \
+                         DROP FUNCTION IF EXISTS rel_fail(); \
                          DROP SEQUENCE IF EXISTS rel_fail_seq"
                             .into(),
                     )
@@ -18311,7 +18356,8 @@ mod teams {
                     let body = std::panic::AssertUnwindSafe(async {
                         // The credit spend (the first thing after the claim) fails.
                         db.execute_unprepared(
-                            "CREATE OR REPLACE FUNCTION rel_boom() RETURNS trigger AS $$ BEGIN \
+                            "DROP TRIGGER IF EXISTS rel_boom ON credit_ledger; \
+                             CREATE OR REPLACE FUNCTION rel_boom() RETURNS trigger AS $$ BEGIN \
                                RAISE EXCEPTION 'injected'; END $$ LANGUAGE plpgsql; \
                              CREATE TRIGGER rel_boom BEFORE INSERT ON credit_ledger \
                                FOR EACH ROW WHEN (NEW.reason = 'x post') \
@@ -18344,9 +18390,12 @@ mod teams {
                     })
                     .catch_unwind()
                     .await;
-                    db.execute_unprepared("DROP TRIGGER IF EXISTS rel_boom ON credit_ledger")
-                        .await
-                        .unwrap();
+                    db.execute_unprepared(
+                        "DROP TRIGGER IF EXISTS rel_boom ON credit_ledger; \
+                         DROP FUNCTION IF EXISTS rel_boom()",
+                    )
+                    .await
+                    .unwrap();
                     if let Err(e) = body {
                         std::panic::resume_unwind(e);
                     }
