@@ -3,7 +3,7 @@
 //! logged. Members like, repost, follow and mute; owners and admins block, hide, delete a reply
 //! and report.
 use axum::{
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -19,6 +19,7 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use super::numbered::{ItemId, ID_PARAM};
 use super::{
     auth::{internal, Body, FromWeb},
     teams::InTeam,
@@ -122,10 +123,10 @@ fn failed(e: &InboxError) -> Response {
 /// The account's live state toward an item's post and author, and what was done to it from here,
 /// newest first. Every member.
 #[utoipa::path(get, path = "/inbox-items/{id}/actions", tag = "inbox",
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Actions), (status = 401, body = crate::controllers::waitlist::Error),
         (status = 404, body = crate::controllers::waitlist::Error)))]
-async fn list(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> Response {
+async fn list(State(app): State<AppState>, t: InTeam, ItemId(id): ItemId) -> Response {
     if !app.live_limiter.hit(t.current.0.id) {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
@@ -185,7 +186,7 @@ async fn list(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> R
 /// `invalid_reason`, `too_many_hidden`, and the Bluesky errors of a reply) or `429`. At most 60 a
 /// minute per user, shared with thread reads.
 #[utoipa::path(post, path = "/inbox-items/{id}/actions", tag = "inbox", request_body = ActionInput,
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = ActionDone), (status = 401, body = crate::controllers::waitlist::Error),
         (status = 403, body = crate::controllers::waitlist::Error), (status = 404, body = crate::controllers::waitlist::Error),
         (status = 422, body = crate::controllers::waitlist::Error), (status = 429, body = crate::controllers::waitlist::Error)))]
@@ -193,7 +194,7 @@ async fn act(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    ItemId(id): ItemId,
     Body(input): Body<ActionInput>,
 ) -> Response {
     if input.action.manages() && !t.role.manages() {

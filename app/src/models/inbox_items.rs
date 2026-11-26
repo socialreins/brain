@@ -5,6 +5,9 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
+    /// The number web addresses use: one counter over every team, set by the column's identity, so an
+    /// insert leaves it `NotSet`.
+    pub number: i64,
     pub team_id: Uuid,
     pub social_account_id: Uuid,
     #[sea_orm(column_type = "Text")]

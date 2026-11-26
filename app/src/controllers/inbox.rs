@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use axum::{
-    extract::{rejection::QueryRejection, Path, Query, State},
+    extract::{rejection::QueryRejection, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -23,6 +23,7 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use super::numbered::{self, InboxId, ItemId, ID_PARAM};
 use super::{
     auth::{internal, Body, FromWeb},
     billing::plan_limit,
@@ -50,6 +51,9 @@ const MAX_PAGE: u64 = 100;
 #[derive(Serialize, ToSchema)]
 pub struct Inbox {
     pub id: Uuid,
+    /// The inbox's number, unique over every team: the address web pages use. Every `{id}` of an
+    /// inbox route takes it as well as `id`.
+    pub number: i64,
     pub name: String,
     /// The team's "All" inbox: every item, cannot be changed or deleted.
     pub is_all: bool,
@@ -111,6 +115,9 @@ pub struct Assignee {
 #[derive(Serialize, ToSchema)]
 pub struct Item {
     pub id: Uuid,
+    /// The item's number, unique over every team: the address web pages use. Every `{id}` of an
+    /// inbox item route takes it as well as `id`.
+    pub number: i64,
     pub social_account_id: Uuid,
     pub platform: String,
     /// `comment` (a reply to the account), `mention` (a mention or quote), `dm`, or activity,
@@ -163,6 +170,8 @@ pub struct Item {
     pub reply_window: Option<ReplyWindow>,
     /// The author's contact (`GET /contacts/{id}`).
     pub contact_id: Option<Uuid>,
+    /// The contact's `number`.
+    pub contact_number: Option<i64>,
     /// The contact's tags, by name.
     pub contact_tags: Vec<String>,
     /// The member it is assigned to; `null` for nobody.
@@ -323,6 +332,7 @@ fn not_found() -> Response {
 fn inbox_json(i: inboxes::Model, account_ids: Vec<Uuid>) -> Inbox {
     Inbox {
         id: i.id,
+        number: i.number,
         name: i.name,
         is_all: i.is_all,
         account_ids,
@@ -576,6 +586,8 @@ pub(super) async fn items_json(
     let last = last_messages(db, &rows).await?;
     let (videos, parents) = youtube_context(db, &rows).await?;
     let tags = tags_of(db, rows.iter().filter_map(|i| i.contact_id)).await?;
+    let contacts =
+        numbered::numbers(db, "contacts", rows.iter().filter_map(|i| i.contact_id)).await?;
     let names: HashMap<Uuid, String> = users::Entity::find()
         .filter(users::Column::Id.is_in(rows.iter().filter_map(|i| i.assigned_to)))
         .all(db)
@@ -653,6 +665,7 @@ pub(super) async fn items_json(
             inbox_ids: held.remove(&i.id).unwrap_or_default(),
             replies: by_item.remove(&i.id).unwrap_or_default(),
             id: i.id,
+            number: i.number,
             social_account_id: i.social_account_id,
             remote_url: i.permalink.or_else(|| url_of(&i.remote_id)),
             platform: i.platform,
@@ -682,6 +695,7 @@ pub(super) async fn items_json(
                 .and_then(|c| tags.get(&c).cloned())
                 .unwrap_or_default(),
             contact_id: i.contact_id,
+            contact_number: i.contact_id.and_then(|c| contacts.get(&c).copied()),
             assigned_to: i.assigned_to.and_then(|id| {
                 let name = names.get(&id)?.clone();
                 Some(Assignee { id, name })
@@ -822,7 +836,9 @@ async fn list(State(app): State<AppState>, t: InTeam) -> Response {
     let found = async {
         let stmt = Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "INSERT INTO inboxes (id, team_id, name, is_all) VALUES ($1, $2, 'All', true) \
+            // `WHERE NOT EXISTS`: a proposed row takes a number from the identity, kept or not.
+            "INSERT INTO inboxes (id, team_id, name, is_all) SELECT $1, $2, 'All', true \
+             WHERE NOT EXISTS (SELECT 1 FROM inboxes WHERE team_id = $2 AND is_all) \
              ON CONFLICT (team_id) WHERE is_all DO NOTHING",
             [Uuid::now_v7().into(), t.team.id.into()],
         );
@@ -937,7 +953,7 @@ async fn create(
 
 /// Replaces an inbox's name, accounts and filters. Owners and admins; "All" is `409 all_inbox`.
 #[utoipa::path(put, path = "/inboxes/{id}", tag = "inbox", request_body = InboxInput,
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Inbox), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error)))]
@@ -945,7 +961,7 @@ async fn update(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    InboxId(id): InboxId,
     Body(input): Body<InboxInput>,
 ) -> Response {
     if !t.role.manages() {
@@ -984,14 +1000,14 @@ async fn update(
 
 /// Deletes an inbox (its items stay, in the other inboxes). Owners and admins; "All" is
 /// `409 not_deletable`.
-#[utoipa::path(delete, path = "/inboxes/{id}", tag = "inbox", params(("id" = Uuid, Path)),
+#[utoipa::path(delete, path = "/inboxes/{id}", tag = "inbox", params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
         (status = 404, body = Error), (status = 409, body = Error)))]
 async fn destroy(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    InboxId(id): InboxId,
 ) -> Response {
     if !t.role.manages() {
         return forbidden();
@@ -1139,13 +1155,13 @@ pub fn items_sql(
 
 /// An inbox's items, newest first, a page at a time.
 #[utoipa::path(get, path = "/inboxes/{id}/items", tag = "inbox",
-    params(("id" = Uuid, Path), ItemQuery),
+    params(("id" = String, Path, description = ID_PARAM), ItemQuery),
     responses((status = 200, body = ItemPage), (status = 401, body = Error),
         (status = 404, body = Error), (status = 422, body = Error)))]
 async fn items(
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    InboxId(id): InboxId,
     q: Result<Query<ItemQuery>, QueryRejection>,
 ) -> Response {
     let Ok(Query(q)) = q else {
@@ -1236,10 +1252,10 @@ async fn items(
 }
 
 /// One item with the replies sent from SocialReins.
-#[utoipa::path(get, path = "/inbox-items/{id}", tag = "inbox", params(("id" = Uuid, Path)),
+#[utoipa::path(get, path = "/inbox-items/{id}", tag = "inbox", params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Item), (status = 401, body = Error),
         (status = 404, body = Error)))]
-async fn show_item(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> Response {
+async fn show_item(State(app): State<AppState>, t: InTeam, ItemId(id): ItemId) -> Response {
     let found = async {
         match find_item(&app.db, t.team.id, id).await? {
             Some(i) => item_json(&app.db, i, app.meta.human_agent).await.map(Some),
@@ -1257,13 +1273,13 @@ async fn show_item(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>)
 /// `replies`. The newest page first, oldest first within it; `before` (the first item's id)
 /// pages back. `422 not_a_conversation` for an item that is no DM.
 #[utoipa::path(get, path = "/inbox-items/{id}/conversation", tag = "inbox",
-    params(("id" = Uuid, Path), ConversationQuery),
+    params(("id" = String, Path, description = ID_PARAM), ConversationQuery),
     responses((status = 200, body = ConversationPage), (status = 401, body = Error),
         (status = 404, body = Error), (status = 422, body = Error)))]
 async fn conversation(
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    ItemId(id): ItemId,
     q: Result<Query<ConversationQuery>, QueryRejection>,
 ) -> Response {
     let Ok(Query(q)) = q else {
@@ -1336,10 +1352,10 @@ pub struct ThreadContext {
 /// follow, `422 post_unavailable` when the post is gone, blocked or hidden, `429 rate_limited` past 60 reads a minute per user, and the other send errors (`429`,
 /// `reconnect_required`) when Bluesky cannot be read.
 #[utoipa::path(get, path = "/inbox-items/{id}/thread", tag = "inbox",
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = ThreadContext), (status = 401, body = Error),
         (status = 404, body = Error), (status = 422, body = Error), (status = 429, body = Error)))]
-async fn thread(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> Response {
+async fn thread(State(app): State<AppState>, t: InTeam, ItemId(id): ItemId) -> Response {
     let item = match find_item(&app.db, t.team.id, id).await {
         Ok(Some(i)) => i,
         Ok(None) => return not_found(),
@@ -1440,14 +1456,14 @@ async fn threads_thread(app: &AppState, t: &InTeam, item: &inbox_items::Model) -
 /// conversation in one statement. Every member. `422 invalid_state`, `invalid_assignee` (not
 /// a member of the team), and `invalid_body` when neither field is sent.
 #[utoipa::path(patch, path = "/inbox-items/{id}", tag = "inbox", request_body = ItemChange,
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Item), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 422, body = Error)))]
 async fn change_item(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    ItemId(id): ItemId,
     Body(input): Body<ItemChange>,
 ) -> Response {
     let unprocessable = |code| reply(StatusCode::UNPROCESSABLE_ENTITY, code);
@@ -1529,7 +1545,7 @@ fn send_error(e: &InboxError) -> Response {
 /// `meta_reconnect_required`, `meta_failed`, `outside_window`, `dm_unavailable`) and a
 /// `message`, or `429`.
 #[utoipa::path(post, path = "/inbox-items/{id}/reply", tag = "inbox", request_body = ReplyInput,
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 201, body = Item), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error), (status = 429, body = Error)))]
@@ -1537,7 +1553,7 @@ async fn send_reply(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    ItemId(id): ItemId,
     Body(input): Body<ReplyInput>,
 ) -> Response {
     let item = match find_item(&app.db, t.team.id, id).await {
@@ -1635,7 +1651,7 @@ pub struct ModerateInput {
 /// action the item cannot take (a like on Instagram, a Bluesky item), or a Meta refusal worded as
 /// for a reply (`meta_reconnect_required`, `meta_denied`, `meta_failed`, `rate_limited`).
 #[utoipa::path(post, path = "/inbox-items/{id}/moderate", tag = "inbox",
-    request_body = ModerateInput, params(("id" = Uuid, Path)),
+    request_body = ModerateInput, params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Item), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 422, body = Error),
         (status = 429, body = Error)))]
@@ -1643,7 +1659,7 @@ async fn moderate_item(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    ItemId(id): ItemId,
     Body(input): Body<ModerateInput>,
 ) -> Response {
     let item = match find_item(&app.db, t.team.id, id).await {

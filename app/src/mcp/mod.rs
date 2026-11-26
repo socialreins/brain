@@ -36,6 +36,7 @@ use crate::{
         feeds::{self, FeedId, FeedInput},
         library::{self, MediaInput, MediaQuery, SnippetInput, SnippetQuery},
         lists::{self, AddPost, ListInput, Order},
+        numbered::Ref,
         posts,
         posts::{Decision, PostGroupInput, PostInput, PostQuery, PostRef},
         queue::{self, QueueInput},
@@ -101,28 +102,29 @@ struct SetQueue {
 
 #[derive(Deserialize, JsonSchema)]
 struct ListId {
-    id: Uuid,
+    /// The list's `id` (UUID) or its `number`.
+    id: Ref,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct AddToList {
-    /// The list.
-    id: Uuid,
+    /// The list's `id` (UUID) or its `number`.
+    id: Ref,
     #[serde(flatten)]
     add: AddPost,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct RemoveFromList {
-    /// The list.
-    id: Uuid,
+    /// The list's `id` (UUID) or its `number`.
+    id: Ref,
     post_id: Uuid,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct Reorder {
-    /// The list.
-    id: Uuid,
+    /// The list's `id` (UUID) or its `number`.
+    id: Ref,
     #[serde(flatten)]
     order: Order,
 }
@@ -256,6 +258,14 @@ async fn resolve(app: &AppState, r: PostRef) -> Uuid {
     })
 }
 
+/// The list an MCP tool named, resolved like `resolve`.
+async fn list(app: &AppState, r: Ref) -> Uuid {
+    r.resolve(&app.db, "post_lists").await.unwrap_or_else(|e| {
+        tracing::error!(error = %e, "list number lookup failed");
+        Uuid::default()
+    })
+}
+
 /// The `422` the REST route answers for a query or body it cannot read.
 fn invalid(code: &str) -> Response {
     error(StatusCode::UNPROCESSABLE_ENTITY, code).into_response()
@@ -330,19 +340,19 @@ async fn run(app: &AppState, a: &Actor, name: &str, v: Value) -> Option<Response
             None => invalid("invalid_body"),
         },
         "get-list" => match args::<ListId>(v) {
-            Some(l) => lists::get_list(app, a, l.id).await,
+            Some(l) => lists::get_list(app, a, list(app, l.id).await).await,
             None => invalid("invalid_body"),
         },
         "add-post-to-list" => match args::<AddToList>(v) {
-            Some(l) => lists::add_post(app, a, l.id, l.add).await,
+            Some(l) => lists::add_post(app, a, list(app, l.id).await, l.add).await,
             None => invalid("invalid_body"),
         },
         "remove-post-from-list" => match args::<RemoveFromList>(v) {
-            Some(l) => lists::remove_post(app, a, l.id, l.post_id).await,
+            Some(l) => lists::remove_post(app, a, list(app, l.id).await, l.post_id).await,
             None => invalid("invalid_body"),
         },
         "reorder-list" => match args::<Reorder>(v) {
-            Some(l) => lists::reorder_list(app, a, l.id, l.order).await,
+            Some(l) => lists::reorder_list(app, a, list(app, l.id).await, l.order).await,
             None => invalid("invalid_body"),
         },
         "list-media" => match args(v) {

@@ -582,28 +582,48 @@ pub(crate) fn clip(text: &str) -> String {
 // contact keeps the handle, name and avatar of its newest item (`$17`, when it came) that gave
 // one, so an old item read late or delivered again changes none of them; it stores nothing.
 // A like or repost makes no contact: people who only liked are not people who wrote to us.
-const INSERT: &str = "WITH c AS (INSERT INTO contacts AS k (id, team_id, platform, external_id, \
+// The same text brings a known contact up to date (`hit`) and, on a race, the one a parallel
+// statement just made (`ON CONFLICT`).
+macro_rules! contact_set {
+    () => {
+        "handle = CASE WHEN $17 < k.last_seen_at THEN COALESCE(k.handle, $13) \
+            ELSE COALESCE($13, k.handle) END, \
+        display_name = CASE WHEN $17 < k.last_seen_at THEN COALESCE(k.display_name, $14) \
+            ELSE COALESCE($14, k.display_name) END, \
+        avatar_url = CASE WHEN $17 < k.last_seen_at THEN COALESCE(k.avatar_url, $15) \
+            ELSE COALESCE($15, k.avatar_url) END, \
+        first_seen_at = LEAST(k.first_seen_at, $17), \
+        last_seen_at = GREATEST(k.last_seen_at, $17)"
+    };
+}
+
+// A contact and an item each get a `number` from an identity, which counts every row an INSERT
+// proposes, kept or not. So a known contact is updated first (`hit`) and only a new one inserted,
+// and an item already stored is not proposed again: a re-read burns no number.
+const INSERT: &str = concat!(
+    "WITH hit AS (UPDATE contacts k SET ",
+    contact_set!(),
+    " WHERE k.team_id = $2 AND k.platform = $4 AND k.external_id = $12 \
+    AND $5 NOT IN ('like', 'repost') RETURNING k.id), \
+    c AS (INSERT INTO contacts AS k (id, team_id, platform, external_id, \
     handle, display_name, avatar_url, first_seen_at, last_seen_at) \
     SELECT $24, $2, $4, $12, $13, $14, $15, $17, $17 WHERE $5 NOT IN ('like', 'repost') \
-    ON CONFLICT (team_id, platform, external_id) DO UPDATE SET \
-    handle = CASE WHEN $17 < k.last_seen_at THEN COALESCE(k.handle, $13) \
-        ELSE COALESCE($13, k.handle) END, \
-    display_name = CASE WHEN $17 < k.last_seen_at THEN COALESCE(k.display_name, $14) \
-        ELSE COALESCE($14, k.display_name) END, \
-    avatar_url = CASE WHEN $17 < k.last_seen_at THEN COALESCE(k.avatar_url, $15) \
-        ELSE COALESCE($15, k.avatar_url) END, \
-    first_seen_at = LEAST(k.first_seen_at, $17), \
-    last_seen_at = GREATEST(k.last_seen_at, $17) RETURNING id) \
+    AND NOT EXISTS (SELECT 1 FROM hit) \
+    ON CONFLICT (team_id, platform, external_id) DO UPDATE SET ",
+    contact_set!(),
+    " RETURNING id) \
     INSERT INTO inbox_items (id, team_id, social_account_id, platform, kind, \
     remote_id, remote_cid, parent_remote_id, root_remote_id, root_remote_cid, convo_id, \
     author_id, author_handle, author_name, author_avatar, text, received_at, permalink, \
     story_reply, story_id, story_url, state, button_payload, attachments, post_id, contact_id, \
     automated_at) \
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
+    SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
     $19, $20, $21, $22, $23, $25, (SELECT t.post_id FROM post_targets t WHERE t.social_account_id = $3 \
-     AND t.remote_id IN ($8, $9) LIMIT 1), (SELECT id FROM c), \
-     CASE WHEN $26 THEN now() END) \
-    ON CONFLICT (social_account_id, remote_id) DO NOTHING RETURNING *";
+     AND t.remote_id IN ($8, $9) LIMIT 1), (SELECT id FROM hit UNION ALL SELECT id FROM c LIMIT 1), \
+     CASE WHEN $26 THEN now() END \
+    WHERE NOT EXISTS (SELECT 1 FROM inbox_items e WHERE e.social_account_id = $3 AND e.remote_id = $6) \
+    ON CONFLICT (social_account_id, remote_id) DO NOTHING RETURNING *"
+);
 
 /// An item to store, from any platform.
 #[derive(Clone)]

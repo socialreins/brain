@@ -240,6 +240,7 @@ fn item_of(
     };
     inbox_items::Model {
         id: Uuid::now_v7(),
+        number: 0,
         team_id: account.team_id,
         social_account_id: account.id,
         platform: account.provider.clone(),

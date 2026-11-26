@@ -26,6 +26,8 @@ crates/core/     framework-free domain rules (email checks, tokens)
 
 ## Endpoints
 
+Numbers: next to their `id`, posts, lists, automations, broadcasts, newsletters, inboxes, inbox items and contacts carry a `number` in every answer: an integer, one counter per kind over every team, which the web app puts in its addresses (`/t/<team>/lists/12`, `?item=4821`). Every route with one of those `{id}`s takes the `id` or the `number` (the MCP list tools too); a number that names nothing, or belongs to another team, is `404`. An answer that points at one carries its number too (`contact_number`, `inbox_item_number`, `automation_number`, `lists[].number` on a post). The automation notice mail links to the item's number. The UUID stays the primary key and the only form in request bodies and filters. Numbers go up and are never reused; a deleted row leaves a gap.
+
 | Method | Path | What it does |
 |---|---|---|
 | GET | `/health` | `{"status":"ok"}` |
@@ -127,7 +129,7 @@ crates/core/     framework-free domain rules (email checks, tokens)
 | POST | `/v1/post-groups/{group_id}/takedown` | Takes every `published` post of a group down, one after another: `200` with the group and `results` (`post_id`, `platform`, `state` `taken_down`, `already_gone`, `failed` with a `message`, or `not_published`, left alone: a scheduled or queued post still goes out). A failure (TikTok has no delete call) does not stop the others, and calling it again only tries what is still up. One of the 10 publish, retry or take-down calls a minute. A token works too (`404` for a group outside a set token's set, `403 read_only_token` for a read-only one); the MCP tool is `takedown-post-group` |
 | POST | `/v1/post-groups/{group_id}/approve`, `/v1/post-groups/{group_id}/reject` | The same for every `scheduled` post of a group that has an `approval`, all or none: `200 {"posts":[...]}` with the posts it changed, `409 not_awaiting_approval` when there is none |
 | GET, POST | `/v1/lists` | Post lists (ordered groups such as a series), or create one (`{"name","social_set_id"}`; no set means team-wide, or the token's own set for a set token) |
-| GET, PATCH, DELETE | `/v1/lists/{id}` | One list with its `items` (`post_id`, 1-based `position`, `post`); rename (`{"name"}`); delete (posts stay) |
+| GET, PATCH, DELETE | `/v1/lists/{id}` | One list (as every `{id}` of a list, automation, broadcast, newsletter, inbox, inbox item or contact: the `id` or the `number`, see "Numbers") with its `items` (`post_id`, 1-based `position`, `post`); rename (`{"name"}`); delete (posts stay) |
 | POST | `/v1/lists/{id}/posts` | Add a post (`{"post_id","position"}`; appends by default, an existing post moves) |
 | DELETE | `/v1/lists/{id}/posts/{post_id}` | Take a post out; later posts move up |
 | PUT | `/v1/lists/{id}/order` | Reorder (`{"post_ids"}`: every post of the list once, else `422 invalid_order`) |

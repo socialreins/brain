@@ -17,6 +17,7 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use super::numbered::{ItemId, ID_PARAM};
 use super::{
     auth::{internal, Body, FromWeb},
     teams::InTeam,
@@ -279,14 +280,14 @@ async fn resume(
 /// `message` when X refuses (`x_reconnect_required` for an account connected without the
 /// permission, `x_failed`, `rate_limited`, `not_repliable` for an item the action does not fit).
 #[utoipa::path(post, path = "/inbox-items/{id}/x-action", tag = "inbox", request_body = ActionInput,
-    security(("session" = []), ("api_token" = [])), params(("id" = Uuid, Path)),
+    security(("session" = []), ("api_token" = [])), params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 204), (status = 401, body = Error), (status = 404, body = Error),
         (status = 409, body = Error), (status = 422, body = Error), (status = 429, body = Error)))]
 async fn act(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    ItemId(id): ItemId,
     Body(input): Body<ActionInput>,
 ) -> Response {
     let Some(action) = Action::parse(&input.action) else {

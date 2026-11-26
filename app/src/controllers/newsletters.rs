@@ -2,7 +2,7 @@
 //! unsubscribe (`crate::newsletters`). Owners and admins only, reads included, and like
 //! broadcasts these routes take a session only.
 use axum::{
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -16,6 +16,7 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use super::numbered::{NewsletterId, ID_PARAM};
 use super::{
     auth::{internal, Body, FromWeb},
     teams::InTeam,
@@ -47,6 +48,9 @@ pub struct Counts {
 #[derive(Serialize, ToSchema)]
 pub struct Newsletter {
     pub id: Uuid,
+    /// The newsletter's number, unique over every team: the address web pages use. Every `{id}` of a
+    /// newsletter route takes it as well as `id`.
+    pub number: i64,
     pub subject: String,
     /// Plain text: a blank line ends a paragraph, `**text**` is bold, a bare `https://`
     /// address becomes a link. Nothing else is markup; HTML is shown as typed.
@@ -111,6 +115,7 @@ const SELECT: &str = "SELECT n.*, c.* FROM newsletters n, LATERAL (SELECT count(
 fn newsletter_json(r: &QueryResult) -> Result<Newsletter, DbErr> {
     Ok(Newsletter {
         id: r.try_get("", "id")?,
+        number: r.try_get("", "number")?,
         subject: r.try_get("", "subject")?,
         body: r.try_get("", "body")?,
         status: r.try_get("", "status")?,
@@ -222,10 +227,10 @@ async fn create(
 }
 
 /// One newsletter with its counts. Owners and admins.
-#[utoipa::path(get, path = "/newsletters/{id}", tag = "newsletters", params(("id" = Uuid, Path)),
+#[utoipa::path(get, path = "/newsletters/{id}", tag = "newsletters", params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Newsletter), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error)))]
-async fn show(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> Response {
+async fn show(State(app): State<AppState>, t: InTeam, NewsletterId(id): NewsletterId) -> Response {
     if !t.role.manages() {
         return forbidden();
     }
@@ -235,7 +240,7 @@ async fn show(State(app): State<AppState>, t: InTeam, Path(id): Path<Uuid>) -> R
 /// Replaces a draft. Owners and admins. A changed subject or body clears `tested_at`, so a
 /// new test must go out before the send. `409 already_started` for anything but a draft.
 #[utoipa::path(put, path = "/newsletters/{id}", tag = "newsletters",
-    request_body = NewsletterInput, params(("id" = Uuid, Path)),
+    request_body = NewsletterInput, params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Newsletter), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error)))]
@@ -243,7 +248,7 @@ async fn update(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    NewsletterId(id): NewsletterId,
     Body(input): Body<NewsletterInput>,
 ) -> Response {
     if !t.role.manages() {
@@ -267,14 +272,14 @@ async fn update(
 /// Deletes a draft or a finished newsletter with its recipients. Owners and admins.
 /// `409 still_sending` while it sends or is paused: cancel it first.
 #[utoipa::path(delete, path = "/newsletters/{id}", tag = "newsletters",
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
         (status = 404, body = Error), (status = 409, body = Error)))]
 async fn destroy(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    NewsletterId(id): NewsletterId,
 ) -> Response {
     if !t.role.manages() {
         return forbidden();
@@ -295,7 +300,7 @@ async fn destroy(
 /// `409 already_started` for anything but a draft, `429 too_many_tests` after 10 in 24 hours
 /// per team, `502 mail_failed` when the mail did not go out.
 #[utoipa::path(post, path = "/newsletters/{id}/test", tag = "newsletters",
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Newsletter), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error), (status = 429, body = Error), (status = 502, body = Error)))]
@@ -303,7 +308,7 @@ async fn test(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    NewsletterId(id): NewsletterId,
 ) -> Response {
     if !t.role.manages() {
         return forbidden();
@@ -373,7 +378,7 @@ async fn test(
 /// then waits for `POST /newsletters/{id}/resume`. All teams together send 10000 newsletter
 /// mails in 24 hours; past that, recipients wait as `pending`.
 #[utoipa::path(post, path = "/newsletters/{id}/send", tag = "newsletters",
-    request_body = SendInput, params(("id" = Uuid, Path)),
+    request_body = SendInput, params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Newsletter), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 422, body = Error), (status = 429, body = Error)))]
@@ -381,7 +386,7 @@ async fn send(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    NewsletterId(id): NewsletterId,
     Body(input): Body<SendInput>,
 ) -> Response {
     if !t.role.manages() {
@@ -415,14 +420,14 @@ async fn send(
 /// Cancels a sending or paused newsletter: recipients not mailed yet are skipped, the ones
 /// mailed stay. Owners and admins. `409 not_sending` otherwise.
 #[utoipa::path(post, path = "/newsletters/{id}/cancel", tag = "newsletters",
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Newsletter), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error)))]
 async fn cancel(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    NewsletterId(id): NewsletterId,
 ) -> Response {
     if !t.role.manages() {
         return forbidden();
@@ -438,14 +443,14 @@ async fn cancel(
 /// Puts a paused newsletter back to `sending`, once whatever paused it is dealt with; the
 /// failed recipients are not tried again. Owners and admins. `409 not_paused` otherwise.
 #[utoipa::path(post, path = "/newsletters/{id}/resume", tag = "newsletters",
-    params(("id" = Uuid, Path)),
+    params(("id" = String, Path, description = ID_PARAM)),
     responses((status = 200, body = Newsletter), (status = 401, body = Error),
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error)))]
 async fn resume(
     _: FromWeb,
     State(app): State<AppState>,
     t: InTeam,
-    Path(id): Path<Uuid>,
+    NewsletterId(id): NewsletterId,
 ) -> Response {
     if !t.role.manages() {
         return forbidden();

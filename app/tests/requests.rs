@@ -21901,7 +21901,7 @@ mod teams {
                         assert!(b["created_at"].is_string());
                         assert!(b["started_at"].is_null() && b["finished_at"].is_null());
                         let keys: Vec<&String> = b.as_object().unwrap().keys().collect();
-                        assert_eq!(keys.len(), 12, "{keys:?}");
+                        assert_eq!(keys.len(), 13, "{keys:?}");
                         assert!(b["pause_reason"].is_null());
 
                         let second = draft(&s, &cookie, vip("Second", "Hi {name}")).await;
@@ -23121,6 +23121,181 @@ mod teams {
                     .await;
                 res.assert_status_ok();
                 res.json()
+            }
+
+            /// Where each counter stands: inbox items, contacts, inboxes.
+            async fn counters(db: &DatabaseConnection) -> (i64, i64, i64) {
+                use sea_orm::{ConnectionTrait, DbBackend, Statement};
+                let mut last = Vec::new();
+                for table in ["inbox_items", "contacts", "inboxes"] {
+                    let sql = format!("SELECT last_value FROM {table}_number_seq");
+                    let row = db
+                        .query_one_raw(Statement::from_string(DbBackend::Postgres, sql))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    last.push(row.try_get::<i64>("", "last_value").unwrap());
+                }
+                (last[0], last[1], last[2])
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn inbox_things_are_addressed_by_their_number_or_their_uuid() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                set_inbox(&me, three_people(&me));
+                ingest(&db, &state, &account).await;
+                // Reading the same items again changes them and takes no number from the counters.
+                all_inbox(&s, &cookie).await;
+                let before = counters(&db).await;
+                ingest(&db, &state, &account).await;
+                all_inbox(&s, &cookie).await;
+                assert_eq!(counters(&db).await, before, "a re-read burns no number");
+                let (other, ..) = owner(&s, &db).await;
+
+                let contacts = fetch(&s, &cookie, "/v1/contacts").await;
+                let contact = contacts["items"][0].clone();
+                let (cid, cn) = (contact["id"].clone(), contact["number"].as_i64().unwrap());
+                assert_eq!(
+                    fetch(&s, &cookie, &format!("/v1/contacts/{cn}")).await["id"],
+                    cid
+                );
+
+                let all = all_inbox(&s, &cookie).await;
+                let inbox_n = all["number"].as_i64().unwrap();
+                let listed = items(&s, &cookie, &inbox_n.to_string(), "").await;
+                assert_eq!(
+                    listed,
+                    items(&s, &cookie, all["id"].as_str().unwrap(), "").await
+                );
+                let item = listed["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|i| i["contact_id"] == cid)
+                    .unwrap()
+                    .clone();
+                assert_eq!(item["contact_number"], cn);
+                let n = item["number"].as_i64().unwrap();
+                for path in [
+                    format!("/v1/inbox-items/{n}"),
+                    format!("/v1/inbox-items/{n}/conversation"),
+                    format!("/v1/inbox-items/{n}/automations"),
+                ] {
+                    let res = s.get(&path).add_header("cookie", &cookie).await;
+                    assert_eq!(res.status_code(), 200, "{path}: {}", res.text());
+                }
+                assert_eq!(
+                    fetch(&s, &cookie, &format!("/v1/inbox-items/{n}")).await["id"],
+                    item["id"]
+                );
+                let res = req(&s, Method::PATCH, &format!("/v1/inbox-items/{n}"), &cookie)
+                    .json(&json!({"state": "done"}))
+                    .await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                assert_eq!(res.json::<Value>()["id"], item["id"]);
+                let res = req(&s, Method::PATCH, &format!("/v1/contacts/{cn}"), &cookie)
+                    .json(&json!({"notes": "by number"}))
+                    .await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+
+                // Another team's number, and one nobody has, are `404`.
+                let (note, done, reply) = (
+                    json!({"notes": "x"}),
+                    json!({"state": "done"}),
+                    json!({"text": "x"}),
+                );
+                let edit = json!({"name": "x", "account_ids": [account]});
+                for (method, path, body) in [
+                    (Method::GET, format!("/v1/contacts/{cn}"), json!({})),
+                    (Method::PATCH, format!("/v1/contacts/{cn}"), note),
+                    (Method::DELETE, format!("/v1/contacts/{cn}"), json!({})),
+                    (Method::GET, format!("/v1/inbox-items/{n}"), json!({})),
+                    (Method::PATCH, format!("/v1/inbox-items/{n}"), done),
+                    (
+                        Method::GET,
+                        format!("/v1/inbox-items/{n}/thread"),
+                        json!({}),
+                    ),
+                    (
+                        Method::GET,
+                        format!("/v1/inbox-items/{n}/conversation"),
+                        json!({}),
+                    ),
+                    (Method::POST, format!("/v1/inbox-items/{n}/reply"), reply),
+                    (
+                        Method::GET,
+                        format!("/v1/inbox-items/{n}/automations"),
+                        json!({}),
+                    ),
+                    (
+                        Method::GET,
+                        format!("/v1/inboxes/{inbox_n}/items"),
+                        json!({}),
+                    ),
+                    (Method::PUT, format!("/v1/inboxes/{inbox_n}"), edit),
+                    (Method::DELETE, format!("/v1/inboxes/{inbox_n}"), json!({})),
+                    (
+                        Method::GET,
+                        "/v1/inbox-items/999999999".to_owned(),
+                        json!({}),
+                    ),
+                    (Method::GET, "/v1/contacts/nope".to_owned(), json!({})),
+                ] {
+                    let res = req(&s, method, &path, &other).json(&body).await;
+                    assert_eq!(res.status_code(), 404, "{path}: {}", res.text());
+                }
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn automations_broadcasts_and_newsletters_take_a_number_too() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, _, _, _) = owner(&s, &db).await;
+                let (other, ..) = owner(&s, &db).await;
+                let bodies = [
+                    (
+                        "automations",
+                        json!({"name": "Hi", "trigger": "comment_received",
+                        "conditions": {"keywords": ["hi"]},
+                        "actions": [{"type": "send_dm", "text": "hello"}]}),
+                    ),
+                    (
+                        "broadcasts",
+                        json!({"name": "B", "text": "Hi {name}", "tag": "vip"}),
+                    ),
+                    ("newsletters", json!({"subject": "News", "body": "Hello"})),
+                ];
+                for (kind, body) in bodies {
+                    let res = req(&s, Method::POST, &format!("/v1/{kind}"), &cookie)
+                        .json(&body)
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{kind}: {}", res.text());
+                    let made = res.json::<Value>();
+                    let (id, n) = (made["id"].clone(), made["number"].as_i64().unwrap());
+                    let path = format!("/v1/{kind}/{n}");
+                    assert_eq!(fetch(&s, &cookie, &path).await["id"], id, "{kind}");
+                    let listed = fetch(&s, &cookie, &format!("/v1/{kind}")).await;
+                    let listed = listed
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_else(|| listed["items"].as_array().cloned().unwrap_or_default());
+                    assert!(listed.iter().all(|x| x["number"].is_i64()), "{kind}");
+                    // Another team's number is as unknown as a missing one.
+                    for (method, tail) in [(Method::GET, ""), (Method::DELETE, "")] {
+                        let res = req(&s, method, &format!("{path}{tail}"), &other).await;
+                        assert_eq!(res.status_code(), 404, "{kind}: {}", res.text());
+                    }
+                    let res = req(&s, Method::GET, &format!("/v1/{kind}/999999999"), &cookie).await;
+                    assert_eq!(res.status_code(), 404, "{kind}");
+                    let res = req(&s, Method::DELETE, &path, &cookie).await;
+                    assert!(
+                        res.status_code() == 204 || res.status_code() == 200,
+                        "{kind}: {}",
+                        res.text()
+                    );
+                }
             }
 
             #[tokio::test]
@@ -31521,6 +31696,77 @@ mod teams {
 
                 #[tokio::test]
                 #[serial]
+                async fn a_list_is_addressed_by_its_number_or_its_uuid() {
+                    let (s, db) = on_mock(1000).await;
+                    let (_, default, _, team, _) = setup(&s, &db).await;
+                    let (_, theirs, _, other, _) = setup(&s, &db).await;
+                    let post = new_post(&s, &team, &default).await;
+                    let foreign = new_post(&s, &other, &theirs).await;
+                    let id = new_list(&s, &team, json!({"name": "Series"})).await;
+                    let got = bearer(&s, Method::GET, &format!("/v1/lists/{id}"), &team).await;
+                    let n = got.json::<Value>()["number"].as_i64().unwrap();
+                    let second = new_list(&s, &team, json!({"name": "Two"})).await;
+                    let m = bearer(&s, Method::GET, &format!("/v1/lists/{second}"), &team)
+                        .await
+                        .json::<Value>()["number"]
+                        .as_i64()
+                        .unwrap();
+                    assert!(m > n, "the counter only goes up: {n} then {m}");
+
+                    // Both forms read, rename, fill, order and empty the same list.
+                    let by_number = bearer(&s, Method::GET, &format!("/v1/lists/{n}"), &team).await;
+                    assert_eq!(by_number.json::<Value>()["id"], id);
+                    let res = bearer(&s, Method::PATCH, &format!("/v1/lists/{n}"), &team)
+                        .json(&json!({"name": "Renamed"}))
+                        .await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    let res = add(&s, &team, &n.to_string(), json!({"post_id": post})).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    assert_eq!(items(&s, &team, &id).await.len(), 1);
+                    let res = reorder(&s, &team, &n.to_string(), &[&post]).await;
+                    assert_eq!(res.status_code(), 200, "{}", res.text());
+                    assert_eq!(post_lists(&s, &team, &post).await[0]["number"], n);
+                    let path = format!("/v1/lists/{n}/posts/{post}");
+                    let res = bearer(&s, Method::DELETE, &path, &team).await;
+                    assert_eq!(res.status_code(), 204, "{}", res.text());
+
+                    // The MCP tools take either, as a number or as text.
+                    for arg in [json!(n), json!(n.to_string()), json!(id)] {
+                        let (err, v) = mcp::call(&s, &team, "get-list", json!({"id": arg})).await;
+                        assert!(!err && v["id"] == json!(id), "{arg}: {v}");
+                    }
+                    let (err, _) = mcp::call(&s, &team, "get-list", json!({"id": 999999999})).await;
+                    assert!(err);
+
+                    // Another team's number, and one nobody has, are `404` on every route.
+                    let (named, added, order) = (
+                        json!({"name": "x"}),
+                        json!({"post_id": foreign}),
+                        json!({"post_ids": []}),
+                    );
+                    for (method, path, body) in [
+                        (Method::GET, format!("/v1/lists/{n}"), json!({})),
+                        (Method::PATCH, format!("/v1/lists/{n}"), named),
+                        (Method::DELETE, format!("/v1/lists/{n}"), json!({})),
+                        (Method::POST, format!("/v1/lists/{n}/posts"), added),
+                        (
+                            Method::DELETE,
+                            format!("/v1/lists/{n}/posts/{post}"),
+                            json!({}),
+                        ),
+                        (Method::PUT, format!("/v1/lists/{n}/order"), order),
+                        (Method::GET, "/v1/lists/999999999".to_owned(), json!({})),
+                        (Method::GET, "/v1/lists/nope".to_owned(), json!({})),
+                    ] {
+                        let res = bearer(&s, method, &path, &other).json(&body).await;
+                        assert_eq!(res.status_code(), 404, "{path}: {}", res.text());
+                    }
+                    let res = bearer(&s, Method::DELETE, &format!("/v1/lists/{n}"), &team).await;
+                    assert_eq!(res.status_code(), 204, "{}", res.text());
+                }
+
+                #[tokio::test]
+                #[serial]
                 async fn lists_keep_order_and_posts_carry_them() {
                     let (s, db) = on_mock(1000).await;
                     let (owner, default, clients, team, _) = setup(&s, &db).await;
@@ -31563,7 +31809,12 @@ mod teams {
                     res.assert_json(&json!({"error": "invalid_post"}));
 
                     // Every post carries its lists, in the single and the list answer.
-                    let want = json!([{"id": list, "name": "Series", "position": 2}]);
+                    let number = bearer(&s, Method::GET, &format!("/v1/lists/{list}"), &team)
+                        .await
+                        .json::<Value>()["number"]
+                        .clone();
+                    let want =
+                        json!([{"id": list, "number": number, "name": "Series", "position": 2}]);
                     assert_eq!(post_lists(&s, &team, &p2).await, want);
                     let all = bearer(&s, Method::GET, "/v1/posts", &team)
                         .await
@@ -31695,7 +31946,9 @@ mod teams {
                         .json::<Value>();
                     assert_eq!(ids(&all), vec![other.clone(), tied]);
                     let left = post_lists(&s, &team, &p2).await;
-                    assert_eq!(left, json!([{"id": other, "name": "Other", "position": 1}]));
+                    assert_eq!(left.as_array().unwrap().len(), 1);
+                    assert_eq!(left[0]["id"], json!(other));
+                    assert!(left[0]["number"].is_i64());
 
                     // Token writes take an Idempotency-Key.
                     let p5 = new_post(&s, &team, &default).await;
