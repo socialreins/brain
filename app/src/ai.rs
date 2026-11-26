@@ -75,7 +75,11 @@ impl Ai {
         system: &str,
         user: &str,
     ) -> Result<(String, &'static str), Option<u16>> {
-        let _turn = CALLS.acquire().await;
+        // A burst waits its turn, but not for ever (a dry run of an automation has someone waiting).
+        let Ok(_turn) = tokio::time::timeout(Duration::from_secs(120), CALLS.acquire()).await
+        else {
+            return Err(None);
+        };
         let (req, model) = match provider {
             "anthropic" => (
                 self.client

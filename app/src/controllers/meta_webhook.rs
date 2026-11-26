@@ -78,7 +78,29 @@ async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -
             // Waits its turn: a burst of deliveries (a viral post) must not run every automation
             // at once. What is still waiting is stored, and the sweep takes it after 2 minutes.
             let _turn = FOLLOW_UPS.acquire().await;
-            meta_inbox::follow_up(&later, fresh).await
+            // The sweep may have taken some while this waited: they are not run a second time.
+            let ids: Vec<uuid::Uuid> = fresh.iter().map(|i| i.1.id).collect();
+            let waiting = sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Postgres,
+                "SELECT id FROM inbox_items WHERE id = ANY($1) AND automated_at IS NULL",
+                [ids.into()],
+            );
+            let still: std::collections::HashSet<uuid::Uuid> =
+                match sea_orm::ConnectionTrait::query_all_raw(&later.db, waiting).await {
+                    Ok(rows) => rows
+                        .iter()
+                        .filter_map(|r| r.try_get("", "id").ok())
+                        .collect(),
+                    // Cannot tell: run them all, as before (a run is claimed once per item).
+                    Err(_) => fresh.iter().map(|i| i.1.id).collect(),
+                };
+            let fresh: Vec<_> = fresh
+                .into_iter()
+                .filter(|i| still.contains(&i.1.id))
+                .collect();
+            if !fresh.is_empty() {
+                meta_inbox::follow_up(&later, fresh).await
+            }
         });
     }
     match stored {
