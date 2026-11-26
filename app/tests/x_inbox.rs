@@ -543,6 +543,44 @@ async fn other_failures_wait_for_the_interval_and_five_in_a_row_pause() {
     let got = e.get().await;
     assert_eq!(got["paused"], "errors", "{got}");
     assert_eq!(e.mock.count(), 5, "one call a round, never more");
+    // Still paused an hour later; after two hours it reads once by itself, and a read that
+    // still fails ends the pause again at once.
+    let aged = |hours: i32| {
+        format!(
+            "UPDATE x_inbox SET updated_at = now() - interval '{hours} hours' \
+             WHERE social_account_id = '{}'",
+            e.account
+        )
+    };
+    e.sql(&aged(1)).await;
+    e.tick().await;
+    assert_eq!(e.mock.count(), 5);
+    e.sql(&aged(3)).await;
+    e.tick().await;
+    assert_eq!(e.mock.count(), 6, "one read after the wait");
+    assert_eq!(e.get().await["paused"], "errors");
+    e.tick().await;
+    assert_eq!(e.mock.count(), 6, "and a new wait");
+    // The provider is back: the next resume reads on, with no click.
+    *e.mock.mentions.lock().unwrap() = json!({"data": [], "meta": {"result_count": 0}});
+    e.sql(&format!(
+        "UPDATE social_accounts SET external_id = '1' WHERE id = '{}'",
+        e.account
+    ))
+    .await;
+    e.sql(&aged(3)).await;
+    e.tick().await;
+    let got = e.get().await;
+    assert_eq!(got["paused"], Value::Null, "{got}");
+    // A pause for credits or the budget is not undone by the clock.
+    e.sql(&format!(
+        "UPDATE x_inbox SET paused_reason = 'budget', updated_at = now() - interval '9 hours' \
+         WHERE social_account_id = '{}'",
+        e.account
+    ))
+    .await;
+    e.tick().await;
+    assert_eq!(e.get().await["paused"], "budget");
 }
 
 #[tokio::test]

@@ -22,6 +22,8 @@
 //! A send a platform refused for rate limiting sent nothing, so it is safe to try again: a flow
 //! parks and tries the step again in 5, 10 and 15 minutes (`retry_later`, at most `MAX_RETRIES`),
 //! and a person may retry a run that ended that way (`retry`) when nothing else of it went out.
+//! The same for an AI step whose provider did not answer (a timeout, a 429 or a 5xx: nothing was sent and
+//! the credit is given back; the new try pays under a new reference, `ai_reference`).
 //! Every other failure is final, because it may have been sent.
 //!
 //! `tag_contact`, an action and a step, sends nothing: it adds a tag to the contact of the
@@ -1743,7 +1745,7 @@ impl Flow<'_> {
             };
             let result = match with_page(template, self.page) {
                 _ if self.steps[i].ai() => {
-                    let reference = format!("ai:{run}:{i}");
+                    let reference = ai_reference(db, run, i).await?;
                     let (app, account, item) = (self.app, self.account, target);
                     ai_send(
                         app, account, item, self.a.id, kind, via, template, &reference,
@@ -1765,8 +1767,13 @@ impl Flow<'_> {
                     )
                 }
             };
-            // An AI step is written again at a retry, which costs a model call: a person decides.
-            let again = is_rate_limited(&result) && !self.steps[i].ai();
+            // A refused AI send is not tried again (a person decides: it costs a model call), but
+            // a provider that gave no answer sent nothing and cost nothing.
+            let again = if self.steps[i].ai() {
+                result.unavailable
+            } else {
+                is_rate_limited(&result)
+            };
             if again && retry_later(db, run, i, &results).await? {
                 // Parked: step `i` is sent again later, and this refusal is not kept.
                 return Ok(());
@@ -2169,6 +2176,26 @@ async fn claim_step(
     }
     txn.commit().await?;
     Ok(true)
+}
+
+/// What an AI step pays under: `ai:{run}:{step}`, and once the step has been tried again
+/// (`retry_later`) `ai:{run}:{step}:{tries}`, because the credit of a try that failed was given
+/// back and a reference given back is never paid again.
+async fn ai_reference(db: &DatabaseConnection, run: Uuid, i: usize) -> Result<String, DbErr> {
+    let row = db
+        .query_one_raw(sql(
+            "SELECT retries FROM automation_runs WHERE id = $1",
+            vec![run.into()],
+        ))
+        .await?;
+    let tries: i32 = row
+        .map(|r| r.try_get("", "retries"))
+        .transpose()?
+        .unwrap_or(0);
+    Ok(match tries {
+        0 => format!("ai:{run}:{i}"),
+        n => format!("ai:{run}:{i}:{n}"),
+    })
 }
 
 /// A send the platform refused for rate limiting: nothing went out.
@@ -2695,6 +2722,11 @@ pub struct ActionResult {
     /// An AI send: the model that wrote it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// An AI step whose provider did not answer (timeout, 429, 5xx): nothing was sent and the
+    /// credit is back, so a flow may try the step again (`advance`). Never stored or shown.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub unavailable: bool,
 }
 
 fn outcome(kind: &str, sent: Result<Result<String, InboxError>, DbErr>) -> ActionResult {
@@ -3034,9 +3066,12 @@ pub(crate) async fn ai_write(
         limit,
     );
     let mut model = None;
+    let mut unavailable = false;
     let text = match app.ai.write(&provider, &key, &system, &user).await {
         Err(status) => {
             tracing::warn!(?status, %provider, item = %item.id, "ai reply not written");
+            // No answer, a rate limit, a server error or an overloaded model: it may be fine soon.
+            unavailable = matches!(status, None | Some(408 | 425 | 429 | 500..=599));
             Err("ai_failed")
         }
         Ok((text, m)) => {
@@ -3066,6 +3101,7 @@ pub(crate) async fn ai_write(
             Err(ActionResult {
                 provider: Some(provider),
                 model,
+                unavailable,
                 ..ended("failed", reason)
             })
         }

@@ -58,6 +58,8 @@ const TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
 const PAUSE_MINUTES: i64 = 60;
 /// After the platform rate limits an account's read, the tick leaves it alone this long.
 const RETRY_MINUTES: i64 = 5;
+/// How long an account whose read failed with an outage (unreachable, 5xx) is left alone.
+const OUTAGE_MINUTES: i64 = 3;
 /// Longest item text kept.
 const MAX_TEXT_CHARS: usize = 10_000;
 /// Bluesky chat limits a message to 1000 graphemes and 10000 bytes.
@@ -389,7 +391,7 @@ pub async fn ingest(app: &AppState, account: social_accounts::Model) -> Result<(
 }
 
 /// What a failed read means for the account. A refused password pauses it for an hour and flags
-/// it for reconnecting; a rate limit leaves it alone for `RETRY_MINUTES`. True when the round
+/// it for reconnecting; a rate limit leaves it alone for `RETRY_MINUTES`, an outage of Bluesky for `OUTAGE_MINUTES`. True when the round
 /// should end there.
 async fn read_failed(
     db: &DatabaseConnection,
@@ -405,6 +407,16 @@ async fn read_failed(
             "UPDATE social_accounts SET inbox_retry_at = now() + make_interval(mins => $2) \
              WHERE id = $1",
             vec![account.id.into(), (RETRY_MINUTES as i32).into()],
+        ),
+        // Bluesky down or unreachable: leave the account alone for a few minutes instead of
+        // asking again, twice, every round of an outage.
+        InboxError::Unreachable
+        | InboxError::Refused {
+            status: 500..=599, ..
+        } => sql(
+            "UPDATE social_accounts SET inbox_retry_at = now() + make_interval(mins => $2) \
+             WHERE id = $1",
+            vec![account.id.into(), (OUTAGE_MINUTES as i32).into()],
         ),
         _ => return Ok(false),
     };

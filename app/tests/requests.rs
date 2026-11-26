@@ -24380,6 +24380,93 @@ mod teams {
                     assert_eq!(balance().await.unwrap(), 1);
                 }
 
+                /// A flow's AI step whose provider does not answer sent nothing and is paid back,
+                /// so the flow tries it again later (5, 10, 15 minutes) and goes on once the
+                /// provider is back; after the last try it ends `failed: ai_failed`.
+                #[tokio::test]
+                #[serial]
+                async fn an_ai_provider_that_does_not_answer_is_tried_again_by_the_flow() {
+                    use sea_orm::ConnectionTrait;
+                    let (s, db, state) = on_ai(true, Some(OUR_KEY)).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team: uuid::Uuid = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    db.execute_raw(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Postgres,
+                        "INSERT INTO subscriptions (team_id, plan_id, status, provider) \
+                         VALUES ($1, 'automation', 'active', 'comp') \
+                         ON CONFLICT (team_id) DO NOTHING",
+                        [team.into()],
+                    ))
+                    .await
+                    .unwrap();
+                    let res = connect(&s, &cookie, &new_handle(), DM_APP_PASSWORD).await;
+                    let body = res.json::<Value>();
+                    let account = body["id"].as_str().unwrap().to_owned();
+                    let me = body["external_id"].as_str().unwrap().to_owned();
+                    let id = automation(
+                        &s,
+                        &cookie,
+                        json!({"name": "AI retry", "trigger": "comment_received", "steps": [
+                            {"type": "ai_send_dm", "prompt": "Say hi"}]}),
+                    )
+                    .await;
+                    let t = (&s, &db, &state);
+                    let at = (account.as_str(), me.as_str(), id.as_str());
+                    let used = || billing::ai_used(&db, team, chrono::Utc::now());
+                    let due = |run: String| {
+                        let db = &db;
+                        let state = &state;
+                        async move {
+                            db.execute_unprepared(&format!(
+                                "UPDATE automation_runs SET resume_at = now() - interval '1 minute' \
+                                 WHERE id = '{run}' AND status = 'waiting'"
+                            ))
+                            .await
+                            .unwrap();
+                            socialreins_brain::automations::tick(state).await.unwrap();
+                        }
+                    };
+
+                    // The provider is down: nothing sent, the credit back, the run waits.
+                    reply("500");
+                    let sent0 = SENT.lock().unwrap().len();
+                    let run = comment(t, &cookie, at, "rt1", 1).await;
+                    assert_eq!(run["status"], "waiting", "{run}");
+                    assert_eq!(used().await.unwrap(), 0, "paid back");
+                    assert_eq!(SENT.lock().unwrap().len(), sent0);
+                    // Back at the next round after the wait: written, sent and paid once.
+                    reply("Hi again!");
+                    let run_id = run["id"].as_str().unwrap().to_owned();
+                    due(run_id.clone()).await;
+                    let run = runs(&s, &cookie, &id).await[0].clone();
+                    assert_eq!(run["status"], "sent", "{run}");
+                    assert_eq!(used().await.unwrap(), 1);
+                    assert_eq!(SENT.lock().unwrap().len(), sent0 + 1);
+                    assert_eq!(run["results"].as_array().unwrap().len(), 1, "{run}");
+
+                    // Down for good: three more tries, then it ends failed, paid back, nothing sent.
+                    reply("500");
+                    let run = comment(t, &cookie, at, "rt2", 2).await;
+                    assert_eq!(run["status"], "waiting", "{run}");
+                    let run_id = run["id"].as_str().unwrap().to_owned();
+                    for n in 1..=3 {
+                        due(run_id.clone()).await;
+                        let run = runs(&s, &cookie, &id).await[0].clone();
+                        assert_eq!(run["id"], run_id.as_str());
+                        let want = if n < 3 { "waiting" } else { "failed" };
+                        assert_eq!(run["status"], want, "try {n}: {run}");
+                    }
+                    let run = runs(&s, &cookie, &id).await[0].clone();
+                    assert_eq!(run["status"], "failed", "{run}");
+                    assert_eq!(run["reason"], "ai_failed");
+                    assert_eq!(used().await.unwrap(), 1, "only the first reply was paid");
+                    assert_eq!(SENT.lock().unwrap().len(), sent0 + 1);
+                }
+
                 /// The allowance counts per calendar month (UTC), a repeated reference is paid
                 /// once, a reply given back frees its slot, and past the allowance come credits.
                 #[tokio::test]
@@ -25836,11 +25923,11 @@ mod teams {
             }
 
             /// A page or conversation that fails after an earlier one keeps what that gave and
-            /// carries on from the failed one; a 429 also holds the account back for a while.
+            /// carries on from the failed one; a 429 or a 5xx also holds the account back for a while.
             #[tokio::test]
             #[serial]
             async fn a_failure_partway_keeps_the_progress() {
-                for (status, held) in [(429, true), (503, false)] {
+                for (status, held) in [(429, true), (503, true)] {
                     let (s, db, state) = on_mock().await;
                     let (_, team_id, account, me) = owner(&s, &db).await;
                     let notes: Vec<Value> = (1..=5)
