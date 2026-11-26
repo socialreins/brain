@@ -375,6 +375,9 @@ async fn create(
     if !t.role.manages() {
         return forbidden();
     }
+    if super::review_login::is_demo_email(&t.current.0.email) {
+        return reply(StatusCode::FORBIDDEN, "review_account");
+    }
     if !t.current.recent() {
         return reply(StatusCode::FORBIDDEN, "reauth_required");
     }

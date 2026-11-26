@@ -3883,6 +3883,24 @@ mod teams {
                         image("image/png", 64)
                     }),
                 )
+                .route(
+                    "/flaky.png",
+                    get(|| async {
+                        if FLAKY
+                            .try_update(
+                                std::sync::atomic::Ordering::SeqCst,
+                                std::sync::atomic::Ordering::SeqCst,
+                                |n| n.checked_sub(1),
+                            )
+                            .is_ok()
+                        {
+                            return axum::response::IntoResponse::into_response(
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            );
+                        }
+                        axum::response::IntoResponse::into_response(image("image/png", 64))
+                    }),
+                )
                 .route("/big.png", get(|| async { image("image/png", 1_000_001) }))
                 .route("/big.gif", get(|| async { image("image/gif", 1_000_001) }))
                 .route("/noise.png", get(|| async { noise_png() }))
@@ -3895,6 +3913,9 @@ mod teams {
             tokio::spawn(async move { axum::serve(listener, app).await });
             base
         }
+
+        /// How many more requests for `/flaky.png` the mock answers with a 503.
+        static FLAKY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
         /// What the mock's inbox endpoints answer, per account DID: `notifications` (a list),
         /// `convos` (a list) and `messages` (convo id to list).
@@ -9869,6 +9890,175 @@ mod teams {
                     assert_eq!(p["status"], "published", "{p}");
                     assert_eq!(p["targets"][0]["retried"], true);
                     assert_eq!(p["targets"][0]["error"], Value::Null);
+                }
+
+                /// A store or a media host that fails for a moment sent nothing, so the target
+                /// goes out again by itself, once (decision 0008).
+                #[tokio::test]
+                #[serial]
+                async fn a_media_host_that_fails_for_a_moment_is_retried_once() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let base = pds_of(&db, &team_id).await;
+                    let records = RECORDS.lock().unwrap().len();
+                    FLAKY.store(1, std::sync::atomic::Ordering::SeqCst);
+                    let id = id_of(&create(&s, &cookie, input(&set, "pic", Some(&past()))).await);
+                    set_media(&db, &base, &id, &["/flaky.png"]).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "queued", "{p}");
+                    let t = &p["targets"][0];
+                    assert_eq!(t["status"], "pending", "{p}");
+                    assert_eq!(t["retried"], true);
+                    let why = t["error"].as_str().unwrap();
+                    assert!(why.contains("(HTTP 503)"), "{why}");
+                    assert!(why.ends_with("Nothing was posted."), "{why}");
+                    assert_eq!(RECORDS.lock().unwrap().len(), records, "nothing was sent");
+                    // Due: the host answers now, and the post goes out once.
+                    retry_now(&db, &id).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(RECORDS.lock().unwrap().len(), records + 1);
+
+                    // Down on the retry too: failed for good, after the one retry.
+                    FLAKY.store(2, std::sync::atomic::Ordering::SeqCst);
+                    let id = id_of(&create(&s, &cookie, input(&set, "pic2", Some(&past()))).await);
+                    set_media(&db, &base, &id, &["/flaky.png"]).await;
+                    publish::tick(&state).await.unwrap();
+                    retry_now(&db, &id).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    assert_eq!(RECORDS.lock().unwrap().len(), records + 1);
+
+                    // A file that is not there is never retried: a 404 stays final.
+                    let id = id_of(&create(&s, &cookie, input(&set, "gone", Some(&past()))).await);
+                    set_media(&db, &base, &id, &["/no/such.png"]).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    assert_eq!(p["targets"][0]["retried"], false);
+                }
+
+                /// Saving a thread part twice (the first try committed, its answer was lost)
+                /// leaves one part.
+                #[tokio::test]
+                #[serial]
+                async fn a_thread_part_is_saved_once_however_often_the_save_is_tried() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let id = id_of(&create(&s, &cookie, input(&set, "root", Some(&past()))).await);
+                    publish::tick(&state).await.unwrap();
+                    let target: uuid::Uuid = get_post(&s, &cookie, &id).await["targets"][0]["id"]
+                        .as_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    let part = json!({"remote_id": "p1", "cid": "", "remote_url": null,
+                        "published_at": "2026-01-01T00:00:00Z"});
+                    for _ in 0..3 {
+                        let stmt = publish::part_saved(target, part.clone(), None, 0);
+                        sea_orm::ConnectionTrait::execute_raw(&db, stmt)
+                            .await
+                            .unwrap();
+                    }
+                    let row = post_targets::Entity::find_by_id(target)
+                        .one(&db)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(row.parts.as_array().unwrap().len(), 1);
+                    // The next part goes after it.
+                    let next = json!({"remote_id": "p2", "cid": "", "remote_url": null,
+                        "published_at": "2026-01-01T00:00:01Z"});
+                    let stmt = publish::part_saved(target, next, None, 1);
+                    sea_orm::ConnectionTrait::execute_raw(&db, stmt)
+                        .await
+                        .unwrap();
+                    let row = post_targets::Entity::find_by_id(target)
+                        .one(&db)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(row.parts.as_array().unwrap().len(), 2);
+                }
+
+                /// Fails the update that saves a post's remote id the first `fails` times.
+                async fn fail_remote_id_saves(db: &DatabaseConnection, fails: u32) {
+                    exec(
+                        db,
+                        format!(
+                            "DROP TRIGGER IF EXISTS rel_fail ON post_targets; \
+                             DROP SEQUENCE IF EXISTS rel_fail_seq; \
+                             CREATE SEQUENCE rel_fail_seq; \
+                             CREATE OR REPLACE FUNCTION rel_fail() RETURNS trigger AS $$ BEGIN \
+                               IF NEW.remote_id IS NOT NULL AND OLD.remote_id IS NULL \
+                                  AND nextval('rel_fail_seq') <= {fails} THEN \
+                                 RAISE EXCEPTION 'injected'; END IF; RETURN NEW; END $$ \
+                               LANGUAGE plpgsql; \
+                             CREATE TRIGGER rel_fail BEFORE UPDATE ON post_targets \
+                               FOR EACH ROW EXECUTE FUNCTION rel_fail()"
+                        ),
+                    )
+                    .await;
+                }
+
+                async fn stop_failing_saves(db: &DatabaseConnection) {
+                    exec(
+                        db,
+                        "DROP TRIGGER IF EXISTS rel_fail ON post_targets; \
+                         DROP FUNCTION IF EXISTS rel_fail(); \
+                         DROP SEQUENCE IF EXISTS rel_fail_seq"
+                            .into(),
+                    )
+                    .await;
+                }
+
+                /// The platform took the post: its id is saved even through a database that
+                /// blinks, and when it cannot be saved the target says it may be live.
+                #[tokio::test]
+                #[serial]
+                async fn a_live_post_keeps_its_id_through_a_database_blink() {
+                    use futures_util::FutureExt;
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let body = std::panic::AssertUnwindSafe(async {
+                        // Two failed saves, the third works.
+                        fail_remote_id_saves(&db, 2).await;
+                        let id =
+                            id_of(&create(&s, &cookie, input(&set, "blink", Some(&past()))).await);
+                        publish::tick(&state).await.unwrap();
+                        let p = get_post(&s, &cookie, &id).await;
+                        assert_eq!(p["status"], "published", "{p}");
+                        assert!(p["targets"][0]["remote_id"].is_string(), "{p}");
+
+                        // Never saved: failed at once as "may be live", no retry offered.
+                        let records = RECORDS.lock().unwrap().len();
+                        fail_remote_id_saves(&db, 1000).await;
+                        let id =
+                            id_of(&create(&s, &cookie, input(&set, "lost", Some(&past()))).await);
+                        publish::tick(&state).await.unwrap();
+                        let p = get_post(&s, &cookie, &id).await;
+                        assert_eq!(p["status"], "failed", "{p}");
+                        let t = &p["targets"][0];
+                        assert_eq!(t["remote_id"], Value::Null, "{p}");
+                        assert!(t["error"].as_str().unwrap().contains("may be live"), "{p}");
+                        assert_eq!(RECORDS.lock().unwrap().len(), records + 1, "sent once");
+                        stop_failing_saves(&db).await;
+                        let res =
+                            req(&s, Method::POST, &format!("/v1/posts/{id}/retry"), &cookie).await;
+                        assert_eq!(res.status_code(), 409, "{}", res.text());
+                    })
+                    .catch_unwind()
+                    .await;
+                    stop_failing_saves(&db).await;
+                    if let Err(e) = body {
+                        std::panic::resume_unwind(e);
+                    }
                 }
 
                 #[tokio::test]
@@ -18311,6 +18501,69 @@ mod teams {
                     assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 4);
                 }
 
+                /// A database error after the target is claimed and before X is called sent
+                /// nothing: the target retries once, and the credit is not lost.
+                #[tokio::test]
+                #[serial]
+                async fn a_database_error_before_the_call_to_x_is_retried_not_stranded() {
+                    use futures_util::FutureExt;
+                    use socialreins_brain::billing::{self, Kind};
+                    let (s, db, mut state, _, mock, cookie, team_id, set) = team().await;
+                    state.billing_enabled = true;
+                    let team: uuid::Uuid = team_id.parse().unwrap();
+                    on_plan(&db, team, "active").await;
+                    billing::grant(&db, team, Kind::X, 3, "test", None)
+                        .await
+                        .unwrap();
+                    let before = mock.tweets.lock().unwrap().len();
+                    let body = std::panic::AssertUnwindSafe(async {
+                        // The credit spend (the first thing after the claim) fails.
+                        db.execute_unprepared(
+                            "DROP TRIGGER IF EXISTS rel_boom ON credit_ledger; \
+                             CREATE OR REPLACE FUNCTION rel_boom() RETURNS trigger AS $$ BEGIN \
+                               RAISE EXCEPTION 'injected'; END $$ LANGUAGE plpgsql; \
+                             CREATE TRIGGER rel_boom BEFORE INSERT ON credit_ledger \
+                               FOR EACH ROW WHEN (NEW.reason = 'x post') \
+                               EXECUTE FUNCTION rel_boom()",
+                        )
+                        .await
+                        .unwrap();
+                        let id = id_of(&create(&s, &cookie, x_post(&set, "Blink")).await);
+                        publish::tick(&state).await.unwrap();
+                        let p = get_post(&s, &cookie, &id).await;
+                        let t = &p["targets"][0];
+                        assert_eq!(t["status"], "pending", "{p}");
+                        assert_eq!(t["retried"], true, "{p}");
+                        let why = t["error"].as_str().unwrap();
+                        assert!(why.ends_with("Nothing was posted."), "{why}");
+                        assert_eq!(mock.tweets.lock().unwrap().len(), before);
+                        db.execute_unprepared("DROP TRIGGER rel_boom ON credit_ledger")
+                            .await
+                            .unwrap();
+                        // Due again: it goes out, and costs its one credit.
+                        db.execute_unprepared(&format!(
+                            "UPDATE post_targets SET retry_at = now() - interval '1 second' \
+                             WHERE post_id = '{id}'"
+                        ))
+                        .await
+                        .unwrap();
+                        publish::tick(&state).await.unwrap();
+                        assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                        assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 2);
+                    })
+                    .catch_unwind()
+                    .await;
+                    db.execute_unprepared(
+                        "DROP TRIGGER IF EXISTS rel_boom ON credit_ledger; \
+                         DROP FUNCTION IF EXISTS rel_boom()",
+                    )
+                    .await
+                    .unwrap();
+                    if let Err(e) = body {
+                        std::panic::resume_unwind(e);
+                    }
+                }
+
                 /// Several X posts due at once for a team with one credit: one goes out, not all.
                 #[tokio::test]
                 #[serial]
@@ -21937,7 +22190,10 @@ mod teams {
                             button_payload: None,
                             attachments: Vec::new(),
                         };
-                        let item = inbox::store(db, account, fresh).await.unwrap().unwrap();
+                        let item = inbox::store(db, account, fresh, false)
+                            .await
+                            .unwrap()
+                            .unwrap();
                         item.contact_id.unwrap()
                     }
 
@@ -24300,6 +24556,14 @@ mod teams {
                     billing: bool,
                     own_key: Option<&str>,
                 ) -> (TestServer, DatabaseConnection, AppState) {
+                    on_ai_capped(billing, own_key, socialreins_brain::ai::DEFAULT_DAILY_CAP).await
+                }
+
+                async fn on_ai_capped(
+                    billing: bool,
+                    own_key: Option<&str>,
+                    daily_cap: i64,
+                ) -> (TestServer, DatabaseConnection, AppState) {
                     let base = mock_bluesky().await;
                     let ai = mock_ai().await;
                     let mut config = Config::from_env().expect("test config");
@@ -24309,6 +24573,7 @@ mod teams {
                     config.bluesky.allow_insecure_pds = true;
                     config.billing_enabled = billing;
                     config.ai.own_key = own_key.map(Into::into);
+                    config.ai.daily_cap = daily_cap;
                     config.ai.anthropic_url = ai;
                     let db = socialreins_brain::connect(&config)
                         .await
@@ -24335,6 +24600,71 @@ mod teams {
 
                 fn reply(text: &str) {
                     *AI_REPLY.lock().unwrap() = text.to_owned();
+                }
+
+                /// With billing off our key is not open: a team gets `AI_DAILY_CAP` calls a day, then
+                /// the run is skipped `ai_daily_cap` and the model is never called. 0 is no cap.
+                #[tokio::test]
+                #[serial]
+                async fn our_key_has_a_daily_cap_for_each_team_when_billing_is_off() {
+                    let (s, db, state) = on_ai_capped(false, Some(OUR_KEY), 2).await;
+                    let (cookie, _, account, me) = owner(&s, &db).await;
+                    let id = automation(
+                        &s,
+                        &cookie,
+                        json!({"name": "AI", "trigger": "comment_received",
+                            "actions": [{"type": "ai_reply_publicly", "prompt": "Say hi"}]}),
+                    )
+                    .await;
+                    let t = (&s, &db, &state);
+                    let at = (account.as_str(), me.as_str(), id.as_str());
+                    reply("Hi there!");
+                    for (rkey, secs) in [("dc1", 1), ("dc2", 2)] {
+                        let run = comment(t, &cookie, at, rkey, secs).await;
+                        assert_eq!(run["status"], "sent", "{run}");
+                    }
+                    let calls = AI_CALLS.lock().unwrap().len();
+                    let run = comment(t, &cookie, at, "dc3", 3).await;
+                    assert_eq!(run["status"], "skipped", "{run}");
+                    assert_eq!(run["reason"], "ai_daily_cap");
+                    assert_eq!(AI_CALLS.lock().unwrap().len(), calls);
+
+                    // A call that gives nothing usable gives its slot back: an outage drains nothing.
+                    let (s, db, state) = on_ai_capped(false, Some(OUR_KEY), 1).await;
+                    let (cookie, _, account, me) = owner(&s, &db).await;
+                    let id = automation(
+                        &s,
+                        &cookie,
+                        json!({"name": "AI", "trigger": "comment_received",
+                            "actions": [{"type": "ai_reply_publicly", "prompt": "Say hi"}]}),
+                    )
+                    .await;
+                    let t = (&s, &db, &state);
+                    let at = (account.as_str(), me.as_str(), id.as_str());
+                    reply("500");
+                    for (rkey, secs) in [("df1", 1), ("df2", 2)] {
+                        let run = comment(t, &cookie, at, rkey, secs).await;
+                        assert_eq!(run["reason"], "ai_failed", "{run}");
+                    }
+                    reply("Hi there!");
+                    let run = comment(t, &cookie, at, "df3", 3).await;
+                    assert_eq!(run["status"], "sent", "{run}");
+
+                    let (s, db, state) = on_ai_capped(false, Some(OUR_KEY), 0).await;
+                    let (cookie, _, account, me) = owner(&s, &db).await;
+                    let id = automation(
+                        &s,
+                        &cookie,
+                        json!({"name": "AI", "trigger": "comment_received",
+                            "actions": [{"type": "ai_reply_publicly", "prompt": "Say hi"}]}),
+                    )
+                    .await;
+                    let t = (&s, &db, &state);
+                    let at = (account.as_str(), me.as_str(), id.as_str());
+                    for (rkey, secs) in [("dn1", 1), ("dn2", 2), ("dn3", 3)] {
+                        let run = comment(t, &cookie, at, rkey, secs).await;
+                        assert_eq!(run["status"], "sent", "{run}");
+                    }
                 }
 
                 /// AI sends are checked on save, use the team's key, record the provider and
@@ -27937,7 +28267,7 @@ mod teams {
                     .await;
                 assert_eq!(res.status_code(), 201, "{}", res.text());
 
-                let plain = json!({"name": "Leads", "trigger": "dm_received",
+                let plain = json!({"name": "Leads", "trigger": "dm_received", "cooldown_minutes": 0,
                     "actions": [tag("  Lead "), hi]});
                 let res = req(&s, Method::POST, "/v1/automations", &cookie)
                     .json(&plain)
@@ -28292,7 +28622,7 @@ mod teams {
                     &s,
                     &cookie,
                     json!({"name": "Follow likers", "trigger": "like_received",
-                        "actions": [{"type": "follow_back"}]}),
+                        "cooldown_minutes": 0, "actions": [{"type": "follow_back"}]}),
                 )
                 .await;
                 set_inbox(
@@ -28579,6 +28909,7 @@ mod teams {
                         button_payload: None,
                         attachments: vec![],
                     },
+                    false,
                 )
                 .await
                 .unwrap()
@@ -28782,6 +29113,7 @@ mod teams {
                         button_payload: None,
                         attachments: vec![],
                     },
+                    false,
                 )
                 .await
                 .unwrap()
@@ -36052,7 +36384,7 @@ mod teams {
             assert_eq!(b["limits"]["automation"], true);
             assert_eq!(
                 b["usage"],
-                json!({"accounts": 0, "members": 1, "inboxes": 0, "ai_replies": 0})
+                json!({"accounts": 0, "members": 1, "contacts": 0, "inboxes": 0, "ai_replies": 0})
             );
             assert_eq!(b["limits"]["inboxes"], Value::Null);
             assert_eq!(b["limits"]["ai_monthly"], Value::Null);
@@ -36362,6 +36694,78 @@ mod teams {
         async fn post(s: &TestServer, cookie: &str, path: &str, body: Value) -> (u16, Value) {
             let res = req(s, Method::POST, path, cookie).json(&body).await;
             (res.status_code().as_u16(), res.json())
+        }
+
+        /// The plan's contact limit (not stored when billing is off): a new person makes no contact
+        /// past it, their item is stored all the same, and the contacts there keep updating.
+        #[tokio::test]
+        #[serial]
+        async fn a_plans_contact_limit_stops_new_contacts_only() {
+            use socialreins_brain::{
+                connectors::bluesky::Author,
+                inbox::{self, Fresh},
+            };
+            let (s, db) = server_where(|c| c.billing_enabled = true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            db.execute_unprepared(
+                "INSERT INTO plans (id, name, automation, max_contacts) \
+                 VALUES ('tiny_contacts', 'Tiny', true, 2) ON CONFLICT DO NOTHING",
+            )
+            .await
+            .unwrap();
+            subscribe(&db, &team, "tiny_contacts").await;
+            let account = bluesky_account(&db, &team).await;
+            let account = socialreins_brain::models::social_accounts::Entity::find_by_id(account)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            let say = |who: &'static str, billing: bool| {
+                let (db, account) = (&db, &account);
+                async move {
+                    let fresh = Fresh {
+                        kind: "comment",
+                        remote_id: format!("{who}-{}", uuid::Uuid::now_v7().simple()),
+                        remote_cid: None,
+                        parent: None,
+                        root: (None, None),
+                        convo_id: None,
+                        author: Author {
+                            did: who.to_owned(),
+                            ..Author::default()
+                        },
+                        text: "hi".into(),
+                        at: Utc::now().fixed_offset(),
+                        permalink: None,
+                        story: None,
+                        button_payload: None,
+                        attachments: Vec::new(),
+                    };
+                    inbox::store(db, account, fresh, billing)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                }
+            };
+            assert!(say("a", true).await.contact_id.is_some());
+            assert!(say("b", true).await.contact_id.is_some());
+            // The third person: the item is kept, the contact is not made.
+            assert!(say("c", true).await.contact_id.is_none());
+            // A person already there is still known and still updated.
+            assert!(say("a", true).await.contact_id.is_some());
+            // Billing off (self-host): no limit.
+            assert!(say("d", false).await.contact_id.is_some());
+            // Cheaper plan check: a plan without a limit stores them.
+            subscribe(&db, &team, "scheduler").await;
+            assert!(say("e", true).await.contact_id.is_some());
+            // And no live plan at all stores none, as every other limit does.
+            db.execute_unprepared(&format!(
+                "UPDATE subscriptions SET status = 'canceled' WHERE team_id = '{team}'"
+            ))
+            .await
+            .unwrap();
+            assert!(say("f", true).await.contact_id.is_none());
         }
 
         /// A plan without automation refuses to create or send any of its features; one with it,
@@ -37461,6 +37865,126 @@ mod teams {
             );
             assert_eq!(send(&events[2]).await.status_code(), 200);
             assert_eq!(plan_of(&s, &owner).await["status"], "canceled");
+        }
+
+        /// One trial for a person (decision 0015): a trial that began in one team is not offered
+        /// again in a new team of the same person, not even under another `+tag`.
+        #[tokio::test]
+        #[serial]
+        async fn a_person_gets_one_trial_not_one_per_team() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let billing = |c: String| {
+                let s = &s;
+                async move {
+                    req(s, Method::GET, "/v1/team/billing", &c)
+                        .await
+                        .json::<Value>()
+                }
+            };
+            assert_eq!(billing(owner.clone()).await["trial_available"], true);
+            let before = count("/checkout");
+            checkout(&s, &owner, "scheduler").await.assert_status_ok();
+            let f = form_of("/checkout", before);
+            assert_eq!(f["subscription_data[trial_period_days]"], "7");
+            let key = f["subscription_data[metadata][trial_key]"].clone();
+            assert!(key.contains('@'), "{key}");
+            // Stripe starts the trial: the person is written down.
+            let now = Utc::now().timestamp();
+            let mut e: Value = serde_json::from_str(&sub_event(
+                "evt_trial",
+                now,
+                "sub_trial",
+                &team,
+                "trialing",
+                "price_s",
+            ))
+            .unwrap();
+            e["data"]["object"]["metadata"]["trial_key"] = key.clone().into();
+            assert_eq!(
+                deliver(&s, &e.to_string(), WHSEC, now).await.status_code(),
+                200
+            );
+            let used = |k: String| {
+                let db = &db;
+                async move {
+                    db.query_one_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "SELECT 1 FROM trial_uses WHERE person_key = $1",
+                        [k.into()],
+                    ))
+                    .await
+                    .unwrap()
+                    .is_some()
+                }
+            };
+            assert!(used(key.clone()).await);
+            // A new team of the same person pays at once, however the team starts.
+            let made = req(&s, Method::POST, "/v1/teams", &owner)
+                .json(&json!({"name": "Second"}))
+                .await;
+            assert_eq!(made.status_code(), 201);
+            assert_eq!(billing(owner.clone()).await["trial_available"], false);
+            let before = count("/checkout");
+            checkout(&s, &owner, "scheduler").await.assert_status_ok();
+            let f = form_of("/checkout", before);
+            assert!(
+                !f.contains_key("subscription_data[trial_period_days]"),
+                "{f:?}"
+            );
+            assert!(!f.contains_key("subscription_data[metadata][trial_key]"));
+            // Someone else's trial is not this person's.
+            let (_, other, _) = user(&s, &db).await;
+            assert_eq!(billing(other).await["trial_available"], true);
+        }
+
+        /// Two checkouts opened before either finished both carry a trial: the second to start is
+        /// cancelled in Stripe and never written, and the first stays.
+        #[tokio::test]
+        #[serial]
+        async fn two_trials_started_at_once_keep_one() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let first = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let made = req(&s, Method::POST, "/v1/teams", &owner)
+                .json(&json!({"name": "Other"}))
+                .await;
+            let second = made.json::<Value>()["id"].as_str().unwrap().to_owned();
+            let key = format!("race-{}@example.com", *RUN);
+            let now = Utc::now().timestamp();
+            for (i, team) in [&first, &second].into_iter().enumerate() {
+                let mut e: Value = serde_json::from_str(&sub_event(
+                    &format!("evt_race{i}"),
+                    now,
+                    &format!("sub_race{i}"),
+                    team,
+                    "trialing",
+                    "price_s",
+                ))
+                .unwrap();
+                e["data"]["object"]["metadata"]["trial_key"] = key.clone().into();
+                assert_eq!(
+                    deliver(&s, &e.to_string(), WHSEC, now).await.status_code(),
+                    200
+                );
+            }
+            let held = |team: String| {
+                let db = &db;
+                async move {
+                    db.query_one_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "SELECT 1 FROM subscriptions WHERE team_id = $1",
+                        [team.parse::<uuid::Uuid>().unwrap().into()],
+                    ))
+                    .await
+                    .unwrap()
+                    .is_some()
+                }
+            };
+            assert!(held(first).await);
+            assert!(!held(second).await);
+            assert_eq!(count(&format!("/cancel/sub_race1_{}", *RUN)), 1);
         }
 
         #[tokio::test]

@@ -465,7 +465,8 @@ async fn store_new(
                 if n.author.did == account.external_id {
                     continue;
                 }
-                if let Some(item) = store_notification(db, &account, n).await? {
+                if let Some(item) = store_notification(db, &account, n, app.billing_enabled).await?
+                {
                     fresh.push(item);
                 }
             }
@@ -517,7 +518,7 @@ async fn store_new(
     {
         Ok(read) => {
             for m in read.found.iter().rev() {
-                if let Some(item) = store_message(db, &account, m).await? {
+                if let Some(item) = store_message(db, &account, m, app.billing_enabled).await? {
                     fresh.push(item);
                 }
             }
@@ -605,6 +606,10 @@ const INSERT: &str = concat!(
     handle, display_name, avatar_url, first_seen_at, last_seen_at) \
     SELECT $24, $2, $4, $12, $13, $14, $15, $17, $17 WHERE $5 NOT IN ('like', 'repost') \
     AND NOT EXISTS (SELECT 1 FROM hit) \
+    AND (NOT $27 OR EXISTS (SELECT 1 FROM subscriptions s JOIN plans p ON p.id = s.plan_id \
+      WHERE s.team_id = $2 AND s.status IN ('trialing', 'active', 'past_due') \
+      AND (p.max_contacts IS NULL OR (SELECT count(*) FROM contacts x WHERE x.team_id = $2) \
+        < p.max_contacts))) \
     ON CONFLICT (team_id, platform, external_id) DO UPDATE SET ",
     contact_set!(),
     " RETURNING id) \
@@ -675,18 +680,22 @@ pub async fn store(
     db: &DatabaseConnection,
     account: &social_accounts::Model,
     f: Fresh,
+    billing: bool,
 ) -> Result<Option<inbox_items::Model>, DbErr> {
-    store_with(db, account, f, (true, false)).await
+    store_with(db, account, f, (true, false), billing).await
 }
 
 /// `store`; with `opt` false a `stop` or `start` changes nobody's broadcast opt-out (a message read
 /// late, which a newer one from its author may already have overruled), and with `automated` the
-/// item is stored as already automated, in the same statement, so no automation answers it.
+/// item is stored as already automated, in the same statement, so no automation answers it. With
+/// `billing` on, a new author makes no contact once the team's plan has its `max_contacts` (the
+/// item is stored all the same, without a contact; contacts it has stay and keep updating).
 pub async fn store_with(
     db: &DatabaseConnection,
     account: &social_accounts::Model,
     f: Fresh,
     (opt, automated): (bool, bool),
+    billing: bool,
 ) -> Result<Option<inbox_items::Model>, DbErr> {
     let values: Vec<Value> = vec![
         Uuid::now_v7().into(),
@@ -721,6 +730,7 @@ pub async fn store_with(
         Uuid::now_v7().into(),
         serde_json::json!(f.attachments[..f.attachments.len().min(MAX_ATTACHMENTS)]).into(),
         automated.into(),
+        billing.into(),
     ];
     let item = inbox_items::Entity::find()
         .from_raw_sql(sql(INSERT, values))
@@ -765,6 +775,7 @@ async fn store_notification(
     db: &DatabaseConnection,
     account: &social_accounts::Model,
     n: &Notification,
+    billing: bool,
 ) -> Result<Option<inbox_items::Model>, DbErr> {
     let fresh = Fresh {
         kind: n.kind,
@@ -781,13 +792,14 @@ async fn store_notification(
         button_payload: None,
         attachments: n.attachments.clone(),
     };
-    store(db, account, fresh).await
+    store(db, account, fresh, billing).await
 }
 
 async fn store_message(
     db: &DatabaseConnection,
     account: &social_accounts::Model,
     m: &Message,
+    billing: bool,
 ) -> Result<Option<inbox_items::Model>, DbErr> {
     let fresh = Fresh {
         kind: "dm",
@@ -804,7 +816,7 @@ async fn store_message(
         button_payload: None,
         attachments: Vec::new(),
     };
-    store(db, account, fresh).await
+    store(db, account, fresh, billing).await
 }
 
 /// How a reply goes out.
