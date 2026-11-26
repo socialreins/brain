@@ -45,8 +45,11 @@ pub struct Part {
     pub skip: &'static str,
     /// `WHERE` of the slice; `$1` is the team (or, for the user's own parts, the user).
     pub filter: &'static str,
-    /// A text expression unique among the slice's rows; pages continue after the last one.
+    /// An expression unique among the slice's rows; pages continue after the last one. A column
+    /// (`id`) is compared as a uuid so the primary key index serves the page; the composite
+    /// keys of the small link tables are text.
     pub id: &'static str,
+    pub uuid: bool,
     /// One row, written as an object (or `null`), not a list.
     pub one: bool,
 }
@@ -64,7 +67,8 @@ const fn part(
         cols,
         skip,
         filter,
-        id: "id::text",
+        id: "id",
+        uuid: true,
         one: false,
     }
 }
@@ -76,6 +80,7 @@ const fn one(mut p: Part) -> Part {
 
 const fn keyed(mut p: Part, id: &'static str) -> Part {
     p.id = id;
+    p.uuid = false;
     p
 }
 
@@ -302,9 +307,11 @@ fn stmt(sql: &str, values: Vec<Value>) -> Statement {
 fn page_sql(p: &Part, filter: &str, last: usize) -> String {
     format!(
         "SELECT k, to_jsonb(r) - 'k' AS j FROM \
-         (SELECT {id} AS k, {cols} FROM {table} WHERE {filter}) r \
-         WHERE k > ${last} ORDER BY k LIMIT {PAGE}",
+         (SELECT {id}::text AS k, {cols} FROM {table} \
+          WHERE ({filter}) AND {id} > ${last}::text{cast} ORDER BY {id} LIMIT {PAGE}) r \
+         ORDER BY k",
         id = p.id,
+        cast = if p.uuid { "::uuid" } else { "" },
         cols = p.cols,
         table = p.table,
     )
@@ -321,7 +328,11 @@ async fn write_part(
     let head = format!("{}:", serde_json::to_string(p.key).unwrap_or_default());
     out.put(if p.one { head } else { format!("{head}[") })
         .await?;
-    let mut last = String::new();
+    let mut last = if p.uuid {
+        Uuid::nil().to_string()
+    } else {
+        String::new()
+    };
     let mut first = true;
     loop {
         let mut values = binds.to_vec();
@@ -393,14 +404,15 @@ async fn export_to(db: &DatabaseConnection, out: &Sink, user: Uuid) -> Result<()
             json_str(&role)
         ))
         .await?;
-        if role == "member" {
-            write_parts(db, out, MEMBER, &[team.into(), user.into()]).await?;
-        } else {
-            write_parts(db, out, TEAM_PARTS, &[team.into()]).await?;
+        match role.as_str() {
+            "owner" | "admin" => write_parts(db, out, TEAM_PARTS, &[team.into()]).await?,
+            "member" => write_parts(db, out, MEMBER, &[team.into(), user.into()]).await?,
+            _ => {}
         }
         out.put("}".into()).await?;
     }
-    out.put("]}".into()).await?;
+    // A body cut short by a failure ends without it, whatever a proxy does with the broken stream.
+    out.put("],\"complete\":true}".into()).await?;
     Ok(())
 }
 
@@ -456,10 +468,11 @@ async fn export(
     tokio::spawn(async move {
         let sink = Sink(tx);
         let done = export_to(&db, &sink, id).await;
-        if let Err(stop) = done {
-            // A failed or abandoned export gives its slot back.
+        // A reader that leaves keeps its slot used (else dropping the connection would make
+        // exports free); only our own failure gives it back.
+        if let Err(Stop::Db(e)) = done {
             crate::rate_limit::daily_refund(&db, &[hit]).await;
-            if let Stop::Db(e) = stop {
+            {
                 tracing::error!(error = %e, "account export failed");
                 let _ = sink
                     .0
@@ -495,6 +508,8 @@ struct Confirm {
 
 enum Erased {
     Done,
+    /// Already deleted by an earlier request: nothing to do, nothing to send.
+    Gone,
     /// Teams the person owns alone that other people belong to.
     Shared(Vec<String>),
     /// A subscription Stripe would not cancel.
@@ -505,16 +520,20 @@ enum Erased {
 /// inside the transaction, so a failure leaves everything as it was), then the person's own
 /// rows and what is keyed by their email. Locks the user and every team of theirs first, so a
 /// member joining or leaving cannot change the answer while it runs. Posts already out on a
-/// network are not touched; stored files of a deleted team go with the hourly media sweep.
+/// network are not touched; stored files of a deleted team go with the media sweep (up to 7 days).
 async fn erase(app: &AppState, user: &users::Model) -> Result<Erased, DbErr> {
     let txn = app.db.begin().await?;
     let id = || vec![Value::from(user.id)];
-    txn.execute_raw(stmt("SELECT id FROM users WHERE id = $1 FOR UPDATE", id()))
-        .await?;
+    // Teams first, then the user: the order `DELETE /v1/team` takes them in.
     let lock =
         "SELECT id FROM teams WHERE id IN (SELECT team_id FROM team_user WHERE user_id = $1) \
                 ORDER BY id FOR UPDATE";
     txn.execute_raw(stmt(lock, id())).await?;
+    let locked = "SELECT id FROM users WHERE id = $1 FOR UPDATE";
+    if txn.query_one_raw(stmt(locked, id())).await?.is_none() {
+        // A second request for the same deletion, after the first one went through.
+        return Ok(Erased::Gone);
+    }
     let sql = "SELECT t.id, t.name, t.slug, tu.role, \
         (SELECT count(*) FROM team_user o WHERE o.team_id = t.id AND o.user_id <> $1) AS others, \
         (SELECT count(*) FROM team_user o WHERE o.team_id = t.id AND o.user_id <> $1 \
@@ -540,7 +559,7 @@ async fn erase(app: &AppState, user: &users::Model) -> Result<Erased, DbErr> {
     if !stuck.is_empty() {
         return Ok(Erased::Shared(stuck));
     }
-    let mut cancelled = 0_i32;
+    let mut subs = Vec::new();
     for (team, _) in &solo {
         let sql = "SELECT provider_subscription_id AS sub FROM subscriptions WHERE team_id = $1 \
                    AND provider = 'stripe' AND provider_subscription_id IS NOT NULL \
@@ -548,16 +567,7 @@ async fn erase(app: &AppState, user: &users::Model) -> Result<Erased, DbErr> {
         let Some(row) = txn.query_one_raw(stmt(sql, vec![(*team).into()])).await? else {
             continue;
         };
-        let sub: String = row.try_get("", "sub")?;
-        // `resource_missing`: Stripe has already ended it, which is what we wanted.
-        match app.stripe.cancel(&sub).await {
-            Ok(()) => cancelled += 1,
-            Err(e) if e.1 == "resource_missing" => {}
-            Err(e) => {
-                tracing::error!(%team, status = ?e.0, code = %e.1, "account delete: stripe cancel failed");
-                return Ok(Erased::Stripe);
-            }
-        }
+        subs.push(row.try_get::<String>("", "sub")?);
     }
     for (team, slug) in &solo {
         if let Some(slug) = slug {
@@ -592,6 +602,21 @@ async fn erase(app: &AppState, user: &users::Model) -> Result<Erased, DbErr> {
         .await?;
     txn.execute_raw(stmt("DELETE FROM users WHERE id = $1", id()))
         .await?;
+    // Last, so what can fail in the database fails before the one step that cannot be undone. A
+    // second team's refusal after a first's cancel still leaves that one cancelled: a retry
+    // finds it ended (`resource_missing`) and goes on.
+    let mut cancelled = 0_i32;
+    for sub in &subs {
+        match app.stripe.cancel(sub).await {
+            Ok(()) => cancelled += 1,
+            // Stripe has already ended it, which is what we wanted.
+            Err(e) if e.1 == "resource_missing" => {}
+            Err(e) => {
+                tracing::error!(status = ?e.0, code = %e.1, "account delete: stripe cancel failed");
+                return Ok(Erased::Stripe);
+            }
+        }
+    }
     let audit =
         "INSERT INTO account_deletions (teams_deleted, teams_left, subscriptions_cancelled) \
                  VALUES ($1, $2, $3)";
@@ -605,7 +630,7 @@ async fn erase(app: &AppState, user: &users::Model) -> Result<Erased, DbErr> {
 /// sign-in from the last 10 minutes (`403 reauth_required`) and the account's email in the body
 /// (`422 email_mismatch`). A team the person alone owns but others belong to must be handed over
 /// or deleted first (`409 owns_shared_team` with the team names); a team only they belong to is
-/// deleted with them, its Stripe plan cancelled first (`502 stripe_failed`, nothing deleted).
+/// deleted with them, its Stripe plan cancelled last, before the commit (`502 stripe_failed`, nothing deleted).
 /// Sessions end, a mail confirms it. The App Review demo user cannot (`403 review_account`).
 #[utoipa::path(delete, path = "/account", tag = "account", request_body = Confirm,
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
@@ -627,6 +652,10 @@ async fn destroy(
         return error(StatusCode::UNPROCESSABLE_ENTITY, "email_mismatch").into_response();
     }
     match erase(&app, &user).await {
+        Ok(Erased::Gone) => {
+            let clear = named_cookie(&app, SESSION_COOKIE, "/", "", 0);
+            return (StatusCode::NO_CONTENT, [(header::SET_COOKIE, clear)]).into_response();
+        }
         Ok(Erased::Done) => {}
         Ok(Erased::Shared(teams)) => {
             let body = serde_json::json!({"error": "owns_shared_team", "teams": teams});

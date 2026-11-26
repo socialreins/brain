@@ -449,7 +449,9 @@ async fn apply_subscription(
     ) {
         let claimed = db
             .execute_raw(stmt(
-                "INSERT INTO trial_uses (person_key, team_id) VALUES ($1, $2) \
+                "INSERT INTO trial_uses (person_key, team_id) SELECT $1::text, $2 \
+                 WHERE NOT EXISTS (SELECT 1 FROM trial_uses \
+                   WHERE person_key = encode(sha256(convert_to($1::text, 'UTF8')), 'hex')) \
                  ON CONFLICT DO NOTHING",
                 vec![key.into(), team.into()],
             ))

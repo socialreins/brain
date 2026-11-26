@@ -37599,6 +37599,12 @@ mod teams {
             CALLS.lock().unwrap().iter().filter(|c| c.0 == path).count()
         }
 
+        async fn put(db: &DatabaseConnection, sql: &str, value: &str) {
+            let stmt =
+                Statement::from_sql_and_values(DbBackend::Postgres, sql, [value.to_owned().into()]);
+            db.execute_raw(stmt).await.unwrap();
+        }
+
         async fn put_sub(
             db: &DatabaseConnection,
             team: &str,
@@ -38469,6 +38475,45 @@ mod teams {
         /// again in a new team of the same person, not even under another `+tag`.
         #[tokio::test]
         #[serial]
+        async fn a_late_trial_event_does_not_write_a_deleted_persons_address_back() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let key = format!("gone{}@example.com", uuid::Uuid::now_v7().simple());
+            // What deleting the account leaves: the key as a hash.
+            let sql = "INSERT INTO trial_uses (person_key) \
+                       VALUES (encode(sha256(convert_to($1::text, 'UTF8')), 'hex'))";
+            put(&db, sql, &key).await;
+            let now = Utc::now().timestamp();
+            let mut e: Value = serde_json::from_str(&sub_event(
+                &format!("evt_late_{}", *RUN),
+                now,
+                &format!("sub_late_{}", *RUN),
+                &team,
+                "trialing",
+                "price_s",
+            ))
+            .unwrap();
+            e["data"]["object"]["metadata"]["trial_key"] = key.clone().into();
+            assert_eq!(
+                deliver(&s, &e.to_string(), WHSEC, now).await.status_code(),
+                200
+            );
+            let plain = "SELECT count(*) AS n FROM trial_uses WHERE person_key = $1";
+            let row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    plain,
+                    [key.into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
+        }
+
+        #[tokio::test]
+        #[serial]
         async fn a_person_gets_one_trial_not_one_per_team() {
             let (s, db) = on(true).await;
             let (_, owner, _) = user(&s, &db).await;
@@ -38875,6 +38920,7 @@ mod teams {
             }
             let v: Value = serde_json::from_str(&text).unwrap();
             assert!(v["readme"].as_str().unwrap().contains("plain member"));
+            assert_eq!(v["complete"], true);
             assert_eq!(v["profile"]["email"], email);
             assert_eq!(v["passkeys"][0]["name"], "Laptop");
             assert_eq!(v["memberships"][0]["role"], "owner");
