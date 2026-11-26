@@ -3883,6 +3883,24 @@ mod teams {
                         image("image/png", 64)
                     }),
                 )
+                .route(
+                    "/flaky.png",
+                    get(|| async {
+                        if FLAKY
+                            .try_update(
+                                std::sync::atomic::Ordering::SeqCst,
+                                std::sync::atomic::Ordering::SeqCst,
+                                |n| n.checked_sub(1),
+                            )
+                            .is_ok()
+                        {
+                            return axum::response::IntoResponse::into_response(
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            );
+                        }
+                        axum::response::IntoResponse::into_response(image("image/png", 64))
+                    }),
+                )
                 .route("/big.png", get(|| async { image("image/png", 1_000_001) }))
                 .route("/big.gif", get(|| async { image("image/gif", 1_000_001) }))
                 .route("/noise.png", get(|| async { noise_png() }))
@@ -3895,6 +3913,9 @@ mod teams {
             tokio::spawn(async move { axum::serve(listener, app).await });
             base
         }
+
+        /// How many more requests for `/flaky.png` the mock answers with a 503.
+        static FLAKY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
         /// What the mock's inbox endpoints answer, per account DID: `notifications` (a list),
         /// `convos` (a list) and `messages` (convo id to list).
@@ -7099,9 +7120,9 @@ mod teams {
                     assert_eq!(p["targets"][0]["error"], msg);
                     assert_eq!(p["error"], format!("@{handle}: {msg}"));
                     assert!(!p.to_string().contains("secret.example"));
+                    // A failed post has nothing on any network, so it can be deleted.
                     let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
-                    assert_eq!(res.status_code(), 409);
-                    res.assert_json(&json!({"error": "not_deletable"}));
+                    assert_eq!(res.status_code(), 204);
                 }
 
                 // A refused app password asks for a reconnect, on publish and on takedown.
@@ -9046,6 +9067,116 @@ mod teams {
 
             #[tokio::test]
             #[serial]
+            async fn the_post_cap_counts_live_posts_once_each_and_the_list_takes_a_limit() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let run = |sql: String| {
+                    let db = db.clone();
+                    async move {
+                        use sea_orm::ConnectionTrait;
+                        db.execute_raw(sea_orm::Statement::from_string(
+                            sea_orm::DbBackend::Postgres,
+                            sql,
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                };
+                let rows = |status: &str, groups: u32, copies: u32, at: &str| {
+                    format!(
+                        "INSERT INTO posts (id, team_id, social_set_id, platform, status, group_id, scheduled_at, published_at) \
+                         SELECT gen_random_uuid(), '{team_id}', '{set}', 'bluesky', '{status}', \
+                         md5('{status}' || g::text)::uuid, {at}, {at} \
+                         FROM generate_series(1, {groups}) g, generate_series(1, {copies}) c"
+                    )
+                };
+                // History does not count: 2,500 published posts and a taken-down one.
+                run(rows(
+                    "published",
+                    2500,
+                    1,
+                    "now() - g * interval '1 minute'",
+                ))
+                .await;
+                run(rows("deleted", 10, 1, "NULL")).await;
+                // 1,998 live posts of 3 copies each (5,994 rows) leave room for two more posts.
+                run(rows("draft", 1998, 3, "NULL")).await;
+                let res = create(&s, &cookie, input(&set, "one", None)).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                // A failed post counts too, until it is deleted.
+                let failed = create(&s, &cookie, input(&set, "two", None)).await;
+                assert_eq!(failed.status_code(), 201);
+                let failed = id_of(&failed);
+                run(format!(
+                    "UPDATE posts SET status = 'failed' WHERE id = '{failed}'"
+                ))
+                .await;
+                let res = create(&s, &cookie, input(&set, "three", None)).await;
+                assert_eq!(res.status_code(), 409);
+                res.assert_json(&json!({"error": "too_many_posts"}));
+                // One with a target that is up (a partial send) is kept for a take down.
+                run(format!(
+                    "INSERT INTO post_targets (id, post_id, status, remote_id) \
+                     VALUES (gen_random_uuid(), '{failed}', 'failed', 'up')"
+                ))
+                .await;
+                let res = req(&s, Method::DELETE, &format!("/v1/posts/{failed}"), &cookie).await;
+                assert_eq!(res.status_code(), 409);
+                run(format!(
+                    "DELETE FROM post_targets WHERE post_id = '{failed}'"
+                ))
+                .await;
+                let res = req(&s, Method::DELETE, &format!("/v1/posts/{failed}"), &cookie).await;
+                assert_eq!(res.status_code(), 204);
+                assert_eq!(
+                    create(&s, &cookie, input(&set, "three", None))
+                        .await
+                        .status_code(),
+                    201
+                );
+
+                // The list takes a limit and an order, and the newest published are reachable.
+                let list = |q: &str| {
+                    let path = format!("/v1/posts?{q}");
+                    let (s, cookie) = (&s, cookie.clone());
+                    async move { req(s, Method::GET, &path, &cookie).await }
+                };
+                let res = list("status=published&order=desc&limit=3").await;
+                assert_eq!(res.status_code(), 200);
+                let got: Vec<Value> = res.json();
+                assert_eq!(got.len(), 3);
+                let times: Vec<&str> = got
+                    .iter()
+                    .map(|p| p["scheduled_at"].as_str().unwrap())
+                    .collect();
+                assert!(times[0] > times[1] && times[1] > times[2], "{times:?}");
+                let oldest: Vec<Value> = list("status=published&limit=1").await.json();
+                assert!(oldest[0]["scheduled_at"].as_str().unwrap() < times[2]);
+                assert_eq!(
+                    list("status=published").await.json::<Vec<Value>>().len(),
+                    2000
+                );
+                for bad in ["limit=0", "limit=2001", "order=sideways"] {
+                    assert_eq!(list(bad).await.status_code(), 422, "{bad}");
+                }
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn json_answers_are_compressed_for_clients_that_ask() {
+                let (s, _, _) = on_mock().await;
+                let res = s
+                    .get("/openapi.json")
+                    .add_header("accept-encoding", "gzip")
+                    .await;
+                assert_eq!(res.header("content-encoding"), "gzip");
+                let res = s.get("/openapi.json").await;
+                assert!(res.maybe_header("content-encoding").is_none());
+            }
+
+            #[tokio::test]
+            #[serial]
             async fn validate_only_and_the_create_agree() {
                 let (s, db, _) = on_mock().await;
                 let (cookie, team_id, _) = owner_with_account(&s, &db).await;
@@ -9869,6 +10000,175 @@ mod teams {
                     assert_eq!(p["status"], "published", "{p}");
                     assert_eq!(p["targets"][0]["retried"], true);
                     assert_eq!(p["targets"][0]["error"], Value::Null);
+                }
+
+                /// A store or a media host that fails for a moment sent nothing, so the target
+                /// goes out again by itself, once (decision 0008).
+                #[tokio::test]
+                #[serial]
+                async fn a_media_host_that_fails_for_a_moment_is_retried_once() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let base = pds_of(&db, &team_id).await;
+                    let records = RECORDS.lock().unwrap().len();
+                    FLAKY.store(1, std::sync::atomic::Ordering::SeqCst);
+                    let id = id_of(&create(&s, &cookie, input(&set, "pic", Some(&past()))).await);
+                    set_media(&db, &base, &id, &["/flaky.png"]).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "queued", "{p}");
+                    let t = &p["targets"][0];
+                    assert_eq!(t["status"], "pending", "{p}");
+                    assert_eq!(t["retried"], true);
+                    let why = t["error"].as_str().unwrap();
+                    assert!(why.contains("(HTTP 503)"), "{why}");
+                    assert!(why.ends_with("Nothing was posted."), "{why}");
+                    assert_eq!(RECORDS.lock().unwrap().len(), records, "nothing was sent");
+                    // Due: the host answers now, and the post goes out once.
+                    retry_now(&db, &id).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "published", "{p}");
+                    assert_eq!(RECORDS.lock().unwrap().len(), records + 1);
+
+                    // Down on the retry too: failed for good, after the one retry.
+                    FLAKY.store(2, std::sync::atomic::Ordering::SeqCst);
+                    let id = id_of(&create(&s, &cookie, input(&set, "pic2", Some(&past()))).await);
+                    set_media(&db, &base, &id, &["/flaky.png"]).await;
+                    publish::tick(&state).await.unwrap();
+                    retry_now(&db, &id).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    assert_eq!(RECORDS.lock().unwrap().len(), records + 1);
+
+                    // A file that is not there is never retried: a 404 stays final.
+                    let id = id_of(&create(&s, &cookie, input(&set, "gone", Some(&past()))).await);
+                    set_media(&db, &base, &id, &["/no/such.png"]).await;
+                    publish::tick(&state).await.unwrap();
+                    let p = get_post(&s, &cookie, &id).await;
+                    assert_eq!(p["status"], "failed", "{p}");
+                    assert_eq!(p["targets"][0]["retried"], false);
+                }
+
+                /// Saving a thread part twice (the first try committed, its answer was lost)
+                /// leaves one part.
+                #[tokio::test]
+                #[serial]
+                async fn a_thread_part_is_saved_once_however_often_the_save_is_tried() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let id = id_of(&create(&s, &cookie, input(&set, "root", Some(&past()))).await);
+                    publish::tick(&state).await.unwrap();
+                    let target: uuid::Uuid = get_post(&s, &cookie, &id).await["targets"][0]["id"]
+                        .as_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    let part = json!({"remote_id": "p1", "cid": "", "remote_url": null,
+                        "published_at": "2026-01-01T00:00:00Z"});
+                    for _ in 0..3 {
+                        let stmt = publish::part_saved(target, part.clone(), None, 0);
+                        sea_orm::ConnectionTrait::execute_raw(&db, stmt)
+                            .await
+                            .unwrap();
+                    }
+                    let row = post_targets::Entity::find_by_id(target)
+                        .one(&db)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(row.parts.as_array().unwrap().len(), 1);
+                    // The next part goes after it.
+                    let next = json!({"remote_id": "p2", "cid": "", "remote_url": null,
+                        "published_at": "2026-01-01T00:00:01Z"});
+                    let stmt = publish::part_saved(target, next, None, 1);
+                    sea_orm::ConnectionTrait::execute_raw(&db, stmt)
+                        .await
+                        .unwrap();
+                    let row = post_targets::Entity::find_by_id(target)
+                        .one(&db)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(row.parts.as_array().unwrap().len(), 2);
+                }
+
+                /// Fails the update that saves a post's remote id the first `fails` times.
+                async fn fail_remote_id_saves(db: &DatabaseConnection, fails: u32) {
+                    exec(
+                        db,
+                        format!(
+                            "DROP TRIGGER IF EXISTS rel_fail ON post_targets; \
+                             DROP SEQUENCE IF EXISTS rel_fail_seq; \
+                             CREATE SEQUENCE rel_fail_seq; \
+                             CREATE OR REPLACE FUNCTION rel_fail() RETURNS trigger AS $$ BEGIN \
+                               IF NEW.remote_id IS NOT NULL AND OLD.remote_id IS NULL \
+                                  AND nextval('rel_fail_seq') <= {fails} THEN \
+                                 RAISE EXCEPTION 'injected'; END IF; RETURN NEW; END $$ \
+                               LANGUAGE plpgsql; \
+                             CREATE TRIGGER rel_fail BEFORE UPDATE ON post_targets \
+                               FOR EACH ROW EXECUTE FUNCTION rel_fail()"
+                        ),
+                    )
+                    .await;
+                }
+
+                async fn stop_failing_saves(db: &DatabaseConnection) {
+                    exec(
+                        db,
+                        "DROP TRIGGER IF EXISTS rel_fail ON post_targets; \
+                         DROP FUNCTION IF EXISTS rel_fail(); \
+                         DROP SEQUENCE IF EXISTS rel_fail_seq"
+                            .into(),
+                    )
+                    .await;
+                }
+
+                /// The platform took the post: its id is saved even through a database that
+                /// blinks, and when it cannot be saved the target says it may be live.
+                #[tokio::test]
+                #[serial]
+                async fn a_live_post_keeps_its_id_through_a_database_blink() {
+                    use futures_util::FutureExt;
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let body = std::panic::AssertUnwindSafe(async {
+                        // Two failed saves, the third works.
+                        fail_remote_id_saves(&db, 2).await;
+                        let id =
+                            id_of(&create(&s, &cookie, input(&set, "blink", Some(&past()))).await);
+                        publish::tick(&state).await.unwrap();
+                        let p = get_post(&s, &cookie, &id).await;
+                        assert_eq!(p["status"], "published", "{p}");
+                        assert!(p["targets"][0]["remote_id"].is_string(), "{p}");
+
+                        // Never saved: failed at once as "may be live", no retry offered.
+                        let records = RECORDS.lock().unwrap().len();
+                        fail_remote_id_saves(&db, 1000).await;
+                        let id =
+                            id_of(&create(&s, &cookie, input(&set, "lost", Some(&past()))).await);
+                        publish::tick(&state).await.unwrap();
+                        let p = get_post(&s, &cookie, &id).await;
+                        assert_eq!(p["status"], "failed", "{p}");
+                        let t = &p["targets"][0];
+                        assert_eq!(t["remote_id"], Value::Null, "{p}");
+                        assert!(t["error"].as_str().unwrap().contains("may be live"), "{p}");
+                        assert_eq!(RECORDS.lock().unwrap().len(), records + 1, "sent once");
+                        stop_failing_saves(&db).await;
+                        let res =
+                            req(&s, Method::POST, &format!("/v1/posts/{id}/retry"), &cookie).await;
+                        assert_eq!(res.status_code(), 409, "{}", res.text());
+                    })
+                    .catch_unwind()
+                    .await;
+                    stop_failing_saves(&db).await;
+                    if let Err(e) = body {
+                        std::panic::resume_unwind(e);
+                    }
                 }
 
                 #[tokio::test]
@@ -18209,6 +18509,69 @@ mod teams {
                     let p = get_post(&s, &cookie, &id).await;
                     assert_eq!(p["targets"][0]["status"], "failed", "{p}");
                     assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 4);
+                }
+
+                /// A database error after the target is claimed and before X is called sent
+                /// nothing: the target retries once, and the credit is not lost.
+                #[tokio::test]
+                #[serial]
+                async fn a_database_error_before_the_call_to_x_is_retried_not_stranded() {
+                    use futures_util::FutureExt;
+                    use socialreins_brain::billing::{self, Kind};
+                    let (s, db, mut state, _, mock, cookie, team_id, set) = team().await;
+                    state.billing_enabled = true;
+                    let team: uuid::Uuid = team_id.parse().unwrap();
+                    on_plan(&db, team, "active").await;
+                    billing::grant(&db, team, Kind::X, 3, "test", None)
+                        .await
+                        .unwrap();
+                    let before = mock.tweets.lock().unwrap().len();
+                    let body = std::panic::AssertUnwindSafe(async {
+                        // The credit spend (the first thing after the claim) fails.
+                        db.execute_unprepared(
+                            "DROP TRIGGER IF EXISTS rel_boom ON credit_ledger; \
+                             CREATE OR REPLACE FUNCTION rel_boom() RETURNS trigger AS $$ BEGIN \
+                               RAISE EXCEPTION 'injected'; END $$ LANGUAGE plpgsql; \
+                             CREATE TRIGGER rel_boom BEFORE INSERT ON credit_ledger \
+                               FOR EACH ROW WHEN (NEW.reason = 'x post') \
+                               EXECUTE FUNCTION rel_boom()",
+                        )
+                        .await
+                        .unwrap();
+                        let id = id_of(&create(&s, &cookie, x_post(&set, "Blink")).await);
+                        publish::tick(&state).await.unwrap();
+                        let p = get_post(&s, &cookie, &id).await;
+                        let t = &p["targets"][0];
+                        assert_eq!(t["status"], "pending", "{p}");
+                        assert_eq!(t["retried"], true, "{p}");
+                        let why = t["error"].as_str().unwrap();
+                        assert!(why.ends_with("Nothing was posted."), "{why}");
+                        assert_eq!(mock.tweets.lock().unwrap().len(), before);
+                        db.execute_unprepared("DROP TRIGGER rel_boom ON credit_ledger")
+                            .await
+                            .unwrap();
+                        // Due again: it goes out, and costs its one credit.
+                        db.execute_unprepared(&format!(
+                            "UPDATE post_targets SET retry_at = now() - interval '1 second' \
+                             WHERE post_id = '{id}'"
+                        ))
+                        .await
+                        .unwrap();
+                        publish::tick(&state).await.unwrap();
+                        assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
+                        assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 2);
+                    })
+                    .catch_unwind()
+                    .await;
+                    db.execute_unprepared(
+                        "DROP TRIGGER IF EXISTS rel_boom ON credit_ledger; \
+                         DROP FUNCTION IF EXISTS rel_boom()",
+                    )
+                    .await
+                    .unwrap();
+                    if let Err(e) = body {
+                        std::panic::resume_unwind(e);
+                    }
                 }
 
                 /// Several X posts due at once for a team with one credit: one goes out, not all.
