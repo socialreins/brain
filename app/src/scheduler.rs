@@ -21,239 +21,221 @@ pub const RESTORE_DAYS: i64 = 30;
 /// Advisory lock key held by the instance that purges.
 const PURGE_LOCK: i64 = 0x0050_5552_4745_5345;
 
+/// First wait after a round panicked; it doubles per panic in a row up to `BACKOFF_CAP_TIMES`
+/// times this, so a round that always panics is tried about once a minute, never in a hot loop.
+const BACKOFF: Duration = Duration::from_secs(5);
+const BACKOFF_CAP_TIMES: u32 = 12;
+
+/// Runs `round(state)` now and then every `period` (a late round delays the next), each round
+/// as its own task: a panic is logged as an error with the loop's `name` and the loop waits a
+/// bounded back-off and carries on, instead of ending for good with `/health` still ok.
+/// Dropping the returned future (the runtime stopping) aborts the round with it. Rounds are
+/// not waited for beyond their own return: a round that starts longer work spawns it itself.
+async fn every<S, F, Fut>(
+    name: &'static str,
+    period: Duration,
+    backoff: Duration,
+    state: S,
+    round: F,
+) where
+    S: Clone,
+    F: Fn(S) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut panics: u32 = 0;
+    loop {
+        tick.tick().await;
+        // A JoinSet, not `tokio::spawn`: dropping it aborts the round.
+        let mut run = tokio::task::JoinSet::new();
+        run.spawn(round(state.clone()));
+        match run.join_next().await {
+            Some(Err(e)) => {
+                panics = panics.saturating_add(1);
+                tracing::error!(job = name, error = %e, consecutive_panics = panics, "background round panicked");
+                let wait = backoff
+                    .saturating_mul(2u32.saturating_pow(panics - 1))
+                    .min(backoff * BACKOFF_CAP_TIMES);
+                tokio::time::sleep(wait).await;
+            }
+            _ => panics = 0,
+        }
+    }
+}
+
+fn start<F, Fut>(name: &'static str, period: Duration, app: &AppState, round: F)
+where
+    F: Fn(AppState) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(every(name, period, BACKOFF, app.clone(), round));
+}
+
 /// Starts the jobs; each first runs right away, so a restart also fails targets cut off
-/// mid-publish.
+/// mid-publish. Each runs under `every`, so a panic in a round does not end its job.
 pub fn spawn(app: AppState) {
-    let db = app.db.clone();
-    let inbox_app = app.clone();
-    let hook_app = app.clone();
-    let sweep_app = app.clone();
-    let threads_app = app.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(24 * 3600));
-        loop {
-            tick.tick().await;
-            match threads::refresh_tokens(&threads_app).await {
+    let min = Duration::from_secs(60);
+    start(
+        "tokens",
+        Duration::from_secs(24 * 3600),
+        &app,
+        |app| async move {
+            match threads::refresh_tokens(&app).await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(accounts = n, "extended threads tokens"),
                 Err(e) => tracing::warn!(error = %e, "threads token refresh failed"),
             }
-            match linkedin::refresh_tokens(&threads_app).await {
+            match linkedin::refresh_tokens(&app).await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(accounts = n, "renewed linkedin tokens"),
                 Err(e) => tracing::warn!(error = %e, "linkedin token refresh failed"),
             }
-            match pinterest::refresh_tokens(&threads_app).await {
+            match pinterest::refresh_tokens(&app).await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(accounts = n, "renewed pinterest tokens"),
                 Err(e) => tracing::warn!(error = %e, "pinterest token refresh failed"),
             }
-            match expiry::notify(&threads_app).await {
+            match expiry::notify(&app).await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(accounts = n, "mailed about expiring or refused tokens"),
                 Err(e) => tracing::warn!(error = %e, "expiry mail failed"),
             }
-        }
-    });
-    let x_app = app.clone();
-    tokio::spawn(async move {
-        // X access tokens last two hours.
-        let mut tick = tokio::time::interval(Duration::from_secs(15 * 60));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            match x::refresh_tokens(&x_app).await {
+        },
+    );
+    // X access tokens last two hours.
+    start(
+        "x tokens",
+        Duration::from_secs(15 * 60),
+        &app,
+        |app| async move {
+            match x::refresh_tokens(&app).await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(accounts = n, "renewed x tokens"),
                 Err(e) => tracing::warn!(error = %e, "x token refresh failed"),
             }
-        }
-    });
-    let feed_app = app.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(feeds::EVERY_SECS as u64));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            if let Err(e) = feeds::tick(&feed_app).await {
+        },
+    );
+    start(
+        "feeds",
+        Duration::from_secs(feeds::EVERY_SECS as u64),
+        &app,
+        |app| async move {
+            if let Err(e) = feeds::tick(&app).await {
                 tracing::warn!(error = %e, "feed tick failed");
             }
-        }
-    });
-    let metrics_app = app.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(metrics::EVERY_SECS));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            if let Err(e) = metrics::tick(&metrics_app).await {
+        },
+    );
+    start(
+        "metrics",
+        Duration::from_secs(metrics::EVERY_SECS),
+        &app,
+        |app| async move {
+            if let Err(e) = metrics::tick(&app).await {
                 tracing::warn!(error = %e, "metrics tick failed");
             }
+        },
+    );
+    start("webhooks", min, &app, |app| async move {
+        if let Err(e) = webhooks::tick(&app).await {
+            tracing::warn!(error = %e, "webhook tick failed");
         }
     });
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            if let Err(e) = webhooks::tick(&hook_app).await {
-                tracing::warn!(error = %e, "webhook tick failed");
-            }
+    start("automation flows", min, &app, |app| async move {
+        if let Err(e) = automations::tick(&app).await {
+            tracing::warn!(error = %e, "automation flow tick failed");
         }
     });
-    let flow_app = app.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            if let Err(e) = automations::tick(&flow_app).await {
-                tracing::warn!(error = %e, "automation flow tick failed");
-            }
+    start("broadcasts", min, &app, |app| async move {
+        if let Err(e) = broadcasts::tick(&app).await {
+            tracing::warn!(error = %e, "broadcast tick failed");
         }
     });
-    let broadcast_app = app.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            if let Err(e) = broadcasts::tick(&broadcast_app).await {
-                tracing::warn!(error = %e, "broadcast tick failed");
-            }
+    start("newsletters", min, &app, |app| async move {
+        if let Err(e) = newsletters::tick(&app).await {
+            tracing::warn!(error = %e, "newsletter tick failed");
         }
     });
-    let newsletter_app = app.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            if let Err(e) = newsletters::tick(&newsletter_app).await {
-                tracing::warn!(error = %e, "newsletter tick failed");
-            }
+    start("inbox", min, &app, |app| async move {
+        if let Err(e) = inbox::tick(&app).await {
+            tracing::warn!(error = %e, "inbox tick failed");
         }
     });
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            if let Err(e) = inbox::tick(&inbox_app).await {
-                tracing::warn!(error = %e, "inbox tick failed");
-            }
+    // Which X accounts are due, and how often, is the account's own setting (`x_inbox`).
+    start("x inbox", min, &app, |app| async move {
+        if let Err(e) = crate::x_inbox::tick(&app).await {
+            tracing::warn!(error = %e, "x inbox tick failed");
         }
     });
-    let x_app = app.clone();
-    tokio::spawn(async move {
-        // Which X accounts are due, and how often, is the account's own setting (`x_inbox`).
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            if let Err(e) = crate::x_inbox::tick(&x_app).await {
-                tracing::warn!(error = %e, "x inbox tick failed");
-            }
+    // Which Threads accounts are due (every 5 minutes, or at once after a webhook hint) is
+    // decided by the account's own stamps (`threads_inbox`).
+    start("threads inbox", min, &app, |app| async move {
+        if let Err(e) = crate::threads_inbox::tick(&app).await {
+            tracing::warn!(error = %e, "threads inbox tick failed");
         }
     });
-    let threads_app = app.clone();
-    tokio::spawn(async move {
-        // Which Threads accounts are due (every 5 minutes, or at once after a webhook hint) is
-        // decided by the account's own stamps (`threads_inbox`).
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            if let Err(e) = crate::threads_inbox::tick(&threads_app).await {
-                tracing::warn!(error = %e, "threads inbox tick failed");
-            }
+    // Which channels are due, and how often, is the channel's own setting (`youtube_inbox`).
+    start("youtube inbox", min, &app, |app| async move {
+        if let Err(e) = crate::youtube_inbox::tick(&app).await {
+            tracing::warn!(error = %e, "youtube inbox tick failed");
         }
     });
-    let youtube_app = app.clone();
-    tokio::spawn(async move {
-        // Which channels are due, and how often, is the channel's own setting (`youtube_inbox`).
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            if let Err(e) = crate::youtube_inbox::tick(&youtube_app).await {
-                tracing::warn!(error = %e, "youtube inbox tick failed");
-            }
+    // Does nothing until LinkedIn approved the Community Management API (`linkedin_inbox`).
+    start("linkedin inbox", min, &app, |app| async move {
+        if let Err(e) = crate::linkedin_inbox::tick(&app).await {
+            tracing::warn!(error = %e, "linkedin inbox tick failed");
         }
     });
-    let linkedin_app = app.clone();
-    tokio::spawn(async move {
-        // Does nothing until LinkedIn approved the Community Management API (`linkedin_inbox`).
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            if let Err(e) = crate::linkedin_inbox::tick(&linkedin_app).await {
-                tracing::warn!(error = %e, "linkedin inbox tick failed");
-            }
+    start("meta backfill", min, &app, |app| async move {
+        if let Err(e) = meta_inbox::tick(&app).await {
+            tracing::warn!(error = %e, "meta backfill tick failed");
         }
     });
-    let meta_app = app.clone();
+    let publish_app = app.clone();
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            if let Err(e) = meta_inbox::tick(&meta_app).await {
-                tracing::warn!(error = %e, "meta backfill tick failed");
-            }
+        // Posts a killed process claimed and never started go out at the first round. Its own
+        // task: a panic here must not keep the publish loop from starting.
+        let release = publish_app.clone();
+        let released = tokio::spawn(async move { publish::release_unstarted(&release.db).await });
+        match released.await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => tracing::info!(posts = n, "released posts claimed and not started"),
+            Ok(Err(e)) => tracing::warn!(error = %e, "releasing unstarted posts failed"),
+            Err(e) => tracing::error!(error = %e, "releasing unstarted posts panicked"),
         }
-    });
-    tokio::spawn(async move {
-        // Posts a killed process claimed and never started go out at the first round.
-        match publish::release_unstarted(&app.db).await {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(posts = n, "released posts claimed and not started"),
-            Err(e) => tracing::warn!(error = %e, "releasing unstarted posts failed"),
-        }
-        let mut tick = tokio::time::interval(Duration::from_secs(60));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            // Not waited for: a post that takes many minutes must not delay the next round.
-            // Run as its own task: a panic in a round is logged and the next tick still comes,
-            // instead of ending this loop and leaving every scheduled post unpublished.
-            let round = app.clone();
+        every("publish", min, BACKOFF, publish_app, |app| async move {
             // Before `begin`, so the round already judges lateness without our own downtime.
             if let Err(e) = publish::note_tick(&app.db).await {
                 tracing::warn!(error = %e, "publish tick not recorded");
             }
-            match tokio::spawn(async move { publish::begin(&round).await }).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => tracing::warn!(error = %e, "publish tick failed"),
-                Err(e) => tracing::error!(error = %e, "publish tick panicked"),
+            // `begin` starts the posts as tasks and returns: a post that takes many minutes
+            // does not delay the next round.
+            if let Err(e) = publish::begin(&app).await {
+                tracing::warn!(error = %e, "publish tick failed");
             }
-        }
+        })
+        .await
     });
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(3600));
-        loop {
-            tick.tick().await;
-            match purge_deleted_sets(&db).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(sets = n, "purged deleted social sets"),
-                Err(e) => tracing::warn!(error = %e, "social set purge failed"),
-            }
-            match purge_idempotency_keys(&db).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(keys = n, "purged old idempotency keys"),
-                Err(e) => tracing::warn!(error = %e, "idempotency key purge failed"),
-            }
-            match purge(&db, &webhooks::purge_sql()).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(deliveries = n, "purged old webhook deliveries"),
-                Err(e) => tracing::warn!(error = %e, "webhook delivery purge failed"),
-            }
-            match media::sweep(&sweep_app).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(files = n, "deleted stored media"),
-                Err(e) => tracing::warn!(error = %e, "stored media sweep failed"),
-            }
+    start("purge", Duration::from_secs(3600), &app, |app| async move {
+        match purge_deleted_sets(&app.db).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(sets = n, "purged deleted social sets"),
+            Err(e) => tracing::warn!(error = %e, "social set purge failed"),
+        }
+        match purge_idempotency_keys(&app.db).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(keys = n, "purged old idempotency keys"),
+            Err(e) => tracing::warn!(error = %e, "idempotency key purge failed"),
+        }
+        match purge(&app.db, &webhooks::purge_sql()).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(deliveries = n, "purged old webhook deliveries"),
+            Err(e) => tracing::warn!(error = %e, "webhook delivery purge failed"),
+        }
+        match media::sweep(&app).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(files = n, "deleted stored media"),
+            Err(e) => tracing::warn!(error = %e, "stored media sweep failed"),
         }
     });
 }
@@ -289,4 +271,70 @@ async fn purge(db: &DatabaseConnection, sql: &str) -> Result<u64, DbErr> {
     let done = txn.execute_unprepared(sql).await?;
     txn.commit().await?;
     Ok(done.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicU32, Ordering::SeqCst},
+        Arc,
+    };
+
+    use super::*;
+
+    const MS: Duration = Duration::from_millis(1);
+
+    #[tokio::test]
+    async fn a_panicking_round_does_not_end_the_loop() {
+        let rounds = Arc::new(AtomicU32::new(0));
+        let job = tokio::spawn(every(
+            "test",
+            5 * MS,
+            MS,
+            rounds.clone(),
+            |rounds| async move {
+                // The first round panics, the ones after it count.
+                if rounds.fetch_add(1, SeqCst) == 0 {
+                    panic!("boom");
+                }
+            },
+        ));
+        tokio::time::sleep(300 * MS).await;
+        assert!(!job.is_finished(), "the loop ended");
+        assert!(
+            rounds.load(SeqCst) >= 3,
+            "rounds after the panic did not run"
+        );
+        job.abort();
+    }
+
+    #[tokio::test]
+    async fn stopping_the_loop_aborts_the_round() {
+        struct Dropped(Arc<AtomicU32>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, SeqCst);
+            }
+        }
+        let started = Arc::new(AtomicU32::new(0));
+        let dropped = Arc::new(AtomicU32::new(0));
+        let job = tokio::spawn(every(
+            "test",
+            5 * MS,
+            MS,
+            (started.clone(), dropped.clone()),
+            |(started, dropped)| async move {
+                let _guard = Dropped(dropped);
+                started.fetch_add(1, SeqCst);
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            },
+        ));
+        tokio::time::sleep(50 * MS).await;
+        assert_eq!(started.load(SeqCst), 1);
+        job.abort();
+        let _ = job.await;
+        tokio::time::sleep(50 * MS).await;
+        assert_eq!(dropped.load(SeqCst), 1, "the round outlived the loop");
+        assert_eq!(started.load(SeqCst), 1, "a round started after the stop");
+    }
 }
