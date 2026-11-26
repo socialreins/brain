@@ -4,6 +4,8 @@
 //! Cloud costs the team 1 `ai` credit a reply. Keys and prompts are never logged.
 use std::{collections::HashSet, sync::LazyLock, time::Duration};
 
+use tokio::sync::Semaphore;
+
 use regex::Regex;
 
 use serde_json::{json, Value};
@@ -16,6 +18,10 @@ pub const ANTHROPIC_MODEL: &str = "claude-haiku-5-5";
 pub const OPENAI_MODEL: &str = "gpt-4.1-mini";
 pub const ANTHROPIC_URL: &str = "https://api.anthropic.com";
 pub const OPENAI_URL: &str = "https://api.openai.com";
+/// Calls to a model in flight at once across the process: a burst of comments (a viral post)
+/// waits its turn here instead of every automation calling at once into the provider's limit and
+/// the database pool. A call still has its own 20 second limit once it is sent.
+static CALLS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(8));
 /// Most tokens a reply may take; the text is held to the network's limit afterwards too.
 const MAX_TOKENS: u32 = 800;
 /// Longest reply the model is ever asked for, in characters (`budget`).
@@ -69,6 +75,11 @@ impl Ai {
         system: &str,
         user: &str,
     ) -> Result<(String, &'static str), Option<u16>> {
+        // A burst waits its turn, but not for ever (a dry run of an automation has someone waiting).
+        let Ok(_turn) = tokio::time::timeout(Duration::from_secs(120), CALLS.acquire()).await
+        else {
+            return Err(None);
+        };
         let (req, model) = match provider {
             "anthropic" => (
                 self.client
