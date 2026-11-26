@@ -14,8 +14,8 @@ use axum::{
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, DbErr,
-    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, SqlErr, Statement,
-    TransactionTrait,
+    EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, SqlErr,
+    Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use socialreins_core::{
@@ -378,27 +378,30 @@ async fn pick_team(
     db: &DatabaseConnection,
     user: &users::Model,
 ) -> Result<Option<(teams::Model, Role)>, DbErr> {
-    let current = match user.current_team_id {
-        Some(id) => membership(db, id, user.id).await?,
-        None => None,
+    // The current team when the user is still in it, else the oldest membership; one query.
+    let stmt = Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT t.*, m.role AS member_role FROM team_user m JOIN teams t ON t.id = m.team_id \
+         WHERE m.user_id = $1 \
+         ORDER BY COALESCE(m.team_id = $2::uuid, false) DESC, m.created_at, m.team_id LIMIT 1",
+        [user.id.into(), user.current_team_id.into()],
+    );
+    let Some(row) = db.query_one_raw(stmt).await? else {
+        return Ok(None);
     };
-    let row = match current {
-        Some(row) => Some(row),
-        None => {
-            team_user::Entity::find()
-                .filter(team_user::Column::UserId.eq(user.id))
-                .order_by_asc(team_user::Column::CreatedAt)
-                .order_by_asc(team_user::Column::TeamId)
-                .one(db)
-                .await?
-        }
-    };
-    let Some(row) = row else { return Ok(None) };
-    if user.current_team_id != Some(row.team_id) {
-        set_current(db, user.id, row.team_id).await?;
+    let (team, role) = team_and_role(&row)?;
+    if user.current_team_id != Some(team.id) {
+        set_current(db, user.id, team.id).await?;
     }
-    let team = teams::Entity::find_by_id(row.team_id).one(db).await?;
-    Ok(team.map(|t| (t, role_of(&row))))
+    Ok(Some((team, role)))
+}
+
+/// The team and the role of a row of `SELECT t.*, m.role AS member_role` over `teams` and `team_user`.
+fn team_and_role(row: &sea_orm::QueryResult) -> Result<(teams::Model, Role), DbErr> {
+    let team = teams::Model::from_query_result(row, "")?;
+    // The CHECK constraint keeps the column to the three roles.
+    let role: String = row.try_get("", "member_role")?;
+    Ok((team, Role::parse(&role).unwrap_or(Role::Member)))
 }
 
 /// The user's current team and their role in it, making a personal team when they have none.
@@ -447,14 +450,17 @@ pub(super) async fn team_by_code(
     if team::parse_code(&named).is_none() && team::slug(&named).is_err() {
         return Ok(None);
     }
-    // A slug never equals a code (`set_slug`, `insert_team`); the code would win if one did.
-    let sql = "SELECT * FROM teams WHERE code = $1 OR lower(slug) = $1 \
-               ORDER BY (code = $1) DESC LIMIT 1";
-    let stmt = Statement::from_sql_and_values(DbBackend::Postgres, sql, [named.into()]);
-    let found = teams::Entity::find().from_raw_sql(stmt).one(db).await?;
-    let Some(found) = found else { return Ok(None) };
-    let row = membership(db, found.id, user_id).await?;
-    Ok(row.map(|row| (found, role_of(&row))))
+    // A slug never equals a code (`set_slug`, `insert_team`); the code would win if one did. The
+    // user's membership is joined in, so a team they are not in is not found (one query).
+    let sql = "SELECT t.*, m.role AS member_role FROM teams t \
+               JOIN team_user m ON m.team_id = t.id AND m.user_id = $2 \
+               WHERE t.code = $1 OR lower(t.slug) = $1 ORDER BY (t.code = $1) DESC LIMIT 1";
+    let stmt =
+        Statement::from_sql_and_values(DbBackend::Postgres, sql, [named.into(), user_id.into()]);
+    db.query_one_raw(stmt)
+        .await?
+        .map(|row| team_and_role(&row))
+        .transpose()
 }
 
 /// The signed-in user inside a team; `401` without a session. The team is the one the request
