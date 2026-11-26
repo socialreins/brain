@@ -118,6 +118,7 @@ pub(super) async fn live(
     let page = post_pages::Entity::find()
         .filter(post_pages::Column::Code.eq(code))
         .filter(post_pages::Column::Enabled.eq(true))
+        .filter(post_pages::Column::TakenDownAt.is_null())
         .one(db)
         .await?;
     let Some(page) = page else { return Ok(None) };
@@ -136,7 +137,10 @@ async fn page_json(
     subject: Uuid,
     row: Option<post_pages::Model>,
 ) -> Result<Page, DbErr> {
-    let on = team.public_pages && row.as_ref().is_some_and(|r| r.enabled);
+    let on = team.public_pages
+        && row
+            .as_ref()
+            .is_some_and(|r| r.enabled && r.taken_down_at.is_none());
     let live = on && !published(db, team.id, subject).await?.is_empty();
     let (enabled, details, code) = match row {
         Some(r) => (r.enabled, r.details, Some(r.code)),
@@ -168,6 +172,7 @@ pub async fn address(
     let page = post_pages::Entity::find()
         .filter(post_pages::Column::Subject.eq(subject))
         .filter(post_pages::Column::Enabled.eq(true))
+        .filter(post_pages::Column::TakenDownAt.is_null())
         .one(db)
         .await?;
     let Some(page) = page else { return Ok(None) };
@@ -320,8 +325,147 @@ async fn public(
     }
 }
 
+const REASONS: [&str; 4] = ["phishing", "spam", "illegal", "other"];
+const MAX_REPORT_CHARS: usize = 1000;
+/// Reports a day: from one IP address, about one page, and in all.
+const REPORTS_PER_IP: i64 = 10;
+const REPORTS_PER_PAGE: i64 = 20;
+const REPORTS_PER_DAY: i64 = 200;
+
+#[derive(Deserialize, ToSchema)]
+pub struct NewReport {
+    /// `phishing`, `spam`, `illegal` or `other`.
+    pub reason: String,
+    /// What is wrong, at most 1000 characters. Optional.
+    pub message: Option<String>,
+    /// Where an answer may go. Optional.
+    pub email: Option<String>,
+    /// The Turnstile widget's token; required when `GET /auth/providers` gives a
+    /// `turnstile_site_key`, else ignored.
+    pub turnstile_token: Option<String>,
+}
+
+/// Public: reports the page with `code` to the operators ("Report this page" on `/p/<code>`). The
+/// report is stored and mailed to `CONTACT_TO`; an admin can then take the page down
+/// (`PUT /admin/pages/{code}/takedown`). `404` unless the page is live. `422 invalid_reason`,
+/// `invalid_message`, `invalid_email`; `429` past 5 an hour for an address (the contact form's
+/// limit). Past the daily caps (10 a day for an address, 20 for a page, 200 in all) the report is
+/// still stored and shown to admins, only the mail is not sent.
+#[utoipa::path(post, path = "/public/pages/{code}/report", tag = "posts",
+    params(("code" = String, Path)), request_body = NewReport,
+    responses((status = 202, body = serde_json::Value), (status = 400, body = Error),
+        (status = 404, body = Error), (status = 413, body = Error), (status = 415, body = Error),
+        (status = 422, body = Error), (status = 429, body = Error), (status = 500, body = Error),
+        (status = 503, body = Error)))]
+async fn report(
+    State(app): State<AppState>,
+    ClientIp(ip): ClientIp,
+    Path(code): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    use axum::extract::FromRequest;
+    if !app.contact_limiter.allow(ip) {
+        return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    }
+    let body = match Json::<NewReport>::from_request(request, &()).await {
+        Ok(Json(body)) => body,
+        Err(r) => return super::waitlist::rejected(&r).into_response(),
+    };
+    let invalid = |code| reply(StatusCode::UNPROCESSABLE_ENTITY, code);
+    if !REASONS.contains(&body.reason.as_str()) {
+        return invalid("invalid_reason");
+    }
+    let message = body.message.as_deref().map(str::trim).unwrap_or_default();
+    if message.chars().count() > MAX_REPORT_CHARS
+        || message
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
+    {
+        return invalid("invalid_message");
+    }
+    let contact = match body
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        Some(e) => match socialreins_core::email::normalize(e) {
+            Some(e) => Some(e),
+            None => return invalid("invalid_email"),
+        },
+        None => None,
+    };
+    if let Err(r) =
+        crate::turnstile::check(app.turnstile.as_ref(), body.turnstile_token.as_deref(), ip).await
+    {
+        return r.into_response();
+    }
+    let (page, team) = match live(&app.db, code.clone()).await {
+        Ok(Some((page, team, _))) => (page, team),
+        Ok(None) => return reply(StatusCode::NOT_FOUND, "not_found"),
+        Err(e) => return internal(e, "report page read"),
+    };
+    let sql = "INSERT INTO page_reports (id, page_id, reason, message, contact) \
+               VALUES ($1, $2, $3, $4, $5)";
+    let values = [
+        Uuid::now_v7().into(),
+        page.id.into(),
+        body.reason.clone().into(),
+        message.to_owned().into(),
+        contact.clone().into(),
+    ];
+    let stored = app
+        .db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await;
+    if let Err(e) = stored {
+        return internal(e, "report insert");
+    }
+    // The report is stored whatever happens next, so a flood cannot silence real reports; the caps
+    // only decide whether it is also mailed (the admin list always has it).
+    let mut caps = vec![
+        (format!("page-report:page:{}", page.id), REPORTS_PER_PAGE),
+        ("page-report:all".to_owned(), REPORTS_PER_DAY),
+    ];
+    if let Some(ip) = ip {
+        let key = format!("page-report:ip:{}", crate::rate_limit::bucket(ip));
+        caps.push((key, REPORTS_PER_IP));
+    }
+    let mailed = match crate::rate_limit::daily_reserve(&app.db, &caps).await {
+        Ok(slot) => slot.is_some(),
+        Err(e) => {
+            tracing::error!(error = %e, "page report cap not read");
+            false
+        }
+    };
+    if let (true, Some(to)) = (mailed, app.contact_to.clone()) {
+        let text = format!(
+            "Page: {}/p/{code}\nTeam: {}\nReason: {}\nFrom: {}\n\n{message}\n\nTake it down in the admin console: {}/admin/reports\n",
+            app.web_url,
+            team::inert(&team.name),
+            body.reason,
+            contact.as_deref().unwrap_or("not given"),
+            app.web_url,
+        );
+        let subject = format!("Page report ({}): {code}", body.reason);
+        let sent = app
+            .mailer
+            .send_reply_to(&to, contact.as_deref(), &subject, text);
+        if let Err(e) = sent.await {
+            // The report is stored, so the admin list has it.
+            tracing::error!(error = %e, "page report mail not sent");
+        }
+    }
+    (StatusCode::ACCEPTED, Json(serde_json::json!({}))).into_response()
+}
+
 pub fn api() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(show, save))
         .routes(routes!(public))
+        .routes(routes!(report))
 }

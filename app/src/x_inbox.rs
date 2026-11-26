@@ -62,6 +62,11 @@ const DM_PAGE: i64 = 10;
 const MAX_PAGES: usize = 6;
 /// Failed rounds in a row that pause the account.
 const MAX_ERRORS: i32 = 5;
+/// A pause for errors (`paused_reason = errors`) ends by itself this many hours after it began: a
+/// provider outage must not leave the inbox, and the automations on it, off until a click. The
+/// next read then ends the pause again at once if it still fails (`MAX_ERRORS - 1` errors are
+/// kept), so an outage costs one read per wait.
+const RESUME_HOURS: i32 = 2;
 /// Accounts read at once across the process.
 static SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
 
@@ -221,7 +226,7 @@ pub fn pause_message(reason: &str, last_error: Option<&str>) -> String {
                      on the 1st (UTC), or raise the budget."
             .into(),
         _ => format!(
-            "X failed {MAX_ERRORS} times in a row{}. Check the account, then resume.",
+            "X failed {MAX_ERRORS} times in a row{}. It tries again by itself {RESUME_HOURS} hours after; check the account, then resume.",
             last_error.map(|e| format!(" ({e})")).unwrap_or_default()
         ),
     }
@@ -698,6 +703,17 @@ async fn on_error(
 /// due, and not waiting for a reconnect is claimed (its next poll moves on first, so a crash
 /// never makes it poll twice at once) and read, four at a time.
 pub async fn tick(app: &AppState) -> Result<(), DbErr> {
+    app.db
+        .execute_raw(sql(
+            &format!(
+                "UPDATE x_inbox SET paused_reason = NULL, errors = {}, next_poll_at = now(), \
+                 updated_at = now() WHERE enabled AND paused_reason = 'errors' \
+                 AND updated_at < now() - make_interval(hours => {RESUME_HOURS})",
+                MAX_ERRORS - 1
+            ),
+            vec![],
+        ))
+        .await?;
     app.db
         .execute_raw(sql(
             "UPDATE x_inbox SET period = (date_trunc('month', now() AT TIME ZONE 'UTC'))::date, \
