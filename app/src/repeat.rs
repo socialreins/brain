@@ -13,14 +13,14 @@ use chrono_tz::Tz;
 use schemars::JsonSchema;
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseTransaction, DbErr,
-    EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, TransactionTrait,
+    EntityTrait, IntoActiveModel, QueryFilter, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
-    controllers::posts::MAX_POSTS,
+    controllers::posts::{live_posts, MAX_POSTS},
     models::{posts, queue_schedules},
     post_mail,
 };
@@ -220,12 +220,7 @@ async fn copy(
     let Some((at, rule)) = next.and_then(|at| rule.next(at.to_utc(), now, zone)) else {
         return Ok(());
     };
-    let live = posts::Entity::find()
-        .filter(posts::Column::TeamId.eq(p.team_id))
-        .filter(posts::Column::Status.ne("deleted"))
-        .count(txn)
-        .await?;
-    if live >= MAX_POSTS {
+    if live_posts(txn, p.team_id, None).await? >= MAX_POSTS {
         tracing::warn!(post = %p.id, "team at its post cap: repeat ends");
         return post_mail::queue(txn, p.id, post_mail::Kind::RepeatEnded).await;
     }

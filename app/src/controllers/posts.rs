@@ -108,8 +108,38 @@ impl PostRef {
     }
 }
 
-/// Most posts a team keeps that are not `deleted`; at the cap a repeat rule makes no copy.
+/// Most posts a team has that still need something done (a draft, a scheduled or queued post, a
+/// failed one a person can retry or delete), counted once per post: a post group of five
+/// platforms is one. Published and taken-down posts are history and do not count (what a team
+/// publishes in a day is limited by `PUBLISHES_PER_DAY`, so history grows slowly). At the cap a
+/// repeat rule makes no copy. Also the most posts one list call returns.
 pub(crate) const MAX_POSTS: u64 = 2000;
+
+/// The statuses of a post that count against `MAX_POSTS`.
+const LIVE_STATUSES: &str = "'draft', 'scheduled', 'queued', 'failed'";
+
+/// How many posts of `team` count against `MAX_POSTS`, a group counting once; `besides` is a
+/// group to leave out (the one being created, whose other posts are already stored).
+pub(crate) async fn live_posts(
+    db: &impl ConnectionTrait,
+    team: Uuid,
+    besides: Option<Uuid>,
+) -> Result<u64, DbErr> {
+    let stmt = Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        format!(
+            "SELECT count(DISTINCT COALESCE(group_id, id)) AS n FROM posts WHERE team_id = $1 \
+             AND status IN ({LIVE_STATUSES}) \
+             AND COALESCE(group_id, id) <> COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000')"
+        ),
+        [team.into(), besides.into()],
+    );
+    let n: i64 = match db.query_one_raw(stmt).await? {
+        Some(r) => r.try_get("", "n")?,
+        None => 0,
+    };
+    Ok(n as u64)
+}
 
 /// Most posts of a team that carry a repeat rule.
 const MAX_REPEATS: u64 = 200;
@@ -415,6 +445,11 @@ pub struct PostQuery {
     pub approval: Option<String>,
     /// `true`: only posts with a repeat rule; `false`: only posts without one.
     pub repeat: Option<bool>,
+    /// At most this many posts, 1 to 2000 (the default).
+    pub limit: Option<u64>,
+    /// `asc` (default): by `scheduled_at`, soonest first, unscheduled last. `desc`: the reverse, so
+    /// the newest come first and `limit` keeps them.
+    pub order: Option<String>,
 }
 
 /// The body of an approve or reject call; the body itself is optional.
@@ -1532,8 +1567,8 @@ pub(crate) async fn narrowed(
     Ok((!default).then_some(set))
 }
 
-/// The current team's posts, by `scheduled_at` (unscheduled last), at most 2000. For a calendar,
-/// pass `from` and `to`.
+/// The current team's posts, by `scheduled_at` (unscheduled last), at most 2000 (`limit`; `order`
+/// `desc` reverses it). For a calendar, pass `from` and `to`.
 #[utoipa::path(get, path = "/posts", tag = "posts",
     security(("session" = []), ("api_token" = [])), params(PostQuery),
     responses((status = 200, body = [Post]), (status = 401, body = Error),
@@ -1555,6 +1590,10 @@ pub async fn list_posts(app: &AppState, a: &Actor, q: PostQuery) -> Response {
         || q.approval
             .as_deref()
             .is_some_and(|s| !APPROVALS.contains(&s))
+        || q.limit.is_some_and(|n| n == 0 || n > MAX_POSTS)
+        || q.order
+            .as_deref()
+            .is_some_and(|o| !["asc", "desc"].contains(&o))
     {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     }
@@ -1590,13 +1629,23 @@ pub async fn list_posts(app: &AppState, a: &Actor, q: PostQuery) -> Response {
                 rule.is_null()
             });
         }
-        let rows = sel
-            .order_by_asc(posts::Column::ScheduledAt)
-            .order_by_asc(posts::Column::CreatedAt)
-            .order_by_asc(posts::Column::Id)
-            .limit(MAX_POSTS)
-            .all(&app.db)
-            .await?;
+        let rows = if q.order.as_deref() == Some("desc") {
+            // `desc` puts the unscheduled first in Postgres; the newest are wanted first.
+            sel.order_by_with_nulls(
+                posts::Column::ScheduledAt,
+                sea_orm::Order::Desc,
+                sea_orm::sea_query::NullOrdering::Last,
+            )
+            .order_by_desc(posts::Column::CreatedAt)
+            .order_by_desc(posts::Column::Id)
+        } else {
+            sel.order_by_asc(posts::Column::ScheduledAt)
+                .order_by_asc(posts::Column::CreatedAt)
+                .order_by_asc(posts::Column::Id)
+        }
+        .limit(q.limit.unwrap_or(MAX_POSTS))
+        .all(&app.db)
+        .await?;
         posts_json(&app.db, a, rows).await
     };
     match found.await {
@@ -2025,12 +2074,7 @@ async fn store(
     input: &PostInput,
     group_id: Option<Uuid>,
 ) -> Result<Result<posts::Model, Response>, DbErr> {
-    let live = posts::Entity::find()
-        .filter(posts::Column::TeamId.eq(a.team.id))
-        .filter(posts::Column::Status.ne("deleted"))
-        .count(txn)
-        .await?;
-    if live >= MAX_POSTS {
+    if live_posts(txn, a.team.id, group_id).await? >= MAX_POSTS {
         return Ok(Err(reply(StatusCode::CONFLICT, "too_many_posts")));
     }
     let (approval, approval_by, approval_at) = approval_for(a, input.scheduled_at.is_some());
@@ -2726,10 +2770,10 @@ async fn delete_repeat(State(app): State<AppState>, a: Actor, PostId(id): PostId
     set_repeat(&app, &a, id, None).await
 }
 
-/// Deletes a post. `draft` or `scheduled`: removed (`204`). `published`: taken down from every
-/// account and kept as `deleted` (`200`); when an account cannot take it down, `422
-/// {"error":"takedown_failed","message"}` says what to do, and a retry only tries what is still
-/// up. `queued` and `failed`: `409 not_deletable`.
+/// Deletes a post. `draft`, `scheduled` or `failed` (nothing of it is on any network): removed
+/// (`204`). `published`: taken down from every account and kept as `deleted` (`200`); when an
+/// account cannot take it down, `422 {"error":"takedown_failed","message"}` says what to do, and
+/// a retry only tries what is still up. `queued`: `409 not_deletable`.
 #[utoipa::path(delete, path = "/posts/{id}", tag = "posts",
     security(("session" = []), ("api_token" = [])), params(("id" = String, Path, description = ID_PARAM), ("Idempotency-Key" = Option<String>, Header, description = IDEMPOTENCY)),
     responses((status = 204), (status = 200, body = Post), (status = 401, body = Error),
@@ -2835,10 +2879,10 @@ pub async fn delete_post(app: &AppState, a: &Actor, id: Uuid) -> Response {
         Err(e) => return internal(e, "post read"),
     };
     match found.status.as_str() {
-        "draft" | "scheduled" => {
+        "draft" | "scheduled" | "failed" => {
             let gone = posts::Entity::delete_many()
                 .filter(posts::Column::Id.eq(id))
-                .filter(posts::Column::Status.is_in(["draft", "scheduled"]))
+                .filter(posts::Column::Status.is_in(["draft", "scheduled", "failed"]))
                 .filter(in_scope(a))
                 .exec(&app.db)
                 .await;
