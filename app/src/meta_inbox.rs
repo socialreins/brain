@@ -20,6 +20,7 @@
 //! answers a week of old comments.
 use std::{
     collections::HashSet,
+    sync::LazyLock,
     time::{Duration as Wait, Instant},
 };
 
@@ -27,6 +28,7 @@ use chrono::{DateTime, Duration, FixedOffset, Utc};
 use sea_orm::ColumnTrait;
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, EntityTrait, QueryFilter, Statement};
 use serde_json::Value;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::{
@@ -48,10 +50,17 @@ pub(crate) const MESSAGE_HOURS: i64 = 24;
 const MAX_PAYLOAD_CHARS: usize = 200;
 /// A person's reply, with Meta's Human Agent feature, may go out this long after their last message.
 pub(crate) const HUMAN_AGENT_DAYS: i64 = 7;
-/// An account is read again this long after its last read, and `BACKFILL_ACCOUNTS` are read a
-/// tick (a minute), so a thousand accounts still fit in the hour.
+/// An account is read again this long after its last read. A tick claims `BACKFILL_CHUNK`
+/// accounts at a time, oldest read first, reads `BACKFILL_SLOTS` at once and claims the next chunk
+/// until nothing is due or `TICK_BUDGET` is spent, so a thousand accounts fit in the hour (it was
+/// 4 a minute, one after another: 240 an hour at best).
 const BACKFILL_EVERY_MINUTES: i64 = 60;
-const BACKFILL_ACCOUNTS: i64 = 4;
+const BACKFILL_CHUNK: i64 = 12;
+const BACKFILL_SLOTS: usize = 4;
+/// No new chunk is claimed after this; the next tick carries on.
+const TICK_BUDGET: Wait = Wait::from_secs(45);
+/// Backfills running at once across the process (about 110 Graph calls each, one Page each).
+static SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(BACKFILL_SLOTS));
 /// Longest one account's read takes; what it reached is kept and the rest waits for the next
 /// hour (shortcut: no resume cursor, since a read is capped at about 110 calls).
 const BACKFILL_BUDGET: Wait = Wait::from_secs(30);
@@ -972,10 +981,19 @@ async fn newer_message(
     }
 }
 
-/// One round: claims the accounts not read for an hour (or ever: a new connection), at most
-/// `BACKFILL_ACCOUNTS`, by stamping them, so a second instance skips them and a crash costs one
-/// hour. An account whose token is known dead, or whose read was refused in the last hour, waits.
+/// One tick: rounds of due accounts, oldest read first, until none is due or `TICK_BUDGET` is
+/// spent. A round claims at most `BACKFILL_CHUNK` accounts not read for an hour (or ever: a new
+/// connection) by stamping them, so a second instance skips them and a crash costs one hour, and
+/// reads them `BACKFILL_SLOTS` at a time. An account whose token is known dead, or whose read was
+/// refused in the last hour, waits.
 pub async fn tick(app: &AppState) -> Result<(), DbErr> {
+    let deadline = Instant::now() + TICK_BUDGET;
+    while round(app).await? == BACKFILL_CHUNK as usize && Instant::now() < deadline {}
+    Ok(())
+}
+
+/// One chunk: claims it and reads it, returning how many accounts it claimed.
+async fn round(app: &AppState) -> Result<usize, DbErr> {
     let claim = sql(
         "WITH due AS (SELECT id, meta_synced_at IS NULL AS first FROM social_accounts \
          WHERE provider IN ('facebook', 'instagram') \
@@ -987,22 +1005,36 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
          RETURNING a.id, due.first",
         vec![
             (BACKFILL_EVERY_MINUTES as i32).into(),
-            BACKFILL_ACCOUNTS.into(),
+            BACKFILL_CHUNK.into(),
         ],
     );
-    for row in app.db.query_all_raw(claim).await? {
+    let rows = app.db.query_all_raw(claim).await?;
+    let claimed = rows.len();
+    let mut reads = Vec::new();
+    for row in rows {
         let id: Uuid = row.try_get("", "id")?;
         let first: bool = row.try_get("", "first")?;
-        let Some(account) = social_accounts::Entity::find_by_id(id).one(&app.db).await? else {
-            continue;
-        };
-        match backfill(app, &account, first).await {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(account = %id, items = n, "meta backfill stored items"),
-            Err(e) => tracing::error!(error = %e, account = %id, "meta backfill failed"),
-        }
+        let app = app.clone();
+        reads.push(tokio::spawn(async move {
+            let Ok(_slot) = SLOTS.acquire().await else {
+                return;
+            };
+            let account = match social_accounts::Entity::find_by_id(id).one(&app.db).await {
+                Ok(Some(a)) => a,
+                Ok(None) => return,
+                Err(e) => return tracing::error!(error = %e, account = %id, "meta backfill failed"),
+            };
+            match backfill(&app, &account, first).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(account = %id, items = n, "meta backfill stored items"),
+                Err(e) => tracing::error!(error = %e, account = %id, "meta backfill failed"),
+            }
+        }));
     }
-    Ok(())
+    for r in reads {
+        let _ = r.await;
+    }
+    Ok(claimed)
 }
 
 /// Sends `text` for `item` from a Facebook or Instagram `account`, once: a public reply under
