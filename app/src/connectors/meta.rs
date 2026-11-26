@@ -616,7 +616,7 @@ impl Meta {
                 return Ok(video);
             }
             if i < polls {
-                tokio::time::sleep(self.poll_every * i.min(POLLS)).await;
+                super::idle(self.poll_every * i.min(POLLS)).await;
             }
         }
         Err(failed(
@@ -812,7 +812,7 @@ impl Meta {
                 return Ok(());
             }
             if i < polls {
-                tokio::time::sleep(self.poll_every * i.min(base)).await;
+                super::idle(self.poll_every * i.min(base)).await;
             }
         }
         Err(failed(

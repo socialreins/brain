@@ -510,7 +510,7 @@ impl Pinterest {
                 let msg = "Video: Pinterest is still processing the video. Try again later.";
                 return Err(failed(super::unsent(msg.into(), true)));
             }
-            tokio::time::sleep(self.poll_every).await;
+            super::idle(self.poll_every).await;
         }
     }
 

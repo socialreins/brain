@@ -346,7 +346,7 @@ impl Threads {
         };
         self.finished(token, std::slice::from_ref(&container))
             .await?;
-        tokio::time::sleep(self.publish_wait).await;
+        super::idle(self.publish_wait).await;
         let form = [("creation_id", container.as_str())];
         let made = self
             .call(
@@ -468,7 +468,7 @@ impl Threads {
                 return Ok(());
             }
             if i < polls {
-                tokio::time::sleep(self.poll_every * i.min(POLLS)).await;
+                super::idle(self.poll_every * i.min(POLLS)).await;
             }
         }
         Err(failed(

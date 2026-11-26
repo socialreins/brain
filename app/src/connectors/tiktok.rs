@@ -626,7 +626,7 @@ impl TikTok {
             if started.elapsed() >= POLL_FOR + Duration::from_secs(50) * super::extra_polls() {
                 return Err(failed(NOT_DONE));
             }
-            tokio::time::sleep(self.poll_every).await;
+            super::idle(self.poll_every).await;
         }
     }
 }
