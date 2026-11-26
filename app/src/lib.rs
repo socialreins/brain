@@ -36,10 +36,16 @@ pub mod x_inbox;
 pub mod youtube_inbox;
 
 use migration::{Migrator, MigratorTrait};
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbErr, TransactionTrait};
+use sea_orm::{
+    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbErr, TransactionTrait,
+};
+use std::time::Duration;
 
 /// Any fixed number: every brain process asks Postgres for this same advisory lock.
 const MIGRATION_LOCK: i64 = 0x736f_6369_616c; // "social"
+
+/// Longest a request, or a tick that needs a second connection, waits for a free one.
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connects to `DATABASE_URL` and applies pending migrations.
 ///
@@ -48,11 +54,39 @@ const MIGRATION_LOCK: i64 = 0x736f_6369_616c; // "social"
 /// connection, held while the migrations run on the pool, and Postgres frees it on commit or
 /// if this process dies.
 pub async fn connect(config: &config::Config) -> Result<DatabaseConnection, DbErr> {
-    let db = Database::connect(&config.database_url).await?;
+    let mut options = ConnectOptions::new(&config.database_url);
+    options
+        .max_connections(config.database_max_connections)
+        .connect_timeout(Duration::from_secs(10))
+        .acquire_timeout(ACQUIRE_TIMEOUT);
+    let db = Database::connect(options).await?;
     let lock = db.begin().await?;
     lock.execute_unprepared(&format!("SELECT pg_advisory_xact_lock({MIGRATION_LOCK})"))
         .await?;
     Migrator::up(&db, None).await?;
     lock.commit().await?;
     Ok(db)
+}
+
+/// `connect`, tried again every `retry` until it works or `wait` has passed: a Postgres that
+/// restarts or fails over while brain starts costs a few seconds, not an outage that ends when
+/// Railway gives up restarting the process. Whatever stops it for longer is returned.
+pub async fn connect_when_ready(
+    config: &config::Config,
+    wait: Duration,
+    retry: Duration,
+) -> Result<DatabaseConnection, DbErr> {
+    let give_up = tokio::time::Instant::now() + wait;
+    loop {
+        let e = match connect(config).await {
+            Ok(db) => return Ok(db),
+            // sea-orm puts the whole URL in some errors, and it carries the password.
+            Err(e) => e.to_string().replace(&config.database_url, "DATABASE_URL"),
+        };
+        if tokio::time::Instant::now() + retry >= give_up {
+            return Err(DbErr::Custom(e));
+        }
+        tracing::warn!(error = %e, "database not ready, trying again");
+        tokio::time::sleep(retry).await;
+    }
 }
