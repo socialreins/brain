@@ -995,7 +995,18 @@ async fn a_new_automation_gets_a_ten_minute_cooldown_unless_told_otherwise() {
     let none = e.automation(json!({"cooldown_minutes": 0})).await;
     assert_eq!(read(none).await, Value::Null);
     let five = e.automation(json!({"cooldown_minutes": 5})).await;
-    assert_eq!(read(five).await, 5);
+    assert_eq!(read(five.clone()).await, 5);
+    // null says "none" as well, so a client that sends back what it read can clear it.
+    let null = e.automation(json!({"cooldown_minutes": null})).await;
+    assert_eq!(read(null).await, Value::Null);
+    let body = json!({"name": "Thanks", "trigger": "mention_received", "cooldown_minutes": null,
+        "conditions": {"account_ids": [e.account]},
+        "actions": [{"type": "reply_publicly", "text": "thanks"}]});
+    let res = e
+        .req(Method::PUT, &format!("/v1/automations/{five}"), body)
+        .await;
+    assert_eq!(res.status_code(), 200, "{}", res.text());
+    assert_eq!(res.json::<Value>()["cooldown_minutes"], Value::Null);
     // A save without the field keeps the stored one (an old client cannot lift it by accident).
     let body = json!({"name": "Renamed", "trigger": "mention_received",
         "conditions": {"account_ids": [e.account]},

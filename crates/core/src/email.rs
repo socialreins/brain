@@ -33,6 +33,9 @@ pub fn person_key(raw: &str) -> Option<String> {
     let email = normalize(raw)?;
     let (local, domain) = email.split_once('@')?;
     let local = local.split('+').next().unwrap_or(local);
+    if local.is_empty() {
+        return None;
+    }
     Some(match domain {
         "gmail.com" | "googlemail.com" => format!("{}@gmail.com", local.replace('.', "")),
         _ => format!("{local}@{domain}"),
@@ -62,6 +65,8 @@ mod tests {
         );
         assert_ne!(person_key("a@corp.example"), person_key("a@other.example"));
         assert_eq!(person_key("nope"), None);
+        // Nothing before the +tag: no person to name.
+        assert_eq!(person_key("+a@corp.example"), None);
     }
 
     #[test]

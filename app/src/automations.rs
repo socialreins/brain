@@ -2907,7 +2907,15 @@ struct AiAccess {
     provider: String,
     key: String,
     /// What was paid, to give back when nothing usable came of the call.
-    paid: Option<billing::Kind>,
+    paid: Paid,
+}
+
+/// What a call took: a credit or allowance use (billing on) and a hit of the daily cap on our key
+/// (billing off). Both come back when nothing usable came of the call.
+#[derive(Default)]
+struct Paid {
+    kind: Option<billing::Kind>,
+    slot: Vec<i64>,
 }
 
 /// Picks the key and pays for the call before it is made. `Err` is the (status, reason) of the
@@ -2931,13 +2939,13 @@ async fn ai_pay(
     let Some((provider, key)) = team_key.or_else(ours) else {
         return Err(("skipped", "no_ai_key"));
     };
-    let mut paid = None;
+    let mut paid = Paid::default();
     // Billing off is a free install, but our own key is never open: a team gets so many calls a day.
     let ours_unmetered = team_key_none && !app.billing_enabled && app.ai.own_key.is_some();
     if ours_unmetered && app.ai.daily_cap > 0 {
         let cap = [(format!("ai-own:team:{}", item.team_id), app.ai.daily_cap)];
         match crate::rate_limit::daily_reserve(&app.db, &cap).await {
-            Ok(Some(_)) => {}
+            Ok(Some(slot)) => paid.slot = slot,
             Ok(None) => return Err(("skipped", "ai_daily_cap")),
             Err(e) => {
                 tracing::error!(error = %e, item = %item.id, "ai daily cap not read");
@@ -2963,7 +2971,7 @@ async fn ai_pay(
             Err(e) => Err(e),
         };
         match spent {
-            Ok(AiSpent::Paid(kind)) => paid = Some(kind),
+            Ok(AiSpent::Paid(kind)) => paid.kind = Some(kind),
             Ok(AiSpent::Short) => return Err(("skipped", "no_ai_credits")),
             Ok(AiSpent::Refunded) => return Err(("failed", "ai_failed")),
             Err(e) => {
@@ -2983,11 +2991,12 @@ async fn ai_pay(
 async fn ai_refund(
     app: &AppState,
     item: &inbox_items::Model,
-    paid: Option<billing::Kind>,
+    paid: Paid,
     reference: &str,
     why: &str,
 ) {
-    if let Some(kind) = paid {
+    crate::rate_limit::daily_refund(&app.db, &paid.slot).await;
+    if let Some(kind) = paid.kind {
         let back = billing::grant(&app.db, item.team_id, kind, 1, why, Some(reference));
         if let Err(e) = back.await {
             tracing::error!(error = %e, item = %item.id, "ai reply not given back");

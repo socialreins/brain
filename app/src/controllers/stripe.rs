@@ -393,6 +393,38 @@ async fn apply_subscription(
             return Ok(Outcome::Extra(id.to_owned()));
         }
     }
+    // A trial that begins is that person's one trial, whatever happens to the team later. Two
+    // checkouts opened before either finished both carry a trial: the second to start is cancelled
+    // like any second live subscription, and the person pays at once by starting it again.
+    if let (Some(key), Some(_)) = (
+        sub["metadata"]["trial_key"]
+            .as_str()
+            .filter(|k| !k.is_empty()),
+        time(&sub["trial_end"]),
+    ) {
+        let claimed = db
+            .execute_raw(stmt(
+                "INSERT INTO trial_uses (person_key, team_id) VALUES ($1, $2) \
+                 ON CONFLICT DO NOTHING",
+                vec![key.into(), team.into()],
+            ))
+            .await?
+            .rows_affected()
+            == 1;
+        if !claimed && status == "trialing" {
+            let owner = db
+                .query_one_raw(stmt(
+                    "SELECT team_id FROM trial_uses WHERE person_key = $1",
+                    vec![key.into()],
+                ))
+                .await?
+                .and_then(|r| r.try_get::<Option<Uuid>>("", "team_id").ok().flatten());
+            if owner.is_some_and(|o| o != team) {
+                tracing::warn!(%team, subscription = id, "second trial for one person");
+                return Ok(Outcome::Extra(id.to_owned()));
+            }
+        }
+    }
     // Stripe moved the period end into the item in newer API versions.
     let period_end = time(&sub["current_period_end"]).or_else(|| time(&item["current_period_end"]));
     let sql = "INSERT INTO subscriptions (team_id, plan_id, status, provider, provider_customer_id, \
@@ -437,20 +469,6 @@ async fn apply_subscription(
         .await?
         .rows_affected()
         == 1;
-    // A trial that really began is that person's one trial, whatever happens to the team later.
-    if let (true, Some(key), Some(_)) = (
-        written,
-        sub["metadata"]["trial_key"]
-            .as_str()
-            .filter(|k| !k.is_empty()),
-        time(&sub["trial_end"]),
-    ) {
-        db.execute_raw(stmt(
-            "INSERT INTO trial_uses (person_key, team_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-            vec![key.into(), team.into()],
-        ))
-        .await?;
-    }
     Ok(Outcome::Applied(
         written && was_live && !billing::live(status),
     ))

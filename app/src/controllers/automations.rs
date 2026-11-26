@@ -138,10 +138,11 @@ pub struct AutomationInput {
     #[serde(default)]
     pub fallback_public_reply: Option<String>,
     /// Minutes, 1 to 10080: it does not answer the same person again within this time (the
-    /// run is stored `skipped: cooldown`). 0: no cool-down. Absent: 10 minutes on a new
+    /// run is stored `skipped: cooldown`). 0 or null: no cool-down. Absent: 10 minutes on a new
     /// automation (`POST`), the stored value kept on `PUT`.
-    #[serde(default)]
-    pub cooldown_minutes: Option<u32>,
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Option<u32>)]
+    pub cooldown_minutes: Option<Option<u32>>,
     /// 1 to 500: most runs of this automation in 24 hours (a run past it is stored `skipped:
     /// automation_cap`). Absent: only the team's daily cap.
     #[serde(default)]
@@ -266,6 +267,21 @@ async fn find(
         .await
 }
 
+/// Tells `null` from a missing field: absent stays `None`, `null` becomes `Some(None)`.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<u32>>, D::Error> {
+    <Option<u32> as Deserialize>::deserialize(d).map(Some)
+}
+
+/// What to store for the input's cool-down: `absent` when it names none, no cool-down for null
+/// or 0.
+fn cooldown(input: Option<Option<u32>>, absent: Option<i32>) -> Option<i32> {
+    match input {
+        None => absent,
+        Some(None | Some(0)) => None,
+        Some(Some(v)) => Some(v as i32),
+    }
+}
+
 /// The cool-down a new automation gets when its input names none: one answer to the same person
 /// in 10 minutes, so a hostile bot cannot run an automation into its daily cap. Automations made
 /// before this keep what they stored (a null stays "no cool-down").
@@ -282,7 +298,7 @@ async fn checked(
     };
     let in_range = |v: Option<u32>, max: u32| v.is_none_or(|v| (1..=max).contains(&v));
     // 0 is "no cool-down", asked for on purpose.
-    if input.cooldown_minutes.is_some_and(|v| v > 10_080) {
+    if input.cooldown_minutes.flatten().is_some_and(|v| v > 10_080) {
         return Ok(Err(reply(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_cooldown",
@@ -605,11 +621,10 @@ async fn create(
             actions: Set(serde_json::json!(input.actions.unwrap_or_default())),
             steps: Set(input.steps.map(|s| serde_json::json!(s))),
             fallback_public_reply: Set(input.fallback_public_reply),
-            cooldown_minutes: Set(match input.cooldown_minutes {
-                None => Some(DEFAULT_COOLDOWN_MINUTES),
-                Some(0) => None,
-                Some(v) => Some(v as i32),
-            }),
+            cooldown_minutes: Set(cooldown(
+                input.cooldown_minutes,
+                Some(DEFAULT_COOLDOWN_MINUTES),
+            )),
             daily_cap: Set(input.daily_cap.map(|v| v as i32)),
             created_by: Set(Some(t.current.0.id)),
             ..Default::default()
@@ -710,12 +725,7 @@ async fn update(
             )
             .col_expr(
                 automations::Column::CooldownMinutes,
-                match input.cooldown_minutes {
-                    None => old.cooldown_minutes,
-                    Some(0) => None,
-                    Some(v) => Some(v as i32),
-                }
-                .into(),
+                cooldown(input.cooldown_minutes, old.cooldown_minutes).into(),
             )
             .col_expr(
                 automations::Column::DailyCap,

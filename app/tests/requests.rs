@@ -24213,6 +24213,27 @@ mod teams {
                     assert_eq!(run["reason"], "ai_daily_cap");
                     assert_eq!(AI_CALLS.lock().unwrap().len(), calls);
 
+                    // A call that gives nothing usable gives its slot back: an outage drains nothing.
+                    let (s, db, state) = on_ai_capped(false, Some(OUR_KEY), 1).await;
+                    let (cookie, _, account, me) = owner(&s, &db).await;
+                    let id = automation(
+                        &s,
+                        &cookie,
+                        json!({"name": "AI", "trigger": "comment_received",
+                            "actions": [{"type": "ai_reply_publicly", "prompt": "Say hi"}]}),
+                    )
+                    .await;
+                    let t = (&s, &db, &state);
+                    let at = (account.as_str(), me.as_str(), id.as_str());
+                    reply("500");
+                    for (rkey, secs) in [("df1", 1), ("df2", 2)] {
+                        let run = comment(t, &cookie, at, rkey, secs).await;
+                        assert_eq!(run["reason"], "ai_failed", "{run}");
+                    }
+                    reply("Hi there!");
+                    let run = comment(t, &cookie, at, "df3", 3).await;
+                    assert_eq!(run["status"], "sent", "{run}");
+
                     let (s, db, state) = on_ai_capped(false, Some(OUR_KEY), 0).await;
                     let (cookie, _, account, me) = owner(&s, &db).await;
                     let id = automation(
@@ -37500,6 +37521,54 @@ mod teams {
             // Someone else's trial is not this person's.
             let (_, other, _) = user(&s, &db).await;
             assert_eq!(billing(other).await["trial_available"], true);
+        }
+
+        /// Two checkouts opened before either finished both carry a trial: the second to start is
+        /// cancelled in Stripe and never written, and the first stays.
+        #[tokio::test]
+        #[serial]
+        async fn two_trials_started_at_once_keep_one() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let first = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let made = req(&s, Method::POST, "/v1/teams", &owner)
+                .json(&json!({"name": "Other"}))
+                .await;
+            let second = made.json::<Value>()["id"].as_str().unwrap().to_owned();
+            let key = format!("race-{}@example.com", *RUN);
+            let now = Utc::now().timestamp();
+            for (i, team) in [&first, &second].into_iter().enumerate() {
+                let mut e: Value = serde_json::from_str(&sub_event(
+                    &format!("evt_race{i}"),
+                    now,
+                    &format!("sub_race{i}"),
+                    team,
+                    "trialing",
+                    "price_s",
+                ))
+                .unwrap();
+                e["data"]["object"]["metadata"]["trial_key"] = key.clone().into();
+                assert_eq!(
+                    deliver(&s, &e.to_string(), WHSEC, now).await.status_code(),
+                    200
+                );
+            }
+            let held = |team: String| {
+                let db = &db;
+                async move {
+                    db.query_one_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "SELECT 1 FROM subscriptions WHERE team_id = $1",
+                        [team.parse::<uuid::Uuid>().unwrap().into()],
+                    ))
+                    .await
+                    .unwrap()
+                    .is_some()
+                }
+            };
+            assert!(held(first).await);
+            assert!(!held(second).await);
+            assert_eq!(count(&format!("/cancel/sub_race1_{}", *RUN)), 1);
         }
 
         #[tokio::test]
