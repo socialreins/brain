@@ -20,6 +20,49 @@ pub struct List<'a> {
     pub unsubscribe: &'a str,
 }
 
+/// Waits before the two more tries of `Mailer::send`.
+const RETRY_WAITS: [Duration; 2] = [Duration::from_millis(500), Duration::from_millis(1500)];
+
+/// Whether a `deliver` error is the provider being slow or down (a timeout, no connection, a
+/// 429 or a 5xx), which another try can fix, and not a refusal.
+fn transient(error: &str) -> bool {
+    let status = error.strip_prefix("resend status ");
+    matches!(error, "resend timeout" | "resend connection")
+        || status.is_some_and(|c| c == "429" || c.starts_with('5'))
+        || ["smtp transient", "smtp timeout", "smtp connection"]
+            .iter()
+            .any(|p| error.starts_with(p))
+}
+
+/// Mails being sent by a task nobody waits for (a sign-in link, answered before it is sent):
+/// `drain` lets a shutdown wait for them.
+static SENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Held by such a task until it ends.
+pub struct Sending;
+
+impl Sending {
+    pub fn begin() -> Self {
+        SENDING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Sending
+    }
+}
+
+impl Drop for Sending {
+    fn drop(&mut self) {
+        SENDING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Waits until no `Sending` is held, at most `limit`.
+pub async fn drain(limit: Duration) {
+    let end = tokio::time::Instant::now() + limit;
+    while SENDING.load(std::sync::atomic::Ordering::SeqCst) > 0 && tokio::time::Instant::now() < end
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 #[derive(Clone)]
 pub enum Mailer {
     /// `MAIL_LOG=true`: each message, sign-in link included, is written to the log at info level.
@@ -78,8 +121,21 @@ impl Mailer {
         web_url: &str,
     ) -> Result<(), String> {
         let page = html(subject, &body, web_url);
-        self.deliver(to, None, subject, body, Some(page), None)
-            .await
+        // Mail we write (sign-in links, notices) is safe to send twice, so a provider that is
+        // slow or briefly down gets another try; newsletters and contact mail do not (below).
+        let mut waits = RETRY_WAITS.into_iter();
+        loop {
+            let sent = self
+                .deliver(to, None, subject, body.clone(), Some(page.clone()), None)
+                .await;
+            match (sent, waits.next()) {
+                (Err(e), Some(wait)) if transient(&e) => {
+                    tracing::warn!(error = %e, "mail not sent, trying again");
+                    tokio::time::sleep(wait).await;
+                }
+                (sent, _) => return sent,
+            }
+        }
     }
 
     /// A newsletter: the caller's own text and HTML, from `list.from_name`, with the
@@ -360,6 +416,116 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("<p style=\"margin:0 0 16px\">Body</p>"));
+    }
+
+    /// A stand-in that answers 503 to the first `fails` requests, then 200.
+    async fn flaky(fails: usize) -> (String, Seen) {
+        let seen = Seen::default();
+        let log = seen.clone();
+        let app = Router::new().route(
+            "/emails",
+            post(move |Json(body): Json<Value>| async move {
+                let mut seen = log.lock().unwrap();
+                seen.push((None, body));
+                let status = if seen.len() <= fails {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::OK
+                };
+                (status, Json(json!({"id": "x"})))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/emails", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (url, seen)
+    }
+
+    #[tokio::test]
+    async fn mail_we_write_is_tried_again_when_the_provider_is_down_for_a_moment() {
+        let send = |url: String| async move {
+            let mailer = Mailer::resend_at(&url, "re_test", "login@example.com").unwrap();
+            mailer
+                .send("a@example.com", "Hi", "Body".into(), "https://web.test")
+                .await
+        };
+        // Two 503s and then it works: three requests, one Ok.
+        let (url, seen) = flaky(2).await;
+        send(url).await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        // Down for good: three tries and the last error.
+        let (url, seen) = mock(StatusCode::BAD_GATEWAY).await;
+        assert_eq!(send(url).await.unwrap_err(), "resend status 502");
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        // A refusal is not retried.
+        let (url, seen) = mock(StatusCode::UNPROCESSABLE_ENTITY).await;
+        assert_eq!(send(url).await.unwrap_err(), "resend status 422");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        // A rate limit is.
+        let (url, seen) = flaky(1).await;
+        send(url).await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_newsletter_or_contact_mail_is_never_sent_twice_by_a_retry() {
+        let (url, seen) = mock(StatusCode::SERVICE_UNAVAILABLE).await;
+        let mailer = Mailer::resend_at(&url, "re_test", "login@example.com").unwrap();
+        let list = super::List {
+            from_name: "Ann",
+            unsubscribe: "https://brain.test/u",
+        };
+        let sent = mailer.send_list("a@example.com", list, "Hi", "T".into(), "<p>T</p>".into());
+        assert!(sent.await.is_err());
+        let sent = mailer.send_reply_to("a@example.com", None, "Hi", "T".into());
+        assert!(sent.await.is_err());
+        assert_eq!(seen.lock().unwrap().len(), 2, "one request each");
+    }
+
+    #[test]
+    fn only_a_provider_that_is_slow_or_down_is_transient() {
+        for e in [
+            "resend timeout",
+            "resend connection",
+            "resend status 429",
+            "resend status 503",
+            "smtp transient 451",
+            "smtp timeout",
+        ] {
+            assert!(super::transient(e), "{e}");
+        }
+        for e in [
+            "resend status 400",
+            "resend status 422",
+            "smtp permanent 550",
+            "smtp tls",
+            "recipient is not a mailbox",
+        ] {
+            assert!(!super::transient(e), "{e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_a_mail_in_flight_and_gives_up_at_the_limit() {
+        use std::time::{Duration, Instant};
+        let held = super::Sending::begin();
+        let started = Instant::now();
+        super::drain(Duration::from_millis(300)).await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "waited for it"
+        );
+        let started = Instant::now();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(held);
+        });
+        super::drain(Duration::from_secs(5)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "left as soon as it ended"
+        );
+        release.await.unwrap();
     }
 
     #[test]

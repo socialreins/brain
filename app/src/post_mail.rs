@@ -3,7 +3,9 @@
 //! its next copy could not be made. Whatever decides that queues a
 //! notice (`queue`) in its own transaction; the publish round sends what is queued (`send_due`)
 //! in the background, never inside a transaction. Each notice mails the post's author and the
-//! team's owners once, at most `PER_DAY` notices a team a day; the rest are only logged.
+//! team's owners once, at most `PER_DAY` notices a team a day; the rest are only logged. A notice
+//! whose mail failed for every recipient (the mail provider is down) goes back and is tried again,
+//! `RETRIES` times at growing waits (`send_one`).
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement, Value};
 use uuid::Uuid;
 
@@ -11,6 +13,9 @@ use crate::{rate_limit, state::AppState};
 
 /// Notices a team is mailed a day.
 pub const PER_DAY: i64 = 10;
+
+/// How many more times a notice is tried after a round where no recipient got it.
+pub const RETRIES: i32 = 5;
 
 /// Why a post is mailed about.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -53,7 +58,8 @@ pub async fn queue(db: &impl ConnectionTrait, post: Uuid, kind: Kind) -> Result<
     let stmt = sql(
         "INSERT INTO post_notices (post_id, team_id, kind) \
          SELECT id, team_id, $2 FROM posts WHERE id = $1 \
-         ON CONFLICT (post_id, kind) DO UPDATE SET created_at = now(), sent_at = NULL \
+         ON CONFLICT (post_id, kind) DO UPDATE SET created_at = now(), sent_at = NULL, \
+           tries = 0, retry_at = NULL \
          WHERE post_notices.created_at < (SELECT scheduled_at FROM posts WHERE id = $1)",
         vec![post.into(), kind.as_str().into()],
     );
@@ -61,13 +67,15 @@ pub async fn queue(db: &impl ConnectionTrait, post: Uuid, kind: Kind) -> Result<
 }
 
 /// Claims the notices not sent yet (each by one instance, `sent_at` first) and mails them, one
-/// at a time. Errors are logged: a notice is never sent twice, so a lost one stays lost.
+/// at a time. A notice is not mailed twice to anyone who got it; one that reached nobody because
+/// the mail provider failed is put back (`send_one`). Other errors are logged and the notice is lost.
 pub async fn send_due(app: &AppState) {
     let claim = sql(
         "UPDATE post_notices SET sent_at = now() WHERE (post_id, kind) IN ( \
            SELECT post_id, kind FROM post_notices WHERE sent_at IS NULL \
+           AND (retry_at IS NULL OR retry_at <= now()) \
            ORDER BY created_at LIMIT 50 FOR UPDATE SKIP LOCKED) \
-         RETURNING post_id, team_id, kind",
+         RETURNING post_id, team_id, kind, tries",
         vec![],
     );
     let rows = match app.db.query_all_raw(claim).await {
@@ -79,26 +87,32 @@ pub async fn send_due(app: &AppState) {
             let post: Uuid = row.try_get("", "post_id")?;
             let team: Uuid = row.try_get("", "team_id")?;
             let kind: String = row.try_get("", "kind")?;
-            Ok::<_, DbErr>((post, team, kind))
+            let tries: i32 = row.try_get("", "tries")?;
+            Ok::<_, DbErr>((post, team, kind, tries))
         })();
-        let Ok((post, team, kind)) = got else {
+        let Ok((post, team, kind, tries)) = got else {
             continue;
         };
         let Some(kind) = Kind::parse(&kind) else {
             continue;
         };
-        if let Err(e) = send_one(app, post, team, kind).await {
+        if let Err(e) = send_one(app, post, team, (kind, tries)).await {
             tracing::warn!(error = %e, %post, "post notice not sent");
         }
     }
 }
 
-async fn send_one(app: &AppState, post: Uuid, team: Uuid, kind: Kind) -> Result<(), DbErr> {
+async fn send_one(
+    app: &AppState,
+    post: Uuid,
+    team: Uuid,
+    (kind, tries): (Kind, i32),
+) -> Result<(), DbErr> {
     let cap = [(format!("post-mail:team:{team}"), PER_DAY)];
-    if rate_limit::daily_reserve(&app.db, &cap).await?.is_none() {
+    let Some(hit) = rate_limit::daily_reserve(&app.db, &cap).await? else {
         tracing::info!(%post, %team, "post notice over the team's daily cap: not mailed");
         return Ok(());
-    }
+    };
     let found = app
         .db
         .query_one_raw(sql(
@@ -127,15 +141,38 @@ async fn send_one(app: &AppState, post: Uuid, team: Uuid, kind: Kind) -> Result<
         .await?;
     let link = format!("{}/t/{code}/posts/{number}", app.web_url);
     let (subject, text) = compose(kind, &platform, &body, error.as_deref(), &link);
+    let (mut sent, mut failed) = (0, 0);
     for r in to {
         let email: String = r.try_get("", "email")?;
-        if let Err(e) = app
+        match app
             .mailer
             .send(&email, &subject, text.clone(), &app.web_url)
             .await
         {
-            tracing::warn!(error = %e, %post, "post notice mail not sent");
+            Ok(()) => sent += 1,
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(error = %e, %post, "post notice mail not sent");
+            }
         }
+    }
+    // Nobody got it: the mail provider is down. Give the notice and the day's hit back, and try
+    // again in a while (5, 10, 15 ... minutes). If anyone got it, it is done: the rest would
+    // only get it twice.
+    if sent == 0 && failed > 0 {
+        rate_limit::daily_refund(&app.db, &hit).await;
+        let back = sql(
+            "UPDATE post_notices SET sent_at = NULL, tries = tries + 1, \
+             retry_at = now() + make_interval(mins => 5 * ($4 + 1)) \
+             WHERE post_id = $1 AND kind = $2 AND tries < $3 AND sent_at IS NOT NULL",
+            vec![
+                post.into(),
+                kind.as_str().into(),
+                RETRIES.into(),
+                tries.into(),
+            ],
+        );
+        app.db.execute_raw(back).await?;
     }
     Ok(())
 }
