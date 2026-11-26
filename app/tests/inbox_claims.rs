@@ -49,13 +49,35 @@ async fn the_tick_stamps_what_it_claims_and_skips_what_is_paused_or_fresh() {
         .await
         .unwrap();
     }
+    // More due accounts than one chunk, so the tick has to claim again.
+    for i in 0..60 {
+        db.execute_unprepared(&format!(
+            "INSERT INTO social_accounts (id, team_id, provider, external_id, access_token) \
+             VALUES ('{}', '{team}', 'bluesky', 'many{i}', '\\x00')",
+            Uuid::now_v7()
+        ))
+        .await
+        .unwrap();
+    }
     inbox::tick(&state).await.unwrap();
+    let r = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Postgres,
+            format!(
+                "SELECT count(*) FILTER (WHERE inbox_read_at > now() - interval '30 seconds') AS n \
+                 FROM social_accounts WHERE team_id = '{team}' AND external_id LIKE 'many%'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.try_get::<i64>("", "n").unwrap(), 60);
     let rows = db
         .query_all_raw(Statement::from_string(
             DbBackend::Postgres,
             format!(
                 "SELECT external_id, inbox_read_at > now() - interval '2 seconds' AS claimed, \
-                 inbox_read_at IS NULL AS never FROM social_accounts WHERE team_id = '{team}'"
+                 inbox_read_at IS NULL AS never FROM social_accounts WHERE team_id = '{team}' AND external_id NOT LIKE 'many%'"
             ),
         ))
         .await

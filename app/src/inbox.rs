@@ -45,12 +45,12 @@ pub const PLATFORMS: [&str; 8] = [
 ];
 /// Accounts read at once across the process.
 static ACCOUNT_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(16));
-/// An account is read again this many seconds after its last read (a little under the tick, so
-/// every tick finds it due). A round claims `READ_CHUNK` accounts, oldest read first, and the
+/// An account is read again this many seconds after its last read (well under the tick, since a
+/// late chunk of a tick is stamped up to 45 s into it and must still be due at the next one). A round claims `READ_CHUNK` accounts, oldest read first, and the
 /// next chunk follows until none is due or `TICK_BUDGET` is spent: a round that is too long for a
 /// minute reads the accounts that waited longest first, so no account is starved and the lock
 /// that held a database connection for the whole round is gone.
-const READ_EVERY_SECONDS: i32 = 55;
+const READ_EVERY_SECONDS: i32 = 40;
 const READ_CHUNK: i64 = 48;
 const TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
 /// After the platform refuses the stored password, ingest leaves the account alone this long,

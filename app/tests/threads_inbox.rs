@@ -1091,7 +1091,7 @@ async fn test_this_automation_plans_what_threads_can_do() {
 
 #[tokio::test]
 #[serial]
-async fn one_tick_reads_every_account_that_is_due_and_the_oldest_read_goes_first() {
+async fn one_tick_reads_every_account_that_is_due_across_chunks() {
     let e = env().await;
     // 40 accounts, 10 of them read before (the others never): the mock knows only account 1, so
     // their reads fail after the first call, which is enough to see that each was reached.
