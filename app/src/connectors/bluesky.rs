@@ -777,7 +777,7 @@ impl Bluesky {
                 _ if std::time::Instant::now() >= deadline => {
                     return Err(failed("Bluesky took too long to process the video."))
                 }
-                _ => tokio::time::sleep(VIDEO_POLL).await,
+                _ => super::idle(VIDEO_POLL).await,
             }
         }
     }

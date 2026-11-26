@@ -628,7 +628,7 @@ impl LinkedIn {
                 _ => {}
             }
             if i < polls {
-                tokio::time::sleep(self.poll_every * i.min(POLLS)).await;
+                super::idle(self.poll_every * i.min(POLLS)).await;
             }
         }
         Err(failed(format!(

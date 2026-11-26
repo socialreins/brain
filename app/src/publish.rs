@@ -1030,10 +1030,11 @@ pub fn publisher<'a>(app: &'a AppState, platform: &str) -> Option<&'a dyn Publis
 
 /// Due posts claimed per tick; the rest wait for the next one.
 const CLAIM_BATCH: i64 = 50;
-/// Posts publishing at once, and targets publishing at once, across the process.
+/// Posts being prepared at once (checks, media downloads), and targets sending at once, across
+/// the process.
 const POSTS_AT_ONCE: usize = 8;
 static POST_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(POSTS_AT_ONCE));
-static TARGET_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(8));
+static TARGET_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8)));
 /// Posts, and targets, one team publishes at once in this process, taken before the shared
 /// slots above: a team with many large videos waits for its own, and never holds all of those.
 pub const TEAM_AT_ONCE: usize = 3;
@@ -1822,7 +1823,7 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         return Ok(());
     };
     let _team_slot = team_slot(&TEAM_POSTS, team).acquire_owned().await;
-    let Ok(_slot) = POST_SLOTS.acquire().await else {
+    let Ok(slot) = POST_SLOTS.acquire().await else {
         return release(db, id).await;
     };
     let Some(post) = posts::Entity::find_by_id(id).one(db).await? else {
@@ -2002,6 +2003,10 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
     } else {
         Arc::new(ingest(app, &post).await)
     };
+    // The post slot bounds what is prepared (checks, media downloaded); the targets that send
+    // are bounded by `TARGET_SLOTS` and give theirs back while they only wait for the platform
+    // (`connectors::idle`). `drain` still sees the post through `IN_FLIGHT`.
+    drop(slot);
     let runs: Vec<_> = pending
         .into_iter()
         .map(|t| {
@@ -2617,10 +2622,14 @@ async fn publish_target_held(
     stored: &Media,
     hold: &mut Option<XHold>,
 ) -> Result<(), DbErr> {
-    let _team_slot = team_slot(&TEAM_TARGETS, post.team_id).acquire_owned().await;
-    let Ok(_slot) = TARGET_SLOTS.acquire().await else {
+    let Ok(team_slot) = team_slot(&TEAM_TARGETS, post.team_id).acquire_owned().await else {
         return Ok(());
     };
+    let Ok(slot) = TARGET_SLOTS.clone().acquire_owned().await else {
+        return Ok(());
+    };
+    // Handed back by `connectors::idle` while the target only waits for the platform.
+    let slots = Arc::new(crate::connectors::Slots::new(vec![team_slot, slot]));
     let db = &app.db;
     if !claim_target(db, id).await? {
         return Ok(());
@@ -2629,7 +2638,8 @@ async fn publish_target_held(
     // one retry of an unsent failure (`fail_target`) instead of leaving it `publishing` for
     // `recover_stuck` to call "may have posted" 31 minutes on.
     let mut sending = false;
-    match publish_claimed(app, post, id, stored, hold, &mut sending).await {
+    let run = publish_claimed(app, post, id, stored, hold, &mut sending);
+    match crate::connectors::SLOTS.scope(slots.clone(), run).await {
         Err(e) if !sending => {
             tracing::warn!(error = %e, target = %id, "database error before anything was sent");
             let msg = unsent("Publishing hit a database error.".into(), true);

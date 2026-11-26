@@ -10,6 +10,39 @@ pub mod x;
 pub mod youtube;
 
 tokio::task_local! {
+    /// The slots the target publishing in this task holds (`publish::publish_target_held`).
+    pub static SLOTS: std::sync::Arc<Slots>;
+}
+
+/// The permits of the shared publish slots a target holds. `idle` hands them back for good once
+/// the target only has light calls left, so a platform's processing wait (Threads' 30 seconds, a
+/// video's status polls) never keeps a slot from a target that can send.
+// shortcut: no slot is taken again after the wait; what follows is a status poll and the final
+// publish call, a few small requests. Take them again if a connector ever uploads after a wait.
+pub struct Slots(std::sync::Mutex<Vec<tokio::sync::OwnedSemaphorePermit>>);
+
+impl Slots {
+    pub fn new(permits: Vec<tokio::sync::OwnedSemaphorePermit>) -> Self {
+        Self(std::sync::Mutex::new(permits))
+    }
+
+    fn release(&self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
+/// Waits `time` for the platform to process what was sent, holding no publish slot while it does
+/// (see `Slots`). Only for waits after which no large transfer follows. Outside a publish it is
+/// a plain sleep. The wait is never followed by a repeat of a call that may have been sent: this
+/// changes who holds a slot, nothing about what is sent or when (decision 0008).
+pub async fn idle(time: std::time::Duration) {
+    if let Ok(slots) = SLOTS.try_with(std::sync::Arc::clone) {
+        slots.release();
+    }
+    tokio::time::sleep(time).await;
+}
+
+tokio::task_local! {
     /// Extra processing checks for the publish running in this task: `publish::send` sets it
     /// from the size of the post's videos, so no connector call has to carry it.
     pub static PATIENCE: u32;
@@ -88,5 +121,47 @@ mod tests {
             panic!("still a failure");
         };
         assert_eq!(kept, "Publish: X could not be reached.");
+    }
+
+    #[tokio::test]
+    async fn idle_hands_the_slots_back_while_it_waits() {
+        use std::{sync::Arc, time::Duration};
+        use tokio::sync::Semaphore;
+        let gate = Arc::new(Semaphore::new(8));
+        // 40 publishes that each wait 100 ms for a platform, 8 slots: holding a slot while
+        // waiting takes 5 rounds, giving it back takes about one.
+        let run = |idle_wait: bool| {
+            let gate = gate.clone();
+            async move {
+                let started = std::time::Instant::now();
+                let mut all = Vec::new();
+                for _ in 0..40 {
+                    let permit = gate.clone().acquire_owned().await.unwrap();
+                    let slots = Arc::new(super::Slots::new(vec![permit]));
+                    all.push(tokio::spawn(super::SLOTS.scope(
+                        slots.clone(),
+                        async move {
+                            if idle_wait {
+                                super::idle(Duration::from_millis(100)).await;
+                            } else {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                            drop(slots);
+                        },
+                    )));
+                }
+                for t in all {
+                    t.await.unwrap();
+                }
+                started.elapsed()
+            }
+        };
+        let held = run(false).await;
+        let given = run(true).await;
+        assert!(held >= Duration::from_millis(450), "{held:?}");
+        assert!(given < Duration::from_millis(300), "{given:?}");
+        assert_eq!(gate.available_permits(), 8);
+        // Outside a publish it is a plain sleep.
+        super::idle(Duration::from_millis(1)).await;
     }
 }
