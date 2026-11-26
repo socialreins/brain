@@ -117,6 +117,31 @@ fn gate(app: &AppState, t: &InTeam) -> Option<Response> {
     None
 }
 
+/// Stripe's idempotency key for a checkout: one per team and price per minute, so a double
+/// click or two tabs open the same session instead of two that could both be paid.
+fn checkout_key(team: Uuid, price: &str) -> String {
+    format!("checkout:{team}:{price}:{}", Utc::now().timestamp() / 60)
+}
+
+/// Mails the site admins (`ADMIN_EMAILS`) about something only a person can fix, in the
+/// background. These are rare (a payment with nothing granted, a refund, a dispute, a
+/// subscription left running), so there is no cap. Stripe ids only, never a card or email.
+fn alert_admins(app: &AppState, subject: &str, text: String) {
+    let app = app.clone();
+    let subject = subject.to_owned();
+    tokio::spawn(async move {
+        for to in &app.admin_emails {
+            if let Err(e) = app
+                .mailer
+                .send(to, &subject, text.clone(), &app.web_url)
+                .await
+            {
+                tracing::warn!(error = %e, "stripe alert mail not sent");
+            }
+        }
+    });
+}
+
 /// Starts a subscription: answers the Stripe Checkout page to send the browser to. The team's
 /// first subscription has a 7-day trial, once for each person (a person who had a trial in any
 /// team pays at once, and so does a team that had a subscription before). `409
@@ -186,7 +211,11 @@ async fn checkout(
         Some(customer) => form.push(("customer".to_owned(), customer)),
         None => form.push(("customer_email".to_owned(), t.current.0.email.clone())),
     }
-    match app.stripe.checkout(&form).await {
+    match app
+        .stripe
+        .checkout(&form, &checkout_key(t.team.id, price))
+        .await
+    {
         Ok(url) => Json(Redirect { url }).into_response(),
         Err(e) => {
             tracing::error!(status = ?e.0, code = %e.1, "stripe checkout failed");
@@ -255,7 +284,11 @@ async fn buy_credits(
         Some(customer) => form.push(("customer".to_owned(), customer)),
         None => form.push(("customer_email".to_owned(), t.current.0.email.clone())),
     }
-    match app.stripe.checkout(&form).await {
+    match app
+        .stripe
+        .checkout(&form, &checkout_key(t.team.id, price))
+        .await
+    {
         Ok(url) => Json(Redirect { url }).into_response(),
         Err(e) => {
             tracing::error!(status = ?e.0, code = %e.1, "stripe credits checkout failed");
@@ -673,8 +706,31 @@ async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -
             let meta = &event["data"]["object"]["metadata"];
             tracing::error!(kind, team = ?meta["team_id"].as_str(), pack = ?meta["pack"].as_str(),
                 "stripe pack payment refunded or disputed: review its credits");
+            if fresh {
+                let text = format!(
+                    "Stripe event {id} ({kind}): a payment was refunded or disputed. Team {}, pack {}. \
+                     Its credits stay until a person takes them back with the admin tools.",
+                    meta["team_id"].as_str().unwrap_or("unknown"),
+                    meta["pack"].as_str().unwrap_or("unknown"),
+                );
+                alert_admins(
+                    &app,
+                    "SocialReins: a Stripe payment was refunded or disputed",
+                    text,
+                );
+            }
         }
         if fresh && paid && !apply_purchase(&txn, &event["data"]["object"]).await? {
+            let text = format!(
+                "Stripe event {id} ({kind}) is a paid checkout session ({}) with no known team or \
+                 pack, so nothing was granted. Grant the credits by hand or refund it in Stripe.",
+                event["data"]["object"]["id"].as_str().unwrap_or("unknown"),
+            );
+            alert_admins(
+                &app,
+                "SocialReins: a paid Stripe checkout needs a person",
+                text,
+            );
             return Ok((None, None));
         }
         let object = &event["data"]["object"];
@@ -720,6 +776,16 @@ async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -
             if let Some(sub) = extra {
                 if let Err(e) = app.stripe.cancel(&sub).await {
                     tracing::error!(subscription = %sub, status = ?e.0, code = %e.1, "extra stripe subscription not cancelled");
+                    let text = format!(
+                        "Stripe subscription {sub} is a second live plan for a team and could not be \
+                         cancelled automatically ({}). Cancel it, and refund it, in Stripe.",
+                        e.1
+                    );
+                    alert_admins(
+                        &app,
+                        "SocialReins: a second Stripe subscription is still running",
+                        text,
+                    );
                 }
             }
             // In the background: a slow mail service must not hold Stripe's answer.

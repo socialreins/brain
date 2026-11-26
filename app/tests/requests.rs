@@ -36938,6 +36938,8 @@ mod teams {
         /// Every call the mock took: (path, basic-auth user, form).
         static CALLS: Mutex<Vec<Call>> = Mutex::new(Vec::new());
         type Call = (String, String, Vec<(String, String)>);
+        /// The `Idempotency-Key` of every checkout the mock took.
+        static KEYS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
         async fn mock() -> String {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -36954,6 +36956,9 @@ mod teams {
                     )
                     .unwrap();
                     let fail = form.iter().any(|(k, v)| k == "customer" && v == "cus_fail");
+                    if let Some(k) = headers.get("idempotency-key") {
+                        KEYS.lock().unwrap().push(k.to_str().unwrap().to_owned());
+                    }
                     CALLS.lock().unwrap().push((path.into(), user, form));
                     if fail {
                         return (
@@ -37281,6 +37286,120 @@ mod teams {
                 .await
                 .unwrap();
             assert!(kept.is_none());
+        }
+
+        /// A double click opens one checkout: the same team and price in the same minute send
+        /// the same `Idempotency-Key`, another price or team another one.
+        #[tokio::test]
+        #[serial]
+        async fn a_checkout_carries_a_key_that_repeats_for_the_same_click() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let (_, other, _) = user(&s, &db).await;
+            let before = KEYS.lock().unwrap().len();
+            for (who, pack) in [
+                (&owner, "x100"),
+                (&owner, "x100"),
+                (&owner, "x500"),
+                (&other, "x100"),
+            ] {
+                let res = req(&s, Method::POST, "/v1/team/billing/credits", who)
+                    .json(&json!({"pack": pack}))
+                    .await;
+                res.assert_status_ok();
+            }
+            let keys = KEYS.lock().unwrap()[before..].to_vec();
+            assert_eq!(keys.len(), 4, "{keys:?}");
+            assert_eq!(keys[0], keys[1], "the same click");
+            assert_ne!(keys[0], keys[2], "another pack");
+            assert_ne!(keys[0], keys[3], "another team");
+            assert!(keys[0].starts_with("checkout:"), "{keys:?}");
+        }
+
+        /// What only a person can fix reaches `ADMIN_EMAILS` by mail, once per event: a paid
+        /// session with no team, a refund, a dispute.
+        #[tokio::test]
+        #[serial]
+        async fn payments_that_need_a_person_mail_the_admins() {
+            let base = mock().await;
+            let (url, seen) = crate::captcha_and_contact::resend().await;
+            let (s, db) = server_where(|c| {
+                c.billing_enabled = true;
+                let mut st = Stripe::new(
+                    Some("sk_test_mock".into()),
+                    Some(WHSEC.into()),
+                    [
+                        ("scheduler", "month", Some("price_s".into())),
+                        ("automation", "month", None),
+                        ("scheduler", "year", None),
+                        ("automation", "year", None),
+                    ],
+                    [
+                        ("x100", Some("price_p1".into())),
+                        ("x500", Some("price_p5".into())),
+                    ],
+                )
+                .unwrap();
+                st.api_url = base;
+                c.stripe = st;
+                c.admin_emails = vec!["ops@example.com".into()];
+                c.mailer = socialreins_brain::mail::Mailer::resend_at(
+                    &url,
+                    "re_test",
+                    "brain@example.com",
+                )
+                .unwrap();
+            })
+            .await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let now = Utc::now().timestamp();
+            let to_admin = || {
+                seen.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|m| m["to"] == json!(["ops@example.com"]))
+                    .map(|m| {
+                        (
+                            m["subject"].as_str().unwrap().to_owned(),
+                            m["text"].as_str().unwrap().to_owned(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let settle = || tokio::time::sleep(std::time::Duration::from_millis(500));
+            // A paid session with no known pack.
+            let bad = paid_event("evt_a1", "cs_a1", &team, "x9", "paid");
+            assert_eq!(deliver(&s, &bad, WHSEC, now).await.status_code(), 200);
+            settle().await;
+            let mails = to_admin();
+            assert_eq!(mails.len(), 1, "{mails:?}");
+            assert_eq!(
+                mails[0].0,
+                "SocialReins: a paid Stripe checkout needs a person"
+            );
+            assert!(mails[0].1.contains("cs_a1"), "{}", mails[0].1);
+            // A good purchase mails nobody.
+            let good = paid_event("evt_a2", "cs_a2", &team, "x100", "paid");
+            assert_eq!(deliver(&s, &good, WHSEC, now).await.status_code(), 200);
+            settle().await;
+            assert_eq!(to_admin().len(), 1);
+            // A refund, once even if Stripe sends it twice.
+            let refund = json!({
+                "id": format!("evt_a3_{}", *RUN), "type": "charge.refunded", "created": now,
+                "data": {"object": {"id": "ch_1", "metadata": {"team_id": team, "pack": "x100"}}}
+            })
+            .to_string();
+            for _ in 0..2 {
+                assert_eq!(deliver(&s, &refund, WHSEC, now).await.status_code(), 200);
+            }
+            settle().await;
+            let mails = to_admin();
+            assert_eq!(mails.len(), 2, "{mails:?}");
+            assert_eq!(
+                mails[1].0,
+                "SocialReins: a Stripe payment was refunded or disputed"
+            );
         }
 
         /// The owners hear when a trial is about to end, on the first failed renewal (not each

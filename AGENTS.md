@@ -326,6 +326,8 @@ cargo run -p socialreins-brain
   `webhooks::with_event`, so its event is queued in the same statement; README documents the
   payload and signature.
 
+- `app/src/controllers/stripe.rs`: a checkout call carries Stripe's `Idempotency-Key` (`checkout_key`: team, price, minute), so a double click opens one session. What only a person can fix (a paid session with no team or pack, a refund or dispute, a second subscription that could not be cancelled) is mailed to `ADMIN_EMAILS` (`alert_admins`) as well as logged. There is still no reconciliation against Stripe's event list: subscription state comes only from webhooks.
+
 ## Rules
 
 - No em dashes in any text: code, comments, docs, commit messages, PR bodies. Use a comma, a
