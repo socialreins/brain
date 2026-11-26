@@ -43,9 +43,16 @@ pub const PLATFORMS: [&str; 8] = [
     "tiktok",
     "youtube",
 ];
-const INBOX_LOCK: i64 = 0x0049_4e42_4f58_5449;
 /// Accounts read at once across the process.
-static ACCOUNT_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(8));
+static ACCOUNT_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(16));
+/// An account is read again this many seconds after its last read (well under the tick, since a
+/// late chunk of a tick is stamped up to 45 s into it and must still be due at the next one). A round claims `READ_CHUNK` accounts, oldest read first, and the
+/// next chunk follows until none is due or `TICK_BUDGET` is spent: a round that is too long for a
+/// minute reads the accounts that waited longest first, so no account is starved and the lock
+/// that held a database connection for the whole round is gone.
+const READ_EVERY_SECONDS: i32 = 40;
+const READ_CHUNK: i64 = 48;
+const TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
 /// After the platform refuses the stored password, ingest leaves the account alone this long,
 /// so a revoked password is not tried every minute.
 const PAUSE_MINUTES: i64 = 60;
@@ -302,37 +309,44 @@ pub(crate) fn secret(app: &AppState, account: &social_accounts::Model) -> Option
         .and_then(|b| String::from_utf8(b).ok())
 }
 
-/// One ingest round: every Bluesky account not paused, 8 at a time. Skips while another
-/// instance holds the lock.
+/// One ingest tick: rounds of the Bluesky accounts that are due (not paused, not read in the last
+/// `READ_EVERY_SECONDS`), oldest read first, until none is due or `TICK_BUDGET` is spent. A round
+/// claims its accounts by stamping `inbox_read_at`, so a second instance skips them and a crash
+/// costs one interval, then reads them 16 at a time and runs the automations on what was new.
 pub async fn tick(app: &AppState) -> Result<(), DbErr> {
-    let lock = app.db.begin().await?;
-    let row = lock
-        .query_one_raw(sql(
-            "SELECT pg_try_advisory_xact_lock($1) AS ok",
-            vec![INBOX_LOCK.into()],
-        ))
-        .await?;
-    let locked: bool = match row {
-        Some(r) => r.try_get("", "ok")?,
-        None => false,
-    };
-    if !locked {
-        return Ok(());
-    }
     if let Err(e) = automations::recover_stuck(&app.db).await {
         tracing::warn!(error = %e, "stuck automation run recovery failed");
     }
-    let paused = (Utc::now() - Duration::minutes(PAUSE_MINUTES)).fixed_offset();
-    let accounts = social_accounts::Entity::find()
-        .filter(social_accounts::Column::Provider.eq("bluesky"))
-        .filter(
-            sea_orm::Condition::any()
-                .add(social_accounts::Column::InboxErrorAt.is_null())
-                .add(social_accounts::Column::InboxErrorAt.lt(paused)),
-        )
-        .filter(sea_orm::sea_query::Expr::cust(
-            "(inbox_retry_at IS NULL OR inbox_retry_at < now())",
+    let deadline = Instant::now() + TICK_BUDGET;
+    while round(app).await? == READ_CHUNK as usize && Instant::now() < deadline {}
+    automations::sweep(app).await
+}
+
+/// One chunk: claims it and reads it, returning how many accounts it claimed.
+async fn round(app: &AppState) -> Result<usize, DbErr> {
+    let claimed = app
+        .db
+        .query_all_raw(sql(
+            "UPDATE social_accounts SET inbox_read_at = now() WHERE id IN ( \
+               SELECT id FROM social_accounts WHERE provider = 'bluesky' \
+               AND (inbox_error_at IS NULL OR inbox_error_at < now() - make_interval(mins => $1)) \
+               AND (inbox_retry_at IS NULL OR inbox_retry_at < now()) \
+               AND (inbox_read_at IS NULL OR inbox_read_at < now() - make_interval(secs => $2)) \
+               ORDER BY inbox_read_at NULLS FIRST LIMIT $3 FOR UPDATE SKIP LOCKED) \
+             RETURNING id",
+            vec![
+                (PAUSE_MINUTES as i32).into(),
+                READ_EVERY_SECONDS.into(),
+                READ_CHUNK.into(),
+            ],
         ))
+        .await?;
+    let ids: Vec<Uuid> = claimed
+        .iter()
+        .filter_map(|r| r.try_get("", "id").ok())
+        .collect();
+    let accounts = social_accounts::Entity::find()
+        .filter(social_accounts::Column::Id.is_in(ids.clone()))
         .all(&app.db)
         .await?;
     let reads: Vec<_> = accounts
@@ -342,35 +356,17 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
             tokio::spawn(async move {
                 let id = a.id;
                 match store_new(&app, a).await {
-                    Ok(stored) => stored,
-                    Err(e) => {
-                        tracing::error!(error = %e, account = %id, "inbox ingest failed");
-                        None
-                    }
+                    Ok(Some((account, fresh))) => run_fresh(&app, &account, &fresh).await,
+                    Ok(None) => {}
+                    Err(e) => tracing::error!(error = %e, account = %id, "inbox ingest failed"),
                 }
             })
         })
         .collect();
-    let mut stored = Vec::new();
     for read in reads {
-        if let Ok(Some(s)) = read.await {
-            stored.push(s);
-        }
+        let _ = read.await;
     }
-    // The lock covers reading and storing only: sends to the platforms, which can be slow, must
-    // not hold up the next round. A second instance running these too sends nothing twice.
-    lock.commit().await?;
-    let runs: Vec<_> = stored
-        .into_iter()
-        .map(|(account, fresh)| {
-            let app = app.clone();
-            tokio::spawn(async move { run_fresh(&app, &account, &fresh).await })
-        })
-        .collect();
-    for run in runs {
-        let _ = run.await;
-    }
-    automations::sweep(app).await
+    Ok(ids.len())
 }
 
 /// Automations over one account's new items, oldest first. An item whose run fails keeps no
