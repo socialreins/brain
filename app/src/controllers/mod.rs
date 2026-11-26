@@ -55,10 +55,12 @@ use axum::{
     extract::DefaultBodyLimit,
     http::{header, HeaderValue, Method},
     middleware::from_fn_with_state,
+    response::IntoResponse,
     routing::get,
     Json, Router,
 };
 use tower_http::{
+    catch_panic::CatchPanicLayer,
     cors::{AllowOrigin, CorsLayer},
     set_header::SetResponseHeaderLayer,
     trace::TraceLayer,
@@ -168,6 +170,22 @@ fn logged_path(path: &str) -> &str {
     }
 }
 
+/// A handler that panicked: logged as an error and answered with a 500 (without this the
+/// connection just drops and the edge shows its own 502 page).
+fn panic_response(panic: Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response {
+    let what = panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    tracing::error!(panic = %what, "request handler panicked");
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": "internal_error"})),
+    )
+        .into_response()
+}
+
 pub fn router(state: AppState, config: &Config) -> Router {
     let (v1, mut doc) = api().split_for_parts();
     let (auth_api, mut auth_doc) = auth::api().split_for_parts();
@@ -236,6 +254,7 @@ pub fn router(state: AppState, config: &Config) -> Router {
         )
         .layer(cors)
         .layer(TraceLayer::new_for_http().make_span_with(span))
+        .layer(CatchPanicLayer::custom(panic_response))
         // Browsers ignore this over plain http, so local dev is unaffected; it matches the web app's.
         .layer(SetResponseHeaderLayer::overriding(
             header::STRICT_TRANSPORT_SECURITY,
@@ -246,7 +265,26 @@ pub fn router(state: AppState, config: &Config) -> Router {
 
 #[cfg(test)]
 mod tests {
-    use super::logged_path;
+    use super::{logged_path, panic_response};
+    use axum::{routing::get, Router};
+    use tower_http::catch_panic::CatchPanicLayer;
+
+    fn boom() -> &'static str {
+        panic!("boom")
+    }
+
+    #[tokio::test]
+    async fn a_panicking_handler_answers_500_and_the_server_goes_on() {
+        let app = Router::new()
+            .route("/boom", get(|| async { boom() }))
+            .route("/ok", get(|| async { "fine" }))
+            .layer(CatchPanicLayer::custom(panic_response));
+        let s = axum_test::TestServer::new(app).unwrap();
+        let res = s.get("/boom").await;
+        res.assert_status(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        res.assert_json(&serde_json::json!({"error": "internal_error"}));
+        s.get("/ok").await.assert_text("fine");
+    }
 
     #[test]
     fn secret_path_segments_never_reach_the_log() {

@@ -12,3 +12,4 @@
 - [ ] New or changed endpoints have a request test in `app/tests/`
 - [ ] No secrets, no em dashes
 - [ ] The README's endpoint list is updated if the API changed
+- [ ] A new migration: take a database backup just before merging, and check it works while the old brain still runs (a deploy overlaps)
