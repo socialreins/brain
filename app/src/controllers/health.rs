@@ -1,10 +1,41 @@
-use axum::{extract::State, http::header, response::IntoResponse, routing::get, Json, Router};
+use std::time::Duration;
+
+use axum::{
+    extract::State,
+    http::{header, StatusCode},
+    response::IntoResponse,
+    routing::get,
+    Json, Router,
+};
+use sea_orm::ConnectionTrait;
 use serde_json::{json, Value};
 
 use crate::state::AppState;
 
-async fn health() -> Json<Value> {
-    Json(json!({"status": "ok"}))
+/// Longest the database may take to answer `/health`: a pool or database that is slower than
+/// this is down as far as a monitor is concerned.
+const DB_WAIT: Duration = Duration::from_secs(3);
+
+/// Up only while Postgres answers a query, so an uptime monitor sees a dead database as 503.
+/// Railway reads it at deploy time only (`railway.json`), so a database outage never restarts brain.
+async fn health(State(app): State<AppState>) -> (StatusCode, Json<Value>) {
+    match tokio::time::timeout(DB_WAIT, app.db.execute_unprepared("SELECT 1")).await {
+        Ok(Ok(_)) => (StatusCode::OK, Json(json!({"status": "ok"}))),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "health check: database query failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"status": "error"})),
+            )
+        }
+        Err(_) => {
+            tracing::error!("health check: database did not answer in {DB_WAIT:?}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"status": "error"})),
+            )
+        }
+    }
 }
 
 async fn version(State(app): State<AppState>) -> Json<Value> {

@@ -49,6 +49,24 @@ async fn health_and_version() {
 
 #[tokio::test]
 #[serial]
+async fn health_is_503_when_the_database_is_gone() {
+    let mut config = Config::from_env().expect("DATABASE_URL must point at a test Postgres");
+    config.git_commit = "dev".into();
+    let db = connect(&config).await.expect("database reachable");
+    let app = controllers::router(AppState::new(db.clone(), &config), &config);
+    let s = TestServer::new(app).unwrap();
+    s.get("/health").await.assert_status_ok();
+    // Closing the pool is what a dead database looks like to a handler: every query errors.
+    db.close().await.unwrap();
+    let res = s.get("/health").await;
+    res.assert_status(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    res.assert_json(&json!({"status": "error"}));
+    // `/version` needs no database and keeps answering.
+    s.get("/version").await.assert_status_ok();
+}
+
+#[tokio::test]
+#[serial]
 async fn favicon_and_icon_are_served() {
     let (s, _) = server().await;
     let ico = s.get("/favicon.ico").await;

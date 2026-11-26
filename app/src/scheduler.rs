@@ -216,8 +216,13 @@ pub fn spawn(app: AppState) {
         loop {
             tick.tick().await;
             // Not waited for: a post that takes many minutes must not delay the next round.
-            if let Err(e) = publish::begin(&app).await {
-                tracing::warn!(error = %e, "publish tick failed");
+            // Run as its own task: a panic in a round is logged and the next tick still comes,
+            // instead of ending this loop and leaving every scheduled post unpublished.
+            let round = app.clone();
+            match tokio::spawn(async move { publish::begin(&round).await }).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(error = %e, "publish tick failed"),
+                Err(e) => tracing::error!(error = %e, "publish tick panicked"),
             }
         }
     });
