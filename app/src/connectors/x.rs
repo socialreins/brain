@@ -105,7 +105,7 @@ impl Profile {
 }
 
 /// The longest the token endpoint may take.
-const TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Deserialize)]
 struct TokenAnswer {
