@@ -509,6 +509,9 @@ pub struct Invited {
     pub capped: u32,
     /// Unknown, not verified or already invited: left alone, not mailed again.
     pub skipped: u32,
+    /// The mail provider did not answer in time: the mail may or may not have gone out, so the
+    /// signup stays approved and is not mailed again. Tell them by hand.
+    pub unsure: u32,
 }
 
 /// Invites the listed verified signups, oldest first: each is approved (it may sign up whatever
@@ -552,6 +555,7 @@ async fn invite(
         failed: 0,
         capped: 0,
         skipped: (ids.len() - rows.len()) as u32,
+        unsure: 0,
     };
     // A task of its own, so a browser that gives up waiting cannot stop the batch between a
     // claim and its mail.
@@ -563,17 +567,18 @@ async fn invite(
                 done.capped += 1;
                 continue;
             }
-            let unclaim = || async {
-                let undone = waitlist_signups::Entity::update_many()
-                    .col_expr(
-                        Column::ApprovedAt,
-                        Expr::value(None::<DateTime<FixedOffset>>),
-                    )
-                    .filter(Column::Id.eq(row.id))
-                    .exec(&app.db)
-                    .await;
-                if let Err(e) = undone {
-                    tracing::error!(error = %e, "waitlist invite unclaim failed");
+            // The cap hit comes first, so a capped signup is never approved, not even briefly.
+            let caps = [(INVITE_BUCKET.to_owned(), INVITES_PER_DAY)];
+            let reserved = match daily_reserve(&app.db, &caps).await {
+                Ok(Some(ids)) => ids,
+                Ok(None) => {
+                    done.capped += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "waitlist invite cap check failed");
+                    done.failed += 1;
+                    continue;
                 }
             };
             let claimed = waitlist_signups::Entity::update_many()
@@ -585,37 +590,40 @@ async fn invite(
                 .await;
             match claimed {
                 Ok(r) if r.rows_affected == 1 => {}
-                Ok(_) => {
-                    done.skipped += 1;
-                    continue;
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "waitlist invite claim failed");
-                    done.failed += 1;
+                other => {
+                    daily_refund(&app.db, &reserved).await;
+                    match other {
+                        Ok(_) => done.skipped += 1,
+                        Err(e) => {
+                            tracing::error!(error = %e, "waitlist invite claim failed");
+                            done.failed += 1;
+                        }
+                    }
                     continue;
                 }
             }
-            let caps = [(INVITE_BUCKET.to_owned(), INVITES_PER_DAY)];
-            let reserved = match daily_reserve(&app.db, &caps).await {
-                Ok(Some(ids)) => ids,
-                Ok(None) => {
-                    unclaim().await;
-                    done.capped += 1;
-                    continue;
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "waitlist invite cap check failed");
-                    unclaim().await;
-                    done.failed += 1;
-                    continue;
-                }
-            };
             match send_invite(&app, &row.email).await {
                 Ok(()) => done.sent += 1,
+                // The provider may have taken the mail before the timeout: keep the approval and
+                // the cap hit rather than risk a second mail. The admin tells them by hand.
+                Err(e) if e.ends_with("timeout") => {
+                    tracing::warn!(error = %e, "waitlist invite mail unconfirmed");
+                    done.unsure += 1;
+                }
                 Err(e) => {
                     tracing::error!(error = %e, "waitlist invite mail not sent");
                     daily_refund(&app.db, &reserved).await;
-                    unclaim().await;
+                    let undone = waitlist_signups::Entity::update_many()
+                        .col_expr(
+                            Column::ApprovedAt,
+                            Expr::value(None::<DateTime<FixedOffset>>),
+                        )
+                        .filter(Column::Id.eq(row.id))
+                        .exec(&app.db)
+                        .await;
+                    if let Err(e) = undone {
+                        tracing::error!(error = %e, "waitlist invite unclaim failed");
+                    }
                     done.failed += 1;
                 }
             }
@@ -625,6 +633,7 @@ async fn invite(
             failed = done.failed,
             capped = done.capped,
             skipped = done.skipped,
+            unsure = done.unsure,
             "waitlist invites"
         );
         done

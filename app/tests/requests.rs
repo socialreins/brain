@@ -40455,7 +40455,7 @@ mod admin_console {
         };
         let res = invite(vec![&mid_id, &old_id]).await;
         res.assert_status_ok();
-        res.assert_json(&json!({"sent": 2, "failed": 0, "capped": 0, "skipped": 0}));
+        res.assert_json(&json!({"sent": 2, "failed": 0, "capped": 0, "skipped": 0, "unsure": 0}));
         for email in [&old, &mid] {
             let mails = c.approval_mails(email);
             assert_eq!(mails.len(), 1, "one invite each");
@@ -40470,7 +40470,7 @@ mod admin_console {
 
         // The same ids again, and an id that is not verified: nobody is mailed twice.
         let res = invite(vec![&old_id, &mid_id, &unverified_id]).await;
-        res.assert_json(&json!({"sent": 0, "failed": 0, "capped": 0, "skipped": 3}));
+        res.assert_json(&json!({"sent": 0, "failed": 0, "capped": 0, "skipped": 3, "unsure": 0}));
         assert_eq!(c.approval_mails(&old).len(), 1);
         assert!(c.approval_mails(&unverified).is_empty());
         let preview = c.get("/v1/admin/waitlist-invites?count=5", &admin).await;
@@ -40555,7 +40555,7 @@ mod admin_console {
             .req(Method::POST, "/v1/admin/waitlist-invites", &admin)
             .json(&json!({"ids": ids}))
             .await;
-        res.assert_json(&json!({"sent": 1, "failed": 0, "capped": 2, "skipped": 0}));
+        res.assert_json(&json!({"sent": 1, "failed": 0, "capped": 2, "skipped": 0, "unsure": 0}));
         assert_eq!(approved_rows(&c).await, 1);
         let left = c.get("/v1/admin/waitlist-invites?count=3", &admin).await;
         assert_eq!(left["left_today"], 0);
@@ -40581,7 +40581,7 @@ mod admin_console {
             .req(Method::POST, "/v1/admin/waitlist-invites", &admin)
             .json(&json!({"ids": [id]}))
             .await;
-        res.assert_json(&json!({"sent": 0, "failed": 1, "capped": 0, "skipped": 0}));
+        res.assert_json(&json!({"sent": 0, "failed": 1, "capped": 0, "skipped": 0, "unsure": 0}));
         assert_eq!(approved_rows(&c).await, 0);
         let left = c.get("/v1/admin/waitlist-invites?count=1", &admin).await;
         assert_eq!(
