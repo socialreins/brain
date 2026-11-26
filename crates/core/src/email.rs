@@ -25,9 +25,49 @@ pub fn normalize(raw: &str) -> Option<String> {
     ok.then_some(email)
 }
 
+/// The person behind an address, for things one person gets once (the free trial): the
+/// normalized address without a `+tag`, and for Gmail also without dots. `None` for a bad address.
+/// shortcut: other providers' aliases and a person with several real mailboxes pass, upgrade to a
+/// card fingerprint if trials get farmed.
+pub fn person_key(raw: &str) -> Option<String> {
+    let email = normalize(raw)?;
+    let (local, domain) = email.split_once('@')?;
+    let local = local.split('+').next().unwrap_or(local);
+    if local.is_empty() {
+        return None;
+    }
+    Some(match domain {
+        "gmail.com" | "googlemail.com" => format!("{}@gmail.com", local.replace('.', "")),
+        _ => format!("{local}@{domain}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::normalize;
+    use super::{normalize, person_key};
+
+    #[test]
+    fn one_person_one_key() {
+        for same in [
+            "Jane.Doe+a@gmail.com",
+            "janedoe@googlemail.com",
+            "j.a.n.e.d.o.e+x+y@gmail.com",
+        ] {
+            assert_eq!(
+                person_key(same).as_deref(),
+                Some("janedoe@gmail.com"),
+                "{same}"
+            );
+        }
+        assert_eq!(
+            person_key("a.b+c@corp.example").as_deref(),
+            Some("a.b@corp.example")
+        );
+        assert_ne!(person_key("a@corp.example"), person_key("a@other.example"));
+        assert_eq!(person_key("nope"), None);
+        // Nothing before the +tag: no person to name.
+        assert_eq!(person_key("+a@corp.example"), None);
+    }
 
     #[test]
     fn accepts_and_lowercases() {

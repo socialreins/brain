@@ -5364,6 +5364,10 @@ mod teams {
                 let db = socialreins_brain::connect(&config)
                     .await
                     .expect("database reachable");
+                // No downtime on record (`publish::note_tick`): lateness is plain.
+                sea_orm::ConnectionTrait::execute_unprepared(&db, "DELETE FROM scheduler_ticks")
+                    .await
+                    .unwrap();
                 let mut state = AppState::new(db.clone(), &config);
                 // Upload links only: sign-in still checks the real brain URL.
                 if let Some(url) = brain_url {
@@ -9303,6 +9307,65 @@ mod teams {
                     let p = get_post(&s, &cookie, &left).await;
                     assert_eq!(p["status"], "draft", "{p}");
                     assert_eq!(RECORDS.lock().unwrap().len(), records + 1);
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn time_brain_was_down_does_not_make_a_post_late() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let soon = Some(past());
+                    // The publish loop last ran 80 minutes ago: its next round records that
+                    // stretch as our own downtime.
+                    exec(
+                        &db,
+                        "INSERT INTO scheduler_ticks (name, at) \
+                         VALUES ('publish', now() - interval '80 minutes')"
+                            .into(),
+                    )
+                    .await;
+                    publish::note_tick(&db).await.unwrap();
+                    // Due 90 minutes ago, 80 of them down: 10 late. Due 150 minutes ago: 70 late.
+                    let kept =
+                        due_ago(&s, &db, &cookie, input(&set, "kept", soon.as_deref()), 90).await;
+                    let gone =
+                        due_ago(&s, &db, &cookie, input(&set, "gone", soon.as_deref()), 150).await;
+                    // Rounds that follow find brain running: they keep the stretch.
+                    publish::note_tick(&db).await.unwrap();
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &kept).await["status"], "published");
+                    let p = get_post(&s, &cookie, &gone).await;
+                    assert_eq!(p["status"], "draft", "{p}");
+                    // A post the first round could not take is judged by the same stretch later.
+                    let later =
+                        due_ago(&s, &db, &cookie, input(&set, "later", soon.as_deref()), 95).await;
+                    publish::note_tick(&db).await.unwrap();
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &later).await["status"], "published");
+                    exec(&db, "DELETE FROM scheduler_ticks".into()).await;
+                }
+
+                #[tokio::test]
+                #[serial]
+                async fn a_round_a_minute_after_the_last_is_no_downtime() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let soon = Some(past());
+                    exec(
+                        &db,
+                        "INSERT INTO scheduler_ticks (name, at) \
+                         VALUES ('publish', now() - interval '70 seconds')"
+                            .into(),
+                    )
+                    .await;
+                    publish::note_tick(&db).await.unwrap();
+                    let late =
+                        due_ago(&s, &db, &cookie, input(&set, "late", soon.as_deref()), 61).await;
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &late).await["status"], "draft");
+                    exec(&db, "DELETE FROM scheduler_ticks".into()).await;
                 }
 
                 #[tokio::test]
@@ -21774,7 +21837,10 @@ mod teams {
                             button_payload: None,
                             attachments: Vec::new(),
                         };
-                        let item = inbox::store(db, account, fresh).await.unwrap().unwrap();
+                        let item = inbox::store(db, account, fresh, false)
+                            .await
+                            .unwrap()
+                            .unwrap();
                         item.contact_id.unwrap()
                     }
 
@@ -24137,6 +24203,14 @@ mod teams {
                     billing: bool,
                     own_key: Option<&str>,
                 ) -> (TestServer, DatabaseConnection, AppState) {
+                    on_ai_capped(billing, own_key, socialreins_brain::ai::DEFAULT_DAILY_CAP).await
+                }
+
+                async fn on_ai_capped(
+                    billing: bool,
+                    own_key: Option<&str>,
+                    daily_cap: i64,
+                ) -> (TestServer, DatabaseConnection, AppState) {
                     let base = mock_bluesky().await;
                     let ai = mock_ai().await;
                     let mut config = Config::from_env().expect("test config");
@@ -24146,6 +24220,7 @@ mod teams {
                     config.bluesky.allow_insecure_pds = true;
                     config.billing_enabled = billing;
                     config.ai.own_key = own_key.map(Into::into);
+                    config.ai.daily_cap = daily_cap;
                     config.ai.anthropic_url = ai;
                     let db = socialreins_brain::connect(&config)
                         .await
@@ -24172,6 +24247,71 @@ mod teams {
 
                 fn reply(text: &str) {
                     *AI_REPLY.lock().unwrap() = text.to_owned();
+                }
+
+                /// With billing off our key is not open: a team gets `AI_DAILY_CAP` calls a day, then
+                /// the run is skipped `ai_daily_cap` and the model is never called. 0 is no cap.
+                #[tokio::test]
+                #[serial]
+                async fn our_key_has_a_daily_cap_for_each_team_when_billing_is_off() {
+                    let (s, db, state) = on_ai_capped(false, Some(OUR_KEY), 2).await;
+                    let (cookie, _, account, me) = owner(&s, &db).await;
+                    let id = automation(
+                        &s,
+                        &cookie,
+                        json!({"name": "AI", "trigger": "comment_received",
+                            "actions": [{"type": "ai_reply_publicly", "prompt": "Say hi"}]}),
+                    )
+                    .await;
+                    let t = (&s, &db, &state);
+                    let at = (account.as_str(), me.as_str(), id.as_str());
+                    reply("Hi there!");
+                    for (rkey, secs) in [("dc1", 1), ("dc2", 2)] {
+                        let run = comment(t, &cookie, at, rkey, secs).await;
+                        assert_eq!(run["status"], "sent", "{run}");
+                    }
+                    let calls = AI_CALLS.lock().unwrap().len();
+                    let run = comment(t, &cookie, at, "dc3", 3).await;
+                    assert_eq!(run["status"], "skipped", "{run}");
+                    assert_eq!(run["reason"], "ai_daily_cap");
+                    assert_eq!(AI_CALLS.lock().unwrap().len(), calls);
+
+                    // A call that gives nothing usable gives its slot back: an outage drains nothing.
+                    let (s, db, state) = on_ai_capped(false, Some(OUR_KEY), 1).await;
+                    let (cookie, _, account, me) = owner(&s, &db).await;
+                    let id = automation(
+                        &s,
+                        &cookie,
+                        json!({"name": "AI", "trigger": "comment_received",
+                            "actions": [{"type": "ai_reply_publicly", "prompt": "Say hi"}]}),
+                    )
+                    .await;
+                    let t = (&s, &db, &state);
+                    let at = (account.as_str(), me.as_str(), id.as_str());
+                    reply("500");
+                    for (rkey, secs) in [("df1", 1), ("df2", 2)] {
+                        let run = comment(t, &cookie, at, rkey, secs).await;
+                        assert_eq!(run["reason"], "ai_failed", "{run}");
+                    }
+                    reply("Hi there!");
+                    let run = comment(t, &cookie, at, "df3", 3).await;
+                    assert_eq!(run["status"], "sent", "{run}");
+
+                    let (s, db, state) = on_ai_capped(false, Some(OUR_KEY), 0).await;
+                    let (cookie, _, account, me) = owner(&s, &db).await;
+                    let id = automation(
+                        &s,
+                        &cookie,
+                        json!({"name": "AI", "trigger": "comment_received",
+                            "actions": [{"type": "ai_reply_publicly", "prompt": "Say hi"}]}),
+                    )
+                    .await;
+                    let t = (&s, &db, &state);
+                    let at = (account.as_str(), me.as_str(), id.as_str());
+                    for (rkey, secs) in [("dn1", 1), ("dn2", 2), ("dn3", 3)] {
+                        let run = comment(t, &cookie, at, rkey, secs).await;
+                        assert_eq!(run["status"], "sent", "{run}");
+                    }
                 }
 
                 /// AI sends are checked on save, use the team's key, record the provider and
@@ -27774,7 +27914,7 @@ mod teams {
                     .await;
                 assert_eq!(res.status_code(), 201, "{}", res.text());
 
-                let plain = json!({"name": "Leads", "trigger": "dm_received",
+                let plain = json!({"name": "Leads", "trigger": "dm_received", "cooldown_minutes": 0,
                     "actions": [tag("  Lead "), hi]});
                 let res = req(&s, Method::POST, "/v1/automations", &cookie)
                     .json(&plain)
@@ -28129,7 +28269,7 @@ mod teams {
                     &s,
                     &cookie,
                     json!({"name": "Follow likers", "trigger": "like_received",
-                        "actions": [{"type": "follow_back"}]}),
+                        "cooldown_minutes": 0, "actions": [{"type": "follow_back"}]}),
                 )
                 .await;
                 set_inbox(
@@ -28416,6 +28556,7 @@ mod teams {
                         button_payload: None,
                         attachments: vec![],
                     },
+                    false,
                 )
                 .await
                 .unwrap()
@@ -28619,6 +28760,7 @@ mod teams {
                         button_payload: None,
                         attachments: vec![],
                     },
+                    false,
                 )
                 .await
                 .unwrap()
@@ -35889,7 +36031,7 @@ mod teams {
             assert_eq!(b["limits"]["automation"], true);
             assert_eq!(
                 b["usage"],
-                json!({"accounts": 0, "members": 1, "inboxes": 0, "ai_replies": 0})
+                json!({"accounts": 0, "members": 1, "contacts": 0, "inboxes": 0, "ai_replies": 0})
             );
             assert_eq!(b["limits"]["inboxes"], Value::Null);
             assert_eq!(b["limits"]["ai_monthly"], Value::Null);
@@ -36199,6 +36341,78 @@ mod teams {
         async fn post(s: &TestServer, cookie: &str, path: &str, body: Value) -> (u16, Value) {
             let res = req(s, Method::POST, path, cookie).json(&body).await;
             (res.status_code().as_u16(), res.json())
+        }
+
+        /// The plan's contact limit (not stored when billing is off): a new person makes no contact
+        /// past it, their item is stored all the same, and the contacts there keep updating.
+        #[tokio::test]
+        #[serial]
+        async fn a_plans_contact_limit_stops_new_contacts_only() {
+            use socialreins_brain::{
+                connectors::bluesky::Author,
+                inbox::{self, Fresh},
+            };
+            let (s, db) = server_where(|c| c.billing_enabled = true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            db.execute_unprepared(
+                "INSERT INTO plans (id, name, automation, max_contacts) \
+                 VALUES ('tiny_contacts', 'Tiny', true, 2) ON CONFLICT DO NOTHING",
+            )
+            .await
+            .unwrap();
+            subscribe(&db, &team, "tiny_contacts").await;
+            let account = bluesky_account(&db, &team).await;
+            let account = socialreins_brain::models::social_accounts::Entity::find_by_id(account)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap();
+            let say = |who: &'static str, billing: bool| {
+                let (db, account) = (&db, &account);
+                async move {
+                    let fresh = Fresh {
+                        kind: "comment",
+                        remote_id: format!("{who}-{}", uuid::Uuid::now_v7().simple()),
+                        remote_cid: None,
+                        parent: None,
+                        root: (None, None),
+                        convo_id: None,
+                        author: Author {
+                            did: who.to_owned(),
+                            ..Author::default()
+                        },
+                        text: "hi".into(),
+                        at: Utc::now().fixed_offset(),
+                        permalink: None,
+                        story: None,
+                        button_payload: None,
+                        attachments: Vec::new(),
+                    };
+                    inbox::store(db, account, fresh, billing)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                }
+            };
+            assert!(say("a", true).await.contact_id.is_some());
+            assert!(say("b", true).await.contact_id.is_some());
+            // The third person: the item is kept, the contact is not made.
+            assert!(say("c", true).await.contact_id.is_none());
+            // A person already there is still known and still updated.
+            assert!(say("a", true).await.contact_id.is_some());
+            // Billing off (self-host): no limit.
+            assert!(say("d", false).await.contact_id.is_some());
+            // Cheaper plan check: a plan without a limit stores them.
+            subscribe(&db, &team, "scheduler").await;
+            assert!(say("e", true).await.contact_id.is_some());
+            // And no live plan at all stores none, as every other limit does.
+            db.execute_unprepared(&format!(
+                "UPDATE subscriptions SET status = 'canceled' WHERE team_id = '{team}'"
+            ))
+            .await
+            .unwrap();
+            assert!(say("f", true).await.contact_id.is_none());
         }
 
         /// A plan without automation refuses to create or send any of its features; one with it,
@@ -37298,6 +37512,126 @@ mod teams {
             );
             assert_eq!(send(&events[2]).await.status_code(), 200);
             assert_eq!(plan_of(&s, &owner).await["status"], "canceled");
+        }
+
+        /// One trial for a person (decision 0015): a trial that began in one team is not offered
+        /// again in a new team of the same person, not even under another `+tag`.
+        #[tokio::test]
+        #[serial]
+        async fn a_person_gets_one_trial_not_one_per_team() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let billing = |c: String| {
+                let s = &s;
+                async move {
+                    req(s, Method::GET, "/v1/team/billing", &c)
+                        .await
+                        .json::<Value>()
+                }
+            };
+            assert_eq!(billing(owner.clone()).await["trial_available"], true);
+            let before = count("/checkout");
+            checkout(&s, &owner, "scheduler").await.assert_status_ok();
+            let f = form_of("/checkout", before);
+            assert_eq!(f["subscription_data[trial_period_days]"], "7");
+            let key = f["subscription_data[metadata][trial_key]"].clone();
+            assert!(key.contains('@'), "{key}");
+            // Stripe starts the trial: the person is written down.
+            let now = Utc::now().timestamp();
+            let mut e: Value = serde_json::from_str(&sub_event(
+                "evt_trial",
+                now,
+                "sub_trial",
+                &team,
+                "trialing",
+                "price_s",
+            ))
+            .unwrap();
+            e["data"]["object"]["metadata"]["trial_key"] = key.clone().into();
+            assert_eq!(
+                deliver(&s, &e.to_string(), WHSEC, now).await.status_code(),
+                200
+            );
+            let used = |k: String| {
+                let db = &db;
+                async move {
+                    db.query_one_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "SELECT 1 FROM trial_uses WHERE person_key = $1",
+                        [k.into()],
+                    ))
+                    .await
+                    .unwrap()
+                    .is_some()
+                }
+            };
+            assert!(used(key.clone()).await);
+            // A new team of the same person pays at once, however the team starts.
+            let made = req(&s, Method::POST, "/v1/teams", &owner)
+                .json(&json!({"name": "Second"}))
+                .await;
+            assert_eq!(made.status_code(), 201);
+            assert_eq!(billing(owner.clone()).await["trial_available"], false);
+            let before = count("/checkout");
+            checkout(&s, &owner, "scheduler").await.assert_status_ok();
+            let f = form_of("/checkout", before);
+            assert!(
+                !f.contains_key("subscription_data[trial_period_days]"),
+                "{f:?}"
+            );
+            assert!(!f.contains_key("subscription_data[metadata][trial_key]"));
+            // Someone else's trial is not this person's.
+            let (_, other, _) = user(&s, &db).await;
+            assert_eq!(billing(other).await["trial_available"], true);
+        }
+
+        /// Two checkouts opened before either finished both carry a trial: the second to start is
+        /// cancelled in Stripe and never written, and the first stays.
+        #[tokio::test]
+        #[serial]
+        async fn two_trials_started_at_once_keep_one() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let first = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let made = req(&s, Method::POST, "/v1/teams", &owner)
+                .json(&json!({"name": "Other"}))
+                .await;
+            let second = made.json::<Value>()["id"].as_str().unwrap().to_owned();
+            let key = format!("race-{}@example.com", *RUN);
+            let now = Utc::now().timestamp();
+            for (i, team) in [&first, &second].into_iter().enumerate() {
+                let mut e: Value = serde_json::from_str(&sub_event(
+                    &format!("evt_race{i}"),
+                    now,
+                    &format!("sub_race{i}"),
+                    team,
+                    "trialing",
+                    "price_s",
+                ))
+                .unwrap();
+                e["data"]["object"]["metadata"]["trial_key"] = key.clone().into();
+                assert_eq!(
+                    deliver(&s, &e.to_string(), WHSEC, now).await.status_code(),
+                    200
+                );
+            }
+            let held = |team: String| {
+                let db = &db;
+                async move {
+                    db.query_one_raw(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        "SELECT 1 FROM subscriptions WHERE team_id = $1",
+                        [team.parse::<uuid::Uuid>().unwrap().into()],
+                    ))
+                    .await
+                    .unwrap()
+                    .is_some()
+                }
+            };
+            assert!(held(first).await);
+            assert!(!held(second).await);
+            assert_eq!(count(&format!("/cancel/sub_race1_{}", *RUN)), 1);
         }
 
         #[tokio::test]

@@ -279,7 +279,9 @@ async fn poll(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         };
         for c in comments.iter().filter(|c| c.actor != own) {
             let Some(f) = fresh_of(post, c) else { continue };
-            if let Some(item) = inbox::store_with(&app.db, &account, f, (true, first)).await? {
+            if let Some(item) =
+                inbox::store_with(&app.db, &account, f, (true, first), app.billing_enabled).await?
+            {
                 fresh.push(item);
             }
         }

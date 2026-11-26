@@ -1,7 +1,7 @@
-use std::process::ExitCode;
+use std::{process::ExitCode, time::Duration};
 
 use socialreins_brain::{
-    config::Config, connect, controllers, publish, scheduler, state::AppState,
+    config::Config, connect_when_ready, controllers, publish, scheduler, state::AppState,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -20,9 +20,14 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
-    let db = connect(&config).await?;
+    // Wait for Postgres instead of dying: Railway stops restarting a crashing process.
+    let db = connect_when_ready(&config, Duration::from_secs(300), Duration::from_secs(5)).await?;
     if config.review_login_token.is_none() {
         controllers::review_login::close(&db).await?;
+    }
+    let on_railway = std::env::var_os("RAILWAY_ENVIRONMENT").is_some();
+    for warning in config.warnings(on_railway) {
+        tracing::warn!("{warning}");
     }
     let state = AppState::new(db, &config);
     scheduler::spawn(state.clone());

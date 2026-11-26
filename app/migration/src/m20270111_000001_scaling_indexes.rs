@@ -46,7 +46,10 @@ impl MigrationTrait for Migration {
         for (name, on) in INDEXES {
             sql += &format!("CREATE INDEX {name} ON {on};\n");
         }
-        m.get_connection().execute_unprepared(&sql).await.map(|_| ())
+        m.get_connection()
+            .execute_unprepared(&sql)
+            .await
+            .map(|_| ())
     }
 
     async fn down(&self, m: &SchemaManager) -> Result<(), DbErr> {
@@ -54,6 +57,9 @@ impl MigrationTrait for Migration {
         for (name, _) in INDEXES {
             sql += &format!("DROP INDEX IF EXISTS {name};\n");
         }
-        m.get_connection().execute_unprepared(&sql).await.map(|_| ())
+        m.get_connection()
+            .execute_unprepared(&sql)
+            .await
+            .map(|_| ())
     }
 }

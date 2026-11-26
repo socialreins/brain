@@ -36,6 +36,9 @@ const PROVIDER_APPS: [(&str, [&str; 2]); 7] = [
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
+    /// `DATABASE_MAX_CONNECTIONS` (default 20, 5 to 500): the most connections this process
+    /// opens to Postgres. Keep it under Postgres's `max_connections` divided by the replicas.
+    pub database_max_connections: u32,
     pub port: u16,
     pub cors_origins: Vec<HeaderValue>,
     /// `RAILWAY_GIT_COMMIT_SHA`, else `GIT_COMMIT` (baked into published images), else `dev`.
@@ -135,9 +138,27 @@ pub struct Config {
 }
 
 impl Config {
+    /// Settings that start fine but are probably a slip, logged once at boot. `on_railway` is
+    /// whether `RAILWAY_ENVIRONMENT` is set. Not errors: production runs with Stripe set and
+    /// billing off on purpose until launch.
+    pub fn warnings(&self, on_railway: bool) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.stripe.configured() && !self.billing_enabled {
+            out.push("STRIPE_SECRET_KEY is set but BILLING_ENABLED is not: every team has every plan feature and unmetered use of our AI key (capped by AI_DAILY_CAP only)");
+        }
+        if on_railway && !self.trust_proxy {
+            out.push("TRUST_PROXY is not true behind Railway's proxy: every visitor shares one address, so per-IP limits are global");
+        }
+        if self.review_login_token.is_some() {
+            out.push("REVIEW_LOGIN_TOKEN is set: a link signs in as the demo team's owner; remove it when the app review ends");
+        }
+        out
+    }
+
     pub fn from_env() -> Result<Self, String> {
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
         let database_url = var("DATABASE_URL").ok_or("missing required variable: DATABASE_URL")?;
+        let database_max_connections = max_connections(var("DATABASE_MAX_CONNECTIONS"))?;
         let port = match var("PORT") {
             Some(p) => p.parse().map_err(|_| "PORT: not a port number")?,
             None => 8080,
@@ -194,6 +215,7 @@ impl Config {
         );
         Ok(Self {
             database_url,
+            database_max_connections,
             port,
             cors_origins: parse_origins(&origins)?,
             git_commit: var("RAILWAY_GIT_COMMIT_SHA")
@@ -266,7 +288,11 @@ impl Config {
                     ("x500", var("STRIPE_PRICE_X500")),
                 ],
             )?,
-            ai: crate::ai::Ai::new(var("ANTHROPIC_API_KEY"))?,
+            ai: {
+                let mut ai = crate::ai::Ai::new(var("ANTHROPIC_API_KEY"))?;
+                ai.daily_cap = ai_daily_cap(var("AI_DAILY_CAP"))?;
+                ai
+            },
         })
     }
 }
@@ -338,6 +364,15 @@ fn admin_emails(raw: Option<String>) -> Result<Vec<String>, String> {
         .collect()
 }
 
+/// `DATABASE_MAX_CONNECTIONS`: 5 to 500, default 20.
+fn max_connections(value: Option<String>) -> Result<u32, String> {
+    match value.map(|v| v.trim().parse::<u32>()) {
+        None => Ok(20),
+        Some(Ok(n)) if (5..=500).contains(&n) => Ok(n),
+        Some(_) => Err("DATABASE_MAX_CONNECTIONS: a number from 5 to 500".into()),
+    }
+}
+
 /// `MEDIA_MAX_BYTES`: the largest video stored, in bytes. Default and most: 1 GiB
 /// (`media::MAX_BYTES`), which saving a post checks against whatever this says.
 fn media_max_bytes(value: Option<String>) -> Result<usize, String> {
@@ -358,6 +393,16 @@ fn inbox_units(value: Option<String>) -> Result<i64, String> {
         None => Ok(crate::connectors::youtube::DEFAULT_INBOX_UNITS),
         Some(Ok(n)) if (0..=10_000).contains(&n) => Ok(n),
         Some(_) => Err("YOUTUBE_INBOX_UNITS: a number of units from 0 to 10000".into()),
+    }
+}
+
+/// `AI_DAILY_CAP`: AI calls a team a day on `ANTHROPIC_API_KEY` while billing is off, 0 to 100,000
+/// (default 200, 0 for none: a self-hoster paying for their own key may want that).
+fn ai_daily_cap(value: Option<String>) -> Result<i64, String> {
+    match value.map(|v| v.trim().parse::<i64>()) {
+        None => Ok(crate::ai::DEFAULT_DAILY_CAP),
+        Some(Ok(n)) if (0..=100_000).contains(&n) => Ok(n),
+        Some(_) => Err("AI_DAILY_CAP: a number of calls from 0 to 100000".into()),
     }
 }
 
@@ -461,6 +506,17 @@ fn parse_origins(list: &str) -> Result<Vec<HeaderValue>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pool_size_defaults_to_20_and_is_bounded() {
+        let size = |v: &str| super::max_connections(Some(v.into()));
+        assert_eq!(super::max_connections(None), Ok(20));
+        assert_eq!(size(" 35 "), Ok(35));
+        assert_eq!(size("5"), Ok(5));
+        for bad in ["4", "1", "0", "501", "-3", "many", ""] {
+            assert!(size(bad).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn review_token_needs_32_characters() {
         assert_eq!(super::review_login_token(None), Ok(None));
