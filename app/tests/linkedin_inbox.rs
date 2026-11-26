@@ -39,6 +39,8 @@ struct Mock {
     /// (method, path, query, body)
     calls: Mutex<Vec<(String, String, String, Value)>>,
     comments: Mutex<Vec<Value>>,
+    /// A read of a path holding this answers 404.
+    gone: Mutex<Option<String>>,
 }
 
 impl Mock {
@@ -66,6 +68,15 @@ async fn handler(State(m): State<Arc<Mock>>, method: Method, uri: Uri, body: Byt
         .unwrap()
         .push((method.to_string(), path.clone(), query, parsed));
     match (method.as_str(), path.as_str()) {
+        ("GET", p)
+            if m.gone
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|g| p.contains(g)) =>
+        {
+            StatusCode::NOT_FOUND.into_response()
+        }
         ("GET", p) if p.ends_with("/comments") => {
             Json(json!({"elements": m.comments.lock().unwrap().clone()})).into_response()
         }
@@ -202,14 +213,17 @@ impl Env {
     }
     /// A published post of the Page, whose comments are read.
     async fn published(&self) {
+        self.published_as(POST).await;
+    }
+    async fn published_as(&self, urn: &str) {
         let (post, set) = (Uuid::now_v7(), Uuid::now_v7());
         self.sql(&format!(
-            "INSERT INTO social_sets (id, team_id, name) SELECT '{set}', team_id, 'li' \
+            "INSERT INTO social_sets (id, team_id, name) SELECT '{set}', team_id, 'li-{set}' \
                FROM social_accounts WHERE id = '{a}'; \
              INSERT INTO posts (id, team_id, social_set_id, platform, status) \
                SELECT '{post}', team_id, '{set}', 'linkedin', 'published' FROM social_accounts WHERE id = '{a}'; \
              INSERT INTO post_targets (id, post_id, social_account_id, status, remote_id, published_at) \
-               VALUES (gen_random_uuid(), '{post}', '{a}', 'published', '{POST}', now())",
+               VALUES (gen_random_uuid(), '{post}', '{a}', 'published', '{urn}', now())",
             a = self.account
         ))
         .await;
@@ -420,7 +434,7 @@ async fn a_page_stops_at_its_daily_calls_and_a_profile_never_sends() {
     e.published().await;
     e.sql(&format!(
         "UPDATE social_accounts SET meta = meta || jsonb_build_object('linkedin_inbox', \
-         jsonb_build_object('day', current_date::text, 'calls', {})) WHERE id = '{}'",
+         jsonb_build_object('day', (now() AT TIME ZONE 'UTC')::date::text, 'calls', {})) WHERE id = '{}'",
         linkedin_inbox::READ_CALLS,
         e.account
     ))
@@ -448,4 +462,26 @@ async fn a_page_stops_at_its_daily_calls_and_a_profile_never_sends() {
         Err(InboxError::Invalid("linkedin_personal_profile"))
     ));
     assert!(e.mock.seen("POST", "").is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn a_post_that_cannot_be_read_does_not_stop_the_others() {
+    let e = env(true, page()).await;
+    e.published().await;
+    e.published_as("urn:li:share:7002").await;
+    *e.mock.gone.lock().unwrap() = Some("7001".into());
+    *e.mock.comments.lock().unwrap() = vec![comment(1, "urn:li:person:ann", "hi", 5)];
+    e.tick().await;
+    assert_eq!(
+        e.mock.seen("GET", "/rest/socialActions/").len(),
+        2,
+        "both posts were asked"
+    );
+    assert_eq!(e.items().await.len(), 1, "the readable post was read");
+    // The first read is not over while a post is missing: its history is not marked done.
+    assert_ne!(
+        e.model().await.meta["linkedin_inbox"]["first_done"],
+        json!(true)
+    );
 }

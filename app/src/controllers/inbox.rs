@@ -773,7 +773,7 @@ async fn checked(
             sea_orm::Condition::any()
                 .add(social_accounts::Column::Provider.is_in(inbox::INBOX_PLATFORMS))
                 .add(sea_orm::sea_query::Expr::cust(
-                    "provider = 'linkedin' AND meta->>'organization' IS NOT NULL",
+                    "provider = 'linkedin' AND meta->>'organization' LIKE 'urn:li:organization:%'",
                 )),
         )
         .count(db)

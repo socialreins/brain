@@ -125,10 +125,10 @@ async fn reserve(db: &impl ConnectionTrait, id: Uuid, cap: i64) -> Result<bool, 
         .query_all_raw(sql(
             "UPDATE social_accounts SET meta = meta || jsonb_build_object('linkedin_inbox', \
                COALESCE(meta->'linkedin_inbox', '{}'::jsonb) || jsonb_build_object('day', \
-               current_date::text, 'calls', CASE WHEN meta->'linkedin_inbox'->>'day' = \
-               current_date::text THEN COALESCE((meta->'linkedin_inbox'->>'calls')::int, 0) + 1 \
+               (now() AT TIME ZONE 'UTC')::date::text, 'calls', CASE WHEN meta->'linkedin_inbox'->>'day' = \
+               (now() AT TIME ZONE 'UTC')::date::text THEN COALESCE((meta->'linkedin_inbox'->>'calls')::int, 0) + 1 \
                ELSE 1 END)) \
-             WHERE id = $1 AND (COALESCE(meta->'linkedin_inbox'->>'day', '') <> current_date::text \
+             WHERE id = $1 AND (COALESCE(meta->'linkedin_inbox'->>'day', '') <> (now() AT TIME ZONE 'UTC')::date::text \
                OR COALESCE((meta->'linkedin_inbox'->>'calls')::int, 0) < $2) RETURNING id",
             vec![id.into(), cap.into()],
         ))
@@ -258,6 +258,7 @@ async fn poll(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         .filter_map(|r| r.try_get("", "remote_id").ok())
         .collect();
     let mut fresh = Vec::new();
+    let mut missed = false;
     for post in &posts {
         if !reserve(&app.db, id, READ_CALLS).await? {
             return Ok(());
@@ -265,11 +266,15 @@ async fn poll(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         let comments = match app.linkedin.comments(&token, post).await {
             Ok(c) => c,
             Err(e) => {
+                tracing::warn!(account = %id, "linkedin comments read failed");
+                // A dead token ends the round; a post that cannot be read (deleted, refused) does not
+                // stop the others.
                 if matches!(e, PostError::Reconnect) {
                     crate::expiry::flag_reconnect(&app.db, id).await;
+                    return Ok(());
                 }
-                tracing::warn!(account = %id, "linkedin comments read failed");
-                return Ok(());
+                missed = true;
+                continue;
             }
         };
         for c in comments.iter().filter(|c| c.actor != own) {
@@ -279,7 +284,7 @@ async fn poll(app: &AppState, id: Uuid) -> Result<(), DbErr> {
             }
         }
     }
-    if first {
+    if first && !missed {
         app.db
             .execute_raw(sql(
                 "UPDATE social_accounts SET meta = meta || jsonb_build_object('linkedin_inbox', \
@@ -307,7 +312,7 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
         .query_all_raw(sql(
             "UPDATE social_accounts SET meta = meta || jsonb_build_object('linkedin_inbox', \
                COALESCE(meta->'linkedin_inbox', '{}'::jsonb) || jsonb_build_object('next_at', \
-               to_char(now() + make_interval(mins => $1), 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'))) \
+               to_char((now() + make_interval(mins => $1)) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'))) \
              WHERE id IN (SELECT id FROM social_accounts WHERE provider = 'linkedin' \
                AND meta->>'organization' LIKE 'urn:li:organization:%' \
                AND COALESCE(meta->>'reconnect', 'false') <> 'true' \

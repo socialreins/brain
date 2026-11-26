@@ -2803,6 +2803,8 @@ async fn act(
                         | "already_replied"
                         | "dm_unavailable"
                         | "threads_no_dm"
+                        | "youtube_no_dm"
+                        | "linkedin_no_dm"
                 )
             )
     });
