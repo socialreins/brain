@@ -549,6 +549,27 @@ async fn quota_and_failures_pause_without_retrying() {
         e.tick().await;
     }
     assert_eq!(e.get().await["paused"], "errors");
+    // It reads once more by itself after two hours; failing again, it pauses again at once.
+    let calls = e.mock.count();
+    let aged = |hours: i32| {
+        format!(
+            "UPDATE youtube_inbox SET updated_at = now() - interval '{hours} hours' \
+             WHERE social_account_id = '{}'",
+            e.account
+        )
+    };
+    e.sql(&aged(1)).await;
+    e.tick().await;
+    assert_eq!(e.mock.count(), calls, "too soon");
+    e.sql(&aged(3)).await;
+    e.tick().await;
+    assert_eq!(e.mock.count(), calls + 1);
+    assert_eq!(e.get().await["paused"], "errors");
+    // The channel answers again: the pause ends and reading goes on, with no click.
+    e.mock.mode.store(0, Ordering::SeqCst);
+    e.sql(&aged(3)).await;
+    e.tick().await;
+    assert_eq!(e.get().await["paused"], Value::Null);
     // A token YouTube refuses flags the account and is not read again.
     let e = env(false).await;
     e.put(json!({"enabled": true})).await.assert_status_ok();

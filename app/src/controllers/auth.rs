@@ -94,7 +94,9 @@ async fn request_link(
     if let Err(r) = turnstile::check(app.turnstile.as_ref(), token, ip).await {
         return r.into_response();
     }
+    let sending = crate::mail::Sending::begin();
     tokio::spawn(async move {
+        let _sending = sending;
         if let Err(e) = send_link(&app, ip, email, name, body.login_only).await {
             tracing::error!(error = %e, "magic link not sent");
         }
@@ -114,7 +116,9 @@ async fn request_own_link(
     if !app.magic_link_limiter.allow(ip) {
         return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited").into_response();
     }
+    let sending = crate::mail::Sending::begin();
     tokio::spawn(async move {
+        let _sending = sending;
         if let Err(e) = send_link(&app, ip, user.email, None, true).await {
             tracing::error!(error = %e, "own magic link not sent");
         }

@@ -419,6 +419,99 @@ async fn remove(
     }
 }
 
+#[derive(Serialize, ToSchema)]
+pub struct PageReportRow {
+    pub id: Uuid,
+    /// The page's public address (`/p/{code}`).
+    pub code: String,
+    pub team_id: Uuid,
+    pub team: String,
+    /// `phishing`, `spam`, `illegal` or `other`.
+    pub reason: String,
+    pub message: String,
+    /// The reporter's email, when given.
+    pub contact: Option<String>,
+    pub created_at: DateTime<FixedOffset>,
+    /// Reports about this page in all.
+    pub reports: i64,
+    /// Whether an admin took the page down.
+    pub taken_down: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct PageReports {
+    pub reports: Vec<PageReportRow>,
+}
+
+const PAGE_REPORTS: &str = "SELECT r.id, p.code, p.team_id, t.name AS team, r.reason, r.message, \
+    r.contact, r.created_at, p.taken_down_at IS NOT NULL AS taken_down, \
+    (SELECT count(*) FROM page_reports x WHERE x.page_id = p.id) AS reports \
+    FROM page_reports r JOIN post_pages p ON p.id = r.page_id JOIN teams t ON t.id = p.team_id \
+    ORDER BY r.created_at DESC, r.id DESC LIMIT 200";
+
+/// The latest 200 reports of public pages ("Report this page"), newest first.
+#[utoipa::path(get, path = "/admin/page-reports", tag = "admin", security(("session" = [])),
+    responses((status = 200, body = PageReports), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 500, body = Error)))]
+async fn page_reports(State(app): State<AppState>, _: Admin) -> Response {
+    let found = async {
+        let rows = app.db.query_all_raw(stmt(PAGE_REPORTS, [])).await?;
+        rows.iter()
+            .map(|r| {
+                Ok(PageReportRow {
+                    id: r.try_get("", "id")?,
+                    code: r.try_get("", "code")?,
+                    team_id: r.try_get("", "team_id")?,
+                    team: r.try_get("", "team")?,
+                    reason: r.try_get("", "reason")?,
+                    message: r.try_get("", "message")?,
+                    contact: r.try_get("", "contact")?,
+                    created_at: r.try_get("", "created_at")?,
+                    reports: r.try_get("", "reports")?,
+                    taken_down: r.try_get("", "taken_down")?,
+                })
+            })
+            .collect::<Result<Vec<_>, DbErr>>()
+    };
+    match found.await {
+        Ok(reports) => Json(PageReports { reports }).into_response(),
+        Err(e) => internal(e, "admin page reports"),
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct TakeDown {
+    /// `true` switches the page off for everyone, `false` gives it back.
+    pub taken_down: bool,
+}
+
+/// Takes the public page with `code` down, or gives it back: the public route answers `404`
+/// whatever the team's own switch says, and the team cannot undo it. `204`; `404` for an unknown
+/// code.
+#[utoipa::path(put, path = "/admin/pages/{code}/takedown", tag = "admin",
+    security(("session" = [])), params(("code" = String, Path,)), request_body = TakeDown,
+    responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
+        (status = 404, body = Error), (status = 500, body = Error)))]
+async fn take_down(
+    _: FromWeb,
+    State(app): State<AppState>,
+    _: Admin,
+    Path(code): Path<String>,
+    Body(body): Body<TakeDown>,
+) -> Response {
+    let sql = "UPDATE post_pages SET taken_down_at = CASE WHEN $2 THEN COALESCE(taken_down_at, now()) END \
+               WHERE code = $1";
+    let done = app
+        .db
+        .execute_raw(stmt(sql, [code.into(), body.taken_down.into()]))
+        .await;
+    match done {
+        Ok(r) if r.rows_affected() == 1 => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => reply(StatusCode::NOT_FOUND, "not_found"),
+        Err(e) => internal(e, "page takedown"),
+    }
+}
+
 #[derive(Deserialize, ToSchema)]
 pub struct NewCredits {
     /// `x` or `ai`.
@@ -664,5 +757,6 @@ pub fn api() -> OpenApiRouter<AppState> {
         .routes(routes!(grant_credits))
         .routes(routes!(comp_plan, end_comp_plan))
         .routes(routes!(remove))
+        .routes(routes!(page_reports, take_down))
         .routes(routes!(signup_settings, save_signup_settings))
 }

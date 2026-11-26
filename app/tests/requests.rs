@@ -10361,6 +10361,106 @@ mod teams {
                     assert_eq!(mail_for(&seen.lock().unwrap(), &owner).len(), 10);
                 }
 
+                /// A failure notice that reached nobody (the mail provider is down) goes back,
+                /// keeps the team's daily allowance, and is mailed once the provider is back.
+                #[tokio::test]
+                #[serial]
+                async fn a_notice_is_tried_again_when_the_mail_provider_is_down() {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    let (s, db, state) = on_mock().await;
+                    let down = std::sync::Arc::new(AtomicBool::new(true));
+                    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+                    let (flag, log) = (down.clone(), seen.clone());
+                    let app = axum::Router::new().route(
+                        "/emails",
+                        axum::routing::post(move |Json(body): Json<Value>| async move {
+                            if flag.load(Ordering::SeqCst) {
+                                return (
+                                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                    Json(json!({})),
+                                );
+                            }
+                            log.lock().unwrap().push(body);
+                            (axum::http::StatusCode::OK, Json(json!({"id": "x"})))
+                        }),
+                    );
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let url = format!("http://{}/emails", listener.local_addr().unwrap());
+                    tokio::spawn(async move { axum::serve(listener, app).await });
+                    let mut state = state.clone();
+                    state.mailer = socialreins_brain::mail::Mailer::resend_at(
+                        &url,
+                        "re_test",
+                        "b@example.com",
+                    )
+                    .unwrap();
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    exec(
+                        &db,
+                        "UPDATE post_notices SET sent_at = now() WHERE sent_at IS NULL".into(),
+                    )
+                    .await;
+                    let id =
+                        id_of(&create(&s, &cookie, input(&set, "REJECT me", Some(&past()))).await);
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(get_post(&s, &cookie, &id).await["status"], "failed");
+                    publish::tick(&state).await.unwrap();
+                    let row = |sql: String| {
+                        let db = &db;
+                        async move {
+                            db.query_one_raw(sea_orm::Statement::from_string(
+                                sea_orm::DbBackend::Postgres,
+                                sql,
+                            ))
+                            .await
+                            .unwrap()
+                            .unwrap()
+                        }
+                    };
+                    let notice = || {
+                        row(format!(
+                            "SELECT sent_at IS NULL AS unsent, tries, retry_at > now() AS later \
+                             FROM post_notices WHERE post_id = '{id}'"
+                        ))
+                    };
+                    let n = notice().await;
+                    assert!(n.try_get::<bool>("", "unsent").unwrap());
+                    assert_eq!(n.try_get::<i32>("", "tries").unwrap(), 1);
+                    assert!(n.try_get::<bool>("", "later").unwrap());
+                    let hits = row(format!(
+                        "SELECT count(*)::int AS n FROM rate_limit_hits \
+                         WHERE bucket = 'post-mail:team:{team_id}'"
+                    ))
+                    .await;
+                    assert_eq!(
+                        hits.try_get::<i32>("", "n").unwrap(),
+                        0,
+                        "allowance given back"
+                    );
+                    // Not before its time.
+                    publish::tick(&state).await.unwrap();
+                    assert_eq!(notice().await.try_get::<i32>("", "tries").unwrap(), 1);
+                    // The provider is back and the wait is over: mailed, once.
+                    down.store(false, Ordering::SeqCst);
+                    exec(
+                        &db,
+                        format!("UPDATE post_notices SET retry_at = now() WHERE post_id = '{id}'"),
+                    )
+                    .await;
+                    publish::tick(&state).await.unwrap();
+                    publish::tick(&state).await.unwrap();
+                    let n = notice().await;
+                    assert!(!n.try_get::<bool>("", "unsent").unwrap());
+                    let subjects: Vec<String> = seen
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|m| m["subject"].as_str().unwrap().to_owned())
+                        .collect();
+                    assert_eq!(subjects, ["Your Bluesky post failed"], "{subjects:?}");
+                }
+
                 async fn status_of(db: &DatabaseConnection, id: &str) -> String {
                     posts::Entity::find_by_id(id.parse::<uuid::Uuid>().unwrap())
                         .one(db)
@@ -24883,6 +24983,93 @@ mod teams {
                     assert_eq!(balance().await.unwrap(), 1);
                 }
 
+                /// A flow's AI step whose provider does not answer sent nothing and is paid back,
+                /// so the flow tries it again later (5, 10, 15 minutes) and goes on once the
+                /// provider is back; after the last try it ends `failed: ai_failed`.
+                #[tokio::test]
+                #[serial]
+                async fn an_ai_provider_that_does_not_answer_is_tried_again_by_the_flow() {
+                    use sea_orm::ConnectionTrait;
+                    let (s, db, state) = on_ai(true, Some(OUR_KEY)).await;
+                    let (_, cookie, _) = user(&s, &db).await;
+                    let team: uuid::Uuid = current(&s, &cookie).await["id"]
+                        .as_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    db.execute_raw(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Postgres,
+                        "INSERT INTO subscriptions (team_id, plan_id, status, provider) \
+                         VALUES ($1, 'automation', 'active', 'comp') \
+                         ON CONFLICT (team_id) DO NOTHING",
+                        [team.into()],
+                    ))
+                    .await
+                    .unwrap();
+                    let res = connect(&s, &cookie, &new_handle(), DM_APP_PASSWORD).await;
+                    let body = res.json::<Value>();
+                    let account = body["id"].as_str().unwrap().to_owned();
+                    let me = body["external_id"].as_str().unwrap().to_owned();
+                    let id = automation(
+                        &s,
+                        &cookie,
+                        json!({"name": "AI retry", "trigger": "comment_received", "steps": [
+                            {"type": "ai_send_dm", "prompt": "Say hi"}]}),
+                    )
+                    .await;
+                    let t = (&s, &db, &state);
+                    let at = (account.as_str(), me.as_str(), id.as_str());
+                    let used = || billing::ai_used(&db, team, chrono::Utc::now());
+                    let due = |run: String| {
+                        let db = &db;
+                        let state = &state;
+                        async move {
+                            db.execute_unprepared(&format!(
+                                "UPDATE automation_runs SET resume_at = now() - interval '1 minute' \
+                                 WHERE id = '{run}' AND status = 'waiting'"
+                            ))
+                            .await
+                            .unwrap();
+                            socialreins_brain::automations::tick(state).await.unwrap();
+                        }
+                    };
+
+                    // The provider is down: nothing sent, the credit back, the run waits.
+                    reply("500");
+                    let sent0 = SENT.lock().unwrap().len();
+                    let run = comment(t, &cookie, at, "rt1", 1).await;
+                    assert_eq!(run["status"], "waiting", "{run}");
+                    assert_eq!(used().await.unwrap(), 0, "paid back");
+                    assert_eq!(SENT.lock().unwrap().len(), sent0);
+                    // Back at the next round after the wait: written, sent and paid once.
+                    reply("Hi again!");
+                    let run_id = run["id"].as_str().unwrap().to_owned();
+                    due(run_id.clone()).await;
+                    let run = runs(&s, &cookie, &id).await[0].clone();
+                    assert_eq!(run["status"], "sent", "{run}");
+                    assert_eq!(used().await.unwrap(), 1);
+                    assert_eq!(SENT.lock().unwrap().len(), sent0 + 1);
+                    assert_eq!(run["results"].as_array().unwrap().len(), 1, "{run}");
+
+                    // Down for good: three more tries, then it ends failed, paid back, nothing sent.
+                    reply("500");
+                    let run = comment(t, &cookie, at, "rt2", 2).await;
+                    assert_eq!(run["status"], "waiting", "{run}");
+                    let run_id = run["id"].as_str().unwrap().to_owned();
+                    for n in 1..=3 {
+                        due(run_id.clone()).await;
+                        let run = runs(&s, &cookie, &id).await[0].clone();
+                        assert_eq!(run["id"], run_id.as_str());
+                        let want = if n < 3 { "waiting" } else { "failed" };
+                        assert_eq!(run["status"], want, "try {n}: {run}");
+                    }
+                    let run = runs(&s, &cookie, &id).await[0].clone();
+                    assert_eq!(run["status"], "failed", "{run}");
+                    assert_eq!(run["reason"], "ai_failed");
+                    assert_eq!(used().await.unwrap(), 1, "only the first reply was paid");
+                    assert_eq!(SENT.lock().unwrap().len(), sent0 + 1);
+                }
+
                 /// The allowance counts per calendar month (UTC), a repeated reference is paid
                 /// once, a reply given back frees its slot, and past the allowance come credits.
                 #[tokio::test]
@@ -26339,11 +26526,11 @@ mod teams {
             }
 
             /// A page or conversation that fails after an earlier one keeps what that gave and
-            /// carries on from the failed one; a 429 also holds the account back for a while.
+            /// carries on from the failed one; a 429 or a 5xx also holds the account back for a while.
             #[tokio::test]
             #[serial]
             async fn a_failure_partway_keeps_the_progress() {
-                for (status, held) in [(429, true), (503, false)] {
+                for (status, held) in [(429, true), (503, true)] {
                     let (s, db, state) = on_mock().await;
                     let (_, team_id, account, me) = owner(&s, &db).await;
                     let notes: Vec<Value> = (1..=5)
@@ -30062,6 +30249,8 @@ mod teams {
 
                 /// A brain on the mock Bluesky whose mail goes to a fake Resend (`endpoint`
                 /// given) or the one this makes, and what that took.
+                const PAGES_ADMIN: &str = "pages-admin@example.com";
+
                 async fn with_mail(
                     endpoint: Option<String>,
                 ) -> (TestServer, DatabaseConnection, Sent) {
@@ -30090,6 +30279,8 @@ mod teams {
                         "b@example.com",
                     )
                     .unwrap();
+                    config.contact_to = Some("ops@example.com".into());
+                    config.admin_emails = vec![PAGES_ADMIN.into()];
                     let db = socialreins_brain::connect(&config).await.unwrap();
                     let state = AppState::new(db.clone(), &config);
                     let app = controllers::router(state, &config);
@@ -30141,6 +30332,156 @@ mod teams {
                     let res = req(s, Method::GET, "/v1/subscribers", cookie).await;
                     res.assert_status_ok();
                     res.json::<Value>()["subscribers"].clone()
+                }
+
+                /// "Report this page": stored, mailed to the operators, limited; an admin takes the page
+                /// down and the team cannot bring it back.
+                #[tokio::test]
+                #[serial]
+                async fn a_page_can_be_reported_and_an_admin_can_take_it_down() {
+                    let (s, db, seen) = with_mail(None).await;
+                    let (owner, team_id, account) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    pages_on(&s, &owner, true).await;
+                    let id = new_post(&s, &owner, &set, "hello").await;
+                    let code = put_page(&s, &owner, &id, true, "x").await.json::<Value>()["code"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    // Daily caps outlive a run, so each run speaks from its own addresses.
+                    let b = uuid::Uuid::now_v7().into_bytes();
+                    let net = format!("10.{}.{}", b[14], b[15]);
+                    let report = |body: Value, ip: &str| {
+                        s.post(&format!("/v1/public/pages/{code}/report"))
+                            .add_header("x-forwarded-for", ip.to_owned())
+                            .json(&body)
+                    };
+                    // A draft is no page: nothing to report.
+                    let res = report(json!({"reason": "spam"}), &format!("{net}.1")).await;
+                    assert_eq!(res.status_code(), 404);
+                    publish(&db, &id, &account, "https://bsky.test/a").await;
+                    assert_eq!(public(&s, &code).await.status_code(), 200);
+
+                    for (bad, why) in [
+                        (json!({"reason": "rude"}), "invalid_reason"),
+                        (
+                            json!({"reason": "spam", "message": "x".repeat(1001)}),
+                            "invalid_message",
+                        ),
+                        (json!({"reason": "spam", "email": "nope"}), "invalid_email"),
+                    ] {
+                        let res = report(bad, &format!("{net}.2")).await;
+                        assert_eq!(res.status_code(), 422);
+                        assert_eq!(res.json::<Value>()["error"], why);
+                    }
+                    let before = seen.lock().unwrap().len();
+                    let res = report(
+                        json!({"reason": "phishing", "message": "asks for passwords",
+                            "email": "Reporter@Example.com"}),
+                        &format!("{net}.3"),
+                    )
+                    .await;
+                    assert_eq!(res.status_code(), 202, "{}", res.text());
+                    let sent = seen.lock().unwrap()[before..].to_vec();
+                    assert_eq!(sent.len(), 1, "{sent:?}");
+                    let mail = sent[0].to_string();
+                    assert!(
+                        mail.contains("ops@example.com") && mail.contains(&code),
+                        "{mail}"
+                    );
+                    assert!(
+                        mail.contains("asks for passwords")
+                            && mail.contains("reporter@example.com")
+                    );
+                    let n = db
+                        .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                            sea_orm::DbBackend::Postgres,
+                            "SELECT count(*)::bigint AS n FROM page_reports r JOIN post_pages p \
+                             ON p.id = r.page_id WHERE p.code = $1",
+                            [code.clone().into()],
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .try_get::<i64>("", "n")
+                        .unwrap();
+                    assert_eq!(n, 1);
+                    // One address: 5 an hour (the contact form's limit).
+                    let mut last = 202;
+                    for _ in 0..6 {
+                        last = report(json!({"reason": "spam"}), &format!("{net}.3"))
+                            .await
+                            .status_code()
+                            .as_u16();
+                    }
+                    assert_eq!(last, 429);
+
+                    // Past the page's daily cap a report is stored all the same, only not mailed.
+                    sql(
+                        &db,
+                        format!(
+                            "INSERT INTO rate_limit_hits (bucket) \
+                             SELECT 'page-report:page:' || id FROM post_pages, generate_series(1, 20) WHERE code = '{code}'"
+                        ),
+                    )
+                    .await;
+                    let mails = seen.lock().unwrap().len();
+                    let res = report(
+                        json!({"reason": "other", "message": "capped\tnote"}),
+                        &format!("{net}.5"),
+                    )
+                    .await;
+                    assert_eq!(res.status_code(), 202, "{}", res.text());
+                    assert_eq!(seen.lock().unwrap().len(), mails, "no mail past the cap");
+
+                    // Only an admin takes a page down.
+                    let takedown = |cookie: &str, down: bool| {
+                        req(
+                            &s,
+                            Method::PUT,
+                            &format!("/v1/admin/pages/{code}/takedown"),
+                            cookie,
+                        )
+                        .json(&json!({"taken_down": down}))
+                    };
+                    assert_eq!(takedown(&owner, true).await.status_code(), 403);
+                    assert_eq!(public(&s, &code).await.status_code(), 200);
+                    let admin = sign_in(&s, &db, PAGES_ADMIN).await.unwrap();
+                    let list = req(&s, Method::GET, "/v1/admin/page-reports", &admin).await;
+                    list.assert_status_ok();
+                    let list = list.json::<Value>();
+                    let all = list["reports"].as_array().unwrap();
+                    let row = all.iter().find(|r| r["reason"] == "phishing").unwrap();
+                    assert_eq!(row["code"], code.as_str());
+                    assert_eq!(row["message"], "asks for passwords");
+                    // The first one, the four more the address got through, and the capped one.
+                    assert_eq!(row["reports"], 6);
+                    assert_eq!(row["taken_down"], false);
+                    assert_eq!(takedown(&admin, true).await.status_code(), 204);
+                    assert_eq!(public(&s, &code).await.status_code(), 404);
+                    assert_eq!(page(&s, &owner, &id).await["live"], false);
+                    // The team's own switch cannot undo it.
+                    put_page(&s, &owner, &id, true, "again")
+                        .await
+                        .assert_status_ok();
+                    assert_eq!(public(&s, &code).await.status_code(), 404);
+                    assert_eq!(
+                        report(json!({"reason": "spam"}), &format!("{net}.4"))
+                            .await
+                            .status_code(),
+                        404
+                    );
+                    assert_eq!(takedown(&admin, false).await.status_code(), 204);
+                    assert_eq!(public(&s, &code).await.status_code(), 200);
+                    let res = req(
+                        &s,
+                        Method::PUT,
+                        "/v1/admin/pages/nosuchcode/takedown",
+                        &admin,
+                    )
+                    .json(&json!({"taken_down": true}))
+                    .await;
+                    assert_eq!(res.status_code(), 404);
                 }
 
                 #[tokio::test]
@@ -38300,6 +38641,60 @@ mod captcha_and_contact {
         }
     }
 
+    /// The forms that mail a stranger on someone else's behalf (an invitation, a newsletter
+    /// confirmation) and the page report need the token too, before anything is looked up.
+    #[tokio::test]
+    #[serial]
+    async fn invitations_subscriptions_and_reports_need_a_good_token_when_turnstile_is_on() {
+        let (s, db, seen) = app(Some(siteverify().await)).await;
+        let secret = auth::link(&db, &unique_email(), chrono::Duration::minutes(15)).await;
+        let b = socialreins_core::token::new().into_bytes();
+        let res = s
+            .post("/auth/magic")
+            .add_header("origin", "http://localhost:8080")
+            .add_header("x-forwarded-for", format!("10.{}.{}.{}", b[0], b[1], b[2]))
+            .form(&[("token", secret.as_str())])
+            .await;
+        let cookie = auth::session(res.header("set-cookie").to_str().unwrap());
+        let invite = |token: Option<&str>| {
+            s.post("/v1/team/invitations")
+                .add_header("origin", "http://localhost:3000")
+                .add_header("cookie", cookie.clone())
+                .json(&json!({"email": unique_email(), "role": "member", "turnstile_token": token}))
+        };
+        let before = seen.lock().unwrap().len();
+        for token in [None, Some("bad")] {
+            let res = invite(token).await;
+            assert_eq!(res.status_code(), 422, "{token:?}");
+            res.assert_json(&json!({"error": "captcha_failed"}));
+        }
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            before,
+            "no mail before the captcha"
+        );
+        assert_eq!(invite(Some("good")).await.status_code(), 201);
+        // Public forms: the captcha comes before the page is looked up (an unknown code is a 404 only after).
+        let ip = format!("10.{}.{}.9", b[3], b[4]);
+        for path in ["subscribe", "report"] {
+            let url = format!("/v1/public/pages/nosuchcode/{path}");
+            let body = |token: Option<&str>| json!({"email": unique_email(), "reason": "spam", "turnstile_token": token});
+            let res = s
+                .post(&url)
+                .add_header("x-forwarded-for", ip.clone())
+                .json(&body(None))
+                .await;
+            assert_eq!(res.status_code(), 422, "{path}");
+            res.assert_json(&json!({"error": "captcha_failed"}));
+            let res = s
+                .post(&url)
+                .add_header("x-forwarded-for", ip.clone())
+                .json(&body(Some("good")))
+                .await;
+            assert_eq!(res.status_code(), 404, "{path}");
+        }
+    }
+
     #[tokio::test]
     #[serial]
     async fn forms_fail_closed_when_siteverify_is_down() {
@@ -38711,8 +39106,15 @@ mod waitlist_confirm {
         let email = unique_email();
         join(&s, &email).await;
         assert_eq!(rows(&db, &email).await, 1);
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let r = row(&db, &email).await;
+        // The mail is tried three times (`Mailer::send`) before it counts as failed.
+        let mut r = row(&db, &email).await;
+        for _ in 0..40 {
+            if r.verify_sent_at.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            r = row(&db, &email).await;
+        }
         assert!(
             r.verify_sent_at.is_none(),
             "a failed send does not throttle"
