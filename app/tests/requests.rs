@@ -2129,6 +2129,45 @@ mod teams {
 
     #[tokio::test]
     #[serial]
+    async fn a_user_who_left_their_current_team_lands_in_the_oldest_one() {
+        use sea_orm::ConnectionTrait;
+        let (s, db) = server_where(|_| {}).await;
+        let (_, cookie, id) = user(&s, &db).await;
+        let personal = current(&s, &cookie).await;
+        let made = req(&s, Method::POST, "/v1/teams", &cookie)
+            .json(&json!({"name": "Acme"}))
+            .await;
+        assert_eq!(made.status_code(), 201);
+        let acme = made.json::<Value>();
+        // The new team is current; the user then leaves it (a row removed, current team kept).
+        assert_eq!(current(&s, &cookie).await["id"], acme["id"]);
+        let stmt = sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Postgres,
+            format!(
+                "DELETE FROM team_user WHERE user_id = '{id}' AND team_id = '{}'",
+                acme["id"].as_str().unwrap()
+            ),
+        );
+        db.execute_raw(stmt).await.unwrap();
+        // The oldest membership answers, and it becomes the current team again.
+        assert_eq!(current(&s, &cookie).await["id"], personal["id"]);
+        let row = users::Entity::find_by_id(id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.current_team_id.unwrap().to_string(), personal["id"]);
+        // Naming the team they left is a 404, as for a team that does not exist.
+        let named = s
+            .get("/v1/team")
+            .add_header("cookie", cookie.clone())
+            .add_header("x-team", acme["code"].as_str().unwrap())
+            .await;
+        assert_eq!(named.status_code(), 404);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn create_switch_rename_and_delete() {
         let (s, db) = server_where(|_| {}).await;
         let (_, cookie, id) = user(&s, &db).await;
