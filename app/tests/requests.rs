@@ -7120,9 +7120,9 @@ mod teams {
                     assert_eq!(p["targets"][0]["error"], msg);
                     assert_eq!(p["error"], format!("@{handle}: {msg}"));
                     assert!(!p.to_string().contains("secret.example"));
+                    // A failed post has nothing on any network, so it can be deleted.
                     let res = req(&s, Method::DELETE, &format!("/v1/posts/{id}"), &cookie).await;
-                    assert_eq!(res.status_code(), 409);
-                    res.assert_json(&json!({"error": "not_deletable"}));
+                    assert_eq!(res.status_code(), 204);
                 }
 
                 // A refused app password asks for a reconnect, on publish and on takedown.
@@ -9063,6 +9063,116 @@ mod teams {
                     }
                 }
                 assert_eq!(count().await, before);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn the_post_cap_counts_live_posts_once_each_and_the_list_takes_a_limit() {
+                let (s, db, _) = on_mock().await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let run = |sql: String| {
+                    let db = db.clone();
+                    async move {
+                        use sea_orm::ConnectionTrait;
+                        db.execute_raw(sea_orm::Statement::from_string(
+                            sea_orm::DbBackend::Postgres,
+                            sql,
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                };
+                let rows = |status: &str, groups: u32, copies: u32, at: &str| {
+                    format!(
+                        "INSERT INTO posts (id, team_id, social_set_id, platform, status, group_id, scheduled_at, published_at) \
+                         SELECT gen_random_uuid(), '{team_id}', '{set}', 'bluesky', '{status}', \
+                         md5('{status}' || g::text)::uuid, {at}, {at} \
+                         FROM generate_series(1, {groups}) g, generate_series(1, {copies}) c"
+                    )
+                };
+                // History does not count: 2,500 published posts and a taken-down one.
+                run(rows(
+                    "published",
+                    2500,
+                    1,
+                    "now() - g * interval '1 minute'",
+                ))
+                .await;
+                run(rows("deleted", 10, 1, "NULL")).await;
+                // 1,998 live posts of 3 copies each (5,994 rows) leave room for two more posts.
+                run(rows("draft", 1998, 3, "NULL")).await;
+                let res = create(&s, &cookie, input(&set, "one", None)).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                // A failed post counts too, until it is deleted.
+                let failed = create(&s, &cookie, input(&set, "two", None)).await;
+                assert_eq!(failed.status_code(), 201);
+                let failed = id_of(&failed);
+                run(format!(
+                    "UPDATE posts SET status = 'failed' WHERE id = '{failed}'"
+                ))
+                .await;
+                let res = create(&s, &cookie, input(&set, "three", None)).await;
+                assert_eq!(res.status_code(), 409);
+                res.assert_json(&json!({"error": "too_many_posts"}));
+                // One with a target that is up (a partial send) is kept for a take down.
+                run(format!(
+                    "INSERT INTO post_targets (id, post_id, status, remote_id) \
+                     VALUES (gen_random_uuid(), '{failed}', 'failed', 'up')"
+                ))
+                .await;
+                let res = req(&s, Method::DELETE, &format!("/v1/posts/{failed}"), &cookie).await;
+                assert_eq!(res.status_code(), 409);
+                run(format!(
+                    "DELETE FROM post_targets WHERE post_id = '{failed}'"
+                ))
+                .await;
+                let res = req(&s, Method::DELETE, &format!("/v1/posts/{failed}"), &cookie).await;
+                assert_eq!(res.status_code(), 204);
+                assert_eq!(
+                    create(&s, &cookie, input(&set, "three", None))
+                        .await
+                        .status_code(),
+                    201
+                );
+
+                // The list takes a limit and an order, and the newest published are reachable.
+                let list = |q: &str| {
+                    let path = format!("/v1/posts?{q}");
+                    let (s, cookie) = (&s, cookie.clone());
+                    async move { req(s, Method::GET, &path, &cookie).await }
+                };
+                let res = list("status=published&order=desc&limit=3").await;
+                assert_eq!(res.status_code(), 200);
+                let got: Vec<Value> = res.json();
+                assert_eq!(got.len(), 3);
+                let times: Vec<&str> = got
+                    .iter()
+                    .map(|p| p["scheduled_at"].as_str().unwrap())
+                    .collect();
+                assert!(times[0] > times[1] && times[1] > times[2], "{times:?}");
+                let oldest: Vec<Value> = list("status=published&limit=1").await.json();
+                assert!(oldest[0]["scheduled_at"].as_str().unwrap() < times[2]);
+                assert_eq!(
+                    list("status=published").await.json::<Vec<Value>>().len(),
+                    2000
+                );
+                for bad in ["limit=0", "limit=2001", "order=sideways"] {
+                    assert_eq!(list(bad).await.status_code(), 422, "{bad}");
+                }
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn json_answers_are_compressed_for_clients_that_ask() {
+                let (s, _, _) = on_mock().await;
+                let res = s
+                    .get("/openapi.json")
+                    .add_header("accept-encoding", "gzip")
+                    .await;
+                assert_eq!(res.header("content-encoding"), "gzip");
+                let res = s.get("/openapi.json").await;
+                assert!(res.maybe_header("content-encoding").is_none());
             }
 
             #[tokio::test]
