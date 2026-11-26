@@ -52,7 +52,7 @@ cargo run -p socialreins-brain
   `POST /v1/waitlist/verify` (never a state-changing GET: mail scanners open links). Mail goes
   out after the reply, at most hourly per email, 20 a day per IP and 500 a day overall
   (`rate_limit::daily_reserve`). `POST /v1/waitlist/name` sets an optional name with the join's `name_token` (hash stored on a new row only, a dummy for a known email, valid an hour). `GET /v1/waitlist/count` counts verified signups, cached 30 seconds, and `GET /v1/admin/waitlist` is for `ADMIN_EMAILS` (`config.rs`) with a
-  session cookie only.
+  session cookie only. Invites in batches (`admin.rs`): `GET /v1/admin/waitlist-invites?count=N` previews the oldest N verified signups not yet approved, `POST` with their `ids` (1 to 50, recent sign-in) approves each by one claiming UPDATE (so nobody is mailed twice, `approved_at` is the invited timestamp) and sends the invite mail (`send_invite`: sign in with this address, 7-day trial, connect, publish) within 100 a day (`waitlist:invite` in `rate_limit_hits`); a failed mail or a reached cap gives the claim back. `overview.waitlist.signed_up` counts approved emails with an account.
 - `app/src/controllers/pages.rs`: public pages of posts. `teams.public_pages` (`PATCH /v1/team`,
   owner or admin) switches them on; `post_pages` holds one row per `subject` (the post's
   `group_id`, else its `id`), so a group has one page under one permanent `code`.

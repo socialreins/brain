@@ -12,8 +12,8 @@ use axum::{
 };
 use chrono::{DateTime, FixedOffset, Utc};
 use sea_orm::{
-    sea_query::Expr, ColumnTrait, ConnectionTrait, DbBackend, DbErr, EntityTrait, QueryFilter,
-    QueryResult, Statement,
+    sea_query::Expr, ColumnTrait, ConnectionTrait, DbBackend, DbErr, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, QueryResult, QuerySelect, Statement,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -24,12 +24,24 @@ use super::{
     auth::{internal, signup_rules, Body, CurrentUser, FromWeb},
     waitlist::{error, is_admin, like, AdminSignup, Error, Reply},
 };
-use crate::{config::signup_entry, models::waitlist_signups, state::AppState};
+use crate::{
+    config::signup_entry,
+    models::waitlist_signups,
+    rate_limit::{daily_refund, daily_reserve},
+    state::AppState,
+};
 
 const DEFAULT_LIMIT: u64 = 50;
 const MAX_LIMIT: u64 = 200;
 const MAX_QUERY_CHARS: usize = 200;
 const MAX_SIGNUP_DOMAINS: usize = 50;
+const INVITE_SUBJECT: &str = "You can now create your SocialReins account";
+const INVITE_BUCKET: &str = "waitlist:invite";
+/// Invite emails per rolling 24 hours, so a batch cannot use up the mail provider's allowance
+/// for sign-in links. `approve` (one by hand) is not counted.
+const INVITES_PER_DAY: i64 = 100;
+/// Most signups one batch invites.
+const MAX_INVITE_BATCH: usize = 50;
 
 /// A user in `ADMIN_EMAILS` with a session cookie: `401 unauthorized` signed out, `403 forbidden`
 /// for anyone else.
@@ -66,7 +78,10 @@ pub struct AccountTotals {
 pub struct WaitlistTotals {
     pub total: i64,
     pub verified: i64,
+    /// Invited: an admin approved the email for sign-up (`approved_at`).
     pub approved: i64,
+    /// Approved emails that have an account.
+    pub signed_up: i64,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -88,6 +103,8 @@ const OVERVIEW: &str = "SELECT (SELECT count(*) FROM users) AS users, \
     (SELECT count(*) FROM waitlist_signups) AS waitlist, \
     (SELECT count(*) FROM waitlist_signups WHERE verified_at IS NOT NULL) AS verified, \
     (SELECT count(*) FROM waitlist_signups WHERE approved_at IS NOT NULL) AS approved, \
+    (SELECT count(*) FROM waitlist_signups w WHERE w.approved_at IS NOT NULL \
+      AND EXISTS (SELECT 1 FROM users u WHERE u.email = w.email)) AS signed_up, \
     COALESCE((SELECT jsonb_object_agg(provider, n) FROM \
       (SELECT provider, count(*) AS n FROM social_accounts GROUP BY provider) a), '{}') AS accounts, \
     COALESCE((SELECT jsonb_object_agg(status, n) FROM \
@@ -128,6 +145,7 @@ async fn overview(State(app): State<AppState>, _: Admin) -> Response {
                 total: row.try_get("", "waitlist")?,
                 verified: row.try_get("", "verified")?,
                 approved: row.try_get("", "approved")?,
+                signed_up: row.try_get("", "signed_up")?,
             },
         })
     };
@@ -338,8 +356,25 @@ pub struct Approval {
     pub mail: String,
 }
 
+/// The invite mail: how to start, with a link to `{WEB_URL}/signup`.
+async fn send_invite(app: &AppState, email: &str) -> Result<(), String> {
+    let text = format!(
+        "Good news: you are off the SocialReins waitlist and can now create your account.\n\n\
+         How to start:\n\
+         1. Open the link below and sign in with this email address. We email you a link, no password.\n\
+         2. On the Plans page, pick a plan. A first plan starts with a 7-day free trial.\n\
+         3. Connect a social account, then write a post and publish or schedule it.\n\n\
+         Create my account:\n\n{}/signup\n\n\
+         If you did not join the waitlist, ignore this email.\n",
+        app.web_url
+    );
+    app.mailer
+        .send(email, INVITE_SUBJECT, text, &app.web_url)
+        .await
+}
+
 /// Approves a waitlist signup: its exact email may then sign up whatever the sign-up rules say,
-/// and is told so by email with a link to `{WEB_URL}/signup`. Approving again changes nothing
+/// and is told so by email (`send_invite`). Approving again changes nothing
 /// and sends nothing.
 #[utoipa::path(post, path = "/admin/waitlist/{id}/approve", tag = "admin",
     security(("session" = [])), params(("id" = Uuid, Path,)),
@@ -369,18 +404,7 @@ async fn approve(
         Err(e) => return internal(e, "waitlist approve"),
     };
     let mail = if new {
-        let text = format!(
-            "Good news: you are off the SocialReins waitlist and can now create your account.\n\n\
-             Use this email address when you sign up.\n\nCreate my account:\n\n{}/signup\n\n\
-             If you did not join the waitlist, ignore this email.\n",
-            app.web_url
-        );
-        let subject = "You can now create your SocialReins account";
-        match app
-            .mailer
-            .send(&row.email, subject, text, &app.web_url)
-            .await
-        {
+        match send_invite(&app, &row.email).await {
             Ok(()) => "sent",
             Err(e) => {
                 tracing::error!(error = %e, "waitlist approval mail not sent");
@@ -395,6 +419,220 @@ async fn approve(
         mail: mail.into(),
     })
     .into_response()
+}
+
+/// Verified signups an admin has not approved yet.
+fn not_invited() -> sea_orm::Select<waitlist_signups::Entity> {
+    use waitlist_signups::Column;
+    waitlist_signups::Entity::find()
+        .filter(Column::VerifiedAt.is_not_null())
+        .filter(Column::ApprovedAt.is_null())
+}
+
+#[derive(Deserialize, IntoParams)]
+pub struct InviteQuery {
+    /// How many to invite, 1 to 50.
+    pub count: Option<u64>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct InvitePreview {
+    /// Verified signups not yet invited.
+    pub eligible: i64,
+    /// How many invite emails may still go out in the next 24 hours.
+    pub left_today: i64,
+    /// The oldest `count` of them, oldest first: who `POST /admin/waitlist-invites` would invite.
+    pub selected: Vec<AdminSignup>,
+}
+
+/// Who a batch of `count` invites would reach: the oldest verified signups not yet invited.
+/// Changes nothing.
+#[utoipa::path(get, path = "/admin/waitlist-invites", tag = "admin", security(("session" = [])),
+    params(InviteQuery),
+    responses((status = 200, body = InvitePreview), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 422, body = Error), (status = 500, body = Error)))]
+async fn invite_preview(
+    State(app): State<AppState>,
+    _: Admin,
+    q: Result<Query<InviteQuery>, QueryRejection>,
+) -> Response {
+    use waitlist_signups::Column;
+    let count = match q {
+        Ok(Query(InviteQuery { count: Some(n) })) if (1..=MAX_INVITE_BATCH as u64).contains(&n) => {
+            n
+        }
+        _ => return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_count"),
+    };
+    let found = async {
+        let eligible = not_invited().count(&app.db).await?;
+        let selected = not_invited()
+            .order_by_asc(Column::CreatedAt)
+            .order_by_asc(Column::Id)
+            .limit(count)
+            .all(&app.db)
+            .await?;
+        let sql = "SELECT count(*) AS n FROM rate_limit_hits \
+                   WHERE bucket = $1 AND created_at > now() - interval '1 day'";
+        let used: i64 = match app
+            .db
+            .query_one_raw(stmt(sql, [INVITE_BUCKET.into()]))
+            .await?
+        {
+            Some(row) => row.try_get("", "n")?,
+            None => 0,
+        };
+        Ok::<_, DbErr>(InvitePreview {
+            eligible: eligible as i64,
+            left_today: (INVITES_PER_DAY - used).max(0),
+            selected: selected.into_iter().map(AdminSignup::from).collect(),
+        })
+    };
+    match found.await {
+        Ok(preview) => Json(preview).into_response(),
+        Err(e) => internal(e, "waitlist invite preview"),
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct InviteBody {
+    /// The signups to invite, 1 to 50: the ids a preview listed.
+    pub ids: Vec<Uuid>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct Invited {
+    /// Approved and mailed now.
+    pub sent: u32,
+    /// The mail failed: not approved, so a later batch may try them again.
+    pub failed: u32,
+    /// Not mailed because the daily cap was reached: not approved either.
+    pub capped: u32,
+    /// Unknown, not verified or already invited: left alone, not mailed again.
+    pub skipped: u32,
+}
+
+/// Invites the listed verified signups, oldest first: each is approved (it may sign up whatever
+/// the sign-up rules say) and gets the invite mail. Nobody is mailed twice: one UPDATE claims
+/// each approval, so a repeated or concurrent call skips the ones already invited. At most 100
+/// invite mails per rolling 24 hours (`capped` beyond that). Needs a sign-in from the last 10
+/// minutes (else `403 reauth_required`); `422 invalid_ids` for no ids or more than 50.
+#[utoipa::path(post, path = "/admin/waitlist-invites", tag = "admin", security(("session" = [])),
+    request_body = InviteBody,
+    responses((status = 200, body = Invited), (status = 400, body = Error),
+        (status = 401, body = Error), (status = 403, body = Error), (status = 413, body = Error),
+        (status = 415, body = Error), (status = 422, body = Error), (status = 500, body = Error)))]
+async fn invite(
+    _: FromWeb,
+    State(app): State<AppState>,
+    Admin(current): Admin,
+    Body(body): Body<InviteBody>,
+) -> Response {
+    use waitlist_signups::Column;
+    if !current.recent() {
+        return reply(StatusCode::FORBIDDEN, "reauth_required");
+    }
+    let mut ids = body.ids;
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() || ids.len() > MAX_INVITE_BATCH {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_ids");
+    }
+    let rows = not_invited()
+        .filter(Column::Id.is_in(ids.clone()))
+        .order_by_asc(Column::CreatedAt)
+        .order_by_asc(Column::Id)
+        .all(&app.db)
+        .await;
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(e) => return internal(e, "waitlist invite"),
+    };
+    let mut done = Invited {
+        sent: 0,
+        failed: 0,
+        capped: 0,
+        skipped: (ids.len() - rows.len()) as u32,
+    };
+    // A task of its own, so a browser that gives up waiting cannot stop the batch between a
+    // claim and its mail.
+    let sending = crate::mail::Sending::begin();
+    let task = tokio::spawn(async move {
+        let _sending = sending;
+        for row in rows {
+            if done.capped > 0 {
+                done.capped += 1;
+                continue;
+            }
+            let unclaim = || async {
+                let undone = waitlist_signups::Entity::update_many()
+                    .col_expr(
+                        Column::ApprovedAt,
+                        Expr::value(None::<DateTime<FixedOffset>>),
+                    )
+                    .filter(Column::Id.eq(row.id))
+                    .exec(&app.db)
+                    .await;
+                if let Err(e) = undone {
+                    tracing::error!(error = %e, "waitlist invite unclaim failed");
+                }
+            };
+            let claimed = waitlist_signups::Entity::update_many()
+                .col_expr(Column::ApprovedAt, Expr::value(Utc::now().fixed_offset()))
+                .filter(Column::Id.eq(row.id))
+                .filter(Column::ApprovedAt.is_null())
+                .filter(Column::VerifiedAt.is_not_null())
+                .exec(&app.db)
+                .await;
+            match claimed {
+                Ok(r) if r.rows_affected == 1 => {}
+                Ok(_) => {
+                    done.skipped += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "waitlist invite claim failed");
+                    done.failed += 1;
+                    continue;
+                }
+            }
+            let caps = [(INVITE_BUCKET.to_owned(), INVITES_PER_DAY)];
+            let reserved = match daily_reserve(&app.db, &caps).await {
+                Ok(Some(ids)) => ids,
+                Ok(None) => {
+                    unclaim().await;
+                    done.capped += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "waitlist invite cap check failed");
+                    unclaim().await;
+                    done.failed += 1;
+                    continue;
+                }
+            };
+            match send_invite(&app, &row.email).await {
+                Ok(()) => done.sent += 1,
+                Err(e) => {
+                    tracing::error!(error = %e, "waitlist invite mail not sent");
+                    daily_refund(&app.db, &reserved).await;
+                    unclaim().await;
+                    done.failed += 1;
+                }
+            }
+        }
+        tracing::info!(
+            sent = done.sent,
+            failed = done.failed,
+            capped = done.capped,
+            skipped = done.skipped,
+            "waitlist invites"
+        );
+        done
+    });
+    match task.await {
+        Ok(done) => Json(done).into_response(),
+        Err(e) => internal(e, "waitlist invite task"),
+    }
 }
 
 /// Removes a waitlist signup, `204`. An approved email that has not signed up yet loses its
@@ -754,6 +992,7 @@ pub fn api() -> OpenApiRouter<AppState> {
         .routes(routes!(users))
         .routes(routes!(teams))
         .routes(routes!(approve))
+        .routes(routes!(invite_preview, invite))
         .routes(routes!(grant_credits))
         .routes(routes!(comp_plan, end_comp_plan))
         .routes(routes!(remove))
