@@ -183,6 +183,15 @@ cargo run -p socialreins-brain
   deletes or likes a Meta comment (`meta_inbox::moderate`; what was done is kept in
   `inbox_items.moderation`); a person's DM reply after 24 hours goes out with the HUMAN_AGENT tag
   only with `META_HUMAN_AGENT`.
+- `app/src/linkedin_inbox.rs`: LinkedIn comments for automations, all behind `capability` (off until
+  `LINKEDIN_COMMUNITY_API=true`, the account is a Page with `meta.organization` and its token holds
+  `r_organization_social_feed` and `w_organization_social_feed` in `meta.scopes`, which connect records from
+  LinkedIn's token answer). No Page can be connected yet, so no account is ready today; a personal profile can
+  never be (apps cannot read a member's comments). A ready Page's newest 5 posts are polled every 3 hours
+  (1 call each, `meta.linkedin_inbox` counts the day: reads stop at 80, reads and writes at 100, LinkedIn's
+  Development tier per member), the first read is stored automated, and `send` (a reply as the Page) and `like`
+  are one call each, never retried. Comment limit 1250 (`inbox::fits_on`); no DM, no hide. Nothing was run
+  against real LinkedIn.
 - `app/src/youtube_inbox.rs`: YouTube comments into `inbox_items` (`connectors/youtube/comments.rs`:
   `commentThreads.list` with `allThreadsRelatedToChannelId`, newest first). Opt-in per channel
   (`youtube_inbox`), because the Google project's 10,000 units a day are shared: a channel's

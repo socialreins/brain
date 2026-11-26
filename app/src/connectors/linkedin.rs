@@ -45,6 +45,9 @@ pub struct LinkedIn {
     pub oauth_url: String,
     pub api_url: String,
     pub poll_every: Duration,
+    /// `LINKEDIN_COMMUNITY_API=true`: set only once LinkedIn approved the Community Management API
+    /// for this app. Off, no LinkedIn comment is read and none is answered (`linkedin_inbox`).
+    pub community_api: bool,
     client: reqwest::Client,
 }
 
@@ -53,6 +56,8 @@ pub struct Token {
     pub expires_in: i64,
     /// Only partner apps get one.
     pub refresh_token: Option<String>,
+    /// The scopes LinkedIn says it granted, space separated.
+    pub scope: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -67,6 +72,7 @@ struct TokenAnswer {
     access_token: String,
     expires_in: Option<i64>,
     refresh_token: Option<String>,
+    scope: Option<String>,
 }
 
 /// One file to post: its bytes (a video's are read from the store a part at a time) and type.
@@ -135,6 +141,58 @@ fn encoded(urn: &str) -> Option<String> {
     plain.then(|| urn.replace(':', "%3A"))
 }
 
+/// Longest comment or reply LinkedIn takes, in characters. LinkedIn's Comments API page (read
+/// 2026-11-26) states no limit; 1250 is the long-standing one and the one `first_comment` uses.
+pub const COMMENT_MAX: usize = 1250;
+
+/// A URN as one path segment: everything but unreserved characters is percent-encoded, so a
+/// comment URN's parentheses and comma survive (`urn:li:comment:(urn:li:activity:1,2)`).
+fn urn_segment(urn: &str) -> Option<String> {
+    let ok = urn.starts_with("urn:li:")
+        && urn.len() <= 300
+        && urn.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-' | b'(' | b')' | b',')
+        });
+    ok.then(|| {
+        urn.bytes()
+            .map(|b| match b {
+                b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'-' | b'_' => (b as char).to_string(),
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    })
+}
+
+/// A comment as LinkedIn's Comments API lists it (`GET /rest/socialActions/{post}/comments`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Comment {
+    /// `urn:li:comment:(urn:li:activity:...,...)`.
+    pub urn: String,
+    /// `urn:li:person:...` or `urn:li:organization:...`.
+    pub actor: String,
+    pub text: String,
+    /// Milliseconds since the epoch.
+    pub at_ms: i64,
+    /// The comment this one answers, when it is a reply.
+    pub parent: Option<String>,
+}
+
+fn comment_of(v: &Value) -> Option<Comment> {
+    let urn = v["commentUrn"]
+        .as_str()
+        .filter(|u| u.starts_with("urn:li:comment:"))?;
+    Some(Comment {
+        urn: urn.to_owned(),
+        actor: v["actor"]
+            .as_str()
+            .filter(|a| a.starts_with("urn:li:"))?
+            .to_owned(),
+        text: v["message"]["text"].as_str().unwrap_or_default().to_owned(),
+        at_ms: v["created"]["time"].as_i64()?,
+        parent: v["parentComment"].as_str().map(str::to_owned),
+    })
+}
+
 /// The public link to a post.
 pub fn post_url(urn: &str) -> String {
     format!("https://www.linkedin.com/feed/update/{urn}")
@@ -178,6 +236,7 @@ impl LinkedIn {
             oauth_url: OAUTH_URL.into(),
             api_url: API_URL.into(),
             poll_every: Duration::from_secs(5),
+            community_api: false,
             client,
         })
     }
@@ -266,6 +325,7 @@ impl LinkedIn {
                 .filter(|s| *s > 0)
                 .unwrap_or(DEFAULT_EXPIRES_IN),
             refresh_token: t.refresh_token.filter(|r| !r.is_empty()),
+            scope: t.scope.filter(|s| !s.is_empty()),
         })
     }
 
@@ -615,6 +675,74 @@ impl LinkedIn {
             .ok_or_else(|| failed("Comment: LinkedIn sent no comment id."))
     }
 
+    /// The comments on a post (`GET /rest/socialActions/{post}/comments`), replies included, as
+    /// LinkedIn lists them; one page, never retried. For a Page's post this needs
+    /// `r_organization_social_feed` and an administrator's token; a member's own post cannot be
+    /// read by an app at all (`r_member_social_feed` is closed). An entry that is not a comment
+    /// is left out.
+    pub async fn comments(&self, token: &str, post: &str) -> Result<Vec<Comment>, PostError> {
+        let Some(path) = encoded(post).map(|e| format!("socialActions/{e}/comments")) else {
+            return Err(failed("This is not a LinkedIn post id."));
+        };
+        let (_, body) = self
+            .send(self.rest(Method::GET, &path, token), "Comments")
+            .await?;
+        Ok(body["elements"]
+            .as_array()
+            .map(|a| a.iter().filter_map(comment_of).collect())
+            .unwrap_or_default())
+    }
+
+    /// Answers `parent` (a comment URN) on `post` as `actor` (`urn:li:organization:...`): `POST
+    /// /rest/socialActions/{parent}/comments` with `parentComment`, which needs
+    /// `w_organization_social_feed`. The new comment's id. Once, never retried.
+    pub async fn reply(
+        &self,
+        token: &str,
+        (actor, post, parent): (&str, &str, &str),
+        text: &str,
+    ) -> Result<String, PostError> {
+        let (Some(path), true) = (
+            urn_segment(parent).map(|e| format!("socialActions/{e}/comments")),
+            encoded(post).is_some() && actor.starts_with("urn:li:organization:"),
+        ) else {
+            return Err(failed("This is not a LinkedIn comment id."));
+        };
+        let body = json!({
+            "actor": actor,
+            "object": post,
+            "parentComment": parent,
+            "message": {"text": text},
+        });
+        let req = self.rest(Method::POST, &path, token).json(&body);
+        let (headers, body) = self.send(req, "Reply").await?;
+        headers
+            .get("x-restli-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .or_else(|| body["id"].as_str().map(str::to_owned))
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| failed("Reply: LinkedIn sent no comment id."))
+    }
+
+    /// Likes `comment` as `actor` (`POST /rest/reactions?actor=...`, `w_organization_social_feed`).
+    /// LinkedIn answers 201; a like already there is not an error worth retrying, and nothing is.
+    pub async fn like_comment(
+        &self,
+        token: &str,
+        actor: &str,
+        comment: &str,
+    ) -> Result<(), PostError> {
+        let (Some(who), true) = (urn_segment(actor), urn_segment(comment).is_some()) else {
+            return Err(failed("This is not a LinkedIn comment id."));
+        };
+        let body = json!({"root": comment, "reactionType": "LIKE"});
+        let req = self
+            .rest(Method::POST, &format!("reactions?actor={who}"), token)
+            .json(&body);
+        self.send(req, "Like").await.map(|_| ())
+    }
+
     /// Takes a post down (`w_member_social`). LinkedIn answers 204 also for one already gone.
     pub async fn delete_post(&self, token: &str, urn: &str) -> Result<(), PostError> {
         let Some(path) = encoded(urn).map(|e| format!("posts/{e}")) else {
@@ -629,6 +757,45 @@ impl LinkedIn {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_comment_urn_is_one_encoded_path_segment() {
+        let urn = "urn:li:comment:(urn:li:activity:6666,120381273128)";
+        assert_eq!(
+            urn_segment(urn).as_deref(),
+            Some("urn%3Ali%3Acomment%3A%28urn%3Ali%3Aactivity%3A6666%2C120381273128%29")
+        );
+        for bad in [
+            "",
+            "urn:li:share:1/../x",
+            "https://x",
+            "urn:li:share:1?a=b",
+            "urn:li:share:1 2",
+        ] {
+            assert!(urn_segment(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_comment_is_read_from_the_comments_api_shape() {
+        let v = json!({"commentUrn": "urn:li:comment:(urn:li:activity:1,2)",
+            "actor": "urn:li:person:abc", "created": {"time": 1_700_000_000_000_i64},
+            "message": {"text": "great post"},
+            "parentComment": "urn:li:comment:(urn:li:activity:1,1)"});
+        let c = comment_of(&v).unwrap();
+        assert_eq!(c.actor, "urn:li:person:abc");
+        assert_eq!(c.text, "great post");
+        assert_eq!(
+            c.parent.as_deref(),
+            Some("urn:li:comment:(urn:li:activity:1,1)")
+        );
+        // No comment URN, no actor or no time: not a comment.
+        for k in ["commentUrn", "actor", "created"] {
+            let mut v = v.clone();
+            v.as_object_mut().unwrap().remove(k);
+            assert!(comment_of(&v).is_none(), "{k}");
+        }
+    }
+
     use super::*;
 
     #[test]

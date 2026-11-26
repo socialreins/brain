@@ -181,6 +181,18 @@ pub fn spawn(app: AppState) {
             }
         }
     });
+    let linkedin_app = app.clone();
+    tokio::spawn(async move {
+        // Does nothing until LinkedIn approved the Community Management API (`linkedin_inbox`).
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if let Err(e) = crate::linkedin_inbox::tick(&linkedin_app).await {
+                tracing::warn!(error = %e, "linkedin inbox tick failed");
+            }
+        }
+    });
     let meta_app = app.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));

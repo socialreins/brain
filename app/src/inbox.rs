@@ -839,6 +839,8 @@ pub fn fits_on(platform: &str, via: Via, text: &str) -> bool {
         ("threads", Via::Dm) => false,
         ("youtube", Via::Public) => some && chars <= 10_000,
         ("youtube", Via::Dm) => false,
+        ("linkedin", Via::Public) => some && chars <= crate::connectors::linkedin::COMMENT_MAX,
+        ("linkedin", Via::Dm) => false,
         _ => fits(via, text),
     }
 }
@@ -917,7 +919,7 @@ async fn send_inner(
     if !meta
         && !matches!(
             account.provider.as_str(),
-            "bluesky" | "x" | "threads" | "youtube"
+            "bluesky" | "x" | "threads" | "youtube" | "linkedin"
         )
     {
         return Ok(Err(InboxError::Invalid("unsupported_platform")));
@@ -928,6 +930,9 @@ async fn send_inner(
     }
     if account.provider == "youtube" && via == Via::Dm {
         return Ok(Err(InboxError::Invalid("youtube_no_dm")));
+    }
+    if account.provider == "linkedin" && via == Via::Dm {
+        return Ok(Err(InboxError::Invalid("linkedin_no_dm")));
     }
     if !fits_for(account, via, text) {
         return Ok(Err(InboxError::Invalid("too_long")));
@@ -948,6 +953,8 @@ async fn send_inner(
         crate::threads_inbox::send(app, account, item, text).await
     } else if account.provider == "youtube" {
         crate::youtube_inbox::send(app, account, item, text).await
+    } else if account.provider == "linkedin" {
+        crate::linkedin_inbox::send(app, account, item, text).await
     } else {
         send_bluesky(app, account, item, (via, text, skip)).await
     };
@@ -1057,6 +1064,14 @@ async fn send_bluesky(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_linkedin_reply_holds_1250_characters_and_no_message() {
+        assert!(fits_on("linkedin", Via::Public, &"a".repeat(1250)));
+        assert!(!fits_on("linkedin", Via::Public, &"a".repeat(1251)));
+        assert!(!fits_on("linkedin", Via::Public, "  "));
+        assert!(!fits_on("linkedin", Via::Dm, "hello"));
+    }
 
     #[test]
     fn filters_become_numbered_sql() {

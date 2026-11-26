@@ -12,6 +12,7 @@ pub mod dry_run;
 pub mod expiry;
 pub mod feeds;
 pub mod inbox;
+pub mod linkedin_inbox;
 pub mod mail;
 pub mod mcp;
 pub mod media;

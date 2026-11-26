@@ -856,6 +856,10 @@ pub enum InboxError {
     YouTubeReconnect,
     /// YouTube refused the call, or could not be reached; what to tell a person.
     YouTube(String),
+    /// LinkedIn refused the Page's token or a permission is missing: connect the Page again.
+    LinkedInReconnect,
+    /// LinkedIn refused the call, or could not be reached; what to tell a person.
+    LinkedIn(String),
 }
 
 impl InboxError {
@@ -882,6 +886,8 @@ impl InboxError {
             Self::Threads(_) => "threads_failed",
             Self::YouTubeReconnect => "youtube_reconnect_required",
             Self::YouTube(_) => "youtube_failed",
+            Self::LinkedInReconnect => "linkedin_reconnect_required",
+            Self::LinkedIn(_) => "linkedin_failed",
         }
     }
 
@@ -939,6 +945,25 @@ impl InboxError {
                                                         not sent."
                     .into()
             }
+            Self::Invalid("linkedin_no_dm") => "LinkedIn gives apps no direct messages, so \
+                                                nothing was sent."
+                .into(),
+            Self::Invalid("linkedin_needs_approval") => {
+                crate::linkedin_inbox::Capability::NeedsApproval
+                    .message()
+                    .into()
+            }
+            Self::Invalid("linkedin_personal_profile") => {
+                crate::linkedin_inbox::Capability::PersonalProfile
+                    .message()
+                    .into()
+            }
+            Self::Invalid("linkedin_needs_scope") => crate::linkedin_inbox::Capability::NeedsScope
+                .message()
+                .into(),
+            Self::Invalid("linkedin_call_budget") => "This Page used the LinkedIn calls it may \
+                                                      make today. Try again tomorrow."
+                .into(),
             Self::Invalid("threads_no_dm") => "Threads has no direct messages, so nothing was \
                                                sent."
                 .into(),
@@ -994,6 +1019,10 @@ impl InboxError {
                                        missing. Connect the channel again under Accounts."
                 .into(),
             Self::YouTube(why) => why.clone(),
+            Self::LinkedInReconnect => "LinkedIn refused the Page's token or a permission is \
+                                        missing. Connect the Page again under Accounts."
+                .into(),
+            Self::LinkedIn(why) => why.clone(),
         }
     }
 }

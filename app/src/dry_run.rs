@@ -120,7 +120,9 @@ pub struct Outcome {
     /// live page: the automation does not run, so there are no steps), and the rules of
     /// `network_limits` for the account's network (`meta_one_private_reply`,
     /// `meta_reply_window`, `x_unsupported_trigger`, `bluesky_unsupported_trigger`,
-    /// `youtube_unsupported_trigger`, `youtube_no_dm`; the steps are
+    /// `youtube_unsupported_trigger`, `youtube_no_dm`, `linkedin_unsupported_trigger`,
+    /// `linkedin_no_dm`, `linkedin_no_hide`, and for a LinkedIn account that cannot read comments
+    /// yet `linkedin_needs_approval`, `linkedin_personal_profile` or `linkedin_needs_scope`; the steps are
     /// still listed, as a run would go as far as it can), and `paused` (the team paused its
     /// automations: no steps), and `no_ai_key`, `no_ai_credits` or `ai_failed` when a `question`
     /// condition could not be judged (no steps).
@@ -394,6 +396,14 @@ pub async fn test(
         Err(code) if code != "invalid_text" => out.blocks.push(code.into()),
         _ => {}
     }
+    // A LinkedIn account that cannot read comments yet (see `linkedin_inbox::capability`) would
+    // never see this one: the test still shows what a run would do, and says so.
+    if account.provider == "linkedin" {
+        let c = crate::linkedin_inbox::capability(app, account);
+        if c != crate::linkedin_inbox::Capability::Ready {
+            out.blocks.push(c.code().into());
+        }
+    }
     let parts = parts(actions, steps);
     let holds = |t: &str| t.contains("{page}");
     let needs_page = parts
@@ -628,6 +638,21 @@ async fn effect_step(
             None => step(kind, "would_do"),
         };
     }
+    // LinkedIn likes a comment as the Page; it cannot hide, repost or follow back.
+    if account.provider == "linkedin"
+        && matches!(
+            kind,
+            "hide_comment" | "like_comment" | "repost_comment" | "follow_back"
+        )
+    {
+        return match (kind, item.kind.as_str()) {
+            ("like_comment", "comment") => step(kind, "would_do"),
+            _ => PlannedStep {
+                reason: Some("not_supported".into()),
+                ..step(kind, "would_skip")
+            },
+        };
+    }
     // Threads hides a reply directly under our post, as a run does; it has no like for an app.
     if account.provider == "threads"
         && matches!(
@@ -688,6 +713,13 @@ async fn plan_send(
     (kind, via, template, ai, buttons): (&str, Via, &str, bool, &[Button]),
     (page, dm_open): (Option<&str>, bool),
 ) -> PlannedStep {
+    if via == Via::Dm && account.provider == "linkedin" {
+        // LinkedIn gives apps no messaging: only a public reply can answer a comment.
+        return PlannedStep {
+            reason: Some("linkedin_no_dm".into()),
+            ..step(kind, "would_skip")
+        };
+    }
     if via == Via::Dm && account.provider == "threads" {
         // Threads has no DM and no private reply: only a public reply can answer.
         return PlannedStep {

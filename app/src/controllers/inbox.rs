@@ -768,7 +768,14 @@ async fn checked(
     let found = social_accounts::Entity::find()
         .filter(social_accounts::Column::TeamId.eq(team_id))
         .filter(social_accounts::Column::Id.is_in(account_ids.iter().copied()))
-        .filter(social_accounts::Column::Provider.is_in(inbox::INBOX_PLATFORMS))
+        // A LinkedIn Page, not a personal profile (nothing can be read from one).
+        .filter(
+            sea_orm::Condition::any()
+                .add(social_accounts::Column::Provider.is_in(inbox::INBOX_PLATFORMS))
+                .add(sea_orm::sea_query::Expr::cust(
+                    "provider = 'linkedin' AND meta->>'organization' LIKE 'urn:li:organization:%'",
+                )),
+        )
         .count(db)
         .await?;
     if found != account_ids.len() as u64 {

@@ -43,13 +43,19 @@ async fn start(State(app): State<AppState>, t: Result<InTeam, Reply>) -> Respons
 
 /// The `meta` of an account: its refresh token sealed with `ENCRYPTION_KEY`, when it has one.
 fn meta_of(app: &AppState, token: &Token) -> serde_json::Value {
-    match &token.refresh_token {
-        Some(r) => {
-            let sealed = URL_SAFE_NO_PAD.encode(app.cipher.encrypt(r.as_bytes()));
-            serde_json::json!({ "refresh_token": sealed })
+    // The scopes LinkedIn says it granted: `linkedin_inbox::capability` reads them.
+    let mut meta = match &token.scope {
+        Some(s) => {
+            serde_json::json!({ "scopes": s.split([' ', ',']).filter(|s| !s.is_empty()).collect::<Vec<_>>() })
         }
         None => serde_json::json!({}),
+    };
+    if let Some(r) = &token.refresh_token {
+        meta["refresh_token"] = URL_SAFE_NO_PAD
+            .encode(app.cipher.encrypt(r.as_bytes()))
+            .into();
     }
+    meta
 }
 
 /// `GET /connect/linkedin/callback`: LinkedIn sends the browser here with `code` and `state`, or
@@ -201,7 +207,8 @@ pub async fn refresh_tokens(app: &AppState) -> Result<u64, DbErr> {
         };
         let stmt = Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "UPDATE social_accounts SET access_token = $2, meta = $5, \
+            "UPDATE social_accounts SET access_token = $2, \
+             meta = (meta - 'reconnect' - 'expiry_notice') || $5, \
              token_expires_at = now() + make_interval(secs => $3), updated_at = now() \
              WHERE id = $1 AND access_token = $4",
             [
