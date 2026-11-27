@@ -87,8 +87,8 @@ fn stagger(n: u32) -> Duration {
 const STAGGER_STEP: Duration = Duration::from_secs(2);
 const STAGGER_JOBS: u32 = 25;
 
-/// Starts the jobs; each first runs right away, so a restart also fails targets cut off
-/// mid-publish. Each runs under `every`, so a panic in a round does not end its job.
+/// Starts the jobs: the publish loop at once (a restart also fails targets cut off mid-publish),
+/// the others 2 seconds apart (`stagger`). Each runs under `every`, so a panic in a round does not end its job.
 pub fn spawn(app: AppState) {
     let min = Duration::from_secs(60);
     start(
