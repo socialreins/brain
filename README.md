@@ -927,6 +927,18 @@ mac = hmac.new(secret.encode(), f"{t}.".encode() + raw_body, hashlib.sha256).hex
 assert hmac.compare_digest(mac, v1) and abs(time.time() - int(t)) < 300
 ```
 
+## Inbox retention
+
+Inbox items are kept for `INBOX_RETENTION_DAYS` days (365 by default, `0` keeps everything). Once a
+day brain deletes the items created longer ago than that, 1000 rows a statement, each in its own
+short transaction under its own advisory lock, so a large delete never holds a long transaction
+and two instances never delete the same batch (a run that finds the lock held stops early and the
+other carries on). Only the items and what belongs to them go: their replies (`inbox_replies`),
+automation runs and automation misses cascade. Contacts and their tags, notes and opt-outs stay,
+as do posts and media, and the inbox lists and counts read whatever remains. Action history
+(`inbox_actions`) keeps its rows with the item unset. A person whose items all aged out is still
+a contact, with the profile of their newest item.
+
 ## Feeds
 
 A feed (`/v1/feeds`) is an RSS 2.0 or Atom URL whose new items become posts on their own. Every
@@ -1120,6 +1132,7 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | no | All or none. Keep post media in an S3-compatible bucket instead of `MEDIA_DIR`, path-style. Cloudflare R2: `S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com`; AWS S3: `https://s3.<region>.amazonaws.com` with `S3_REGION`. Files are written as multipart uploads, which brain aborts when a download fails; give the bucket a lifecycle rule that aborts incomplete multipart uploads after a day (R2 does so after 7 days by default) for the ones a restart cuts off |
 | `S3_REGION` | no | `auto` (what R2 wants) |
 | `MEDIA_MAX_BYTES` | no | `1073741824` (1 GiB), which is also the most. The largest video a post may carry, in bytes. Videos are streamed to and from storage, so this is disk or bucket space, not memory. It caps videos only, whatever its value: images and PDFs stay at 100 MB. A video over it is refused when the post is saved (`422 media_too_large` with `limit` and `actual`) where its server says its size, else when it publishes |
+| `INBOX_RETENTION_DAYS` | no | `365` (0 keeps every inbox item, else 1 to 3650). How long inbox items are kept: a daily job deletes items created longer ago than this, in batches of 1000, with their replies and automation runs. Contacts, their tags and notes, posts and media stay (see "Inbox retention") |
 | `CONTACT_TO` | no | Turn on `POST /v1/contact`, which mails each message to this address (Reply-To: the sender). Off when unset |
 
 ## App Review login

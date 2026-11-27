@@ -50,6 +50,10 @@ pub struct Config {
     /// the posts it is publishing (`publish::drain`). Set `RAILWAY_DEPLOYMENT_DRAINING_SECONDS`
     /// above it, or Railway kills the process first.
     pub publish_drain: std::time::Duration,
+    /// `INBOX_RETENTION_DAYS` (default 365, 0 keeps everything, else 1 to 3650): how long inbox
+    /// items are kept. The daily purge (`scheduler::purge_old_inbox_items`) deletes older ones
+    /// with their replies and automation runs; contacts, posts and media stay.
+    pub inbox_retention_days: i64,
     pub port: u16,
     pub cors_origins: Vec<HeaderValue>,
     /// `RAILWAY_GIT_COMMIT_SHA`, else `GIT_COMMIT` (baked into published images), else `dev`.
@@ -182,6 +186,7 @@ impl Config {
         )?;
         let publish_drain =
             std::time::Duration::from_secs(publish_drain(var("PUBLISH_DRAIN_SECONDS"))?);
+        let inbox_retention_days = inbox_retention_days(var("INBOX_RETENTION_DAYS"))?;
         let port = match var("PORT") {
             Some(p) => p.parse().map_err(|_| "PORT: not a port number")?,
             None => 8080,
@@ -242,6 +247,7 @@ impl Config {
             database_statement_timeout,
             database_idle_in_transaction_timeout,
             publish_drain,
+            inbox_retention_days,
             port,
             cors_origins: parse_origins(&origins)?,
             git_commit: var("RAILWAY_GIT_COMMIT_SHA")
@@ -396,6 +402,23 @@ fn publish_drain(value: Option<String>) -> Result<u64, String> {
         None => Ok(crate::publish::DRAIN.as_secs()),
         Some(Ok(n)) if (10..=3000).contains(&n) => Ok(n),
         Some(_) => Err("PUBLISH_DRAIN_SECONDS: a number from 10 to 3000".into()),
+    }
+}
+
+/// `INBOX_RETENTION_DAYS`'s default: a year of inbox history.
+const DEFAULT_INBOX_RETENTION_DAYS: i64 = 365;
+
+/// The most `INBOX_RETENTION_DAYS` may be: ten years.
+const MAX_INBOX_RETENTION_DAYS: i64 = 3650;
+
+/// `INBOX_RETENTION_DAYS`: 0 (keep everything) to 3650, default 365.
+fn inbox_retention_days(value: Option<String>) -> Result<i64, String> {
+    match value.map(|v| v.trim().parse::<i64>()) {
+        None => Ok(DEFAULT_INBOX_RETENTION_DAYS),
+        Some(Ok(n)) if (0..=MAX_INBOX_RETENTION_DAYS).contains(&n) => Ok(n),
+        Some(_) => {
+            Err("INBOX_RETENTION_DAYS: a number of days from 0 to 3650, 0 keeps everything".into())
+        }
     }
 }
 
@@ -558,6 +581,18 @@ mod tests {
         assert_eq!(drain(" 540 "), Ok(540));
         for bad in ["9", "3001", "-1", "soon", ""] {
             assert!(drain(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn inbox_retention_is_a_year_by_default_and_zero_keeps_everything() {
+        let days = |v: &str| super::inbox_retention_days(Some(v.into()));
+        assert_eq!(super::inbox_retention_days(None), Ok(365));
+        assert_eq!(days("0"), Ok(0));
+        assert_eq!(days(" 30 "), Ok(30));
+        assert_eq!(days("3650"), Ok(3650));
+        for bad in ["-1", "3651", "soon", ""] {
+            assert!(days(bad).is_err(), "{bad}");
         }
     }
 

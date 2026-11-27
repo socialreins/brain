@@ -247,6 +247,14 @@ cargo run -p socialreins-brain
   remove a person's data; items outlive a deleted contact with `contact_id` null.
   Session only, like the inbox. `inbox_items.assigned_to` is set under a share lock of the
   member's `team_user` row, and `teams::change_member` clears it after deleting that row.
+- `INBOX_RETENTION_DAYS` (default 365, 0 keeps every item, else 1 to 3650): the daily job
+  `scheduler::purge_old_inbox_items` deletes `inbox_items` created before now minus the window,
+  1000 rows a statement, each in its own short transaction under its own advisory lock (two
+  instances never delete the same batch; one that finds the lock held stops early and the other
+  carries on). Replies, `automation_runs` and `automation_misses` go with the item by cascade;
+  contacts (with their tags, notes and opt-outs), posts and media stay, and inbox lists and
+  counts read what remains. `inbox_actions` keeps its rows with the item unset.
+  `inbox_items_created_idx` serves the delete.
 - `app/src/broadcasts.rs` and `controllers/broadcasts.rs`: broadcasts, one DM to every reachable
   contact with a tag (owners and admins write, session only). `ROUTE` is the one place that says
   who is reachable and through which item: never opted out (`contact_opt_outs`, a row per team,
