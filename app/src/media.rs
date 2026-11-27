@@ -477,14 +477,21 @@ impl Media {
 
     /// Deletes the uploads at least `hours` old that no post of their team still needs (one
     /// not published yet, or published with a target that failed and may be retried), and
-    /// uploads still in progress after `PENDING_HOURS` (a restart or a lost request). Each row
-    /// goes in its own transaction: locked first, so a post being saved with it (which holds it
-    /// `FOR SHARE`) commits before the re-check. The file goes after the row; one that will not
-    /// go is an orphan for `release_orphans`. Returns how many went.
-    pub async fn release_uploads(&self, db: &DatabaseConnection, hours: i32) -> Result<u64, DbErr> {
+    /// uploads still in progress after `PENDING_HOURS` (a restart or a lost request). With
+    /// `billing` on, the old uploads of a team whose live plan ended go too: nothing of that
+    /// team will publish until it pays (`publish::claim`). Each row goes in its own
+    /// transaction: locked first, so a post being saved with it (which holds it `FOR SHARE`)
+    /// commits before the re-check. The file goes after the row; one that will not go is an
+    /// orphan for `release_orphans`. Returns how many went.
+    pub async fn release_uploads(
+        &self,
+        db: &DatabaseConnection,
+        hours: i32,
+        billing: bool,
+    ) -> Result<u64, DbErr> {
         let stmt = sql(
             &format!("SELECT u.id FROM media_uploads u WHERE {RELEASABLE} LIMIT 1000"),
-            vec![hours.into(), PENDING_HOURS.into()],
+            vec![hours.into(), PENDING_HOURS.into(), billing.into()],
         );
         let mut gone = 0;
         for row in db.query_all_raw(stmt).await? {
@@ -497,10 +504,15 @@ impl Media {
             txn.query_one_raw(lock).await?;
             let stmt = sql(
                 &format!(
-                    "DELETE FROM media_uploads u WHERE u.id = $3 AND ({RELEASABLE}) \
+                    "DELETE FROM media_uploads u WHERE u.id = $4 AND ({RELEASABLE}) \
                      RETURNING storage_key"
                 ),
-                vec![hours.into(), PENDING_HOURS.into(), id.into()],
+                vec![
+                    hours.into(),
+                    PENDING_HOURS.into(),
+                    billing.into(),
+                    id.into(),
+                ],
             );
             let deleted = txn.query_one_raw(stmt).await?;
             txn.commit().await?;
@@ -1192,7 +1204,10 @@ pub async fn sweep(app: &AppState) -> Result<u64, DbErr> {
         return Ok(0);
     }
     let mut gone = app.media.release(&app.db, None, SWEEP_DAYS).await?;
-    gone += app.media.release_uploads(&app.db, UPLOAD_HOURS).await?;
+    gone += app
+        .media
+        .release_uploads(&app.db, UPLOAD_HOURS, app.billing_enabled)
+        .await?;
     gone += app.media.release_orphans(&app.db, TEMP_AGE).await?;
     if let Some(dir) = app.media.dir.clone() {
         let swept = tokio::task::spawn_blocking(move || sweep_temp(&dir, TEMP_AGE));
@@ -1225,13 +1240,17 @@ pub const PENDING_HOURS: i32 = 6;
 
 /// Which uploads `release_uploads` deletes, of `u`: `$1` hours old and needed by no post, or
 /// in progress for `$2` hours. A post names an upload by its exact link (`uploads::foreign`
-/// refuses any other spelling), so its sealed token is in the post's text as is.
+/// refuses any other spelling), so its sealed token is in the post's text as is. `$3` is
+/// billing on: an upload older than `$1` whose team has no live plan goes too, since no post of
+/// that team will publish until it pays. The statuses are `billing::live`'s.
 const RELEASABLE: &str = "(NOT u.pending AND u.created_at <= now() - make_interval(hours => $1) \
-   AND NOT EXISTS (SELECT 1 FROM posts p WHERE p.team_id = u.team_id \
+   AND (NOT EXISTS (SELECT 1 FROM posts p WHERE p.team_id = u.team_id \
      AND (p.status NOT IN ('published', 'deleted') OR EXISTS (SELECT 1 FROM post_targets t \
        WHERE t.post_id = p.id AND t.status = 'failed')) \
      AND strpos(p.media::text || p.thread::text || coalesce(p.cover, ''), \
-       split_part(split_part(u.url, '/media/', 2), '.', 1)) > 0)) \
+       split_part(split_part(u.url, '/media/', 2), '.', 1)) > 0) \
+     OR ($3 AND NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.team_id = u.team_id \
+       AND s.status IN ('trialing', 'active', 'past_due'))))) \
  OR (u.pending AND u.created_at <= now() - make_interval(hours => $2))";
 
 /// A temp file on local disk this old belongs to no download still running: several times
