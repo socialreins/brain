@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc, Weekday};
 use chrono_tz::Asia::Dhaka;
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement, Value};
+use uuid::Uuid;
 
 use crate::{expiry::label, post_mail, rate_limit, state::AppState};
 
@@ -69,6 +70,10 @@ struct Facts {
     /// that were already spent (`credit_takebacks`).
     takebacks: (i64, i64, i64),
     backup: Backup,
+    /// `None` when there is nothing to check (billing off); else the team (slug, code, or
+    /// "unknown team") and what differs for each mismatch with Stripe, or why Stripe could not
+    /// be read (`stripe_check`).
+    stripe: Option<Result<Vec<(String, String)>, String>>,
 }
 
 impl Facts {
@@ -95,6 +100,10 @@ impl Facts {
             || self.signin_failed > 0
             || self.takebacks.0 > 0
             || self.backup_bad()
+            || self
+                .stripe
+                .as_ref()
+                .is_some_and(|s| s.as_ref().map_or(true, |m| !m.is_empty()))
     }
 }
 
@@ -259,7 +268,47 @@ async fn collect(app: &AppState, from: DateTime<Utc>, now: DateTime<Utc>) -> Res
         signin_failed,
         takebacks,
         backup: backup(app, now).await,
+        stripe: stripe(app).await,
     })
+}
+
+/// `stripe_check::check` with each team named by its slug (or code). A mismatch is also logged.
+async fn stripe(app: &AppState) -> Option<Result<Vec<(String, String)>, String>> {
+    let found = match crate::stripe_check::check(app).await? {
+        Ok(found) => found,
+        Err(why) => {
+            tracing::warn!(why, "stripe check failed");
+            return Some(Err(why));
+        }
+    };
+    let ids: Vec<Uuid> = found.iter().filter_map(|m| m.team).collect();
+    let mut names: BTreeMap<Uuid, String> = BTreeMap::new();
+    let rows = app
+        .db
+        .query_all_raw(sql(
+            "SELECT id, COALESCE(slug, code) AS team FROM teams WHERE id = ANY($1)",
+            vec![ids.into()],
+        ))
+        .await;
+    for r in rows.unwrap_or_default() {
+        if let (Ok(id), Ok(team)) = (r.try_get("", "id"), r.try_get("", "team")) {
+            names.insert(id, team);
+        }
+    }
+    let named = |t: Option<Uuid>| t.and_then(|t| names.get(&t).cloned());
+    let lines: Vec<(String, String)> = found
+        .into_iter()
+        .map(|m| {
+            (
+                named(m.team).unwrap_or_else(|| "unknown team".into()),
+                m.what,
+            )
+        })
+        .collect();
+    for (team, what) in &lines {
+        tracing::warn!(team, what, "stripe mismatch");
+    }
+    Some(Ok(lines))
 }
 
 async fn backup(app: &AppState, now: DateTime<Utc>) -> Backup {
@@ -437,6 +486,17 @@ fn compose(facts: &Facts, day: &str) -> (String, String) {
     lines.push(format!("Accounts to reconnect: {}", facts.reconnect));
     lines.push(format!("X inboxes paused after errors: {}", facts.x_paused));
     lines.push(format!("Sign-in mails failed ({})", facts.signin_failed));
+    match &facts.stripe {
+        None => {}
+        Some(Err(why)) => lines.push(format!("Stripe mismatches: not checked, {why}")),
+        Some(Ok(found)) => {
+            lines.push(format!("Stripe mismatches: {}", found.len()));
+            lines.extend(found.iter().take(TEAMS).map(|(t, w)| format!("- {t}: {w}")));
+            if found.len() > TEAMS {
+                lines.push(format!("- and {} more", found.len() - TEAMS));
+            }
+        }
+    }
     let (n, taken, short) = facts.takebacks;
     lines.push(format!(
         "Credit pack refunds or disputes: {n} ({taken} credits taken back, {short} already spent)"
@@ -458,6 +518,11 @@ fn compose(facts: &Facts, day: &str) -> (String, String) {
     }
     if facts.signin_failed > 0 {
         flags.push(format!("{} sign-in mails failed", facts.signin_failed));
+    }
+    match &facts.stripe {
+        Some(Ok(found)) if !found.is_empty() => flags.push(format!("{} Stripe", found.len())),
+        Some(Err(_)) => flags.push("Stripe unread".into()),
+        _ => {}
     }
     if facts.backup_bad() {
         flags.push("backup".into());
@@ -514,6 +579,10 @@ mod tests {
             signin_failed: 3,
             takebacks: (0, 0, 0),
             backup: Backup::Age(Duration::minutes(200)),
+            stripe: Some(Ok(vec![(
+                "acme".into(),
+                "Stripe has it active, brain has canceled".into(),
+            )])),
         };
         facts.counts.insert(("failed".into(), "x".into()), 2);
         facts.counts.insert(("failed".into(), "bluesky".into()), 1);
@@ -521,7 +590,7 @@ mod tests {
         let (subject, text) = compose(&facts, "2026-11-27");
         assert_eq!(
             subject,
-            "SocialReins digest 2026-11-27: 4 posts not out, 1 stuck, 2 to reconnect, 3 sign-in mails failed"
+            "SocialReins digest 2026-11-27: 4 posts not out, 1 stuck, 2 to reconnect, 3 sign-in mails failed, 1 Stripe"
         );
         assert!(text.contains("Failed: 3 (Bluesky 1, X 2)"), "{text}");
         assert!(
@@ -537,6 +606,11 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("STALE"));
+        assert!(text.contains("Stripe mismatches: 1"), "{text}");
+        assert!(
+            text.contains("- acme: Stripe has it active, brain has canceled"),
+            "{text}"
+        );
         facts.backup = Backup::Age(Duration::hours(8));
         assert!(compose(&facts, "d").1.contains("STALE"));
         facts.backup = Backup::Unreadable;
@@ -551,6 +625,7 @@ mod tests {
             x_paused: 0,
             signin_failed: 0,
             takebacks: (2, 130, 70),
+            stripe: None,
             backup: Backup::Age(Duration::minutes(10)),
         };
         let (subject, text) = compose(&quiet, "2026-11-27");
