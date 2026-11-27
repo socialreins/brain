@@ -247,7 +247,6 @@ pub const NOT_EXPORTED: &[&str] = &[
     "team_ai_keys",
     "team_invitations",
     "team_slug_history",
-    "team_slug_holds",
     "team_user",
     "trial_uses",
     "webhook_deliveries",
