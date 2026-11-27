@@ -184,6 +184,33 @@ pub async fn daily_refund(db: &DatabaseConnection, ids: &[i64]) {
     }
 }
 
+/// Counts one event in `bucket` with no cap, to be counted later (`count_since`): a hit nobody
+/// gives back. Logged, not returned: losing a count must not fail what it describes.
+pub async fn note(db: &DatabaseConnection, bucket: &str) {
+    let sql = "INSERT INTO rate_limit_hits (bucket) VALUES ($1)";
+    if let Err(e) = db.execute_raw(bind(sql, bucket)).await {
+        tracing::warn!(error = %e, bucket, "event not counted");
+    }
+}
+
+/// Hits in `bucket` made from `from` up to `to` (they are kept a day, `prune_daily`).
+pub async fn count_since(
+    db: &DatabaseConnection,
+    bucket: &str,
+    (from, to): (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
+) -> Result<i64, DbErr> {
+    let stmt = Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT count(*) AS n FROM rate_limit_hits WHERE bucket = $1 \
+         AND created_at >= $2 AND created_at < $3",
+        [bucket.to_owned().into(), from.into(), to.into()],
+    );
+    match db.query_one_raw(stmt).await? {
+        Some(row) => row.try_get("", "n"),
+        None => Ok(0),
+    }
+}
+
 /// Deletes day-old hits, at most once an hour per process, outside any caller's transaction.
 async fn prune_daily(db: &DatabaseConnection) {
     let now = chrono::Utc::now().timestamp();

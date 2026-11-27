@@ -199,10 +199,14 @@ async fn send_link(
             "Here is your sign-in link for SocialReins.\n\nSign in to SocialReins:\n\n{url}\n\nIt works once and expires in \
              {LINK_MINUTES} minutes. If you did not ask for it, ignore this email.\n"
         );
-        app.mailer
+        if let Err(e) = app
+            .mailer
             .send(&email, "Your sign-in link", text, &app.web_url)
             .await
-            .map_err(|e| format!("mail: {e}"))?;
+        {
+            rate_limit::note(&app.db, crate::mail::SIGNIN_FAILED).await;
+            return Err(format!("mail: {e}"));
+        }
         Ok(true)
     }
     .await;
@@ -231,15 +235,20 @@ async fn send_no_account_notice(app: &AppState, email: &str) -> Result<(), Strin
          Create an account:\n\n{}/signup\n\nIf this was not you, ignore this email.\n",
         app.web_url
     );
-    app.mailer
+    let sent = app
+        .mailer
         .send(
             email,
             "No SocialReins account for this email",
             text,
             &app.web_url,
         )
-        .await
-        .map_err(|e| format!("mail: {e}"))
+        .await;
+    if let Err(e) = sent {
+        rate_limit::note(&app.db, crate::mail::SIGNIN_FAILED).await;
+        return Err(format!("mail: {e}"));
+    }
+    Ok(())
 }
 
 /// Stores a new link unless `email` already holds `MAX_LIVE_LINKS` unexpired ones, which caps

@@ -64,6 +64,8 @@ struct Facts {
     stuck: i64,
     reconnect: i64,
     x_paused: i64,
+    /// Sign-in mails (links, no-account notices) that could not be sent (`mail::SIGNIN_FAILED`).
+    signin_failed: i64,
     /// Refunds and disputes of credit packs in the window, the credits taken back and the credits
     /// that were already spent (`credit_takebacks`).
     takebacks: (i64, i64, i64),
@@ -95,6 +97,7 @@ impl Facts {
             || self.stuck > 0
             || self.reconnect > 0
             || self.x_paused > 0
+            || self.signin_failed > 0
             || self.takebacks.0 > 0
             || self.backup_bad()
             || self
@@ -237,6 +240,8 @@ async fn collect(app: &AppState, from: DateTime<Utc>, now: DateTime<Utc>) -> Res
         vec![],
     ))
     .await?;
+    let signin_failed =
+        rate_limit::count_since(db, crate::mail::SIGNIN_FAILED, (from, now)).await?;
     let row = db
         .query_one_raw(sql(
             "SELECT count(*) AS n, COALESCE(sum(taken), 0)::bigint AS taken, \
@@ -260,6 +265,7 @@ async fn collect(app: &AppState, from: DateTime<Utc>, now: DateTime<Utc>) -> Res
         stuck,
         reconnect,
         x_paused,
+        signin_failed,
         takebacks,
         backup: backup(app, now).await,
         stripe: stripe(app).await,
@@ -479,6 +485,7 @@ fn compose(facts: &Facts, day: &str) -> (String, String) {
     ));
     lines.push(format!("Accounts to reconnect: {}", facts.reconnect));
     lines.push(format!("X inboxes paused after errors: {}", facts.x_paused));
+    lines.push(format!("Sign-in mails failed ({})", facts.signin_failed));
     match &facts.stripe {
         None => {}
         Some(Err(why)) => lines.push(format!("Stripe mismatches: not checked, {why}")),
@@ -508,6 +515,9 @@ fn compose(facts: &Facts, day: &str) -> (String, String) {
     }
     if facts.reconnect > 0 {
         flags.push(format!("{} to reconnect", facts.reconnect));
+    }
+    if facts.signin_failed > 0 {
+        flags.push(format!("{} sign-in mails failed", facts.signin_failed));
     }
     match &facts.stripe {
         Some(Ok(found)) if !found.is_empty() => flags.push(format!("{} Stripe", found.len())),
@@ -566,6 +576,7 @@ mod tests {
             stuck: 1,
             reconnect: 2,
             x_paused: 0,
+            signin_failed: 3,
             takebacks: (0, 0, 0),
             backup: Backup::Age(Duration::minutes(200)),
             stripe: Some(Ok(vec![(
@@ -579,7 +590,7 @@ mod tests {
         let (subject, text) = compose(&facts, "2026-11-27");
         assert_eq!(
             subject,
-            "SocialReins digest 2026-11-27: 4 posts not out, 1 stuck, 2 to reconnect, 1 Stripe"
+            "SocialReins digest 2026-11-27: 4 posts not out, 1 stuck, 2 to reconnect, 3 sign-in mails failed, 1 Stripe"
         );
         assert!(text.contains("Failed: 3 (Bluesky 1, X 2)"), "{text}");
         assert!(
@@ -587,6 +598,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("- 3 x Timed out"), "{text}");
+        assert!(text.contains("Sign-in mails failed (3)"), "{text}");
         assert!(text.contains("- acme: #7, #3"), "{text}");
         assert!(text.contains("Publishing for over 15 minutes: 1"), "{text}");
         assert!(
@@ -611,6 +623,7 @@ mod tests {
             stuck: 0,
             reconnect: 0,
             x_paused: 0,
+            signin_failed: 0,
             takebacks: (2, 130, 70),
             stripe: None,
             backup: Backup::Age(Duration::minutes(10)),
