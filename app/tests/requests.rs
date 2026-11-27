@@ -10823,7 +10823,7 @@ mod teams {
                             "INSERT INTO credit_takebacks (event_id, team_id, payment_intent, kind, \
                              owed, taken, created_at) VALUES ('evt_digest_{run}', '{team_id}', \
                              'pi_digest_{run}', 'dispute', 100, 30, '2026-11-26T20:00:00Z')",
-                            run = *RUN
+                            run = uuid::Uuid::now_v7().simple()
                         ),
                     )
                     .await;
