@@ -25,8 +25,8 @@ use uuid::Uuid;
 
 #[derive(Default)]
 struct Mock {
-    /// Every call: method, status asked, `starting_after`.
-    calls: Mutex<Vec<(String, String, String)>>,
+    /// Every call: method and `starting_after`.
+    calls: Mutex<Vec<(String, String)>>,
     subs: Mutex<Vec<Value>>,
     refuse: Mutex<bool>,
 }
@@ -40,16 +40,13 @@ async fn list(
     m.calls
         .lock()
         .unwrap()
-        .push((method.to_string(), get("status"), get("starting_after")));
+        .push((method.to_string(), get("starting_after")));
     if *m.refuse.lock().unwrap() {
         let body = json!({"error": {"code": "api_key_expired"}});
         return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
     }
     let subs = m.subs.lock().unwrap();
-    let all: Vec<&Value> = subs
-        .iter()
-        .filter(|s| s["status"] == get("status"))
-        .collect();
+    let all: Vec<&Value> = subs.iter().collect();
     let from = all
         .iter()
         .position(|s| s["id"] == get("starting_after"))
@@ -148,13 +145,13 @@ async fn it_lists_pages_and_only_reads() {
     *m.subs.lock().unwrap() = (0..230)
         .map(|i| sub(&format!("sub_{i:03}"), "active", "price_s", None, 500))
         .collect();
-    let all = stripe_at(&base).subscriptions("active").await.unwrap();
+    let all = stripe_at(&base).subscriptions().await.unwrap();
     assert_eq!(all.len(), 230);
     assert_eq!(all[229]["id"], "sub_229");
     let calls = m.calls.lock().unwrap();
     assert_eq!(calls.len(), 3, "three pages of 100");
-    assert_eq!(calls[1].2, "sub_099");
-    assert!(calls.iter().all(|c| c.0 == "GET" && c.1 == "active"));
+    assert_eq!(calls[1].1, "sub_099");
+    assert!(calls.iter().all(|c| c.0 == "GET"));
 }
 
 #[tokio::test]
@@ -162,21 +159,40 @@ async fn it_lists_pages_and_only_reads() {
 async fn each_difference_is_found_and_nothing_is_written() {
     let (m, base) = mock().await;
     let app = state(&base, true).await;
+    // What an earlier run of this test left.
+    app.db
+        .execute_unprepared(
+            "DELETE FROM subscriptions WHERE provider_subscription_id LIKE 'sub_chk_%'",
+        )
+        .await
+        .unwrap();
     let (same, status, gone, fresh, plan) = (
-        team(&app, Some(("sub_same", "active", "scheduler", 500))).await,
-        team(&app, Some(("sub_status", "active", "scheduler", 500))).await,
-        team(&app, Some(("sub_gone", "past_due", "scheduler", 500))).await,
-        team(&app, Some(("sub_fresh", "active", "scheduler", 3))).await,
-        team(&app, Some(("sub_plan", "trialing", "scheduler", 500))).await,
+        team(&app, Some(("sub_chk_same", "active", "scheduler", 500))).await,
+        team(&app, Some(("sub_chk_status", "active", "scheduler", 500))).await,
+        team(&app, Some(("sub_chk_gone", "past_due", "scheduler", 500))).await,
+        team(&app, Some(("sub_chk_fresh", "active", "scheduler", 3))).await,
+        team(&app, Some(("sub_chk_plan", "trialing", "scheduler", 500))).await,
     );
     let unbooked = team(&app, None).await;
+    let trial = team(&app, Some(("sub_chk_trial", "trialing", "scheduler", 500))).await;
+    let over = team(&app, None).await;
     *m.subs.lock().unwrap() = vec![
-        sub("sub_same", "active", "price_s", Some(same), 500),
-        sub("sub_status", "trialing", "price_s", Some(status), 500),
-        sub("sub_plan", "trialing", "price_ay", Some(plan), 500),
-        sub("sub_unbooked", "active", "price_a", Some(unbooked), 500),
+        sub("sub_chk_same", "active", "price_s", Some(same), 500),
+        sub("sub_chk_status", "trialing", "price_s", Some(status), 500),
+        sub("sub_chk_plan", "trialing", "price_ay", Some(plan), 500),
+        sub("sub_chk_unbooked", "active", "price_a", Some(unbooked), 500),
         // Made a minute ago: its webhook may still be on the way.
-        sub("sub_new", "active", "price_s", Some(Uuid::now_v7()), 1),
+        sub("sub_chk_new", "active", "price_s", Some(Uuid::now_v7()), 1),
+        // Another product on the same Stripe account: no team, no price of ours.
+        sub("sub_chk_other", "active", "price_other", None, 500),
+        // A trial that ended five minutes ago: Stripe moved it, the webhook may be coming.
+        {
+            let mut v = sub("sub_chk_trial", "active", "price_s", Some(trial), 5000);
+            v["trial_end"] = json!(Utc::now().timestamp() - 300);
+            v
+        },
+        // One that is over is not live whatever it says.
+        sub("sub_chk_over", "unpaid", "price_s", Some(over), 500),
     ];
     let before: i64 = rows(&app).await;
     let found = stripe_check::check(&app).await.unwrap().unwrap();
@@ -190,6 +206,8 @@ async fn each_difference_is_found_and_nothing_is_written() {
         ["brain has it past_due, Stripe has none live"]
     );
     assert!(said(&found, fresh).is_empty(), "changed 3 minutes ago");
+    assert!(said(&found, trial).is_empty(), "trial ended 5 minutes ago");
+    assert!(said(&found, over).is_empty(), "unpaid is not live");
     assert_eq!(
         said(&found, plan),
         ["Stripe has plan automation, brain has scheduler"]
@@ -202,8 +220,7 @@ async fn each_difference_is_found_and_nothing_is_written() {
     assert_eq!(rows(&app).await, before, "nothing is written");
     let calls = m.calls.lock().unwrap();
     assert!(calls.iter().all(|c| c.0 == "GET"));
-    let asked: Vec<&str> = calls.iter().map(|c| c.1.as_str()).collect();
-    assert_eq!(asked, ["active", "trialing", "past_due"]);
+    assert_eq!(calls.len(), 1, "one list, not one a status");
 }
 
 async fn rows(app: &AppState) -> i64 {

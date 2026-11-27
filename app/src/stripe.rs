@@ -198,14 +198,13 @@ impl Stripe {
         ))
     }
 
-    /// The subscriptions Stripe holds in `status`, at most `LIST_PAGES` pages of 100. Read only.
-    pub async fn subscriptions(&self, status: &str) -> Result<Vec<Value>, StripeError> {
+    /// Every subscription Stripe still holds (the ended ones are left out by Stripe: `active`,
+    /// `trialing`, `past_due`, `unpaid`, `paused`, `incomplete`), at most `LIST_PAGES` pages of
+    /// 100. Read only.
+    pub async fn subscriptions(&self) -> Result<Vec<Value>, StripeError> {
         let mut out: Vec<Value> = Vec::new();
         for _ in 0..LIST_PAGES {
-            let mut query = vec![
-                ("status".to_owned(), status.to_owned()),
-                ("limit".to_owned(), "100".to_owned()),
-            ];
+            let mut query = vec![("limit".to_owned(), "100".to_owned())];
             if let Some(last) = out.last().and_then(|s| s["id"].as_str()) {
                 query.push(("starting_after".to_owned(), last.to_owned()));
             }

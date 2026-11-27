@@ -5,8 +5,11 @@
 //! becomes a line of "Stripe mismatches": the team's slug and what differs, never an id, an
 //! email or a card. Nothing is written or repaired here: resending the event from the Stripe
 //! dashboard is the mend. Does nothing without `BILLING_ENABLED` and a Stripe key.
-//! shortcut: a subscription changed in the last `GRACE_MINUTES` is left out (the webhook may be
-//! on its way), and a mismatch that appears and mends inside a day is not seen.
+//! shortcut: a subscription made or moved in the last `GRACE_MINUTES` is left out (the webhook
+//! may be on its way; Stripe has no "updated" time, so it is read from the creation, trial end,
+//! cancellation and period start), a Stripe-side cancellation that happened minutes before the
+//! check shows as "brain has it live, Stripe has none" until the webhook lands (the next day's
+//! digest no longer lists it), and a mismatch that appears and mends inside a day is not seen.
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
@@ -29,7 +32,9 @@ pub struct Remote {
     pub plan: Option<String>,
     /// The team brain put in its metadata.
     pub team: Option<Uuid>,
-    pub created: DateTime<Utc>,
+    /// When it was made or last moved on its own (a trial that ended, a cancellation, a new
+    /// period): the webhook for that may not have come yet.
+    pub changed: DateTime<Utc>,
 }
 
 /// A row of `subscriptions` that came from Stripe.
@@ -55,7 +60,7 @@ pub fn compare(remote: &[Remote], local: &[Local], now: DateTime<Utc>) -> Vec<Mi
     let by_id: HashMap<&str, &Local> = local.iter().map(|l| (l.id.as_str(), l)).collect();
     let live: HashSet<&str> = remote.iter().map(|r| r.id.as_str()).collect();
     let mut out = Vec::new();
-    for r in remote.iter().filter(|r| r.created < recent) {
+    for r in remote.iter().filter(|r| r.changed < recent) {
         let word = |what: String| Mismatch { team: r.team, what };
         match by_id.get(r.id.as_str()) {
             None => out.push(word(format!(
@@ -91,8 +96,24 @@ pub fn compare(remote: &[Remote], local: &[Local], now: DateTime<Utc>) -> Vec<Mi
     out
 }
 
-fn remote_of(app: &AppState, v: &serde_json::Value) -> Option<Remote> {
-    Some(Remote {
+/// `None` for a subscription that is not ours: no team in its metadata and no price of ours
+/// (another product on the same Stripe account, or one made by hand), which the webhook
+/// ignores as well.
+fn remote_of(app: &AppState, v: &serde_json::Value, now: DateTime<Utc>) -> Option<Remote> {
+    let at = |x: &serde_json::Value| x.as_i64().and_then(|t| DateTime::from_timestamp(t, 0));
+    let item = &v["items"]["data"][0];
+    // A moment in the past; one still to come (a trial's end) has not changed anything yet.
+    let changed = [
+        "created",
+        "trial_end",
+        "canceled_at",
+        "current_period_start",
+    ]
+    .iter()
+    .filter_map(|k| at(&v[*k]).or_else(|| at(&item[*k])))
+    .filter(|t| *t <= now)
+    .max()?;
+    let remote = Remote {
         id: v["id"].as_str()?.to_owned(),
         status: v["status"].as_str()?.to_owned(),
         plan: v["items"]["data"][0]["price"]["id"]
@@ -102,8 +123,9 @@ fn remote_of(app: &AppState, v: &serde_json::Value) -> Option<Remote> {
         team: v["metadata"]["team_id"]
             .as_str()
             .and_then(|t| t.parse().ok()),
-        created: DateTime::from_timestamp(v["created"].as_i64()?, 0)?,
-    })
+        changed,
+    };
+    (remote.plan.is_some() || remote.team.is_some()).then_some(remote)
 }
 
 async fn locals(app: &AppState) -> Result<Vec<Local>, DbErr> {
@@ -140,14 +162,18 @@ pub async fn check(app: &AppState) -> Option<Result<Vec<Mismatch>, String>> {
 
 async fn read(app: &AppState) -> Result<Vec<Mismatch>, String> {
     let mut remote = Vec::new();
-    for status in STATES {
-        let page = app
-            .stripe
-            .subscriptions(status)
-            .await
-            .map_err(|e| format!("Stripe could not be read ({})", e.1))?;
-        remote.extend(page.iter().filter_map(|v| remote_of(app, v)));
-    }
+    // One list, so a subscription that changes state meanwhile is read once, not twice or never.
+    let all = app
+        .stripe
+        .subscriptions()
+        .await
+        .map_err(|e| format!("Stripe could not be read ({})", e.1))?;
+    let now = Utc::now();
+    remote.extend(
+        all.iter()
+            .filter_map(|v| remote_of(app, v, now))
+            .filter(|r| STATES.contains(&r.status.as_str())),
+    );
     let local = locals(app)
         .await
         .map_err(|_| "the database could not be read".to_owned())?;
@@ -168,7 +194,7 @@ mod tests {
             status: status.into(),
             plan: Some(plan.into()),
             team: Some(team),
-            created: at(age),
+            changed: at(age),
         }
     }
 
