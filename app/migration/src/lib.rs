@@ -105,6 +105,7 @@ mod m20270119_000001_team_storage_budget;
 mod m20270120_000001_trial_card;
 mod m20270121_000001_rate_limit_windows;
 mod m20270122_000001_idempotency_secret_rows;
+mod m20270124_000001_post_events;
 mod url_numbers;
 
 pub struct Migrator;
@@ -218,6 +219,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20270120_000001_trial_card::Migration),
             Box::new(m20270121_000001_rate_limit_windows::Migration),
             Box::new(m20270122_000001_idempotency_secret_rows::Migration),
+            Box::new(m20270124_000001_post_events::Migration),
             // inject-above (do not remove this comment)
         ]
     }

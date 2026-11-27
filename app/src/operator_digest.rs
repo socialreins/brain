@@ -340,7 +340,7 @@ fn reasons_of(error: &str) -> Vec<String> {
 /// follows `=`, `Bearer` or `Basic`.
 /// shortcut: a provider error that quotes a post or an account's display name is only cut
 /// short; move to fixed reason codes if one does.
-fn clean(text: &str) -> String {
+pub(crate) fn clean(text: &str) -> String {
     let run = |c: char| c.is_alphanumeric() || "_-.+/~%|@".contains(c);
     let chars: Vec<char> = text.chars().collect();
     // `value`: the next word is a secret (after `=`, `Bearer` or `Basic`), and all of it up to

@@ -148,6 +148,17 @@ cargo run -p socialreins-brain
   for being late, queues a `post_notices` row in the same transaction; each publish round mails
   the queued ones in the background to the post's author and the team's owners, once, at most
   10 a team a day (`rate_limit::daily_reserve`).
+- `app/src/post_events.rs`: a post's real timeline (`post_events`), written where the publisher
+  already acts: `target_claimed` and `attempt_started` (with its number) when a target is
+  claimed, `published` (with the platform's id), `failed` (with the error), `retry_scheduled`
+  (with the time), `late_to_draft`, `taken_down`, `comment_posted`, `comment_failed`,
+  `cover_set` and `cover_failed`. That list is the whole list: keep it small, and a new kind is
+  a migration and a line here. `detail` is our own words or a code, never post text, a URL with
+  a query or a token: it goes through `operator_digest::clean` (`note`; `note_code` only for our
+  own ids such as a platform post id, which stripping would mangle). Writing is best effort, so
+  a failed insert never fails the publish step. `GET /v1/posts/{id}/events` is any member of the
+  team's, newest first, `limit` (1 to 200, 50 by default) and an opaque `cursor`; another team's
+  post is a `404`. Rows go with their post (and their target) by cascade, so no purge of its own.
 - `app/src/publish.rs`: a post's `first_comment` (Facebook, Instagram, LinkedIn, YouTube) goes out
   once, after its target is saved as `published`: `post_targets.comment_status` is claimed
   (`posting`) before the call and never reset, so it is never retried; a failure only sets
