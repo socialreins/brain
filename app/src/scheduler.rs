@@ -1,5 +1,5 @@
 //! Background jobs, in process: publishing due posts and reading inboxes (then running
-//! automations), taking up waiting automation flows, sending broadcasts, sending newsletters and sending webhooks every minute, mailing the operator digest daily, (the old app ran every 5), purging expired sessions and sign-in links daily, and purging deleted
+//! automations), taking up waiting automation flows, sending broadcasts, sending newsletters and sending webhooks every minute, mailing the operator digest daily, (the old app ran every 5), purging expired sessions and sign-in links and inbox items past `INBOX_RETENTION_DAYS` daily, and purging deleted
 //! sets, old idempotency keys, old webhook deliveries and leftover stored media every hour, and
 //! extending Threads and LinkedIn tokens and mailing about ending ones daily and renewing X tokens, reading RSS feeds and reading post metrics every 15 minutes, each run by one instance at a time through an advisory lock.
 //! shortcut: no job queue; move to one if jobs need retries or exact times.
@@ -250,6 +250,20 @@ pub fn spawn(app: AppState) {
             }
         },
     );
+    // A year of inbox history by default; `INBOX_RETENTION_DAYS=0` keeps every item.
+    start(
+        "inbox retention",
+        Duration::from_secs(24 * 3600),
+        &app,
+        |app| async move {
+            let days = app.inbox_retention_days;
+            match purge_old_inbox_items(&app.db, days, INBOX_RETENTION_BATCH).await {
+                Ok(0) => {}
+                Ok(items) => tracing::info!(items, days, "purged old inbox items"),
+                Err(e) => tracing::warn!(error = %e, "inbox retention purge failed"),
+            }
+        },
+    );
     // One mail a day to `ADMIN_EMAILS` at 08:00 Dhaka; the day's record in `rate_limit_hits`
     // keeps a restart from mailing twice.
     start(
@@ -374,6 +388,45 @@ async fn purge_locked(db: &DatabaseConnection, key: i64, sql: &str) -> Result<u6
     let done = txn.execute_unprepared(sql).await?;
     txn.commit().await?;
     Ok(done.rows_affected())
+}
+
+/// Advisory lock key of the daily inbox retention purge, apart from the others. Public so a test
+/// can hold it and prove a second instance skips the round.
+pub const INBOX_RETENTION_LOCK: i64 = 0x0049_4e42_5254_4e54;
+
+/// Rows deleted per statement by the daily inbox retention purge.
+pub const INBOX_RETENTION_BATCH: i64 = 1000;
+
+/// Deletes inbox items created more than `days` ago, `batch` rows a statement, each in its own
+/// short transaction under `INBOX_RETENTION_LOCK`, so a large delete never holds a long one and
+/// two instances never delete the same batch; returns how many went. A run that finds the lock
+/// held stops early and the other instance carries on. Their replies (`inbox_replies`),
+/// automation runs and automation misses go by cascade. Only the items and what belongs to
+/// them: contacts, their tags, posts and media stay, and the inbox counts are read from the
+/// items that remain. `days` of 0 keeps every item and returns 0.
+pub async fn purge_old_inbox_items(
+    db: &DatabaseConnection,
+    days: i64,
+    batch: i64,
+) -> Result<u64, DbErr> {
+    if days <= 0 || batch <= 0 {
+        return Ok(0);
+    }
+    // `days` and `batch` are a config number and a constant, never text from a request.
+    let sql = format!(
+        "DELETE FROM inbox_items WHERE id IN (SELECT id FROM inbox_items \
+         WHERE created_at < now() - make_interval(days => {days}) \
+         ORDER BY created_at LIMIT {batch})"
+    );
+    let mut done = 0;
+    loop {
+        let rows = purge_locked(db, INBOX_RETENTION_LOCK, &sql).await?;
+        done += rows;
+        if rows < batch as u64 {
+            break;
+        }
+    }
+    Ok(done)
 }
 
 #[cfg(test)]
