@@ -50,6 +50,35 @@ const MIGRATION_LOCK: i64 = 0x736f_6369_616c; // "social"
 /// Longest a request, or a tick that needs a second connection, waits for a free one.
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Longest a migration waits for a table lock. A migration that cannot take its lock this
+/// soon fails the boot instead of queueing every writer behind it for as long as it runs. A
+/// migration that wants a shorter wait says so with `SET LOCAL lock_timeout`.
+const MIGRATION_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The pool migrations run on: 3 connections of its own, closed before the app pool opens. It
+/// has no statement or idle timeout (a migration may rightly take long on a big table), only
+/// `MIGRATION_LOCK_TIMEOUT`.
+pub async fn migrating_pool(config: &config::Config) -> Result<DatabaseConnection, DbErr> {
+    // One short string for the life of the process, which `execute` wants to borrow for good.
+    let set: &'static str = Box::leak(
+        format!("SET lock_timeout = {}", MIGRATION_LOCK_TIMEOUT.as_millis()).into_boxed_str(),
+    );
+    let mut options = ConnectOptions::new(&config.database_url);
+    options
+        .max_connections(3)
+        .connect_timeout(Duration::from_secs(10))
+        .acquire_timeout(ACQUIRE_TIMEOUT)
+        .map_sqlx_postgres_pool_opts(move |pool| {
+            pool.after_connect(move |conn, _| {
+                Box::pin(async move {
+                    use sea_orm::sqlx::Executor;
+                    conn.execute(set).await.map(|_| ())
+                })
+            })
+        });
+    Database::connect(options).await
+}
+
 /// Connects to `DATABASE_URL` and applies pending migrations.
 ///
 /// Two processes starting together would both try to create the migrations table, and one
@@ -57,15 +86,12 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 /// connection, held while the migrations run on the pool, and Postgres frees it on commit or
 /// if this process dies.
 pub async fn connect(config: &config::Config) -> Result<DatabaseConnection, DbErr> {
-    // Migrations run on a pool of their own, without the app's timeouts: one may rightly take
-    // long (an index on a big table), and it is closed before the app pool opens.
-    let mut options = ConnectOptions::new(&config.database_url);
-    options
-        .max_connections(3)
-        .connect_timeout(Duration::from_secs(10))
-        .acquire_timeout(ACQUIRE_TIMEOUT);
-    let migrating = Database::connect(options).await?;
+    let migrating = migrating_pool(config).await?;
     let lock = migrating.begin().await?;
+    // The wait for another instance's migrations is however long they take: the table lock
+    // timeout is for a migration's own locks, not this one.
+    lock.execute_unprepared("SET LOCAL lock_timeout = 0")
+        .await?;
     lock.execute_unprepared(&format!("SELECT pg_advisory_xact_lock({MIGRATION_LOCK})"))
         .await?;
     Migrator::up(&migrating, None).await?;
