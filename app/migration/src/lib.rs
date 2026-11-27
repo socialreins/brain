@@ -100,6 +100,7 @@ mod m20270114_000001_drop_team_slug_holds;
 mod m20270115_000001_inbox_search_trigram;
 mod m20270116_000001_credit_takebacks;
 mod m20270117_000001_search_trigram;
+mod m20270118_000001_inbox_retention_index;
 mod url_numbers;
 
 pub struct Migrator;
@@ -208,6 +209,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20270115_000001_inbox_search_trigram::Migration),
             Box::new(m20270116_000001_credit_takebacks::Migration),
             Box::new(m20270117_000001_search_trigram::Migration),
+            Box::new(m20270118_000001_inbox_retention_index::Migration),
             // inject-above (do not remove this comment)
         ]
     }

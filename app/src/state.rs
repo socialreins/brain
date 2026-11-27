@@ -44,6 +44,9 @@ pub struct AppState {
     pub webauthn: Arc<Webauthn>,
     pub registration_disabled: bool,
     pub billing_enabled: bool,
+    /// `INBOX_RETENTION_DAYS`: how long inbox items are kept, 0 keeps everything
+    /// (`scheduler::purge_old_inbox_items`).
+    pub inbox_retention_days: i64,
     pub stripe: crate::stripe::Stripe,
     /// AI steps in automations (`ai.rs`).
     pub ai: crate::ai::Ai,
@@ -113,6 +116,7 @@ impl AppState {
             webauthn: config.webauthn.clone(),
             registration_disabled: config.registration_disabled,
             billing_enabled: config.billing_enabled,
+            inbox_retention_days: config.inbox_retention_days,
             stripe: config.stripe.clone(),
             ai: config.ai.clone(),
             owner_email: config.owner_email.clone(),
