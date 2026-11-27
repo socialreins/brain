@@ -245,6 +245,21 @@ pub fn spawn(app: AppState) {
             }
         },
     );
+    // Gives back X credits a crash or a failed release left spent on a post that sent nothing.
+    start(
+        "x credit sweep",
+        Duration::from_secs(3600),
+        &app,
+        |app| async move {
+            match crate::x_credit_sweep::sweep(&app).await {
+                Ok((0, _)) => {}
+                Ok((credits, posts)) => {
+                    tracing::info!(credits, posts, "gave back x credits of posts never sent")
+                }
+                Err(e) => tracing::warn!(error = %e, "x credit sweep failed"),
+            }
+        },
+    );
     start("purge", Duration::from_secs(3600), &app, |app| async move {
         match purge_deleted_sets(&app.db).await {
             Ok(0) => {}
