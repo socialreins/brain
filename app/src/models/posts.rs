@@ -69,6 +69,9 @@ pub struct Model {
     /// every one of them.
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub account_ids: Option<Json>,
+    /// A live process holds one of its team's publishing places until this time (decision 0009):
+    /// set on claim, renewed every 30 s, null once nothing runs the post.
+    pub lease_until: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }

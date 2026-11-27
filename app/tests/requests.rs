@@ -9079,12 +9079,33 @@ mod teams {
                 assert_eq!(own(&first), publish::TEAM_AT_ONCE);
                 assert!(first.len() <= 50);
                 let mut claimed: Vec<uuid::Uuid> = first.iter().map(|c| c.0).collect();
+                // Each claimed post goes out and frees its place (`lease_until`), as a round's
+                // tasks do; a lease left live would hold the team's places for two minutes.
+                let free = |ids: &[(uuid::Uuid, uuid::Uuid)]| {
+                    let db = &db;
+                    let ids: Vec<uuid::Uuid> = ids.iter().map(|c| c.0).collect();
+                    async move {
+                        let row = posts::ActiveModel {
+                            status: Set("published".into()),
+                            lease_until: Set(None),
+                            ..Default::default()
+                        };
+                        posts::Entity::update_many()
+                            .set(row)
+                            .filter(posts::Column::Id.is_in(ids))
+                            .exec(db)
+                            .await
+                            .unwrap();
+                    }
+                };
+                free(&first).await;
                 loop {
                     let next = publish::claim_due(&db, false).await.unwrap();
                     if next.is_empty() {
                         break;
                     }
                     claimed.extend(next.iter().map(|c| c.0));
+                    free(&next).await;
                 }
                 for id in &mine {
                     assert_eq!(claimed.iter().filter(|c| *c == id).count(), 1);
@@ -9833,6 +9854,207 @@ mod teams {
                             "UPDATE post_targets SET retry_at = now() - interval '1 second' \
                              WHERE post_id = '{id}' AND retry_at IS NOT NULL"
                         ),
+                    )
+                    .await;
+                }
+
+                /// Two replicas of brain over one database.
+                fn two_states(db: &DatabaseConnection) -> (AppState, AppState) {
+                    let config = Config::from_env().expect("test config");
+                    (
+                        AppState::new(db.clone(), &config),
+                        AppState::new(db.clone(), &config),
+                    )
+                }
+
+                /// The posts whose live lease holds one of `team_id`'s places now.
+                async fn leased(db: &DatabaseConnection, team_id: &str) -> Vec<String> {
+                    let rows = sea_orm::ConnectionTrait::query_all_raw(
+                        db,
+                        sea_orm::Statement::from_string(
+                            sea_orm::DbBackend::Postgres,
+                            format!(
+                                "SELECT id FROM posts WHERE team_id = '{team_id}' \
+                                 AND status = 'queued' AND lease_until > now() ORDER BY id"
+                            ),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                    rows.iter()
+                        .map(|r| r.try_get::<uuid::Uuid>("", "id").unwrap().to_string())
+                        .collect()
+                }
+
+                fn only_team(claimed: Vec<(uuid::Uuid, uuid::Uuid)>, team_id: &str) -> Vec<String> {
+                    let mut mine: Vec<String> = claimed
+                        .into_iter()
+                        .filter(|c| c.1.to_string() == team_id)
+                        .map(|c| c.0.to_string())
+                        .collect();
+                    mine.sort();
+                    mine
+                }
+
+                async fn five_due(
+                    s: &TestServer,
+                    db: &DatabaseConnection,
+                    cookie: &str,
+                    set: &str,
+                ) {
+                    for i in 0..5 {
+                        due_ago(
+                            s,
+                            db,
+                            cookie,
+                            input(set, &format!("cap {i}"), Some(&past())),
+                            5,
+                        )
+                        .await;
+                    }
+                }
+
+                /// One team, two replicas claiming at once, hold `TEAM_AT_ONCE` of its posts
+                /// between them, never one each (decision 0009).
+                #[tokio::test]
+                #[serial]
+                async fn two_processes_hold_one_teams_places_together() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    five_due(&s, &db, &cookie, &set).await;
+                    let (_, other) = two_states(&db);
+                    let (a, b) = tokio::join!(
+                        publish::claim_due(&state.db, false),
+                        publish::claim_due(&other.db, false)
+                    );
+                    let mut claimed = only_team(a.unwrap(), &team_id);
+                    claimed.extend(only_team(b.unwrap(), &team_id));
+                    assert_eq!(
+                        claimed.len(),
+                        publish::TEAM_AT_ONCE,
+                        "a team's places, once between the replicas: {claimed:?}"
+                    );
+                    // And while those leases live, neither replica takes more of its posts.
+                    let next = publish::claim_due(&state.db, false).await.unwrap();
+                    assert!(only_team(next, &team_id).is_empty());
+                    // The places belong to exactly the claimed posts.
+                    let live = leased(&db, &team_id).await;
+                    claimed.sort();
+                    assert_eq!(live, claimed);
+                    exec(
+                        &db,
+                        format!("DELETE FROM posts WHERE team_id = '{team_id}'"),
+                    )
+                    .await;
+                }
+
+                /// A process that stops renewing loses its places, so the next claim takes the
+                /// team's remaining posts.
+                #[tokio::test]
+                #[serial]
+                async fn an_unrenewed_lease_frees_its_place() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    five_due(&s, &db, &cookie, &set).await;
+                    let first = publish::claim_due(&state.db, false).await.unwrap();
+                    assert_eq!(only_team(first, &team_id).len(), publish::TEAM_AT_ONCE);
+                    // The process died: nothing renewed its leases, which run out now.
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE posts SET lease_until = now() - interval '1 second' \
+                             WHERE team_id = '{team_id}' AND status = 'queued'"
+                        ),
+                    )
+                    .await;
+                    let (_, other) = two_states(&db);
+                    let next = publish::claim_due(&other.db, false).await.unwrap();
+                    assert_eq!(
+                        only_team(next, &team_id).len(),
+                        2,
+                        "the two posts left take the freed places"
+                    );
+                    exec(
+                        &db,
+                        format!("DELETE FROM posts WHERE team_id = '{team_id}'"),
+                    )
+                    .await;
+                }
+
+                /// A post waiting for its automatic retry holds none of its team's places; one a
+                /// live process is running holds one.
+                #[tokio::test]
+                #[serial]
+                async fn a_post_waiting_for_its_retry_holds_no_place() {
+                    let (s, db, state) = on_mock().await;
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    let waiting =
+                        due_ago(&s, &db, &cookie, input(&set, "waiting", Some(&past())), 5).await;
+                    let target = uuid::Uuid::now_v7();
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE posts SET status = 'queued', quota_reserved = true, \
+                             fanned_out = true, updated_at = now() WHERE id = '{waiting}'; \
+                             INSERT INTO post_targets (id, post_id, status, retried, retry_at) \
+                             VALUES ('{target}', '{waiting}', 'pending', true, \
+                               now() + interval '5 minutes')"
+                        ),
+                    )
+                    .await;
+                    for i in 0..3 {
+                        due_ago(
+                            &s,
+                            &db,
+                            &cookie,
+                            input(&set, &format!("due {i}"), Some(&past())),
+                            4,
+                        )
+                        .await;
+                    }
+                    let claimed = publish::claim_due(&state.db, false).await.unwrap();
+                    assert_eq!(
+                        only_team(claimed, &team_id).len(),
+                        publish::TEAM_AT_ONCE,
+                        "the waiting retry takes none of the team's places"
+                    );
+                    assert!(
+                        leased(&db, &team_id).await.iter().all(|id| *id != waiting),
+                        "and its own lease stays clear"
+                    );
+                    // A run of it does hold a place: two are left for the team's due posts.
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE posts SET status = 'published', lease_until = NULL \
+                             WHERE team_id = '{team_id}' AND id <> '{waiting}'; \
+                             UPDATE posts SET lease_until = now() + interval '2 minutes' \
+                             WHERE id = '{waiting}'"
+                        ),
+                    )
+                    .await;
+                    for i in 0..3 {
+                        due_ago(
+                            &s,
+                            &db,
+                            &cookie,
+                            input(&set, &format!("next {i}"), Some(&past())),
+                            3,
+                        )
+                        .await;
+                    }
+                    let claimed = publish::claim_due(&state.db, false).await.unwrap();
+                    assert_eq!(
+                        only_team(claimed, &team_id).len(),
+                        publish::TEAM_AT_ONCE - 1,
+                        "a live lease holds one place"
+                    );
+                    exec(
+                        &db,
+                        format!("DELETE FROM posts WHERE team_id = '{team_id}'"),
                     )
                     .await;
                 }
