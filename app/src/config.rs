@@ -17,6 +17,9 @@ use crate::{
     turnstile::Turnstile,
 };
 
+/// `TEAM_STORAGE_BYTES`'s default: the uploads a team keeps, 5 GiB.
+const DEFAULT_TEAM_STORAGE_BYTES: i64 = 5 << 30;
+
 /// Public Bluesky AppView (handle resolution, profiles) and the `did:plc` directory.
 const BLUESKY_APPVIEW: &str = "https://public.api.bsky.app";
 const PLC_DIRECTORY: &str = "https://plc.directory";
@@ -54,6 +57,10 @@ pub struct Config {
     /// items are kept. The daily purge (`scheduler::purge_old_inbox_items`) deletes older ones
     /// with their replies and automation runs; contacts, posts and media stay.
     pub inbox_retention_days: i64,
+    /// `TEAM_STORAGE_BYTES` (default 5 GiB, 0 is unlimited, else up to 1 TiB): the bytes of
+    /// uploads a team may keep, for a team with no `teams.storage_budget_bytes` of its own
+    /// (`controllers::uploads`). `MEDIA_MAX_BYTES` still caps one file.
+    pub team_storage_bytes: i64,
     pub port: u16,
     pub cors_origins: Vec<HeaderValue>,
     /// `RAILWAY_GIT_COMMIT_SHA`, else `GIT_COMMIT` (baked into published images), else `dev`.
@@ -187,6 +194,7 @@ impl Config {
         let publish_drain =
             std::time::Duration::from_secs(publish_drain(var("PUBLISH_DRAIN_SECONDS"))?);
         let inbox_retention_days = inbox_retention_days(var("INBOX_RETENTION_DAYS"))?;
+        let team_storage_bytes = team_storage_bytes(var("TEAM_STORAGE_BYTES"))?;
         let port = match var("PORT") {
             Some(p) => p.parse().map_err(|_| "PORT: not a port number")?,
             None => 8080,
@@ -248,6 +256,7 @@ impl Config {
             database_idle_in_transaction_timeout,
             publish_drain,
             inbox_retention_days,
+            team_storage_bytes,
             port,
             cors_origins: parse_origins(&origins)?,
             git_commit: var("RAILWAY_GIT_COMMIT_SHA")
@@ -450,6 +459,21 @@ fn media_max_bytes(value: Option<String>) -> Result<usize, String> {
         Some(Ok(n)) if (1..=max).contains(&n) => Ok(n),
         Some(_) => Err(format!(
             "MEDIA_MAX_BYTES: a number of bytes from 1 to {max}"
+        )),
+    }
+}
+
+/// `TEAM_STORAGE_BYTES`: the bytes of uploads a team without a budget of its own may keep,
+/// default 5 GiB (`DEFAULT_TEAM_STORAGE_BYTES`). 0 is unlimited; a value past the most
+/// (`uploads::MAX_STORAGE_BYTES`, 1 TiB, the console's own limit) is refused at start, so a typo
+/// fails there instead of silently capping or uncapping every team.
+fn team_storage_bytes(value: Option<String>) -> Result<i64, String> {
+    let max = crate::controllers::uploads::MAX_STORAGE_BYTES;
+    match value.map(|v| v.trim().parse::<i64>()) {
+        None => Ok(DEFAULT_TEAM_STORAGE_BYTES),
+        Some(Ok(n)) if (0..=max).contains(&n) => Ok(n),
+        Some(_) => Err(format!(
+            "TEAM_STORAGE_BYTES: 0 (unlimited), or a number of bytes from 1 to {max} (1 TiB)"
         )),
     }
 }
@@ -759,6 +783,20 @@ mod tests {
         assert_eq!(max(" 1073741824 "), Ok(1 << 30));
         for bad in ["0", "1073741825", "1GB", "-5"] {
             assert!(max(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_team_keeps_five_gib_of_uploads_unless_set_otherwise() {
+        let size = |v: &str| super::team_storage_bytes(Some(v.into()));
+        assert_eq!(super::team_storage_bytes(None), Ok(5 << 30));
+        assert_eq!(size("300000000"), Ok(300_000_000));
+        assert_eq!(size(" 5368709120 "), Ok(5 << 30));
+        // 0 is unlimited, and 1 TiB is still a number of bytes.
+        assert_eq!(size("0"), Ok(0));
+        assert_eq!(size("1099511627776"), Ok(1 << 40));
+        for bad in ["-1", "1099511627777", "5GB", "1.5"] {
+            assert!(size(bad).is_err(), "{bad}");
         }
     }
 

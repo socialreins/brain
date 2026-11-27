@@ -5479,6 +5479,24 @@ mod teams {
                 cap: usize,
                 brain_url: Option<&str>,
             ) -> (TestServer, DatabaseConnection, AppState) {
+                on_mock_set(cap, brain_url, None).await
+            }
+
+            /// `on_mock_capped` with `TEAM_STORAGE_BYTES` set to `storage`.
+            async fn on_mock_storage(
+                cap: usize,
+                storage: i64,
+            ) -> (TestServer, DatabaseConnection, AppState) {
+                on_mock_set(cap, None, Some(storage)).await
+            }
+
+            /// `on_mock_capped`, with brain at `brain_url` when given and `TEAM_STORAGE_BYTES`
+            /// set when `storage` is.
+            async fn on_mock_set(
+                cap: usize,
+                brain_url: Option<&str>,
+                storage: Option<i64>,
+            ) -> (TestServer, DatabaseConnection, AppState) {
                 let base = mock_bluesky().await;
                 let mut config = Config::from_env().expect("test config");
 
@@ -5487,6 +5505,9 @@ mod teams {
                 config.bluesky.plc = base.clone();
                 config.bluesky.video = base.clone();
                 config.bluesky.allow_insecure_pds = true;
+                if let Some(bytes) = storage {
+                    config.team_storage_bytes = bytes;
+                }
                 let disk = object_store::local::LocalFileSystem::new_with_prefix(media_dir())
                     .unwrap()
                     .with_automatic_cleanup(true);
@@ -6797,15 +6818,25 @@ mod teams {
                     "DELETE FROM media_uploads WHERE team_id = '{team_id}' AND pending"
                 ))
                 .await;
-                // A running upload counts the most it may take, so a nearly full team waits.
+                // A running upload counts the most it may take, so a nearly full team waits: past
+                // the budget the answer is 413 with the numbers, and the file is not stored.
+                let budget = state.team_storage_bytes;
                 run(format!(
                     "UPDATE media_uploads SET size = {} WHERE url = '{url}'",
-                    10i64 * 1024 * 1024 * 1024 - 1000
+                    budget - 1000
                 ))
                 .await;
                 let res = upload(&s, &cookie, file(PNG, 64)).await;
-                assert_eq!(res.status_code(), 409, "{}", res.text());
-                res.assert_json(&json!({"error": "too_many_uploads"}));
+                assert_eq!(res.status_code(), 413, "{}", res.text());
+                let body = res.json::<Value>();
+                assert_eq!(
+                    (
+                        body["error"].as_str(),
+                        body["used"].as_i64(),
+                        body["budget"].as_i64()
+                    ),
+                    (Some("storage_limit"), Some(budget - 1000), Some(budget))
+                );
                 run(format!(
                     "UPDATE media_uploads SET size = 64 WHERE url = '{url}'"
                 ))
@@ -6897,6 +6928,132 @@ mod teams {
                     let kept = state.media.store.head(&key.as_str().into()).await.is_ok();
                     assert_eq!(kept, !pending, "pending {pending}");
                 }
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn uploads_count_against_the_teams_own_storage_budget() {
+                use sea_orm::ConnectionTrait;
+                const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+                // What an upload in progress reserves, whatever the file's own size.
+                const RESERVE: i64 = 100_000_000;
+                // The env default, for a team with no budget of its own.
+                let (s, db, _) = on_mock_storage(52_000_000, RESERVE).await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                // The team's stored uploads as exactly one row of `size` bytes.
+                let spent = |size: i64| {
+                    let db = db.clone();
+                    let sql = format!(
+                        "DELETE FROM media_uploads WHERE team_id = '{team_id}'; \
+                         INSERT INTO media_uploads (id, team_id, storage_key, url, content_type, \
+                          size, pending) VALUES (gen_random_uuid(), '{team_id}', \
+                          'uploads/{team_id}/kept', '', '', {size}, false)"
+                    );
+                    async move { db.execute_unprepared(&sql).await.unwrap() }
+                };
+                let set = |bytes: &str| {
+                    let db = db.clone();
+                    let sql = format!(
+                        "UPDATE teams SET storage_budget_bytes = {bytes} WHERE id = '{team_id}'"
+                    );
+                    async move { db.execute_unprepared(&sql).await.unwrap() }
+                };
+                let send = |bytes: Vec<u8>| {
+                    let (s, cookie) = (&s, &cookie);
+                    async move { upload(s, cookie, bytes).await }
+                };
+
+                // An empty team is under its budget; one byte over it is refused with both
+                // numbers, and the file is stored nowhere.
+                assert_eq!(send(file(PNG, 64)).await.status_code(), 201);
+                spent(1).await;
+                let res = send(file(PNG, 64)).await;
+                assert_eq!(res.status_code(), 413, "{}", res.text());
+                let body = res.json::<Value>();
+                assert_eq!(
+                    (
+                        body["error"].as_str(),
+                        body["used"].as_i64(),
+                        body["budget"].as_i64()
+                    ),
+                    (Some("storage_limit"), Some(1), Some(RESERVE))
+                );
+                // Just under it, with a budget an admin raised by 1,000 bytes.
+                set(&(RESERVE + 1000).to_string()).await;
+                assert_eq!(send(file(PNG, 64)).await.status_code(), 201);
+
+                // An admin's own budget raises it, and lowers it again.
+                let four_gib = 4 * 1024 * 1024 * 1024;
+                spent(four_gib - RESERVE).await;
+                set(&four_gib.to_string()).await;
+                assert_eq!(send(file(PNG, 64)).await.status_code(), 201);
+                set("1000").await;
+                let res = send(file(PNG, 64)).await;
+                assert_eq!(res.status_code(), 413, "{}", res.text());
+                assert_eq!(res.json::<Value>()["budget"].as_i64(), Some(1000));
+
+                // A budget of 0 is unlimited, whatever it would have counted.
+                set("0").await;
+                spent(2 * 1024 * 1024 * 1024 * 1024).await;
+                assert_eq!(send(file(PNG, 64)).await.status_code(), 201);
+
+                // Clearing the column returns the team to the env default.
+                set("NULL").await;
+                let res = send(file(PNG, 64)).await;
+                assert_eq!(res.status_code(), 413, "{}", res.text());
+                let body = res.json::<Value>();
+                assert_eq!(
+                    (body["error"].as_str(), body["budget"].as_i64()),
+                    (Some("storage_limit"), Some(RESERVE))
+                );
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn two_parallel_uploads_cannot_both_pass_the_budget() {
+                use sea_orm::ConnectionTrait;
+                const MP4: &[u8] = b"\0\0\0\x18ftypmp42\0\0\0\0";
+                const FILE: usize = 51_000_000;
+                // Two files that fit one at a time (each reserves the 100 MB a still may take)
+                // but not together: 102 MB of files against a 101 MB budget.
+                let (s, db, state) = on_mock_storage(52_000_000, 101_000_000).await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                // A second server on the same database and media store, so both uploads run at
+                // once. The team's advisory lock is what keeps them apart, not one process.
+                let other = TestServer::new(controllers::router(
+                    state.clone(),
+                    &Config::from_env().unwrap(),
+                ))
+                .unwrap();
+                async fn at_once(s: &TestServer, cookie: &str, bytes: Vec<u8>) -> (u16, Value) {
+                    let res = upload(s, cookie, bytes).await;
+                    (res.status_code().as_u16(), res.json::<Value>())
+                }
+                let (a, b) = tokio::join!(
+                    at_once(&s, &cookie, file(MP4, FILE)),
+                    at_once(&other, &cookie, file(MP4, FILE))
+                );
+                let refused =
+                    |r: &(u16, Value)| r.0 == 413 && r.1["error"] == json!("storage_limit");
+                let made = |r: &(u16, Value)| r.0 == 201;
+                assert!(
+                    (made(&a) && refused(&b)) || (refused(&a) && made(&b)),
+                    "{a:?} and {b:?}"
+                );
+                let sum = db
+                    .query_one_raw(sea_orm::Statement::from_string(
+                        sea_orm::DbBackend::Postgres,
+                        format!(
+                            "SELECT coalesce(sum(size), 0)::bigint AS n FROM media_uploads \
+                             WHERE team_id = '{team_id}'"
+                        ),
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .try_get::<i64>("", "n")
+                    .unwrap();
+                assert_eq!(sum, FILE as i64, "the one that passed, in full");
             }
 
             #[tokio::test]
@@ -41464,7 +41621,8 @@ mod admin_console {
             *first,
             json!({"id": acme, "name": "Acme_Rockets", "created_at": created_at, "members": 1,
                 "accounts": 1, "posts": 2, "owner_email": owner, "plan": null,
-                "plan_status": null, "plan_provider": null})
+                "plan_status": null, "plan_provider": null, "storage_used": 0,
+                "storage_budget": 5i64 << 30, "storage_budget_override": null})
         );
         let last = &all["teams"][2];
         assert_eq!(
@@ -41713,6 +41871,142 @@ mod admin_console {
         c.sql("UPDATE sessions SET created_at = now() - interval '11 minutes'")
             .await;
         let res = put(json!({"plan": "automation"})).await;
+        assert_eq!(error_of(&res), (403, "reauth_required".into()));
+        c.done().await;
+    }
+
+    /// The console reads each team's upload storage and sets its own budget; uploads obey it (one
+    /// in progress reserves the 100 MB a still may take).
+    #[tokio::test]
+    #[serial]
+    async fn the_console_sets_a_teams_upload_storage_budget() {
+        const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+        let c = console(|c| {
+            c.media.max_bytes = 52_000_000;
+            c.team_storage_bytes = 101_000_000;
+        })
+        .await;
+        let admin = c.admin().await;
+        let team = c.get("/v1/team", &admin).await;
+        let (team, name) = (
+            team["id"].as_str().unwrap().to_owned(),
+            team["name"].as_str().unwrap().to_owned(),
+        );
+        let path = format!("/v1/admin/teams/{team}/storage-budget");
+        let upload = |bytes: Vec<u8>| {
+            let (c, admin) = (&c, &admin);
+            async move {
+                c.req(Method::POST, "/v1/uploads", admin)
+                    .content_type("application/octet-stream")
+                    .bytes(bytes.into())
+                    .await
+            }
+        };
+        let put = |body: Value| {
+            let (c, admin, path) = (&c, &admin, &path);
+            async move { c.req(Method::PUT, path, admin).json(&body).await }
+        };
+        let used = |size: i64| {
+            let db = c.db.clone();
+            let sql = format!("UPDATE media_uploads SET size = {size} WHERE team_id = '{team}'");
+            async move { db.execute_unprepared(&sql).await.unwrap() }
+        };
+        // The team read shows its storage: the env default, and nothing used yet.
+        let listed = c
+            .get(
+                &format!("/v1/admin/teams?q={}", name.replace(' ', "%20")),
+                &admin,
+            )
+            .await;
+        let row = listed["teams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == json!(team))
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            (row["storage_used"].as_i64(), row["storage_budget"].as_i64()),
+            (Some(0), Some(101_000_000))
+        );
+        assert_eq!(upload(PNG.to_vec()).await.status_code(), 201);
+
+        // At the env default, the next upload is refused with both numbers.
+        used(50_000_000).await;
+        let res = upload(PNG.to_vec()).await;
+        assert_eq!(res.status_code(), 413, "{}", res.text());
+        let body = res.json::<Value>();
+        assert_eq!(
+            (
+                body["error"].as_str(),
+                body["used"].as_i64(),
+                body["budget"].as_i64()
+            ),
+            (Some("storage_limit"), Some(50_000_000), Some(101_000_000))
+        );
+
+        // An override raises it, and the console shows both numbers.
+        let res = put(json!({"bytes": 160_000_000})).await;
+        res.assert_status_ok();
+        assert_eq!(
+            res.json::<Value>(),
+            json!({"used": 50_000_000, "budget": 160_000_000})
+        );
+        assert_eq!(upload(PNG.to_vec()).await.status_code(), 201);
+        let listed = c
+            .get(
+                &format!("/v1/admin/teams?q={}", name.replace(' ', "%20")),
+                &admin,
+            )
+            .await;
+        let row = listed["teams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == json!(team))
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            (row["storage_used"].as_i64(), row["storage_budget"].as_i64()),
+            (Some(50_000_008), Some(160_000_000))
+        );
+
+        // Lowering it refuses what it no longer covers; null returns to the env default; 0 is
+        // unlimited.
+        for (bytes, budget, accepted) in [
+            (json!(60_000_000), 60_000_000, false),
+            (Value::Null, 101_000_000, false),
+            (json!(0), 0, true),
+        ] {
+            let res = put(json!({"bytes": bytes})).await;
+            res.assert_status_ok();
+            assert_eq!(res.json::<Value>()["budget"].as_i64(), Some(budget));
+            let res = upload(PNG.to_vec()).await;
+            let code = if accepted { 201 } else { 413 };
+            assert_eq!(res.status_code(), code, "{}", res.text());
+        }
+
+        // The numbers are checked here, and an unknown team is 404.
+        for bytes in [json!(-1), json!(1_099_511_627_777i64)] {
+            let res = put(json!({"bytes": bytes})).await;
+            assert_eq!(error_of(&res), (422, "invalid_storage_budget".into()));
+        }
+        let unknown = format!("/v1/admin/teams/{}/storage-budget", uuid::Uuid::now_v7());
+        let res = c
+            .req(Method::PUT, &unknown, &admin)
+            .json(&json!({"bytes": 1}))
+            .await;
+        assert_eq!(error_of(&res), (404, "not_found".into()));
+        // Nobody but an admin reaches it.
+        let member = c.sign_in(&unique_email()).await.unwrap();
+        let res = c
+            .req(Method::PUT, &path, &member)
+            .json(&json!({"bytes": 1}))
+            .await;
+        assert_eq!(res.status_code(), 403);
+        c.sql("UPDATE sessions SET created_at = now() - interval '11 minutes'")
+            .await;
+        let res = put(json!({"bytes": 1})).await;
         assert_eq!(error_of(&res), (403, "reauth_required".into()));
         c.done().await;
     }
@@ -42064,6 +42358,7 @@ mod admin_console {
             ("/admin/overview", "get"),
             ("/admin/users", "get"),
             ("/admin/teams", "get"),
+            ("/admin/teams/{id}/storage-budget", "put"),
             ("/admin/waitlist/{id}/approve", "post"),
             ("/admin/waitlist/{id}", "delete"),
             ("/admin/waitlist-invites", "get"),
