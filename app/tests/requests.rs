@@ -18944,6 +18944,21 @@ mod teams {
                     publish::tick(&state).await.unwrap();
                     assert_eq!(get_post(&s, &cookie, &id).await["status"], "published");
                     assert_eq!(billing::balance(&db, team, Kind::X).await.unwrap(), 0);
+                    // Every spend that stayed spent says so, so the sweep leaves it alone.
+                    use sea_orm::ConnectionTrait;
+                    let row = db
+                        .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                            sea_orm::DbBackend::Postgres,
+                            "SELECT count(*) FILTER (WHERE reason = 'x post') AS open, \
+                             count(*) FILTER (WHERE reason = 'x post kept') AS kept \
+                             FROM credit_ledger WHERE team_id = $1 AND amount < 0",
+                            [team.into()],
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(row.try_get::<i64>("", "open").unwrap(), 0);
+                    assert_eq!(row.try_get::<i64>("", "kept").unwrap(), 2);
                 }
 
                 /// Credits held for posts that did not go out come back; the ones that went out stay spent.

@@ -2432,6 +2432,20 @@ pub fn credit_kept(msg: &str) -> bool {
 async fn release_x(app: &AppState, post: &posts::Model, id: Uuid, hold: XHold) {
     let back = hold.amount - hold.sent;
     if back <= 0 {
+        // Settled with nothing to give back: say so on the spend, so the sweep
+        // (`x_credit_sweep`) never takes it for a release that was lost.
+        let stmt = sql(
+            "UPDATE credit_ledger SET reason = $3 WHERE team_id = $1 AND kind = 'x' \
+             AND ref = $2 AND amount < 0",
+            vec![
+                post.team_id.into(),
+                hold.reference.clone().into(),
+                crate::x_credit_sweep::KEPT.into(),
+            ],
+        );
+        if let Err(e) = app.db.execute_raw(stmt).await {
+            tracing::error!(error = %e, %id, "x credit spend not marked kept");
+        }
         return;
     }
     let reference = Some(hold.reference.as_str());

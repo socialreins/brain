@@ -129,6 +129,40 @@ async fn only_credits_of_posts_that_certainly_sent_nothing_come_back_and_only_on
     assert_eq!(e.credits().await, owed + back);
 }
 
+/// A spend whose credits stayed spent (`release_x` marked it kept) is never taken for a lost
+/// release, whatever a later attempt of the same target says; and only a target's latest spend
+/// is judged.
+#[tokio::test]
+#[serial]
+async fn a_kept_spend_and_an_older_attempt_are_left_alone() {
+    let e = env(true).await;
+    let clean = "X refused it (403). Nothing was posted.";
+    let kept = e.spent("failed", Some(clean), false, "3 hours").await;
+    e.app
+        .db
+        .execute_unprepared(&format!(
+            "UPDATE credit_ledger SET reason = 'x post kept' WHERE ref = '{kept}'"
+        ))
+        .await
+        .unwrap();
+    // An older attempt of a target that has a newer spend.
+    let old = e.spent("failed", Some(clean), false, "5 hours").await;
+    let target = &old[..36];
+    e.app
+        .db
+        .execute_unprepared(&format!(
+            "INSERT INTO credit_ledger (id, team_id, kind, amount, reason, ref, created_at) \
+             VALUES (gen_random_uuid(), '{}', 'x', -1, 'x post kept', '{target}:{}', now() - interval '4 hours')",
+            e.team,
+            Uuid::now_v7()
+        ))
+        .await
+        .unwrap();
+    let before = e.credits().await;
+    sweep(&e.app).await.unwrap();
+    assert_eq!(e.credits().await, before);
+}
+
 #[tokio::test]
 #[serial]
 async fn credits_already_given_back_are_not_given_twice() {
