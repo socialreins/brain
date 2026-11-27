@@ -33,8 +33,9 @@ use crate::{
 
 /// Most uploads a team keeps at once.
 pub const MAX_UPLOADS: i64 = 200;
-/// Most bytes of uploads a team keeps at once: 10 GiB.
-pub const MAX_UPLOAD_BYTES: i64 = 10 * 1024 * 1024 * 1024;
+/// Most bytes of uploads a team may be given, `TEAM_STORAGE_BYTES` and a team's own budget alike:
+/// 1 TiB. A budget of 0 is unlimited, and a bigger one would only hide a typo.
+pub const MAX_STORAGE_BYTES: i64 = 1 << 40;
 /// Most uploads of a team in progress at once.
 pub const MAX_IN_PROGRESS: i64 = 3;
 
@@ -53,6 +54,15 @@ pub struct Upload {
 
 fn reply(status: StatusCode, code: &str) -> Response {
     error(status, code).into_response()
+}
+
+/// The team's upload budget is spent: `413` with the numbers the composer shows.
+fn storage_full(used: i64, budget: i64) -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(serde_json::json!({"error": "storage_limit", "used": used, "budget": budget})),
+    )
+        .into_response()
 }
 
 fn sql(sql: &str, values: Vec<sea_orm::Value>) -> Statement {
@@ -74,6 +84,21 @@ async fn usage(db: &impl ConnectionTrait, team: Uuid) -> Result<(i64, i64, i64),
             r.try_get("", "busy")?,
         )),
         None => Ok((0, 0, 0)),
+    }
+}
+
+/// The team's upload budget in bytes: its own `storage_budget_bytes` when an admin set one, else
+/// `default` (`TEAM_STORAGE_BYTES`). 0 is unlimited. Read inside the upload's transaction, so an
+/// admin's change is seen by the next upload and never half of one.
+async fn team_budget(db: &impl ConnectionTrait, team: Uuid, default: i64) -> Result<i64, DbErr> {
+    let stmt = sql(
+        "SELECT coalesce(storage_budget_bytes, $2::bigint) AS budget FROM teams WHERE id = $1",
+        vec![team.into(), default.into()],
+    );
+    match db.query_one_raw(stmt).await? {
+        Some(r) => r.try_get("", "budget"),
+        // The team went away under the request; the upload's insert fails on its foreign key.
+        None => Ok(default),
     }
 }
 
@@ -128,11 +153,12 @@ pub async fn release_pending(app: &AppState, id: Uuid) {
 /// a PDF up to 100 MB, or an MP4 or MOV video up to `MEDIA_MAX_BYTES`, told by its bytes. Any
 /// member, and any token that may write. `422 media_type_not_supported` for another type (or an
 /// empty body), `413 media_too_large` over the size, `409 too_many_uploads` when the team keeps
-/// 200 uploads, or would pass 10 GiB counting `MEDIA_MAX_BYTES` for this one until it is in.
-/// `429 uploads_in_progress` while 3 of the team's uploads are running, `429 rate_limited` past
-/// 60 a minute. `402 plan_limit` with billing on and no live plan. Each platform's own media
-/// rules apply when a post is saved. Not idempotent: an `Idempotency-Key` on a body over 64 KiB
-/// is `413`.
+/// 200 uploads, `413 storage_limit` when the file would pass the team's upload budget
+/// (`used` and `budget`, in bytes, counting `MEDIA_MAX_BYTES` for an upload in progress until
+/// it is in), `429 uploads_in_progress` while 3 of the team's uploads are running, `429
+/// rate_limited` past 60 a minute. `402 plan_limit` with billing on and no live plan. Each
+/// platform's own media rules apply when a post is saved. Not idempotent: an `Idempotency-Key`
+/// on a body over 64 KiB is `413`.
 #[utoipa::path(post, path = "/uploads", tag = "posts",
     security(("session" = []), ("api_token" = [])),
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
@@ -159,6 +185,8 @@ async fn create(State(app): State<AppState>, a: Actor, body: Body) -> Response {
     };
     let reserved = async {
         let txn = app.db.begin().await?;
+        // The team's advisory lock covers the check and the insert: two uploads at once cannot
+        // both read the room left, so the budget holds against parallel uploads.
         lock(&txn, "uploads", a.team.id).await?;
         let (n, bytes, busy) = usage(&txn, a.team.id).await?;
         if busy >= MAX_IN_PROGRESS {
@@ -167,8 +195,12 @@ async fn create(State(app): State<AppState>, a: Actor, body: Body) -> Response {
                 "uploads_in_progress",
             )));
         }
-        if n >= MAX_UPLOADS || bytes + reserve > MAX_UPLOAD_BYTES {
+        if n >= MAX_UPLOADS {
             return Ok(Err(reply(StatusCode::CONFLICT, "too_many_uploads")));
+        }
+        let budget = team_budget(&txn, a.team.id, app.team_storage_bytes).await?;
+        if budget > 0 && bytes.saturating_add(reserve) > budget {
+            return Ok(Err(storage_full(bytes, budget)));
         }
         txn.execute_raw(sql(
             "INSERT INTO media_uploads (id, team_id, storage_key, url, content_type, size, \

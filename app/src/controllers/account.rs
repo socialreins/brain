@@ -131,7 +131,8 @@ pub const MEMBER: &[Part] = &[
         "teams",
         "id, name, code, slug, created_at",
         "updated_at, public_pages, newsletter, require_approval, newsletter_sender_name, \
-         newsletter_sender_address, newsletter_sender_logo, automations_paused",
+         newsletter_sender_address, newsletter_sender_logo, automations_paused, \
+         storage_budget_bytes",
         "id = $1",
     )),
     part(
@@ -155,7 +156,7 @@ pub const TEAM_PARTS: &[Part] = &[
     one(part("team", "teams",
         "id, name, code, slug, created_at, updated_at, public_pages, newsletter, require_approval, \
          newsletter_sender_name, newsletter_sender_address, newsletter_sender_logo, \
-         automations_paused", "", "id = $1")),
+         automations_paused, storage_budget_bytes", "", "id = $1")),
     keyed(one(part("billing", "subscriptions",
         "plan_id, status, trial_ends_at, current_period_end, cancel_at_period_end, created_at",
         "team_id, provider, provider_customer_id, provider_subscription_id, updated_at, \

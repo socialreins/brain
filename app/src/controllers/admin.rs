@@ -284,6 +284,15 @@ pub struct AdminTeam {
     pub plan_status: Option<String>,
     /// `stripe`, or `comp` for a free plan an admin gave.
     pub plan_provider: Option<String>,
+    /// Bytes of uploads the team keeps now (`media_uploads`, an upload in progress counting what
+    /// it may take).
+    pub storage_used: i64,
+    /// The team's upload budget in bytes: its own `storage_budget_bytes` when set, else
+    /// `TEAM_STORAGE_BYTES`. 0 is unlimited.
+    pub storage_budget: i64,
+    /// The budget an admin set for this team alone (`storage_budget_bytes`), `null` while it
+    /// uses `TEAM_STORAGE_BYTES`.
+    pub storage_budget_override: Option<i64>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -301,7 +310,11 @@ const TEAMS: &str = "SELECT t.id, t.name, t.created_at, \
     (SELECT u.email FROM team_user m JOIN users u ON u.id = m.user_id \
       WHERE m.team_id = t.id AND m.role = 'owner' \
       ORDER BY m.created_at, u.id LIMIT 1) AS owner_email, \
-    s.plan_id AS plan, s.status AS plan_status, s.provider AS plan_provider \
+    s.plan_id AS plan, s.status AS plan_status, s.provider AS plan_provider, \
+    (SELECT coalesce(sum(u.size), 0)::bigint FROM media_uploads u \
+      WHERE u.team_id = t.id) AS storage_used, \
+    coalesce(t.storage_budget_bytes, $4::bigint) AS storage_budget, \
+    t.storage_budget_bytes AS storage_budget_override \
     FROM teams t LEFT JOIN subscriptions s ON s.team_id = t.id WHERE t.name ILIKE $1 \
     ORDER BY t.created_at DESC, t.id DESC LIMIT $2 OFFSET $3";
 
@@ -321,7 +334,8 @@ async fn teams(
     let found = async {
         let count = "SELECT count(*) AS n FROM teams t WHERE t.name ILIKE $1";
         let total = total(&app, count, &pattern).await?;
-        let values = [pattern.into(), limit.into(), offset.into()];
+        let default = app.team_storage_bytes;
+        let values = [pattern.into(), limit.into(), offset.into(), default.into()];
         let rows = app.db.query_all_raw(stmt(TEAMS, values)).await?;
         let teams = rows
             .iter()
@@ -337,6 +351,9 @@ async fn teams(
                     plan: r.try_get("", "plan")?,
                     plan_status: r.try_get("", "plan_status")?,
                     plan_provider: r.try_get("", "plan_provider")?,
+                    storage_used: r.try_get("", "storage_used")?,
+                    storage_budget: r.try_get("", "storage_budget")?,
+                    storage_budget_override: r.try_get("", "storage_budget_override")?,
                 })
             })
             .collect::<Result<_, DbErr>>()?;
@@ -995,6 +1012,89 @@ async fn save_signup_settings(
     }
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct NewStorageBudget {
+    /// Bytes: 0 is unlimited for this team, and the most is 1 TiB (1099511627776). `null`
+    /// clears the team's own budget, which returns it to `TEAM_STORAGE_BYTES`.
+    pub bytes: Option<i64>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct TeamStorage {
+    /// Bytes of uploads the team keeps now (an upload in progress counts what it may take).
+    pub used: i64,
+    /// The budget in force after the change: the team's own, else `TEAM_STORAGE_BYTES`.
+    /// 0 is unlimited.
+    pub budget: i64,
+}
+
+/// Sets a team's own upload storage budget, or clears it (`bytes: null`). Past the budget a new
+/// upload is refused (`413 storage_limit`); it never deletes what is stored. `422
+/// invalid_storage_budget` outside 0 to 1 TiB, `404` for an unknown team, and a sign-in from the
+/// last 10 minutes (else `403 reauth_required`), like the console's other writes.
+#[utoipa::path(put, path = "/admin/teams/{id}/storage-budget", tag = "admin",
+    security(("session" = [])), params(("id" = Uuid, Path,)), request_body = NewStorageBudget,
+    responses((status = 200, body = TeamStorage), (status = 401, body = Error),
+        (status = 403, body = Error), (status = 404, body = Error), (status = 422, body = Error),
+        (status = 500, body = Error)))]
+async fn storage_budget(
+    _: FromWeb,
+    State(app): State<AppState>,
+    Admin(current): Admin,
+    Path(id): Path<Uuid>,
+    Body(body): Body<NewStorageBudget>,
+) -> Response {
+    if !current.recent() {
+        return reply(StatusCode::FORBIDDEN, "reauth_required");
+    }
+    if body
+        .bytes
+        .is_some_and(|n| !(0..=crate::controllers::uploads::MAX_STORAGE_BYTES).contains(&n))
+    {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_storage_budget");
+    }
+    let done = async {
+        let written = app
+            .db
+            .execute_raw(stmt(
+                "UPDATE teams SET storage_budget_bytes = $2 WHERE id = $1",
+                [id.into(), body.bytes.into()],
+            ))
+            .await?
+            .rows_affected();
+        if written == 0 {
+            return Ok(None);
+        }
+        let row = app
+            .db
+            .query_one_raw(stmt(
+                "SELECT (SELECT coalesce(sum(size), 0)::bigint FROM media_uploads \
+                    WHERE team_id = $1) AS used, \
+                 coalesce(storage_budget_bytes, $2::bigint) AS budget FROM teams WHERE id = $1",
+                [id.into(), app.team_storage_bytes.into()],
+            ))
+            .await?
+            .ok_or_else(|| DbErr::Custom("team went away".into()))?;
+        Ok::<_, DbErr>(Some(TeamStorage {
+            used: row.try_get("", "used")?,
+            budget: row.try_get("", "budget")?,
+        }))
+    };
+    match done.await {
+        Ok(Some(storage)) => {
+            tracing::info!(
+                admin = %current.0.email,
+                team = %id,
+                bytes = ?body.bytes,
+                "team storage budget set"
+            );
+            Json(storage).into_response()
+        }
+        Ok(None) => reply(StatusCode::NOT_FOUND, "not_found"),
+        Err(e) => internal(e, "storage budget"),
+    }
+}
+
 pub fn api() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(overview))
@@ -1004,6 +1104,7 @@ pub fn api() -> OpenApiRouter<AppState> {
         .routes(routes!(invite_preview, invite))
         .routes(routes!(grant_credits))
         .routes(routes!(comp_plan, end_comp_plan))
+        .routes(routes!(storage_budget))
         .routes(routes!(remove))
         .routes(routes!(page_reports, take_down))
         .routes(routes!(signup_settings, save_signup_settings))

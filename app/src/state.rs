@@ -34,6 +34,9 @@ pub struct AppState {
     pub live_limiter: Arc<RateLimiter<uuid::Uuid>>,
     /// Per-team limit on `POST /v1/uploads`.
     pub upload_limiter: Arc<RateLimiter<uuid::Uuid>>,
+    /// `TEAM_STORAGE_BYTES`: the upload bytes a team with no `teams.storage_budget_bytes` may
+    /// keep, 0 for unlimited (`controllers::uploads`).
+    pub team_storage_bytes: i64,
     /// Per-token limit on every request made with an API token.
     pub api_token_limiter: Arc<RateLimiter<uuid::Uuid>>,
     pub brain_url: String,
@@ -106,6 +109,7 @@ impl AppState {
             moderate_limiter: Arc::new(RateLimiter::per_minute(60)),
             live_limiter: Arc::new(RateLimiter::per_minute(60)),
             upload_limiter: Arc::new(RateLimiter::per_minute(60)),
+            team_storage_bytes: config.team_storage_bytes,
             api_token_limiter: Arc::new(RateLimiter::per_minute(120)),
             brain_url: config.brain_url.clone(),
             web_url: config.web_url.clone(),
