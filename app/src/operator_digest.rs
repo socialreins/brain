@@ -311,10 +311,10 @@ fn clean(text: &str) -> String {
         } else {
             &word
         });
-        if value {
+        if matches!(lower.as_str(), "bearer" | "basic") {
+            (value, used) = (true, false);
+        } else if value {
             used = true;
-        } else {
-            value = matches!(lower.as_str(), "bearer" | "basic");
         }
         i = end;
     }
