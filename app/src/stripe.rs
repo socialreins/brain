@@ -9,6 +9,8 @@ use serde_json::Value;
 pub const DEFAULT_API_URL: &str = "https://api.stripe.com";
 /// How far a webhook's timestamp may be from now, the same as Stripe's own libraries.
 pub const TOLERANCE_SECONDS: i64 = 300;
+/// Pages of 100 read when listing subscriptions (`Stripe::subscriptions`).
+const LIST_PAGES: usize = 20;
 /// X credit packs (decision 0006): `(pack id, credits)`, one-time, never expire.
 pub const PACKS: [(&str, i64); 2] = [("x100", 100), ("x500", 500)];
 
@@ -96,6 +98,11 @@ impl Stripe {
         self.secret.is_some() && self.prices.len() == 4
     }
 
+    /// Whether subscriptions can be read: the key alone.
+    pub fn can_read(&self) -> bool {
+        self.secret.is_some()
+    }
+
     /// Whether credit packs can be sold: the key and both pack prices.
     pub fn packs_on(&self) -> bool {
         self.secret.is_some() && self.packs.len() == PACKS.len()
@@ -161,9 +168,14 @@ impl Stripe {
             .ok_or_else(|| StripeError(None, "not_configured".into()))?;
         let mut req = self
             .client
-            .request(method, format!("{}{path}", self.api_url))
-            .basic_auth(key, None::<&str>)
-            .form(form);
+            .request(method.clone(), format!("{}{path}", self.api_url))
+            .basic_auth(key, None::<&str>);
+        // A read puts its filters in the query, a write sends a form.
+        req = if method == reqwest::Method::GET {
+            req.query(form)
+        } else {
+            req.form(form)
+        };
         if let Some(k) = idempotency {
             req = req.header("Idempotency-Key", k);
         }
@@ -184,6 +196,30 @@ impl Stripe {
             Some(status.as_u16()),
             code.chars().take(60).collect(),
         ))
+    }
+
+    /// The subscriptions Stripe holds in `status`, at most `LIST_PAGES` pages of 100. Read only.
+    pub async fn subscriptions(&self, status: &str) -> Result<Vec<Value>, StripeError> {
+        let mut out: Vec<Value> = Vec::new();
+        for _ in 0..LIST_PAGES {
+            let mut query = vec![
+                ("status".to_owned(), status.to_owned()),
+                ("limit".to_owned(), "100".to_owned()),
+            ];
+            if let Some(last) = out.last().and_then(|s| s["id"].as_str()) {
+                query.push(("starting_after".to_owned(), last.to_owned()));
+            }
+            let page = self
+                .call(reqwest::Method::GET, "/v1/subscriptions", &query, None)
+                .await?;
+            let data = page["data"].as_array().cloned().unwrap_or_default();
+            out.extend(data);
+            if page["has_more"].as_bool() != Some(true) {
+                return Ok(out);
+            }
+        }
+        // shortcut: more than LIST_PAGES x 100 live subscriptions are not all read; raise it then.
+        Err(StripeError(None, "too_many".into()))
     }
 
     /// A Checkout Session: the URL to send the customer to. Called twice with the same `key`
