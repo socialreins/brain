@@ -186,10 +186,12 @@ async fn collect(app: &AppState, from: DateTime<Utc>, now: DateTime<Utc>) -> Res
     for r in rows {
         let kind: String = r.try_get("", "kind")?;
         let error: Option<String> = r.try_get("", "error")?;
-        teams
-            .entry(r.try_get("", "team")?)
-            .or_default()
-            .push(r.try_get("", "number")?);
+        let numbers = teams.entry(r.try_get("", "team")?).or_default();
+        let number = r.try_get("", "number")?;
+        // A post that failed and went late has two notices.
+        if !numbers.contains(&number) {
+            numbers.push(number);
+        }
         // A late post's text is its due time, a stopped repeat's is not about publishing.
         if matches!(kind.as_str(), "failed" | "partial") {
             for reason in reasons_of(error.as_deref().unwrap_or("No reason was stored.")) {
@@ -255,41 +257,62 @@ fn reasons_of(error: &str) -> Vec<String> {
         .collect()
 }
 
-/// `text` as one short line with what could identify a person or open a door removed: links
-/// keep only their host (no path, query or fragment), addresses, handles and long
-/// token-looking words go, and the value of any `name=value` goes.
+/// `text` as one short line with what could identify a person or open a door removed: a link
+/// keeps its scheme and host only (no user info, path, query or fragment, wherever it sits), and
+/// a word goes when it holds an `@` (address, handle), looks like a token (16 or more
+/// letters, digits and `-_.+/~%|` with a digit in them), is a name with two dots (`a.b.c`), or
+/// follows `=`, `Bearer` or `Basic`.
+/// shortcut: a provider error that quotes a post or an account's display name is only cut
+/// short; move to fixed reason codes if one does.
 fn clean(text: &str) -> String {
-    let mut after_scheme = false;
-    let words: Vec<String> = text
-        .split_whitespace()
-        .map(|w| {
-            let secret = std::mem::replace(&mut after_scheme, matches!(w, "Bearer" | "Basic"));
-            let bare = w.trim_matches(|c: char| !c.is_alphanumeric() && c != '@');
-            if secret {
-                "<redacted>".into()
-            } else if w.starts_with("https://") || w.starts_with("http://") {
-                let (scheme, rest) = w.split_once("//").unwrap_or_default();
-                format!(
-                    "{scheme}//{}",
-                    rest.split(['/', '?', '#']).next().unwrap_or_default()
-                )
-            } else if let Some((name, _)) = w.split_once('=') {
-                format!("{name}=<redacted>")
-            } else if bare.starts_with('@') || bare.contains('@') {
-                "<handle>".into()
-            } else if bare.len() >= 20
-                && bare.chars().any(|c| c.is_ascii_digit())
-                && bare
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "-_.+/".contains(c))
-            {
-                "<redacted>".into()
-            } else {
-                w.to_owned()
+    let run = |c: char| c.is_alphanumeric() || "_-.+/~%|@".contains(c);
+    let chars: Vec<char> = text.chars().collect();
+    let (mut out, mut i, mut value) = (String::new(), 0, false);
+    while i < chars.len() {
+        if !run(chars[i]) {
+            let c = chars[i];
+            if c == '=' {
+                value = true;
+            } else if !(c.is_whitespace() || c == '"' || c == '\'') {
+                value = false;
             }
-        })
-        .collect();
-    post_mail::one_line(&words.join(" "), 120)
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let end = (i..chars.len())
+            .find(|&j| !run(chars[j]))
+            .unwrap_or(chars.len());
+        let word: String = chars[i..end].iter().collect();
+        let lower = word.to_ascii_lowercase();
+        if matches!(lower.as_str(), "http" | "https") && chars[end..].starts_with(&[':', '/', '/'])
+        {
+            let stop = |c: char| c.is_whitespace() || ")]>\"'<,;".contains(c);
+            let k = (end + 3..chars.len())
+                .find(|&j| stop(chars[j]))
+                .unwrap_or(chars.len());
+            let rest: String = chars[end + 3..k].iter().collect();
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+            out.push_str(&format!(
+                "{word}://{}",
+                authority.rsplit('@').next().unwrap_or_default()
+            ));
+            (i, value) = (k, false);
+            continue;
+        }
+        let token = word.len() >= 16 && word.chars().any(|c| c.is_ascii_digit());
+        let named = word.split('.').filter(|p| !p.is_empty()).count() >= 3;
+        out.push_str(if word.contains('@') {
+            "<handle>"
+        } else if value || token || named {
+            "<redacted>"
+        } else {
+            &word
+        });
+        value = matches!(lower.as_str(), "bearer" | "basic");
+        i = end;
+    }
+    post_mail::one_line(&out, 120)
 }
 
 fn plural(n: i64, one: &str, many: &str) -> String {
@@ -412,12 +435,25 @@ mod tests {
         let reasons = reasons_of(error);
         assert_eq!(reasons[0], "Bluesky refused it (InvalidRequest).");
         assert_eq!(reasons[1], "GET https://graph.test failed");
-        let dirty = clean(
-            "Bearer abcdef token=xyz mail me@a.test @ann AbCdEf1234567890AbCdEf1234567890 ok https://a.test/p?k=v#f",
+        assert_eq!(
+            clean(
+                "Bearer abcdef token=xyz mail me@a.test @ann AbCdEf1234567890AbCdEf1234567890 ok"
+            ),
+            "Bearer <redacted> token=<redacted> mail <handle> <handle> <redacted> ok"
         );
         assert_eq!(
-            dirty,
-            "Bearer <redacted> token=<redacted> mail <handle> <handle> <redacted> ok https://a.test"
+            clean(
+                "https://u:pw@a.test/p?k=v#f (https://b.test/x?t=1) \
+                 {\"access_token\":\"EAAB123456789012345\"} ann.bsky.social ..."
+            ),
+            "https://a.test (https://b.test) {\"access_token\":\"<redacted>\"} <redacted> ..."
+        );
+        // A link in brackets, as reqwest writes it, loses its path too.
+        assert_eq!(
+            clean(
+                "error sending request for url (https://graph.test/v19.0/1234/feed?access_token=x)"
+            ),
+            "error sending request for url (https://graph.test)"
         );
         assert!(clean(&"x ".repeat(200)).ends_with("..."));
     }
