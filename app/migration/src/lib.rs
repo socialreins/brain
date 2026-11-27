@@ -98,6 +98,7 @@ mod m20270112_000001_post_notice_retries;
 mod m20270113_000001_account_deletions;
 mod m20270114_000001_drop_team_slug_holds;
 mod m20270115_000001_inbox_search_trigram;
+mod m20270116_000001_credit_takebacks;
 mod url_numbers;
 
 pub struct Migrator;
@@ -204,6 +205,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20270113_000001_account_deletions::Migration),
             Box::new(m20270114_000001_drop_team_slug_holds::Migration),
             Box::new(m20270115_000001_inbox_search_trigram::Migration),
+            Box::new(m20270116_000001_credit_takebacks::Migration),
             // inject-above (do not remove this comment)
         ]
     }
