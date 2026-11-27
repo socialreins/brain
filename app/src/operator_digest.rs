@@ -432,7 +432,7 @@ fn compose(facts: &Facts, day: &str) -> (String, String) {
     lines.push(format!("X inboxes paused after errors: {}", facts.x_paused));
     let (n, taken, short) = facts.takebacks;
     lines.push(format!(
-        "Credit pack refunds or disputes taken back: {n} ({taken} credits taken, {short} already spent)"
+        "Credit pack refunds or disputes: {n} ({taken} credits taken back, {short} already spent)"
     ));
     lines.push(backup);
     let total = failed + partial + late + repeat;
@@ -544,7 +544,7 @@ mod tests {
         assert_eq!(subject, "SocialReins digest 2026-11-27: 2 take-backs");
         assert!(
             text.contains(
-                "Credit pack refunds or disputes taken back: 2 (130 credits taken, 70 already spent)"
+                "Credit pack refunds or disputes: 2 (130 credits taken back, 70 already spent)"
             ),
             "{text}"
         );

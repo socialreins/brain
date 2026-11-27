@@ -10815,8 +10815,30 @@ mod teams {
                     assert_eq!(mails[2].0, "SocialReins digest 2026-11-26: backup");
                     assert!(mails[2].1.contains("STALE"), "{}", mails[2].1);
                     std::fs::remove_file(media_dir().join("backups/latest.json")).unwrap();
+                    // A credit pack take-back from the day before is counted: one that took 30
+                    // credits and found 70 already spent.
+                    exec(
+                        &db,
+                        format!(
+                            "INSERT INTO credit_takebacks (event_id, team_id, payment_intent, kind, \
+                             owed, taken, created_at) VALUES ('evt_digest_{run}', '{team_id}', \
+                             'pi_digest_{run}', 'dispute', 100, 30, '2026-11-26T20:00:00Z')",
+                            run = *RUN
+                        ),
+                    )
+                    .await;
                     assert_eq!(run(&state, fri).await.unwrap(), Outcome::Sent(1));
-                    assert!(digests()[3].1.contains("could not be read"));
+                    let friday = digests()[3].clone();
+                    assert!(friday.1.contains("could not be read"));
+                    assert!(friday.0.contains("1 take-back"), "{}", friday.0);
+                    assert!(
+                        friday.1.contains(
+                            "Credit pack refunds or disputes: 1 (30 credits taken back, 70 already spent)"
+                        ),
+                        "{}",
+                        friday.1
+                    );
+                    exec(&db, "DELETE FROM credit_takebacks".into()).await;
 
                     // No admin address: logged, nothing sent, the day is done.
                     state.admin_emails = vec![];
@@ -38176,6 +38198,17 @@ mod teams {
                 })
                 .to_string()
             };
+            // A dispute names its charge and payment, not the refunded amount.
+            let dispute = |evt: &str, payment: &str| {
+                json!({
+                    "id": format!("{evt}_{}", *RUN), "type": "charge.dispute.created", "created": now,
+                    "data": {"object": {
+                        "id": "dp_t", "charge": "ch_t", "payment_intent": payment, "amount": 500,
+                        "status": "needs_response", "metadata": {}
+                    }}
+                })
+                .to_string()
+            };
             let send = |body: String| {
                 let (s, db) = (&s, &db);
                 async move {
@@ -38209,7 +38242,7 @@ mod teams {
             .unwrap();
             assert_eq!(spent, socialreins_brain::billing::Spent::Taken);
             assert_eq!(x_credits(&s, &owner).await, 20);
-            send(charge("evt_t6", "charge.dispute.created", &pi("b"), 0)).await;
+            send(dispute("evt_t6", &pi("b"))).await;
             assert_eq!(x_credits(&s, &owner).await, 0);
             send(charge("evt_t7", "charge.refunded", &pi("b"), 500)).await;
             assert_eq!(x_credits(&s, &owner).await, 0);
@@ -38217,6 +38250,14 @@ mod teams {
             send(charge("evt_t8", "charge.refunded", &pi("nobody"), 500)).await;
             send(pack("evt_t9", "cs_t9", &pi("c"))).await;
             assert_eq!(x_credits(&s, &owner).await, 100);
+            // Refund events out of order (500 before 250): the later, smaller one asks for
+            // nothing. Then a dispute asks only for what the refund left.
+            send(charge("evt_t10", "charge.refunded", &pi("c"), 250)).await;
+            assert_eq!(x_credits(&s, &owner).await, 50);
+            send(charge("evt_t11", "charge.refunded", &pi("c"), 100)).await;
+            assert_eq!(x_credits(&s, &owner).await, 50);
+            send(dispute("evt_t12", &pi("c"))).await;
+            assert_eq!(x_credits(&s, &owner).await, 0);
             let rows = db
                 .query_all_raw(Statement::from_sql_and_values(
                     DbBackend::Postgres,
@@ -38244,6 +38285,8 @@ mod teams {
                     (a.clone(), "refund".into(), 50, 50),
                     (a, "refund".into(), 50, 50),
                     (b, "dispute".into(), 100, 20),
+                    (pi("c"), "refund".into(), 50, 50),
+                    (pi("c"), "dispute".into(), 50, 50),
                 ]
             );
             let reason = db

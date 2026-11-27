@@ -687,7 +687,10 @@ struct TakenBack {
 /// it; what earlier events of the payment already asked for is not asked again. Never below a
 /// zero balance: the part already spent is not taken (the ledger reason and `credit_takebacks`
 /// say how much). Under the team row lock, as `billing::spend`, so a post cannot spend what is
-/// being taken. A won dispute does not give the credits back.
+/// being taken. A won dispute does not give the credits back. Limits: credits held by an X post
+/// that is still publishing count as spent, so `release_x` can give a few back if it fails; an
+/// event that comes before its pack's grant (a failed first delivery) finds nothing and is only
+/// mailed; a dispute asks for the whole pack whatever its `amount`.
 async fn take_back(
     db: &impl ConnectionTrait,
     kind: &str,
