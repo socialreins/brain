@@ -236,6 +236,7 @@ pub const NOT_EXPORTED: &[&str] = &[
     "automation_misses",
     "automation_runs",
     "contact_opt_outs",
+    "credit_takebacks",
     "idempotency_keys",
     "inbox_actions",
     "media_uploads",

@@ -10815,8 +10815,30 @@ mod teams {
                     assert_eq!(mails[2].0, "SocialReins digest 2026-11-26: backup");
                     assert!(mails[2].1.contains("STALE"), "{}", mails[2].1);
                     std::fs::remove_file(media_dir().join("backups/latest.json")).unwrap();
+                    // A credit pack take-back from the day before is counted: one that took 30
+                    // credits and found 70 already spent.
+                    exec(
+                        &db,
+                        format!(
+                            "INSERT INTO credit_takebacks (event_id, team_id, payment_intent, kind, \
+                             owed, taken, created_at) VALUES ('evt_digest_{run}', '{team_id}', \
+                             'pi_digest_{run}', 'dispute', 100, 30, '2026-11-26T20:00:00Z')",
+                            run = uuid::Uuid::now_v7().simple()
+                        ),
+                    )
+                    .await;
                     assert_eq!(run(&state, fri).await.unwrap(), Outcome::Sent(1));
-                    assert!(digests()[3].1.contains("could not be read"));
+                    let friday = digests()[3].clone();
+                    assert!(friday.1.contains("could not be read"));
+                    assert!(friday.0.contains("1 take-back"), "{}", friday.0);
+                    assert!(
+                        friday.1.contains(
+                            "Credit pack refunds or disputes: 1 (30 credits taken back, 70 already spent)"
+                        ),
+                        "{}",
+                        friday.1
+                    );
+                    exec(&db, "DELETE FROM credit_takebacks".into()).await;
 
                     // No admin address: logged, nothing sent, the day is done.
                     state.admin_emails = vec![];
@@ -38308,6 +38330,143 @@ mod teams {
             assert_ne!(keys[0], keys[2], "another pack");
             assert_ne!(keys[0], keys[3], "another team");
             assert!(keys[0].starts_with("checkout:"), "{keys:?}");
+        }
+
+        /// A refund or dispute of a pack takes its credits back: once per event, its share of the
+        /// pack for a partial refund, all of it for a dispute, never below a zero balance (the
+        /// ledger and `credit_takebacks` say what was already spent), and nothing for a payment
+        /// brain did not grant.
+        #[tokio::test]
+        #[serial]
+        async fn a_refund_or_dispute_takes_pack_credits_back_once_and_never_below_zero() {
+            let (s, db) = on(true).await;
+            let (_, owner, _) = user(&s, &db).await;
+            let team = current(&s, &owner).await["id"].as_str().unwrap().to_owned();
+            let now = Utc::now().timestamp();
+            let pi = |n: &str| format!("pi_{n}_{}", *RUN);
+            let pack = |evt: &str, session: &str, payment: &str| {
+                json!({
+                    "id": format!("{evt}_{}", *RUN), "type": "checkout.session.completed", "created": now,
+                    "data": {"object": {
+                        "id": format!("{session}_{}", *RUN), "mode": "payment", "payment_status": "paid",
+                        "payment_intent": payment, "metadata": {"team_id": team, "pack": "x100"}
+                    }}
+                })
+                .to_string()
+            };
+            let charge = |evt: &str, kind: &str, payment: &str, refunded: i64| {
+                json!({
+                    "id": format!("{evt}_{}", *RUN), "type": kind, "created": now,
+                    "data": {"object": {
+                        "id": "ch_t", "payment_intent": payment, "amount": 500,
+                        "amount_refunded": refunded, "metadata": {"team_id": team, "pack": "x100"}
+                    }}
+                })
+                .to_string()
+            };
+            // A dispute names its charge and payment, not the refunded amount.
+            let dispute = |evt: &str, payment: &str| {
+                json!({
+                    "id": format!("{evt}_{}", *RUN), "type": "charge.dispute.created", "created": now,
+                    "data": {"object": {
+                        "id": "dp_t", "charge": "ch_t", "payment_intent": payment, "amount": 500,
+                        "status": "needs_response", "metadata": {}
+                    }}
+                })
+                .to_string()
+            };
+            let send = |body: String| {
+                let (s, db) = (&s, &db);
+                async move {
+                    assert_eq!(deliver(s, &body, WHSEC, now).await.status_code(), 200);
+                    let _ = db;
+                }
+            };
+            // A pack of 100; half refunded takes 50, the same event again nothing, the rest of the
+            // refund takes the other 50, and a repeat of the full refund nothing more.
+            send(pack("evt_t1", "cs_t1", &pi("a"))).await;
+            assert_eq!(x_credits(&s, &owner).await, 100);
+            let half = charge("evt_t2", "charge.refunded", &pi("a"), 250);
+            send(half.clone()).await;
+            send(half).await;
+            assert_eq!(x_credits(&s, &owner).await, 50);
+            send(charge("evt_t3", "charge.refunded", &pi("a"), 500)).await;
+            send(charge("evt_t4", "charge.refunded", &pi("a"), 500)).await;
+            assert_eq!(x_credits(&s, &owner).await, 0);
+            // A pack with 80 spent, then disputed: only the 20 left go, the balance stays at 0,
+            // and a later refund of the same payment asks for nothing more.
+            send(pack("evt_t5", "cs_t5", &pi("b"))).await;
+            let spent = socialreins_brain::billing::spend(
+                &db,
+                team.parse().unwrap(),
+                socialreins_brain::billing::Kind::X,
+                80,
+                "test",
+                Some("t-spend"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(spent, socialreins_brain::billing::Spent::Taken);
+            assert_eq!(x_credits(&s, &owner).await, 20);
+            send(dispute("evt_t6", &pi("b"))).await;
+            assert_eq!(x_credits(&s, &owner).await, 0);
+            send(charge("evt_t7", "charge.refunded", &pi("b"), 500)).await;
+            assert_eq!(x_credits(&s, &owner).await, 0);
+            // A payment brain never granted changes nothing, and a new pack starts clean.
+            send(charge("evt_t8", "charge.refunded", &pi("nobody"), 500)).await;
+            send(pack("evt_t9", "cs_t9", &pi("c"))).await;
+            assert_eq!(x_credits(&s, &owner).await, 100);
+            // Refund events out of order (500 before 250): the later, smaller one asks for
+            // nothing. Then a dispute asks only for what the refund left.
+            send(charge("evt_t10", "charge.refunded", &pi("c"), 250)).await;
+            assert_eq!(x_credits(&s, &owner).await, 50);
+            send(charge("evt_t11", "charge.refunded", &pi("c"), 100)).await;
+            assert_eq!(x_credits(&s, &owner).await, 50);
+            send(dispute("evt_t12", &pi("c"))).await;
+            assert_eq!(x_credits(&s, &owner).await, 0);
+            let rows = db
+                .query_all_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT payment_intent, kind, owed, taken FROM credit_takebacks \
+                     WHERE team_id = $1::uuid ORDER BY created_at, event_id",
+                    [team.clone().into()],
+                ))
+                .await
+                .unwrap();
+            let got: Vec<(String, String, i64, i64)> = rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.try_get("", "payment_intent").unwrap(),
+                        r.try_get("", "kind").unwrap(),
+                        r.try_get("", "owed").unwrap(),
+                        r.try_get("", "taken").unwrap(),
+                    )
+                })
+                .collect();
+            let (a, b) = (pi("a"), pi("b"));
+            assert_eq!(
+                got,
+                vec![
+                    (a.clone(), "refund".into(), 50, 50),
+                    (a, "refund".into(), 50, 50),
+                    (b, "dispute".into(), 100, 20),
+                    (pi("c"), "refund".into(), 50, 50),
+                    (pi("c"), "dispute".into(), 50, 50),
+                ]
+            );
+            let reason = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT reason FROM credit_ledger WHERE team_id = $1::uuid AND amount = -20",
+                    [team.into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get::<String>("", "reason")
+                .unwrap();
+            assert!(reason.contains("20 of 100, 80 already spent"), "{reason}");
         }
 
         /// What only a person can fix reaches `ADMIN_EMAILS` by mail, once per event: a paid
