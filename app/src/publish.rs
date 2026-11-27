@@ -2413,13 +2413,18 @@ impl XHold {
     /// dropped connection) may have been taken and billed by X, so it stays paid for. A 5xx
     /// answer is not told apart from a refusal and is still given back.
     fn failed(&mut self, msg: &str) {
-        // A dropped connection that was not certainly never opened may have carried the post.
-        let dropped =
-            msg.contains("could not be reached") && !msg.contains(crate::connectors::UNSENT);
-        if outcome_unknown(Some(msg)) || dropped {
+        if credit_kept(msg) {
             self.sent += 1;
         }
     }
+}
+
+/// Whether a failed X call's credit stays spent: the call may have been taken and billed by X
+/// (`outcome_unknown`, or a connection that dropped without being certainly never opened).
+/// The one rule of `XHold::failed` and of `x_credit_sweep`, which gives back what it says no to.
+pub fn credit_kept(msg: &str) -> bool {
+    let dropped = msg.contains("could not be reached") && !msg.contains(crate::connectors::UNSENT);
+    outcome_unknown(Some(msg)) || dropped
 }
 
 /// Gives back the credits held for X posts that did not go out. A failure here is logged; the
