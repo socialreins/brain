@@ -49,7 +49,7 @@ path = "src/bin/main.rs"
 [dev-dependencies]
 axum-test = "17"
 serial_test = "4"
-webauthn-authenticator-rs = { version = "0.5.5", features = ["softpasskey"] }
+webauthn-authenticator-rs = { version = "0.6.2", features = ["softpasskey"] }
 
 [lints]
 workspace = true
