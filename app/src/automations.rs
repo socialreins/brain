@@ -24,6 +24,10 @@
 //! and a person may retry a run that ended that way (`retry`) when nothing else of it went out.
 //! The same for an AI step whose provider did not answer (a timeout, a 429 or a 5xx: nothing was sent and
 //! the credit is given back; the new try pays under a new reference, `ai_reference`).
+//! An action list does the same when nothing of it went out and an AI action got no answer
+//! (`finish_or_retry`): the run waits 5, 10 and 15 minutes and the whole list runs again
+//! (`resume_list`), unless the automation was switched off or its actions changed; a list that
+//! already sent something is final.
 //! Every other failure is final, because it may have been sent.
 //!
 //! `tag_contact`, an action and a step, sends nothing: it adds a tag to the contact of the
@@ -1573,7 +1577,7 @@ async fn run_matching(
             flow.advance(run_id, 0, Vec::new()).await?;
         } else {
             let results = act(app, account, item, &a, &actions, page.as_deref(), run_id).await;
-            finish(db, run_id, results).await?;
+            finish_or_retry(db, &a, run_id, results).await?;
         }
         // This automation took the item: the newer ones leave it alone.
         if stop {
@@ -2178,7 +2182,7 @@ async fn claim_step(
     Ok(true)
 }
 
-/// What an AI step pays under: `ai:{run}:{step}`, and `ai:{run}:{step}:{n}` once `n` earlier
+/// What an AI step (`key` is its index) or action (`key` is its kind) pays under: `ai:{run}:{key}`, and `ai:{run}:{step}:{n}` once `n` earlier
 /// tries of the step were paid back (a provider that gave no answer, `retry_later`): a reference
 /// given back is never paid again. A try that was paid and sent (a person's retry of a refused
 /// send) keeps its reference, so it is never paid twice.
@@ -2186,9 +2190,9 @@ async fn ai_reference(
     db: &DatabaseConnection,
     team: Uuid,
     run: Uuid,
-    i: usize,
+    key: impl std::fmt::Display,
 ) -> Result<String, DbErr> {
-    let base = format!("ai:{run}:{i}");
+    let base = format!("ai:{run}:{key}");
     let row = db
         .query_one_raw(sql(
             "SELECT count(*)::int AS n FROM credit_ledger WHERE team_id = $1 \
@@ -2317,6 +2321,17 @@ pub async fn retry(
     if flow {
         return Ok(Ok(()));
     }
+    run_list(app, a, run).await?;
+    Ok(Ok(()))
+}
+/// Runs the action list of `a` for the item of `run`, a run that is `running`, and ends it
+/// (`finish_or_retry`). A run whose item or account is gone ends `skipped`.
+async fn run_list(
+    app: &AppState,
+    a: &automations::Model,
+    run: &automation_runs::Model,
+) -> Result<(), DbErr> {
+    let db = &app.db;
     let item = inbox_items::Entity::find_by_id(run.inbox_item_id)
         .one(db)
         .await?;
@@ -2330,8 +2345,7 @@ pub async fn retry(
     };
     let actions: Vec<Action> = serde_json::from_value(a.actions.clone()).unwrap_or_default();
     let (Some(item), Some(account)) = (item, account) else {
-        settle(db, run.id, "skipped", Some(CHANGED.into()), &[]).await?;
-        return Ok(Ok(()));
+        return settle(db, run.id, "skipped", Some(CHANGED.into()), &[]).await;
     };
     let holds = |t: &str| t.contains("{page}");
     let wanted = actions
@@ -2344,8 +2358,7 @@ pub async fn retry(
         _ => None,
     };
     let results = act(app, &account, &item, a, &actions, page.as_deref(), run.id).await;
-    finish(db, run.id, results).await?;
-    Ok(Ok(()))
+    finish_or_retry(db, a, run.id, results).await
 }
 
 /// Parks a run at its `wait` step: `waiting` until `minutes` from now. A run whose automation
@@ -2486,6 +2499,10 @@ pub async fn resume_due(app: &AppState, budget: Duration) -> Result<usize, DbErr
 
 /// Goes on with a run a round claimed, from the step after its wait.
 pub async fn resume(app: &AppState, run: &automation_runs::Model) -> Result<(), DbErr> {
+    // An action list waits only to run again after a provider did not answer.
+    if run.step_index.is_none() {
+        return resume_list(app, run).await;
+    }
     let db = &app.db;
     let results: Vec<ActionResult> =
         serde_json::from_value(run.results.clone()).unwrap_or_default();
@@ -2813,7 +2830,21 @@ async fn act(
             continue;
         };
         if action.ai() {
-            let (kind, reference) = (action.kind(), format!("ai:{run}:{}", action.kind()));
+            let kind = action.kind();
+            // A try after one the provider never answered (`finish_or_retry`) pays anew.
+            let reference = match ai_reference(&app.db, a.team_id, run, kind).await {
+                Ok(reference) => reference,
+                Err(e) => {
+                    tracing::error!(error = %e, run = %run, "ai reference not read");
+                    results.push(ActionResult {
+                        kind: kind.into(),
+                        status: "failed".into(),
+                        reason: Some("internal".into()),
+                        ..Default::default()
+                    });
+                    continue;
+                }
+            };
             results.push(ai_send(app, account, item, a.id, kind, via, template, &reference).await);
             continue;
         }
@@ -3215,6 +3246,84 @@ pub fn summary(results: &[ActionResult]) -> (&'static str, Option<String>) {
     };
     let reason = sends().find_map(|r| r.reason.clone());
     (status, reason)
+}
+
+/// Whether an action list's results are only the provider of an AI action not answering and
+/// sends that were refused: nothing went out and nothing else may have, so the whole list can be
+/// run again. A send that went out, or failed in a way that may have sent it, makes it final.
+fn nothing_went_out(results: &[ActionResult]) -> bool {
+    let sends = |r: &&ActionResult| !matches!(r.kind.as_str(), "tag_contact" | "stop_automations");
+    results.iter().any(|r| r.unavailable)
+        && results
+            .iter()
+            .filter(sends)
+            .all(|r| r.unavailable || r.status == "skipped")
+}
+
+/// Ends an action list's run, unless an AI action got no answer from its provider and nothing
+/// went out (`nothing_went_out`, the credit is already back): then the run waits `waiting` to
+/// run the list again in 5, 10 and 15 minutes (`MAX_RETRIES`, the same wait as a flow's step).
+/// `resume` takes it up; the list is checked against the actions it started with.
+async fn finish_or_retry(
+    db: &DatabaseConnection,
+    a: &automations::Model,
+    id: Uuid,
+    results: Vec<ActionResult>,
+) -> Result<(), DbErr> {
+    if nothing_went_out(&results) {
+        let stmt = sql(
+            "UPDATE automation_runs SET status = 'waiting', results = '[]', \
+             retries = retries + 1, steps_hash = md5($2::jsonb::text), \
+             resume_at = now() + make_interval(mins => (retries + 1) * 5), \
+             updated_at = now() WHERE id = $1 AND status = 'running' AND retries < $3 \
+             AND step_index IS NULL",
+            vec![id.into(), a.actions.clone().into(), MAX_RETRIES.into()],
+        );
+        if db.execute_raw(stmt).await?.rows_affected() == 1 {
+            return Ok(());
+        }
+    }
+    finish(db, id, results).await
+}
+
+/// Runs an action list's run again, taken up by `tick` after a provider did not answer
+/// (`finish_or_retry`). Ends `skipped` when the automation is off or its actions changed since,
+/// or the team is paused. `resume_at` is cleared first, so a run cut off in the middle ends
+/// `interrupted` (`recover_stuck`) and is never sent twice.
+async fn resume_list(app: &AppState, run: &automation_runs::Model) -> Result<(), DbErr> {
+    let db = &app.db;
+    let a = automations::Entity::find_by_id(run.automation_id)
+        .one(db)
+        .await?;
+    let same = match &a {
+        Some(a) if a.active && a.steps.is_none() => {
+            let stmt = sql(
+                "SELECT steps_hash = md5($2::jsonb::text) AS same FROM automation_runs \
+                 WHERE id = $1",
+                vec![run.id.into(), a.actions.clone().into()],
+            );
+            match db.query_one_raw(stmt).await? {
+                Some(r) => r.try_get::<Option<bool>>("", "same")?.unwrap_or(false),
+                None => false,
+            }
+        }
+        _ => false,
+    };
+    let Some(a) = a.filter(|_| same) else {
+        return settle(db, run.id, "skipped", Some(CHANGED.into()), &[]).await;
+    };
+    if team_paused(db, a.team_id).await? {
+        return settle(db, run.id, "skipped", Some("paused_waiting".into()), &[]).await;
+    }
+    let started = sql(
+        "UPDATE automation_runs SET resume_at = NULL, updated_at = now() \
+         WHERE id = $1 AND status = 'running'",
+        vec![run.id.into()],
+    );
+    if db.execute_raw(started).await?.rows_affected() != 1 {
+        return Ok(());
+    }
+    run_list(app, &a, run).await
 }
 
 async fn finish(
