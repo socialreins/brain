@@ -39,6 +39,13 @@ pub struct Config {
     /// `DATABASE_MAX_CONNECTIONS` (default 20, 5 to 500): the most connections this process
     /// opens to Postgres. Keep it under Postgres's `max_connections` divided by the replicas.
     pub database_max_connections: u32,
+    /// `DATABASE_STATEMENT_TIMEOUT_SECONDS` (default 300, 0 is none, else 5 to 86400): Postgres
+    /// `statement_timeout` of every connection of the app pool (not of migrations).
+    pub database_statement_timeout: u64,
+    /// `DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS` (default 1800, 0 is none, else 5 to
+    /// 86400): Postgres `idle_in_transaction_session_timeout` of the app pool. Must stay above
+    /// the longest round that holds a lock transaction while it works elsewhere.
+    pub database_idle_in_transaction_timeout: u64,
     /// `PUBLISH_DRAIN_SECONDS` (default 120, 10 to 3000): how long a stopping process waits for
     /// the posts it is publishing (`publish::drain`). Set `RAILWAY_DEPLOYMENT_DRAINING_SECONDS`
     /// above it, or Railway kills the process first.
@@ -163,6 +170,16 @@ impl Config {
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
         let database_url = var("DATABASE_URL").ok_or("missing required variable: DATABASE_URL")?;
         let database_max_connections = max_connections(var("DATABASE_MAX_CONNECTIONS"))?;
+        let database_statement_timeout = timeout_seconds(
+            var("DATABASE_STATEMENT_TIMEOUT_SECONDS"),
+            "DATABASE_STATEMENT_TIMEOUT_SECONDS",
+            300,
+        )?;
+        let database_idle_in_transaction_timeout = timeout_seconds(
+            var("DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS"),
+            "DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS",
+            1800,
+        )?;
         let publish_drain =
             std::time::Duration::from_secs(publish_drain(var("PUBLISH_DRAIN_SECONDS"))?);
         let port = match var("PORT") {
@@ -222,6 +239,8 @@ impl Config {
         Ok(Self {
             database_url,
             database_max_connections,
+            database_statement_timeout,
+            database_idle_in_transaction_timeout,
             publish_drain,
             port,
             cors_origins: parse_origins(&origins)?,
@@ -389,6 +408,16 @@ fn max_connections(value: Option<String>) -> Result<u32, String> {
     }
 }
 
+/// A database timeout in seconds: 0 is none, else 5 to 86400 (a day).
+fn timeout_seconds(value: Option<String>, name: &str, default: u64) -> Result<u64, String> {
+    match value.map(|v| v.trim().parse::<u64>()) {
+        None => Ok(default),
+        Some(Ok(0)) => Ok(0),
+        Some(Ok(n)) if (5..=86_400).contains(&n) => Ok(n),
+        Some(_) => Err(format!("{name}: 0, or a number of seconds from 5 to 86400")),
+    }
+}
+
 /// `MEDIA_MAX_BYTES`: the largest video stored, in bytes. Default and most: 1 GiB
 /// (`media::MAX_BYTES`), which saving a post checks against whatever this says.
 fn media_max_bytes(value: Option<String>) -> Result<usize, String> {
@@ -540,6 +569,18 @@ mod tests {
         assert_eq!(size("5"), Ok(5));
         for bad in ["4", "1", "0", "501", "-3", "many", ""] {
             assert!(size(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn database_timeouts_are_zero_or_five_seconds_to_a_day() {
+        let t = |v: Option<&str>| super::timeout_seconds(v.map(Into::into), "X", 300);
+        assert_eq!(t(None), Ok(300));
+        assert_eq!(t(Some("0")), Ok(0));
+        assert_eq!(t(Some(" 5 ")), Ok(5));
+        assert_eq!(t(Some("86400")), Ok(86_400));
+        for bad in ["1", "4", "86401", "-1", "soon", ""] {
+            assert!(t(Some(bad)).is_err(), "{bad}");
         }
     }
 

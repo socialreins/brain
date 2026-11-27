@@ -23,6 +23,10 @@ pub struct List<'a> {
 /// Waits before the two more tries of `Mailer::send`.
 const RETRY_WAITS: [Duration; 2] = [Duration::from_millis(500), Duration::from_millis(1500)];
 
+/// The `rate_limit_hits` bucket counting sign-in mails that could not be sent (after the
+/// tries of `send`), which the operator digest reports.
+pub const SIGNIN_FAILED: &str = "signin-mail-failed";
+
 /// Whether a `deliver` error is the provider being briefly down (no connection, a 429 or a 5xx),
 /// which another try can fix, and not a refusal. A timeout is not retried in place (each
 /// takes 15 seconds); the notice that was being sent is given back and tried later instead.
