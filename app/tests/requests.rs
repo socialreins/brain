@@ -6666,11 +6666,17 @@ mod teams {
                 .unwrap();
                 let unattached = upload(&s, &cookie, file(PNG, 64)).await;
                 assert_eq!(unattached.status_code(), 201);
-                assert_eq!(state.media.release_uploads(&db, 24).await.unwrap(), 0);
+                assert_eq!(
+                    state.media.release_uploads(&db, 24, false).await.unwrap(),
+                    0
+                );
                 assert_eq!(rows(&db).await, 2);
                 let res = req(&s, Method::DELETE, &format!("/v1/posts/{draft}"), &cookie).await;
                 assert!(res.status_code().is_success(), "{}", res.text());
-                assert_eq!(state.media.release_uploads(&db, 24).await.unwrap(), 1);
+                assert_eq!(
+                    state.media.release_uploads(&db, 24, false).await.unwrap(),
+                    1
+                );
                 assert_eq!(rows(&db).await, 1, "the young unattached one stays");
                 s.get(url.strip_prefix(BRAIN).unwrap())
                     .await
@@ -6760,14 +6766,14 @@ mod teams {
                      WHERE team_id = '{team_id}'"
                 );
                 run(old.clone()).await;
-                state.media.release_uploads(&db, 24).await.unwrap();
+                state.media.release_uploads(&db, 24, false).await.unwrap();
                 assert!(kept(url.clone()).await, "kept for the retry");
                 set_body(&db, &id, "fine", json!([])).await;
                 let res = req(&s, Method::POST, &retry_url(&id), &cookie).await;
                 assert_eq!(res.status_code(), 202, "{}", res.text());
                 let p = settled(&s, &cookie, &id).await;
                 assert_eq!(p["status"], "published", "{p}");
-                state.media.release_uploads(&db, 24).await.unwrap();
+                state.media.release_uploads(&db, 24, false).await.unwrap();
                 assert!(!kept(url).await, "gone once nothing may need it");
 
                 // A save holding an upload keeps the sweep off it until it commits.
@@ -6788,7 +6794,7 @@ mod teams {
                 .unwrap();
                 let sweep = tokio::spawn({
                     let (m, db) = (state.media.clone(), db.clone());
-                    async move { m.release_uploads(&db, 24).await.unwrap() }
+                    async move { m.release_uploads(&db, 24, false).await.unwrap() }
                 });
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 txn.commit().await.unwrap();
@@ -6844,7 +6850,7 @@ mod teams {
 
                 // A lost running upload goes after its hours; a stored file with no row too.
                 run(pending(media::PENDING_HOURS + 1)).await;
-                state.media.release_uploads(&db, 24).await.unwrap();
+                state.media.release_uploads(&db, 24, false).await.unwrap();
                 let left = db
                     .query_one_raw(sea_orm::Statement::from_string(
                         sea_orm::DbBackend::Postgres,
@@ -6890,6 +6896,104 @@ mod teams {
                     }
                 }
                 assert!(limited);
+            }
+
+            /// A team whose live plan ended keeps no uploads: no post of it will publish until
+            /// it pays, so the sweep releases them even while a post still names them. With
+            /// billing off (and on a live plan) the old rule holds.
+            #[tokio::test]
+            #[serial]
+            async fn uploads_go_when_the_plan_ends() {
+                use sea_orm::ConnectionTrait;
+                const BRAIN: &str = "https://brain.test";
+                const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+                let (s, db, state) = on_mock_at(media::MAX_BYTES, Some(BRAIN)).await;
+                let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                // Only this test's team: the sweep counts every team's uploads.
+                db.execute_unprepared(&format!(
+                    "DELETE FROM media_uploads WHERE team_id <> '{team_id}'"
+                ))
+                .await
+                .unwrap();
+                let kept = |url: String| {
+                    let db = db.clone();
+                    async move {
+                        db.query_one_raw(sea_orm::Statement::from_sql_and_values(
+                            sea_orm::DbBackend::Postgres,
+                            "SELECT 1 AS ok FROM media_uploads WHERE url = $1",
+                            [url.into()],
+                        ))
+                        .await
+                        .unwrap()
+                        .is_some()
+                    }
+                };
+                let old = {
+                    let q = format!(
+                        "UPDATE media_uploads SET created_at = now() - interval '25 hours' \
+                         WHERE team_id = '{team_id}'"
+                    );
+                    let db = db.clone();
+                    move || {
+                        let (db, q) = (db.clone(), q.clone());
+                        async move { db.execute_unprepared(&q).await.unwrap() }
+                    }
+                };
+                let plan = |status: &str| {
+                    let q = format!(
+                        "INSERT INTO subscriptions (team_id, plan_id, status) \
+                         VALUES ('{team_id}', 'automation', '{status}') \
+                         ON CONFLICT (team_id) DO UPDATE SET status = '{status}'"
+                    );
+                    let db = db.clone();
+                    async move { db.execute_unprepared(&q).await.unwrap() }
+                };
+
+                // A scheduled post names an upload, which keeps it past its day.
+                let made = upload(&s, &cookie, file(PNG, 64)).await;
+                assert_eq!(made.status_code(), 201, "{}", made.text());
+                let url = made.json::<Value>()["url"].as_str().unwrap().to_owned();
+                let mut with = input(
+                    &set,
+                    "monday",
+                    Some(&(Utc::now() + Duration::hours(2)).to_rfc3339()),
+                );
+                with["media"] = json!([url]);
+                assert_eq!(create(&s, &cookie, with).await.status_code(), 201);
+                old().await;
+
+                // Billing off: no plan row of any kind is read, and the upload stays.
+                assert_eq!(
+                    state.media.release_uploads(&db, 24, false).await.unwrap(),
+                    0
+                );
+                assert!(kept(url.clone()).await, "billing off keeps it");
+                plan("canceled").await;
+                assert_eq!(
+                    state.media.release_uploads(&db, 24, false).await.unwrap(),
+                    0
+                );
+                assert!(kept(url.clone()).await, "billing off ignores the plan");
+
+                // Billing on with an ended plan releases it, though a post still names it.
+                assert_eq!(state.media.release_uploads(&db, 24, true).await.unwrap(), 1);
+                assert!(!kept(url).await, "an ended plan releases it");
+
+                // A live plan keeps it as before, and its end releases it.
+                let made = upload(&s, &cookie, file(PNG, 64)).await;
+                assert_eq!(made.status_code(), 201, "{}", made.text());
+                let url = made.json::<Value>()["url"].as_str().unwrap().to_owned();
+                let mut with = input(&set, "tuesday", None);
+                with["media"] = json!([url]);
+                assert_eq!(create(&s, &cookie, with).await.status_code(), 201);
+                old().await;
+                plan("active").await;
+                assert_eq!(state.media.release_uploads(&db, 24, true).await.unwrap(), 0);
+                assert!(kept(url.clone()).await, "a live plan keeps it");
+                plan("canceled").await;
+                assert_eq!(state.media.release_uploads(&db, 24, true).await.unwrap(), 1);
+                assert!(!kept(url).await, "and its end releases it");
             }
 
             #[tokio::test]
