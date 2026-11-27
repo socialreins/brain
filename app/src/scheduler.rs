@@ -38,13 +38,17 @@ fn backoff(period: Duration, panics: u32) -> Duration {
 /// bounded back-off and carries on, instead of ending for good with `/health` still ok.
 /// Dropping the returned future (the runtime stopping) aborts the round with it. Rounds are
 /// not waited for beyond their own return: a round that starts longer work spawns it itself.
-async fn every<S, F, Fut>(name: &'static str, period: Duration, state: S, round: F)
-where
+async fn every<S, F, Fut>(
+    name: &'static str,
+    (delay, period): (Duration, Duration),
+    state: S,
+    round: F,
+) where
     S: Clone,
     F: Fn(S) -> Fut,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let mut tick = tokio::time::interval(period);
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + delay, period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut panics: u32 = 0;
     loop {
@@ -68,11 +72,23 @@ where
     F: Fn(AppState) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(every(name, period, app.clone(), round));
+    static STARTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tokio::spawn(every(name, (stagger(n), period), app.clone(), round));
 }
 
-/// Starts the jobs; each first runs right away, so a restart also fails targets cut off
-/// mid-publish. Each runs under `every`, so a panic in a round does not end its job.
+/// How long the `n`-th job started waits before its first round: 2 seconds each, back to none
+/// after `STAGGER_JOBS`, so the minute loops do not all take a database connection in the same
+/// second (reliability review 1). The publish loop is not staggered: it starts at once.
+fn stagger(n: u32) -> Duration {
+    STAGGER_STEP * (n % STAGGER_JOBS)
+}
+
+const STAGGER_STEP: Duration = Duration::from_secs(2);
+const STAGGER_JOBS: u32 = 25;
+
+/// Starts the jobs: the publish loop at once (a restart also fails targets cut off mid-publish),
+/// the others 2 seconds apart (`stagger`). Each runs under `every`, so a panic in a round does not end its job.
 pub fn spawn(app: AppState) {
     let min = Duration::from_secs(60);
     start(
@@ -202,17 +218,22 @@ pub fn spawn(app: AppState) {
             Ok(Err(e)) => tracing::warn!(error = %e, "releasing unstarted posts failed"),
             Err(e) => tracing::error!(error = %e, "releasing unstarted posts panicked"),
         }
-        every("publish", min, publish_app, |app| async move {
-            // Before `begin`, so the round already judges lateness without our own downtime.
-            if let Err(e) = publish::note_tick(&app.db).await {
-                tracing::warn!(error = %e, "publish tick not recorded");
-            }
-            // `begin` starts the posts as tasks and returns: a post that takes many minutes
-            // does not delay the next round.
-            if let Err(e) = publish::begin(&app).await {
-                tracing::warn!(error = %e, "publish tick failed");
-            }
-        })
+        every(
+            "publish",
+            (Duration::ZERO, min),
+            publish_app,
+            |app| async move {
+                // Before `begin`, so the round already judges lateness without our own downtime.
+                if let Err(e) = publish::note_tick(&app.db).await {
+                    tracing::warn!(error = %e, "publish tick not recorded");
+                }
+                // `begin` starts the posts as tasks and returns: a post that takes many minutes
+                // does not delay the next round.
+                if let Err(e) = publish::begin(&app).await {
+                    tracing::warn!(error = %e, "publish tick failed");
+                }
+            },
+        )
         .await
     });
     start(
@@ -369,12 +390,17 @@ mod tests {
     #[tokio::test]
     async fn a_panicking_round_does_not_end_the_loop() {
         let rounds = Arc::new(AtomicU32::new(0));
-        let job = tokio::spawn(every("test", 5 * MS, rounds.clone(), |rounds| async move {
-            // The first round panics, the ones after it count.
-            if rounds.fetch_add(1, SeqCst) == 0 {
-                panic!("boom");
-            }
-        }));
+        let job = tokio::spawn(every(
+            "test",
+            (Duration::ZERO, 5 * MS),
+            rounds.clone(),
+            |rounds| async move {
+                // The first round panics, the ones after it count.
+                if rounds.fetch_add(1, SeqCst) == 0 {
+                    panic!("boom");
+                }
+            },
+        ));
         tokio::time::sleep(300 * MS).await;
         assert!(!job.is_finished(), "the loop ended");
         assert!(
@@ -396,7 +422,7 @@ mod tests {
         let dropped = Arc::new(AtomicU32::new(0));
         let job = tokio::spawn(every(
             "test",
-            5 * MS,
+            (Duration::ZERO, 5 * MS),
             (started.clone(), dropped.clone()),
             |(started, dropped)| async move {
                 let _guard = Dropped(dropped);
@@ -411,6 +437,37 @@ mod tests {
         tokio::time::sleep(50 * MS).await;
         assert_eq!(dropped.load(SeqCst), 1, "the round outlived the loop");
         assert_eq!(started.load(SeqCst), 1, "a round started after the stop");
+    }
+
+    #[tokio::test]
+    async fn a_delayed_loop_waits_before_its_first_round() {
+        let rounds = Arc::new(AtomicU32::new(0));
+        let job = tokio::spawn(every(
+            "test",
+            (200 * MS, 5 * MS),
+            rounds.clone(),
+            |rounds| async move {
+                rounds.fetch_add(1, SeqCst);
+            },
+        ));
+        tokio::time::sleep(100 * MS).await;
+        assert_eq!(rounds.load(SeqCst), 0, "a round before the delay");
+        tokio::time::sleep(400 * MS).await;
+        assert!(rounds.load(SeqCst) >= 2, "no rounds after the delay");
+        job.abort();
+    }
+
+    #[test]
+    fn jobs_start_two_seconds_apart_and_the_offset_is_bounded() {
+        assert_eq!(stagger(0), Duration::ZERO);
+        assert_eq!(stagger(1), Duration::from_secs(2));
+        assert_eq!(stagger(24), Duration::from_secs(48));
+        assert_eq!(stagger(25), Duration::ZERO);
+        // The minute loops do not share a second.
+        let mut seconds: Vec<_> = (0..20).map(stagger).collect();
+        seconds.dedup();
+        assert_eq!(seconds.len(), 20);
+        assert!(seconds.iter().all(|s| *s < Duration::from_secs(60)));
     }
 
     #[test]
