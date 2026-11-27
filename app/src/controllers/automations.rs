@@ -160,7 +160,7 @@ pub struct Run {
     pub inbox_item_id: Uuid,
     /// The item's `number`; `null` once the item is gone.
     pub inbox_item_number: Option<i64>,
-    /// `running`, `waiting` (a flow at a `wait` step), `sent`, `failed` or `skipped`. A flow's
+    /// `running`, `waiting` (a flow at a `wait` step, or an action list that runs again after its AI provider gave no answer: `step_index` null, `results` empty, `resume_at` set), `sent`, `failed` or `skipped`. A flow's
     /// run is `sent` once every step went out, else it has the status of the send that ended it.
     pub status: String,
     /// Why not everything was sent: `dm_not_allowed`, `no_dm_access`, `rate_limited`,
@@ -700,11 +700,13 @@ async fn update(
             Err(res) => return Ok(Err(res)),
         };
         let steps = input.steps.map(|s| serde_json::json!(s));
+        let actions = serde_json::json!(input.actions.unwrap_or_default());
         let txn = app.db.begin().await?;
         let Some(old) = find(&txn, t.team.id, id).await? else {
             return Ok(Err(not_found()));
         };
-        if old.steps != steps {
+        // A waiting action list (it runs again after an AI outage) holds the actions it started on.
+        if old.steps != steps || old.actions != actions {
             rules::cancel_waiting(&txn, id).await?;
         }
         let done = automations::Entity::update_many()
@@ -714,10 +716,7 @@ async fn update(
                 automations::Column::Conditions,
                 serde_json::json!(input.conditions).into(),
             )
-            .col_expr(
-                automations::Column::Actions,
-                serde_json::json!(input.actions.unwrap_or_default()).into(),
-            )
+            .col_expr(automations::Column::Actions, actions.into())
             .col_expr(automations::Column::Steps, steps.into())
             .col_expr(
                 automations::Column::FallbackPublicReply,

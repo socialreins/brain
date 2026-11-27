@@ -25532,6 +25532,30 @@ mod teams {
                     assert_eq!(used().await.unwrap(), 1, "only the first reply was paid");
                     assert_eq!(SENT.lock().unwrap().len(), sent0 + 1);
 
+                    // Its actions edited while it waits: it ends and is never sent.
+                    reply("500");
+                    let run = comment(t, &cookie, at, "al4", 4).await;
+                    assert_eq!(run["status"], "waiting", "{run}");
+                    let run_id = run["id"].as_str().unwrap().to_owned();
+                    db.execute_unprepared(&format!(
+                        "UPDATE automations SET actions = '[{{\"type\": \"ai_send_dm\", \"prompt\": \"Say bye\"}}]' \
+                         WHERE id = '{id}'"
+                    ))
+                    .await
+                    .unwrap();
+                    reply("Too late");
+                    due(run_id.clone()).await;
+                    let run = runs(&s, &cookie, &id).await[0].clone();
+                    assert_eq!(run["status"], "skipped", "{run}");
+                    assert_eq!(run["reason"], "automation_changed");
+                    assert_eq!(SENT.lock().unwrap().len(), sent0 + 1);
+                    db.execute_unprepared(&format!(
+                        "UPDATE automations SET actions = '[{{\"type\": \"ai_send_dm\", \"prompt\": \"Say hi\"}}]' \
+                         WHERE id = '{id}'"
+                    ))
+                    .await
+                    .unwrap();
+
                     // Switched off while it waits: it ends and is never sent.
                     reply("500");
                     let run = comment(t, &cookie, at, "al3", 3).await;

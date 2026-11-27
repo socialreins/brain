@@ -3295,33 +3295,23 @@ async fn resume_list(app: &AppState, run: &automation_runs::Model) -> Result<(),
     let a = automations::Entity::find_by_id(run.automation_id)
         .one(db)
         .await?;
-    let same = match &a {
-        Some(a) if a.active && a.steps.is_none() => {
-            let stmt = sql(
-                "SELECT steps_hash = md5($2::jsonb::text) AS same FROM automation_runs \
-                 WHERE id = $1",
-                vec![run.id.into(), a.actions.clone().into()],
-            );
-            match db.query_one_raw(stmt).await? {
-                Some(r) => r.try_get::<Option<bool>>("", "same")?.unwrap_or(false),
-                None => false,
-            }
-        }
-        _ => false,
-    };
-    let Some(a) = a.filter(|_| same) else {
+    let Some(a) = a else {
         return settle(db, run.id, "skipped", Some(CHANGED.into()), &[]).await;
     };
     if team_paused(db, a.team_id).await? {
         return settle(db, run.id, "skipped", Some("paused_waiting".into()), &[]).await;
     }
+    // The automation is on and has the actions the run started on, checked in the statement
+    // that takes the run, so a switch-off cannot slip in between (as `claim_step` does).
     let started = sql(
-        "UPDATE automation_runs SET resume_at = NULL, updated_at = now() \
-         WHERE id = $1 AND status = 'running'",
+        "UPDATE automation_runs r SET resume_at = NULL, updated_at = now() \
+         WHERE r.id = $1 AND r.status = 'running' AND r.resume_at IS NOT NULL \
+         AND EXISTS (SELECT 1 FROM automations a WHERE a.id = r.automation_id AND a.active \
+         AND a.steps IS NULL AND md5(a.actions::text) = r.steps_hash)",
         vec![run.id.into()],
     );
     if db.execute_raw(started).await?.rows_affected() != 1 {
-        return Ok(());
+        return settle(db, run.id, "skipped", Some(CHANGED.into()), &[]).await;
     }
     run_list(app, &a, run).await
 }
@@ -3350,6 +3340,42 @@ mod tests {
             first_message: true,
             now: chrono::Utc::now(),
         }
+    }
+
+    fn result(kind: &str, status: &str, unavailable: bool) -> ActionResult {
+        ActionResult {
+            kind: kind.into(),
+            status: status.into(),
+            unavailable,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_list_is_run_again_only_when_nothing_of_it_went_out() {
+        let down = result("ai_send_dm", "failed", true);
+        assert!(nothing_went_out(std::slice::from_ref(&down)));
+        // A tag added, or a send refused, does not stop it: tagging twice is harmless.
+        assert!(nothing_went_out(&[
+            result("tag_contact", "done", false),
+            down.clone()
+        ]));
+        assert!(nothing_went_out(&[
+            result("send_dm", "skipped", false),
+            down.clone()
+        ]));
+        // Anything that went out, or may have, makes it final: it would go out twice.
+        for gone in [
+            result("send_dm", "sent", false),
+            result("reply_publicly", "failed", false),
+            result("like_comment", "sent", false),
+            result("notify_team", "sent", false),
+        ] {
+            assert!(!nothing_went_out(&[gone, down.clone()]));
+        }
+        // No provider outage, no retry.
+        assert!(!nothing_went_out(&[result("ai_send_dm", "failed", false)]));
+        assert!(!nothing_went_out(&[]));
     }
 
     #[test]
