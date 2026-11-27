@@ -196,7 +196,14 @@ async fn trusted_proxy_without_forwarded_for_falls_back_to_the_peer() {
 #[tokio::test]
 #[serial]
 async fn signups_are_rate_limited_per_ip() {
-    let (s, _) = server_with(true).await;
+    use sea_orm::ConnectionTrait;
+    let (s, db) = server_with(true).await;
+    // The window is in Postgres now: a rerun against the same database starts clean.
+    db.execute_unprepared(
+        "DELETE FROM rate_limit_windows WHERE bucket LIKE 'waitlist:203.0.113.9%'",
+    )
+    .await
+    .unwrap();
     let post = |ip: &'static str| {
         s.post("/v1/waitlist")
             .add_header("x-forwarded-for", ip)
@@ -40662,7 +40669,12 @@ mod captcha_and_contact {
     #[tokio::test]
     #[serial]
     async fn contact_allows_5_an_hour_per_ip() {
-        let (s, _, _) = app(None).await;
+        use sea_orm::ConnectionTrait;
+        let (s, db, _) = app(None).await;
+        // The window is in Postgres now: a rerun against the same database starts clean.
+        db.execute_unprepared("DELETE FROM rate_limit_windows WHERE bucket LIKE 'contact:%'")
+            .await
+            .unwrap();
         let post = |ip: &'static str| {
             s.post("/v1/contact")
                 .add_header("x-forwarded-for", ip)
