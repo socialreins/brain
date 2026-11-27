@@ -21,7 +21,7 @@ cargo run -p socialreins-brain
 - `app/`: Axum shell. `controllers/` parse and respond, `models/` hold SeaORM entities,
   `config.rs` reads every env var (defaults live there and only there), `mail.rs` sends mail.
 - `ops/backup/`: the database backup job (pg_dump, age, S3-compatible bucket; own Dockerfile, README, runs as a cron service, not part of the brain image). Its prune rule has a test: `bash ops/backup/prune_test.sh` (GNU date).
-- `app/migration/`: one file per migration, raw SQL, registered in `lib.rs`. Applied on boot.
+- `app/migration/`: one file per migration, raw SQL, registered in `lib.rs`. Applied on boot. Needs Postgres's `pg_trgm` extension (contrib; the official image has it): inbox search (`ILIKE '%q%'` on `inbox_items.text`, `author_name`, `author_handle`) uses trigram GIN indexes, and `grouped_sql` makes a search prove a matching DM per conversation so those indexes are used.
 - `crates/*`: framework-free domain code. Never depend on `axum` or `sea-orm` there.
 - `/v1` routes carry `utoipa::path` annotations; `/openapi.json` is generated from them.
   `PATCH /auth/me` is documented there too, under its own `/` server (`auth::api`).
