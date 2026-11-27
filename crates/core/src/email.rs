@@ -29,8 +29,8 @@ pub fn normalize(raw: &str) -> Option<String> {
 
 /// The person behind an address, for things one person gets once (the free trial): the
 /// normalized address without a `+tag`, and for Gmail also without dots. `None` for a bad address.
-/// shortcut: other providers' aliases and a person with several real mailboxes pass, upgrade to a
-/// card fingerprint if trials get farmed.
+/// shortcut: other providers' aliases and a person with several real mailboxes pass this; billing
+/// also checks the card fingerprint where checkout collected one (`trial_uses.card_hash`).
 pub fn person_key(raw: &str) -> Option<String> {
     let email = normalize(raw)?;
     let (local, domain) = email.split_once('@')?;

@@ -221,6 +221,50 @@ impl Stripe {
         Err(StripeError(None, "too_many".into()))
     }
 
+    /// The card fingerprint of the payment method a subscription charges (`card.fingerprint`):
+    /// one token per card across customers, so a trial can be limited per card as well as per
+    /// person. Read only, at most two GETs: the subscription's default payment method (expanded),
+    /// else the customer's `invoice_settings` default. `None` when no card was collected. The
+    /// fingerprint is never logged; `trial_uses.card_hash` keeps its SHA-256.
+    pub async fn card_fingerprint(
+        &self,
+        subscription: &str,
+    ) -> Result<Option<String>, StripeError> {
+        if !id_shaped(subscription, "sub_") {
+            return Err(StripeError(None, "invalid_id".into()));
+        }
+        let query = [("expand[0]".to_owned(), "default_payment_method".to_owned())];
+        let sub = self
+            .call(
+                reqwest::Method::GET,
+                &format!("/v1/subscriptions/{subscription}"),
+                &query,
+                None,
+            )
+            .await?;
+        if let Some(card) = card_of(&sub["default_payment_method"]) {
+            return Ok(Some(card));
+        }
+        let Some(customer) = sub["customer"].as_str().filter(|c| id_shaped(c, "cus_")) else {
+            return Ok(None);
+        };
+        let query = [(
+            "expand[0]".to_owned(),
+            "invoice_settings.default_payment_method".to_owned(),
+        )];
+        let customer = self
+            .call(
+                reqwest::Method::GET,
+                &format!("/v1/customers/{customer}"),
+                &query,
+                None,
+            )
+            .await?;
+        Ok(card_of(
+            &customer["invoice_settings"]["default_payment_method"],
+        ))
+    }
+
     /// A Checkout Session: the URL to send the customer to. Called twice with the same `key`
     /// (and form) within Stripe's 24 hours it answers the same session, so two clicks start one
     /// checkout, not two.
@@ -246,7 +290,7 @@ impl Stripe {
     /// Cancels a subscription at once, for a second live one a team started by mistake. `id` is
     /// a Stripe id (letters, digits and `_`), so it cannot add to the path.
     pub async fn cancel(&self, id: &str) -> Result<(), StripeError> {
-        if !id.starts_with("sub_") || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        if !id_shaped(id, "sub_") {
             return Err(StripeError(None, "invalid_id".into()));
         }
         self.call(
@@ -270,6 +314,22 @@ impl Stripe {
             .map(str::to_owned)
             .ok_or_else(|| StripeError(None, "no_url".into()))
     }
+}
+
+/// Whether a Stripe id has `prefix` and only the characters Stripe uses (`sub_...`, `cus_...`),
+/// so it cannot add to a URL path.
+fn id_shaped(id: &str, prefix: &str) -> bool {
+    id.len() > prefix.len()
+        && id.starts_with(prefix)
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The card fingerprint of an expanded payment method, if it is a card.
+fn card_of(payment_method: &Value) -> Option<String> {
+    payment_method["card"]["fingerprint"]
+        .as_str()
+        .filter(|fingerprint| !fingerprint.is_empty())
+        .map(str::to_owned)
 }
 
 #[cfg(test)]

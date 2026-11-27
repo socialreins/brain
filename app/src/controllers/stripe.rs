@@ -100,6 +100,20 @@ pub(crate) async fn trial_offer(app: &AppState, email: &str) -> Result<Option<St
     Ok(used.is_none().then_some(key))
 }
 
+/// The card fingerprint of a subscription that is starting a trial, read from Stripe (GET only)
+/// before the event is written. Best effort: a trial may collect no card at all (Stripe has a
+/// payment method only when checkout collected one), and a failed read is treated the same, so
+/// such a trial falls back to the person key alone. The fingerprint itself is never logged.
+async fn trial_card(app: &AppState, subscription: &str) -> Option<String> {
+    match app.stripe.card_fingerprint(subscription).await {
+        Ok(card) => card,
+        Err(e) => {
+            tracing::warn!(status = ?e.0, code = %e.1, "stripe payment method not read");
+            None
+        }
+    }
+}
+
 /// The owner's checks every call here shares: only an owner, with a sign-in from the last 10
 /// minutes, and only where billing is on and Stripe is set up.
 fn gate(app: &AppState, t: &InTeam) -> Option<Response> {
@@ -373,12 +387,14 @@ enum Outcome {
 
 /// Writes one subscription event. Which team: the id in the subscription's metadata, else the
 /// team already holding that subscription. An event for no team, for a price that is no plan,
-/// or older than the last one applied changes nothing.
+/// or older than the last one applied changes nothing. `card` is the trial's card fingerprint
+/// (read from Stripe by the caller), when checkout collected a card.
 async fn apply_subscription(
     app: &AppState,
     db: &impl ConnectionTrait,
     sub: &Value,
     at: DateTime<Utc>,
+    card: Option<&str>,
 ) -> Result<Outcome, DbErr> {
     let id = sub["id"].as_str().unwrap_or_default();
     let team = match sub["metadata"]["team_id"]
@@ -441,23 +457,55 @@ async fn apply_subscription(
     // A trial that begins is that person's one trial, whatever happens to the team later. Two
     // checkouts opened before either finished both carry a trial: the second to start is cancelled
     // like any second live subscription, and the person pays at once by starting it again.
+    // The card it is started with is one trial's card too, whatever the address: a second person
+    // on the same card is written down as well (both rows are kept) and their trial is cancelled
+    // the same way. A trial that collected no card (`card` is `None`) keeps the person rule alone.
     if let (Some(key), Some(_)) = (
         sub["metadata"]["trial_key"]
             .as_str()
             .filter(|k| !k.is_empty()),
         time(&sub["trial_end"]),
     ) {
+        // One event per card at a time, as the person key's primary key does for one person: two
+        // first deliveries for two addresses and one card cannot both read "unused" and both
+        // write a trial. The lock is the card hash, never the fingerprint.
+        let card_used = match card {
+            Some(fingerprint) => {
+                db.execute_raw(stmt(
+                    "SELECT pg_advisory_xact_lock(hashtextextended( \
+                       encode(sha256(convert_to($1::text, 'UTF8')), 'hex'), 0))",
+                    vec![fingerprint.into()],
+                ))
+                .await?;
+                db.query_one_raw(stmt(
+                    "SELECT 1 FROM trial_uses \
+                     WHERE card_hash = encode(sha256(convert_to($1::text, 'UTF8')), 'hex') \
+                       AND person_key NOT IN \
+                         ($2, encode(sha256(convert_to($2::text, 'UTF8')), 'hex')) LIMIT 1",
+                    vec![fingerprint.into(), key.into()],
+                ))
+                .await?
+                .is_some()
+            }
+            None => false,
+        };
         let claimed = db
             .execute_raw(stmt(
-                "INSERT INTO trial_uses (person_key, team_id) SELECT $1::text, $2 \
+                "INSERT INTO trial_uses (person_key, team_id, card_hash) \
+                 SELECT $1::text, $2, CASE WHEN $3::text IS NULL THEN NULL \
+                   ELSE encode(sha256(convert_to($3::text, 'UTF8')), 'hex') END \
                  WHERE NOT EXISTS (SELECT 1 FROM trial_uses \
                    WHERE person_key = encode(sha256(convert_to($1::text, 'UTF8')), 'hex')) \
                  ON CONFLICT DO NOTHING",
-                vec![key.into(), team.into()],
+                vec![key.into(), team.into(), card.map(str::to_owned).into()],
             ))
             .await?
             .rows_affected()
             == 1;
+        if claimed && card_used && status == "trialing" {
+            tracing::warn!(%team, subscription = id, "second trial for one card");
+            return Ok(Outcome::Extra(id.to_owned()));
+        }
         if !claimed && status == "trialing" {
             let owner = db
                 .query_one_raw(stmt(
@@ -804,6 +852,27 @@ async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -
     let at = time(&event["created"]).unwrap_or_else(Utc::now);
     let handled = async {
         let mut alerts: Vec<Alert> = Vec::new();
+        // A trial that starts may have a card: read it before the transaction, so a slow Stripe
+        // never holds a team row. Only while `trialing`, so later events of a converted
+        // subscription cost no read. Absent (checkout collected none, or Stripe failed): the
+        // trial is recorded by its person key alone.
+        let card = if matches!(
+            kind,
+            "customer.subscription.created" | "customer.subscription.updated"
+        ) {
+            let object = &event["data"]["object"];
+            let key = object["metadata"]["trial_key"].as_str().unwrap_or_default();
+            if object["status"] == "trialing"
+                && !key.is_empty()
+                && time(&object["trial_end"]).is_some()
+            {
+                trial_card(&app, object["id"].as_str().unwrap_or_default()).await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let txn = app.db.begin().await?;
         let fresh = txn
             .execute_raw(stmt(
@@ -874,7 +943,7 @@ async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -
         let mut extra = None;
         let mut notice = None;
         if fresh && subscription {
-            match apply_subscription(&app, &txn, object, at).await? {
+            match apply_subscription(&app, &txn, object, at, card.as_deref()).await? {
                 Outcome::Applied(ended) => {
                     if ended {
                         notice = team_holding(&txn, object["id"].as_str(), false)
