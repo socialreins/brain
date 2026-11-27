@@ -267,14 +267,16 @@ fn reasons_of(error: &str) -> Vec<String> {
 fn clean(text: &str) -> String {
     let run = |c: char| c.is_alphanumeric() || "_-.+/~%|@".contains(c);
     let chars: Vec<char> = text.chars().collect();
-    let (mut out, mut i, mut value) = (String::new(), 0, false);
+    // `value`: the next word is a secret (after `=`, `Bearer` or `Basic`), and all of it up to
+    // the next space; `used` says it was met.
+    let (mut out, mut i, mut value, mut used) = (String::new(), 0, false, false);
     while i < chars.len() {
         if !run(chars[i]) {
             let c = chars[i];
             if c == '=' {
                 value = true;
-            } else if !(c.is_whitespace() || c == '"' || c == '\'') {
-                value = false;
+            } else if c.is_whitespace() && used {
+                (value, used) = (false, false);
             }
             out.push(c);
             i += 1;
@@ -297,7 +299,7 @@ fn clean(text: &str) -> String {
                 "{word}://{}",
                 authority.rsplit('@').next().unwrap_or_default()
             ));
-            (i, value) = (k, false);
+            (i, value, used) = (k, false, false);
             continue;
         }
         let token = word.len() >= 16 && word.chars().any(|c| c.is_ascii_digit());
@@ -309,7 +311,11 @@ fn clean(text: &str) -> String {
         } else {
             &word
         });
-        value = matches!(lower.as_str(), "bearer" | "basic");
+        if value {
+            used = true;
+        } else {
+            value = matches!(lower.as_str(), "bearer" | "basic");
+        }
         i = end;
     }
     post_mail::one_line(&out, 120)
