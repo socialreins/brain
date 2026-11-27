@@ -1161,6 +1161,11 @@ fn scope_as(scope: &str, alias: &str) -> String {
 ///   For `state` `open` the conversations are found from the open DMs (a conversation is open
 ///   when one of its items is), so the work follows the open conversations, not the whole history
 ///   (a team with very many open conversations still reads them all, as the old query did).
+///   Otherwise, for a search (`hit` is not `TRUE`), a head must also have a DM of its
+///   conversation that matches (which `rest` demands anyway through `conv_hit`): Postgres can
+///   then find the few conversations that match through the trigram indexes on `text`,
+///   `author_name` and `author_handle`, or probe a conversation at a time when most match. A
+///   search among open conversations is left as it was: its work already follows the open ones.
 ///
 /// `state`, `q` and `assigned` (`rest`) narrow the groups after their `conv_*` are known.
 fn grouped_sql(scope: &str, rest: &str, hit: &str, limit: usize, state: Option<&str>) -> String {
@@ -1195,13 +1200,26 @@ fn grouped_sql(scope: &str, rest: &str, hit: &str, limit: usize, state: Option<&
              CROSS JOIN LATERAL ({count}) c"
         )
     } else {
+        // A search: the head's conversation must have a DM in scope that matches, which `rest`
+        // demands anyway through `conv_hit`. Said here too, Postgres can start from the few
+        // matches (the trigram indexes) instead of every conversation.
+        let matching = if hit == "TRUE" {
+            String::new()
+        } else {
+            format!(
+                " AND EXISTS (SELECT 1 FROM inbox_items o WHERE o.team_id = $1{o} AND o.kind = 'dm' \
+                 AND o.contact_id = h.contact_id AND o.social_account_id = h.social_account_id \
+                 AND {})",
+                scope_as(hit, "o")
+            )
+        };
         format!(
             "FROM inbox_items h CROSS JOIN LATERAL ({count}) c \
              WHERE h.team_id = $1{h} AND h.kind = 'dm' AND h.contact_id IS NOT NULL \
              AND NOT EXISTS (SELECT 1 FROM inbox_items n WHERE n.team_id = $1{n} \
                AND n.kind = 'dm' AND n.contact_id = h.contact_id \
                AND n.social_account_id = h.social_account_id \
-               AND (n.received_at, n.id) > (h.received_at, h.id))"
+               AND (n.received_at, n.id) > (h.received_at, h.id)){matching}"
         )
     };
     format!(
@@ -1282,7 +1300,19 @@ async fn items(
             limit,
             grouped,
         );
-        let mut found = app.db.query_all_raw(stmt).await?;
+        // A search is planned for its own pattern. After five runs of one statement Postgres
+        // reuses a generic plan, which cannot tell a rare term from a common one: measured at
+        // 400,000 items it took 8 to 11 s for a rare term (0.3 ms planned for it).
+        let mut found = if search.is_some() || !filters.keywords.is_empty() {
+            let tx = app.db.begin().await?;
+            tx.execute_unprepared("SET LOCAL plan_cache_mode = force_custom_plan")
+                .await?;
+            let rows = tx.query_all_raw(stmt).await?;
+            tx.commit().await?;
+            rows
+        } else {
+            app.db.query_all_raw(stmt).await?
+        };
         let more = found.len() as u64 > limit;
         found.truncate(limit as usize);
         let mut rows = Vec::new();
@@ -1821,6 +1851,43 @@ mod tests {
             assert!(sql.contains("UNION ALL") && sql.contains("LIMIT $51"));
             assert_eq!(sql.contains("SELECT DISTINCT o."), state == Some("open"));
         }
+    }
+
+    #[test]
+    fn a_search_makes_every_conversation_prove_a_matching_dm() {
+        let hit = "(i.text ILIKE $2 OR i.author_name ILIKE $2 OR i.author_handle ILIKE $2)";
+        let mut values = Vec::new();
+        let scope = inbox::filter_sql(Some(Uuid::nil()), &Filters::default(), &mut values)
+            + inbox::NOT_ACTIVITY;
+        let probe = "EXISTS (SELECT 1 FROM inbox_items o WHERE o.team_id = $1";
+        for state in [None, Some("done")] {
+            let sql = grouped_sql(&scope, " AND i.conv_hit", hit, 51, state);
+            assert_eq!(sql.matches(probe).count(), 1, "{sql}");
+            // The probe joins on the head's conversation, keeps the scope and tests `o`'s text.
+            assert!(
+                sql.contains(
+                    "o.contact_id = h.contact_id AND o.social_account_id = h.social_account_id \
+                     AND (o.text ILIKE $2 OR o.author_name ILIKE $2 OR o.author_handle ILIKE $2))"
+                ),
+                "{sql}"
+            );
+            assert!(
+                sql.contains("o.kind NOT IN ('follow', 'like', 'repost')"),
+                "{sql}"
+            );
+            // It sits in the conversations arm (before the closing of `heads`), and the head
+            // is still the newest of the scope.
+            assert!(sql.contains("(n.received_at, n.id) > (h.received_at, h.id)) AND EXISTS"));
+            // No search: no probe, the page is what it was.
+            let plain = grouped_sql(&scope, "", "TRUE", 51, state);
+            assert!(!plain.contains(probe), "{plain}");
+        }
+        // Open conversations are found from their open DMs and left alone by a search.
+        let open = grouped_sql(&scope, " AND i.conv_hit", hit, 51, Some("open"));
+        assert!(
+            open.contains("SELECT DISTINCT o.") && !open.contains(probe),
+            "{open}"
+        );
     }
 
     #[test]
