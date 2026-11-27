@@ -5454,7 +5454,12 @@ mod teams {
 
             /// Where the tests' brain stores media: local disk, as by default.
             fn media_dir() -> std::path::PathBuf {
-                let dir = std::env::temp_dir().join("socialreins-brain-test-media");
+                // One directory per test process: the sweep counts every file in it, so another run's
+                // leftovers (a parallel `cargo test`, a run that died half way) would change its count.
+                let dir = std::env::temp_dir().join(format!(
+                    "socialreins-brain-test-media-{}",
+                    std::process::id()
+                ));
                 std::fs::create_dir_all(&dir).unwrap();
                 dir
             }
@@ -7304,12 +7309,25 @@ mod teams {
                 let (s, db, state) = on_mock().await;
                 let (cookie, team_id, _) = owner_with_account(&s, &db).await;
                 let set = default_set(&db, &team_id).await.to_string();
+                // This test's own marker: RECORDS is shared by every test in the process.
+                let tag = uuid::Uuid::now_v7().simple().to_string();
                 let mut mine = Vec::new();
                 for i in 0..publish::TEAM_AT_ONCE {
-                    let res =
-                        create(&s, &cookie, input(&set, &format!("due {i}"), Some(&past()))).await;
+                    let text = format!("due {i} {tag}");
+                    let res = create(&s, &cookie, input(&set, &text, Some(&past()))).await;
                     mine.push(id_of(&res).parse::<uuid::Uuid>().unwrap());
                 }
+                // A past time is saved as the app's "now", and the claim compares it with the
+                // database's clock, which may run behind (a Docker VM): make them due for sure.
+                sea_orm::ConnectionTrait::execute_unprepared(
+                    &db,
+                    &format!(
+                        "UPDATE posts SET scheduled_at = scheduled_at - interval '1 minute' \
+                         WHERE team_id = '{team_id}'"
+                    ),
+                )
+                .await
+                .unwrap();
                 let (a, b) = tokio::join!(
                     publish::claim_due(&db, false),
                     publish::claim_due(&db, false)
@@ -7321,14 +7339,21 @@ mod teams {
                     assert_eq!(n, 1, "each due post is claimed once");
                 }
                 // Two runs of one queued post: every target is claimed once, one record each.
-                let before = RECORDS.lock().unwrap().len();
+                let sent = || {
+                    let records = RECORDS.lock().unwrap();
+                    records
+                        .iter()
+                        .filter(|r| r.to_string().contains(&tag))
+                        .count()
+                };
+                assert_eq!(sent(), 0);
                 let (x, y) = tokio::join!(
                     publish::publish_post(&state, mine[0]),
                     publish::publish_post(&state, mine[0])
                 );
                 x.unwrap();
                 y.unwrap();
-                assert_eq!(RECORDS.lock().unwrap().len(), before + 1);
+                assert_eq!(sent(), 1);
                 let targets = post_targets::Entity::find()
                     .filter(post_targets::Column::PostId.eq(mine[0]))
                     .all(&db)
@@ -21454,7 +21479,9 @@ mod teams {
                     assert_eq!(meta_inbox::backfill(&state, &fb, false).await.unwrap(), 0);
                     assert_eq!(meta_inbox::backfill(&state, &ig, false).await.unwrap(), 3);
                     let items = stored(&db, &team_id).await;
-                    let ids: Vec<_> = items.iter().map(|i| i.remote_id.as_str()).collect();
+                    let mut ids: Vec<_> = items.iter().map(|i| i.remote_id.as_str()).collect();
+                    // Sorted here, by byte: a database collation may rank `ig_m1` and `ig5` either way.
+                    ids.sort_unstable();
                     // Not the Page's own, not the old post's, not the old conversation's.
                     assert_eq!(
                         ids,
