@@ -1038,6 +1038,13 @@ static TARGET_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaph
 /// Posts, and targets, one team publishes at once in this process, taken before the shared
 /// slots above: a team with many large videos waits for its own, and never holds all of those.
 pub const TEAM_AT_ONCE: usize = 3;
+/// How long a claimed post's hold on one of its team's places lasts, and how often the process
+/// running it renews the hold: a replica only counts a place while the lease is live, so a
+/// crashed process's places free within `LEASE_MINUTES`, and a live one keeps its places across
+/// a missed heartbeat. Two minutes against a 30 second renewal.
+pub const LEASE_MINUTES: i32 = 2;
+/// How often a process renews the leases of the posts it is running.
+pub const LEASE_RENEW_SECONDS: u64 = 30;
 type TeamSlots = std::sync::Mutex<HashMap<Uuid, Arc<Semaphore>>>;
 static TEAM_POSTS: LazyLock<TeamSlots> = LazyLock::new(TeamSlots::default);
 static TEAM_TARGETS: LazyLock<TeamSlots> = LazyLock::new(TeamSlots::default);
@@ -1300,11 +1307,12 @@ pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, D
     }
     // Posts left `queued` by a crash between claim and settle: fan-out and claims are
     // idempotent, so running them again only finishes the job. Also posts with a target whose
-    // automatic retry is due.
+    // automatic retry is due. A post a live process runs holds its lease and is not taken.
     let stmt = sql(
         "SELECT id FROM posts WHERE status = 'queued' \
-         AND (updated_at < now() - make_interval(mins => $1) OR EXISTS (SELECT 1 FROM \
-           post_targets t WHERE t.post_id = posts.id AND t.status = 'pending' \
+         AND (lease_until IS NULL OR lease_until <= now()) \
+         AND (updated_at < now() - make_interval(mins => $1) OR EXISTS (SELECT 1 \
+           FROM post_targets t WHERE t.post_id = posts.id AND t.status = 'pending' \
            AND t.retry_at <= now())) LIMIT $2",
         vec![(STUCK_MINUTES as i32).into(), CLAIM_BATCH.into()],
     );
@@ -1315,7 +1323,13 @@ pub async fn begin(app: &AppState) -> Result<Vec<tokio::task::JoinHandle<()>>, D
         .into_iter()
         .map(|(f, team)| (f, Some(team)))
         .collect();
-    // Never picked up as left behind while this process still runs it.
+    // Never picked up as left behind while this process still runs it. Each takes its team's
+    // place for the run, counted across processes like a claim (`lease_left`).
+    let left: Vec<Uuid> = left
+        .into_iter()
+        .filter(|id| !in_flight(|flying| flying.contains(id)))
+        .collect();
+    let left = lease_left(&app.db, &left).await?;
     let left = left
         .into_iter()
         .filter(|id| in_flight(|flying| flying.insert(*id)));
@@ -1344,9 +1358,8 @@ async fn claim_flights(app: &AppState, only: Option<Uuid>) -> Result<Vec<(Flight
     let _gate = CLAIM_GATE.lock().await;
     let running: Vec<Uuid> = in_flight(|flying| flying.iter().copied().collect());
     let room = (CLAIM_BATCH - running.len() as i64).max(0);
-    let busy = busy_teams(&app.db, &running).await?;
     let mut flights = Vec::new();
-    for (id, team) in claim(&app.db, room, app.billing_enabled, &busy, only).await? {
+    for (id, team) in claim(&app.db, room, app.billing_enabled, only).await? {
         if in_flight(|flying| flying.insert(id)) {
             flights.push((Flight(id), team));
         } else if let Err(e) = unclaim(&app.db, id, None).await {
@@ -1432,15 +1445,19 @@ pub async fn tick(app: &AppState) -> Result<(), DbErr> {
 /// a live set, of a team under its daily publish cap (and with `billing`, on a live plan), and none `rejected`, nor `pending` while its
 /// team requires approval. Returns `(post, team)`.
 pub async fn claim_due(db: &DatabaseConnection, billing: bool) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
-    claim(db, CLAIM_BATCH, billing, &HashMap::new(), None).await
+    claim(db, CLAIM_BATCH, billing, None).await
 }
 
-/// How many of `posts` each team has in flight in this process.
-async fn busy_teams(db: &DatabaseConnection, posts: &[Uuid]) -> Result<HashMap<Uuid, i32>, DbErr> {
+/// How many of `teams`' posts a live process is running now: the places a claim must leave.
+async fn live_leases(
+    db: &impl ConnectionTrait,
+    teams: &[Uuid],
+) -> Result<HashMap<Uuid, i32>, DbErr> {
     let stmt = sql(
-        "SELECT team_id, count(*)::int AS n FROM posts WHERE id = ANY($1::uuid[]) \
+        "SELECT team_id, count(*)::int AS n FROM posts \
+         WHERE team_id = ANY($1::uuid[]) AND status = 'queued' AND lease_until > now() \
          GROUP BY team_id",
-        vec![posts.to_vec().into()],
+        vec![teams.to_vec().into()],
     );
     let mut busy = HashMap::new();
     for row in db.query_all_raw(stmt).await? {
@@ -1449,22 +1466,47 @@ async fn busy_teams(db: &DatabaseConnection, posts: &[Uuid]) -> Result<HashMap<U
     Ok(busy)
 }
 
+/// Locks `teams` for the rest of the transaction, in id order so two processes never deadlock:
+/// a team's live places are counted and its posts claimed while no other process does the same
+/// for it (decision 0009).
+async fn lock_teams(db: &impl ConnectionTrait, teams: &[Uuid]) -> Result<(), DbErr> {
+    if teams.is_empty() {
+        return Ok(());
+    }
+    let stmt = sql(
+        "SELECT pg_advisory_xact_lock(hashtext(t.team_id::text)) FROM \
+         (SELECT unnest($1::uuid[]) AS team_id ORDER BY team_id) t",
+        vec![teams.to_vec().into()],
+    );
+    db.query_all_raw(stmt).await.map(|_| ())
+}
+
 /// `claim_due` of at most `limit` posts. A claimed post with a repeat rule yields its next copy
 /// in the same transaction (`repeat::spawn`), so it does once. A team is claimed no more posts
-/// than it has places left (`TEAM_AT_ONCE` less its posts in `busy`, in flight here), `only`
-/// that team when set: a post that could only wait for its team's places stays `scheduled`, so
-/// it counts nowhere against the batch, is not `queued` long enough to be called stuck, and no
-/// other instance mistakes it for left behind. A team's backlog never keeps another team's post
-/// from going out, and each post that ends claims the team's next one at once (`refill`), so the
-/// tick is not the team's throughput. A post still `scheduled` an hour past its time is late
-/// (`draft_late`) as any other.
+/// than it has places left (`TEAM_AT_ONCE` less the live leases of its posts, in this process or
+/// another), `only` that team when set: a post that could only wait for its team's places stays
+/// `scheduled`, so it counts nowhere against the batch, is not `queued` long enough to be called
+/// stuck, and no other instance mistakes it for left behind. A team's backlog never keeps
+/// another team's post from going out, and each post that ends claims the team's next one at
+/// once (`refill`), so the tick is not the team's throughput. A post still `scheduled` an hour
+/// past its time is late (`draft_late`) as any other.
 async fn claim(
     db: &DatabaseConnection,
     limit: i64,
     billing: bool,
-    busy: &HashMap<Uuid, i32>,
     only: Option<Uuid>,
 ) -> Result<Vec<(Uuid, Uuid)>, DbErr> {
+    let txn = db.begin().await?;
+    // Every team with a post due now is locked before its live places are counted, so two
+    // processes cannot both count 2 and each claim 1 against a cap of 3 (decision 0009).
+    let stmt = sql(
+        "SELECT DISTINCT team_id FROM posts WHERE status = 'scheduled' \
+         AND scheduled_at <= now() AND ($1::uuid IS NULL OR team_id = $1) ORDER BY team_id",
+        vec![only.into()],
+    );
+    let teams: Vec<Uuid> = ids(&txn, stmt, "team_id").await?;
+    lock_teams(&txn, &teams).await?;
+    let busy = live_leases(&txn, &teams).await?;
     // A CTE runs once; a LIMIT inside `IN (...)` may be re-run and claim more. The posts of one
     // group (`group_id`, one per platform) are claimed together or not at all, so they are all
     // judged by the same clock (`LATE_MINUTES`): the batch is cut between groups, never inside
@@ -1499,7 +1541,8 @@ async fn claim(
          due AS ( \
            SELECT p.id FROM posts p JOIN cand c ON c.id = p.id JOIN fit f ON f.gk = c.gk \
            ORDER BY c.scheduled_at, p.id FOR UPDATE OF p SKIP LOCKED) \
-         UPDATE posts p SET status = 'queued', updated_at = now() FROM due \
+         UPDATE posts p SET status = 'queued', updated_at = now(), \
+           lease_until = now() + make_interval(mins => $9) FROM due \
          WHERE p.id = due.id AND p.status = 'scheduled' \
          RETURNING p.id, p.team_id",
         vec![
@@ -1511,9 +1554,9 @@ async fn claim(
             busy.values().copied().collect::<Vec<_>>().into(),
             (TEAM_AT_ONCE as i32).into(),
             only.into(),
+            LEASE_MINUTES.into(),
         ],
     );
-    let txn = db.begin().await?;
     let rows = txn.query_all_raw(stmt).await?;
     let claimed = rows
         .iter()
@@ -1523,6 +1566,71 @@ async fn claim(
     crate::repeat::spawn(&txn, &ids, None).await?;
     txn.commit().await?;
     Ok(claimed)
+}
+
+/// Gives posts picked up as left behind (a crash, or a retry now due) the place of their team for
+/// the run, as a claim does: their teams are locked, the live places are counted across
+/// processes, and each post takes a free one, so a team never runs more than `TEAM_AT_ONCE` of
+/// its posts whatever process started them. Returns the posts that got a place.
+async fn lease_left(db: &DatabaseConnection, candidates: &[Uuid]) -> Result<Vec<Uuid>, DbErr> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let txn = db.begin().await?;
+    let stmt = sql(
+        "SELECT team_id FROM posts WHERE id = ANY($1::uuid[]) \
+         GROUP BY team_id ORDER BY team_id",
+        vec![candidates.to_vec().into()],
+    );
+    let teams: Vec<Uuid> = ids(&txn, stmt, "team_id").await?;
+    lock_teams(&txn, &teams).await?;
+    let busy = live_leases(&txn, &teams).await?;
+    let stmt = sql(
+        "WITH cand AS ( \
+           SELECT p.id, p.team_id, p.updated_at FROM posts p \
+           WHERE p.id = ANY($1::uuid[]) AND p.status = 'queued' \
+           AND (p.lease_until IS NULL OR p.lease_until <= now())), \
+         ranked AS ( \
+           SELECT c.id, c.team_id, row_number() OVER (PARTITION BY c.team_id \
+             ORDER BY c.updated_at, c.id) AS rn FROM cand c) \
+         UPDATE posts p SET lease_until = now() + make_interval(mins => $4) \
+         FROM ranked r LEFT JOIN unnest($2::uuid[], $3::int[]) AS b(team_id, n) \
+           ON b.team_id = r.team_id \
+         WHERE p.id = r.id AND r.rn <= $5 - COALESCE(b.n, 0) \
+         AND p.status = 'queued' AND (p.lease_until IS NULL OR p.lease_until <= now()) \
+         RETURNING p.id",
+        vec![
+            candidates.to_vec().into(),
+            busy.keys().copied().collect::<Vec<_>>().into(),
+            busy.values().copied().collect::<Vec<_>>().into(),
+            LEASE_MINUTES.into(),
+            (TEAM_AT_ONCE as i32).into(),
+        ],
+    );
+    let leased = ids(&txn, stmt, "id").await?;
+    txn.commit().await?;
+    Ok(leased)
+}
+
+/// Renews the lease of every post this process is running, so its team's place stays taken while
+/// it lives. One statement for all of them; the scheduler runs it every
+/// `LEASE_RENEW_SECONDS`. A process that dies stops renewing, and its places free within
+/// `LEASE_MINUTES`.
+pub async fn renew_leases(app: &AppState) {
+    let flying: Vec<Uuid> = in_flight(|flying| flying.iter().copied().collect());
+    if flying.is_empty() {
+        return;
+    }
+    let stmt = sql(
+        "UPDATE posts SET lease_until = now() + make_interval(mins => $2) \
+         WHERE id = ANY($1::uuid[]) AND status = 'queued' \
+         AND NOT EXISTS (SELECT 1 FROM post_targets t WHERE t.post_id = posts.id \
+         AND t.status = 'pending' AND t.retry_at > now())",
+        vec![flying.into(), LEASE_MINUTES.into()],
+    );
+    if let Err(e) = app.db.execute_raw(stmt).await {
+        tracing::warn!(error = %e, "publish leases not renewed");
+    }
 }
 
 /// A scheduled post this many minutes past its time is never published (decision 0008), not
@@ -1602,6 +1710,7 @@ pub async fn draft_late(db: &DatabaseConnection, running: &[Uuid]) -> Result<Vec
     let stmt = sql(
         &format!(
             "UPDATE posts p SET status = 'draft', quota_reserved = false, fanned_out = false, \
+             lease_until = NULL, \
              error = '{LATE} ' || to_char(p.scheduled_at AT TIME ZONE z.name, \
                'YYYY-MM-DD HH24:MI') || ' ' || z.name || ' and is more than an hour late. \
                Schedule it again.', \
@@ -1678,7 +1787,7 @@ pub async fn reserve_and(
 async fn unclaim(db: &DatabaseConnection, id: Uuid, error: Option<&str>) -> Result<(), DbErr> {
     let stmt = sql(
         "UPDATE posts SET status = 'scheduled', error = COALESCE($2, error), \
-         quota_reserved = false, updated_at = now() \
+         quota_reserved = false, lease_until = NULL, updated_at = now() \
          WHERE id = $1 AND status = 'queued'",
         vec![id.into(), error.map(str::to_owned).into()],
     );
@@ -1700,6 +1809,7 @@ async fn release(db: &DatabaseConnection, id: Uuid) -> Result<(), DbErr> {
 pub async fn hand_back_reserved(db: &DatabaseConnection, id: Uuid) -> Result<(), DbErr> {
     let stmt = sql(
         "WITH back AS (UPDATE posts SET status = 'scheduled', quota_reserved = false, \
+           lease_until = NULL, \
            updated_at = now() WHERE id = $1 AND status = 'queued' AND quota_reserved \
            AND NOT fanned_out \
            AND NOT EXISTS (SELECT 1 FROM post_targets t WHERE t.post_id = posts.id) \
@@ -1723,7 +1833,7 @@ pub async fn release_unstarted(db: &DatabaseConnection) -> Result<u64, DbErr> {
 
 async fn release_where(db: &DatabaseConnection, id: Option<Uuid>) -> Result<u64, DbErr> {
     let stmt = sql(
-        "UPDATE posts SET status = 'scheduled', updated_at = now() \
+        "UPDATE posts SET status = 'scheduled', lease_until = NULL, updated_at = now() \
          WHERE ($1::uuid IS NULL OR id = $1) AND status = 'queued' AND NOT quota_reserved \
          AND NOT fanned_out \
          AND NOT EXISTS (SELECT 1 FROM post_targets t WHERE t.post_id = posts.id)",
@@ -1840,7 +1950,8 @@ async fn fail_post_mail(
     mail: bool,
 ) -> Result<(), DbErr> {
     let stmt = sql(
-        "UPDATE posts SET status = 'failed', error = $2, updated_at = now() \
+        "UPDATE posts SET status = 'failed', error = $2, lease_until = NULL, \
+         updated_at = now() \
          WHERE id = $1 AND status = 'queued'",
         vec![id.into(), msg.into()],
     );
@@ -1873,6 +1984,15 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
     let Some(team) = team else {
         return Ok(());
     };
+    // The post takes one of its team's places for as long as this process runs it, whoever
+    // queued it (a claim, publish now, a retry); renewed every `LEASE_RENEW_SECONDS` and cleared
+    // when it stops (`settle`, `unclaim`, waiting for a retry), so another replica counts it.
+    let stmt = sql(
+        "UPDATE posts SET lease_until = now() + make_interval(mins => $2) \
+         WHERE id = $1 AND status = 'queued'",
+        vec![id.into(), LEASE_MINUTES.into()],
+    );
+    db.execute_raw(stmt).await?;
     let _team_slot = team_slot(&TEAM_POSTS, team).acquire_owned().await;
     let Ok(slot) = POST_SLOTS.acquire().await else {
         release(db, id).await?;
@@ -2084,8 +2204,24 @@ pub async fn publish_post(app: &AppState, id: Uuid) -> Result<(), DbErr> {
         .is_some_and(|p| p.status != "queued");
     if done {
         app.media.release_post(db, id).await;
+    } else {
+        // Waiting for an automatic retry (or another run took its targets): nothing runs it
+        // now, so it holds no place of its team.
+        clear_lease(db, id).await?;
     }
     settled
+}
+
+/// Clears the lease of a post this process is done with, unless another run still has one of its
+/// targets `publishing`. A post waiting for its automatic retry holds no place of its team.
+async fn clear_lease(db: &DatabaseConnection, id: Uuid) -> Result<(), DbErr> {
+    let stmt = sql(
+        "UPDATE posts SET lease_until = NULL WHERE id = $1 AND status = 'queued' \
+         AND NOT EXISTS (SELECT 1 FROM post_targets t WHERE t.post_id = posts.id \
+         AND t.status = 'publishing')",
+        vec![id.into()],
+    );
+    db.execute_raw(stmt).await.map(|_| ())
 }
 
 /// Each media URL of a post and its thread, downloaded once into storage, or why not.
@@ -3185,7 +3321,7 @@ pub async fn settle(db: &DatabaseConnection, id: Uuid) -> Result<(), DbErr> {
     };
     let error = (!errors.is_empty()).then(|| errors.join("; "));
     let stmt = sql(
-        "UPDATE posts SET status = $2, error = $3, updated_at = now(), \
+        "UPDATE posts SET status = $2, error = $3, updated_at = now(), lease_until = NULL, \
          published_at = CASE WHEN $2 = 'published' THEN COALESCE(published_at, now()) \
            ELSE published_at END \
          WHERE id = $1 AND status = 'queued'",
