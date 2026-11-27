@@ -55,18 +55,43 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 /// connection, held while the migrations run on the pool, and Postgres frees it on commit or
 /// if this process dies.
 pub async fn connect(config: &config::Config) -> Result<DatabaseConnection, DbErr> {
+    // Migrations run on a pool of their own, without the app's timeouts: one may rightly take
+    // long (an index on a big table), and it is closed before the app pool opens.
     let mut options = ConnectOptions::new(&config.database_url);
+    options
+        .max_connections(3)
+        .connect_timeout(Duration::from_secs(10))
+        .acquire_timeout(ACQUIRE_TIMEOUT);
+    let migrating = Database::connect(options).await?;
+    let lock = migrating.begin().await?;
+    lock.execute_unprepared(&format!("SELECT pg_advisory_xact_lock({MIGRATION_LOCK})"))
+        .await?;
+    Migrator::up(&migrating, None).await?;
+    lock.commit().await?;
+    migrating.close().await?;
+    let mut options = ConnectOptions::new(&config.database_url);
+    // One short string for the life of the process, which `execute` wants to borrow for good.
+    let set: &'static str = Box::leak(
+        format!(
+            "SET statement_timeout = {}; SET idle_in_transaction_session_timeout = {}",
+            config.database_statement_timeout * 1000,
+            config.database_idle_in_transaction_timeout * 1000
+        )
+        .into_boxed_str(),
+    );
     options
         .max_connections(config.database_max_connections)
         .connect_timeout(Duration::from_secs(10))
-        .acquire_timeout(ACQUIRE_TIMEOUT);
-    let db = Database::connect(options).await?;
-    let lock = db.begin().await?;
-    lock.execute_unprepared(&format!("SELECT pg_advisory_xact_lock({MIGRATION_LOCK})"))
-        .await?;
-    Migrator::up(&db, None).await?;
-    lock.commit().await?;
-    Ok(db)
+        .acquire_timeout(ACQUIRE_TIMEOUT)
+        .map_sqlx_postgres_pool_opts(move |pool| {
+            pool.after_connect(move |conn, _| {
+                Box::pin(async move {
+                    use sea_orm::sqlx::Executor;
+                    conn.execute(set).await.map(|_| ())
+                })
+            })
+        });
+    Database::connect(options).await
 }
 
 /// `connect`, tried again every `retry` until it works or `wait` has passed: a Postgres that

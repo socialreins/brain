@@ -1079,6 +1079,8 @@ Port 5432 taken? Run `PG_PORT=55433 docker compose up -d postgres` and use that 
 | Variable | Required | Default |
 |---|---|---|
 | `DATABASE_URL` | yes | |
+| `DATABASE_STATEMENT_TIMEOUT_SECONDS` | no | `300` (0 for none, else 5 to 86400). Postgres `statement_timeout` of every connection the app uses (not migrations, which run first on their own connections without it). A statement that runs longer is cancelled with an error. |
+| `DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS` | no | `1800` (0 for none, else 5 to 86400). Postgres `idle_in_transaction_session_timeout` of the same connections: a transaction left open and idle this long loses its session, so a stuck background round cannot hold a connection (and its lock) for ever. Keep it above the longest round that holds a lock transaction while it works elsewhere (the inbox, feeds, webhook and token rounds take minutes). |
 | `DATABASE_MAX_CONNECTIONS` | no | `20` (5 to 500). The most connections one brain process opens to Postgres; a request waits 5 seconds for one, then fails. Keep it under Postgres's `max_connections` divided by the number of replicas (and leave room for other clients): a pool larger than the database allows turns into connection errors at boot |
 | `ENCRYPTION_KEY` | yes | Encrypts platform tokens and Bluesky app passwords at rest (AES-256-GCM). 32 bytes, base64: `openssl rand -base64 32`. brain refuses to start without a valid one. Keep it with your database backups: losing or changing it makes every connected account need reconnecting |
 | `PORT` | no | `8080` |
