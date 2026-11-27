@@ -63,6 +63,8 @@ struct Facts {
     stuck: i64,
     reconnect: i64,
     x_paused: i64,
+    /// Sign-in mails (links, no-account notices) that could not be sent (`mail::SIGNIN_FAILED`).
+    signin_failed: i64,
     backup: Backup,
 }
 
@@ -87,6 +89,7 @@ impl Facts {
             || self.stuck > 0
             || self.reconnect > 0
             || self.x_paused > 0
+            || self.signin_failed > 0
             || self.backup_bad()
     }
 }
@@ -224,6 +227,8 @@ async fn collect(app: &AppState, from: DateTime<Utc>, now: DateTime<Utc>) -> Res
         vec![],
     ))
     .await?;
+    let signin_failed =
+        rate_limit::count_since(db, crate::mail::SIGNIN_FAILED, (from, now)).await?;
     Ok(Facts {
         counts,
         reasons,
@@ -231,6 +236,7 @@ async fn collect(app: &AppState, from: DateTime<Utc>, now: DateTime<Utc>) -> Res
         stuck,
         reconnect,
         x_paused,
+        signin_failed,
         backup: backup(app, now).await,
     })
 }
@@ -409,6 +415,7 @@ fn compose(facts: &Facts, day: &str) -> (String, String) {
     ));
     lines.push(format!("Accounts to reconnect: {}", facts.reconnect));
     lines.push(format!("X inboxes paused after errors: {}", facts.x_paused));
+    lines.push(format!("Sign-in mails failed ({})", facts.signin_failed));
     lines.push(backup);
     let total = failed + partial + late + repeat;
     let mut flags = Vec::new();
@@ -420,6 +427,9 @@ fn compose(facts: &Facts, day: &str) -> (String, String) {
     }
     if facts.reconnect > 0 {
         flags.push(format!("{} to reconnect", facts.reconnect));
+    }
+    if facts.signin_failed > 0 {
+        flags.push(format!("{} sign-in mails failed", facts.signin_failed));
     }
     if facts.backup_bad() {
         flags.push("backup".into());
@@ -473,6 +483,7 @@ mod tests {
             stuck: 1,
             reconnect: 2,
             x_paused: 0,
+            signin_failed: 3,
             backup: Backup::Age(Duration::minutes(200)),
         };
         facts.counts.insert(("failed".into(), "x".into()), 2);
@@ -481,7 +492,7 @@ mod tests {
         let (subject, text) = compose(&facts, "2026-11-27");
         assert_eq!(
             subject,
-            "SocialReins digest 2026-11-27: 4 posts not out, 1 stuck, 2 to reconnect"
+            "SocialReins digest 2026-11-27: 4 posts not out, 1 stuck, 2 to reconnect, 3 sign-in mails failed"
         );
         assert!(text.contains("Failed: 3 (Bluesky 1, X 2)"), "{text}");
         assert!(
@@ -489,6 +500,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("- 3 x Timed out"), "{text}");
+        assert!(text.contains("Sign-in mails failed (3)"), "{text}");
         assert!(text.contains("- acme: #7, #3"), "{text}");
         assert!(text.contains("Publishing for over 15 minutes: 1"), "{text}");
         assert!(
