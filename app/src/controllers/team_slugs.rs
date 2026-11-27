@@ -1,8 +1,9 @@
 //! Team slugs: the address a team picks for itself (`/t/<slug>/...`) beside its permanent code.
 //! `PATCH /team/slug` changes it (owner, fresh sign-in), `GET /slugs/check` says whether one is
 //! free, and `GET /public/team-slugs/{slug}` tells the web app where a retired one now lives.
-//! Every slug a team gives up goes into `team_slug_history`: for 90 days no other team may take
-//! it, and for 400 days its old links are redirected by the web app.
+//! Every slug a team gives up goes into `team_slug_history`: for one window of
+//! `team::SLUG_WINDOW_DAYS` (400 days) no other team may take it, and its old links are
+//! redirected for the same window, so an old link never opens another team's address.
 use axum::{
     extract::{rejection::QueryRejection, Path, Query, State},
     http::{header, StatusCode},
@@ -14,7 +15,7 @@ use sea_orm::{
     Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
-use socialreins_core::team::{self, Role};
+use socialreins_core::team::{self, Role, SLUG_WINDOW_DAYS};
 use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
@@ -41,8 +42,8 @@ fn bad_slug(reason: &str) -> Response {
 }
 
 /// Whether `slug` cannot be taken by team `team` (`None`: one not made yet): it is some team's
-/// code, another team's slug, or another team's slug given up in the last 90 days (a deleted
-/// team's too). A team may take back its own.
+/// code, another team's slug, or another team's slug given up in the last `SLUG_WINDOW_DAYS`
+/// (a deleted team's too). A team may take back its own.
 pub(super) async fn taken(
     db: &impl ConnectionTrait,
     slug: &str,
@@ -51,9 +52,10 @@ pub(super) async fn taken(
     let sql = "SELECT 1 FROM teams WHERE code = $1 \
                OR (lower(slug) = $1 AND id IS DISTINCT FROM $2::uuid) \
                UNION ALL SELECT 1 FROM team_slug_history WHERE slug = $1 \
-               AND team_id IS DISTINCT FROM $2::uuid AND retired_at > now() - interval '90 days' \
+               AND team_id IS DISTINCT FROM $2::uuid \
+               AND retired_at > now() - make_interval(days => $3::int) \
                LIMIT 1";
-    let values = [slug.into(), team.into()];
+    let values = [slug.into(), team.into(), (SLUG_WINDOW_DAYS as i32).into()];
     let stmt = Statement::from_sql_and_values(DbBackend::Postgres, sql, values);
     Ok(db.query_one_raw(stmt).await?.is_some())
 }
@@ -70,11 +72,12 @@ pub struct SlugChange {
 /// Sets or clears the current team's slug. Owner only, with a sign-in from the last 10 minutes
 /// (else `403 reauth_required`). A bad slug is `422 invalid_slug` with a `reason` (`reserved`,
 /// `length`, `characters` or `blocked`); one that is some team's code, another team's slug, or
-/// one another team gave up in the last 90 days is `409 slug_taken`. A team gives up a slug
-/// (changes or clears it) at most 3 times in 30 days, then `429 slug_changed_too_often`; sending
-/// the slug it already has changes nothing and costs nothing. The slug given up stops naming the
-/// team for API calls at once, but the web app redirects its links to the new address for 400
-/// days.
+/// one another team gave up in the last `team::SLUG_WINDOW_DAYS` (400 days) is `409 slug_taken`.
+/// A team gives up a slug (changes or clears it) at most 3 times in 30 days, then `429
+/// slug_changed_too_often`; sending the slug it already has changes nothing and costs nothing.
+/// The slug given up stops naming the team for API calls at once, but the web app redirects its
+/// links to the new address for the same 400 days it is held, so its links never open another
+/// team's address.
 #[utoipa::path(patch, path = "/team/slug", tag = "teams", request_body = SlugChange,
     responses((status = 200, body = Team), (status = 401, body = Error),
         (status = 403, body = Error), (status = 409, body = Error),
@@ -233,8 +236,9 @@ pub struct SlugAddress {
 }
 
 /// Where the links of a slug a team gave up lead now, for the web app's redirect. Public, and
-/// `404` for a slug that is a team's code or current slug, one given up more than 400 days ago,
-/// one never used, one whose team was deleted, and one that more than one team gave up. Per-IP limit of 600 calls a minute.
+/// `404` for a slug that is a team's code or current slug, one given up more than
+/// `team::SLUG_WINDOW_DAYS` (400 days) ago, one never used, one whose team was deleted, and one
+/// that more than one team gave up. Per-IP limit of 600 calls a minute.
 #[utoipa::path(get, path = "/public/team-slugs/{slug}", tag = "teams",
     params(("slug" = String, Path)),
     responses((status = 200, body = SlugAddress,
@@ -254,15 +258,20 @@ async fn address(
     }
     // A slug a team holds now, or a code, is that team's address, not a redirect. One that more
     // than one team gave up inside the window is ambiguous (it passed from one team to another
-    // after its 90 days), so it leads nowhere rather than to the wrong team.
+    // once the window ended), so it leads nowhere rather than to the wrong team.
     let sql = "SELECT COALESCE(t.slug, t.code) AS address FROM team_slug_history h \
                JOIN teams t ON t.id = h.team_id WHERE h.slug = $1 \
-               AND h.retired_at > now() - interval '400 days' \
+               AND h.retired_at > now() - make_interval(days => $2::int) \
                AND NOT EXISTS (SELECT 1 FROM teams c WHERE c.code = $1 OR lower(c.slug) = $1) \
                AND NOT EXISTS (SELECT 1 FROM team_slug_history o WHERE o.slug = h.slug \
-                   AND o.team_id <> h.team_id AND o.retired_at > now() - interval '400 days') \
+                   AND o.team_id <> h.team_id \
+                   AND o.retired_at > now() - make_interval(days => $2::int)) \
                ORDER BY h.retired_at DESC LIMIT 1";
-    let stmt = Statement::from_sql_and_values(DbBackend::Postgres, sql, [slug.into()]);
+    let stmt = Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        sql,
+        [slug.into(), (SLUG_WINDOW_DAYS as i32).into()],
+    );
     let found = async {
         match app.db.query_one_raw(stmt).await? {
             Some(row) => row.try_get::<String>("", "address").map(Some),

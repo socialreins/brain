@@ -108,6 +108,14 @@ pub fn read_only_token() -> Response {
     reply(StatusCode::FORBIDDEN, "read_only_token")
 }
 
+/// The refusal of a set-scoped token where a route is the team's, not a set's (the media
+/// library, snippets and uploads, which every set shares): `403 team_token_required`. A
+/// session and a whole-team token pass, so `None` is the answer for them.
+pub fn refuses_set_token(a: &Actor) -> Option<Response> {
+    a.set_id()
+        .map(|_| reply(StatusCode::FORBIDDEN, "team_token_required"))
+}
+
 fn invalid_token() -> Response {
     reply(StatusCode::UNAUTHORIZED, "invalid_token")
 }

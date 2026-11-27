@@ -6,7 +6,9 @@
 //! with `Idempotent-Replayed: true`, or `409 idempotency_in_progress` while the first still runs;
 //! with anything else, `422 idempotency_key_reused`. 5xx and 429 answers are not stored, so a retry runs again; every
 //! other answer is. A first run left unfinished for 10 minutes (a crash) is run again. Keys live
-//! 30 days. Sessions ignore the header. A request this layer answers itself counts once against
+//! 30 days. A route whose answer carries a secret (`POST /api-tokens`, `PUT /team/webhook`)
+//! ignores the header and is never stored, so neither a replay nor `GET /idempotency/{key}` can
+//! hand a secret out. Sessions ignore the header. A request this layer answers itself counts once against
 //! the token's rate limit, as the route would have. `GET /idempotency/{key}` answers what a key
 //! stored, for a caller that lost the response.
 use axum::{
@@ -34,7 +36,7 @@ use super::{
 use crate::{models::api_tokens, state::AppState};
 
 /// The `Idempotency-Key` header, as every `/v1` write documents it.
-pub const IDEMPOTENCY: &str = "With an API token: 1 to 255 printable ASCII characters. Sent again for 30 days, the same key replays the first answer (`Idempotent-Replayed: true`) when the method, path and request body are byte for byte the same (the raw bytes, not the parsed JSON: another key order or whitespace is a different body), else `422 idempotency_key_reused`; `409 idempotency_in_progress` while the first request still runs. The token's team shares keys, a set token's keys are its own set's. 5xx and 429 answers are not stored, so a retry runs again. Lost the response? `GET /idempotency/{key}` says what the key made";
+pub const IDEMPOTENCY: &str = "With an API token: 1 to 255 printable ASCII characters. Sent again for 30 days, the same key replays the first answer (`Idempotent-Replayed: true`) when the method, path and request body are byte for byte the same (the raw bytes, not the parsed JSON: another key order or whitespace is a different body), else `422 idempotency_key_reused`; `409 idempotency_in_progress` while the first request still runs. The token's team shares keys, a set token's keys are its own set's. 5xx and 429 answers are not stored, so a retry runs again. A route whose answer carries a secret (`POST /api-tokens`, `PUT /team/webhook`) ignores the header and is never stored. Lost the response? `GET /idempotency/{key}` says what the key made";
 
 /// How long a key and its response are kept.
 pub const KEEP_DAYS: i64 = 30;
@@ -70,8 +72,24 @@ fn kept(status: StatusCode) -> bool {
     !status.is_server_error() && status != StatusCode::TOO_MANY_REQUESTS
 }
 
+/// Whether a route's answer may be stored for replay. Every route stores, except the ones whose
+/// answer carries a secret or another one-time value: `POST /api-tokens` (the bearer secret) and
+/// `PUT /team/webhook` (the signing secret, once). Passkey challenges live under `/auth`, outside
+/// this layer. Stored, a secret would sit in `response_body` for 30 days, readable by every token
+/// of the team through `GET /idempotency/{key}`.
+fn stores(method: &Method, path: &str) -> bool {
+    let path = path.strip_prefix("/v1").unwrap_or(path);
+    !((method == Method::POST && path == "/api-tokens")
+        || (method == Method::PUT && path == "/team/webhook"))
+}
+
 /// The `/v1` middleware.
 pub async fn layer(State(app): State<AppState>, req: Request, next: Next) -> Response {
+    // A route whose answer carries a secret is never stored: the key is ignored, as for a
+    // session, so neither a replay nor `GET /idempotency/{key}` can hand a secret out.
+    if !stores(req.method(), req.uri().path()) {
+        return next.run(req).await;
+    }
     // A validate-only create writes nothing, so it takes no key: nothing stored, nothing replayed.
     let writes = matches!(
         *req.method(),
@@ -382,5 +400,21 @@ mod tests {
         for s in [429, 500, 502, 503] {
             assert!(!super::kept(StatusCode::from_u16(s).unwrap()), "{s}");
         }
+    }
+
+    #[test]
+    fn secret_answers_are_never_stored() {
+        use axum::http::Method;
+        let stores =
+            |m: &str, p: &str| super::stores(&Method::from_bytes(m.as_bytes()).unwrap(), p);
+        assert!(!stores("POST", "/v1/api-tokens"));
+        assert!(!stores("PUT", "/v1/team/webhook"));
+        // Only the creates: the rest of those controllers is stored as usual.
+        assert!(stores("GET", "/v1/api-tokens"));
+        assert!(stores("DELETE", "/v1/api-tokens/7"));
+        assert!(stores("DELETE", "/v1/team/webhook"));
+        assert!(stores("POST", "/v1/posts"));
+        assert!(stores("PATCH", "/v1/media-library/7"));
+        assert!(stores("POST", "/v1/snippets"));
     }
 }

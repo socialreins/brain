@@ -253,8 +253,9 @@ cargo run -p socialreins-brain
   commit; a slot is free when no `scheduled` post of the set is at that exact time.
 - `app/src/controllers/library.rs`: the media library (`media_library`, URLs only, unique per team,
   at most 1000) and snippets (`snippets`, `caption`, `hashtags` or `reply`, a saved inbox reply; name unique per team and kind
-  ignoring case, at most 500). Team assets: every member and token writes them, set tokens too,
-  read-only tokens never; creates take a per-team advisory lock so the caps hold.
+  ignoring case, at most 500). Team assets: every member and whole-team token writes them; a set
+  token is `403 team_token_required` on every route (same for `POST /v1/uploads`), and a
+  read-only token never; creates take a per-team advisory lock so the caps hold.
 - `app/src/controllers/contacts.rs`: contacts (`contacts`, one per team, platform and author id;
   `contact_tags`, at most 20 a contact). `inbox::store` is the only place an item is stored and
   upserts the author's contact in the same statement, so never insert into `inbox_items` any
@@ -332,8 +333,8 @@ cargo run -p socialreins-brain
   slug has its own routes in `controllers/team_slugs.rs` (`PATCH /team/slug`: owner, fresh sign-in;
   `GET /slugs/check`; public `GET /public/team-slugs/{slug}`) and `POST /teams` takes one. A slug given
   up (change, clear, team delete) is a `team_slug_history` row, written in the same transaction: it holds
-  the slug for other teams 90 days, feeds the web redirect for 400 days and counts the team's changes (3
-  per 30 days). `crates/core/src/team.rs` has the rules and `RESERVED_SLUGS`; the web repo's
+  the slug for other teams 400 days, the same window that feeds the web redirect (`SLUG_WINDOW_DAYS`), and counts
+  the team's changes (3 per 30 days). `crates/core/src/team.rs` has the rules and `RESERVED_SLUGS`; the web repo's
   `tests/unit/team-slug.test.ts` checks it covers every web route. Post notice mail links by
   `COALESCE(slug, code)`.
 - `app/src/dry_run.rs`: `POST /v1/automations/test`, "Test this automation". It runs the real matching (`automations::mismatches`), `network_limits`, `{name}` and `{page}` filling and the AI step (`automations::ai_write`, shared with the real send, so the key choice, the monthly allowance and the checks are the same) on a sample from a stranger, and sends nothing, stores no inbox item or run and takes no daily hit. Keep it in step with `automations::run_matching` and `act` when a rule changes.

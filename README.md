@@ -141,13 +141,13 @@ Numbers: next to their `id`, posts, lists, automations, broadcasts, newsletters,
 | POST | `/v1/lists/{id}/posts` | Add a post (`{"post_id","position"}`; appends by default, an existing post moves) |
 | DELETE | `/v1/lists/{id}/posts/{post_id}` | Take a post out; later posts move up |
 | PUT | `/v1/lists/{id}/order` | Reorder (`{"post_ids"}`: every post of the list once, else `422 invalid_order`) |
-| GET, POST | `/v1/media-library` | The team's media library, newest first: `{"items":[{"id","url","name","created_at","created_by"}],"next_cursor"}` (`?q=&cursor=&limit=`: `q` searches name and URL in any case, wildcards matched as typed; `limit` 1 to 100, default 50; `created_by` is `null` for a token). Add one (`{"url","name"}`, `201`): `url` a public `https://` URL up to 2048 bytes with no user or password, `name` trimmed up to 100 characters, by default the URL's last path segment decoded. `422 {"error":"invalid_media","field"}`, `409 {"error":"already_in_library","id"}` for a URL the team has, `422 library_full` past 1000 items |
+| GET, POST | `/v1/media-library` | The team's media library, newest first: `{"items":[{"id","url","name","created_at","created_by"}],"next_cursor"}` (`?q=&cursor=&limit=`: `q` searches name and URL in any case, wildcards matched as typed; `limit` 1 to 100, default 50; `created_by` is `null` for a token). Add one (`{"url","name"}`, `201`): `url` a public `https://` URL up to 2048 bytes with no user or password, `name` trimmed up to 100 characters, by default the URL's last path segment decoded. `422 {"error":"invalid_media","field"}`, `409 {"error":"already_in_library","id"}` for a URL the team has, `422 library_full` past 1000 items. A set token is `403 team_token_required` |
 | PATCH, DELETE | `/v1/media-library/{id}` | Rename (`{"name"}`, `200` with the item); remove (`204`). Posts keep their media URLs |
-| POST | `/v1/uploads` | A file from the device for a post: the raw file as the body (any member, any token that may write). Typed by its bytes: JPEG, PNG, WebP, GIF or PDF up to 100 MB, MP4 or MOV up to `MEDIA_MAX_BYTES`. `201 {"id","url","content_type","size"}`; `422 media_type_not_supported`, `413 media_too_large`, `409 too_many_uploads` (200 uploads kept per team), `413 storage_limit` with `used` and `budget` (the team's upload bytes, `TEAM_STORAGE_BYTES` or its own budget, an upload in progress counting `MEDIA_MAX_BYTES`), `429 uploads_in_progress` (3 at once per team), `429 rate_limited` (60 a minute per team), `402 plan_limit` (billing on, no live plan). Put `url` in a post's `media` or `cover`: another team's (or a deleted) upload is `422 invalid_upload`, whatever the link's host or query. Kept a day, then while a post not yet published, or published with a failed target, names it; with billing on, one a day old whose team has no live plan goes too (none of its posts would publish) |
+| POST | `/v1/uploads` | A file from the device for a post: the raw file as the body (any member, any whole-team token that may write; a set token is `403 team_token_required`). Typed by its bytes: JPEG, PNG, WebP, GIF or PDF up to 100 MB, MP4 or MOV up to `MEDIA_MAX_BYTES`. `201 {"id","url","content_type","size"}`; `422 media_type_not_supported`, `413 media_too_large`, `409 too_many_uploads` (200 uploads kept per team), `413 storage_limit` with `used` and `budget` (the team's upload bytes, `TEAM_STORAGE_BYTES` or its own budget, an upload in progress counting `MEDIA_MAX_BYTES`), `429 uploads_in_progress` (3 at once per team), `429 rate_limited` (60 a minute per team), `402 plan_limit` (billing on, no live plan). Put `url` in a post's `media` or `cover`: another team's (or a deleted) upload is `422 invalid_upload`, whatever the link's host or query. Kept a day, then while a post not yet published, or published with a failed target, names it; with billing on, one a day old whose team has no live plan goes too (none of its posts would publish) |
 | GET, POST | `/v1/feeds` | The team's RSS and Atom feeds, oldest first, as an array of `{"id","url","social_set_id","platforms":[..],"template","mode":"draft"\|"queue"\|"now","active","last_checked_at","last_error","items_posted","created_at"}`. Add one (`{"url","social_set_id","platforms","template","mode"}`, `201`; owner, admin or a full token): see [Feeds](#feeds). `422 {"error":"invalid_feed","field"}`, `422 {"error":"platform_not_supported","platform"}` for TikTok and YouTube, `422 {"error":"feed_unreadable","reason"}`, `422 too_many_feeds` past 20 |
 | GET, PUT, DELETE | `/v1/feeds/{id}` | One feed; replace it (the same fields and `active`, `200`); remove it (`204`, its posts stay). Another team's id is `404` |
 | POST | `/v1/feeds/{id}/check` | Check the feed now and answer it (`200`). At most once a minute per feed, every other check included: `429 checked_recently` |
-| GET, POST | `/v1/snippets` | Saved captions, hashtag sets and inbox replies by name, ignoring case: `{"items":[{"id","kind","name","body","created_at","updated_at"}]}` (`?kind=caption`, `hashtags` or `reply`, a saved inbox reply). Save one (`{"kind","name","body"}`, `201`): `name` trimmed 1 to 80 characters, unique per team and kind ignoring case (`409 snippet_name_taken`), `body` 1 to 5000 characters. `422 {"error":"invalid_snippet","field"}`, `422 too_many_snippets` past 500 per team |
+| GET, POST | `/v1/snippets` | Saved captions, hashtag sets and inbox replies by name, ignoring case: `{"items":[{"id","kind","name","body","created_at","updated_at"}]}` (`?kind=caption`, `hashtags` or `reply`, a saved inbox reply). Save one (`{"kind","name","body"}`, `201`): `name` trimmed 1 to 80 characters, unique per team and kind ignoring case (`409 snippet_name_taken`), `body` 1 to 5000 characters. `422 {"error":"invalid_snippet","field"}`, `422 too_many_snippets` past 500 per team. A set token is `403 team_token_required` |
 | PUT, DELETE | `/v1/snippets/{id}` | Replace kind, name and body, checked as on create (`200`); delete (`204`) |
 | GET, POST | `/v1/inboxes` | The team's inboxes, the undeletable "All" first (every item of the team, `account_ids: []`), each with `account_ids` and `open_count` (its `open` items, follows left out; in the list only); create one (`{"name","account_ids":[..],"filters":{"kinds","keywords","unanswered"}}`, owner, admin): a custom inbox holds the items of its accounts, 1 to 100 of the team's Bluesky, Facebook and Instagram accounts (`422 invalid_accounts`), and an account may be in several. Its filters narrow it further. Past the plan's inboxes `402 plan_limit` with `limit: "inboxes"`; past 50 ("All" included) `409 too_many_inboxes` |
 | PUT, DELETE | `/v1/inboxes/{id}` | Replace name, accounts and filters (same body); delete (owner, admin; not "All"). Disconnecting an account takes it out of every inbox |
@@ -310,12 +310,13 @@ A team gives up a slug (changes it or clears it) at most 3 times in 30 days, the
 {"error":"slug_changed_too_often"}`; setting its first slug, refused changes and sending the slug
 it already has do not count. A slug given up (by changing or clearing it, or when the team is
 deleted) is written to `team_slug_history` and stops naming the team for API calls at once
-(`404`, so link by code where a call must last). For 90 days after that no other team can take
+(`404`, so link by code where a call must last). For 400 days after that no other team can take
 it (`409 slug_taken`), so an old link never lands on another team; the team that had it may take
-it back at any time. For 400 days `GET /v1/public/team-slugs/{slug}` answers `{"address"}`, the
-team's current slug or its code, and the web app redirects `/t/<old>/...` there with a permanent
-redirect, keeping the path and the query; after the 90 days another team may have taken the
-slug, and then it is theirs and nothing redirects (nor when two teams gave it up). The lookup is public (a slug is in every link
+it back at any time. For the same 400 days `GET /v1/public/team-slugs/{slug}` answers
+`{"address"}`, the team's current slug or its code, and the web app redirects `/t/<old>/...`
+there with a permanent redirect, keeping the path and the query. The hold and the redirect end on
+the same day, so a slug another team takes is one whose old links have stopped redirecting (and
+a slug two teams gave up redirects nowhere). The lookup is public (a slug is in every link
 a team shares) and limited to 600 calls a minute per IP. Everything else is keyed by the team's
 id: API tokens, posts, public post pages (`/p/<code>`), newsletter and invitation links and
 webhooks do not hold the slug and do not notice a change. Post notice mails link to
@@ -499,8 +500,9 @@ member: only an owner or admin may hold one. `GET /v1/posts/{id}` lists the post
 display name, target id and status), also before it publishes and has targets.
 
 The media library and snippets are team assets, not set assets: any member reads and writes
-them, and so does every token of the team, a set token too (it sees and changes the whole
-team's library and snippets); a read-only token only reads them. Another team's id is `404`.
+them, and so does a whole-team token; a set-scoped token never reaches them (`403
+{"error":"team_token_required"}`, like `/v1/uploads`, since its set does not own them), and a
+read-only token only reads them. Another team's id is `404`.
 Adding a URL to the library stores the URL only, nothing is downloaded.
 
 API token writes (`POST`, `PUT`, `PATCH`, `DELETE`) take an optional `Idempotency-Key` header,
@@ -509,7 +511,9 @@ token's team. A retry with the same key, method, path and body gets the first an
 `Idempotent-Replayed: true`, or `409 idempotency_in_progress` while the first still runs; the
 same key with anything else is `422 idempotency_key_reused`. 5xx and 429 answers are not kept,
 so a retry runs again; every other answer is kept for 30 days. A first run unfinished after 10
-minutes is taken as crashed and runs again. Sessions ignore the header.
+minutes is taken as crashed and runs again. Sessions ignore the header; so do the two routes whose
+answer carries a secret (`POST /v1/api-tokens`, `PUT /v1/team/webhook`), which are never stored,
+so neither a replay nor `GET /v1/idempotency/{key}` can hand a secret out.
 
 Connections are the current team's social accounts. Members list them; owners and admins connect,
 regroup and disconnect them. Tokens are sealed with `ENCRYPTION_KEY` and never returned. Every

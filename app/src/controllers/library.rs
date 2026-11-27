@@ -1,9 +1,10 @@
 //! Team assets for the composer: the media library (`/v1/media-library`, URLs kept for reuse) and
 //! saved text snippets (`/v1/snippets`, captions and hashtag sets). Both belong to the team, not to
-//! a set: any member reads and writes them, and so does any API token of the team, a set token
-//! included; a read-only token only reads (the `Actor` extractor and `/mcp` refuse its writes).
-//! Each create runs under a per-team advisory lock, so the caps and the duplicate checks hold
-//! under concurrent calls.
+//! a set: any member reads and writes them, and so does a whole-team API token. A set-scoped
+//! token sees nothing outside its set, so every route here is `403 team_token_required` for one
+//! (`api_tokens::refuses_set_token`); a read-only token only reads (the `Actor` extractor and
+//! `/mcp` refuse its writes). Each create runs under a per-team advisory lock, so the caps and
+//! the duplicate checks hold under concurrent calls.
 use axum::{
     extract::{rejection::QueryRejection, Path, Query, State},
     http::StatusCode,
@@ -26,7 +27,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use super::{
-    api_tokens::Actor,
+    api_tokens::{refuses_set_token, Actor},
     auth::{internal, Body},
     idempotency::IDEMPOTENCY,
     waitlist::{error, like, Error},
@@ -227,7 +228,7 @@ fn default_name(url: &str) -> String {
 #[utoipa::path(get, path = "/media-library", tag = "library",
     security(("session" = []), ("api_token" = [])), params(MediaQuery),
     responses((status = 200, body = MediaPage), (status = 401, body = Error),
-        (status = 422, body = Error)))]
+        (status = 403, body = Error), (status = 422, body = Error)))]
 async fn media_index(
     State(app): State<AppState>,
     a: Actor,
@@ -241,6 +242,9 @@ async fn media_index(
 
 /// The body of `GET /media-library`, shared with the MCP `list-media` tool.
 pub async fn list_media(app: &AppState, a: &Actor, q: MediaQuery) -> Response {
+    if let Some(res) = refuses_set_token(a) {
+        return res;
+    }
     let limit = q.limit.unwrap_or(PAGE);
     let search = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
     if !(1..=MAX_PAGE).contains(&limit) || search.is_some_and(|s| s.chars().count() > MAX_QUERY) {
@@ -301,6 +305,9 @@ async fn media_create(
 
 /// The body of `POST /media-library`, shared with the MCP `add-media` tool.
 pub async fn add_media(app: &AppState, a: &Actor, input: MediaInput) -> Response {
+    if let Some(res) = refuses_set_token(a) {
+        return res;
+    }
     if !https_url(&input.url) {
         return invalid("invalid_media", "url");
     }
@@ -370,6 +377,9 @@ async fn media_rename(
     Path(id): Path<Uuid>,
     Body(input): Body<MediaName>,
 ) -> Response {
+    if let Some(res) = refuses_set_token(&a) {
+        return res;
+    }
     let Some(name) = name_up_to(&input.name, MAX_MEDIA_NAME) else {
         return invalid("invalid_media", "name");
     };
@@ -393,6 +403,9 @@ async fn media_rename(
     responses((status = 204), (status = 401, body = Error), (status = 403, body = Error),
         (status = 404, body = Error)))]
 async fn media_destroy(State(app): State<AppState>, a: Actor, Path(id): Path<Uuid>) -> Response {
+    if let Some(res) = refuses_set_token(&a) {
+        return res;
+    }
     let done = media_library::Entity::delete_many()
         .filter(media_library::Column::Id.eq(id))
         .filter(media_library::Column::TeamId.eq(a.team.id))
@@ -409,7 +422,7 @@ async fn media_destroy(State(app): State<AppState>, a: Actor, Path(id): Path<Uui
 #[utoipa::path(get, path = "/snippets", tag = "library",
     security(("session" = []), ("api_token" = [])), params(SnippetQuery),
     responses((status = 200, body = SnippetList), (status = 401, body = Error),
-        (status = 422, body = Error)))]
+        (status = 403, body = Error), (status = 422, body = Error)))]
 async fn snippet_index(
     State(app): State<AppState>,
     a: Actor,
@@ -427,6 +440,9 @@ fn kind_ok(kind: &str) -> bool {
 
 /// The body of `GET /snippets`, shared with the MCP `list-snippets` tool.
 pub async fn list_snippets(app: &AppState, a: &Actor, q: SnippetQuery) -> Response {
+    if let Some(res) = refuses_set_token(a) {
+        return res;
+    }
     if q.kind.as_deref().is_some_and(|k| !kind_ok(k)) {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     }
@@ -505,6 +521,9 @@ async fn snippet_create(
 
 /// The body of `POST /snippets`, shared with the MCP `save-snippet` tool.
 pub async fn create_snippet(app: &AppState, a: &Actor, input: SnippetInput) -> Response {
+    if let Some(res) = refuses_set_token(a) {
+        return res;
+    }
     let (kind, name, body) = match checked(input) {
         Ok(s) => s,
         Err(field) => return invalid("invalid_snippet", field),
@@ -565,6 +584,9 @@ async fn snippet_update(
 
 /// The body of `PUT /snippets/{id}`, shared with the MCP `save-snippet` tool.
 pub async fn update_snippet(app: &AppState, a: &Actor, id: Uuid, input: SnippetInput) -> Response {
+    if let Some(res) = refuses_set_token(a) {
+        return res;
+    }
     let (kind, name, body) = match checked(input) {
         Ok(s) => s,
         Err(field) => return invalid("invalid_snippet", field),
@@ -613,6 +635,9 @@ async fn snippet_destroy(State(app): State<AppState>, a: Actor, Path(id): Path<U
 
 /// The body of `DELETE /snippets/{id}`, shared with the MCP `delete-snippet` tool.
 pub async fn delete_snippet(app: &AppState, a: &Actor, id: Uuid) -> Response {
+    if let Some(res) = refuses_set_token(a) {
+        return res;
+    }
     let done = snippets::Entity::delete_many()
         .filter(snippets::Column::Id.eq(id))
         .filter(snippets::Column::TeamId.eq(a.team.id))
@@ -625,14 +650,15 @@ pub async fn delete_snippet(app: &AppState, a: &Actor, id: Uuid) -> Response {
     }
 }
 
-/// `/media-library` routes.
+/// `/media-library` routes; a set-scoped token is `403 team_token_required` on each.
 pub fn media_api() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(media_index, media_create))
         .routes(routes!(media_rename, media_destroy))
 }
 
-/// `/snippets` routes; a 5000-character body can pass 4 KiB.
+/// `/snippets` routes; a set-scoped token is `403 team_token_required` on each, and a
+/// 5000-character body can pass 4 KiB.
 pub fn snippets_api() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(snippet_index, snippet_create))

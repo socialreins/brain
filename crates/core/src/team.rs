@@ -196,6 +196,11 @@ const BLOCKED_WORDS: &[&str] = &[
 pub const SLUG_MIN_CHARS: usize = 3;
 pub const SLUG_MAX_CHARS: usize = 32;
 
+/// How long a slug a team gave up stays out of other teams' hands, and how long its old links
+/// are redirected: one window, so a link can never open another team's address. It is the
+/// redirect's lifetime (`controllers::team_slugs::address`), not a shorter hold beside it.
+pub const SLUG_WINDOW_DAYS: i64 = 400;
+
 /// `raw` as a team slug (trimmed, lowercase): 3 to 32 of `a-z`, `0-9` and `-`, a letter or digit
 /// at both ends, no `--`, not in `RESERVED_SLUGS`, not containing `socialreins`, no part in the
 /// blocklist. The error is the reason: `reserved`, `length`, `characters` or `blocked`, checked
