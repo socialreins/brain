@@ -1161,6 +1161,10 @@ fn scope_as(scope: &str, alias: &str) -> String {
 ///   For `state` `open` the conversations are found from the open DMs (a conversation is open
 ///   when one of its items is), so the work follows the open conversations, not the whole history
 ///   (a team with very many open conversations still reads them all, as the old query did).
+///   For a search (`hit` is not `TRUE`) a head must also have a DM of its conversation that
+///   matches (`hit_in`, which `rest` demands anyway through `conv_hit`): Postgres can then find
+///   the few conversations that match through the trigram indexes on `text`, `author_name` and
+///   `author_handle` and join to their heads, or probe a conversation at a time when most match.
 ///
 /// `state`, `q` and `assigned` (`rest`) narrow the groups after their `conv_*` are known.
 fn grouped_sql(scope: &str, rest: &str, hit: &str, limit: usize, state: Option<&str>) -> String {
@@ -1183,6 +1187,19 @@ fn grouped_sql(scope: &str, rest: &str, hit: &str, limit: usize, state: Option<&
          FROM inbox_items i WHERE i.team_id = $1{scope} AND i.kind = 'dm' \
          AND i.contact_id = h.contact_id AND i.social_account_id = h.social_account_id"
     );
+    // The conversation of `pair` (an alias holding `social_account_id` and `contact_id`) has a DM
+    // in scope that matches the search. Nothing when there is no search.
+    let hit_in = |pair: &str| {
+        match hit {
+        "TRUE" => String::new(),
+        _ => format!(
+            "EXISTS (SELECT 1 FROM inbox_items o WHERE o.team_id = $1{o} AND o.kind = 'dm' \
+             AND o.contact_id = {pair}.contact_id AND o.social_account_id = {pair}.social_account_id \
+             AND {})",
+            scope_as(hit, "o")
+        ),
+    }
+    };
     let heads = if state == Some("open") {
         format!(
             "FROM (SELECT DISTINCT o.social_account_id, o.contact_id FROM inbox_items o \
@@ -1192,7 +1209,11 @@ fn grouped_sql(scope: &str, rest: &str, hit: &str, limit: usize, state: Option<&
                AND h.kind = 'dm' AND h.contact_id = k.contact_id \
                AND h.social_account_id = k.social_account_id \
                ORDER BY h.received_at DESC, h.id DESC LIMIT 1) h \
-             CROSS JOIN LATERAL ({count}) c"
+             CROSS JOIN LATERAL ({count}) c{}",
+            match hit_in("k") {
+                s if s.is_empty() => s,
+                s => format!(" WHERE {s}"),
+            }
         )
     } else {
         format!(
@@ -1201,7 +1222,11 @@ fn grouped_sql(scope: &str, rest: &str, hit: &str, limit: usize, state: Option<&
              AND NOT EXISTS (SELECT 1 FROM inbox_items n WHERE n.team_id = $1{n} \
                AND n.kind = 'dm' AND n.contact_id = h.contact_id \
                AND n.social_account_id = h.social_account_id \
-               AND (n.received_at, n.id) > (h.received_at, h.id))"
+               AND (n.received_at, n.id) > (h.received_at, h.id)){}",
+            match hit_in("h") {
+                s if s.is_empty() => s,
+                s => format!(" AND {s}"),
+            }
         )
     };
     format!(
@@ -1820,6 +1845,30 @@ mod tests {
             let sql = grouped_sql(&scope, " AND i.conv_open > 0", "TRUE", 51, state);
             assert!(sql.contains("UNION ALL") && sql.contains("LIMIT $51"));
             assert_eq!(sql.contains("SELECT DISTINCT o."), state == Some("open"));
+        }
+    }
+
+    #[test]
+    fn a_search_makes_every_conversation_prove_a_matching_dm() {
+        let hit = "(i.text ILIKE $2 OR i.author_name ILIKE $2 OR i.author_handle ILIKE $2)";
+        for state in [None, Some("open"), Some("done")] {
+            let sql = grouped_sql("", " AND i.conv_hit", hit, 51, state);
+            let probe = sql
+                .matches("EXISTS (SELECT 1 FROM inbox_items o WHERE o.team_id = $1")
+                .count();
+            assert_eq!(probe, 1, "{sql}");
+            assert!(
+                sql.contains(
+                    "(o.text ILIKE $2 OR o.author_name ILIKE $2 OR o.author_handle ILIKE $2)"
+                ),
+                "{sql}"
+            );
+            // No search: no probe, the page is what it was.
+            let plain = grouped_sql("", "", "TRUE", 51, state);
+            assert!(
+                !plain.contains("EXISTS (SELECT 1 FROM inbox_items o"),
+                "{plain}"
+            );
         }
     }
 
