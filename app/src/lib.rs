@@ -21,6 +21,7 @@ pub mod meta_rules;
 pub mod metrics;
 pub mod models;
 pub mod newsletters;
+pub mod operator_digest;
 pub mod post_mail;
 pub mod publish;
 pub mod rate_limit;

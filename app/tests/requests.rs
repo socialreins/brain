@@ -10668,6 +10668,163 @@ mod teams {
                     assert_eq!(subjects, ["Your Bluesky post failed"], "{subjects:?}");
                 }
 
+                /// The operator digest (`ADMIN_EMAILS`, 08:00 Dhaka): counts, nothing leaked, quiet
+                /// midweek when all is zero, an all-clear line on Mondays, one mail a day.
+                #[tokio::test]
+                #[serial]
+                async fn the_operator_digest_is_counted_clean_and_sent_once_a_day() {
+                    use chrono::TimeZone;
+                    use socialreins_brain::operator_digest::{run, Outcome};
+                    let (s, db, state) = on_mock().await;
+                    let (mut state, seen) = mail_to_fake(&state).await;
+                    state.admin_emails = vec!["ops@example.com".into()];
+                    let (cookie, team_id, _) = owner_with_account(&s, &db).await;
+                    let set = default_set(&db, &team_id).await.to_string();
+                    // A clean slate for what the digest reads (08:30 in Dhaka is 02:30 UTC).
+                    exec(
+                        &db,
+                        "DELETE FROM rate_limit_hits WHERE bucket LIKE 'operator-digest:%'; \
+                         UPDATE posts SET status = 'draft' WHERE status IN ('scheduled', 'queued'); \
+                         DELETE FROM post_notices; DELETE FROM post_targets WHERE status = 'publishing'; \
+                         UPDATE social_accounts SET meta = meta - 'reconnect'; \
+                         UPDATE x_inbox SET paused_reason = NULL"
+                            .into(),
+                    )
+                    .await;
+                    let at = |day: u32| Utc.with_ymd_and_hms(2026, 11, day, 2, 30, 0).unwrap();
+                    let (mon, tue, wed, thu, fri, sat) =
+                        (at(23), at(24), at(25), at(26), at(27), at(28));
+                    let backup = |now: chrono::DateTime<Utc>, age_hours: i64| {
+                        let dir = media_dir().join("backups");
+                        std::fs::create_dir_all(&dir).unwrap();
+                        let time = (now - Duration::hours(age_hours)).to_rfc3339();
+                        std::fs::write(dir.join("latest.json"), json!({"time": time}).to_string())
+                            .unwrap();
+                    };
+                    let digests = || mail_for(&seen.lock().unwrap(), "ops@example.com");
+
+                    // Before 08:00 in Dhaka: not due.
+                    backup(mon, 3);
+                    let early = Utc.with_ymd_and_hms(2026, 11, 22, 21, 0, 0).unwrap();
+                    assert_eq!(run(&state, early).await.unwrap(), Outcome::NotDue);
+                    // All zero on a Tuesday: nothing sent, and the day is done.
+                    backup(tue, 3);
+                    assert_eq!(run(&state, tue).await.unwrap(), Outcome::Quiet);
+                    assert_eq!(run(&state, tue).await.unwrap(), Outcome::Done);
+                    assert!(digests().is_empty());
+                    // All zero on a Monday: the all-clear line, once.
+                    backup(mon, 3);
+                    assert_eq!(run(&state, mon).await.unwrap(), Outcome::Sent(1));
+                    assert_eq!(run(&state, mon).await.unwrap(), Outcome::Done);
+                    let mails = digests();
+                    assert_eq!(mails.len(), 1, "{mails:?}");
+                    assert_eq!(mails[0].0, "SocialReins digest 2026-11-23: all clear");
+                    assert!(mails[0].1.contains("3 h 0 min old"), "{}", mails[0].1);
+
+                    // Failures: two failed (one with a token in its reason), one late.
+                    let first = id_of(
+                        &create(&s, &cookie, input(&set, "REJECT secret one", Some(&past()))).await,
+                    );
+                    create(&s, &cookie, input(&set, "REJECT secret two", Some(&past()))).await;
+                    for _ in 0..3 {
+                        publish::tick(&state).await.unwrap();
+                    }
+                    due_ago(&s, &db, &cookie, input(&set, "late one", Some(&past())), 61).await;
+                    for _ in 0..3 {
+                        publish::tick(&state).await.unwrap();
+                    }
+                    exec(
+                        &db,
+                        format!(
+                            "UPDATE posts SET error = '@ann.example: GET https://graph.example/me?access_token=SECRET123&x=1 failed' \
+                             WHERE id = '{first}'; \
+                             UPDATE post_notices SET created_at = '2026-11-25T00:30:00Z'; \
+                             INSERT INTO post_targets (id, post_id, status, updated_at) \
+                             VALUES (gen_random_uuid(), '{first}', 'publishing', '2026-11-25T02:00:00Z'); \
+                             UPDATE social_accounts SET meta = meta || '{{\"reconnect\": true}}' \
+                             WHERE team_id = '{team_id}'"
+                        ),
+                    )
+                    .await;
+                    let code = db
+                        .query_one_raw(sea_orm::Statement::from_string(
+                            sea_orm::DbBackend::Postgres,
+                            format!("SELECT COALESCE(slug, code) AS v FROM teams WHERE id = '{team_id}'"),
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .try_get::<String>("", "v")
+                        .unwrap();
+                    backup(wed, 3);
+                    assert_eq!(run(&state, wed).await.unwrap(), Outcome::Sent(1));
+                    // A restart or a second instance: the day's mail is not sent again.
+                    assert_eq!(run(&state, wed).await.unwrap(), Outcome::Done);
+                    let mails = digests();
+                    assert_eq!(mails.len(), 2, "{mails:?}");
+                    let (subject, text) = &mails[1];
+                    assert_eq!(
+                        subject,
+                        "SocialReins digest 2026-11-25: 3 posts not out, 1 stuck, 1 to reconnect"
+                    );
+                    assert!(text.contains("Failed: 2 (Bluesky 2)"), "{text}");
+                    assert!(
+                        text.contains("Late, back to draft: 1 (Bluesky 1)"),
+                        "{text}"
+                    );
+                    assert!(text.contains("Part failed: 0\n"), "{text}");
+                    assert!(
+                        text.contains("- 1 x GET https://graph.example failed"),
+                        "{text}"
+                    );
+                    assert!(
+                        text.contains("- 1 x Bluesky refused it (InvalidRequest)."),
+                        "{text}"
+                    );
+                    assert!(text.contains(&format!("- {code}: #")), "{text}");
+                    assert!(text.contains("Publishing for over 15 minutes: 1"), "{text}");
+                    assert!(text.contains("Accounts to reconnect: 1"), "{text}");
+                    assert!(
+                        text.contains("Last database backup: 3 h 0 min old."),
+                        "{text}"
+                    );
+                    // No token, address, handle or post text.
+                    for leak in [
+                        "SECRET123",
+                        "access_token",
+                        "ann.example",
+                        "REJECT",
+                        "secret",
+                        "late one",
+                        "@",
+                    ] {
+                        assert!(!text.contains(leak), "{leak} in {text}");
+                    }
+
+                    // An old backup (and an unreadable one) is flagged, even with no failures.
+                    exec(
+                        &db,
+                        "DELETE FROM post_targets WHERE status = 'publishing'; \
+                         UPDATE social_accounts SET meta = meta - 'reconnect'"
+                            .into(),
+                    )
+                    .await;
+                    backup(thu, 8);
+                    assert_eq!(run(&state, thu).await.unwrap(), Outcome::Sent(1));
+                    let mails = digests();
+                    assert_eq!(mails[2].0, "SocialReins digest 2026-11-26: backup");
+                    assert!(mails[2].1.contains("STALE"), "{}", mails[2].1);
+                    std::fs::remove_file(media_dir().join("backups/latest.json")).unwrap();
+                    assert_eq!(run(&state, fri).await.unwrap(), Outcome::Sent(1));
+                    assert!(digests()[3].1.contains("could not be read"));
+
+                    // No admin address: logged, nothing sent, the day is done.
+                    state.admin_emails = vec![];
+                    assert_eq!(run(&state, sat).await.unwrap(), Outcome::NoAdmins);
+                    assert_eq!(run(&state, sat).await.unwrap(), Outcome::Done);
+                    assert_eq!(digests().len(), 4);
+                }
+
                 async fn status_of(db: &DatabaseConnection, id: &str) -> String {
                     posts::Entity::find_by_id(id.parse::<uuid::Uuid>().unwrap())
                         .one(db)
