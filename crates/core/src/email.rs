@@ -1,6 +1,8 @@
 //! Email address checks for signups.
 
 /// Trims and lowercases `raw`, returning it when it looks like a deliverable address.
+/// The domain is ASCII letters, digits, hyphen and dot: a name that is not stays away, its
+/// `xn--` form is what an international one looks like on the wire.
 /// shortcut: syntax check only (no MX lookup, no quoted local parts), upgrade if bounces show up.
 pub fn normalize(raw: &str) -> Option<String> {
     let email = raw.trim().to_lowercase();
@@ -9,7 +11,7 @@ pub fn normalize(raw: &str) -> Option<String> {
         !l.is_empty()
             && !l.starts_with('-')
             && !l.ends_with('-')
-            && l.chars().all(|c| c.is_alphanumeric() || c == '-')
+            && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
     });
     let ok = email.len() <= 254
         && !local.is_empty()
@@ -75,6 +77,34 @@ mod tests {
             normalize("  Jane.Doe+x@Example.COM ").as_deref(),
             Some("jane.doe+x@example.com")
         );
+    }
+
+    #[test]
+    fn the_domain_is_ascii_only_and_punycode_passes() {
+        // An internationalised domain as typed is refused; its `xn--` form is ASCII and is what
+        // SMTP carries, so it is accepted.
+        for bad in ["user@почта.рф", "user@bücher.de", "user@例え.テスト"] {
+            assert_eq!(normalize(bad), None, "{bad}");
+        }
+        assert_eq!(
+            normalize("  User@XN--BCHER-KVA.de ").as_deref(),
+            Some("user@xn--bcher-kva.de")
+        );
+    }
+
+    #[test]
+    fn the_local_part_keeps_the_quoting_characters() {
+        // RFC 5321 atext, which SMTP delivers: a local part may hold them. Only the domain is
+        // held to ASCII.
+        for ok in [
+            "o'brien@example.com",
+            "a|b@example.com",
+            "a`b@example.com",
+            "a{b}@example.com",
+        ] {
+            assert_eq!(normalize(ok).as_deref(), Some(ok), "{ok}");
+        }
+        assert_eq!(normalize("o'brien@exämple.com"), None);
     }
 
     #[test]
