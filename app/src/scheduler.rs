@@ -1,5 +1,5 @@
 //! Background jobs, in process: publishing due posts and reading inboxes (then running
-//! automations), taking up waiting automation flows, sending broadcasts, sending newsletters and sending webhooks every minute (the old app ran every 5), purging expired sessions and sign-in links daily, and purging deleted
+//! automations), taking up waiting automation flows, sending broadcasts, sending newsletters and sending webhooks every minute, mailing the operator digest daily, (the old app ran every 5), purging expired sessions and sign-in links daily, and purging deleted
 //! sets, old idempotency keys, old webhook deliveries and leftover stored media every hour, and
 //! extending Threads and LinkedIn tokens and mailing about ending ones daily and renewing X tokens, reading RSS feeds and reading post metrics every 15 minutes, each run by one instance at a time through an advisory lock.
 //! shortcut: no job queue; move to one if jobs need retries or exact times.
@@ -226,6 +226,22 @@ pub fn spawn(app: AppState) {
                     tracing::info!(sessions, links, "purged expired sessions and sign-in links")
                 }
                 Err(e) => tracing::warn!(error = %e, "expired session and link purge failed"),
+            }
+        },
+    );
+    // One mail a day to `ADMIN_EMAILS` at 08:00 Dhaka; the day's record in `rate_limit_hits`
+    // keeps a restart from mailing twice.
+    start(
+        "operator digest",
+        Duration::from_secs(10 * 60),
+        &app,
+        |app| async move {
+            match crate::operator_digest::tick(&app).await {
+                Ok(crate::operator_digest::Outcome::Sent(n)) => {
+                    tracing::info!(admins = n, "operator digest mailed")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "operator digest failed"),
             }
         },
     );

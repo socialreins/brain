@@ -262,7 +262,7 @@ fn compose(
 }
 
 /// `text` on one line, its whitespace collapsed, cut at `max` characters.
-fn one_line(text: &str, max: usize) -> String {
+pub(crate) fn one_line(text: &str, max: usize) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     match flat.char_indices().nth(max) {
         Some((i, _)) => format!("{}...", &flat[..i]),
