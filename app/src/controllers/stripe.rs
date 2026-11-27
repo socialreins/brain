@@ -664,8 +664,113 @@ async fn apply_purchase(db: &impl ConnectionTrait, session: &Value) -> Result<bo
         tracing::error!(%team, "paid stripe session for an unknown team");
         return Ok(false);
     }
-    billing::grant(db, team, billing::Kind::X, credits, "x pack", Some(id)).await?;
+    // The payment is in the reason so a refund or dispute of it finds this grant (`take_back`).
+    let reason = match session["payment_intent"].as_str() {
+        Some(pi) => format!("x pack {pi}"),
+        None => "x pack".to_owned(),
+    };
+    billing::grant(db, team, billing::Kind::X, credits, &reason, Some(id)).await?;
     Ok(true)
+}
+
+/// What a refund or dispute took back of a credit pack.
+struct TakenBack {
+    team: Uuid,
+    owed: i64,
+    taken: i64,
+}
+
+/// Takes the credits of a refunded or disputed pack back, once per event. The pack is the grant
+/// whose reason names the charge's payment intent (`apply_purchase`); anything else (a
+/// subscription, a pack granted before reasons named the payment) is `None` and left to a person.
+/// A refund takes back its share of the pack (`amount_refunded` of `amount`), a dispute all of
+/// it; what earlier events of the payment already asked for is not asked again. Never below a
+/// zero balance: the part already spent is not taken (the ledger reason and `credit_takebacks`
+/// say how much). Under the team row lock, as `billing::spend`, so a post cannot spend what is
+/// being taken. A won dispute does not give the credits back.
+async fn take_back(
+    db: &impl ConnectionTrait,
+    kind: &str,
+    event: &str,
+    charge: &Value,
+) -> Result<Option<TakenBack>, DbErr> {
+    let Some(pi) = charge["payment_intent"].as_str() else {
+        return Ok(None);
+    };
+    let Some(grant) = db
+        .query_one_raw(stmt(
+            "SELECT team_id, amount FROM credit_ledger WHERE kind = 'x' AND amount > 0 \
+             AND reason = $1 LIMIT 1",
+            vec![format!("x pack {pi}").into()],
+        ))
+        .await?
+    else {
+        return Ok(None);
+    };
+    let team: Uuid = grant.try_get("", "team_id")?;
+    let pack: i64 = grant.try_get("", "amount")?;
+    let dispute = kind == "charge.dispute.created";
+    let want = if dispute {
+        pack
+    } else {
+        match (
+            charge["amount"].as_i64(),
+            charge["amount_refunded"].as_i64(),
+        ) {
+            (Some(paid), Some(back)) if paid > 0 && back > 0 => pack * back.min(paid) / paid,
+            _ => return Ok(None),
+        }
+    };
+    db.execute_raw(stmt(
+        "SELECT id FROM teams WHERE id = $1 FOR NO KEY UPDATE",
+        vec![team.into()],
+    ))
+    .await?;
+    let asked: i64 = db
+        .query_one_raw(stmt(
+            "SELECT COALESCE(SUM(owed), 0)::bigint AS n FROM credit_takebacks WHERE payment_intent = $1",
+            vec![pi.into()],
+        ))
+        .await?
+        .map_or(Ok(0), |r| r.try_get("", "n"))?;
+    let owed = want - asked;
+    if owed <= 0 {
+        return Ok(None);
+    }
+    let taken = owed.min(billing::balance(db, team, billing::Kind::X).await?.max(0));
+    if taken > 0 {
+        let what = if dispute { "dispute" } else { "refund" };
+        let short = match owed - taken {
+            0 => String::new(),
+            n => format!(", {n} already spent"),
+        };
+        db.execute_raw(stmt(
+            "INSERT INTO credit_ledger (id, team_id, kind, amount, reason, ref) \
+             VALUES ($1, $2, 'x', $3, $4, $5)",
+            vec![
+                Uuid::now_v7().into(),
+                team.into(),
+                (-taken).into(),
+                format!("x pack taken back, {what} of {pi}: {taken} of {owed}{short}").into(),
+                format!("takeback:{event}").into(),
+            ],
+        ))
+        .await?;
+    }
+    db.execute_raw(stmt(
+        "INSERT INTO credit_takebacks (event_id, team_id, payment_intent, kind, owed, taken) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+        vec![
+            event.into(),
+            team.into(),
+            pi.into(),
+            (if dispute { "dispute" } else { "refund" }).into(),
+            owed.into(),
+            taken.into(),
+        ],
+    ))
+    .await?;
+    Ok(Some(TakenBack { team, owed, taken }))
 }
 
 /// `POST /webhooks/stripe`: `403` unless `Stripe-Signature` signs the raw body (timestamp within
@@ -715,26 +820,41 @@ async fn receive(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -
             kind,
             "checkout.session.completed" | "checkout.session.async_payment_succeeded"
         );
-        // shortcut: a refunded or disputed pack keeps its credits; a person takes them back with
-        // the admin tools. Automate it if refunds become common.
-        if matches!(kind, "charge.refunded" | "charge.dispute.created") {
-            let meta = &event["data"]["object"]["metadata"];
+        // A refund or dispute of a credit pack takes its credits back (never below zero); every
+        // one, taken back or not, also goes to the admins.
+        if fresh && matches!(kind, "charge.refunded" | "charge.dispute.created") {
+            let object = &event["data"]["object"];
+            let meta = &object["metadata"];
+            let back = take_back(&txn, kind, id, object).await?;
             tracing::error!(kind, team = ?meta["team_id"].as_str(), pack = ?meta["pack"].as_str(),
-                "stripe pack payment refunded or disputed: review its credits");
-            if fresh {
-                let object = &event["data"]["object"];
-                alerts.push((
-                    "SocialReins: a Stripe payment was refunded or disputed",
-                    format!(
-                        "Stripe event {id} ({kind}) on {}: a payment was refunded or disputed. Team {}, \
-                         pack {} (unknown for a dispute or a subscription). A pack's credits stay until \
-                         a person takes them back with the admin tools.",
-                        object["id"].as_str().unwrap_or("an unknown object"),
-                        meta["team_id"].as_str().unwrap_or("unknown"),
-                        meta["pack"].as_str().unwrap_or("unknown"),
-                    ),
-                ));
-            }
+                taken = ?back.as_ref().map(|b| (b.owed, b.taken)),
+                "stripe payment refunded or disputed");
+            let outcome = match back {
+                Some(b) => format!(
+                    "Credits taken back from team {}: {} of {}{}.",
+                    b.team,
+                    b.taken,
+                    b.owed,
+                    if b.taken < b.owed {
+                        " (the rest was already spent)"
+                    } else {
+                        ""
+                    }
+                ),
+                None => "No credits were taken back (not a pack payment brain granted, or nothing \
+                         more is owed): a person looks at it."
+                    .to_owned(),
+            };
+            alerts.push((
+                "SocialReins: a Stripe payment was refunded or disputed",
+                format!(
+                    "Stripe event {id} ({kind}) on {}: a payment was refunded or disputed. Team {}, \
+                     pack {}. {outcome}",
+                    object["id"].as_str().unwrap_or("an unknown object"),
+                    meta["team_id"].as_str().unwrap_or("unknown"),
+                    meta["pack"].as_str().unwrap_or("unknown"),
+                ),
+            ));
         }
         if fresh && paid && !apply_purchase(&txn, &event["data"]["object"]).await? {
             alerts.push((
