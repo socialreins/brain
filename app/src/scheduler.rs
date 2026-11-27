@@ -236,6 +236,14 @@ pub fn spawn(app: AppState) {
         )
         .await
     });
+    // A process renews the lease of every post it is running every 30 s, so a team's place stays
+    // taken across replicas while it lives and frees within `publish::LEASE_MINUTES` of a crash.
+    start(
+        "publish leases",
+        Duration::from_secs(publish::LEASE_RENEW_SECONDS),
+        &app,
+        |app| async move { publish::renew_leases(&app).await },
+    );
     start(
         "auth purge",
         Duration::from_secs(24 * 3600),

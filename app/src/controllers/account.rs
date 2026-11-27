@@ -148,7 +148,7 @@ const POST_COLS: &str = "id, number, social_set_id, platform, body, media, statu
     published_at, error, created_by, created_at, updated_at, group_id, thread, first_comment, \
     cover, tiktok, youtube, approval, approval_note, approval_by, approval_at, repeat, \
     account_ids, media_alt, pinterest";
-const POST_SKIP: &str = "team_id, quota_reserved, fanned_out";
+const POST_SKIP: &str = "team_id, quota_reserved, fanned_out, lease_until";
 
 /// What an owner or admin gets of a team (`$1` is the team). Subscribers, recipients and runs
 /// are other people's data or internal logs and are named in the README of the export instead.
