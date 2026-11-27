@@ -1,0 +1,36 @@
+name: audit
+
+# Weekly, and whenever the lockfile or the ignore list changes: a new advisory is seen without a
+# person running `cargo audit`. Reads Cargo.lock only; sends public package names to the advisory
+# database (RustSec).
+on:
+  schedule:
+    - cron: "17 3 * * 1" # Mondays 03:17 UTC
+  pull_request:
+    paths: [Cargo.lock, .cargo/audit.toml, .github/workflows/audit.yml]
+  push:
+    branches: [main]
+    paths: [Cargo.lock, .cargo/audit.toml, .github/workflows/audit.yml]
+  workflow_dispatch:
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: cargo-audit
+      # A vulnerability always fails the job (the default). `--deny` adds unsound and yanked crates.
+      # "Unmaintained" stays a warning: chrono, chrono-tz and humantime are in that state with no
+      # drop-in replacement, and a job that is red from day one is a job nobody reads.
+      # Ignores live in .cargo/audit.toml, each with its reason.
+      - run: cargo audit --deny unsound --deny yanked
