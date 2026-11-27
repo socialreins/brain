@@ -1738,6 +1738,7 @@ pub async fn draft_late(db: &DatabaseConnection, running: &[Uuid]) -> Result<Vec
     crate::repeat::spawn(&txn, &late, None).await?;
     for id in &late {
         crate::post_mail::queue(&txn, *id, crate::post_mail::Kind::Late).await?;
+        crate::post_events::note(&txn, *id, None, "late_to_draft", None).await;
     }
     txn.commit().await?;
     tracing::info!(posts = late.len(), "late posts put back to draft");
@@ -2618,10 +2619,14 @@ async fn fail_target(db: &DatabaseConnection, id: Uuid, msg: &str) -> Result<(),
         let again = sql(
             "UPDATE post_targets SET status = 'pending', error = $2, retried = true, \
              retry_at = now() + make_interval(mins => $3), updated_at = now() \
-             WHERE id = $1 AND status = 'publishing' AND remote_id IS NULL AND NOT retried",
+             WHERE id = $1 AND status = 'publishing' AND remote_id IS NULL AND NOT retried \
+             RETURNING retry_at",
             vec![id.into(), msg.into(), RETRY_AFTER_MINUTES.into()],
         );
-        if db.execute_raw(again).await?.rows_affected() == 1 {
+        if let Some(row) = db.query_one_raw(again).await? {
+            let at: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "retry_at")?;
+            crate::post_events::note_target(db, id, "retry_scheduled", Some(&at.to_rfc3339()))
+                .await;
             tracing::info!(target = %id, "target retries in {RETRY_AFTER_MINUTES} minutes");
             return Ok(());
         }
@@ -2633,7 +2638,10 @@ async fn fail_target(db: &DatabaseConnection, id: Uuid, msg: &str) -> Result<(),
         ),
         vec![id.into(), msg.into()],
     );
-    db.execute_raw(stmt).await.map(|_| ())
+    if db.execute_raw(stmt).await?.rows_affected() == 1 {
+        crate::post_events::note_target(db, id, "failed", Some(msg)).await;
+    }
+    Ok(())
 }
 
 /// A pending target that is up but whose thread is not all out yet.
@@ -2846,6 +2854,7 @@ async fn publish_target_held(
     if !claim_target(db, id).await? {
         return Ok(());
     }
+    crate::post_events::note_attempt(db, id).await;
     // A database error before the first call to the platform sent nothing: give the target the
     // one retry of an unsent failure (`fail_target`) instead of leaving it `publishing` for
     // `recover_stuck` to call "may have posted" 31 minutes on.
@@ -3019,6 +3028,10 @@ async fn publish_claimed(
                     if let Some(h) = hold.as_mut() {
                         h.sent += 1;
                     }
+                    // Instagram takes the cover in the publish call itself: it is set now.
+                    if in_call.is_some() {
+                        crate::post_events::note_target(db, id, "cover_set", None).await;
+                    }
                     (remote, note)
                 }
                 Err(msg) => {
@@ -3140,6 +3153,7 @@ async fn publish_claimed(
     if saved.rows_affected() != 1 {
         return Ok(());
     }
+    crate::post_events::note_code(db, post.id, Some(id), "published", &root.id).await;
     if let Some(cover) = cover.filter(|_| !publisher.cover_in_publish()) {
         set_cover(app, publisher, &account, (id, &root.id), &cover).await;
     }
@@ -3168,7 +3182,10 @@ async fn set_cover(
             .await
     };
     let why = match tokio::time::timeout(TARGET_TIMEOUT, sent).await {
-        Ok(Ok(())) => return,
+        Ok(Ok(())) => {
+            crate::post_events::note_target(&app.db, target, "cover_set", None).await;
+            return;
+        }
         Ok(Err(PublishError::Reconnect)) => publisher.reconnect().to_owned(),
         Ok(Err(PublishError::Denied)) => denied(publisher),
         Ok(Err(PublishError::Failed(msg))) => msg,
@@ -3182,6 +3199,8 @@ async fn set_cover(
     );
     if let Err(e) = app.db.execute_raw(stmt).await {
         tracing::warn!(error = %e, target = %target, "cover warning not saved");
+    } else {
+        crate::post_events::note_target(&app.db, target, "cover_failed", Some(&why)).await;
     }
 }
 
@@ -3232,11 +3251,21 @@ async fn first_comment(
         vec![
             target.into(),
             status.into(),
-            comment_id.into(),
-            error.into(),
+            comment_id.clone().into(),
+            error.clone().into(),
         ],
     );
-    db.execute_raw(stmt).await.map(|_| ())
+    if db.execute_raw(stmt).await?.rows_affected() == 1 {
+        match (&comment_id, &error) {
+            (Some(id), _) => {
+                crate::post_events::note_target_code(db, target, "comment_posted", id).await;
+            }
+            (None, why) => {
+                crate::post_events::note_target(db, target, "comment_failed", why.as_deref()).await;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// An account in messages: `@handle`, else its name (a Facebook Page has no handle).
@@ -3386,7 +3415,9 @@ pub async fn takedown(app: &AppState, post: &posts::Model) -> Result<Vec<String>
                     ),
                     vec![t.id.into()],
                 );
-                db.execute_raw(stmt).await?;
+                if db.execute_raw(stmt).await?.rows_affected() == 1 {
+                    crate::post_events::note_target(db, t.id, "taken_down", None).await;
+                }
             }
         }
     }

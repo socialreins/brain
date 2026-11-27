@@ -37992,6 +37992,124 @@ mod teams {
                 assert!(deliveries(&db, &team_id).await.is_empty());
             }
         }
+
+        /// A post of a team that has no account, and a target on it.
+        async fn seeded_post(db: &DatabaseConnection, team: &str) -> (String, String) {
+            use sea_orm::ConnectionTrait;
+            let set = default_set(db, team).await;
+            let post = uuid::Uuid::now_v7();
+            let target = uuid::Uuid::now_v7();
+            db.execute_unprepared(&format!(
+                "INSERT INTO posts (id, team_id, social_set_id, platform, body, status) \
+                 VALUES ('{post}', '{team}', '{set}', 'bluesky', 'hi', 'published')"
+            ))
+            .await
+            .unwrap();
+            db.execute_unprepared(&format!(
+                "INSERT INTO post_targets (id, post_id, status, remote_id) \
+                 VALUES ('{target}', '{post}', 'published', 'at://x')"
+            ))
+            .await
+            .unwrap();
+            (post.to_string(), target.to_string())
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn a_timeline_lists_every_kind_newest_first_and_another_team_gets_404() {
+            use sea_orm::ConnectionTrait;
+            let (s, db) = server().await;
+            let (_, cookie, _) = user(&s, &db).await;
+            let team = current(&s, &cookie).await["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let (post, target) = seeded_post(&db, &team).await;
+            let target_id: uuid::Uuid = target.parse().unwrap();
+            let kinds = socialreins_brain::post_events::KINDS;
+            for (i, kind) in kinds.iter().enumerate() {
+                let detail = if *kind == "failed" {
+                    "see https://a.test/x?secret=1 Bearer sk-123"
+                } else {
+                    "detail"
+                };
+                socialreins_brain::post_events::record(
+                    &db,
+                    post.parse().unwrap(),
+                    Some(target_id),
+                    kind,
+                    Some(detail),
+                )
+                .await
+                .unwrap();
+                // A fixed, increasing time per kind, so order is not a coin toss between
+                // events written in the same microsecond.
+                db.execute_unprepared(&format!(
+                    "UPDATE post_events SET created_at = now() - interval '{} seconds' \
+                     WHERE post_id = '{post}' AND kind = '{kind}'",
+                    kinds.len() - i
+                ))
+                .await
+                .unwrap();
+            }
+
+            let res = s
+                .get(&format!("/v1/posts/{post}/events"))
+                .add_header("cookie", &cookie)
+                .await;
+            res.assert_status_ok();
+            let body = res.json::<Value>();
+            let events = body["events"].as_array().unwrap();
+            assert_eq!(events.len(), kinds.len(), "{}", body);
+            // Newest first, and every kind is its own line.
+            assert_eq!(events[0]["kind"], kinds[kinds.len() - 1]);
+            assert_eq!(events[events.len() - 1]["kind"], kinds[0]);
+            for kind in kinds {
+                assert!(events.iter().any(|e| e["kind"] == kind), "{kind}");
+            }
+            assert_eq!(events[0]["target_id"], json!(target_id));
+            assert_eq!(events[0]["detail"], "detail");
+            // A detail is our own cleaned line: the link keeps its host, the token goes.
+            let failed = events.iter().find(|e| e["kind"] == "failed").unwrap();
+            assert_eq!(failed["detail"], "see https://a.test Bearer <redacted>");
+
+            // A page at a time, the cursor taking the next one from where the last ended.
+            let first = s
+                .get(&format!("/v1/posts/{post}/events?limit=4"))
+                .add_header("cookie", &cookie)
+                .await
+                .json::<Value>();
+            assert_eq!(first["events"].as_array().unwrap().len(), 4);
+            let cursor = first["next_cursor"].as_str().expect("more follows");
+            let second = s
+                .get(&format!("/v1/posts/{post}/events?limit=4&cursor={cursor}"))
+                .add_header("cookie", &cookie)
+                .await;
+            second.assert_status_ok();
+            let second = second.json::<Value>();
+            assert_eq!(second["events"].as_array().unwrap().len(), 4);
+            assert_ne!(
+                first["events"][0]["id"], second["events"][0]["id"],
+                "a new page, not the same one"
+            );
+            for bad in ["limit=0", "limit=201", "cursor=nonsense"] {
+                let res = s
+                    .get(&format!("/v1/posts/{post}/events?{bad}"))
+                    .add_header("cookie", &cookie)
+                    .await;
+                assert_eq!(res.status_code(), 422, "{bad}");
+                res.assert_json(&json!({"error": "invalid_query"}));
+            }
+
+            // Another team's member sees no such post.
+            let (_, other, _) = user(&s, &db).await;
+            let res = s
+                .get(&format!("/v1/posts/{post}/events"))
+                .add_header("cookie", &other)
+                .await;
+            assert_eq!(res.status_code(), 404);
+            res.assert_json(&json!({"error": "not_found"}));
+        }
     }
 
     mod billing_api {

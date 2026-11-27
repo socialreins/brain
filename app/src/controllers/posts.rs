@@ -16,7 +16,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use chrono::{DateTime, FixedOffset, Utc};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use chrono::{DateTime, FixedOffset, SecondsFormat, Utc};
 use schemars::JsonSchema;
 use sea_orm::{
     sea_query::Query as Select, ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait,
@@ -3404,9 +3405,128 @@ async fn refresh_metrics(State(app): State<AppState>, a: Actor, PostId(id): Post
     }
 }
 
+/// Events one page of a post's timeline holds at most.
+const MAX_EVENTS: u64 = 200;
+/// Events a page holds when `limit` is not given.
+const EVENT_PAGE: u64 = 50;
+
+/// One line of a post's timeline (`GET /posts/{id}/events`).
+#[derive(Serialize, ToSchema)]
+pub struct PostEvent {
+    pub id: Uuid,
+    /// One of the kinds `AGENTS.md` lists, e.g. `target_claimed` or `published`.
+    pub kind: String,
+    /// Our own words or a code, never post text, a URL with a query or a token.
+    pub detail: Option<String>,
+    /// The target it is about; `null` for an event about the post itself.
+    pub target_id: Option<Uuid>,
+    pub created_at: DateTime<FixedOffset>,
+}
+
+/// A page of a post's timeline, newest first.
+#[derive(Serialize, ToSchema)]
+pub struct PostEventPage {
+    pub events: Vec<PostEvent>,
+    /// Pass as `cursor` for the next page, as it is; `null` on the last.
+    pub next_cursor: Option<String>,
+}
+
+/// What narrows a page of a post's timeline.
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct EventQuery {
+    /// 1 to 200; 50 by default.
+    pub limit: Option<u64>,
+    /// `next_cursor` of the previous page.
+    pub cursor: Option<String>,
+}
+
+fn event_cursor(at: DateTime<FixedOffset>, id: Uuid) -> String {
+    let at = at.to_rfc3339_opts(SecondsFormat::Micros, true);
+    URL_SAFE_NO_PAD.encode(format!("{at}|{id}"))
+}
+
+fn event_after(cursor: &str) -> Option<(DateTime<FixedOffset>, Uuid)> {
+    let raw = String::from_utf8(URL_SAFE_NO_PAD.decode(cursor).ok()?).ok()?;
+    let (at, id) = raw.split_once('|')?;
+    Some((DateTime::parse_from_rfc3339(at).ok()?, id.parse().ok()?))
+}
+
+/// A post's real timeline: what the publisher did, newest first, a page at a time. Any member
+/// of the team reads it (a token within its set, like the post it names); another team's post
+/// is a `404`.
+#[utoipa::path(get, path = "/posts/{id}/events", tag = "posts",
+    security(("session" = []), ("api_token" = [])),
+    params(("id" = String, Path, description = ID_PARAM), EventQuery),
+    responses((status = 200, body = PostEventPage), (status = 401, body = Error),
+        (status = 404, body = Error), (status = 422, body = Error)))]
+async fn events(
+    State(app): State<AppState>,
+    a: Actor,
+    PostId(id): PostId,
+    q: Result<Query<EventQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(q)) = q else {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
+    };
+    let limit = q.limit.unwrap_or(EVENT_PAGE);
+    let cursor = q.cursor.as_deref().map(event_after);
+    let cursor_ok = cursor.is_none_or(|c| c.is_some());
+    if !(1..=MAX_EVENTS).contains(&limit) || !cursor_ok {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
+    }
+    let found = async {
+        if find(&app.db, &a, id).await?.is_none() {
+            return Ok::<Option<PostEventPage>, DbErr>(None);
+        }
+        let mut values = vec![id.into()];
+        let mut sql = String::from(
+            "SELECT id, kind, detail, target_id, created_at FROM post_events \
+             WHERE post_id = $1",
+        );
+        if let Some((at, after)) = cursor.flatten() {
+            values.push(at.into());
+            values.push(after.into());
+            let n = values.len();
+            sql += &format!(" AND (created_at, id) < (${}, ${n})", n - 1);
+        }
+        values.push(((limit + 1) as i64).into());
+        sql += &format!(" ORDER BY created_at DESC, id DESC LIMIT ${}", values.len());
+        let stmt = Statement::from_sql_and_values(DbBackend::Postgres, &sql, values);
+        let mut rows = app.db.query_all_raw(stmt).await?;
+        let more = rows.len() as u64 > limit;
+        rows.truncate(limit as usize);
+        let events = rows
+            .iter()
+            .map(|r| {
+                Ok(PostEvent {
+                    id: r.try_get("", "id")?,
+                    kind: r.try_get("", "kind")?,
+                    detail: r.try_get("", "detail")?,
+                    target_id: r.try_get("", "target_id")?,
+                    created_at: r.try_get("", "created_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>, DbErr>>()?;
+        let next_cursor = more
+            .then(|| events.last().map(|e| event_cursor(e.created_at, e.id)))
+            .flatten();
+        Ok(Some(PostEventPage {
+            events,
+            next_cursor,
+        }))
+    };
+    match found.await {
+        Ok(Some(page)) => Json(page).into_response(),
+        Ok(None) => not_found(),
+        Err(e) => internal(e, "post events"),
+    }
+}
+
 pub fn api() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(refresh_metrics))
+        .routes(routes!(events))
         .routes(routes!(list, create))
         .routes(routes!(show, update, destroy))
         .routes(routes!(publish_now))

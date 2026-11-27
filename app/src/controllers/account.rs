@@ -142,6 +142,13 @@ pub const MEMBER: &[Part] = &[
         POST_SKIP,
         "team_id = $1 AND created_by = $2",
     ),
+    part(
+        "post_events",
+        "post_events",
+        "id, post_id, target_id, kind, detail, created_at",
+        "team_id",
+        "post_id IN (SELECT id FROM posts WHERE team_id = $1 AND created_by = $2)",
+    ),
 ];
 
 const POST_COLS: &str = "id, number, social_set_id, platform, body, media, status, scheduled_at, \
@@ -184,6 +191,9 @@ pub const TEAM_PARTS: &[Part] = &[
         "id, post_id, social_account_id, status, remote_id, remote_url, error, published_at, \
          created_at, updated_at, parts, comment_status, comment_id, comment_error, cover_error, \
          alt_error", "remote_cid, retry_at, retried",
+        "post_id IN (SELECT id FROM posts WHERE team_id = $1)"),
+    part("post_events", "post_events",
+        "id, post_id, target_id, kind, detail, created_at", "team_id",
         "post_id IN (SELECT id FROM posts WHERE team_id = $1)"),
     part("lists", "post_lists",
         "id, number, social_set_id, name, remote_ids, created_at, updated_at, deleted_at",
@@ -261,7 +271,8 @@ profile, passkeys (names only), sessions (times only) and memberships are about 
 `teams` has one entry for each team you belong to. For a team where you are an owner or admin it \
 holds the team's data: settings, billing summary (plan and status, no card or Stripe data), \
 credit ledger, API tokens (names only), webhook address, sets, connected accounts (no tokens or \
-passwords), posts with their targets and status, lists, public pages, automations, contacts and \
+passwords), posts with their targets, status and timeline, lists, public pages, automations, \
+contacts and \
 their notes, inbox items and our replies (the text people sent to the team's accounts), \
 broadcasts, newsletters, media library, saved replies, feeds and posting queues. Contacts and \
 inbox text are the team's data, not only yours: they are in the export of an owner or admin and \
