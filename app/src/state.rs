@@ -20,25 +20,25 @@ pub struct AppState {
     /// Per-IP limit on every passkey and Google sign-in attempt.
     pub login_limiter: Arc<RateLimiter>,
     /// Per-user burst limit on `POST /v1/team/invitations`, each of which sends an email. The
-    /// daily caps live in Postgres (`rate_limit::daily_allow`).
-    pub invitation_limiter: Arc<RateLimiter<uuid::Uuid>>,
+    /// daily caps live in Postgres (`rate_limit::daily_reserve`).
+    pub invitation_limiter: Arc<RateLimiter>,
     /// Per-user burst limit on `POST /v1/connections/bluesky`, each of which tries a password
     /// on a Bluesky server. Per IP it shares `login_limiter`; daily caps live in Postgres.
-    pub connect_limiter: Arc<RateLimiter<uuid::Uuid>>,
+    pub connect_limiter: Arc<RateLimiter>,
     /// Per-user limit on publish-now and take-down calls, each of which calls a platform.
-    pub post_limiter: Arc<RateLimiter<uuid::Uuid>>,
+    pub post_limiter: Arc<RateLimiter>,
     /// Per-user limit on moderating comments from the inbox (a spam wave takes many).
-    pub moderate_limiter: Arc<RateLimiter<uuid::Uuid>>,
+    pub moderate_limiter: Arc<RateLimiter>,
     /// Per-user limit on what an inbox item asks Bluesky live: a thread read
     /// (`GET /inbox-items/{id}/thread`) or an action (`POST /inbox-items/{id}/actions`).
-    pub live_limiter: Arc<RateLimiter<uuid::Uuid>>,
+    pub live_limiter: Arc<RateLimiter>,
     /// Per-team limit on `POST /v1/uploads`.
-    pub upload_limiter: Arc<RateLimiter<uuid::Uuid>>,
+    pub upload_limiter: Arc<RateLimiter>,
     /// `TEAM_STORAGE_BYTES`: the upload bytes a team with no `teams.storage_budget_bytes` may
     /// keep, 0 for unlimited (`controllers::uploads`).
     pub team_storage_bytes: i64,
     /// Per-token limit on every request made with an API token.
-    pub api_token_limiter: Arc<RateLimiter<uuid::Uuid>>,
+    pub api_token_limiter: Arc<RateLimiter>,
     pub brain_url: String,
     pub web_url: String,
     /// `CORS_ORIGINS`: the web app's origins, the only ones that may call its state-changing
@@ -68,7 +68,7 @@ pub struct AppState {
     /// Per-IP limit on `GET /v1/public/pages/{code}`.
     pub page_limiter: Arc<RateLimiter>,
     /// Per user limit on `GET /v1/slugs/check`, which a form calls while someone types.
-    pub slug_check_limiter: Arc<RateLimiter<uuid::Uuid>>,
+    pub slug_check_limiter: Arc<RateLimiter>,
     /// Per-IP limit on `GET /v1/public/team-slugs/{slug}`. Generous: the web app asks for
     /// every visitor of an unknown team address, from one address.
     pub slug_lookup_limiter: Arc<RateLimiter>,
@@ -103,17 +103,17 @@ impl AppState {
             db,
             git_commit: config.git_commit.clone(),
             trust_proxy: config.trust_proxy,
-            waitlist_limiter: Arc::new(RateLimiter::per_minute(10)),
-            magic_link_limiter: Arc::new(RateLimiter::per_minute(5)),
-            login_limiter: Arc::new(RateLimiter::per_minute(10)),
-            invitation_limiter: Arc::new(RateLimiter::per_minute(10)),
-            connect_limiter: Arc::new(RateLimiter::per_minute(5)),
-            post_limiter: Arc::new(RateLimiter::per_minute(10)),
-            moderate_limiter: Arc::new(RateLimiter::per_minute(60)),
-            live_limiter: Arc::new(RateLimiter::per_minute(60)),
-            upload_limiter: Arc::new(RateLimiter::per_minute(60)),
+            waitlist_limiter: Arc::new(RateLimiter::per_minute("waitlist", 10)),
+            magic_link_limiter: Arc::new(RateLimiter::per_minute("magic-link", 5)),
+            login_limiter: Arc::new(RateLimiter::per_minute("login", 10)),
+            invitation_limiter: Arc::new(RateLimiter::per_minute("invitation", 10)),
+            connect_limiter: Arc::new(RateLimiter::per_minute("connect", 5)),
+            post_limiter: Arc::new(RateLimiter::per_minute("post", 10)),
+            moderate_limiter: Arc::new(RateLimiter::per_minute("moderate", 60)),
+            live_limiter: Arc::new(RateLimiter::per_minute("live", 60)),
+            upload_limiter: Arc::new(RateLimiter::per_minute("upload", 60)),
             team_storage_bytes: config.team_storage_bytes,
-            api_token_limiter: Arc::new(RateLimiter::per_minute(120)),
+            api_token_limiter: Arc::new(RateLimiter::per_minute("api-token", 120)),
             brain_url: config.brain_url.clone(),
             web_url: config.web_url.clone(),
             web_origins: config.cors_origins.clone(),
@@ -134,14 +134,14 @@ impl AppState {
             turnstile: config.turnstile.clone(),
             contact_to: config.contact_to.clone(),
             contact_limiter: Arc::new(RateLimiter::new(
+                "contact",
                 5,
                 std::time::Duration::from_secs(3600),
-                crate::rate_limit::MAX_KEYS,
             )),
-            page_limiter: Arc::new(RateLimiter::per_minute(120)),
-            slug_check_limiter: Arc::new(RateLimiter::per_minute(120)),
-            slug_lookup_limiter: Arc::new(RateLimiter::per_minute(600)),
-            unsubscribe_limiter: Arc::new(RateLimiter::per_minute(120)),
+            page_limiter: Arc::new(RateLimiter::per_minute("page", 120)),
+            slug_check_limiter: Arc::new(RateLimiter::per_minute("slug-check", 120)),
+            slug_lookup_limiter: Arc::new(RateLimiter::per_minute("slug-lookup", 600)),
+            unsubscribe_limiter: Arc::new(RateLimiter::per_minute("unsubscribe", 120)),
             admin_emails: config.admin_emails.clone(),
             review_login_token: config.review_login_token.clone(),
             waitlist_count: Arc::default(),

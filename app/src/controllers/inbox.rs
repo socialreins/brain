@@ -1469,7 +1469,7 @@ async fn thread(State(app): State<AppState>, t: InTeam, ItemId(id): ItemId) -> R
     let Some(uri) = uri.filter(|_| item.platform == "bluesky") else {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "not_a_thread");
     };
-    if !app.live_limiter.hit(t.current.0.id) {
+    if !app.live_limiter.hit(&app.db, t.current.0.id).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let account = match social_accounts::Entity::find_by_id(item.social_account_id)
@@ -1511,7 +1511,7 @@ async fn thread(State(app): State<AppState>, t: InTeam, ItemId(id): ItemId) -> R
 /// The thread context of a Threads reply or mention: the posts it answers, read as the account
 /// sees them (`threads_inbox::above`).
 async fn threads_thread(app: &AppState, t: &InTeam, item: &inbox_items::Model) -> Response {
-    if !app.live_limiter.hit(t.current.0.id) {
+    if !app.live_limiter.hit(&app.db, t.current.0.id).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let account = match social_accounts::Entity::find_by_id(item.social_account_id)
@@ -1667,7 +1667,7 @@ async fn send_reply(
     if item.platform != "x" && !inbox::fits_on(&item.platform, via, text) {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_text");
     }
-    if !app.post_limiter.hit(t.current.0.id) {
+    if !app.post_limiter.hit(&app.db, t.current.0.id).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let account = match social_accounts::Entity::find_by_id(item.social_account_id)
@@ -1789,7 +1789,7 @@ async fn moderate_item(
         Ok(None) => return not_found(),
         Err(e) => return internal(e, "account read"),
     };
-    if !app.moderate_limiter.hit(t.current.0.id) {
+    if !app.moderate_limiter.hit(&app.db, t.current.0.id).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let done = match (meta_action, yt_action, input.reply_id) {

@@ -73,7 +73,7 @@ async fn request_link(
     ClientIp(ip): ClientIp,
     req: Request,
 ) -> Response {
-    if !app.magic_link_limiter.allow(ip) {
+    if !app.magic_link_limiter.allow(&app.db, ip).await {
         return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited").into_response();
     }
     let body = match Json::<LinkRequest>::from_request(req, &()).await {
@@ -113,7 +113,7 @@ async fn request_own_link(
     _: FromWeb,
     CurrentUser(user, _): CurrentUser,
 ) -> Response {
-    if !app.magic_link_limiter.allow(ip) {
+    if !app.magic_link_limiter.allow(&app.db, ip).await {
         return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited").into_response();
     }
     let sending = crate::mail::Sending::begin();
@@ -468,7 +468,7 @@ async fn redeem(
     headers: HeaderMap,
     Form(Redeem { token: secret }): Form<Redeem>,
 ) -> Response {
-    if !app.magic_link_limiter.allow(ip) {
+    if !app.magic_link_limiter.allow(&app.db, ip).await {
         return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited").into_response();
     }
     if !from_brain(&app, &headers) {

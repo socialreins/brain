@@ -223,8 +223,8 @@ pub async fn find_live(
 }
 
 /// Counts one request against the token's per-minute limit; the `429` once it is over.
-pub fn limited(app: &AppState, token: Uuid) -> Option<Response> {
-    let wait = app.api_token_limiter.wait(token)?;
+pub async fn limited(app: &AppState, token: Uuid) -> Option<Response> {
+    let wait = app.api_token_limiter.wait(&app.db, token).await?;
     let mut res = reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     let secs = HeaderValue::from(wait.as_secs().max(1));
     res.headers_mut().insert(header::RETRY_AFTER, secs);
@@ -244,7 +244,7 @@ impl Actor {
                 .await
                 .map_err(|e| internal(e, "api token lookup"))?;
             let row = found.ok_or_else(invalid_token)?;
-            if let Some(res) = limited(app, row.id) {
+            if let Some(res) = limited(app, row.id).await {
                 return Err(res);
             }
             let team = teams::Entity::find_by_id(row.team_id)

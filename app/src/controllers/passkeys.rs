@@ -179,7 +179,7 @@ async fn register_finish(
 
 /// `POST /auth/passkeys/login/start`: options for a discoverable credential, no email needed.
 async fn login_start(_: FromWeb, State(app): State<AppState>, ClientIp(ip): ClientIp) -> Response {
-    if !app.login_limiter.allow(ip) {
+    if !app.login_limiter.allow(&app.db, ip).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let (mut options, state) = match app.webauthn.start_discoverable_authentication() {
@@ -208,7 +208,7 @@ async fn login_finish(
     ClientIp(ip): ClientIp,
     Body(body): Body<LoginFinish>,
 ) -> Response {
-    if !app.login_limiter.allow(ip) {
+    if !app.login_limiter.allow(&app.db, ip).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let state: DiscoverableAuthentication =

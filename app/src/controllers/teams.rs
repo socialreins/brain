@@ -995,7 +995,7 @@ async fn invite(
     if super::review_login::is_demo_email(&inviter.email) {
         return reply(StatusCode::FORBIDDEN, "review_account");
     }
-    if !app.invitation_limiter.hit(inviter.id) {
+    if !app.invitation_limiter.hit(&app.db, inviter.id).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let Some(email) = email::normalize(&body.email) else {

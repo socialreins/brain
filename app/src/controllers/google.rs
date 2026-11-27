@@ -67,7 +67,7 @@ async fn start(
     let Some(google) = &app.google else {
         return not_configured();
     };
-    if !app.login_limiter.allow(ip) {
+    if !app.login_limiter.allow(&app.db, ip).await {
         return refused(&app, "google_failed");
     }
     let next = q
@@ -243,7 +243,7 @@ async fn callback(
     let clear = named_cookie(&app, STATE_COOKIE, COOKIE_PATH, "", 0);
     let fail =
         |code: &str| ([(header::SET_COOKIE, clear.clone())], refused(&app, code)).into_response();
-    if !app.login_limiter.allow(ip) {
+    if !app.login_limiter.allow(&app.db, ip).await {
         return fail("google_failed");
     }
     let (Some(code), Some(state)) = (q.code, q.state) else {

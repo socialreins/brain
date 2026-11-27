@@ -100,7 +100,7 @@ async fn subscribe(
     request: Request,
 ) -> Response {
     // Counted before the body is read, so malformed requests use up the limit too.
-    if !app.waitlist_limiter.allow(ip) {
+    if !app.waitlist_limiter.allow(&app.db, ip).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let body = match Json::<Subscribe>::from_request(request, &()).await {
@@ -254,7 +254,7 @@ async fn unclaim(app: &AppState, secret: &str) {
         (status = 413, body = Error), (status = 415, body = Error), (status = 422, body = Error),
         (status = 429, body = Error), (status = 500, body = Error)))]
 async fn verify(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Request) -> Response {
-    if !app.waitlist_limiter.allow(ip) {
+    if !app.waitlist_limiter.allow(&app.db, ip).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let secret = match Json::<VerifyBody>::from_request(request, &()).await {
@@ -309,7 +309,7 @@ async fn unsubscribe(
     query: Result<Query<UnsubscribeQuery>, QueryRejection>,
     request: Request,
 ) -> Response {
-    if !app.unsubscribe_limiter.allow(ip) {
+    if !app.unsubscribe_limiter.allow(&app.db, ip).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let secret = match query.ok().and_then(|q| q.0.token) {

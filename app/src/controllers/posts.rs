@@ -2579,7 +2579,7 @@ pub async fn update_post(app: &AppState, a: &Actor, id: Uuid, mut input: PostInp
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 429, body = Error)))]
 async fn publish_now(State(app): State<AppState>, a: Actor, PostId(id): PostId) -> Response {
-    if !app.post_limiter.hit(a.key()) {
+    if !app.post_limiter.hit(&app.db, a.key()).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     if let Some(res) = crate::controllers::billing::needs_plan(&app, a.team.id).await {
@@ -2843,7 +2843,8 @@ pub async fn takedown_post_group(app: &AppState, a: &Actor, group_id: Uuid) -> R
         if found.is_empty() {
             return Ok(not_found());
         }
-        if found.iter().any(|p| p.status == "published") && !app.post_limiter.hit(a.key()) {
+        let published = found.iter().any(|p| p.status == "published");
+        if published && !app.post_limiter.hit(&app.db, a.key()).await {
             return Ok(reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
         }
         let mut results = Vec::new();
@@ -2903,7 +2904,7 @@ pub async fn delete_post(app: &AppState, a: &Actor, id: Uuid) -> Response {
         }
         "published" | "deleted" => {
             if found.status == "published" {
-                if !app.post_limiter.hit(a.key()) {
+                if !app.post_limiter.hit(&app.db, a.key()).await {
                     return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
                 }
                 match take_down(app, &found).await {
@@ -3104,7 +3105,7 @@ fn publish_in_background(app: &AppState, ids: Vec<Uuid>) {
         (status = 403, body = Error), (status = 404, body = Error), (status = 409, body = Error),
         (status = 429, body = Error)))]
 async fn retry_post(State(app): State<AppState>, a: Actor, PostId(id): PostId) -> Response {
-    if !app.post_limiter.hit(a.key()) {
+    if !app.post_limiter.hit(&app.db, a.key()).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     if let Some(res) = crate::controllers::billing::needs_plan(&app, a.team.id).await {
@@ -3151,7 +3152,7 @@ async fn retry_group(
     a: Actor,
     Path(group_id): Path<Uuid>,
 ) -> Response {
-    if !app.post_limiter.hit(a.key()) {
+    if !app.post_limiter.hit(&app.db, a.key()).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     if let Some(res) = crate::controllers::billing::needs_plan(&app, a.team.id).await {

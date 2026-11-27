@@ -280,7 +280,7 @@ async fn public(
     ClientIp(ip): ClientIp,
     Path(code): Path<String>,
 ) -> Response {
-    if !app.page_limiter.allow(ip) {
+    if !app.page_limiter.allow(&app.db, ip).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let db = &app.db;
@@ -364,7 +364,7 @@ async fn report(
     request: axum::extract::Request,
 ) -> Response {
     use axum::extract::FromRequest;
-    if !app.contact_limiter.allow(ip) {
+    if !app.contact_limiter.allow(&app.db, ip).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let body = match Json::<NewReport>::from_request(request, &()).await {

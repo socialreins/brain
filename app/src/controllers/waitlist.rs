@@ -111,7 +111,7 @@ pub(crate) fn rejected(r: &JsonRejection) -> Reply {
         (status = 429, body = Error), (status = 500, body = Error)))]
 async fn join(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Request) -> Reply {
     // Counted before the body is read, so malformed requests use up the limit too.
-    if !app.waitlist_limiter.allow(ip) {
+    if !app.waitlist_limiter.allow(&app.db, ip).await {
         return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let body = match Json::<NewSignup>::from_request(request, &()).await {
@@ -311,7 +311,7 @@ pub struct Verified {
         (status = 429, body = Error), (status = 500, body = Error)))]
 async fn verify(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Request) -> Reply {
     use waitlist_signups::Column;
-    if !app.waitlist_limiter.allow(ip) {
+    if !app.waitlist_limiter.allow(&app.db, ip).await {
         return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let secret = match Json::<VerifyBody>::from_request(request, &()).await {
@@ -365,7 +365,7 @@ pub struct NameBody {
         (status = 429, body = Error), (status = 500, body = Error)))]
 async fn set_name(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Request) -> Reply {
     use waitlist_signups::Column;
-    if !app.waitlist_limiter.allow(ip) {
+    if !app.waitlist_limiter.allow(&app.db, ip).await {
         return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let body = match Json::<NameBody>::from_request(request, &()).await {
