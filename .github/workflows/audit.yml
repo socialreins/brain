@@ -15,7 +15,8 @@ on:
 
 concurrency:
   group: audit-${{ github.ref }}
-  cancel-in-progress: true
+  # Only a newer PR push replaces a PR run: a push to main must not cancel the weekly run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
