@@ -267,6 +267,10 @@ pub async fn purge_idempotency_keys(db: &DatabaseConnection) -> Result<u64, DbEr
     purge(db, &idempotency::purge_sql()).await
 }
 
+/// Advisory lock key of the session and sign-in link purge, apart from `PURGE_LOCK` so the two
+/// jobs, both run at boot, do not make each other skip a round (the next is a day away).
+const AUTH_PURGE_LOCK: i64 = 0x0041_5554_4850_5547;
+
 /// Rows deleted per statement by the daily session and sign-in link purge.
 const AUTH_BATCH: i64 = 1000;
 
@@ -274,9 +278,10 @@ const AUTH_BATCH: i64 = 1000;
 const AUTH_KEEP_DAYS: i64 = 7;
 
 /// Deletes sessions and sign-in links expired more than `AUTH_KEEP_DAYS` ago, `batch` rows a
-/// statement (each in its own short transaction under the purge lock) until none are left;
-/// returns (sessions, links). A used link is deleted when it is opened, so only expired ones
-/// remain. Stops early (the rest waits for tomorrow) while another instance holds the lock.
+/// statement (each in its own short transaction under `AUTH_PURGE_LOCK`) until none are left;
+/// returns (sessions, links). Signing in and sending a link already delete expired rows of their
+/// table (no grace, unbatched), so this is the backstop for quiet days and the 7-day tail. A
+/// used link is deleted when it is opened, so only expired ones remain. Stops early (the rest waits for tomorrow) while another instance holds the lock.
 pub async fn purge_expired_auth(db: &DatabaseConnection, batch: i64) -> Result<(u64, u64), DbErr> {
     let mut done = [0, 0];
     for (n, table) in ["sessions", "magic_links"].into_iter().enumerate() {
@@ -285,7 +290,7 @@ pub async fn purge_expired_auth(db: &DatabaseConnection, batch: i64) -> Result<(
              WHERE expires_at < now() - interval '{AUTH_KEEP_DAYS} days' LIMIT {batch})"
         );
         loop {
-            let rows = purge(db, &sql).await?;
+            let rows = purge_locked(db, AUTH_PURGE_LOCK, &sql).await?;
             done[n] += rows;
             if rows < batch as u64 {
                 break;
@@ -297,8 +302,13 @@ pub async fn purge_expired_auth(db: &DatabaseConnection, batch: i64) -> Result<(
 
 /// Runs `sql` under the purge lock; 0 while another instance holds it.
 async fn purge(db: &DatabaseConnection, sql: &str) -> Result<u64, DbErr> {
+    purge_locked(db, PURGE_LOCK, sql).await
+}
+
+/// Runs `sql` under the advisory lock `key`; 0 while another instance holds it.
+async fn purge_locked(db: &DatabaseConnection, key: i64, sql: &str) -> Result<u64, DbErr> {
     let txn = db.begin().await?;
-    let lock = format!("SELECT pg_try_advisory_xact_lock({PURGE_LOCK}) AS ok");
+    let lock = format!("SELECT pg_try_advisory_xact_lock({key}) AS ok");
     let row = txn
         .query_one_raw(Statement::from_string(DbBackend::Postgres, lock))
         .await?;
