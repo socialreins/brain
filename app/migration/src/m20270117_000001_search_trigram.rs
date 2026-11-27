@@ -25,11 +25,11 @@ pub struct Migration;
 // 1.2 ms, admin users 15.4 ms to 0.19 ms, admin teams 1.9 ms to 0.06 ms; a term matching
 // nothing in the team, 11.3 ms to 0.02 ms. A broad term stays on the team's own index (0.2 ms,
 // unchanged). All seven indexes build in 1.1 s together and take 14 MB at that size. One
-// transaction like every other migration (brain's boot holds an
-// advisory lock in a transaction while it migrates, so `CREATE INDEX CONCURRENTLY` would wait
-// for it forever). Each build blocks writes to its table: milliseconds at production's size.
-// `lock_timeout` fails this boot instead of queueing every writer behind a build that is itself
-// waiting. `down` drops the indexes and leaves the extension: it is not ours alone.
+// transaction like every other migration (brain's boot holds an advisory lock in a transaction
+// while it migrates, so `CREATE INDEX CONCURRENTLY` would wait for it forever). Each build blocks
+// writes to its table: milliseconds at production's size. `lock_timeout` fails this boot instead
+// of queueing every writer behind a build that is itself waiting. `down` drops the indexes and
+// leaves the extension: it is not ours alone.
 const INDEXES: [(&str, &str, &str); 7] = [
     ("contacts_handle_trgm_idx", "contacts", "handle"),
     ("contacts_display_name_trgm_idx", "contacts", "display_name"),
