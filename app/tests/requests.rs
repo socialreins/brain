@@ -5011,6 +5011,7 @@ mod teams {
         /// `/v1/social-sets`.
         mod sets {
             use super::*;
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
             use socialreins_brain::models::sessions;
             use socialreins_brain::scheduler;
 
@@ -5322,6 +5323,73 @@ mod teams {
                     0,
                     "idempotent"
                 );
+            }
+
+            /// The daily purge keeps what is live or expired less than 7 days ago and deletes the
+            /// rest, in batches (here of 2, over 3 old rows a table, so the loop runs twice).
+            #[tokio::test]
+            #[serial]
+            async fn purge_removes_only_long_expired_sessions_and_links() {
+                let (s, db) = server_where(|_| {}).await;
+                let (_, cookie, id) = user(&s, &db).await;
+                // (name, expiry as an offset from now)
+                let rows = [
+                    ("old1", "-8 days"),
+                    ("old2", "-9 days"),
+                    ("old3", "-30 days"),
+                    ("recent", "-6 days"),
+                    ("live", "+15 minutes"),
+                ];
+                for (name, at) in rows {
+                    db.execute_unprepared(&format!(
+                        "INSERT INTO sessions (token_hash, user_id, expires_at) \
+                         VALUES ('purge-s-{name}', '{id}', now() + interval '{at}'); \
+                         INSERT INTO magic_links (token_hash, email, expires_at) \
+                         VALUES ('purge-l-{name}', 'purge@example.com', now() + interval '{at}')"
+                    ))
+                    .await
+                    .unwrap();
+                }
+                let (sessions, links) = scheduler::purge_expired_auth(&db, 2).await.unwrap();
+                assert!(sessions >= 3 && links >= 3, "{sessions} {links}");
+                let left = |table: &'static str, prefix: &'static str| {
+                    let db = db.clone();
+                    async move {
+                        let mut names = vec![];
+                        for r in db
+                            .query_all_raw(Statement::from_string(
+                                DbBackend::Postgres,
+                                format!(
+                                    "SELECT token_hash FROM {table} \
+                                     WHERE token_hash LIKE '{prefix}%' ORDER BY 1"
+                                ),
+                            ))
+                            .await
+                            .unwrap()
+                        {
+                            names.push(r.try_get::<String>("", "token_hash").unwrap());
+                        }
+                        names
+                    }
+                };
+                assert_eq!(
+                    left("sessions", "purge-s-").await,
+                    ["purge-s-live", "purge-s-recent"]
+                );
+                assert_eq!(
+                    left("magic_links", "purge-l-").await,
+                    ["purge-l-live", "purge-l-recent"]
+                );
+                req(&s, Method::GET, "/auth/me", &cookie)
+                    .await
+                    .assert_status_ok();
+                assert_eq!(scheduler::purge_expired_auth(&db, 2).await.unwrap(), (0, 0));
+                db.execute_unprepared(
+                    "DELETE FROM sessions WHERE token_hash LIKE 'purge-s-%'; \
+                     DELETE FROM magic_links WHERE token_hash LIKE 'purge-l-%'",
+                )
+                .await
+                .unwrap();
             }
 
             #[tokio::test]

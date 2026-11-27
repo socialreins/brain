@@ -1,5 +1,5 @@
 //! Background jobs, in process: publishing due posts and reading inboxes (then running
-//! automations), taking up waiting automation flows, sending broadcasts, sending newsletters and sending webhooks every minute (the old app ran every 5), and purging deleted
+//! automations), taking up waiting automation flows, sending broadcasts, sending newsletters and sending webhooks every minute (the old app ran every 5), purging expired sessions and sign-in links daily, and purging deleted
 //! sets, old idempotency keys, old webhook deliveries and leftover stored media every hour, and
 //! extending Threads and LinkedIn tokens and mailing about ending ones daily and renewing X tokens, reading RSS feeds and reading post metrics every 15 minutes, each run by one instance at a time through an advisory lock.
 //! shortcut: no job queue; move to one if jobs need retries or exact times.
@@ -215,6 +215,20 @@ pub fn spawn(app: AppState) {
         })
         .await
     });
+    start(
+        "auth purge",
+        Duration::from_secs(24 * 3600),
+        &app,
+        |app| async move {
+            match purge_expired_auth(&app.db, AUTH_BATCH).await {
+                Ok((0, 0)) => {}
+                Ok((sessions, links)) => {
+                    tracing::info!(sessions, links, "purged expired sessions and sign-in links")
+                }
+                Err(e) => tracing::warn!(error = %e, "expired session and link purge failed"),
+            }
+        },
+    );
     start("purge", Duration::from_secs(3600), &app, |app| async move {
         match purge_deleted_sets(&app.db).await {
             Ok(0) => {}
@@ -251,6 +265,34 @@ pub async fn purge_deleted_sets(db: &DatabaseConnection) -> Result<u64, DbErr> {
 /// Deletes idempotency keys past their 30 days, like `purge_deleted_sets`.
 pub async fn purge_idempotency_keys(db: &DatabaseConnection) -> Result<u64, DbErr> {
     purge(db, &idempotency::purge_sql()).await
+}
+
+/// Rows deleted per statement by the daily session and sign-in link purge.
+const AUTH_BATCH: i64 = 1000;
+
+/// How long an expired session or sign-in link stays before the purge removes it.
+const AUTH_KEEP_DAYS: i64 = 7;
+
+/// Deletes sessions and sign-in links expired more than `AUTH_KEEP_DAYS` ago, `batch` rows a
+/// statement (each in its own short transaction under the purge lock) until none are left;
+/// returns (sessions, links). A used link is deleted when it is opened, so only expired ones
+/// remain. Stops early (the rest waits for tomorrow) while another instance holds the lock.
+pub async fn purge_expired_auth(db: &DatabaseConnection, batch: i64) -> Result<(u64, u64), DbErr> {
+    let mut done = [0, 0];
+    for (n, table) in ["sessions", "magic_links"].into_iter().enumerate() {
+        let sql = format!(
+            "DELETE FROM {table} WHERE token_hash IN (SELECT token_hash FROM {table} \
+             WHERE expires_at < now() - interval '{AUTH_KEEP_DAYS} days' LIMIT {batch})"
+        );
+        loop {
+            let rows = purge(db, &sql).await?;
+            done[n] += rows;
+            if rows < batch as u64 {
+                break;
+            }
+        }
+    }
+    Ok((done[0], done[1]))
 }
 
 /// Runs `sql` under the purge lock; 0 while another instance holds it.
