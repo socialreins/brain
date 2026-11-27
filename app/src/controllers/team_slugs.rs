@@ -187,7 +187,7 @@ async fn check(
     let Ok(Query(q)) = q else {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     };
-    if !app.slug_check_limiter.hit(user.id) {
+    if !app.slug_check_limiter.hit(&app.db, user.id).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let shown = q.slug.trim().to_ascii_lowercase();
@@ -245,7 +245,7 @@ async fn address(
     ClientIp(ip): ClientIp,
     Path(slug): Path<String>,
 ) -> Response {
-    if !app.slug_lookup_limiter.allow(ip) {
+    if !app.slug_lookup_limiter.allow(&app.db, ip).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let slug = slug.to_ascii_lowercase();

@@ -310,7 +310,7 @@ async fn act(
         Ok(None) => return reply(StatusCode::NOT_FOUND, "not_found"),
         Err(e) => return internal(e, "x item read"),
     };
-    if !app.post_limiter.hit(t.current.0.id) {
+    if !app.post_limiter.hit(&app.db, t.current.0.id).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     // One action per item at a time, so a double click cannot take two credits: the lock lives in

@@ -79,7 +79,7 @@ pub(crate) async fn start_with(
     if !t.role.manages() {
         return fail("forbidden");
     }
-    if !app.connect_limiter.hit(t.current.0.id) {
+    if !app.connect_limiter.hit(&app.db, t.current.0.id).await {
         return fail("rate_limited");
     }
     let state = token::new();

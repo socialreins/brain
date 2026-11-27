@@ -196,7 +196,14 @@ async fn trusted_proxy_without_forwarded_for_falls_back_to_the_peer() {
 #[tokio::test]
 #[serial]
 async fn signups_are_rate_limited_per_ip() {
-    let (s, _) = server_with(true).await;
+    use sea_orm::ConnectionTrait;
+    let (s, db) = server_with(true).await;
+    // The window is in Postgres now: a rerun against the same database starts clean.
+    db.execute_unprepared(
+        "DELETE FROM rate_limit_windows WHERE bucket LIKE 'waitlist:203.0.113.9%'",
+    )
+    .await
+    .unwrap();
     let post = |ip: &'static str| {
         s.post("/v1/waitlist")
             .add_header("x-forwarded-for", ip)
@@ -3467,6 +3474,18 @@ mod teams {
         assert_eq!(s.get(&path).await.status_code(), 404);
     }
 
+    /// Forgets a limit's minute window for `key`, as a minute passing would: only the daily caps
+    /// then decide.
+    async fn forget_minute(db: &DatabaseConnection, prefix: &str, key: uuid::Uuid) {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        let stmt = Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "DELETE FROM rate_limit_windows WHERE bucket = $1",
+            [format!("{prefix}:{key}").into()],
+        );
+        db.execute_raw(stmt).await.unwrap();
+    }
+
     #[tokio::test]
     #[serial]
     async fn a_team_sends_at_most_50_invitations_a_day() {
@@ -3497,7 +3516,7 @@ mod teams {
     #[serial]
     async fn daily_invitation_caps_span_teams_and_restarts() {
         let (s, db) = server_where(|_| {}).await;
-        let (_, a, _) = user(&s, &db).await;
+        let (_, a, a_id) = user(&s, &db).await;
         let (_, b, _) = user(&s, &db).await;
         let invite = |s: &TestServer, cookie: &str, email: &str| {
             req(s, Method::POST, "/v1/team/invitations", cookie)
@@ -3516,10 +3535,12 @@ mod teams {
         assert_eq!(res.status_code(), 429);
         res.assert_json(&json!({"error": "rate_limited"}));
 
-        // One inviter: 50 a day, across teams and across fresh servers (fresh memory limiters).
+        // One inviter: 50 a day, across teams and across fresh servers. The minute window is
+        // cleared between rounds, as a minute passing would: the daily cap is what stops it.
         let mut sent = 1;
         for round in 0..5 {
             let (s, _) = server_where(|_| {}).await;
+            forget_minute(&db, "invitation", a_id).await;
             if round == 2 {
                 req(&s, Method::POST, "/v1/teams", &a)
                     .json(&json!({"name": "Other"}))
@@ -3535,6 +3556,7 @@ mod teams {
             }
         }
         let (s, _) = server_where(|_| {}).await;
+        forget_minute(&db, "invitation", a_id).await;
         assert_eq!(invite(&s, &a, &unique_email()).await.status_code(), 429);
     }
 
@@ -30225,7 +30247,8 @@ mod teams {
                     .await
                     .expect("database reachable");
                 let mut state = AppState::new(db.clone(), &config);
-                state.api_token_limiter = Arc::new(RateLimiter::per_minute(per_minute));
+                state.api_token_limiter =
+                    Arc::new(RateLimiter::per_minute("api-token", per_minute));
                 let app = controllers::router(state.clone(), &config);
                 (TestServer::new(app).unwrap(), db, state)
             }
@@ -40932,7 +40955,12 @@ mod captcha_and_contact {
     #[tokio::test]
     #[serial]
     async fn contact_allows_5_an_hour_per_ip() {
-        let (s, _, _) = app(None).await;
+        use sea_orm::ConnectionTrait;
+        let (s, db, _) = app(None).await;
+        // The window is in Postgres now: a rerun against the same database starts clean.
+        db.execute_unprepared("DELETE FROM rate_limit_windows WHERE bucket LIKE 'contact:%'")
+            .await
+            .unwrap();
         let post = |ip: &'static str| {
             s.post("/v1/contact")
                 .add_header("x-forwarded-for", ip)

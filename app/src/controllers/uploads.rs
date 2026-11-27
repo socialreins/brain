@@ -169,7 +169,7 @@ async fn create(State(app): State<AppState>, a: Actor, body: Body) -> Response {
     if let Some(res) = super::billing::needs_plan(&app, a.team.id).await {
         return res;
     }
-    if !app.upload_limiter.hit(a.team.id) {
+    if !app.upload_limiter.hit(&app.db, a.team.id).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let id = Uuid::now_v7();

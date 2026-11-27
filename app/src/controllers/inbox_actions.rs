@@ -127,7 +127,7 @@ fn failed(e: &InboxError) -> Response {
     responses((status = 200, body = Actions), (status = 401, body = crate::controllers::waitlist::Error),
         (status = 404, body = crate::controllers::waitlist::Error)))]
 async fn list(State(app): State<AppState>, t: InTeam, ItemId(id): ItemId) -> Response {
-    if !app.live_limiter.hit(t.current.0.id) {
+    if !app.live_limiter.hit(&app.db, t.current.0.id).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let (item, account) = match find(&app, t.team.id, id).await {
@@ -227,7 +227,7 @@ async fn act(
         },
         None => None,
     };
-    if !app.live_limiter.hit(t.current.0.id) {
+    if !app.live_limiter.hit(&app.db, t.current.0.id).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     // One attempt at a time per item and action, so a double click cannot like twice or file a

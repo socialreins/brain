@@ -57,6 +57,14 @@ fn valid_key(v: &[u8]) -> Option<&str> {
     ok.then(|| std::str::from_utf8(v).ok()).flatten()
 }
 
+/// The answer this layer gives itself, counted once against the token's limit.
+async fn answer(app: &AppState, token: Uuid, res: Response) -> Response {
+    match limited(app, token).await {
+        Some(limited) => limited,
+        None => res,
+    }
+}
+
 /// Whether an answer is kept for replay: a 5xx or 429 means the work did not (fully) happen.
 fn kept(status: StatusCode) -> bool {
     !status.is_server_error() && status != StatusCode::TOO_MANY_REQUESTS
@@ -87,19 +95,25 @@ pub async fn layer(State(app): State<AppState>, req: Request, next: Next) -> Res
         Err(e) => return internal(e, "idempotency token lookup"),
     };
     // A request answered here skips the route, so it counts against the limit here, once.
-    let answer = |res: Response| limited(&app, token.id).unwrap_or(res);
     if token.read_only {
-        return answer(read_only_token());
+        return answer(&app, token.id, read_only_token()).await;
     }
     let Some(key) = valid_key(&key).map(str::to_owned) else {
-        return answer(reply(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_idempotency_key",
-        ));
+        return answer(
+            &app,
+            token.id,
+            reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_idempotency_key"),
+        )
+        .await;
     };
     let (parts, body) = req.into_parts();
     let Ok(body) = to_bytes(body, MAX_BODY).await else {
-        return answer(reply(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"));
+        return answer(
+            &app,
+            token.id,
+            reply(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
+        )
+        .await;
     };
     let method = parts.method.as_str().to_owned();
     let path = parts.uri.path().to_owned();
@@ -110,7 +124,7 @@ pub async fn layer(State(app): State<AppState>, req: Request, next: Next) -> Res
         Err(e) => return internal(e, "idempotency claim"),
     };
     if let Some(res) = claimed {
-        return answer(res);
+        return answer(&app, token.id, res).await;
     }
     let req = Request::from_parts(parts, Body::from(body));
     // Spawned, so a client hanging up mid-request cannot cancel the run between its effect and

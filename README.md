@@ -928,6 +928,20 @@ mac = hmac.new(secret.encode(), f"{t}.".encode() + raw_body, hashlib.sha256).hex
 assert hmac.compare_digest(mac, v1) and abs(time.time() - int(t)) < 300
 ```
 
+## Rate limits
+
+Short bursts (sign-in links, invitations, exports, uploads, the contact form, review login,
+publish calls, public pages, API tokens) are fixed windows kept in Postgres, table
+`rate_limit_windows`: one row per bucket (the limit's name and the network, user, team or token it
+counts) with the window's start and its count. A check is one atomic upsert under the row lock, so
+every replica counts the same window and two cannot both pass the cap; the window starts at its
+first hit, a refused check counts but does not move it, and the window rolls when it ends. A
+database error allows the request and logs a warning, so a limiter that cannot be read never stops
+traffic. Rows are swept a day after their window began. A request with no client address (a server
+with no socket peer) is counted per instance. The daily caps stay rows in `rate_limit_hits` (see
+Teams), so deletes and restarts do not reset those either. Every number is per limit and unchanged,
+and each route documents its own.
+
 ## Inbox retention
 
 Inbox items are kept for `INBOX_RETENTION_DAYS` days (365 by default, `0` keeps everything). Once a

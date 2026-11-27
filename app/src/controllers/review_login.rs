@@ -33,7 +33,7 @@ async fn review_login(
     let Some(want) = &app.review_login_token else {
         return not_found();
     };
-    if !app.login_limiter.allow(ip) {
+    if !app.login_limiter.allow(&app.db, ip).await {
         return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited").into_response();
     }
     // Hashing first makes the compared strings the same length whatever was sent.

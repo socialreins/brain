@@ -37,7 +37,7 @@ async fn send(State(app): State<AppState>, ClientIp(ip): ClientIp, request: Requ
     let Some(to) = app.contact_to.clone() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "contact_unavailable");
     };
-    if !app.contact_limiter.allow(ip) {
+    if !app.contact_limiter.allow(&app.db, ip).await {
         return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let body = match Json::<NewMessage>::from_request(request, &()).await {

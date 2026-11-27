@@ -1,17 +1,15 @@
-//! Rate limits and the client IP extractor they key on. `RateLimiter` is a fixed-window counter
-//! for short bursts. shortcut: in-process memory, so each replica counts on its own; move to
-//! Postgres or Redis once brain runs more than one instance. Daily caps (`daily_reserve`,
-//! `daily_refund`) are counted in Postgres.
+//! Rate limits, the client IP extractor they key on, and the daily caps. A `RateLimiter` is a
+//! fixed-window counter kept in Postgres (`rate_limit_windows`), one row per bucket, so every
+//! replica counts the same window and a restart does not reset it. A check is one atomic
+//! statement (an upsert that takes the row lock), so two replicas cannot both pass the cap. A
+//! database error allows the request and logs a warning: a limiter that cannot be read must
+//! not stop traffic. Daily caps (`daily_reserve`, `daily_refund`) are counted in
+//! `rate_limit_hits`.
 use std::{
-    collections::HashMap,
     convert::Infallible,
-    hash::Hash,
     net::{IpAddr, Ipv6Addr, SocketAddr},
-    sync::{
-        atomic::{AtomicI64, Ordering},
-        Mutex,
-    },
-    time::{Duration, Instant},
+    sync::atomic::{AtomicI64, Ordering},
+    time::Duration,
 };
 
 use axum::{
@@ -23,15 +21,31 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, Statement, 
 
 use crate::state::AppState;
 
-/// Most networks tracked at once; past it the oldest window is evicted, so memory stays bounded.
-pub const MAX_KEYS: usize = 10_000;
-
-/// Keyed by client network by default; `RateLimiter<String>` keys on anything else, e.g. an email.
-pub struct RateLimiter<K = Option<IpAddr>> {
+/// A fixed-window counter for short bursts, shared through Postgres. Keyed by client network
+/// by default (`allow`); `hit` and `wait` key on anything else, e.g. a user or a token id.
+pub struct RateLimiter {
+    prefix: String,
     cap: u32,
     window: Duration,
-    max_keys: usize,
-    hits: Mutex<HashMap<K, (Instant, u32)>>,
+    /// Distinguishes this instance's address-less requests; see `allow`.
+    no_address: String,
+}
+
+/// What a `RateLimiter` counts beside its prefix: the text a bucket is named by.
+pub trait Key {
+    fn key(&self) -> String;
+}
+
+impl Key for uuid::Uuid {
+    fn key(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl Key for IpAddr {
+    fn key(&self) -> String {
+        bucket(*self).to_string()
+    }
 }
 
 /// The bucket key: an IPv4 address as is, an IPv6 address by its /64 (one subscriber's
@@ -48,69 +62,94 @@ pub(crate) fn bucket(ip: IpAddr) -> IpAddr {
 
 impl RateLimiter {
     /// Counts one hit for `ip`; false once its network is over the cap for the current window.
-    pub fn allow(&self, ip: Option<IpAddr>) -> bool {
-        self.hit(ip.map(bucket))
+    pub async fn allow(&self, db: &DatabaseConnection, ip: Option<IpAddr>) -> bool {
+        match ip {
+            Some(ip) => self.check(db, &bucket(ip).to_string()).await.is_none(),
+            // No client address (a server without socket info, which is a test server in
+            // practice): there is nothing a second replica could key it by, so this instance
+            // counts those on its own rather than sharing one bucket across every replica.
+            None => self.check(db, &self.no_address).await.is_none(),
+        }
     }
 }
 
-impl<K: Hash + Eq + Clone> RateLimiter<K> {
-    pub fn per_minute(cap: u32) -> Self {
-        Self::new(cap, Duration::from_secs(60), MAX_KEYS)
+impl RateLimiter {
+    /// `prefix` names the limit in the table (`<prefix>:<key>`): every limit gets its own.
+    pub fn per_minute(prefix: impl Into<String>, cap: u32) -> Self {
+        Self::new(prefix, cap, Duration::from_secs(60))
     }
 
-    pub fn new(cap: u32, window: Duration, max_keys: usize) -> Self {
+    pub fn new(prefix: impl Into<String>, cap: u32, window: Duration) -> Self {
         Self {
+            prefix: prefix.into(),
             cap,
             window,
-            max_keys,
-            hits: Mutex::default(),
+            no_address: format!("no-address:{}", uuid::Uuid::now_v7().simple()),
         }
     }
 
     /// Counts one hit for `key`; false once it is over the cap for the current window.
-    pub fn hit(&self, key: K) -> bool {
-        self.wait(key).is_none()
+    pub async fn hit(&self, db: &DatabaseConnection, key: impl Key) -> bool {
+        self.wait(db, key).await.is_none()
     }
 
     /// `hit`, answering how long until the window resets when `key` is over the cap (for a
     /// `Retry-After` header), else `None`.
-    pub fn wait(&self, key: K) -> Option<Duration> {
-        let now = Instant::now();
-        let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
-        if !hits.contains_key(&key) && hits.len() >= self.max_keys {
-            hits.retain(|_, (start, _)| now.duration_since(*start) < self.window);
-            if hits.len() >= self.max_keys {
-                let oldest = hits
-                    .iter()
-                    .min_by_key(|(_, (start, _))| *start)
-                    .map(|(k, _)| k.clone());
-                if let Some(k) = oldest {
-                    hits.remove(&k);
-                }
+    pub async fn wait(&self, db: &DatabaseConnection, key: impl Key) -> Option<Duration> {
+        self.check(db, &key.key()).await
+    }
+
+    /// One statement: insert the bucket's first hit, or move an expired window to now, or
+    /// count this one in the window that is running. The upsert locks the row, so concurrent
+    /// replicas take turns and the cap holds. A refused check still counts, but it never moves
+    /// `window_start`, so it does not extend the window.
+    async fn check(&self, db: &DatabaseConnection, key: &str) -> Option<Duration> {
+        let bucket = format!("{}:{key}", self.prefix);
+        let sql = "INSERT INTO rate_limit_windows AS w (bucket, window_start, hits) \
+                   VALUES ($1, now(), 1) \
+                   ON CONFLICT (bucket) DO UPDATE SET \
+                     hits = CASE WHEN w.window_start <= now() - ($2 * interval '1 second') \
+                                 THEN 1 ELSE w.hits + 1 END, \
+                     window_start = CASE WHEN w.window_start <= now() - ($2 * interval '1 second') \
+                                         THEN now() ELSE w.window_start END \
+                   RETURNING hits, \
+                     EXTRACT(EPOCH FROM \
+                       (window_start + ($2 * interval '1 second') - now()))::float8 AS reset_in";
+        let stmt = Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            sql,
+            [bucket.clone().into(), self.window.as_secs_f64().into()],
+        );
+        let row = match db.query_one_raw(stmt).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(error = %e, bucket = %bucket, "rate limit check failed, allowing");
+                return None;
             }
+        };
+        let hits: i64 = match row.try_get("", "hits") {
+            Ok(hits) => hits,
+            Err(e) => {
+                tracing::warn!(error = %e, bucket = %bucket, "rate limit check unreadable, allowing");
+                return None;
+            }
+        };
+        prune(db).await;
+        if hits <= i64::from(self.cap) {
+            return None;
         }
-        let entry = hits.entry(key).or_insert((now, 0));
-        if now.duration_since(entry.0) >= self.window {
-            *entry = (now, 0);
-        }
-        entry.1 += 1;
-        (entry.1 > self.cap).then(|| self.window.saturating_sub(now.duration_since(entry.0)))
-    }
-
-    /// Forgets `key`, e.g. after a successful sign-in.
-    pub fn clear(&self, key: &K) {
-        self.hits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(key);
-    }
-
-    pub fn tracked(&self) -> usize {
-        self.hits.lock().unwrap_or_else(|e| e.into_inner()).len()
+        let reset_in: f64 = row.try_get("", "reset_in").unwrap_or_default();
+        let left = if reset_in.is_finite() {
+            reset_in.clamp(0.0, self.window.as_secs_f64())
+        } else {
+            0.0
+        };
+        Some(Duration::from_secs_f64(left))
     }
 }
 
-/// When `prune_daily` last ran, in Unix seconds.
+/// When `prune` last ran, in Unix seconds.
 static LAST_PRUNE: AtomicI64 = AtomicI64::new(0);
 
 fn bind(sql: &str, v: &str) -> Statement {
@@ -132,7 +171,7 @@ pub async fn daily_reserve(
         return Ok(None);
     };
     txn.commit().await?;
-    prune_daily(db).await;
+    prune(db).await;
     Ok(Some(ids))
 }
 
@@ -193,7 +232,7 @@ pub async fn note(db: &DatabaseConnection, bucket: &str) {
     }
 }
 
-/// Hits in `bucket` made from `from` up to `to` (they are kept a day, `prune_daily`).
+/// Hits in `bucket` made from `from` up to `to` (they are kept a day, `prune`).
 pub async fn count_since(
     db: &DatabaseConnection,
     bucket: &str,
@@ -211,8 +250,9 @@ pub async fn count_since(
     }
 }
 
-/// Deletes day-old hits, at most once an hour per process, outside any caller's transaction.
-async fn prune_daily(db: &DatabaseConnection) {
+/// Deletes day-old hits and windows whose window began over a day ago (longer than any window
+/// uses), at most once an hour per process, outside any caller's transaction.
+async fn prune(db: &DatabaseConnection) {
     let now = chrono::Utc::now().timestamp();
     let last = LAST_PRUNE.load(Ordering::Relaxed);
     let due = now - last >= 3600;
@@ -221,9 +261,14 @@ async fn prune_daily(db: &DatabaseConnection) {
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
     {
-        let sql = "DELETE FROM rate_limit_hits WHERE created_at < now() - interval '1 day'";
-        if let Err(e) = db.execute_unprepared(sql).await {
+        let hits = "DELETE FROM rate_limit_hits WHERE created_at < now() - interval '1 day'";
+        if let Err(e) = db.execute_unprepared(hits).await {
             tracing::warn!(error = %e, "rate limit prune failed");
+        }
+        let windows =
+            "DELETE FROM rate_limit_windows WHERE window_start < now() - interval '1 day'";
+        if let Err(e) = db.execute_unprepared(windows).await {
+            tracing::warn!(error = %e, "rate limit window prune failed");
         }
     }
 }
@@ -266,57 +311,24 @@ impl FromRequestParts<AppState> for ClientIp {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::IpAddr, time::Duration};
+    use std::net::IpAddr;
 
-    use super::RateLimiter;
+    use super::bucket;
 
-    fn ip(s: &str) -> Option<IpAddr> {
-        Some(s.parse().unwrap())
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
     }
 
     #[test]
-    fn caps_per_ip() {
-        let l: RateLimiter = RateLimiter::per_minute(2);
-        assert!(l.allow(ip("203.0.113.1")) && l.allow(ip("203.0.113.1")));
-        assert!(!l.allow(ip("203.0.113.1")));
-        assert!(l.allow(ip("203.0.113.2")));
+    fn ipv4_and_its_mapped_ipv6_are_one_bucket() {
+        assert_eq!(bucket(ip("203.0.113.7")), ip("203.0.113.7"));
+        assert_eq!(bucket(ip("::ffff:203.0.113.7")), ip("203.0.113.7"));
     }
 
     #[test]
-    fn ipv6_in_one_slash_64_shares_a_bucket() {
-        let l: RateLimiter = RateLimiter::per_minute(2);
-        assert!(l.allow(ip("2001:db8:1:2::1")));
-        assert!(l.allow(ip("2001:db8:1:2:ffff:ffff:ffff:ffff")));
-        assert!(!l.allow(ip("2001:db8:1:2::abcd")));
-        assert!(l.allow(ip("2001:db8:1:3::1")), "next /64 is its own bucket");
-        assert_eq!(l.tracked(), 2);
-    }
-
-    #[test]
-    fn clear_resets_a_key() {
-        let l: RateLimiter<String> = RateLimiter::per_minute(1);
-        let k = "a@example.com".to_string();
-        assert!(l.hit(k.clone()) && !l.hit(k.clone()));
-        l.clear(&k);
-        assert!(l.hit(k));
-    }
-
-    #[test]
-    fn wait_says_how_long_until_the_window_resets() {
-        let l: RateLimiter<u8> = RateLimiter::per_minute(1);
-        assert_eq!(l.wait(1), None);
-        let left = l.wait(1).expect("over the cap");
-        assert!(left > Duration::from_secs(58) && left <= Duration::from_secs(60));
-    }
-
-    #[test]
-    fn map_never_grows_past_its_cap() {
-        let l: RateLimiter = RateLimiter::new(1, Duration::from_secs(60), 3);
-        for i in 0..50u8 {
-            assert!(l.allow(ip(&format!("198.51.100.{i}"))));
-        }
-        assert_eq!(l.tracked(), 3);
-        // The newest keys stay tracked; the oldest were evicted.
-        assert!(!l.allow(ip("198.51.100.49")));
+    fn ipv6_is_counted_by_its_slash_64() {
+        let one = bucket(ip("2001:db8:1:2::1"));
+        assert_eq!(one, bucket(ip("2001:db8:1:2:ffff:ffff:ffff:ffff")));
+        assert_ne!(one, bucket(ip("2001:db8:1:3::1")));
     }
 }

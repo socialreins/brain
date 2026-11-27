@@ -181,7 +181,7 @@ async fn test(_: FromWeb, State(app): State<AppState>, t: InTeam) -> Response {
     if !t.role.manages() {
         return reply(StatusCode::FORBIDDEN, "forbidden");
     }
-    if !app.post_limiter.hit(t.current.0.id) {
+    if !app.post_limiter.hit(&app.db, t.current.0.id).await {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let found = app

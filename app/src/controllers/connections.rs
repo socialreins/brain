@@ -309,7 +309,9 @@ async fn connect_bluesky(
         return forbidden();
     }
     let user_id = t.current.0.id;
-    if !app.login_limiter.allow(ip) || !app.connect_limiter.hit(user_id) {
+    if !app.login_limiter.allow(&app.db, ip).await
+        || !app.connect_limiter.hit(&app.db, user_id).await
+    {
         return reply(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
     let Some(handle) = bluesky::handle(&body.handle) else {
