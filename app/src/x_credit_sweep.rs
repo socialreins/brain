@@ -6,13 +6,16 @@
 //! target failing and `release_x`) the team stays charged. This hourly sweep finds such a spend:
 //! reason still `x post`, no grant under its reference, older than `AFTER_MINUTES` (a publish
 //! ends well before: `publish::PUBLISH_LIMIT`), the latest spend of its
-//! target (so the target's error is that attempt's), whose target ended `failed` with no remote
+//! target and untouched since its attempt ended (so the target's error is that attempt's), whose target ended `failed` with no remote
 //! id, no thread part out and an error that is certainly unsent (`publish::credit_kept` says
 //! no). It grants the credits back under the spend's own reference, so a second run, or a second
 //! instance, grants nothing more (the ledger's unique index), reason `x post unsent (swept)`.
 //! Does nothing without `BILLING_ENABLED`.
 //! shortcut: spends made before `KEPT` existed have no mark and are judged like the rest (billing
 //! was never on in production when this was written, so there are none there).
+//! shortcut: a user's Retry within `ENDED_WITHIN_MINUTES` of an attempt that kept its credit
+//! (a dropped connection) whose `x post kept` mark was lost, followed by an attempt that fails
+//! before spending, still looks like a lost release; it takes three coincidences.
 //! shortcut: a crash in the middle of a send leaves the target failed as "may have posted"
 //! (`recover_stuck`), which is not told from a crash before the first call, so its credits
 //! stay spent; a thread that failed with parts out keeps them too. Settle those by hand with
@@ -26,6 +29,10 @@ use crate::{billing, publish, state::AppState};
 pub const KEPT: &str = "x post kept";
 /// How old a spend must be before it is judged: no publish is still running.
 const AFTER_MINUTES: i32 = 120;
+/// The target must have last changed this soon after the spend: it then still holds the error of
+/// the attempt that spent (a publish ends within `publish::PUBLISH_LIMIT`, 14 minutes). A target
+/// touched later was retried or changed, and its error may be another attempt's.
+const ENDED_WITHIN_MINUTES: i32 = 20;
 /// How far back to look: older leftovers are not worth a scan every hour.
 const WITHIN_DAYS: i32 = 7;
 /// Most spends judged in one run.
@@ -52,6 +59,7 @@ pub async fn sweep(app: &AppState) -> Result<(i64, u64), DbErr> {
              AND NOT EXISTS (SELECT 1 FROM credit_ledger n WHERE n.team_id = l.team_id \
              AND n.kind = 'x' AND n.amount < 0 AND n.reason IN ('x post', 'x post kept') \
              AND left(n.ref, 37) = left(l.ref, 37) AND n.created_at > l.created_at) \
+             AND t.updated_at BETWEEN l.created_at AND l.created_at + make_interval(mins => $5) \
              AND t.status = 'failed' AND t.remote_id IS NULL AND t.parts = '[]'::jsonb \
              AND t.error IS NOT NULL AND t.error NOT LIKE '%may have posted%' \
              AND t.error NOT LIKE '%may still post%' AND t.error NOT LIKE '%may be live%' \
@@ -64,6 +72,7 @@ pub async fn sweep(app: &AppState) -> Result<(i64, u64), DbErr> {
                 WITHIN_DAYS.into(),
                 BATCH.into(),
                 crate::connectors::UNSENT.into(),
+                ENDED_WITHIN_MINUTES.into(),
             ],
         ))
         .await?;

@@ -62,8 +62,9 @@ impl Env {
             .execute_unprepared(&format!(
                 "INSERT INTO posts (id, team_id, social_set_id, platform, status) \
                  VALUES ('{post}', '{}', '{}', 'x', 'failed'); \
-                 INSERT INTO post_targets (id, post_id, status, error, remote_id) \
-                 VALUES ('{target}', '{post}', '{status}', {error}, {remote}); \
+                 INSERT INTO post_targets (id, post_id, status, error, remote_id, updated_at) \
+                 VALUES ('{target}', '{post}', '{status}', {error}, {remote}, \
+                 now() - interval '{age}' + interval '1 minute'); \
                  INSERT INTO credit_ledger (id, team_id, kind, amount, reason, ref, created_at) \
                  VALUES (gen_random_uuid(), '{}', 'x', -2, 'x post', '{reference}', \
                  now() - interval '{age}')",
@@ -155,6 +156,17 @@ async fn a_kept_spend_and_an_older_attempt_are_left_alone() {
              VALUES (gen_random_uuid(), '{}', 'x', -1, 'x post kept', '{target}:{}', now() - interval '4 hours')",
             e.team,
             Uuid::now_v7()
+        ))
+        .await
+        .unwrap();
+    // A target touched an hour after its spend (retried, then failed before spending) is not
+    // judged: its error may be another attempt's.
+    let later = e.spent("failed", Some(clean), false, "3 hours").await;
+    e.app
+        .db
+        .execute_unprepared(&format!(
+            "UPDATE post_targets SET updated_at = now() - interval '2 hours' WHERE id::text = '{}'",
+            &later[..36]
         ))
         .await
         .unwrap();
