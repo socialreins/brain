@@ -1,5 +1,6 @@
 //! The app pool's Postgres timeouts (`DATABASE_STATEMENT_TIMEOUT_SECONDS`,
-//! `DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS`). Needs `DATABASE_URL` like the request tests.
+//! `DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS`) and the migration pool's fixed lock timeout.
+//! Needs `DATABASE_URL` like the request tests.
 use std::time::Duration;
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
@@ -58,4 +59,17 @@ async fn a_long_statement_and_a_forgotten_transaction_are_cut() {
     db.execute_unprepared("SELECT 1")
         .await
         .expect("answers on a new connection");
+}
+
+/// A migration that cannot take its table lock fails the boot instead of queueing every writer
+/// behind it: the pool migrations run on carries the fixed 15 second timeout.
+#[tokio::test]
+#[serial]
+async fn migrations_time_out_on_a_table_lock() {
+    let config = Config::from_env().expect("DATABASE_URL must point at a test Postgres");
+    let db = socialreins_brain::migrating_pool(&config)
+        .await
+        .expect("database reachable");
+    assert_eq!(show(&db, "lock_timeout").await, "15s");
+    db.close().await.unwrap();
 }
