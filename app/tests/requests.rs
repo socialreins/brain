@@ -38232,7 +38232,10 @@ mod teams {
     mod stripe_api {
         use super::*;
         use axum::{
-            extract::Form, http::HeaderMap, routing::post as route, Json as AxJson, Router,
+            extract::{Form, RawQuery},
+            http::HeaderMap,
+            routing::post as route,
+            Json as AxJson, Router,
         };
         use sea_orm::{ConnectionTrait, DbBackend, Statement};
         use socialreins_brain::stripe::Stripe;
@@ -38244,6 +38247,9 @@ mod teams {
         type Call = (String, String, Vec<(String, String)>);
         /// The `Idempotency-Key` of every checkout the mock took.
         static KEYS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        /// The card fingerprint the mock answers for a subscription's payment method; `None`
+        /// is a trial that collected no card. Reset by `on`, and `#[serial]` keeps tests apart.
+        static CARD: Mutex<Option<String>> = Mutex::new(None);
 
         async fn mock() -> String {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -38283,8 +38289,45 @@ mod teams {
                     .push((format!("/cancel/{id}"), String::new(), Vec::new()));
                 AxJson(json!({"id": id, "status": "canceled"}))
             };
+            let read_sub = |axum::extract::Path(id): axum::extract::Path<String>,
+                            RawQuery(query): RawQuery| async move {
+                let query = query.map(|q| vec![("query".to_owned(), q)]);
+                CALLS.lock().unwrap().push((
+                    format!("/read/sub/{id}"),
+                    String::new(),
+                    query.unwrap_or_default(),
+                ));
+                match CARD.lock().unwrap().clone() {
+                    Some(fingerprint) => AxJson(json!({
+                        "id": id, "customer": "cus_card",
+                        "default_payment_method": {
+                            "id": "pm_card", "card": {"fingerprint": fingerprint}
+                        }
+                    })),
+                    None => AxJson(json!({
+                        "id": id, "customer": "cus_card", "default_payment_method": null
+                    })),
+                }
+            };
+            let read_customer = |axum::extract::Path(id): axum::extract::Path<String>,
+                                 RawQuery(query): RawQuery| async move {
+                let query = query.map(|q| vec![("query".to_owned(), q)]);
+                CALLS.lock().unwrap().push((
+                    format!("/read/cus/{id}"),
+                    String::new(),
+                    query.unwrap_or_default(),
+                ));
+                AxJson(json!({
+                    "id": id,
+                    "invoice_settings": {"default_payment_method": null}
+                }))
+            };
             let app = Router::new()
-                .route("/v1/subscriptions/{id}", axum::routing::delete(cancel))
+                .route(
+                    "/v1/subscriptions/{id}",
+                    axum::routing::delete(cancel).get(read_sub),
+                )
+                .route("/v1/customers/{id}", axum::routing::get(read_customer))
                 .route("/v1/checkout/sessions", route(take("/checkout")))
                 .route("/v1/billing_portal/sessions", route(take("/portal")));
             tokio::spawn(async move { axum::serve(listener, app).await });
@@ -38293,6 +38336,7 @@ mod teams {
 
         /// Billing on, Stripe on the mock; `webhook` sets the signing secret.
         async fn on(webhook: bool) -> (TestServer, DatabaseConnection) {
+            *CARD.lock().unwrap() = None;
             let base = mock().await;
             server_where(|c| {
                 c.billing_enabled = true;
@@ -38336,6 +38380,18 @@ mod teams {
 
         fn count(path: &str) -> usize {
             CALLS.lock().unwrap().iter().filter(|c| c.0 == path).count()
+        }
+
+        /// Whether the team holds a subscription row.
+        async fn holds(db: &DatabaseConnection, team: &str) -> bool {
+            db.query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT 1 FROM subscriptions WHERE team_id = $1",
+                [team.parse::<uuid::Uuid>().unwrap().into()],
+            ))
+            .await
+            .unwrap()
+            .is_some()
         }
 
         async fn put(db: &DatabaseConnection, sql: &str, value: &str) {
@@ -38496,6 +38552,52 @@ mod teams {
                 }}
             })
             .to_string()
+        }
+
+        /// A trialing subscription event carrying the trial key a checkout put on it.
+        fn trial_start(evt: &str, now: i64, sub: &str, team: &str, key: &str) -> Value {
+            let mut e: Value =
+                serde_json::from_str(&sub_event(evt, now, sub, team, "trialing", "price_s"))
+                    .unwrap();
+            e["data"]["object"]["metadata"]["trial_key"] = key.into();
+            e
+        }
+
+        /// `(person_key, card_hash)` of the named trial rows, by person key.
+        async fn trial_rows(
+            db: &DatabaseConnection,
+            keys: [&str; 2],
+        ) -> Vec<(String, Option<String>)> {
+            db.query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT person_key, card_hash FROM trial_uses \
+                 WHERE person_key IN ($1, $2) ORDER BY person_key",
+                [keys[0].to_owned().into(), keys[1].to_owned().into()],
+            ))
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r.try_get("", "person_key").unwrap(),
+                    r.try_get("", "card_hash").unwrap(),
+                )
+            })
+            .collect()
+        }
+
+        /// The hex SHA-256 of `text`, as `trial_uses.card_hash` stores a fingerprint.
+        async fn sha256_of(db: &DatabaseConnection, text: &str) -> String {
+            db.query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT encode(sha256(convert_to($1, 'UTF8')), 'hex') AS h",
+                [text.to_owned().into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "h")
+            .unwrap()
         }
 
         async fn deliver(
@@ -39504,6 +39606,190 @@ mod teams {
             assert!(held(first).await);
             assert!(!held(second).await);
             assert_eq!(count(&format!("/cancel/sub_race1_{}", *RUN)), 1);
+        }
+
+        /// A card is one trial whatever the address (security review): a second person starting
+        /// one on the same card is cancelled like the person duplicate, and both rows are kept.
+        /// The row holds the SHA-256 of the fingerprint, never the fingerprint itself: no log
+        /// capture exists to test the log line, so the stored shape is what this checks.
+        #[tokio::test]
+        #[serial]
+        async fn a_card_gets_one_trial_not_one_per_person() {
+            let (s, db) = on(true).await;
+            let (_, first_owner, _) = user(&s, &db).await;
+            let first = current(&s, &first_owner).await["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let (_, second_owner, _) = user(&s, &db).await;
+            let second = current(&s, &second_owner).await["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let fingerprint = format!("fp_{}", *RUN);
+            *CARD.lock().unwrap() = Some(fingerprint.clone());
+            let now = Utc::now().timestamp();
+            let keys = [
+                format!("carda-{}@example.com", *RUN),
+                format!("cardb-{}@example.com", *RUN),
+            ];
+            for (i, (team, key)) in [
+                (first.clone(), keys[0].clone()),
+                (second.clone(), keys[1].clone()),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let e = trial_start(
+                    &format!("evt_card{i}"),
+                    now,
+                    &format!("sub_card{i}"),
+                    &team,
+                    &key,
+                );
+                assert_eq!(
+                    deliver(&s, &e.to_string(), WHSEC, now).await.status_code(),
+                    200
+                );
+            }
+            assert!(holds(&db, &first).await);
+            assert!(!holds(&db, &second).await);
+            assert_eq!(count(&format!("/cancel/sub_card1_{}", *RUN)), 1);
+            let rows = trial_rows(&db, [&keys[0], &keys[1]]).await;
+            let hash = sha256_of(&db, &fingerprint).await;
+            assert_eq!(rows.len(), 2, "{rows:?}");
+            for (_, card) in &rows {
+                assert_eq!(card.as_deref(), Some(hash.as_str()));
+                assert_ne!(card.as_deref(), Some(fingerprint.as_str()));
+            }
+        }
+
+        /// Another card is another trial: the card rule does not eat a second person's first try.
+        #[tokio::test]
+        #[serial]
+        async fn a_different_card_starts_a_second_trial() {
+            let (s, db) = on(true).await;
+            let (_, first_owner, _) = user(&s, &db).await;
+            let first = current(&s, &first_owner).await["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let (_, second_owner, _) = user(&s, &db).await;
+            let second = current(&s, &second_owner).await["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let first_card = format!("fp_one_{}", *RUN);
+            let second_card = format!("fp_two_{}", *RUN);
+            let now = Utc::now().timestamp();
+            let keys = [
+                format!("cardone-{}@example.com", *RUN),
+                format!("cardtwo-{}@example.com", *RUN),
+            ];
+            let mut hashes = Vec::new();
+            for (i, (team, key, card)) in [
+                (first.clone(), keys[0].clone(), first_card.clone()),
+                (second.clone(), keys[1].clone(), second_card.clone()),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                *CARD.lock().unwrap() = Some(card.clone());
+                let e = trial_start(
+                    &format!("evt_diff{i}"),
+                    now,
+                    &format!("sub_diff{i}"),
+                    &team,
+                    &key,
+                );
+                assert_eq!(
+                    deliver(&s, &e.to_string(), WHSEC, now).await.status_code(),
+                    200
+                );
+                hashes.push(sha256_of(&db, &card).await);
+            }
+            assert!(holds(&db, &first).await);
+            assert!(holds(&db, &second).await);
+            assert_eq!(count(&format!("/cancel/sub_diff1_{}", *RUN)), 0);
+            let rows = trial_rows(&db, [&keys[0], &keys[1]]).await;
+            assert_eq!(rows.len(), 2, "{rows:?}");
+            assert_ne!(hashes[0], hashes[1]);
+            assert!(rows
+                .iter()
+                .all(|(_, card)| [hashes[0].as_str(), hashes[1].as_str()]
+                    .contains(&card.as_deref().unwrap())));
+        }
+
+        /// A trial that collected no card (or whose read failed) keeps the person rule: two
+        /// different people both trial, and one person's second team still gets no second trial.
+        #[tokio::test]
+        #[serial]
+        async fn a_trial_with_no_card_falls_back_to_the_person_rule() {
+            let (s, db) = on(true).await;
+            let (_, first_owner, _) = user(&s, &db).await;
+            let first = current(&s, &first_owner).await["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let (_, second_owner, _) = user(&s, &db).await;
+            let second = current(&s, &second_owner).await["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let now = Utc::now().timestamp();
+            let keys = [
+                format!("nocarda-{}@example.com", *RUN),
+                format!("nocardb-{}@example.com", *RUN),
+            ];
+            for (i, (team, key)) in [
+                (first.clone(), keys[0].clone()),
+                (second.clone(), keys[1].clone()),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let e = trial_start(
+                    &format!("evt_nocard{i}"),
+                    now,
+                    &format!("sub_nocard{i}"),
+                    &team,
+                    &key,
+                );
+                assert_eq!(
+                    deliver(&s, &e.to_string(), WHSEC, now).await.status_code(),
+                    200
+                );
+            }
+            assert!(holds(&db, &first).await);
+            assert!(holds(&db, &second).await);
+            for (_, card) in trial_rows(&db, [&keys[0], &keys[1]]).await {
+                assert_eq!(card, None);
+            }
+            // The same person's new team: still one trial by the email rule.
+            let made = req(&s, Method::POST, "/v1/teams", &first_owner)
+                .json(&json!({"name": "Third"}))
+                .await;
+            let third = made.json::<Value>()["id"].as_str().unwrap().to_owned();
+            let e = trial_start("evt_nocard2", now, "sub_nocard2", &third, &keys[0]);
+            assert_eq!(
+                deliver(&s, &e.to_string(), WHSEC, now).await.status_code(),
+                200
+            );
+            assert!(!holds(&db, &third).await);
+            assert_eq!(count(&format!("/cancel/sub_nocard2_{}", *RUN)), 1);
+            let row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT card_hash FROM trial_uses WHERE person_key = $1",
+                    [keys[0].clone().into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                row.try_get::<Option<String>>("", "card_hash").unwrap(),
+                None
+            );
         }
 
         #[tokio::test]

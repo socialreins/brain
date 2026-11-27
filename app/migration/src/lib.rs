@@ -102,7 +102,8 @@ mod m20270116_000001_credit_takebacks;
 mod m20270117_000001_search_trigram;
 mod m20270118_000001_inbox_retention_index;
 mod m20270119_000001_team_storage_budget;
-mod m20270120_000001_rate_limit_windows;
+mod m20270120_000001_trial_card;
+mod m20270121_000001_rate_limit_windows;
 mod url_numbers;
 
 pub struct Migrator;
@@ -213,7 +214,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20270117_000001_search_trigram::Migration),
             Box::new(m20270118_000001_inbox_retention_index::Migration),
             Box::new(m20270119_000001_team_storage_budget::Migration),
-            Box::new(m20270120_000001_rate_limit_windows::Migration),
+            Box::new(m20270120_000001_trial_card::Migration),
+            Box::new(m20270121_000001_rate_limit_windows::Migration),
             // inject-above (do not remove this comment)
         ]
     }
