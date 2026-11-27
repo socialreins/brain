@@ -4,11 +4,13 @@ use sea_orm_migration::prelude::*;
 pub struct Migration;
 
 // Every slug a team gave up (changed, cleared, or its team deleted), one row per retirement.
-// The row does two jobs: for 90 days after `retired_at` no other team may take the slug, and for
-// 400 days the web app redirects `/t/<slug>/...` to the team's current address. No foreign key:
-// a deleted team's rows outlive it, so its slug stays held. It also counts a team's slug
-// changes in the last 30 days. Replaces `team_slug_holds`, whose rows move over; that table stays,
-// unused, for one release so an instance still running during the deploy does not fail on it.
+// The row does two jobs: no other team may take the slug while it is inside the window
+// (`team::SLUG_WINDOW_DAYS`, 400 days after `retired_at`; 90 days when this migration was
+// written), and for the same window the web app redirects `/t/<slug>/...` to the team's current
+// address. No foreign key: a deleted team's rows outlive it, so its slug stays held. It also
+// counts a team's slug changes in the last 30 days. Replaces `team_slug_holds`, whose rows move
+// over; that table stays, unused, for one release so an instance still running during the deploy
+// does not fail on it.
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, m: &SchemaManager) -> Result<(), DbErr> {

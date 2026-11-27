@@ -5,7 +5,8 @@
 //! team's, and publishing copies the file inside the store instead of downloading it. The link
 //! also serves the file (`GET /media/{name}`) for the composer's preview. An upload lives a day,
 //! then as long as a post of the team that may still publish names it: one not published yet,
-//! or published with a failed target to retry (`media::sweep`).
+//! or published with a failed target to retry (`media::sweep`). Uploads belong to the team, not
+//! a set, so a set-scoped token is `403 team_token_required`.
 use axum::{
     body::Body,
     extract::State,
@@ -21,7 +22,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use super::{
-    api_tokens::Actor,
+    api_tokens::{refuses_set_token, Actor},
     auth::internal,
     library::lock,
     waitlist::{error, Error},
@@ -151,7 +152,8 @@ pub async fn release_pending(app: &AppState, id: Uuid) {
 
 /// Uploads a file (the raw request body) for a post's media: a JPEG, PNG, WebP or GIF image or
 /// a PDF up to 100 MB, or an MP4 or MOV video up to `MEDIA_MAX_BYTES`, told by its bytes. Any
-/// member, and any token that may write. `422 media_type_not_supported` for another type (or an
+/// member, and any whole-team token that may write (`403 team_token_required` for a set token).
+/// `422 media_type_not_supported` for another type (or an
 /// empty body), `413 media_too_large` over the size, `409 too_many_uploads` when the team keeps
 /// 200 uploads, `413 storage_limit` when the file would pass the team's upload budget
 /// (`used` and `budget`, in bytes, counting `MEDIA_MAX_BYTES` for an upload in progress until
@@ -166,6 +168,9 @@ pub async fn release_pending(app: &AppState, id: Uuid) {
         (status = 402, body = Error), (status = 403, body = Error), (status = 409, body = Error),
         (status = 413, body = Error), (status = 422, body = Error), (status = 429, body = Error)))]
 async fn create(State(app): State<AppState>, a: Actor, body: Body) -> Response {
+    if let Some(res) = refuses_set_token(&a) {
+        return res;
+    }
     if let Some(res) = super::billing::needs_plan(&app, a.team.id).await {
         return res;
     }

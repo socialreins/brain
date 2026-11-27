@@ -2674,7 +2674,7 @@ mod teams {
         req(s, Method::PATCH, "/v1/team/slug", cookie).json(&json!({"slug": slug}))
     }
 
-    /// Moves what the team gave up `slug` back in time, past the 90-day hold or the redirect.
+    /// Moves what the team gave up `slug` back in time, past the slug window (hold and redirect).
     async fn retired_days_ago(db: &DatabaseConnection, slug: &str, days: i64) {
         let sql = format!(
             "UPDATE team_slug_history SET retired_at = now() - interval '{days} days' \
@@ -2747,7 +2747,8 @@ mod teams {
         res.assert_status_ok();
         assert_eq!(res.json::<Value>()["slug"], Value::Null);
         assert_eq!(named(&next).await.status_code(), 404);
-        // A slug given up is kept from other teams for 90 days; its old team takes it back.
+        // A slug given up is kept from other teams for the window its redirect lives; its old
+        // team takes it back.
         let (_, other, _) = user(&s, &db).await;
         for held in [&slug, &next] {
             let res = set_slug(&s, &other, json!(held)).await;
@@ -2757,13 +2758,13 @@ mod teams {
         let res = set_slug(&s, &owner, json!(slug)).await;
         assert_eq!(res.json::<Value>()["slug"], slug);
         assert_eq!(named(&slug).await.json::<Value>()["id"], team["id"]);
-        // 89 days on it is still held; after the 90 days another team takes it.
-        retired_days_ago(&db, &next, 89).await;
+        // 399 days on it is still held; after the 400 days another team takes it.
+        retired_days_ago(&db, &next, 399).await;
         assert_eq!(set_slug(&s, &other, json!(next)).await.status_code(), 409);
-        retired_days_ago(&db, &next, 91).await;
+        retired_days_ago(&db, &next, 401).await;
         let res = set_slug(&s, &other, json!(next)).await;
         assert_eq!(res.json::<Value>()["slug"], next);
-        // It is theirs now: they hold it for 90 days when they let go.
+        // It is theirs now: they hold it for the window when they let go.
         set_slug(&s, &other, Value::Null).await.assert_status_ok();
         assert_eq!(set_slug(&s, &owner, json!(next)).await.status_code(), 409);
         // A deleted team's slug is held the same way.
@@ -3037,7 +3038,7 @@ mod teams {
             .await;
         assert_eq!(res.status_code(), 404);
 
-        // A slug that passed to another team after its 90 days is theirs, not a redirect.
+        // A slug that passed to another team once its window ended is theirs, not a redirect.
         let (_, other, _) = user(&s, &db).await;
         let passed = fresh_slug();
         set_slug(&s, &owner, json!(passed)).await.assert_status_ok();
@@ -3045,14 +3046,14 @@ mod teams {
             .await
             .assert_status_ok();
         assert!(redirect_for(&s, &passed).await.is_some());
-        retired_days_ago(&db, &passed, 91).await;
+        retired_days_ago(&db, &passed, 401).await;
         set_slug(&s, &other, json!(passed)).await.assert_status_ok();
         assert_eq!(redirect_for(&s, &passed).await, None);
-        // Once they let go of it too, it is a slug two teams gave up: no redirect to either.
-        set_slug(&s, &other, json!(fresh_slug()))
-            .await
-            .assert_status_ok();
-        assert_eq!(redirect_for(&s, &passed).await, None);
+        // Once they let go of it too, only their row is still inside the window: it leads to
+        // them. The first team's row expired with its links, which stopped redirecting then.
+        let theirs = fresh_slug();
+        set_slug(&s, &other, json!(theirs)).await.assert_status_ok();
+        assert_eq!(redirect_for(&s, &passed).await.as_deref(), Some(&*theirs));
         // A deleted team leaves nothing to redirect to.
         let (_, doomed, _) = user(&s, &db).await;
         req(&s, Method::POST, "/v1/teams", &doomed)
@@ -3067,6 +3068,33 @@ mod teams {
         let res = req(&s, Method::DELETE, "/v1/team", &doomed).await;
         assert_eq!(res.status_code(), 204);
         assert_eq!(redirect_for(&s, &old).await, None);
+    }
+
+    /// A given up slug is held exactly as long as its redirect lives: no day where another team
+    /// may take it while an old link still redirects, and no day where the redirect outlives the
+    /// hold. Both end on the same day, so an old link never opens another team's address.
+    #[tokio::test]
+    #[serial]
+    async fn a_given_up_slug_is_held_as_long_as_its_redirect_lives() {
+        let (s, db) = server_where(|_| {}).await;
+        let (_, owner, _) = user(&s, &db).await;
+        let (_, other, _) = user(&s, &db).await;
+        let old = fresh_slug();
+        let now = fresh_slug();
+        set_slug(&s, &owner, json!(old)).await.assert_status_ok();
+        set_slug(&s, &owner, json!(now)).await.assert_status_ok();
+        // The day before the window ends: still held, and its redirect still answers.
+        retired_days_ago(&db, &old, team::SLUG_WINDOW_DAYS - 1).await;
+        let res = set_slug(&s, &other, json!(old)).await;
+        assert_eq!(res.status_code(), 409, "{}", res.text());
+        res.assert_json(&json!({"error": "slug_taken"}));
+        assert_eq!(redirect_for(&s, &old).await.as_deref(), Some(now.as_str()));
+        // The day after: free to take, and nothing redirects it any more.
+        retired_days_ago(&db, &old, team::SLUG_WINDOW_DAYS + 1).await;
+        assert_eq!(redirect_for(&s, &old).await, None);
+        let res = set_slug(&s, &other, json!(old)).await;
+        assert_eq!(res.status_code(), 200, "{}", res.text());
+        assert_eq!(current(&s, &other).await["slug"], old);
     }
 
     #[tokio::test]
@@ -30670,6 +30698,117 @@ mod teams {
                     .assert_status_ok();
             }
 
+            /// A set token sees nothing outside its set, so the team's own assets (the media
+            /// library, snippets and uploads, which every set shares) are out of its reach: every
+            /// route is `403 team_token_required`, and a whole-team token keeps them all.
+            #[tokio::test]
+            #[serial]
+            async fn set_tokens_never_reach_the_teams_library_snippets_or_uploads() {
+                let (s, db) = on_mock(120).await;
+                let (owner, team_id, _) = owner_with_account(&s, &db).await;
+                let set = default_set(&db, &team_id).await.to_string();
+                let team = make_token(&s, &owner, json!({"name": "team"})).await;
+                let team = team["secret"].as_str().unwrap().to_owned();
+                let limited =
+                    make_token(&s, &owner, json!({"name": "cm", "social_set_id": set})).await;
+                let limited = limited["secret"].as_str().unwrap().to_owned();
+                let refused = |res: axum_test::TestResponse| {
+                    assert_eq!(res.status_code(), 403, "{}", res.text());
+                    res.assert_json(&json!({"error": "team_token_required"}));
+                };
+
+                // A whole-team token reads and writes both, as before.
+                let item = bearer(&s, Method::POST, "/v1/media-library", &team)
+                    .json(&json!({"url": "https://a.example/team.jpg"}))
+                    .await;
+                assert_eq!(item.status_code(), 201, "{}", item.text());
+                let item = item.json::<Value>()["id"].as_str().unwrap().to_owned();
+                let snippet = bearer(&s, Method::POST, "/v1/snippets", &team)
+                    .json(&json!({"kind": "caption", "name": "hello", "body": "Hi there"}))
+                    .await;
+                assert_eq!(snippet.status_code(), 201, "{}", snippet.text());
+                let snippet = snippet.json::<Value>()["id"].as_str().unwrap().to_owned();
+                let mut png = vec![7u8; 64];
+                png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+                let res = bearer(&s, Method::POST, "/v1/uploads", &team)
+                    .content_type("application/octet-stream")
+                    .bytes(png.clone().into())
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                for (method, path) in [
+                    (Method::GET, "/v1/media-library".to_owned()),
+                    (Method::POST, "/v1/media-library".to_owned()),
+                    (Method::PATCH, format!("/v1/media-library/{item}")),
+                    (Method::DELETE, format!("/v1/media-library/{item}")),
+                    (Method::GET, "/v1/snippets".to_owned()),
+                    (Method::POST, "/v1/snippets".to_owned()),
+                    (Method::PUT, format!("/v1/snippets/{snippet}")),
+                    (Method::DELETE, format!("/v1/snippets/{snippet}")),
+                ] {
+                    let call = bearer(&s, method.clone(), &path, &limited);
+                    let body = match method {
+                        Method::POST => json!({"url": "https://a.example/leak.jpg"}),
+                        Method::PATCH => json!({"name": "renamed"}),
+                        Method::PUT => {
+                            json!({"kind": "caption", "name": "hello", "body": "changed"})
+                        }
+                        _ => Value::Null,
+                    };
+                    let res = if body.is_null() {
+                        call.await
+                    } else {
+                        call.json(&body).await
+                    };
+                    assert_eq!(res.status_code(), 403, "{method} {path}");
+                    res.assert_json(&json!({"error": "team_token_required"}));
+                }
+                let res = bearer(&s, Method::POST, "/v1/uploads", &limited)
+                    .content_type("application/octet-stream")
+                    .bytes(png.into())
+                    .await;
+                refused(res);
+
+                // Nothing was written or removed through the refusals.
+                let page = bearer(&s, Method::GET, "/v1/media-library", &team)
+                    .await
+                    .json::<Value>();
+                assert_eq!(page["items"].as_array().unwrap().len(), 1);
+                let list = bearer(&s, Method::GET, "/v1/snippets", &team)
+                    .await
+                    .json::<Value>();
+                assert_eq!(list["items"].as_array().unwrap().len(), 1);
+                assert_eq!(list["items"][0]["body"], "Hi there");
+
+                // The set token still works where its set is the subject.
+                bearer(&s, Method::GET, "/v1/posts", &limited)
+                    .await
+                    .assert_status_ok();
+                // And the team token's own writes are intact.
+                assert_eq!(
+                    bearer(
+                        &s,
+                        Method::PATCH,
+                        &format!("/v1/media-library/{item}"),
+                        &team
+                    )
+                    .json(&json!({"name": "kept"}))
+                    .await
+                    .status_code(),
+                    200
+                );
+                assert_eq!(
+                    bearer(
+                        &s,
+                        Method::DELETE,
+                        &format!("/v1/snippets/{snippet}"),
+                        &team
+                    )
+                    .await
+                    .status_code(),
+                    204
+                );
+            }
+
             #[tokio::test]
             #[serial]
             async fn tokens_are_rate_limited_per_token() {
@@ -34580,8 +34719,9 @@ mod teams {
                     );
                 }
 
-                /// Any member, any token of the team (a set token too) reads and writes; a
-                /// read-only token only reads; another team's ids are `404`.
+                /// Any member and any whole-team token reads and writes; a set token is refused
+                /// on every route (`403 team_token_required`); a read-only token only reads;
+                /// another team's ids are `404`.
                 #[tokio::test]
                 #[serial]
                 async fn members_and_tokens_share_the_team_assets() {
@@ -34609,7 +34749,7 @@ mod teams {
                     let ro = secret(
                         make_token(&s, &owner, json!({"name": "ro", "read_only": true})).await,
                     );
-                    for (i, t) in [&rw, &set_tok].into_iter().enumerate() {
+                    for (i, t) in [&rw].into_iter().enumerate() {
                         let res = bearer(&s, Method::POST, "/v1/media-library", t)
                             .json(&json!({"url": format!("https://a.example/t{i}.jpg")}))
                             .await;
@@ -34636,13 +34776,47 @@ mod teams {
                             .await;
                         res.assert_status_ok();
                     }
-                    let media = bearer(&s, Method::GET, "/v1/media-library", &set_tok)
+                    // A set token owns no team asset: every route is refused for it, nothing read
+                    // and nothing written.
+                    let set_body = json!({"url": "https://a.example/set.jpg", "kind": "caption", "name": "set", "body": "b"});
+                    for (m, p) in [
+                        (Method::GET, "/v1/media-library".to_owned()),
+                        (Method::POST, "/v1/media-library".to_owned()),
+                        (
+                            Method::PATCH,
+                            format!("/v1/media-library/{}", uuid::Uuid::now_v7()),
+                        ),
+                        (
+                            Method::DELETE,
+                            format!("/v1/media-library/{}", uuid::Uuid::now_v7()),
+                        ),
+                        (Method::GET, "/v1/snippets".to_owned()),
+                        (Method::POST, "/v1/snippets".to_owned()),
+                        (
+                            Method::PUT,
+                            format!("/v1/snippets/{}", uuid::Uuid::now_v7()),
+                        ),
+                        (
+                            Method::DELETE,
+                            format!("/v1/snippets/{}", uuid::Uuid::now_v7()),
+                        ),
+                    ] {
+                        let call = bearer(&s, m.clone(), &p, &set_tok);
+                        let res = if m == Method::GET {
+                            call.await
+                        } else {
+                            call.json(&set_body).await
+                        };
+                        assert_eq!(res.status_code(), 403, "{m} {p}");
+                        res.assert_json(&json!({"error": "team_token_required"}));
+                    }
+                    let media = bearer(&s, Method::GET, "/v1/media-library", &rw)
                         .await
                         .json::<Value>();
-                    assert_eq!(media["items"].as_array().unwrap().len(), 3);
+                    assert_eq!(media["items"].as_array().unwrap().len(), 2);
                     let listed = bearer(&s, Method::GET, "/v1/snippets", &ro).await;
                     listed.assert_status_ok();
-                    assert_eq!(listed.json::<Value>()["items"].as_array().unwrap().len(), 3);
+                    assert_eq!(listed.json::<Value>()["items"].as_array().unwrap().len(), 2);
                     let media_id = media["items"][0]["id"].as_str().unwrap().to_owned();
                     let snippet_id = listed.json::<Value>()["items"][0]["id"]
                         .as_str()
@@ -36994,6 +37168,62 @@ mod teams {
                     assert_eq!(res.header("idempotent-replayed"), "true");
                     let in_b = bearer(&s, Method::GET, "/v1/posts", &b).await;
                     assert!(in_b.json::<Vec<Value>>().is_empty());
+                }
+
+                /// A secret answered once must never be stored for replay: the layer ignores the
+                /// key on the routes that carry one, so neither a replay nor
+                /// `GET /idempotency/{key}` can hand it out.
+                #[tokio::test]
+                #[serial]
+                async fn a_secret_is_never_stored_for_replay() {
+                    let (s, db) = on_mock(120).await;
+                    let (owner, _, cm) = team(&s, &db).await;
+                    // The exploit: a session cookie plus a team token's bearer and a key on the
+                    // token create, whose answer holds the new secret.
+                    let leak = |body: Value| {
+                        req(&s, Method::POST, "/v1/api-tokens", &owner)
+                            .add_header("authorization", format!("Bearer {cm}"))
+                            .add_header("idempotency-key", "leak-1")
+                            .json(&body)
+                    };
+                    let res = leak(json!({"name": "leaked"})).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    let made = res.json::<Value>();
+                    let secret = made["secret"].as_str().unwrap().to_owned();
+                    assert!(secret.starts_with("sr_team_live_"), "{secret}");
+                    // Nothing to read back, for any token of the team.
+                    let res = bearer(&s, Method::GET, "/v1/idempotency/leak-1", &cm).await;
+                    assert_eq!(res.status_code(), 404);
+                    res.assert_json(&json!({"error": "not_found"}));
+                    // The key is ignored rather than stored: the route runs again.
+                    let res = leak(json!({"name": "second"})).await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    assert!(res.maybe_header("idempotent-replayed").is_none());
+                    assert_ne!(res.json::<Value>()["secret"], json!(secret));
+
+                    // The same for the webhook's signing secret, answered once on create.
+                    let res = req(&s, Method::PUT, "/v1/team/webhook", &owner)
+                        .add_header("authorization", format!("Bearer {cm}"))
+                        .add_header("idempotency-key", "leak-2")
+                        .json(&json!({"url": "https://hook.example/events"}))
+                        .await;
+                    assert_eq!(res.status_code(), 201, "{}", res.text());
+                    assert!(res.json::<Value>()["secret"].is_string());
+                    let res = bearer(&s, Method::GET, "/v1/idempotency/leak-2", &cm).await;
+                    assert_eq!(res.status_code(), 404);
+                    res.assert_json(&json!({"error": "not_found"}));
+
+                    // No key row at all was written: nothing is left to read if the layer changes.
+                    let row = db
+                        .query_one_raw(Statement::from_string(
+                            DbBackend::Postgres,
+                            "SELECT count(*) AS n FROM idempotency_keys \
+                             WHERE key IN ('leak-1', 'leak-2')",
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
                 }
 
                 /// A route that answers `status` and counts its runs, behind the middleware.
