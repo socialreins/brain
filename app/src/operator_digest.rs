@@ -65,6 +65,9 @@ struct Facts {
     x_paused: i64,
     /// Sign-in mails (links, no-account notices) that could not be sent (`mail::SIGNIN_FAILED`).
     signin_failed: i64,
+    /// Refunds and disputes of credit packs in the window, the credits taken back and the credits
+    /// that were already spent (`credit_takebacks`).
+    takebacks: (i64, i64, i64),
     backup: Backup,
 }
 
@@ -90,6 +93,7 @@ impl Facts {
             || self.reconnect > 0
             || self.x_paused > 0
             || self.signin_failed > 0
+            || self.takebacks.0 > 0
             || self.backup_bad()
     }
 }
@@ -229,6 +233,22 @@ async fn collect(app: &AppState, from: DateTime<Utc>, now: DateTime<Utc>) -> Res
     .await?;
     let signin_failed =
         rate_limit::count_since(db, crate::mail::SIGNIN_FAILED, (from, now)).await?;
+    let row = db
+        .query_one_raw(sql(
+            "SELECT count(*) AS n, COALESCE(sum(taken), 0)::bigint AS taken, \
+             COALESCE(sum(owed - taken), 0)::bigint AS short FROM credit_takebacks \
+             WHERE created_at >= $1 AND created_at < $2",
+            vec![from.into(), now.into()],
+        ))
+        .await?;
+    let takebacks = match row {
+        Some(r) => (
+            r.try_get("", "n")?,
+            r.try_get("", "taken")?,
+            r.try_get("", "short")?,
+        ),
+        None => (0, 0, 0),
+    };
     Ok(Facts {
         counts,
         reasons,
@@ -237,6 +257,7 @@ async fn collect(app: &AppState, from: DateTime<Utc>, now: DateTime<Utc>) -> Res
         reconnect,
         x_paused,
         signin_failed,
+        takebacks,
         backup: backup(app, now).await,
     })
 }
@@ -416,11 +437,18 @@ fn compose(facts: &Facts, day: &str) -> (String, String) {
     lines.push(format!("Accounts to reconnect: {}", facts.reconnect));
     lines.push(format!("X inboxes paused after errors: {}", facts.x_paused));
     lines.push(format!("Sign-in mails failed ({})", facts.signin_failed));
+    let (n, taken, short) = facts.takebacks;
+    lines.push(format!(
+        "Credit pack refunds or disputes: {n} ({taken} credits taken back, {short} already spent)"
+    ));
     lines.push(backup);
     let total = failed + partial + late + repeat;
     let mut flags = Vec::new();
     if total > 0 {
         flags.push(plural(total, "post", "posts") + " not out");
+    }
+    if facts.takebacks.0 > 0 {
+        flags.push(plural(facts.takebacks.0, "take-back", "take-backs"));
     }
     if facts.stuck > 0 {
         flags.push(format!("{} stuck", facts.stuck));
@@ -484,6 +512,7 @@ mod tests {
             reconnect: 2,
             x_paused: 0,
             signin_failed: 3,
+            takebacks: (0, 0, 0),
             backup: Backup::Age(Duration::minutes(200)),
         };
         facts.counts.insert(("failed".into(), "x".into()), 2);
@@ -512,5 +541,25 @@ mod tests {
         assert!(compose(&facts, "d").1.contains("STALE"));
         facts.backup = Backup::Unreadable;
         assert!(compose(&facts, "d").1.contains("could not be read"));
+        // A take-back alone is worth a mail, and says how much was already spent.
+        let quiet = Facts {
+            counts: BTreeMap::new(),
+            reasons: vec![],
+            teams: BTreeMap::new(),
+            stuck: 0,
+            reconnect: 0,
+            x_paused: 0,
+            signin_failed: 0,
+            takebacks: (2, 130, 70),
+            backup: Backup::Age(Duration::minutes(10)),
+        };
+        let (subject, text) = compose(&quiet, "2026-11-27");
+        assert_eq!(subject, "SocialReins digest 2026-11-27: 2 take-backs");
+        assert!(
+            text.contains(
+                "Credit pack refunds or disputes: 2 (130 credits taken back, 70 already spent)"
+            ),
+            "{text}"
+        );
     }
 }
