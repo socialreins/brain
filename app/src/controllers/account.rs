@@ -255,6 +255,7 @@ pub const NOT_EXPORTED: &[&str] = &[
     "oauth_states",
     "post_metrics",
     "post_notices",
+    "saved_views",
     "subscribers",
     "team_ai_keys",
     "team_invitations",

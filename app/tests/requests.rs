@@ -24553,6 +24553,573 @@ mod teams {
             }
         }
 
+        /// Saved views (`/v1/views`) and the Comments filters of the item list and count.
+        mod comments_api {
+            use super::*;
+            use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+            fn code(team: &Value) -> String {
+                team["code"].as_str().unwrap().to_owned()
+            }
+
+            fn call(
+                s: &TestServer,
+                method: Method,
+                path: &str,
+                cookie: &str,
+                team: &str,
+            ) -> TestRequest {
+                req(s, method, path, cookie).add_header("x-team", team.to_owned())
+            }
+
+            async fn make(s: &TestServer, cookie: &str, team: &str, body: Value) -> Value {
+                let res = call(s, Method::POST, "/v1/views", cookie, team)
+                    .json(&body)
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                res.json()
+            }
+
+            async fn views(s: &TestServer, cookie: &str, team: &str, scope: &str) -> Vec<Value> {
+                let res = call(
+                    s,
+                    Method::GET,
+                    &format!("/v1/views?scope={scope}"),
+                    cookie,
+                    team,
+                )
+                .await;
+                res.assert_status_ok();
+                res.json::<Value>().as_array().unwrap().clone()
+            }
+
+            fn names(list: &[Value]) -> Vec<&str> {
+                list.iter().map(|v| v["name"].as_str().unwrap()).collect()
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn views_are_saved_listed_changed_and_deleted_by_their_owner() {
+                let (s, db) = server_where(|_| {}).await;
+                let (_, a, _) = user(&s, &db).await;
+                let team = code(&current(&s, &a).await);
+                let v = make(
+                    &s,
+                    &a,
+                    &team,
+                    json!({"scope": "comments", "name": "  X unanswered ",
+                    "filters": {"network": "x", "unanswered": "1"}}),
+                )
+                .await;
+                assert_eq!(v["name"], "X unanswered");
+                assert_eq!(v["is_default"], false);
+                assert_eq!(v["filters"], json!({"network": "x", "unanswered": "1"}));
+                let id = v["id"].as_str().unwrap();
+
+                // The same name in another case is taken; another page is a separate list.
+                let dup = call(&s, Method::POST, "/v1/views", &a, &team)
+                    .json(&json!({"scope": "comments", "name": "x UNANSWERED", "filters": {}}))
+                    .await;
+                assert_eq!(dup.status_code(), 409);
+                dup.assert_json(&json!({"error": "name_taken"}));
+                make(
+                    &s,
+                    &a,
+                    &team,
+                    json!({"scope": "inbox", "name": "x unanswered"}),
+                )
+                .await;
+                assert_eq!(
+                    names(&views(&s, &a, &team, "comments").await),
+                    ["X unanswered"]
+                );
+
+                for bad in [
+                    json!({"scope": "comments", "name": "", "filters": {}}),
+                    json!({"scope": "comments", "name": "   ", "filters": {}}),
+                    json!({"scope": "comments", "name": "n".repeat(61), "filters": {}}),
+                    json!({"scope": "posts", "name": "n", "filters": {}}),
+                    json!({"scope": "comments", "name": "n", "filters": []}),
+                    json!({"scope": "comments", "name": "n", "filters": {"a": 1}}),
+                    json!({"scope": "comments", "name": "n", "filters": {"Net": "x"}}),
+                    json!({"scope": "comments", "name": "n", "filters": {"a": "v".repeat(601)}}),
+                    json!({"scope": "comments", "name": "n", "extra": true}),
+                ] {
+                    let res = call(&s, Method::POST, "/v1/views", &a, &team)
+                        .json(&bad)
+                        .await;
+                    assert_eq!(res.status_code(), 422, "{bad}");
+                }
+                let res = call(&s, Method::GET, "/v1/views?scope=nope", &a, &team).await;
+                assert_eq!(res.status_code(), 422);
+
+                let renamed = call(&s, Method::PUT, &format!("/v1/views/{id}"), &a, &team)
+                    .json(&json!({"name": "Needs an answer", "filters": {"network": "bluesky"}}))
+                    .await;
+                renamed.assert_status_ok();
+                let r: Value = renamed.json();
+                assert_eq!(
+                    (r["name"].as_str(), &r["filters"]),
+                    (Some("Needs an answer"), &json!({"network": "bluesky"}))
+                );
+                // A change that names nothing keeps everything.
+                let same = call(&s, Method::PUT, &format!("/v1/views/{id}"), &a, &team)
+                    .json(&json!({}))
+                    .await;
+                assert_eq!(same.json::<Value>()["name"], "Needs an answer");
+
+                let gone = call(&s, Method::DELETE, &format!("/v1/views/{id}"), &a, &team).await;
+                assert_eq!(gone.status_code(), 204);
+                let again = call(&s, Method::DELETE, &format!("/v1/views/{id}"), &a, &team).await;
+                assert_eq!(again.status_code(), 404);
+                let odd = call(&s, Method::DELETE, "/v1/views/not-an-id", &a, &team).await;
+                assert_eq!(odd.status_code(), 404);
+                assert!(views(&s, &a, &team, "comments").await.is_empty());
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn one_view_per_page_is_the_default_and_clearing_it_keeps_the_view() {
+                let (s, db) = server_where(|_| {}).await;
+                let (_, a, _) = user(&s, &db).await;
+                let team = code(&current(&s, &a).await);
+                let one = make(
+                    &s,
+                    &a,
+                    &team,
+                    json!({"scope": "comments", "name": "Beta", "is_default": true}),
+                )
+                .await;
+                assert_eq!(one["is_default"], true);
+                let other = make(
+                    &s,
+                    &a,
+                    &team,
+                    json!({"scope": "inbox", "name": "Inbox default", "is_default": true}),
+                )
+                .await;
+                let two = make(
+                    &s,
+                    &a,
+                    &team,
+                    json!({"scope": "comments", "name": "Alpha", "is_default": true}),
+                )
+                .await;
+                let list = views(&s, &a, &team, "comments").await;
+                // The default is listed first, then by name; the first one lost its mark.
+                assert_eq!(names(&list), ["Alpha", "Beta"]);
+                assert_eq!(
+                    (list[0]["is_default"].clone(), list[1]["is_default"].clone()),
+                    (json!(true), json!(false))
+                );
+                // The inbox page has its own default.
+                assert_eq!(views(&s, &a, &team, "inbox").await[0]["id"], other["id"]);
+
+                let id = two["id"].as_str().unwrap();
+                let cleared = call(&s, Method::PUT, &format!("/v1/views/{id}"), &a, &team)
+                    .json(&json!({"is_default": false}))
+                    .await;
+                assert_eq!(cleared.json::<Value>()["is_default"], false);
+                let list = views(&s, &a, &team, "comments").await;
+                assert_eq!(names(&list), ["Alpha", "Beta"]);
+                assert!(list.iter().all(|v| v["is_default"] == false));
+                // Making the first one the default again takes it from nobody.
+                let b = one["id"].as_str().unwrap();
+                call(&s, Method::PUT, &format!("/v1/views/{b}"), &a, &team)
+                    .json(&json!({"is_default": true}))
+                    .await
+                    .assert_status_ok();
+                assert_eq!(
+                    names(&views(&s, &a, &team, "comments").await),
+                    ["Beta", "Alpha"]
+                );
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn views_belong_to_their_person_in_their_team() {
+                let (s, db) = server_where(|_| {}).await;
+                let (_, a, _) = user(&s, &db).await;
+                let team = current(&s, &a).await;
+                let (tid, tcode) = (team["id"].as_str().unwrap().to_owned(), code(&team));
+                let (m, _) = joined(&s, &db, &tid, "member").await;
+                let (_, c, _) = user(&s, &db).await;
+                let other = code(&current(&s, &c).await);
+                let mine = make(
+                    &s,
+                    &a,
+                    &tcode,
+                    json!({"scope": "comments", "name": "Mine", "filters": {"q": "refund"}}),
+                )
+                .await;
+                let id = mine["id"].as_str().unwrap();
+
+                // A teammate sees none of it, may use the same name, and cannot change or delete it.
+                assert!(views(&s, &m, &tcode, "comments").await.is_empty());
+                make(&s, &m, &tcode, json!({"scope": "comments", "name": "Mine"})).await;
+                // Someone from another team, naming their own team or yours, gets 404 and no data.
+                for (who, team) in [(&m, &tcode), (&c, &other), (&c, &tcode)] {
+                    let put = call(&s, Method::PUT, &format!("/v1/views/{id}"), who, team)
+                        .json(&json!({"name": "Hijacked"}))
+                        .await;
+                    let del = call(&s, Method::DELETE, &format!("/v1/views/{id}"), who, team).await;
+                    assert_eq!(
+                        (put.status_code().as_u16(), del.status_code().as_u16()),
+                        (404, 404),
+                        "{team}"
+                    );
+                }
+                assert!(views(&s, &c, &other, "comments").await.is_empty());
+                let list = views(&s, &a, &tcode, "comments").await;
+                assert_eq!(
+                    (names(&list), &list[0]["filters"]),
+                    (vec!["Mine"], &json!({"q": "refund"}))
+                );
+                // Signed out is refused.
+                assert_eq!(s.get("/v1/views?scope=comments").await.status_code(), 401);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_person_keeps_at_most_twenty_views_per_page() {
+                let (s, db) = server_where(|_| {}).await;
+                let (_, a, _) = user(&s, &db).await;
+                let team = code(&current(&s, &a).await);
+                for n in 0..20 {
+                    make(
+                        &s,
+                        &a,
+                        &team,
+                        json!({"scope": "comments", "name": format!("view {n}")}),
+                    )
+                    .await;
+                }
+                let res = call(&s, Method::POST, "/v1/views", &a, &team)
+                    .json(&json!({"scope": "comments", "name": "one more"}))
+                    .await;
+                assert_eq!(res.status_code(), 409);
+                res.assert_json(&json!({"error": "too_many_views"}));
+                // The other page has its own twenty.
+                make(&s, &a, &team, json!({"scope": "inbox", "name": "one more"})).await;
+            }
+
+            async fn exec(db: &DatabaseConnection, sql: &str) {
+                db.execute_unprepared(sql).await.unwrap();
+            }
+
+            async fn account(db: &DatabaseConnection, team: &str, provider: &str) -> String {
+                let id = uuid::Uuid::now_v7();
+                exec(db, &format!(
+                    "INSERT INTO social_accounts (id, team_id, provider, external_id, access_token) \
+                     VALUES ('{id}', '{team}', '{provider}', 'ext-{id}', decode('00', 'hex'))")).await;
+                id.to_string()
+            }
+
+            /// One item of `kind` received `ago` ago; `extra` are more columns as `name = value` pairs.
+            async fn item(
+                db: &DatabaseConnection,
+                team: &str,
+                account: &str,
+                platform: &str,
+                kind: &str,
+                ago: &str,
+                extra: &[(&str, &str)],
+            ) -> String {
+                let id = uuid::Uuid::now_v7();
+                let cols: String = extra.iter().map(|(c, _)| format!(", {c}")).collect();
+                let vals: String = extra.iter().map(|(_, v)| format!(", {v}")).collect();
+                exec(db, &format!(
+                    "INSERT INTO inbox_items (id, team_id, social_account_id, platform, kind, remote_id, \
+                     author_id, text, received_at{cols}) VALUES ('{id}', '{team}', '{account}', \
+                     '{platform}', '{kind}', 'r-{id}', 'a', '{kind} {id}', now() - interval '{ago}'{vals})")).await;
+                id.to_string()
+            }
+
+            async fn list_of(
+                s: &TestServer,
+                cookie: &str,
+                team: &str,
+                inbox: &str,
+                path: &str,
+                query: &str,
+            ) -> Value {
+                let res = call(
+                    s,
+                    Method::GET,
+                    &format!("/v1/inboxes/{inbox}/{path}?{query}"),
+                    cookie,
+                    team,
+                )
+                .await;
+                assert_eq!(res.status_code(), 200, "{query}: {}", res.text());
+                res.json()
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn comments_are_the_all_inboxs_comments_and_mentions_under_the_filters_sent() {
+                let (s, db) = server_where(|_| {}).await;
+                let (_, cookie, _) = user(&s, &db).await;
+                let t = current(&s, &cookie).await;
+                let (team, tcode) = (t["id"].as_str().unwrap().to_owned(), code(&t));
+                let set: uuid::Uuid = db
+                    .query_one_raw(Statement::from_string(
+                        DbBackend::Postgres,
+                        format!("SELECT id FROM social_sets WHERE team_id = '{team}' LIMIT 1"),
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .try_get("", "id")
+                    .unwrap();
+                let (bsky, fb, yt) = (
+                    account(&db, &team, "bluesky").await,
+                    account(&db, &team, "facebook").await,
+                    account(&db, &team, "youtube").await,
+                );
+                let post = uuid::Uuid::now_v7();
+                exec(
+                    &db,
+                    &format!(
+                        "INSERT INTO posts (id, team_id, social_set_id, platform, body, status) \
+                    VALUES ('{post}', '{team}', '{set}', 'bluesky', 'hello', 'published')"
+                    ),
+                )
+                .await;
+                let post = post.to_string();
+
+                let comment = item(
+                    &db,
+                    &team,
+                    &bsky,
+                    "bluesky",
+                    "comment",
+                    "1 hour",
+                    &[("post_id", &format!("'{post}'"))],
+                )
+                .await;
+                let mention = item(&db, &team, &bsky, "bluesky", "mention", "2 hours", &[]).await;
+                let dm = item(&db, &team, &bsky, "bluesky", "dm", "3 hours", &[]).await;
+                let hidden = item(
+                    &db,
+                    &team,
+                    &fb,
+                    "facebook",
+                    "comment",
+                    "4 hours",
+                    &[("moderation", "'{\"hidden\": true}'")],
+                )
+                .await;
+                let held = item(
+                    &db,
+                    &team,
+                    &yt,
+                    "youtube",
+                    "comment",
+                    "5 hours",
+                    &[("moderation", "'{\"held\": true}'")],
+                )
+                .await;
+                let answered = item(
+                    &db,
+                    &team,
+                    &fb,
+                    "facebook",
+                    "comment",
+                    "6 hours",
+                    &[("replied_at", "now()")],
+                )
+                .await;
+                let old = item(&db, &team, &bsky, "bluesky", "comment", "72 hours", &[]).await;
+                let follow = item(
+                    &db,
+                    &team,
+                    &bsky,
+                    "bluesky",
+                    "follow",
+                    "7 hours",
+                    &[("state", "'done'")],
+                )
+                .await;
+
+                // Another team's comment is never in this team's list, whatever account it names.
+                let (_, other_cookie, _) = user(&s, &db).await;
+                let o = current(&s, &other_cookie).await;
+                let (oteam, ocode) = (o["id"].as_str().unwrap().to_owned(), code(&o));
+                let theirs = account(&db, &oteam, "bluesky").await;
+                item(&db, &oteam, &theirs, "bluesky", "comment", "1 hour", &[]).await;
+
+                let all = {
+                    let res = call(&s, Method::GET, "/v1/inboxes", &cookie, &tcode).await;
+                    res.assert_status_ok();
+                    res.json::<Value>()[0].clone()
+                };
+                let inbox = all["id"].as_str().unwrap();
+                // The badges: DMs and comments are counted apart, the total is as before (no follow, the answered comment is still open).
+                assert_eq!(
+                    (
+                        all["open_count"].clone(),
+                        all["open_dm_count"].clone(),
+                        all["open_comment_count"].clone()
+                    ),
+                    (json!(7), json!(1), json!(6))
+                );
+
+                let ids = |v: &Value| -> Vec<String> {
+                    v["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|i| i["id"].as_str().unwrap().to_owned())
+                        .collect()
+                };
+                let check = |name: &str, query: &str, want: Vec<&String>| {
+                    let (s, cookie, tcode, query, name) =
+                        (&s, &cookie, &tcode, query.to_owned(), name.to_owned());
+                    let want: Vec<String> = want.into_iter().cloned().collect();
+                    async move {
+                        let page = list_of(s, cookie, tcode, inbox, "items", &query).await;
+                        assert_eq!(ids(&page), want, "{name}: {query}");
+                        // The count says the same as the list, for every filter.
+                        let n = list_of(s, cookie, tcode, inbox, "count", &query).await;
+                        assert_eq!(n["count"], want.len(), "{name}: count {query}");
+                    }
+                };
+                check(
+                    "comments and mentions, newest first",
+                    "kind=comments",
+                    vec![&comment, &mention, &hidden, &held, &answered, &old],
+                )
+                .await;
+                check("one kind still works", "kind=mention", vec![&mention]).await;
+                check("DMs", "kind=dm", vec![&dm]).await;
+                check("activity", "kind=activity", vec![&follow]).await;
+                check(
+                    "accounts",
+                    &format!("kind=comments&account_ids={bsky},{yt}"),
+                    vec![&comment, &mention, &held, &old],
+                )
+                .await;
+                check(
+                    "accounts and the single account together",
+                    &format!("kind=comments&account_ids={bsky},{fb}&account_id={fb}"),
+                    vec![&hidden, &answered],
+                )
+                .await;
+                check(
+                    "networks",
+                    "kind=comments&platforms=facebook,youtube",
+                    vec![&hidden, &held, &answered],
+                )
+                .await;
+                check(
+                    "a post",
+                    &format!("kind=comments&post_id={post}"),
+                    vec![&comment],
+                )
+                .await;
+                check(
+                    "hidden or held",
+                    "kind=comments&hidden=true",
+                    vec![&hidden, &held],
+                )
+                .await;
+                check(
+                    "unanswered",
+                    "kind=comments&unanswered=true",
+                    vec![&comment, &mention, &hidden, &held, &old],
+                )
+                .await;
+                check(
+                    "answered",
+                    "kind=comments&unanswered=false",
+                    vec![&answered],
+                )
+                .await;
+                check(
+                    "hidden=false and an empty list are no filter",
+                    "kind=comments&hidden=false&platforms=",
+                    vec![&comment, &mention, &hidden, &held, &answered, &old],
+                )
+                .await;
+                let from = (chrono::Utc::now() - chrono::Duration::hours(24))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                let to = (chrono::Utc::now()
+                    - chrono::Duration::hours(3)
+                    - chrono::Duration::minutes(30))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                check(
+                    "a date range",
+                    &format!("kind=comments&from={from}&to={to}"),
+                    vec![&hidden, &held, &answered],
+                )
+                .await;
+                check(
+                    "another team's account finds nothing here",
+                    &format!("kind=comments&account_ids={theirs}"),
+                    vec![],
+                )
+                .await;
+                // The other team sees only its own.
+                let oall = call(&s, Method::GET, "/v1/inboxes", &other_cookie, &ocode)
+                    .await
+                    .json::<Value>()[0]
+                    .clone();
+                assert_eq!(oall["open_comment_count"], 1);
+                // Another team's inbox id is not found.
+                let nf = call(
+                    &s,
+                    Method::GET,
+                    &format!("/v1/inboxes/{inbox}/count?kind=comments"),
+                    &other_cookie,
+                    &ocode,
+                )
+                .await;
+                assert_eq!(nf.status_code(), 404);
+                // Malformed lists are refused, not ignored.
+                for bad in [
+                    "account_ids=nope",
+                    "platforms=myspace",
+                    "from=yesterday",
+                    "post_id=1",
+                    "hidden=maybe",
+                    "kind=comment,mention",
+                ] {
+                    for path in ["items", "count"] {
+                        let res = call(
+                            &s,
+                            Method::GET,
+                            &format!("/v1/inboxes/{inbox}/{path}?{bad}"),
+                            &cookie,
+                            &tcode,
+                        )
+                        .await;
+                        assert_eq!(res.status_code(), 422, "{path}?{bad}");
+                    }
+                }
+                let nine = ["x"; 9].join(",");
+                let res = call(
+                    &s,
+                    Method::GET,
+                    &format!("/v1/inboxes/{inbox}/count?platforms={nine}"),
+                    &cookie,
+                    &tcode,
+                )
+                .await;
+                assert_eq!(res.status_code(), 422);
+                let many = vec![uuid::Uuid::nil().to_string(); 101].join(",");
+                let res = call(
+                    &s,
+                    Method::GET,
+                    &format!("/v1/inboxes/{inbox}/count?account_ids={many}"),
+                    &cookie,
+                    &tcode,
+                )
+                .await;
+                assert_eq!(res.status_code(), 422);
+            }
+        }
+
         /// `/v1/inboxes`, `/v1/inbox-items` and `/v1/automations`, with ingest driven directly
         /// against the mock (notifications, chat proxy, replies).
         mod inbox_api {

@@ -107,6 +107,7 @@ mod m20270121_000001_rate_limit_windows;
 mod m20270122_000001_idempotency_secret_rows;
 mod m20270123_000001_post_lease;
 mod m20270124_000001_post_events;
+mod m20270125_000001_saved_views;
 mod url_numbers;
 
 pub struct Migrator;
@@ -222,6 +223,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20270122_000001_idempotency_secret_rows::Migration),
             Box::new(m20270123_000001_post_lease::Migration),
             Box::new(m20270124_000001_post_events::Migration),
+            Box::new(m20270125_000001_saved_views::Migration),
             // inject-above (do not remove this comment)
         ]
     }

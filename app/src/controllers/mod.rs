@@ -46,6 +46,7 @@ pub mod threads;
 pub mod threads_webhook;
 pub mod tiktok;
 pub mod uploads;
+pub mod views;
 pub mod waitlist;
 pub mod webhooks;
 pub mod x;
@@ -150,6 +151,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(broadcasts::api().layer(DefaultBodyLimit::max(MAX_CONTACT_BODY_BYTES)))
         .merge(newsletters::api().layer(DefaultBodyLimit::max(MAX_NEWSLETTER_BODY_BYTES)))
         .merge(analytics::api())
+        .merge(views::api())
         // Two DM texts of 1000 graphemes can pass 4 KiB.
         .merge(automations::api().layer(DefaultBodyLimit::max(MAX_AUTOMATION_BODY_BYTES)))
 }
