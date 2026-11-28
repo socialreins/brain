@@ -265,6 +265,9 @@ pub struct ItemQuery {
     pub assigned: Option<String>,
     /// Only items of this account.
     pub account_id: Option<Uuid>,
+    /// Only items of this network, for example `bluesky`, `facebook`, `instagram`, `threads`,
+    /// `x` or `youtube`.
+    pub platform: Option<String>,
     /// `next_cursor` of the previous page.
     pub cursor: Option<Uuid>,
     /// 1 to 100, default 50.
@@ -1039,6 +1042,8 @@ pub struct Narrow<'a> {
     pub assigned: Option<Option<Uuid>>,
     /// Of this account.
     pub account: Option<Uuid>,
+    /// Of this network.
+    pub platform: Option<&'a str>,
     pub cursor: Option<Uuid>,
 }
 
@@ -1064,6 +1069,7 @@ pub fn items_sql(
         tag,
         assigned,
         account,
+        platform,
         cursor,
     } = *n;
     let mut values: Vec<Value> = vec![team_id.into()];
@@ -1082,6 +1088,10 @@ pub fn items_sql(
     if let Some(account) = account {
         values.push(account.into());
         scope += &format!(" AND i.social_account_id = ${}", values.len());
+    }
+    if let Some(platform) = platform {
+        values.push(platform.to_owned().into());
+        scope += &format!(" AND i.platform = ${}", values.len());
     }
     if let Some(tag) = tag {
         values.push(tag.to_owned().into());
@@ -1261,6 +1271,10 @@ async fn items(
     });
     let search = q.q.as_deref().map(str::trim);
     let search_ok = search.is_none_or(|s| (1..=100).contains(&s.chars().count()));
+    let platform_ok = q
+        .platform
+        .as_deref()
+        .is_none_or(|p| inbox::PLATFORMS.contains(&p));
     let tag = q.tag.as_deref().map(inbox::tag);
     let assigned = q.assigned.as_deref().map(|a| match a {
         "me" => Some(Some(t.current.0.id)),
@@ -1269,7 +1283,13 @@ async fn items(
     });
     let narrow_ok =
         tag.as_ref().is_none_or(Option::is_some) && assigned.is_none_or(|a| a.is_some());
-    if !state_ok || !kind_ok || !search_ok || !narrow_ok || !(1..=MAX_PAGE).contains(&limit) {
+    if !state_ok
+        || !kind_ok
+        || !search_ok
+        || !platform_ok
+        || !narrow_ok
+        || !(1..=MAX_PAGE).contains(&limit)
+    {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     }
     let (tag, assigned) = (tag.flatten(), assigned.flatten());
@@ -1290,6 +1310,7 @@ async fn items(
             tag: tag.as_deref(),
             assigned,
             account: q.account_id,
+            platform: q.platform.as_deref(),
             cursor: q.cursor,
         };
         let stmt = items_sql(
@@ -1957,6 +1978,32 @@ mod tests {
         assert!(
             stmt.sql
                 .contains(" AND i.kind NOT IN ('follow', 'like', 'repost') AND i.social_account_id = $2 ORDER BY"),
+            "{}",
+            stmt.sql
+        );
+        // One network, and one account of it.
+        let n = Narrow {
+            platform: Some("bluesky"),
+            ..Narrow::default()
+        };
+        let stmt = items_sql(team, None, &Filters::default(), &n, 10, false);
+        assert!(
+            stmt.sql.contains(
+                " AND i.kind NOT IN ('follow', 'like', 'repost') AND i.platform = $2 ORDER BY"
+            ),
+            "{}",
+            stmt.sql
+        );
+        assert_eq!(stmt.values.unwrap().0[1], Value::from("bluesky".to_owned()));
+        let n = Narrow {
+            account: Some(Uuid::nil()),
+            platform: Some("bluesky"),
+            ..Narrow::default()
+        };
+        let stmt = items_sql(team, None, &Filters::default(), &n, 10, false);
+        assert!(
+            stmt.sql
+                .contains(" AND i.social_account_id = $2 AND i.platform = $3 ORDER BY"),
             "{}",
             stmt.sql
         );
