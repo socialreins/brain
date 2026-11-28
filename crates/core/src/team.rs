@@ -116,6 +116,7 @@ pub const RESERVED_SLUGS: &[&str] = &[
     "feeds",
     "features",
     "google",
+    "guides",
     "health",
     "help",
     "home",
