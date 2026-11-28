@@ -60,7 +60,13 @@ cargo run -p socialreins-brain
   `group_id`, else its `id`), so a group has one page under one permanent `code`.
   `GET /v1/public/pages/{code}` takes no sign-in (`page_limiter`, per IP) and is a `404` until the
   page is enabled, the team has pages on and a post of the subject is `published`; never return
-  ids, errors, first comments or unpublished versions from it. `POST /v1/public/pages/{code}/report` ("Report this page") stores a `page_reports` row and mails `CONTACT_TO`: 5 an hour for an address (`429`); the daily caps (10 for an address, 20 for a page, 200 in all) only stop the mail, the report is always stored; Turnstile when on. An admin sets `post_pages.taken_down_at` (`PUT /v1/admin/pages/{code}/takedown`, `GET /v1/admin/page-reports`): the page answers `404` whatever the team's `enabled` says. Turnstile (when set) is also checked on invitations (`POST /v1/team/invitations`) and the newsletter subscribe form; invitations also have a daily cap per IP (60, counted only when the client address is known) and overall (2,000).
+  ids, errors, first comments or unpublished versions from it. `controllers/image.rs` serves
+  `GET /v1/public/image?url=<percent-encoded>`: a page's image fetched by brain
+  (`media::Media::public_image`, the download client's public https, `PublicOnly` and 3 redirects),
+  so the author's host sees brain, never the reader. A `image/*` by header and magic bytes else
+  `422`, 5 MB streamed (`413` past it), 8 seconds in all, no stored copy, no cookie or auth header
+  on the way out; `image_limiter` 120 a minute per IP, and the bytes served go to one info line,
+  never one a request. `POST /v1/public/pages/{code}/report` ("Report this page") stores a `page_reports` row and mails `CONTACT_TO`: 5 an hour for an address (`429`); the daily caps (10 for an address, 20 for a page, 200 in all) only stop the mail, the report is always stored; Turnstile when on. An admin sets `post_pages.taken_down_at` (`PUT /v1/admin/pages/{code}/takedown`, `GET /v1/admin/page-reports`): the page answers `404` whatever the team's `enabled` says. Turnstile (when set) is also checked on invitations (`POST /v1/team/invitations`) and the newsletter subscribe form; invitations also have a daily cap per IP (60, counted only when the client address is known) and overall (2,000).
 - `app/src/controllers/subscribers.rs`: newsletter sign-ups from public pages. `teams.newsletter`
   (`PATCH /v1/team`, owner or admin) puts an email box on live pages; `POST /v1/public/pages/{code}/subscribe`
   stores `subscribers (team_id, email)` unconfirmed and mails a link (once an hour per email, 20 a day per IP,

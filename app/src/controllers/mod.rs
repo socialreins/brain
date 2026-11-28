@@ -19,6 +19,7 @@ pub mod feeds;
 pub mod google;
 pub mod health;
 pub mod idempotency;
+pub mod image;
 pub mod inbox;
 pub mod inbox_actions;
 pub mod library;
@@ -131,6 +132,7 @@ fn api() -> OpenApiRouter<AppState> {
         .merge(posts::groups_api().layer(DefaultBodyLimit::max(MAX_GROUP_BODY_BYTES)))
         // 5000 characters of page details can pass 4 KiB.
         .merge(pages::api().layer(DefaultBodyLimit::max(MAX_GROUP_BODY_BYTES)))
+        .merge(image::api())
         .merge(subscribers::api())
         .merge(idempotency::api())
         .merge(lists::api())
