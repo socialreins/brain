@@ -65,6 +65,12 @@ pub struct Inbox {
     /// Its `open` items (follows left out); only in the list.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open_count: Option<i64>,
+    /// Of `open_count`, the DMs; only in the list. What the Inbox page badges, since it lists DMs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_dm_count: Option<i64>,
+    /// Of `open_count`, the comments and mentions; only in the list. What Comments badges.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_comment_count: Option<i64>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -260,7 +266,7 @@ pub struct Count {
 pub struct ItemQuery {
     /// `open` or `done`; both when absent.
     pub state: Option<String>,
-    /// `comment`, `mention`, `dm`, `follow`, `like`, `repost`, or `activity` (the last three), within
+    /// `comment`, `mention`, `comments` (both), `dm`, `follow`, `like`, `repost`, or `activity` (the last three), within
     /// the inbox's own filters; every kind but activity when absent.
     pub kind: Option<String>,
     /// Case-insensitive search in the text and the author's name and handle, 1 to 100
@@ -275,6 +281,21 @@ pub struct ItemQuery {
     /// Only items of this network, for example `bluesky`, `facebook`, `instagram`, `threads`,
     /// `x` or `youtube`.
     pub platform: Option<String>,
+    /// Only items of any of these accounts: up to 100 account ids, comma separated.
+    pub account_ids: Option<String>,
+    /// Only items of any of these networks, comma separated.
+    pub platforms: Option<String>,
+    /// Only comments and mentions on this post of ours (`post_id` of an item).
+    pub post_id: Option<Uuid>,
+    /// Only items received at or after this time (RFC 3339).
+    pub from: Option<DateTime<FixedOffset>>,
+    /// Only items received before this time (RFC 3339).
+    pub to: Option<DateTime<FixedOffset>>,
+    /// `true`: only Facebook and Instagram comments hidden, and YouTube comments held for review.
+    pub hidden: Option<bool>,
+    /// `true`: only items nobody has replied to from SocialReins (`replied_at` is null); `false`:
+    /// only items that have a reply.
+    pub unanswered: Option<bool>,
     /// `next_cursor` of the previous page.
     pub cursor: Option<Uuid>,
     /// 1 to 100, default 50.
@@ -290,7 +311,7 @@ pub struct ItemQuery {
 pub struct CountQuery {
     /// `open` or `done`; both when absent.
     pub state: Option<String>,
-    /// `comment`, `mention`, `dm`, `follow`, `like`, `repost`, or `activity` (the last three), within
+    /// `comment`, `mention`, `comments` (both), `dm`, `follow`, `like`, `repost`, or `activity` (the last three), within
     /// the inbox's own filters; every kind but activity when absent.
     pub kind: Option<String>,
     /// Case-insensitive search in the text and the author's name and handle, 1 to 100
@@ -305,6 +326,21 @@ pub struct CountQuery {
     /// Only items of this network, for example `bluesky`, `facebook`, `instagram`, `threads`,
     /// `x` or `youtube`.
     pub platform: Option<String>,
+    /// Only items of any of these accounts: up to 100 account ids, comma separated.
+    pub account_ids: Option<String>,
+    /// Only items of any of these networks, comma separated.
+    pub platforms: Option<String>,
+    /// Only comments and mentions on this post of ours (`post_id` of an item).
+    pub post_id: Option<Uuid>,
+    /// Only items received at or after this time (RFC 3339).
+    pub from: Option<DateTime<FixedOffset>>,
+    /// Only items received before this time (RFC 3339).
+    pub to: Option<DateTime<FixedOffset>>,
+    /// `true`: only Facebook and Instagram comments hidden, and YouTube comments held for review.
+    pub hidden: Option<bool>,
+    /// `true`: only items nobody has replied to from SocialReins (`replied_at` is null); `false`:
+    /// only items that have a reply.
+    pub unanswered: Option<bool>,
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -372,6 +408,8 @@ fn inbox_json(i: inboxes::Model, account_ids: Vec<Uuid>) -> Inbox {
         created_at: i.created_at,
         updated_at: i.updated_at,
         open_count: None,
+        open_dm_count: None,
+        open_comment_count: None,
     }
 }
 
@@ -842,9 +880,11 @@ pub fn open_counts_sql(team_id: Uuid, inboxes: &[(Option<Uuid>, Filters)]) -> St
         .iter()
         .enumerate()
         .map(|(n, (accounts, f))| {
+            let held = filter_sql(*accounts, f, &mut values);
             format!(
-                "COUNT(*) FILTER (WHERE TRUE{}) AS c{n}",
-                filter_sql(*accounts, f, &mut values)
+                "COUNT(*) FILTER (WHERE TRUE{held}) AS c{n}, \
+                 COUNT(*) FILTER (WHERE i.kind = 'dm'{held}) AS d{n}, \
+                 COUNT(*) FILTER (WHERE i.kind IN ('comment', 'mention'){held}) AS m{n}"
             )
         })
         .collect();
@@ -904,12 +944,14 @@ async fn list(State(app): State<AppState>, t: InTeam) -> Response {
         list.into_iter()
             .enumerate()
             .map(|(n, i)| {
-                let open = match &counts {
-                    Some(r) => r.try_get("", &format!("c{n}"))?,
-                    None => 0,
+                let get = |col: &str| match &counts {
+                    Some(r) => r.try_get("", &format!("{col}{n}")),
+                    None => Ok(0),
                 };
                 Ok(Inbox {
-                    open_count: Some(open),
+                    open_count: Some(get("c")?),
+                    open_dm_count: Some(get("d")?),
+                    open_comment_count: Some(get("m")?),
                     ..i
                 })
             })
@@ -1073,6 +1115,19 @@ pub struct Narrow<'a> {
     pub account: Option<Uuid>,
     /// Of this network.
     pub platform: Option<&'a str>,
+    /// Of any of these accounts (besides `account`).
+    pub accounts: &'a [Uuid],
+    /// Of any of these networks (besides `platform`).
+    pub platforms: &'a [String],
+    /// Under this post of ours.
+    pub post: Option<Uuid>,
+    /// Received at or after, and before.
+    pub from: Option<DateTime<FixedOffset>>,
+    pub to: Option<DateTime<FixedOffset>>,
+    /// Hidden on Facebook or Instagram, held on YouTube.
+    pub hidden: bool,
+    /// `Some(true)`: not replied to from SocialReins; `Some(false)`: replied to.
+    pub unanswered: Option<bool>,
     pub cursor: Option<Uuid>,
 }
 
@@ -1097,6 +1152,13 @@ fn narrow_sql(
         assigned,
         account,
         platform,
+        accounts,
+        platforms,
+        post,
+        from,
+        to,
+        hidden,
+        unanswered,
         cursor,
     } = *n;
     let mut scope = filter_sql(accounts_of, filters, values);
@@ -1104,6 +1166,8 @@ fn narrow_sql(
     let mut hit = String::from("TRUE");
     if kind == Some("activity") {
         scope += " AND i.kind IN ('follow', 'like', 'repost')";
+    } else if kind == Some("comments") {
+        scope += " AND i.kind IN ('comment', 'mention')";
     } else if let Some(kind) = kind {
         values.push(kind.to_owned().into());
         scope += &format!(" AND i.kind = ${}", values.len());
@@ -1117,6 +1181,34 @@ fn narrow_sql(
     if let Some(platform) = platform {
         values.push(platform.to_owned().into());
         scope += &format!(" AND i.platform = ${}", values.len());
+    }
+    if !accounts.is_empty() {
+        let p = inbox::placeholders(values, accounts.iter().map(|a| (*a).into()));
+        scope += &format!(" AND i.social_account_id IN ({p})");
+    }
+    if !platforms.is_empty() {
+        let p = inbox::placeholders(values, platforms.iter().map(|x| x.clone().into()));
+        scope += &format!(" AND i.platform IN ({p})");
+    }
+    if let Some(post) = post {
+        values.push(post.into());
+        scope += &format!(" AND i.post_id = ${}", values.len());
+    }
+    if let Some(from) = from {
+        values.push(from.into());
+        scope += &format!(" AND i.received_at >= ${}", values.len());
+    }
+    if let Some(to) = to {
+        values.push(to.into());
+        scope += &format!(" AND i.received_at < ${}", values.len());
+    }
+    if hidden {
+        scope += " AND (i.moderation->>'hidden' = 'true' OR i.moderation->>'held' = 'true')";
+    }
+    match unanswered {
+        Some(true) => scope += " AND i.replied_at IS NULL",
+        Some(false) => scope += " AND i.replied_at IS NOT NULL",
+        None => {}
     }
     if let Some(tag) = tag {
         values.push(tag.to_owned().into());
@@ -1308,6 +1400,39 @@ fn grouped_sql(scope: &str, rest: &str, hit: &str, limit: usize, state: Option<&
     )
 }
 
+/// The lists of a query, checked: `None` is the `422 invalid_query` reply. At most 100 account ids
+/// and every network known.
+struct Lists {
+    accounts: Vec<Uuid>,
+    platforms: Vec<String>,
+}
+
+fn lists(account_ids: Option<&str>, platforms: Option<&str>) -> Option<Lists> {
+    let parts = |t: Option<&str>| -> Vec<String> {
+        t.map(|t| {
+            t.split(',')
+                .map(str::trim)
+                .filter(|x| !x.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+    };
+    let accounts = parts(account_ids)
+        .iter()
+        .map(|a| a.parse().ok())
+        .collect::<Option<Vec<Uuid>>>()?;
+    let platforms = parts(platforms);
+    (accounts.len() <= 100
+        && platforms
+            .iter()
+            .all(|p| inbox::PLATFORMS.contains(&p.as_str())))
+    .then_some(Lists {
+        accounts,
+        platforms,
+    })
+}
+
 /// What a list or a count narrows by, checked; `None` is the `422 invalid_query` reply.
 /// `search` comes back trimmed, `tag` cleaned by `inbox::tag`, `assigned` resolved to the member
 /// asked for. `state`, `kind` and `platform` pass as they were sent once they hold their rules.
@@ -1328,7 +1453,8 @@ fn checked_narrow<'a>(
 ) -> Option<Narrowing<'a>> {
     let state_ok = state.is_none_or(|s| s == "open" || s == "done");
     let kind_ok = kind.is_none_or(|k| {
-        matches!(k, "comment" | "mention" | "dm" | "activity") || inbox::ACTIVITY.contains(&k)
+        matches!(k, "comment" | "mention" | "comments" | "dm" | "activity")
+            || inbox::ACTIVITY.contains(&k)
     });
     let search = search.map(str::trim);
     let search_ok = search.is_none_or(|s| (1..=100).contains(&s.chars().count()));
@@ -1382,6 +1508,9 @@ async fn items(
     if !(1..=MAX_PAGE).contains(&limit) {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     }
+    let Some(wide) = lists(q.account_ids.as_deref(), q.platforms.as_deref()) else {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
+    };
     let grouped = match q.group.as_deref() {
         None => false,
         Some("conversations") => true,
@@ -1400,6 +1529,13 @@ async fn items(
             assigned,
             account: q.account_id,
             platform: q.platform.as_deref(),
+            accounts: &wide.accounts,
+            platforms: &wide.platforms,
+            post: q.post_id,
+            from: q.from,
+            to: q.to,
+            hidden: q.hidden == Some(true),
+            unanswered: q.unanswered,
             cursor: q.cursor,
         };
         let stmt = items_sql(
@@ -1491,6 +1627,9 @@ async fn count(
     else {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     };
+    let Some(wide) = lists(q.account_ids.as_deref(), q.platforms.as_deref()) else {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
+    };
     let found = async {
         let Some(found) = find_inbox(&app.db, t.team.id, id).await? else {
             return Ok(None);
@@ -1504,6 +1643,13 @@ async fn count(
             assigned,
             account: q.account_id,
             platform: q.platform.as_deref(),
+            accounts: &wide.accounts,
+            platforms: &wide.platforms,
+            post: q.post_id,
+            from: q.from,
+            to: q.to,
+            hidden: q.hidden == Some(true),
+            unanswered: q.unanswered,
             cursor: None,
         };
         let stmt = count_sql(t.team.id, accounts_of(&found), &filters, &narrow);
@@ -2238,9 +2384,17 @@ mod tests {
         assert_eq!(
             stmt.sql,
             "SELECT COUNT(*) FILTER (WHERE TRUE) AS c0, \
+             COUNT(*) FILTER (WHERE i.kind = 'dm') AS d0, \
+             COUNT(*) FILTER (WHERE i.kind IN ('comment', 'mention')) AS m0, \
              COUNT(*) FILTER (WHERE TRUE AND EXISTS (SELECT 1 FROM inbox_accounts ia \
              WHERE ia.inbox_id = $2 AND ia.social_account_id = i.social_account_id) \
-             AND i.kind IN ($3)) AS c1 \
+             AND i.kind IN ($3)) AS c1, \
+             COUNT(*) FILTER (WHERE i.kind = 'dm' AND EXISTS (SELECT 1 FROM inbox_accounts ia \
+             WHERE ia.inbox_id = $2 AND ia.social_account_id = i.social_account_id) \
+             AND i.kind IN ($3)) AS d1, \
+             COUNT(*) FILTER (WHERE i.kind IN ('comment', 'mention') AND EXISTS (SELECT 1 \
+             FROM inbox_accounts ia WHERE ia.inbox_id = $2 \
+             AND ia.social_account_id = i.social_account_id) AND i.kind IN ($3)) AS m1 \
              FROM inbox_items i WHERE i.team_id = $1 AND i.state = 'open' AND i.kind NOT IN ('follow', 'like', 'repost')"
         );
     }
