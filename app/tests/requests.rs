@@ -23458,6 +23458,46 @@ mod teams {
                         assert!(contact["opted_out"].is_object());
                     }
 
+                    /// The list stops at the latest 200; the `x-total-count` header says how
+                    /// many there are in all, so a reader can tell what is not shown.
+                    #[tokio::test]
+                    #[serial]
+                    async fn the_capped_list_says_how_many_there_are_in_all() {
+                        let (s, db, _) = on_both().await;
+                        let t = team(&s, &db).await;
+                        // 205 drafts, a minute apart so the order is fixed.
+                        let insert = format!(
+                            "INSERT INTO broadcasts (id, team_id, name, text, tag, created_at) \
+                             SELECT gen_random_uuid(), '{}', 'B' || g, 'Hi', 'vip', \
+                             now() - g * interval '1 minute' FROM generate_series(1, 205) g",
+                            t.id
+                        );
+                        exec(&db, &insert).await;
+                        let res = s
+                            .get("/v1/broadcasts")
+                            .add_header("cookie", &t.cookie)
+                            .await;
+                        assert_eq!(res.status_code(), 200);
+                        let list = res.json::<Value>();
+                        assert_eq!(list.as_array().unwrap().len(), 200, "the cap holds");
+                        // Newest first (g=1 is a minute old, g=205 two hundred and five), so
+                        // what the cap leaves out is the oldest.
+                        assert_eq!(list[0]["name"], "B1");
+                        let names: Vec<&str> = list
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|b| b["name"].as_str().unwrap())
+                            .collect();
+                        assert!(!names.contains(&"B205"));
+                        assert_eq!(
+                            res.headers()
+                                .get("x-total-count")
+                                .and_then(|v| v.to_str().ok()),
+                            Some("205")
+                        );
+                    }
+
                     #[tokio::test]
                     #[serial]
                     async fn a_preview_counts_who_is_reachable_and_why_not() {
@@ -31857,6 +31897,42 @@ mod teams {
                     assert_eq!(mails_to(&seen, &lower, 2).await.len(), 2);
                 }
 
+                /// The list stops at the newest 5000 rows; `total` says how many there are in
+                /// all, so a reader can tell what is not shown.
+                #[tokio::test]
+                #[serial]
+                async fn the_capped_subscribers_list_says_how_many_there_are_in_all() {
+                    let (s, db, _) = with_mail(None).await;
+                    let (owner, team_id, _) = owner_with_account(&s, &db).await;
+                    assert_eq!(subscribers(&s, &owner).await.as_array().unwrap().len(), 0);
+                    let insert = format!(
+                        "INSERT INTO subscribers (id, team_id, email, created_at) \
+                         SELECT gen_random_uuid(), '{team_id}', \
+                         'nl-cap-' || g || '@x.test', now() - g * interval '1 minute' \
+                         FROM generate_series(1, 5001) g"
+                    );
+                    sql(&db, insert).await;
+                    let res = req(&s, Method::GET, "/v1/subscribers", &owner).await;
+                    res.assert_status_ok();
+                    let body = res.json::<Value>();
+                    assert_eq!(
+                        body["subscribers"].as_array().unwrap().len(),
+                        5000,
+                        "the cap holds"
+                    );
+                    assert_eq!(body["total"], 5001);
+                    // Newest first (g=1 is a minute old, g=5001 over three days), so what the
+                    // cap leaves out is the oldest.
+                    let emails: Vec<&str> = body["subscribers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|r| r["email"].as_str().unwrap())
+                        .collect();
+                    assert_eq!(emails[0], "nl-cap-1@x.test");
+                    assert!(!emails.contains(&"nl-cap-5001@x.test"));
+                }
+
                 #[tokio::test]
                 #[serial]
                 async fn a_mail_that_failed_does_not_block_the_next_sign_up() {
@@ -32410,6 +32486,44 @@ mod teams {
                         let schemas = &doc["components"]["schemas"];
                         assert!(schemas["Team"]["properties"]["newsletter_sender"].is_object());
                         assert!(schemas["Subscriber"]["properties"]["unsubscribed_at"].is_object());
+                    }
+
+                    /// The list stops at the latest 200; the `x-total-count` header says how
+                    /// many there are in all, so a reader can tell what is not shown.
+                    #[tokio::test]
+                    #[serial]
+                    async fn the_capped_list_says_how_many_there_are_in_all() {
+                        let b = brain().await;
+                        let s = &b.s;
+                        let (_, owner, _) = user(s, &b.db).await;
+                        let team = current(s, &owner).await["id"].as_str().unwrap().to_owned();
+                        // 202 drafts, a minute apart so the order is fixed.
+                        let insert = format!(
+                            "INSERT INTO newsletters (id, team_id, subject, body, created_at) \
+                             SELECT gen_random_uuid(), '{team}', 'N' || g, 'B', \
+                             now() - g * interval '1 minute' FROM generate_series(1, 202) g"
+                        );
+                        sql(&b.db, insert).await;
+                        let res = s.get("/v1/newsletters").add_header("cookie", &owner).await;
+                        assert_eq!(res.status_code(), 200);
+                        let list = res.json::<Value>();
+                        assert_eq!(list.as_array().unwrap().len(), 200, "the cap holds");
+                        // Newest first (g=1 is a minute old, g=202 over three hours), so what
+                        // the cap leaves out is the oldest.
+                        assert_eq!(list[0]["subject"], "N1");
+                        let subjects: Vec<&str> = list
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|n| n["subject"].as_str().unwrap())
+                            .collect();
+                        assert!(!subjects.contains(&"N202"));
+                        assert_eq!(
+                            res.headers()
+                                .get("x-total-count")
+                                .and_then(|v| v.to_str().ok()),
+                            Some("202")
+                        );
                     }
 
                     #[tokio::test]
@@ -42232,6 +42346,72 @@ mod waitlist_confirm {
         let only_no = list("?verified=false").await.json::<Value>();
         assert!(emails(&only_no).contains(&no) && !emails(&only_no).contains(&yes));
         assert_eq!(list("?verified=maybe").await.status_code(), 422);
+    }
+
+    /// The table stops at 1000 rows; `matched` says what the filters and the search find in
+    /// all, so a reader can tell what is not shown.
+    #[tokio::test]
+    #[serial]
+    async fn the_capped_list_says_what_it_leaves_out() {
+        let (s, db, _, _) = app().await;
+        // 1002 signups, a minute apart so the order is fixed; none verified. A per-run salt:
+        // the table is shared, so an earlier run's rows are still in it.
+        let salt = &uuid::Uuid::now_v7().simple().to_string()[..8];
+        let insert = format!(
+            "INSERT INTO waitlist_signups (id, email, source, created_at) \
+             SELECT gen_random_uuid(), 'wl-cap-{salt}-' || g || '@x.test', 'web', \
+             now() - g * interval '1 minute' FROM generate_series(1, 1002) g"
+        );
+        db.execute_unprepared(&insert).await.unwrap();
+        let in_all = waitlist_signups::Entity::find().count(&db).await.unwrap();
+        let unverified = waitlist_signups::Entity::find()
+            .filter(waitlist_signups::Column::VerifiedAt.is_null())
+            .count(&db)
+            .await
+            .unwrap();
+        assert!(in_all >= 1002 && unverified >= 1002, "the rows are there");
+        let admin = signed_in(&s, &db, ADMIN).await;
+        let res = s
+            .get("/v1/admin/waitlist")
+            .add_header("cookie", &admin)
+            .await;
+        let body = res.json::<Value>();
+        assert_eq!(
+            body["signups"].as_array().unwrap().len(),
+            1000,
+            "the cap holds"
+        );
+        assert_eq!(body["total"], in_all);
+        assert_eq!(body["matched"], in_all, "no filter matches everything");
+
+        // `matched` follows the filters and the search; `total` never does.
+        let res = s
+            .get("/v1/admin/waitlist?verified=false")
+            .add_header("cookie", &admin)
+            .await;
+        let body = res.json::<Value>();
+        assert_eq!(body["total"], in_all);
+        assert_eq!(body["matched"], unverified);
+        assert_eq!(
+            body["signups"].as_array().unwrap().len(),
+            1000,
+            "the cap holds here too"
+        );
+        let res = s
+            .get(&format!("/v1/admin/waitlist?q=wl-cap-{salt}-1001@"))
+            .add_header("cookie", &admin)
+            .await;
+        let body = res.json::<Value>();
+        assert_eq!(body["total"], in_all);
+        assert_eq!(body["matched"], 1);
+        assert_eq!(body["signups"].as_array().unwrap().len(), 1);
+
+        // Clean up: the table is shared, and other tests read what is in it (a row backdated
+        // by weeks must stay within the newest 1000 for them to be found). Every row of this
+        // prefix is an earlier run of this test, so all of them go.
+        db.execute_unprepared("DELETE FROM waitlist_signups WHERE email LIKE 'wl-cap-%'")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

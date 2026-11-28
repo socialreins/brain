@@ -165,10 +165,13 @@ async fn refused(app: &AppState, team: Uuid, id: Uuid, code: &str) -> Response {
     }
 }
 
-/// The team's newsletters, newest first (the latest 200). Owners and admins.
+/// The team's newsletters, newest first (the latest 200). Owners and admins. The
+/// `x-total-count` header says how many there are in all, so a reader can tell what the cap
+/// leaves out.
 #[utoipa::path(get, path = "/newsletters", tag = "newsletters",
-    responses((status = 200, body = [Newsletter]), (status = 401, body = Error),
-        (status = 403, body = Error)))]
+    responses((status = 200, body = [Newsletter],
+        headers(("x-total-count" = u64, description = "Every newsletter of the team, whether shown or not."))),
+        (status = 401, body = Error), (status = 403, body = Error)))]
 async fn list(State(app): State<AppState>, t: InTeam) -> Response {
     if !t.role.manages() {
         return forbidden();
@@ -179,12 +182,27 @@ async fn list(State(app): State<AppState>, t: InTeam) -> Response {
             .db
             .query_all_raw(stmt(&sql, vec![t.team.id.into(), LIST.into()]))
             .await?;
-        rows.iter()
+        let list = rows
+            .iter()
             .map(newsletter_json)
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<Result<Vec<_>, _>>()?;
+        let row = app
+            .db
+            .query_one_raw(stmt(
+                "SELECT count(*) AS total FROM newsletters WHERE team_id = $1",
+                vec![t.team.id.into()],
+            ))
+            .await?;
+        let total: i64 = row
+            .map(|r| r.try_get("", "total"))
+            .transpose()?
+            .unwrap_or(0);
+        Ok::<_, DbErr>((list, total))
     };
     match found.await {
-        Ok(list) => Json(list).into_response(),
+        // A header, not a field: the body stays the array it always was, so a web app that
+        // does not know it yet keeps working.
+        Ok((list, total)) => ([("x-total-count", total.to_string())], Json(list)).into_response(),
         Err(e) => internal(e, "newsletter list"),
     }
 }

@@ -14,8 +14,8 @@ use axum::{
 };
 use chrono::{DateTime, FixedOffset};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
-    Statement,
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Statement,
 };
 use serde::{Deserialize, Serialize};
 use socialreins_core::{email, token};
@@ -78,6 +78,9 @@ pub struct Subscriber {
 pub struct Subscribers {
     /// Newest first, at most 5000.
     pub subscribers: Vec<Subscriber>,
+    /// Every sign-up of the team, whether shown or not: the list stops at the newest 5000
+    /// (`LIST_LIMIT`), so this says what that leaves out.
+    pub total: u64,
 }
 
 fn reply(status: StatusCode, code: &str) -> Response {
@@ -339,15 +342,22 @@ async fn list(State(app): State<AppState>, t: InTeam) -> Response {
     if !t.role.manages() {
         return reply(StatusCode::FORBIDDEN, "forbidden");
     }
-    let rows = subscribers::Entity::find()
-        .filter(subscribers::Column::TeamId.eq(t.team.id))
-        .order_by_desc(subscribers::Column::CreatedAt)
-        .order_by_desc(subscribers::Column::Id)
-        .limit(LIST_LIMIT)
-        .all(&app.db)
-        .await;
-    match rows {
-        Ok(rows) => Json(Subscribers {
+    let found = async {
+        let total = subscribers::Entity::find()
+            .filter(subscribers::Column::TeamId.eq(t.team.id))
+            .count(&app.db)
+            .await?;
+        let rows = subscribers::Entity::find()
+            .filter(subscribers::Column::TeamId.eq(t.team.id))
+            .order_by_desc(subscribers::Column::CreatedAt)
+            .order_by_desc(subscribers::Column::Id)
+            .limit(LIST_LIMIT)
+            .all(&app.db)
+            .await?;
+        Ok::<_, sea_orm::DbErr>((total, rows))
+    };
+    match found.await {
+        Ok((total, rows)) => Json(Subscribers {
             subscribers: rows
                 .into_iter()
                 .map(|r| Subscriber {
@@ -358,6 +368,7 @@ async fn list(State(app): State<AppState>, t: InTeam) -> Response {
                     unsubscribed_at: r.unsubscribed_at,
                 })
                 .collect(),
+            total,
         })
         .into_response(),
         Err(e) => internal(e, "subscribers list"),
