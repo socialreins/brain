@@ -31360,7 +31360,9 @@ mod teams {
                         format!(
                             "UPDATE posts SET group_id = '{group}' WHERE id IN ('{a}', '{b}'); \
                              UPDATE posts SET media = '[\"https://m.test/a.png\"]', \
-                             thread = '[{{\"body\": \"part two\", \"media\": []}}]' \
+                             media_alt = '[\"A cat on a wall\"]', \
+                             thread = '[{{\"body\": \"part two\", \"media\": [], \
+                             \"media_alt\": [\"A dog on a sofa\"]}}]' \
                              WHERE id = '{a}'"
                         ),
                     )
@@ -31405,7 +31407,9 @@ mod teams {
                         body,
                         json!({"team": name, "body": "first version",
                             "media": ["https://m.test/a.png"],
-                            "thread": [{"body": "part two", "media": []}],
+                            "media_alt": ["A cat on a wall"],
+                            "thread": [{"body": "part two", "media": [],
+                                "media_alt": ["A dog on a sofa"]}],
                             "details": "after publishing", "newsletter": false,
                             "published_at": published_at,
                             "links": [{"platform": "bluesky", "url": "https://bsky.test/a"}]})

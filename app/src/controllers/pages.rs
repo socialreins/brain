@@ -69,6 +69,9 @@ pub struct PublicPage {
     pub team: String,
     pub body: String,
     pub media: Vec<String>,
+    /// Each picture's alt text, in the same order as `media`; an empty string for one the author
+    /// did not describe. A thread part carries the same field inside `thread`.
+    pub media_alt: Vec<String>,
     pub thread: Vec<ThreadPart>,
     pub details: String,
     /// Whether the page offers a newsletter sign-up (`POST /public/pages/{code}/subscribe`).
@@ -311,6 +314,10 @@ async fn public(
             team: team.name,
             body: first.body,
             media: serde_json::from_value(first.media).unwrap_or_default(),
+            media_alt: first
+                .media_alt
+                .and_then(|alt| serde_json::from_value(alt).ok())
+                .unwrap_or_default(),
             thread: serde_json::from_value(first.thread).unwrap_or_default(),
             details: page.details,
             newsletter: team.newsletter,
