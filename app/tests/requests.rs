@@ -24606,6 +24606,15 @@ mod teams {
                 res.json()
             }
 
+            async fn count(s: &TestServer, cookie: &str, inbox: &str, query: &str) -> Value {
+                let res = s
+                    .get(&format!("/v1/inboxes/{inbox}/count{query}"))
+                    .add_header("cookie", cookie)
+                    .await;
+                res.assert_status_ok();
+                res.json()
+            }
+
             /// Where each counter stands: inbox items, contacts, inboxes.
             async fn counters(db: &DatabaseConnection) -> (i64, i64, i64) {
                 use sea_orm::{ConnectionTrait, DbBackend, Statement};
@@ -25080,6 +25089,134 @@ mod teams {
                 assert_eq!(res.status_code(), 404);
                 let res = req(&s, Method::DELETE, &format!("/v1/inboxes/{dms}"), &cookie).await;
                 assert_eq!(res.status_code(), 204);
+            }
+
+            #[tokio::test]
+            #[serial]
+            async fn a_narrowed_count_equals_the_narrowed_list() {
+                let (s, db, state) = on_mock().await;
+                let (cookie, _, account, me) = owner(&s, &db).await;
+                // A second account of the same network, with its own items.
+                let res = connect(&s, &cookie, &new_handle(), DM_APP_PASSWORD).await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let body = res.json::<Value>();
+                let second = body["id"].as_str().unwrap().to_owned();
+                let second_did = body["external_id"].as_str().unwrap().to_owned();
+                set_inbox(
+                    &me,
+                    json!({"notifications": [
+                        note("reply", "did:plc:one", "a1", "one hello", &at(10), &me),
+                        note("mention", "did:plc:two", "a2", "two writes", &at(20), &me),
+                    ]}),
+                );
+                set_inbox(
+                    &second_did,
+                    json!({"notifications": [
+                        note("reply", "did:plc:three", "b1", "three hello", &at(30), &second_did),
+                    ]}),
+                );
+                ingest(&db, &state, &account).await;
+                ingest(&db, &state, &second).await;
+
+                let all = all_inbox(&s, &cookie).await;
+                let all_id = all["id"].as_str().unwrap().to_owned();
+                // One item done, one assigned to me and one contact tagged, so `state`,
+                // `assigned` and `tag` split them.
+                let mention = items(&s, &cookie, &all_id, "?kind=mention").await;
+                let mention = mention["items"][0]["id"].as_str().unwrap().to_owned();
+                let res = req(
+                    &s,
+                    Method::PATCH,
+                    &format!("/v1/inbox-items/{mention}"),
+                    &cookie,
+                )
+                .json(&json!({"state": "done"}))
+                .await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                let mine = s.get("/auth/me").add_header("cookie", &cookie).await;
+                let me_id = mine.json::<Value>()["id"].as_str().unwrap().to_owned();
+                let theirs = items(&s, &cookie, &all_id, &format!("?account_id={second}")).await;
+                let theirs = theirs["items"][0].clone();
+                let res = req(
+                    &s,
+                    Method::PATCH,
+                    &format!("/v1/inbox-items/{}", theirs["id"].as_str().unwrap()),
+                    &cookie,
+                )
+                .json(&json!({"assigned_to": me_id}))
+                .await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+                let contact = theirs["contact_id"].as_str().unwrap().to_owned();
+                let res = req(
+                    &s,
+                    Method::PATCH,
+                    &format!("/v1/contacts/{contact}"),
+                    &cookie,
+                )
+                .json(&json!({"tags": ["vip"]}))
+                .await;
+                assert_eq!(res.status_code(), 200, "{}", res.text());
+
+                // A custom inbox of both accounts, and one narrowed by its own keyword filter.
+                let res = req(&s, Method::POST, "/v1/inboxes", &cookie)
+                    .json(&json!({"name": "Both", "account_ids": [account, second]}))
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let both = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+                let res = req(&s, Method::POST, "/v1/inboxes", &cookie)
+                    .json(&json!({"name": "Hellos", "account_ids": [account, second],
+                        "filters": {"keywords": ["hello"]}}))
+                    .await;
+                assert_eq!(res.status_code(), 201, "{}", res.text());
+                let hellos = res.json::<Value>()["id"].as_str().unwrap().to_owned();
+
+                // Wherever the items are narrowed, on "All" and on a custom inbox, the count is
+                // the length of the list with the same filters, the inbox's own included.
+                for inbox in [&both, &hellos, &all_id] {
+                    for query in [
+                        "",
+                        "?state=open",
+                        "?state=done",
+                        "?kind=comment",
+                        "?kind=mention",
+                        "?q=hello",
+                        "?q=writes",
+                        &format!("?account_id={account}"),
+                        &format!("?account_id={second}"),
+                        "?platform=bluesky",
+                        "?platform=x",
+                        &format!("?account_id={account}&kind=mention"),
+                        "?assigned=none",
+                        "?assigned=me",
+                        "?tag=vip",
+                        "?tag=nope",
+                    ] {
+                        let n = count(&s, &cookie, inbox, query).await["count"].clone();
+                        let page = items(&s, &cookie, inbox, query).await;
+                        let len = page["items"].as_array().unwrap().len();
+                        assert_eq!(n, json!(len), "{inbox} {query}");
+                    }
+                }
+
+                // What the list refuses, the count refuses too; an unknown inbox is not found.
+                for query in [
+                    "?state=closed",
+                    "?kind=banana",
+                    "?q=",
+                    "?platform=nope",
+                    "?assigned=junk",
+                ] {
+                    let res = s
+                        .get(&format!("/v1/inboxes/{both}/count{query}"))
+                        .add_header("cookie", &cookie)
+                        .await;
+                    assert_eq!(res.status_code(), 422, "{query}");
+                }
+                let res = s
+                    .get(&format!("/v1/inboxes/{}/count", uuid::Uuid::now_v7()))
+                    .add_header("cookie", &cookie)
+                    .await;
+                assert_eq!(res.status_code(), 404);
             }
 
             #[tokio::test]

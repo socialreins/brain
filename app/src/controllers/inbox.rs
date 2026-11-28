@@ -249,6 +249,13 @@ pub struct ItemPage {
     pub next_cursor: Option<Uuid>,
 }
 
+/// An inbox's count under the filters sent.
+#[derive(Serialize, ToSchema)]
+pub struct Count {
+    /// How many of the inbox's items the filters leave; `state=open` answers the open badge.
+    pub count: i64,
+}
+
 #[derive(Deserialize, IntoParams)]
 pub struct ItemQuery {
     /// `open` or `done`; both when absent.
@@ -276,6 +283,28 @@ pub struct ItemQuery {
     /// `conversation` object. `state=open` keeps a conversation with any open item, `done` one
     /// with none; `q` and `tag` match any of its items, `assigned` its latest.
     pub group: Option<String>,
+}
+
+/// The narrowing a count shares with the item list: the same filters, without the paging.
+#[derive(Deserialize, IntoParams)]
+pub struct CountQuery {
+    /// `open` or `done`; both when absent.
+    pub state: Option<String>,
+    /// `comment`, `mention`, `dm`, `follow`, `like`, `repost`, or `activity` (the last three), within
+    /// the inbox's own filters; every kind but activity when absent.
+    pub kind: Option<String>,
+    /// Case-insensitive search in the text and the author's name and handle, 1 to 100
+    /// characters after trimming.
+    pub q: Option<String>,
+    /// Only items whose author's contact has this tag.
+    pub tag: Option<String>,
+    /// Only items assigned to `me`, to nobody (`none`) or to the member with this user id.
+    pub assigned: Option<String>,
+    /// Only items of this account.
+    pub account_id: Option<Uuid>,
+    /// Only items of this network, for example `bluesky`, `facebook`, `instagram`, `threads`,
+    /// `x` or `youtube`.
+    pub platform: Option<String>,
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -1047,21 +1076,19 @@ pub struct Narrow<'a> {
     pub cursor: Option<Uuid>,
 }
 
-/// The SQL for one page of an inbox's items, newest first; fetches `limit + 1` rows to tell
-/// whether another page follows. Follows only when `kind` asks for them.
-///
-/// `grouped`: one row per DM conversation (the `dm` items of one account and contact), its
-/// latest item, with `conv_count`, `conv_open` and `conv_first` over the items in the inbox's
-/// scope; every other item is a group of its own. `state`, `q` and `assigned` then narrow the
-/// groups, not the items.
-pub fn items_sql(
-    team_id: Uuid,
+/// The two halves of a `WHERE` over `inbox_items i`, written for the alias `i`: `scope`, what an
+/// item must be to be in the inbox at all (its accounts and filters, the kind, account, network
+/// and tag asked for), then `rest`, what narrows the rows a caller lists (`state`, `q`,
+/// `assigned`, `cursor`). `hit` is what a search matches, `TRUE` when there is none; the
+/// grouped page reads it per conversation. `values` already holds what came before, `$1` the
+/// team. The item pages and the count are narrowed here, so they cannot disagree.
+fn narrow_sql(
     accounts_of: Option<Uuid>,
     filters: &Filters,
     n: &Narrow<'_>,
-    limit: u64,
+    values: &mut Vec<Value>,
     grouped: bool,
-) -> Statement {
+) -> (String, String, String) {
     let Narrow {
         state,
         kind,
@@ -1072,9 +1099,7 @@ pub fn items_sql(
         platform,
         cursor,
     } = *n;
-    let mut values: Vec<Value> = vec![team_id.into()];
-    // What an item must be to be in scope, then what narrows the rows that are listed.
-    let mut scope = filter_sql(accounts_of, filters, &mut values);
+    let mut scope = filter_sql(accounts_of, filters, values);
     let mut rest = String::new();
     let mut hit = String::from("TRUE");
     if kind == Some("activity") {
@@ -1138,6 +1163,42 @@ pub fn items_sql(
              (SELECT c.received_at, c.id FROM inbox_items c WHERE c.id = ${n} AND c.team_id = $1)"
         );
     }
+    (scope, rest, hit)
+}
+
+/// The count of an inbox's items under the narrowing its list takes: one statement, the same
+/// `WHERE`, without the paging. `state` absent counts open and done alike, so the caller that
+/// wants the open badge asks for `state=open`.
+pub fn count_sql(
+    team_id: Uuid,
+    accounts_of: Option<Uuid>,
+    filters: &Filters,
+    n: &Narrow<'_>,
+) -> Statement {
+    let mut values: Vec<Value> = vec![team_id.into()];
+    let (scope, rest, _) = narrow_sql(accounts_of, filters, n, &mut values, false);
+    let sql = format!("SELECT COUNT(*) FROM inbox_items i WHERE i.team_id = $1{scope}{rest}");
+    Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
+}
+
+/// The SQL for one page of an inbox's items, newest first; fetches `limit + 1` rows to tell
+/// whether another page follows. Follows only when `kind` asks for them.
+///
+/// `grouped`: one row per DM conversation (the `dm` items of one account and contact), its
+/// latest item, with `conv_count`, `conv_open` and `conv_first` over the items in the inbox's
+/// scope; every other item is a group of its own. `state`, `q` and `assigned` then narrow the
+/// groups, not the items.
+pub fn items_sql(
+    team_id: Uuid,
+    accounts_of: Option<Uuid>,
+    filters: &Filters,
+    n: &Narrow<'_>,
+    limit: u64,
+    grouped: bool,
+) -> Statement {
+    let mut values: Vec<Value> = vec![team_id.into()];
+    let state = n.state;
+    let (scope, rest, hit) = narrow_sql(accounts_of, filters, n, &mut values, grouped);
     values.push(((limit + 1) as i64).into());
     let n = values.len();
     if grouped {
@@ -1247,6 +1308,46 @@ fn grouped_sql(scope: &str, rest: &str, hit: &str, limit: usize, state: Option<&
     )
 }
 
+/// What a list or a count narrows by, checked; `None` is the `422 invalid_query` reply.
+/// `search` comes back trimmed, `tag` cleaned by `inbox::tag`, `assigned` resolved to the member
+/// asked for. `state`, `kind` and `platform` pass as they were sent once they hold their rules.
+struct Narrowing<'a> {
+    search: Option<&'a str>,
+    tag: Option<String>,
+    assigned: Option<Option<Uuid>>,
+}
+
+fn checked_narrow<'a>(
+    user: Uuid,
+    state: Option<&'a str>,
+    kind: Option<&'a str>,
+    search: Option<&'a str>,
+    platform: Option<&'a str>,
+    tag: Option<&'a str>,
+    assigned: Option<&'a str>,
+) -> Option<Narrowing<'a>> {
+    let state_ok = state.is_none_or(|s| s == "open" || s == "done");
+    let kind_ok = kind.is_none_or(|k| {
+        matches!(k, "comment" | "mention" | "dm" | "activity") || inbox::ACTIVITY.contains(&k)
+    });
+    let search = search.map(str::trim);
+    let search_ok = search.is_none_or(|s| (1..=100).contains(&s.chars().count()));
+    let platform_ok = platform.is_none_or(|p| inbox::PLATFORMS.contains(&p));
+    let cleaned = tag.map(inbox::tag);
+    let tags_ok = cleaned.as_ref().is_none_or(Option::is_some);
+    let who = assigned.map(|a| match a {
+        "me" => Some(Some(user)),
+        "none" => Some(None),
+        id => id.parse().ok().map(Some),
+    });
+    let who_ok = who.as_ref().is_none_or(Option::is_some);
+    (state_ok && kind_ok && search_ok && platform_ok && tags_ok && who_ok).then_some(Narrowing {
+        search,
+        tag: cleaned.flatten(),
+        assigned: who.flatten(),
+    })
+}
+
 /// An inbox's items, newest first, a page at a time.
 #[utoipa::path(get, path = "/inboxes/{id}/items", tag = "inbox",
     params(("id" = String, Path, description = ID_PARAM), ItemQuery),
@@ -1262,37 +1363,25 @@ async fn items(
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     };
     let limit = q.limit.unwrap_or(PAGE);
-    let state_ok = q
-        .state
-        .as_deref()
-        .is_none_or(|s| s == "open" || s == "done");
-    let kind_ok = q.kind.as_deref().is_none_or(|k| {
-        matches!(k, "comment" | "mention" | "dm" | "activity") || inbox::ACTIVITY.contains(&k)
-    });
-    let search = q.q.as_deref().map(str::trim);
-    let search_ok = search.is_none_or(|s| (1..=100).contains(&s.chars().count()));
-    let platform_ok = q
-        .platform
-        .as_deref()
-        .is_none_or(|p| inbox::PLATFORMS.contains(&p));
-    let tag = q.tag.as_deref().map(inbox::tag);
-    let assigned = q.assigned.as_deref().map(|a| match a {
-        "me" => Some(Some(t.current.0.id)),
-        "none" => Some(None),
-        id => id.parse().ok().map(Some),
-    });
-    let narrow_ok =
-        tag.as_ref().is_none_or(Option::is_some) && assigned.is_none_or(|a| a.is_some());
-    if !state_ok
-        || !kind_ok
-        || !search_ok
-        || !platform_ok
-        || !narrow_ok
-        || !(1..=MAX_PAGE).contains(&limit)
-    {
+    let Some(Narrowing {
+        search,
+        tag,
+        assigned,
+    }) = checked_narrow(
+        t.current.0.id,
+        q.state.as_deref(),
+        q.kind.as_deref(),
+        q.q.as_deref(),
+        q.platform.as_deref(),
+        q.tag.as_deref(),
+        q.assigned.as_deref(),
+    )
+    else {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
+    };
+    if !(1..=MAX_PAGE).contains(&limit) {
         return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
     }
-    let (tag, assigned) = (tag.flatten(), assigned.flatten());
     let grouped = match q.group.as_deref() {
         None => false,
         Some("conversations") => true,
@@ -1365,6 +1454,80 @@ async fn items(
         Ok(Some(page)) => Json(page).into_response(),
         Ok(None) => not_found(),
         Err(e) => internal(e, "inbox items"),
+    }
+}
+
+/// An inbox's count under the same narrowing its list takes (`state`, `kind`, `q`, `tag`,
+/// `assigned`, `account_id`, `platform`): one statement over the list's `WHERE`, without its
+/// paging, so a narrowed view can badge itself with what it shows. The inbox list's
+/// `open_count` stays the unfiltered total; `state=open` here answers the open badge. Every
+/// member; `404` for another team's inbox.
+#[utoipa::path(get, path = "/inboxes/{id}/count", tag = "inbox",
+    params(("id" = String, Path, description = ID_PARAM), CountQuery),
+    responses((status = 200, body = Count), (status = 401, body = Error),
+        (status = 404, body = Error), (status = 422, body = Error)))]
+async fn count(
+    State(app): State<AppState>,
+    t: InTeam,
+    InboxId(id): InboxId,
+    q: Result<Query<CountQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(q)) = q else {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
+    };
+    let Some(Narrowing {
+        search,
+        tag,
+        assigned,
+    }) = checked_narrow(
+        t.current.0.id,
+        q.state.as_deref(),
+        q.kind.as_deref(),
+        q.q.as_deref(),
+        q.platform.as_deref(),
+        q.tag.as_deref(),
+        q.assigned.as_deref(),
+    )
+    else {
+        return reply(StatusCode::UNPROCESSABLE_ENTITY, "invalid_query");
+    };
+    let found = async {
+        let Some(found) = find_inbox(&app.db, t.team.id, id).await? else {
+            return Ok(None);
+        };
+        let filters: Filters = serde_json::from_value(found.filters.clone()).unwrap_or_default();
+        let narrow = Narrow {
+            state: q.state.as_deref(),
+            kind: q.kind.as_deref(),
+            q: search,
+            tag: tag.as_deref(),
+            assigned,
+            account: q.account_id,
+            platform: q.platform.as_deref(),
+            cursor: None,
+        };
+        let stmt = count_sql(t.team.id, accounts_of(&found), &filters, &narrow);
+        // A search is planned for its own pattern, as the list is.
+        let row = if search.is_some() || !filters.keywords.is_empty() {
+            let tx = app.db.begin().await?;
+            tx.execute_unprepared("SET LOCAL plan_cache_mode = force_custom_plan")
+                .await?;
+            let row = tx.query_one_raw(stmt).await?;
+            tx.commit().await?;
+            row
+        } else {
+            app.db.query_one_raw(stmt).await?
+        };
+        let count = row
+            .map(|r| r.try_get::<i64>("", "count"))
+            .transpose()?
+            .unwrap_or(0);
+        Ok::<_, DbErr>(Some(Count { count }))
+    };
+    match found.await {
+        Ok(Some(c)) => Json(c).into_response(),
+        Ok(None) => not_found(),
+        Err(e) => internal(e, "inbox count"),
     }
 }
 
@@ -1839,6 +2002,7 @@ pub fn api() -> OpenApiRouter<AppState> {
         .routes(routes!(list, create))
         .routes(routes!(update, destroy))
         .routes(routes!(items))
+        .routes(routes!(count))
         .routes(routes!(show_item, change_item))
         .routes(routes!(conversation))
         .routes(routes!(thread))
@@ -2006,6 +2170,43 @@ mod tests {
                 .contains(" AND i.social_account_id = $2 AND i.platform = $3 ORDER BY"),
             "{}",
             stmt.sql
+        );
+    }
+
+    #[test]
+    fn the_count_takes_the_lists_where_without_its_paging() {
+        let team = Uuid::now_v7();
+        let f = Filters {
+            kinds: vec!["dm".into()],
+            ..Filters::default()
+        };
+        let n = Narrow {
+            state: Some("open"),
+            kind: Some("dm"),
+            q: Some("hi"),
+            tag: Some("vip"),
+            assigned: Some(Some(Uuid::nil())),
+            account: Some(Uuid::nil()),
+            platform: Some("bluesky"),
+            ..Narrow::default()
+        };
+        let list = items_sql(team, Some(Uuid::nil()), &f, &n, 50, false);
+        let count = count_sql(team, Some(Uuid::nil()), &f, &n);
+        // The same `WHERE` as the page, without its ORDER BY and LIMIT.
+        let where_of = list.sql.split_once(" ORDER BY").unwrap().0;
+        assert_eq!(count.sql, where_of.replace("SELECT i.*", "SELECT COUNT(*)"));
+        // One bound value fewer: the page's `limit`.
+        assert_eq!(
+            count.values.unwrap().0.len() + 1,
+            list.values.unwrap().0.len()
+        );
+        // A grouped page narrows its conversations; a count never groups, so the grouped
+        // spelling (`conv_open`, `conv_hit`) never reaches it.
+        let count = count_sql(team, None, &Filters::default(), &Narrow::default());
+        assert_eq!(
+            count.sql,
+            "SELECT COUNT(*) FROM inbox_items i WHERE i.team_id = $1 \
+             AND i.kind NOT IN ('follow', 'like', 'repost')"
         );
     }
 
