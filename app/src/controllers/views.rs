@@ -270,6 +270,12 @@ async fn update(
     }
     let saved = async {
         let txn = app.db.begin().await?;
+        // The same lock as a save takes, so two changes of the default (or one and a save) cannot cross.
+        txn.execute_raw(sql(
+            "SELECT 1 FROM team_user WHERE team_id = $1 AND user_id = $2 FOR UPDATE",
+            vec![t.team.id.into(), t.current.0.id.into()],
+        ))
+        .await?;
         let Some(found) = txn
             .query_one_raw(sql(
                 "SELECT scope FROM saved_views WHERE id = $1 AND team_id = $2 AND user_id = $3 \

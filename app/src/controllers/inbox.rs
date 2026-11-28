@@ -1424,6 +1424,7 @@ fn lists(account_ids: Option<&str>, platforms: Option<&str>) -> Option<Lists> {
         .collect::<Option<Vec<Uuid>>>()?;
     let platforms = parts(platforms);
     (accounts.len() <= 100
+        && platforms.len() <= inbox::PLATFORMS.len()
         && platforms
             .iter()
             .all(|p| inbox::PLATFORMS.contains(&p.as_str())))

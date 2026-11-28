@@ -25097,6 +25097,16 @@ mod teams {
                         assert_eq!(res.status_code(), 422, "{path}?{bad}");
                     }
                 }
+                let nine = vec!["x"; 9].join(",");
+                let res = call(
+                    &s,
+                    Method::GET,
+                    &format!("/v1/inboxes/{inbox}/count?platforms={nine}"),
+                    &cookie,
+                    &tcode,
+                )
+                .await;
+                assert_eq!(res.status_code(), 422);
                 let many = vec![uuid::Uuid::nil().to_string(); 101].join(",");
                 let res = call(
                     &s,
