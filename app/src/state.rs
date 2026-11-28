@@ -67,6 +67,8 @@ pub struct AppState {
     pub contact_limiter: Arc<RateLimiter>,
     /// Per-IP limit on `GET /v1/public/pages/{code}`.
     pub page_limiter: Arc<RateLimiter>,
+    /// Per-IP limit on `GET /v1/public/image`, which fetches an image for a public page's visitor.
+    pub image_limiter: Arc<RateLimiter>,
     /// Per user limit on `GET /v1/slugs/check`, which a form calls while someone types.
     pub slug_check_limiter: Arc<RateLimiter>,
     /// Per-IP limit on `GET /v1/public/team-slugs/{slug}`. Generous: the web app asks for
@@ -139,6 +141,7 @@ impl AppState {
                 std::time::Duration::from_secs(3600),
             )),
             page_limiter: Arc::new(RateLimiter::per_minute("page", 120)),
+            image_limiter: Arc::new(RateLimiter::per_minute("image", 120)),
             slug_check_limiter: Arc::new(RateLimiter::per_minute("slug-check", 120)),
             slug_lookup_limiter: Arc::new(RateLimiter::per_minute("slug-lookup", 600)),
             unsubscribe_limiter: Arc::new(RateLimiter::per_minute("unsubscribe", 120)),

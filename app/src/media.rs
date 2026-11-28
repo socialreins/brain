@@ -61,6 +61,14 @@ const SNIFF_LEN: usize = 12;
 /// Bytes a probe asks for: enough for `animated` to see a WebP's flags, and a PNG's `acTL`
 /// unless a long chunk (a colour profile, say) comes first.
 const PROBE_LEN: usize = 512;
+/// Largest image the public image proxy (`GET /v1/public/image`) serves, and the longest one may
+/// take, the whole exchange included.
+pub const PROXY_BYTES: usize = 5 * 1024 * 1024;
+pub const PROXY_TIMEOUT: Duration = Duration::from_secs(8);
+/// Served image bytes after which the proxy writes one line at info: never one a request.
+const PROXY_LOG_EVERY: u64 = 10 * 1024 * 1024;
+static PROXY_BYTES_SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROXY_IMAGES_SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Image conversions (`to_jpeg`, `fit`) running at once in the process, so the decode and resize
 /// buffers of many posts (up to a few hundred MB each) queue instead of piling up.
 static CONVERTING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
@@ -168,6 +176,29 @@ pub struct Probed {
     pub size: Option<u64>,
     /// An animated WebP or PNG, as far as the first bytes show (`animated`).
     pub animated: bool,
+}
+
+/// An image the public proxy (`Media::public_image`) serves to a visitor: the origin's type and
+/// the bytes, never stored.
+#[derive(Clone, Debug)]
+pub struct Image {
+    pub content_type: String,
+    pub bytes: bytes::Bytes,
+}
+
+/// Why `Media::public_image` served nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageFail {
+    /// Not a public https URL, or it redirected to one that is not.
+    Blocked,
+    /// The origin answered with something that is not an image, by header or by its bytes.
+    NotImage,
+    /// Over `PROXY_BYTES`.
+    TooLarge,
+    Http(u16),
+    Unreachable,
+    /// No answer within `PROXY_TIMEOUT`.
+    TimedOut,
 }
 
 /// Why a file was not stored.
@@ -876,6 +907,81 @@ impl Media {
             return Err(Fail::NotShared);
         }
         Ok(res)
+    }
+
+    /// Fetches `url` for a visitor of a public page (`GET /v1/public/image`), through the same
+    /// guarded client as every download: a public https URL only (`allow_private` in tests), names
+    /// resolved by `PublicOnly`, at most `MAX_REDIRECTS` redirects each checked again, and no
+    /// cookie or auth header, since the request carries only what this method sets. The answer must
+    /// be an `image/*` by its header and its first bytes, at most `PROXY_BYTES`, within
+    /// `PROXY_TIMEOUT`. Nothing is stored: the bytes go straight back to the caller.
+    pub async fn public_image(&self, url: &str) -> Result<Image, ImageFail> {
+        let target = Url::parse(url)
+            .ok()
+            .filter(|u| public_url(u, self.allow_private))
+            .ok_or(ImageFail::Blocked)?;
+        let work = async {
+            // The client follows at most `MAX_REDIRECTS` redirects, each checked by
+            // `public_url` again, and resolves every name through `PublicOnly`.
+            let mut res = self
+                .client
+                .get(target)
+                .header(reqwest::header::ACCEPT, "image/*")
+                .send()
+                .await
+                .map_err(|e| {
+                    let fail = if e.is_redirect() || blocked(&e) {
+                        ImageFail::Blocked
+                    } else {
+                        ImageFail::Unreachable
+                    };
+                    tracing::warn!(error = %e.without_url(), "public image fetch failed");
+                    fail
+                })?;
+            if !res.status().is_success() {
+                return Err(ImageFail::Http(res.status().as_u16()));
+            }
+            let content_type = res
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if !content_type.starts_with("image/") {
+                return Err(ImageFail::NotImage);
+            }
+            if res.content_length().is_some_and(|n| n > PROXY_BYTES as u64) {
+                return Err(ImageFail::TooLarge);
+            }
+            let mut body = Vec::new();
+            while let Some(chunk) = res.chunk().await.map_err(|_| ImageFail::Unreachable)? {
+                if body.len() + chunk.len() > PROXY_BYTES {
+                    return Err(ImageFail::TooLarge);
+                }
+                body.extend_from_slice(&chunk);
+            }
+            // The header said image; the bytes have to agree before they go back out.
+            if !sniff(&body).is_some_and(|t| t.starts_with("image/")) {
+                return Err(ImageFail::NotImage);
+            }
+            Ok(Image {
+                content_type,
+                bytes: body.into(),
+            })
+        };
+        let image = tokio::time::timeout(PROXY_TIMEOUT, work)
+            .await
+            .map_err(|_| ImageFail::TimedOut)??;
+        let served = image.bytes.len() as u64;
+        let total =
+            PROXY_BYTES_SERVED.fetch_add(served, std::sync::atomic::Ordering::Relaxed) + served;
+        let images = PROXY_IMAGES_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // One line per `PROXY_LOG_EVERY` bytes, never one per request.
+        if total / PROXY_LOG_EVERY != (total - served) / PROXY_LOG_EVERY {
+            tracing::info!(bytes = total, images, "public images served");
+        }
+        Ok(image)
     }
 
     /// Streams `url` (a Drive share link as its direct download) into a new object, part by part
