@@ -25097,7 +25097,7 @@ mod teams {
                         assert_eq!(res.status_code(), 422, "{path}?{bad}");
                     }
                 }
-                let nine = vec!["x"; 9].join(",");
+                let nine = ["x"; 9].join(",");
                 let res = call(
                     &s,
                     Method::GET,
