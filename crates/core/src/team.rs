@@ -103,6 +103,7 @@ pub const RESERVED_SLUGS: &[&str] = &[
     "calendar",
     "careers",
     "claude",
+    "comments",
     "compare",
     "config",
     "connections",
