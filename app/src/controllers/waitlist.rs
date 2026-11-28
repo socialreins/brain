@@ -505,6 +505,9 @@ pub struct AdminWaitlist {
     pub total: u64,
     /// Verified signups, whatever the filter.
     pub verified: u64,
+    /// Signups matching the current filters and search, whether shown or not: the table holds
+    /// the newest 1000 (`ADMIN_LIST_LIMIT`), so this says what that leaves out.
+    pub matched: u64,
     /// Newest first, at most 1000.
     pub signups: Vec<AdminSignup>,
 }
@@ -561,15 +564,17 @@ async fn admin_list(
             let q: String = q.to_lowercase().chars().take(200).collect();
             list = list.filter(Column::Email.like(like(&q)));
         }
+        // What the filters match, before the cap takes its rows: the page says what it leaves out.
+        let matched = list.clone().count(&app.db).await?;
         let rows = list
             .order_by_desc(Column::CreatedAt)
             .order_by_desc(Column::Id)
             .limit(ADMIN_LIST_LIMIT)
             .all(&app.db)
             .await?;
-        Ok::<_, sea_orm::DbErr>((total, verified, rows))
+        Ok::<_, sea_orm::DbErr>((total, verified, matched, rows))
     };
-    let (total, verified, rows) = match found.await {
+    let (total, verified, matched, rows) = match found.await {
         Ok(found) => found,
         Err(e) => return internal(e, "admin waitlist"),
     };
@@ -577,6 +582,7 @@ async fn admin_list(
     Json(AdminWaitlist {
         total,
         verified,
+        matched,
         signups,
     })
     .into_response()

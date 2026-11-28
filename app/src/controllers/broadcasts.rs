@@ -226,9 +226,12 @@ async fn shown(app: &AppState, team: Uuid, id: Uuid, status: StatusCode) -> Resp
     }
 }
 
-/// The team's broadcasts, newest first (the latest 200). Every member.
+/// The team's broadcasts, newest first (the latest 200). Every member. The `x-total-count`
+/// header says how many there are in all, so a reader can tell what the cap leaves out.
 #[utoipa::path(get, path = "/broadcasts", tag = "broadcasts",
-    responses((status = 200, body = [Broadcast]), (status = 401, body = Error)))]
+    responses((status = 200, body = [Broadcast],
+        headers(("x-total-count" = u64, description = "Every broadcast of the team, whether shown or not."))),
+        (status = 401, body = Error)))]
 async fn list(State(app): State<AppState>, t: InTeam) -> Response {
     let sql = format!("{SELECT} ORDER BY b.created_at DESC, b.id DESC LIMIT $2");
     let found = async {
@@ -236,12 +239,27 @@ async fn list(State(app): State<AppState>, t: InTeam) -> Response {
             .db
             .query_all_raw(stmt(&sql, vec![t.team.id.into(), LIST.into()]))
             .await?;
-        rows.iter()
+        let list = rows
+            .iter()
             .map(broadcast_json)
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<Result<Vec<_>, _>>()?;
+        let row = app
+            .db
+            .query_one_raw(stmt(
+                "SELECT count(*) AS total FROM broadcasts WHERE team_id = $1",
+                vec![t.team.id.into()],
+            ))
+            .await?;
+        let total: i64 = row
+            .map(|r| r.try_get("", "total"))
+            .transpose()?
+            .unwrap_or(0);
+        Ok::<_, DbErr>((list, total))
     };
     match found.await {
-        Ok(list) => Json(list).into_response(),
+        // A header, not a field: the body stays the array it always was, so a web app that
+        // does not know it yet keeps working.
+        Ok((list, total)) => ([("x-total-count", total.to_string())], Json(list)).into_response(),
         Err(e) => internal(e, "broadcast list"),
     }
 }

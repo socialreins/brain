@@ -224,6 +224,10 @@ pub fn router(state: AppState, config: &Config) -> Router {
             header::CONTENT_TYPE,
             header::HeaderName::from_static(teams::TEAM_HEADER),
         ])
+        // `x-total-count`: the capped lists (broadcasts, newsletters) say in it how many rows
+        // there are in all. Browsers hide response headers from cross-origin scripts unless
+        // they are named here.
+        .expose_headers([header::HeaderName::from_static("x-total-count")])
         // The header makes every call preflighted; browsers may reuse the answer for an hour.
         .max_age(std::time::Duration::from_secs(3600))
         // The web app sends the session cookie on cross-origin calls to `/auth/*`.

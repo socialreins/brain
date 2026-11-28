@@ -54,7 +54,9 @@ cargo run -p socialreins-brain
   `POST /v1/waitlist/verify` (never a state-changing GET: mail scanners open links). Mail goes
   out after the reply, at most hourly per email, 20 a day per IP and 500 a day overall
   (`rate_limit::daily_reserve`). `POST /v1/waitlist/name` sets an optional name with the join's `name_token` (hash stored on a new row only, a dummy for a known email, valid an hour). `GET /v1/waitlist/count` counts verified signups, cached 30 seconds, and `GET /v1/admin/waitlist` is for `ADMIN_EMAILS` (`config.rs`) with a
-  session cookie only. Invites in batches (`admin.rs`): `GET /v1/admin/waitlist-invites?count=N` previews the oldest N verified signups not yet approved, `POST` with their `ids` (1 to 50, recent sign-in) approves each by one claiming UPDATE (so nobody is mailed twice, `approved_at` is the invited timestamp) and sends the invite mail (`send_invite`: sign in with this address, 7-day trial, connect, publish) within 100 a day (`waitlist:invite` in `rate_limit_hits`); a failed mail or a reached cap gives the claim back. `overview.waitlist.signed_up` counts approved emails with an account.
+  session cookie only; its `signups` are the newest 1000 the filters and search match, while
+  `total` and `verified` stay overall and `matched` says how many the filters find in all, so
+  a reader can tell what the cap leaves out. Invites in batches (`admin.rs`): `GET /v1/admin/waitlist-invites?count=N` previews the oldest N verified signups not yet approved, `POST` with their `ids` (1 to 50, recent sign-in) approves each by one claiming UPDATE (so nobody is mailed twice, `approved_at` is the invited timestamp) and sends the invite mail (`send_invite`: sign in with this address, 7-day trial, connect, publish) within 100 a day (`waitlist:invite` in `rate_limit_hits`); a failed mail or a reached cap gives the claim back. `overview.waitlist.signed_up` counts approved emails with an account.
 - `app/src/controllers/pages.rs`: public pages of posts. `teams.public_pages` (`PATCH /v1/team`,
   owner or admin) switches them on; `post_pages` holds one row per `subject` (the post's
   `group_id`, else its `id`), so a group has one page under one permanent `code`.
@@ -72,11 +74,14 @@ cargo run -p socialreins-brain
   stores `subscribers (team_id, email)` unconfirmed and mails a link (once an hour per email, 20 a day per IP,
   200 per team, 5000 overall) to the web app, which posts its token to `POST /v1/public/newsletter/verify`.
   Same reply for a known email. `GET /v1/subscribers` and `DELETE /v1/subscribers/{id}` are for owners and
-  admins. Mail only confirmed rows without `unsubscribed_at`. `POST /v1/public/newsletter/unsubscribe`
+  admins; the list is the newest 5000 rows and its `total` says how many there are in all.
+  Mail only confirmed rows without `unsubscribed_at`. `POST /v1/public/newsletter/unsubscribe`
   sets it (token in the body or, one-click, in the query; same `200` for any token; never a GET) and only
   confirming a link mailed after it clears it.
 - `app/src/newsletters.rs` and `controllers/newsletters.rs`: newsletters, one email to every confirmed,
-  not unsubscribed subscriber (owners and admins only, session only). It goes out from our own mail
+  not unsubscribed subscriber (owners and admins only, session only). The list
+  (`GET /v1/newsletters`) is the latest 200; its `x-total-count` response header says how many
+  there are in all (the CORS layer exposes the header to the web app). It goes out from our own mail
   domain, so everything errs on the side of not sending. `checked` and `render` are the whole markup
   (paragraphs, `**bold**`, bare `https://` links; everything escaped, never pass HTML through), `compose`
   the mail with its legal footer, `mail` the one place a newsletter mail is sent (test included), with
@@ -293,7 +298,8 @@ cargo run -p socialreins-brain
   counts read what remains. `inbox_actions` keeps its rows with the item unset.
   `inbox_items_created_idx` serves the delete.
 - `app/src/broadcasts.rs` and `controllers/broadcasts.rs`: broadcasts, one DM to every reachable
-  contact with a tag (owners and admins write, session only). `ROUTE` is the one place that says
+  contact with a tag (owners and admins write, session only). The list (`GET /v1/broadcasts`) is
+  the latest 200; its `x-total-count` response header says how many there are in all. `ROUTE` is the one place that says
   who is reachable and through which item: never opted out (`contact_opt_outs`, a row per team,
   platform and person that outlives the contact, written by a DM that says `stop` or
   `unsubscribe` in `inbox::store` and by `PATCH /v1/contacts/{id}`), no broadcast in the last 24
