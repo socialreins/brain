@@ -24952,6 +24952,25 @@ mod teams {
                     .await;
                 assert_eq!(res.status_code(), 422);
 
+                // `platform` narrows to one network, and an unknown one is refused.
+                let got = items(&s, &cookie, all_id, "?platform=bluesky").await;
+                assert_eq!(got["items"].as_array().unwrap().len(), 3);
+                let got = items(&s, &cookie, all_id, "?platform=x").await;
+                assert_eq!(got["items"], json!([]));
+                let got = items(
+                    &s,
+                    &cookie,
+                    all_id,
+                    &format!("?account_id={account}&platform=bluesky"),
+                )
+                .await;
+                assert_eq!(got["items"].as_array().unwrap().len(), 3);
+                let res = s
+                    .get(&format!("/v1/inboxes/{all_id}/items?platform=banana"))
+                    .add_header("cookie", &cookie)
+                    .await;
+                assert_eq!(res.status_code(), 422);
+
                 // Shapes and ids are checked; "All" stays. An X account has no inbox.
                 let x = uuid::Uuid::now_v7();
                 // A real Bluesky account, of another team.
